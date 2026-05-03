@@ -9,27 +9,27 @@
 	"compatibility_date": "2026-05-03",
 	"migrations": [
 		{
-			"new_sqlite_classes": [
-				"MyDurableObject"
-			],
-			"tag": "v1"
-		}
+			"new_sqlite_classes": ["MyDurableObject", "PartitionDO"],
+			"tag": "v1",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
 			{
 				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT"
-			}
-		]
+				"name": "MY_DURABLE_OBJECT",
+			},
+			{
+				"class_name": "PartitionDO",
+				"name": "PARTITION_DO",
+			},
+		],
 	},
 	"observability": {
-		"enabled": true
+		"enabled": true,
 	},
 	"upload_source_maps": false,
-	"compatibility_flags": [
-		"nodejs_compat"
-	]
+	"compatibility_flags": ["nodejs_compat"],
 	/**
 	 * Environment Variables
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
