@@ -41,5 +41,9 @@
 			"node",
 			"@cloudflare/vitest-pool-workers" // provides `cloudflare:test` and `cloudflare:workers` types
 		]
-	}
+	},
+	"include": [
+		"./**/*.ts",
+		"../src/worker-configuration.d.ts" // output of `wrangler types`
+	]
 }

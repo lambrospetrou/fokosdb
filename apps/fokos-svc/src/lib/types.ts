@@ -14,7 +14,10 @@ export type PutItemOptions = {
 	data: Uint8Array | string;
 };
 
-export type PutItemResult = {};
+export type PutItemResult = {
+	meta: OperationMetrics & {};
+	__debug?: DebugInfo;
+};
 
 export interface ItemGetter {
 	getItem(opts: GetItemOptions): Promise<GetItemResult>;
@@ -34,10 +37,25 @@ export type GetItemResult =
 			data: Uint8Array | string;
 			ttlEpochUTCSeconds?: number;
 
-			debug?: Record<string, any>;
+			meta: OperationMetrics & {};
+
+			__debug?: DebugInfo;
 	  }
 	| {
 			found: false;
 
-			debug?: Record<string, any>;
+			__debug?: DebugInfo;
 	  };
+
+export type OperationMetrics = {
+	rowsRead: number;
+	rowsWritten: number;
+	databaseSize: number;
+	timings?: {
+		total: number;
+	};
+};
+
+export type DebugInfo = {
+	splitStatus?: Record<string, any>;
+};

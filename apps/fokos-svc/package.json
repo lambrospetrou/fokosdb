@@ -1,21 +1,22 @@
 {
-  "name": "fokos-svc",
-  "version": "0.0.0",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "deploy": "wrangler deploy",
-    "dev": "wrangler dev",
-    "start": "wrangler dev",
-    "test": "vitest run",
-    "cf-typegen": "wrangler types"
-  },
-  "devDependencies": {
-    "@cloudflare/vitest-pool-workers": "^0.15.2",
-    "@types/node": "^25.6.0",
-    "durable-utils": "^0.3.5",
-    "typescript": "^5.5.2",
-    "vitest": "^4.1.5",
-    "wrangler": "^4.87.0"
-  }
+	"name": "fokos-svc",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"deploy": "wrangler deploy",
+		"dev": "wrangler dev",
+		"start": "wrangler dev",
+		"test": "npm run check && vitest run",
+		"cf-typegen": "wrangler types"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.15.2",
+		"@types/node": "^25.6.0",
+		"durable-utils": "^0.3.5",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.5",
+		"wrangler": "^4.87.0"
+	}
 }
