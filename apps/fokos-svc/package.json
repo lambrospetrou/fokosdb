@@ -15,6 +15,7 @@
 		"@cloudflare/vitest-pool-workers": "^0.15.2",
 		"@types/node": "^25.6.0",
 		"durable-utils": "^0.3.5",
+		"js-xxhash": "^5.0.1",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.5",
 		"wrangler": "^4.87.0"

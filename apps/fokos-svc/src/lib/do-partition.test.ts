@@ -2,27 +2,8 @@ import { env } from "cloudflare:workers";
 import { listDurableObjectIds, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { PartitionContextCreator } from "./partition-topology.js";
+import { __encodePartitionIdOpaque, PartitionContextCreator, PartitionTopologyRouterImpl } from "./partition-topology.js";
 import type { PartitionContextResolved } from "./partition-topology.js";
-
-function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
-	const name = `test.partition.${crypto.randomUUID()}`;
-	const base = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsPrefix: "test",
-		rootTreesN: 1,
-		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
-		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
-		...opts,
-	});
-	const id = env.PARTITION_DO.idFromName(name);
-	const ctx: PartitionContextResolved = {
-		...base,
-		doName: name,
-		primaryDoIdStr: id.toString(),
-	};
-	return { ctx, stub: env.PARTITION_DO.get(id) };
-}
 
 describe("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
@@ -147,7 +128,8 @@ describe("PartitionDO - splitting", () => {
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
-		const hashKey = `hk.${stub.id.name!}`;
+		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+		const hashKey = `hk.1`;
 
 		await stub.putItem(ctx, {
 			hashKey,
@@ -158,11 +140,9 @@ describe("PartitionDO - splitting", () => {
 
 		const parentState = await stub.__internalState();
 		expect(parentState.splitStatus?.status).toBe("split_in_progress");
-		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: "test" });
+		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: ctx.nsPrefix });
 
-		// startSplit derives child names as `${nsPrefix}.${hashKey}.${i}` via the placeholder router.
-		// splitN=2 → two children named "test.${hashKey}.0" and "test.${hashKey}.1".
-		const childNames = [`test.${hashKey}.0`, `test.${hashKey}.1`];
+		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
@@ -171,7 +151,7 @@ describe("PartitionDO - splitting", () => {
 
 			expect(childState.partitionContext).toMatchObject({
 				ns: "PARTITION_DO",
-				nsPrefix: "test",
+				nsPrefix: ctx.nsPrefix,
 				doName: name,
 			});
 			expect(childState.parentPartitionContext).toMatchObject({
@@ -281,4 +261,25 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	await runInDurableObject(stub, async (instance: PartitionDO) => {
 		await vi.waitUntil(() => !instance.__testing__alarm_running, { timeout: 5000, interval: 100 });
 	});
+}
+
+function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
+	const prefix = `test.${crypto.randomUUID()}`;
+	const rootName = `${prefix}.r.0`;
+	const base = PartitionContextCreator.create({
+		ns: "PARTITION_DO",
+		nsPrefix: prefix,
+		rootTreesN: 1,
+		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
+		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
+		...opts,
+	});
+	const id = env.PARTITION_DO.idFromName(rootName);
+	const ctx: PartitionContextResolved = {
+		...base,
+		doName: rootName,
+		primaryDoIdStr: id.toString(),
+		partitionId: __encodePartitionIdOpaque({ hashIdxs: [0] }),
+	};
+	return { ctx, stub: env.PARTITION_DO.get(id) };
 }

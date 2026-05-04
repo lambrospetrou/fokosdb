@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import { tryWhile } from "durable-utils/retries";
+import { xxHash32 } from "js-xxhash";
 import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
 
 type PartitionNamespaceKey = {
@@ -36,7 +37,8 @@ export type PartitionContextResolved = PartitionContext & {
 	// Future proofing if we want to use DO read replication.
 	primaryDoIdStr: string;
 
-	partitionId?: PartitionNodeId;
+	// Opaque ID used internally to identify the partition.
+	partitionId: PartitionNodeId;
 };
 
 // This can be used to identify the node in the topology and can be useful for routing and debugging.
@@ -118,28 +120,100 @@ export class PartitionContextCreator {
 }
 
 export interface PartitionTopologyRouter {
+	/**
+	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
+	 * @param hashKey
+	 * @param sortKey
+	 */
 	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+
+	/**
+	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
+	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
+	 * @param partitionContext
+	 * @param hashKey
+	 * @param sortKey
+	 */
+	pickPartitionFromContext(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+
+	calculateChildPartitionIds(
+		parentPartitionIdOpaque: string,
+		N: number,
+	): {
+		doName: string;
+		partitionIdOpaque: string;
+	}[];
+}
+
+type TopologyNode = {
+	partitionContext: Pick<PartitionContextResolved, "doName">;
+	children: TopologyNode[];
+};
+
+// Golden Ratio constant used for better hash scattering
+// See https://softwareengineering.stackexchange.com/a/402543
+const GOLDEN_RATIO = 0x9e3779b1;
+
+export function __encodePartitionIdOpaque({ hashIdxs }: { hashIdxs: number[] }): string {
+	return btoa(JSON.stringify({ hashIdxs }));
+}
+
+export function __decodePartitionIdOpaque(partitionIdOpaque: string): { hashIdxs: number[] } {
+	return JSON.parse(atob(partitionIdOpaque));
 }
 
 /**
  * Used by the FokosDB to route requests to the right partition DO based on the provided partition context and keys.
  */
 export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
+	#topology: TopologyNode[];
+
 	constructor(
 		private readonly encoded: PartitionTopologyEncoded,
 		private readonly basePartitionContext: PartitionContext,
-	) {}
+	) {
+		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
+		this.#topology = Array(basePartitionContext.rootTreesN)
+			.fill(undefined)
+			.map((_, i) => ({
+				partitionContext: {
+					doName: `${basePartitionContext.nsPrefix}.r.${i}`,
+				},
+				children: [],
+			}));
+	}
+
+	calculateChildPartitionIds(
+		parentPartitionIdOpaque: string,
+		N: number,
+	): {
+		doName: string;
+		partitionIdOpaque: string;
+	}[] {
+		const parentPartitionIdDeOpaque = __decodePartitionIdOpaque(parentPartitionIdOpaque);
+		const parentSerializedIdxs = parentPartitionIdDeOpaque.hashIdxs.join(".");
+		const childPartitions = [];
+		for (let i = 0; i < N; i++) {
+			const childHashIdxs = [...parentPartitionIdDeOpaque.hashIdxs, i];
+			const serializedIds = `${parentSerializedIdxs}.${i}`;
+			const partitionIdOpaque = __encodePartitionIdOpaque({ hashIdxs: childHashIdxs });
+			childPartitions.push({
+				doName: `${this.basePartitionContext.nsPrefix}.h.${serializedIds}`,
+				partitionIdOpaque,
+			});
+		}
+		return childPartitions;
+	}
 
 	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		const { ns, nsPrefix } = this.basePartitionContext;
-		// FIXME This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
-		const partitionId = hashKey;
-		const doId = env[ns].idFromName(`${nsPrefix}.${partitionId}`);
-		const partitionIdOpaque = btoa(
-			JSON.stringify({
-				partitionId,
-			}),
-		);
+		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey });
+		const { ns } = this.basePartitionContext;
+		// Use idFromName to ensure the DO itself will have the `.name` populated within itself.
+		const doId = env[ns].idFromName(doName);
 		// Merge with any partition-specific context if needed.
 		const partitionContext: PartitionContextResolved = {
 			...this.basePartitionContext,
@@ -147,10 +221,78 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			primaryDoIdStr: doId.toString(),
 			partitionId: partitionIdOpaque,
 		};
+
 		return {
 			doId,
 			partitionContext,
 		};
+	}
+
+	// Used by the Partition DOs to route requests to their children during the lazy split migration of data.
+	pickPartitionFromContext(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey, fromContext: partitionContext });
+		const { ns } = this.basePartitionContext;
+		const doId = env[ns].idFromName(doName);
+		const childPartitionContext: PartitionContextResolved = {
+			...partitionContext,
+			doName: doId.name!,
+			primaryDoIdStr: doId.toString(),
+			partitionId: partitionIdOpaque,
+		};
+		return {
+			doId,
+			partitionContext: childPartitionContext,
+		};
+	}
+
+	private findPartition({ hashKey, sortKey, fromContext }: { hashKey: string; sortKey?: string; fromContext?: PartitionContextResolved }): {
+		doName: string;
+		partitionIdOpaque: string;
+	} {
+		const { nsPrefix } = this.basePartitionContext;
+
+		// First find the hash partition!
+		let hIdxs: number[] = [];
+		if (fromContext) {
+			// FIXME: Optimize this away by passing the hash indexes directly in the partition context instead of the opaque ID,
+			// since we need to parse it anyway to route the request.
+			// The Partition DO uses the PartitionTopologySplitter which is initialized with the resolved partition context,
+			// so it can easily pass the hash indexes directly in the context without needing to encode them in an opaque ID and parse them back here.
+			const partitionIdDeOpaque = JSON.parse(atob(fromContext.partitionId)) as { hashIdxs: number[] };
+			hIdxs = partitionIdDeOpaque.hashIdxs;
+		} else {
+			// Root tree index first.
+			hIdxs.push(this.hash(hashKey, this.#topology.length));
+		}
+		let hNode = this.#topology[hIdxs.at(-1)!];
+		{
+			// 1 for the root, then one for each level of the tree until we reach a leaf.
+			// The level is used as additional entropy to ensure better distribution of the partitions across the children.
+			let level = hIdxs.length;
+			while (hNode.children.length > 0) {
+				level++;
+				const hChild = this.hash(hashKey + level, hNode.children.length);
+				hIdxs.push(hChild);
+				hNode = hNode.children[hChild];
+			}
+		}
+
+		// TODO: Find the range partition if it exists.
+
+		const serializedIds = hIdxs.join(".");
+		const partitionIdOpaque = __encodePartitionIdOpaque({ hashIdxs: hIdxs });
+		return {
+			doName: `${nsPrefix}.h.${serializedIds}`,
+			partitionIdOpaque,
+		};
+	}
+
+	private hash(hashKey: string, N: number): number {
+		return xxHash32(hashKey, GOLDEN_RATIO) % N;
 	}
 }
 
@@ -288,21 +430,20 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		const splitType = splitStatus.splitType;
 		switch (splitType) {
 			case "hash":
-				// Perform a hash split by calculating the new IDs for the children hash partitions.
-				const anyHashKey = this.#storage.sql.exec<{ hk: string }>("SELECT hk FROM items LIMIT 1").one().hk;
+				const childIds = this.#topologyRouter.calculateChildPartitionIds(
+					this.partitionContext.partitionId,
+					this.partitionContext.hashSplitConditions.splitN,
+				);
 
-				// FIXME: Do the right thing, for now just append the new child partition index to the parent ID.
-				const parentName = this.#topologyRouter.pickPartition(anyHashKey).doId.name!;
 				for (let i = 0; i < this.partitionContext.hashSplitConditions.splitN; i++) {
-					const childPartitionId = `${parentName}.${i}`;
-					const childDoId = env[this.partitionContext.ns].idFromName(childPartitionId);
+					const childDoId = env[this.partitionContext.ns].idFromName(childIds[i].doName);
 					childPartitionContexts.push({
 						parentPartitionContext: this.partitionContext,
 						newPartitionContext: {
 							...this.partitionContext,
 							doName: childDoId.name!,
 							primaryDoIdStr: childDoId.toString(),
-							partitionId: btoa(JSON.stringify({ partitionId: childPartitionId })),
+							partitionId: btoa(JSON.stringify({ partitionId: childIds[i].partitionIdOpaque })),
 						},
 						splitType: "hash",
 					});
