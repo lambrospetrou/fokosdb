@@ -9,7 +9,7 @@
 	"compatibility_date": "2026-05-03",
 	"migrations": [
 		{
-			"new_sqlite_classes": ["MyDurableObject", "PartitionDO"],
+			"new_sqlite_classes": ["MyDurableObject", "PartitionDO", "TopologyKeeperDO"],
 			"tag": "v1",
 		},
 	],
@@ -22,6 +22,10 @@
 			{
 				"class_name": "PartitionDO",
 				"name": "PARTITION_DO",
+			},
+			{
+				"class_name": "TopologyKeeperDO",
+				"name": "TOPOLOGY_KEEPER_DO",
 			},
 		],
 	},

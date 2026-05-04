@@ -2,8 +2,12 @@ import { env } from "cloudflare:workers";
 import { listDurableObjectIds, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { __encodePartitionIdOpaque, PartitionContextCreator, PartitionTopologyRouterImpl } from "./partition-topology.js";
-import type { PartitionContextResolved } from "./partition-topology.js";
+import {
+	__encodePartitionIdOpaque,
+	PartitionContextCreator,
+	PartitionTopologyRouterImpl,
+} from "./partition-topology/partition-topology.js";
+import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
 
 describe("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {

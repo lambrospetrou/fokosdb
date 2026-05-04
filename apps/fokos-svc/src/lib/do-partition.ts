@@ -7,8 +7,8 @@ import {
 	PartitionTopologyImpl,
 	PartitionTopologySplitter,
 	SplitStatusKVItem,
-	SplitType,
-} from "./partition-topology.js";
+} from "./partition-topology/partition-topology.js";
+import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 
 export interface PartitionAPI {

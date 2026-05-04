@@ -1,6 +1,6 @@
 import { GetItemOptions, PutItemOptions } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
-import { PartitionTopologyRouter } from "./partition-topology.js";
+import { PartitionTopologyRouter } from "./partition-topology/partition-topology.js";
 
 export type FokosDBOptions = {
 	ns: DurableObjectNamespace<PartitionDO>;

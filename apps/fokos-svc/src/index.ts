@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 export { PartitionDO } from "./lib/do-partition.js";
+export { TopologyKeeperDO } from "./lib/partition-topology/do-topology-keeper.js";
 
 /** A Durable Object's behavior is defined in an exported Javascript class */
 export class MyDurableObject extends DurableObject<Env> {

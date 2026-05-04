@@ -1,7 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology.js";
+import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
 
 it("routes to the correct partition DO", async ({ expect }) => {
 	const response = await exports.default.fetch("https://example.com/sql");

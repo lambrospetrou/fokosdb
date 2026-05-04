@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { tryWhile } from "durable-utils/retries";
 import { xxHash32 } from "js-xxhash";
-import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
+import { InitFromSplitOptions, PartitionDO } from "../do-partition.js";
+import type { PartitionNodeId, PartitionTopologyEncoded, SplitType, TopologyNode } from "./types.js";
 
 type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
@@ -41,11 +42,8 @@ export type PartitionContextResolved = PartitionContext & {
 	partitionId: PartitionNodeId;
 };
 
-// This can be used to identify the node in the topology and can be useful for routing and debugging.
-// This should be internal to the topology logic and opaque to outsiders.
-// External code should just pass it around.
-// Base64-encoded JSON string with the necessary information to identify the partition, such as the partition ID and any other relevant metadata.
-export type PartitionNodeId = string;
+// PartitionNodeId is re-exported from ./types.js above.
+// It is a base64-encoded JSON string with the necessary information to identify the partition (e.g. the hash index path).
 
 export type SplitConditions = {
 	/**
@@ -149,12 +147,7 @@ export interface PartitionTopologyRouter {
 	}[];
 }
 
-export type PartitionTopologyEncoded = string;
-
-type TopologyNode = {
-	partitionContext: Pick<PartitionContextResolved, "doName">;
-	children: TopologyNode[];
-};
+// PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
 
 // Golden Ratio constant used for better hash scattering
 // See https://softwareengineering.stackexchange.com/a/402543
@@ -179,14 +172,18 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		private readonly basePartitionContext: PartitionContext,
 	) {
 		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
-		this.#topology = Array(basePartitionContext.rootTreesN)
-			.fill(undefined)
-			.map((_, i) => ({
+		this.#topology = Array.from({ length: basePartitionContext.rootTreesN }, (_, i) => {
+			const doName = `${basePartitionContext.nsPrefix}.r.${i}`;
+			const doId = env[basePartitionContext.ns].idFromName(doName);
+			return {
+				partitionId: __encodePartitionIdOpaque({ hashIdxs: [i] }),
 				partitionContext: {
-					doName: `${basePartitionContext.nsPrefix}.r.${i}`,
+					doName: doId.name!,
+					primaryDoIdStr: doId.toString(),
 				},
 				children: [],
-			}));
+			};
+		});
 	}
 
 	calculateChildPartitionIds(
@@ -297,9 +294,6 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		return xxHash32(hashKey, GOLDEN_RATIO) % N;
 	}
 }
-
-export type SplitType = "hash" | "range";
-export type SplitStatus = "split_queued" | "split_partitions_initialized" | "split_started" | "split_completed";
 
 export type SplitStatusKVItem =
 	| {
