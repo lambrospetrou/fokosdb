@@ -109,10 +109,10 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		expect(result.__debug?.splitStatus).toBeDefined();
-		expect(result.__debug?.splitStatus?.status).toBe("split_pending");
+		expect(result.__debug?.splitStatus?.status).toBe("split_queued");
 	});
 
-	it("preserves split_pending status across subsequent writes", async ({ expect }) => {
+	it("preserves split_queued status across subsequent writes", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
 		const hashKey = `hk.${stub.id.name!}`;
 
@@ -123,7 +123,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		const followUp = await stub.putItem(ctx, { hashKey, sortKey: "sk2", data: "small" });
-		expect(followUp.__debug?.splitStatus?.status).toBe("split_pending");
+		expect(followUp.__debug?.splitStatus?.status).toBe("split_queued");
 	});
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
@@ -139,7 +139,7 @@ describe("PartitionDO - splitting", () => {
 		await waitForAlarm(stub);
 
 		const parentState = await stub.__internalState();
-		expect(parentState.splitStatus?.status).toBe("split_in_progress");
+		expect(parentState.splitStatus?.status).toBe("split_partitions_initialized");
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: ctx.nsPrefix });
 
 		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
@@ -247,7 +247,7 @@ describe("PartitionDO - splitting", () => {
 
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
-		expect(splitStatus?.status).toBe("split_pending");
+		expect(splitStatus?.status).toBe("split_queued");
 		expect(splitStatus?.createdAt).toBeTypeOf("number");
 	});
 });

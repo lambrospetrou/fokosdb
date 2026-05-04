@@ -149,6 +149,8 @@ export interface PartitionTopologyRouter {
 	}[];
 }
 
+export type PartitionTopologyEncoded = string;
+
 type TopologyNode = {
 	partitionContext: Pick<PartitionContextResolved, "doName">;
 	children: TopologyNode[];
@@ -296,6 +298,25 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	}
 }
 
+export type SplitType = "hash" | "range";
+export type SplitStatus = "split_queued" | "split_partitions_initialized" | "split_started" | "split_completed";
+
+export type SplitStatusKVItem =
+	| {
+			status: "split_queued";
+			splitType: SplitType;
+			createdAt: number;
+			partitionContext: PartitionContextResolved;
+	  }
+	| {
+			status: "split_partitions_initialized" | "split_started" | "split_completed";
+			splitType: SplitType;
+			createdAt: number;
+			partitionContext: PartitionContextResolved;
+			childPartitionContexts: PartitionContextResolved[];
+			history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
+	  };
+
 export interface PartitionTopologySplitter {
 	splitStatus(): SplitStatusKVItem | undefined;
 
@@ -354,8 +375,8 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// We can track the split status in the DO's storage and check it here.
 
 		const splitStatus = this.#storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
-		if (splitStatus && splitStatus.status !== "split_pending") {
-			// Reject all requests unless the split is pending, hence not started yet.
+		if (splitStatus && splitStatus.status !== "split_queued" && splitStatus.status !== "split_partitions_initialized") {
+			// Reject all requests unless the split is queued or child partitions are initialized, hence not started yet.
 			// Once the split is started, we reject all requests to avoid data loss or returning wrong data.
 			//
 			// FIXME: Instead of rejecting here we should return some information to the caller to trigger a retry with an updated topology, so we can minimize downtime during splits.
@@ -400,7 +421,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		const nowStatus = this.splitStatus();
 		if (!nowStatus) {
 			this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
-				status: "split_pending",
+				status: "split_queued",
 				splitType,
 				createdAt: Date.now(),
 				partitionContext: this.partitionContext,
@@ -417,13 +438,13 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// 1. Calculate if it's a hash split, or a range split.
 		// 2. Calculate the new DO IDs/names for the new partitions and the initialize contexts.
 		// 3. Call the new DOs at `initFromSplit()` to initialize them with the right context and their parent partition that will use to get data during migration.
-		// Final. Mark the split status as `split_in_progress` to indicate that now there are new partitions handling requests,
+		// Final. Mark the split status as `split_started` to indicate that now there are new partitions handling requests,
 		// and the current partition is just a proxy that forwards requests to the new partitions until the split is completed and the data is migrated,
 		// then mark the status as `split_completed` and stop forwarding requests.
 
 		const splitStatus = this.splitStatus();
-		if (!splitStatus || splitStatus.status !== "split_pending") {
-			throw new Error("fokos/topology: Cannot start split process, split is not pending.");
+		if (!splitStatus || splitStatus.status !== "split_queued") {
+			throw new Error("fokos/topology: Cannot start split process, split is not queued.");
 		}
 
 		const childPartitionContexts: InitFromSplitOptions[] = [];
@@ -501,11 +522,11 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			throw error;
 		}
 
-		// Final. Mark the split status as `split_in_progress` to indicate that now there are new partitions handling requests,
+		// Final. Mark the split status as `split_partitions_initialized` to indicate that now there are new partitions handling requests,
 		// and the current partition is just a proxy that forwards requests to the new partitions until the split is completed and the data is migrated,
 		// then mark the status as `split_completed` and stop forwarding requests.
 		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
-			status: "split_in_progress",
+			status: "split_partitions_initialized",
 			splitType,
 			createdAt: Date.now(),
 			partitionContext: this.partitionContext,
@@ -526,23 +547,3 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		});
 	}
 }
-
-export type SplitType = "hash" | "range";
-export type SplitStatus = "split_pending" | "split_in_progress" | "split_completed";
-export type SplitStatusKVItem =
-	| {
-			status: "split_pending";
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-	  }
-	| {
-			status: "split_in_progress" | "split_completed";
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-			childPartitionContexts: PartitionContextResolved[];
-			history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
-	  };
-
-export type PartitionTopologyEncoded = string;
