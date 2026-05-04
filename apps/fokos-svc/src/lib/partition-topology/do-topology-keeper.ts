@@ -3,6 +3,8 @@ import { PartitionContext, __encodePartitionIdOpaque } from "./partition-topolog
 import type { RegisterSplitOptions, TopologyKVItem, TopologyNode } from "./types.js";
 
 /**
+ * ATTENTION:: THIS MIGHT BE MERGED INTO THE PartitionDO later to avoid having to declare two DOs.
+ *
  * TopologyKeeperDO is the authoritative store for the partition topology tree.
  * It is a single instance per logical database and tracks how partitions have been split over time.
  *

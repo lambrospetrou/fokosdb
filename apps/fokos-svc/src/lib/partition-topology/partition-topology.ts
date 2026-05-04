@@ -24,8 +24,6 @@ export type PartitionContext = {
 	hashSplitConditions: SplitConditions;
 	rangeSplitConditions?: SplitConditions;
 
-	partitionId?: PartitionNodeId;
-
 	/**
 	 * This is used to detect changes in the topology configuration and trigger any necessary actions in the DOs,
 	 * such as rebalancing or splitting.
