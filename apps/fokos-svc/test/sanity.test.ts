@@ -47,6 +47,7 @@ describe("fokosdb", async () => {
 				rowsRead: 1,
 				rowsWritten: 0,
 				databaseSize: expect.any(Number),
+				served_by_instance: expect.any(String),
 			},
 		});
 	});

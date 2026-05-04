@@ -15,7 +15,7 @@ export type PutItemOptions = {
 };
 
 export type PutItemResult = {
-	meta: OperationMetrics & {};
+	meta: OperationMetrics & PartitionInfo & {};
 	__debug?: DebugInfo;
 };
 
@@ -37,7 +37,7 @@ export type GetItemResult =
 			data: Uint8Array | string;
 			ttlEpochUTCSeconds?: number;
 
-			meta: OperationMetrics & {};
+			meta: OperationMetrics & PartitionInfo & {};
 
 			__debug?: DebugInfo;
 	  }
@@ -46,6 +46,10 @@ export type GetItemResult =
 
 			__debug?: DebugInfo;
 	  };
+
+export type PartitionInfo = {
+	served_by_instance: string;
+};
 
 export type OperationMetrics = {
 	rowsRead: number;
