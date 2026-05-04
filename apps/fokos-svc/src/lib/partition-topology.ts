@@ -12,6 +12,8 @@ type PartitionNamespaceKey = {
  * FIXME: Type this properly.
  */
 export type PartitionContext = {
+	schema: 1; // For future compatibility, in case we need to change the structure of the context.
+
 	ns: PartitionNamespaceKey;
 	nsPrefix: string;
 
@@ -19,13 +21,24 @@ export type PartitionContext = {
 	hashSplitConditions: SplitConditions;
 	rangeSplitConditions?: SplitConditions;
 
+	partitionId?: PartitionNodeId;
+
 	/**
 	 * This is used to detect changes in the topology configuration and trigger any necessary actions in the DOs,
 	 * such as rebalancing or splitting.
 	 * The actual value can be a hash of the configuration or a version number that increments on every change.
 	 */
-	version: string;
+	signature: string;
 };
+export type PartitionContextResolved = PartitionContext & {
+	partitionId?: PartitionNodeId;
+};
+
+// This can be used to identify the node in the topology and can be useful for routing and debugging.
+// This should be internal to the topology logic and opaque to outsiders.
+// External code should just pass it around.
+// Base64-encoded JSON string with the necessary information to identify the partition, such as the partition ID and any other relevant metadata.
+export type PartitionNodeId = string;
 
 export type SplitConditions = {
 	/**
@@ -82,21 +95,25 @@ export class PartitionContextCreator {
 			throw new Error("fokos: rangeSplitConditions.maxItems must be at least 1");
 		}
 
-		return {
+		const context: PartitionContext = {
+			schema: 1,
 			ns: opts.ns,
 			nsPrefix: opts.nsPrefix,
 			rootTreesN: opts.rootTreesN,
 			hashSplitConditions: opts.hashSplitConditions,
 			rangeSplitConditions: opts.rangeSplitConditions,
 
-			// FIXME Use a hash function.
-			version: JSON.stringify(opts),
+			// Filled properly below.
+			signature: "",
 		};
+		// FIXME: Use a proper hash function.
+		context.signature = btoa(JSON.stringify(context));
+		return context;
 	}
 }
 
 export interface PartitionTopologyRouter {
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContext };
+	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 }
 
 /**
@@ -108,15 +125,24 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		private readonly basePartitionContext: PartitionContext,
 	) {}
 
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContext } {
+	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const { ns, nsPrefix } = this.basePartitionContext;
 		// FIXME This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
-		const partitionId = hashKey; // TODO Replace with actual partitioning logic.
+		const partitionId = hashKey;
 		const doId = env[ns].idFromName(`${nsPrefix}.${partitionId}`);
+		const partitionIdOpaque = btoa(
+			JSON.stringify({
+				partitionId,
+			}),
+		);
+		// Merge with any partition-specific context if needed.
+		const partitionContext: PartitionContextResolved = {
+			...this.basePartitionContext,
+			partitionId: partitionIdOpaque,
+		};
 		return {
 			doId,
-			// TODO Merge with any partition-specific context if needed.
-			partitionContext: this.basePartitionContext,
+			partitionContext,
 		};
 	}
 }
@@ -161,22 +187,10 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 
 	constructor(
 		private readonly encoded: PartitionTopologyEncoded,
-		private readonly partitionContext: PartitionContext,
+		private readonly partitionContext: PartitionContextResolved,
 		private readonly ctx: DurableObjectState,
 	) {
 		this.#storage = ctx.storage;
-	}
-
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContext } {
-		const { ns, nsPrefix } = this.partitionContext;
-		// FIXME This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
-		const partitionId = hashKey; // TODO Replace with actual partitioning logic.
-		const doId = env[ns].idFromName(`${nsPrefix}.${partitionId}`);
-		return {
-			doId,
-			// TODO Merge with any partition-specific context if needed.
-			partitionContext: this.partitionContext,
-		};
 	}
 
 	shouldAllow(hashKey: string, sortKey?: string): boolean {

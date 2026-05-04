@@ -135,9 +135,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
 			// In a real implementation, we might want to allow some flexibility here (e.g. for certain fields)
 			// or have a more robust way to handle context updates.
-			if (this.#_partitionContext.version !== pCtx.version) {
+			if (this.#_partitionContext.signature !== pCtx.signature) {
 				throw new Error(
-					`Provided partition context does not match the stored context: ${this.#_partitionContext.version} vs ${pCtx.version}`,
+					`Provided partition context does not match the stored context: ${this.#_partitionContext.signature} vs ${pCtx.signature}`,
 				);
 			}
 			return this.#_partitionContext;
