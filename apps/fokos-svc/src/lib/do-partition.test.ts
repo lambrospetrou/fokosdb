@@ -154,15 +154,8 @@ describe("PartitionDO - splitting", () => {
 			sortKey: "sk",
 			data: "x".repeat(1 * 1024 * 1024 + 10),
 		});
+		await waitForAlarm(stub);
 
-		// The alarm is set to Date.now() in queueSplit(), so miniflare fires it automatically
-		// in the background after putItem returns. runDurableObjectAlarm drains any remaining
-		// scheduled alarm, but the auto-fired one may still be in progress.
-		// We do this hack to ensure that the alarm is complete before we check the state, without relying on arbitrary timers.
-		await runDurableObjectAlarm(stub);
-		await runInDurableObject(stub, async (instance: PartitionDO) => {
-			await vi.waitUntil(() => !instance.__testing__alarm_running, { timeout: 5000, interval: 100 });
-		});
 		const parentState = await stub.__internalState();
 		expect(parentState.splitStatus?.status).toBe("split_in_progress");
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: "test" });
@@ -278,3 +271,14 @@ describe("PartitionDO - splitting", () => {
 		expect(splitStatus?.createdAt).toBeTypeOf("number");
 	});
 });
+
+async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
+	// The alarm is set to Date.now() in queueSplit(), so miniflare fires it automatically
+	// in the background after putItem returns. runDurableObjectAlarm drains any remaining
+	// scheduled alarm, but the auto-fired one may still be in progress.
+	// We do this hack to ensure that the alarm is complete before we check the state, without relying on arbitrary timers.
+	await runDurableObjectAlarm(stub);
+	await runInDurableObject(stub, async (instance: PartitionDO) => {
+		await vi.waitUntil(() => !instance.__testing__alarm_running, { timeout: 5000, interval: 100 });
+	});
+}
