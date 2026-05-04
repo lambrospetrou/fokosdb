@@ -16,6 +16,33 @@ export interface PartitionAPI {
 	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResult>;
 }
 
+// Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
+// DurableObjectStub<PartitionDO> → PartitionDO → withSplitForwarding → DurableObjectStub<PartitionDO>.
+type PartitionDOStub = {
+	putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult>;
+	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult>;
+};
+
+type MigratedItem = {
+	hk: string;
+	sk: string | null;
+	data: string | Uint8Array;
+	ttl_epoch_utc_seconds: number | null;
+};
+
+type MigrationCursor = { hk: string; sk: string | null };
+
+type GetItemsBatchResult = {
+	items: MigratedItem[];
+	nextCursor: MigrationCursor | null;
+};
+
+// Structural type for child→parent RPC calls during migration.
+type ParentPartitionDOStub = {
+	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
+	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
+};
+
 export class PartitionRpcTarget extends RpcTarget {
 	constructor(
 		private readonly partitionDO: PartitionDO,
@@ -40,11 +67,15 @@ export type InitFromSplitOptions = {
 	splitType: SplitType;
 };
 
+type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
+
 export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly KV_KEYS = {
 		PARTITION_CONTEXT: "__partition_context",
 		PARENT_PARTITION_CONTEXT: "__parent_partition_context",
 		PARENT_SPLIT_TYPE: "__parent_split_type",
+		SPLIT_MIGRATION_STATUS: "__split_migration_status",
+		SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
 	};
 
 	#_migrations: SQLSchemaMigrations;
@@ -102,56 +133,121 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(newPartitionContext);
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
-
-		// TODO Set an alarm to start migrating data from the parent partition to the new partition even though we are doing lazy migration.
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 	}
 
 	async putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
 		this.ensurePartitionContext(ctx);
-
-		const { rowsRead, rowsWritten } = this.ctx.storage.sql.exec(
-			`INSERT OR REPLACE INTO items (hk, sk, data, ttl_epoch_utc_seconds) VALUES (?, ?, ?, ?)`,
-			opts.hashKey,
-			opts.sortKey ?? null,
-			opts.data,
-			opts.ttlEpochUTCSeconds ?? null,
-		);
-
-		const splitStatus = await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
-
-		return {
-			meta: {
-				rowsRead,
-				rowsWritten,
-				databaseSize: this.ctx.storage.sql.databaseSize,
-				served_by_instance: this.ctx.id.toString(),
+		await this.ensureMigration();
+		return await this.withSplitForwarding<PutItemResult>({
+			ctx,
+			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			operationName: "putItem",
+			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
+			local: async () => {
+				const { rowsRead, rowsWritten } = this.ctx.storage.sql.exec(
+					`INSERT OR REPLACE INTO items (hk, sk, data, ttl_epoch_utc_seconds) VALUES (?, ?, ?, ?)`,
+					opts.hashKey,
+					opts.sortKey ?? null,
+					opts.data,
+					opts.ttlEpochUTCSeconds ?? null,
+				);
+				const splitStatus = await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
+				return {
+					meta: {
+						rowsRead,
+						rowsWritten,
+						databaseSize: this.ctx.storage.sql.databaseSize,
+						served_by_instance: this.ctx.id.toString(),
+					},
+					__debug: { splitStatus },
+				};
 			},
-			__debug: { splitStatus },
-		};
+		});
 	}
 
 	async getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
 		this.ensurePartitionContext(ctx);
+		await this.ensureMigration();
+		return await this.withSplitForwarding<GetItemResult>({
+			ctx,
+			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			operationName: "getItem",
+			forward: async (stub, pCtx) => await stub.getItem(pCtx, opts),
+			local: async () => {
+				const res = this.ctx.storage.sql.exec<{
+					data: string | ArrayBuffer;
+					ttl_epoch_utc_seconds: number | null;
+				}>(`SELECT data, ttl_epoch_utc_seconds FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? null);
+				const rows = res.toArray();
+				const { rowsRead, rowsWritten } = res;
+				const result = rows[0];
+				if (!result) {
+					return { found: false };
+				}
+				return {
+					found: true,
+					hashKey: opts.hashKey,
+					sortKey: opts.sortKey,
+					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
+					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+					meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, served_by_instance: this.ctx.id.toString() },
+				};
+			},
+		});
+	}
 
-		const res = this.ctx.storage.sql.exec<{
-			data: string | ArrayBuffer;
-			ttl_epoch_utc_seconds: number | null;
-		}>(`SELECT data, ttl_epoch_utc_seconds FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? null);
-		const rows = res.toArray();
-		const { rowsRead, rowsWritten } = res;
-		const result = rows[0];
-		if (!result) {
-			return { found: false };
+	async getItemsBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: MigrationCursor | null;
+	}): Promise<GetItemsBatchResult> {
+		const splitStatus = this.ensureTopology(this.pCtx()).splitStatus();
+		if (splitStatus?.status !== "split_started") {
+			throw new Error(`fokos/partition: getItemsBatch: not in split_started status.`);
 		}
-		return {
-			found: true,
-			hashKey: opts.hashKey,
-			sortKey: opts.sortKey,
-			data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
-			ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
+		if (!isKnownChild) {
+			throw new Error(`fokos/partition: getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}".`);
+		}
 
-			meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, served_by_instance: this.ctx.id.toString() },
-		};
+		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
+		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
+		const PAGE_SIZE = 1000;
+		const items: MigratedItem[] = [];
+		let totalBytes = 0;
+		let tableCursor = opts.cursor;
+		let reachedLimit = false;
+		const pCtx = this.pCtx();
+		const topology = this.ensureTopology(pCtx);
+
+		outer: while (true) {
+			const page = this.queryPage(tableCursor, PAGE_SIZE);
+			if (page.length === 0) break;
+
+			for (const row of page) {
+				// Filter: only send items that belong to the requesting child partition.
+				const { partitionContext: targetCtx } = topology.pickPartitionFromContext(pCtx, row.hk, row.sk ?? undefined);
+				if (targetCtx.doName === opts.childPartitionContext.doName) {
+					const rowBytes = estimateItemBytes(row);
+					if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
+						reachedLimit = true;
+						break outer;
+					}
+					items.push(row);
+					totalBytes += rowBytes;
+				}
+				// Always advance the table cursor regardless of whether the row matched.
+				tableCursor = { hk: row.hk, sk: row.sk };
+			}
+
+			if (page.length < PAGE_SIZE) break;
+		}
+
+		return { items, nextCursor: reachedLimit ? tableCursor : null };
+	}
+
+	async acknowledgeChildMigrationComplete(childDoName: string): Promise<void> {
+		this.ensureTopology(this.pCtx()).acknowledgeChildMigration(childDoName);
 	}
 
 	async status() {
@@ -162,39 +258,60 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async __internalState() {
+		const partitionContext = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
 		return {
-			partitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
+			partitionContext,
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
-			splitStatus: this.ensureTopology(this.pCtx()).splitStatus(),
+			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
+			splitStatus: partitionContext ? this.ensureTopology(partitionContext).splitStatus() : undefined,
 		};
 	}
 
 	async alarm(alarmInfo: AlarmInvocationInfo): Promise<void> {
 		const topologyRouter = this.ensureTopology(this.pCtx());
 		const splitStatus = topologyRouter.splitStatus();
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 		console.log({
 			...this.logParams(),
-			message: "fokos/partition: Alarm triggered for partition split process.",
+			message: "fokos/partition: Alarm triggered.",
 			alarmInfo,
+			migrationStatus,
 			splitStatus,
 		});
 
-		// We catch the exception to control when it gets retried. We will retry on the next request.
 		try {
 			this.__testing__alarm_running = true;
+
+			if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
+				if (migrationStatus === "migration_initialized") {
+					this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
+				}
+				await tryWhile(
+					async () => {
+						await this.runMigration();
+					},
+					(_error, nextAttempt) => nextAttempt <= 5,
+				);
+				return;
+			}
+
+			// FIXME Add a special flag in KV for this too, to allow future alarm uses too.
+			console.log({
+				...this.logParams(),
+				message: "fokos/partition: Running split process.",
+				splitStatus,
+			});
 			await tryWhile(
 				async () => {
 					await topologyRouter.startSplit();
 				},
-				(_error, nextAttempt) => {
-					return nextAttempt <= 5; // Retry up to 5 times
-				},
+				(_error, nextAttempt) => nextAttempt <= 5,
 			);
 		} catch (error) {
 			console.error({
 				...this.logParams(),
-				message: "fokos/partition: Split process failed, will retry on the next request.",
+				message: "fokos/partition: Alarm process failed, will retry on the next request.",
 				error: String(error),
 				errorProps: error,
 			});
@@ -249,6 +366,132 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_topology;
 	}
 
+	private async ensureMigration(): Promise<void> {
+		// TODO Optimize this away by keeping it in memory.
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+		if (!migrationStatus || migrationStatus === "migration_completed") {
+			return;
+		}
+		if (migrationStatus === "migration_initialized") {
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
+		}
+		// Ensure the background alarm is running in case it crashed or hasn't fired yet.
+		if (!(await this.ctx.storage.getAlarm())) {
+			await this.ctx.storage.setAlarm(Date.now());
+		}
+		// TODO This will reach user requests, so refactor the callers to show something nicer.
+		// We can also consider doing a selective migration of the requested keys only.
+		throw new Error("fokos/partition: Partition split in progress, please retry later.");
+	}
+
+	private async withSplitForwarding<T>(opts: {
+		ctx: PartitionContextResolved;
+		keys: { hashKey: string; sortKey?: string };
+		operationName: string;
+		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>;
+		local: () => Promise<T>;
+	}): Promise<T> {
+		const {
+			ctx,
+			keys: { hashKey, sortKey },
+			operationName,
+			forward,
+			local,
+		} = opts;
+		const topology = this.ensureTopology(ctx);
+		switch (topology.shouldAllow(hashKey, sortKey)) {
+			case "ok":
+				return await local();
+			case "forward": {
+				const { doId, partitionContext } = topology.pickPartitionFromContext(ctx, hashKey, sortKey);
+				const stub = this.env[this.pCtx().ns].get(doId);
+				return await forward(stub, partitionContext);
+			}
+			case "reject":
+				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
+		}
+	}
+
+	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
+		type Row = { hk: string; sk: string | null; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null };
+
+		let sqlCursor: SqlStorageCursor<Row>;
+		if (!cursor) {
+			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items ORDER BY hk, sk LIMIT ?`, limit);
+		} else if (cursor.sk === null) {
+			sqlCursor = this.ctx.storage.sql.exec<Row>(
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items WHERE hk > ? OR (hk = ? AND sk IS NOT NULL) ORDER BY hk, sk LIMIT ?`,
+				cursor.hk,
+				cursor.hk,
+				limit,
+			);
+		} else {
+			sqlCursor = this.ctx.storage.sql.exec<Row>(
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
+				cursor.hk,
+				cursor.hk,
+				cursor.sk,
+				limit,
+			);
+		}
+
+		const items: MigratedItem[] = [];
+		for (const row of sqlCursor) {
+			items.push({
+				hk: row.hk,
+				sk: row.sk,
+				data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
+				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
+			});
+		}
+		return items;
+	}
+
+	private async runMigration(): Promise<void> {
+		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+		if (!parentCtx) {
+			throw new Error("fokos/partition: runMigration called but no parent partition context stored.");
+		}
+
+		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
+		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
+
+		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+
+		const pCtx = this.pCtx();
+		while (true) {
+			const { items, nextCursor } = await parentStub.getItemsBatch({ childPartitionContext: pCtx, cursor });
+
+			if (items.length > 0) {
+				for (const item of items) {
+					// INSERT OR IGNORE rather than OR REPLACE: all writes to this partition are rejected
+					// with 503 while migration_migrating, so no user write can have arrived yet.
+					// IGNORE is safer for retries — if a batch was already written before a crash we
+					// skip re-inserting those items rather than overwriting them unnecessarily.
+					this.ctx.storage.sql.exec(
+						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds) VALUES (?, ?, ?, ?)`,
+						item.hk,
+						item.sk ?? null,
+						item.data,
+						item.ttl_epoch_utc_seconds ?? null,
+					);
+				}
+			}
+
+			// Checkpoint cursor after each batch so we can resume if interrupted.
+			cursor = nextCursor;
+			this.ctx.storage.kv.put<MigrationCursor | null>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
+
+			if (!nextCursor) break;
+		}
+
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
+		await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
+
+		console.log({ ...this.logParams(), message: "fokos/partition: Data migration from parent completed." });
+	}
+
 	private logParams() {
 		return {
 			actorId: this.ctx.id.toString(),
@@ -256,6 +499,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			partitionContext: this.pCtx(),
 		};
 	}
+}
+
+function estimateItemBytes(item: MigratedItem): number {
+	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
+	return item.hk.length * 2 + (item.sk?.length ?? 0) * 2 + dataSize + 64;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [

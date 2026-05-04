@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { tryWhile } from "durable-utils/retries";
 import { xxHash32 } from "js-xxhash";
 import { InitFromSplitOptions, PartitionDO } from "../do-partition.js";
-import type { PartitionNodeId, PartitionTopologyEncoded, SplitType, TopologyNode } from "./types.js";
+import type { PartitionNodeId, PartitionTopologyEncoded, SplitStatus, SplitType, TopologyNode } from "./types.js";
 
 type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
@@ -254,13 +254,15 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 		// First find the hash partition!
 		let hIdxs: number[] = [];
+		let fromContextDepth = -1;
 		if (fromContext) {
 			// FIXME: Optimize this away by passing the hash indexes directly in the partition context instead of the opaque ID,
 			// since we need to parse it anyway to route the request.
 			// The Partition DO uses the PartitionTopologySplitter which is initialized with the resolved partition context,
 			// so it can easily pass the hash indexes directly in the context without needing to encode them in an opaque ID and parse them back here.
-			const partitionIdDeOpaque = JSON.parse(atob(fromContext.partitionId)) as { hashIdxs: number[] };
+			const partitionIdDeOpaque = __decodePartitionIdOpaque(fromContext.partitionId);
 			hIdxs = partitionIdDeOpaque.hashIdxs;
+			fromContextDepth = hIdxs.length;
 		} else {
 			// Root tree index first.
 			hIdxs.push(this.hash(hashKey, this.#topology.length));
@@ -270,11 +272,23 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			// 1 for the root, then one for each level of the tree until we reach a leaf.
 			// The level is used as additional entropy to ensure better distribution of the partitions across the children.
 			let level = hIdxs.length;
-			while (hNode.children.length > 0) {
-				level++;
-				const hChild = this.hash(hashKey + level, hNode.children.length);
-				hIdxs.push(hChild);
-				hNode = hNode.children[hChild];
+			while (true) {
+				if (hNode.children.length > 0) {
+					level++;
+					const hChild = this.hash(hashKey + level, hNode.children.length);
+					hIdxs.push(hChild);
+					hNode = hNode.children[hChild];
+				} else if (fromContext && hIdxs.length === fromContextDepth) {
+					// The in-memory topology has no children for this node, but the caller is routing
+					// FROM this exact partition context — meaning it has split and we need to find the
+					// right child. Compute the virtual child bucket using the context's split conditions.
+					level++;
+					const hChild = this.hash(hashKey + level, fromContext.hashSplitConditions.splitN);
+					hIdxs.push(hChild);
+					break;
+				} else {
+					break;
+				}
 			}
 		}
 
@@ -295,17 +309,18 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 export type SplitStatusKVItem =
 	| {
-			status: "split_queued";
+			status: Extract<SplitStatus, "split_queued">;
 			splitType: SplitType;
 			createdAt: number;
 			partitionContext: PartitionContextResolved;
 	  }
 	| {
-			status: "split_partitions_initialized" | "split_started" | "split_completed";
+			status: Extract<SplitStatus, "split_started" | "split_completed">;
 			splitType: SplitType;
 			createdAt: number;
 			partitionContext: PartitionContextResolved;
 			childPartitionContexts: PartitionContextResolved[];
+			migratedChildDoNames: string[];
 			history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
 	  };
 
@@ -318,7 +333,7 @@ export interface PartitionTopologySplitter {
 	 *
 	 * This should be extremely fast since it's called in every request!
 	 */
-	shouldAllow(hashKey: string, sortKey?: string): boolean;
+	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok";
 
 	/**
 	 * Determines whether a partition should be split based on the provided context, storage, and keys.
@@ -339,6 +354,22 @@ export interface PartitionTopologySplitter {
 	 * which will set a new alarm to trigger this method again.
 	 */
 	startSplit(): Promise<void>;
+
+	/**
+	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
+	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
+	 */
+	pickPartitionFromContext(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+
+	/**
+	 * Called by a child partition after it has fully migrated its share of data from the parent.
+	 * Idempotent. Transitions the parent to split_completed once all children have acknowledged.
+	 */
+	acknowledgeChildMigration(childDoName: string): void;
 }
 
 /**
@@ -362,17 +393,14 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		this.#topologyRouter = new PartitionTopologyRouterImpl(encoded, partitionContext);
 	}
 
-	shouldAllow(hashKey: string, sortKey?: string): boolean {
+	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
 		// TODO If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// We can track the split status in the DO's storage and check it here.
 
+		// TODO - Keep this in memory to avoid reading it all the time from storage.
 		const splitStatus = this.#storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
-		if (splitStatus && splitStatus.status !== "split_queued" && splitStatus.status !== "split_partitions_initialized") {
-			// Reject all requests unless the split is queued or child partitions are initialized, hence not started yet.
-			// Once the split is started, we reject all requests to avoid data loss or returning wrong data.
-			//
-			// FIXME: Instead of rejecting here we should return some information to the caller to trigger a retry with an updated topology, so we can minimize downtime during splits.
-			return false;
+		if (splitStatus && splitStatus.status !== "split_queued") {
+			return "forward";
 		}
 
 		const dbSize = this.#storage.sql.databaseSize;
@@ -382,9 +410,11 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			this.partitionContext.hashSplitConditions.maxSizeMb &&
 			dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
-			return false;
+			return "reject";
 		}
-		return true;
+
+		// All good!
+		return "ok";
 	}
 
 	splitStatus(): SplitStatusKVItem | undefined {
@@ -456,7 +486,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 							...this.partitionContext,
 							doName: childDoId.name!,
 							primaryDoIdStr: childDoId.toString(),
-							partitionId: btoa(JSON.stringify({ partitionId: childIds[i].partitionIdOpaque })),
+							partitionId: childIds[i].partitionIdOpaque,
 						},
 						splitType: "hash",
 					});
@@ -514,15 +544,16 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			throw error;
 		}
 
-		// Final. Mark the split status as `split_partitions_initialized` to indicate that now there are new partitions handling requests,
+		// Final. Mark the split status as `split_started` to indicate that now there are new partitions handling requests,
 		// and the current partition is just a proxy that forwards requests to the new partitions until the split is completed and the data is migrated,
 		// then mark the status as `split_completed` and stop forwarding requests.
 		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
-			status: "split_partitions_initialized",
+			status: "split_started",
 			splitType,
 			createdAt: Date.now(),
 			partitionContext: this.partitionContext,
 			childPartitionContexts: childPartitionContexts.map((child) => child.newPartitionContext),
+			migratedChildDoNames: [],
 			history: [
 				{
 					status: splitStatus.status,
@@ -533,9 +564,65 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			],
 		});
 
+		// TODO Notify the TopologyKeeperDO that the split has started.
+		// We don't want this to be in the hot path of the split to allow as many partitions as necessary to do their splits.
+		// The TopologyKeeperDO can be updated asynchronously since the partitions know their topology (if they have children)
+		// and can route requests to them.
+		// try {} catch (error) {}
+
 		console.log({
 			message: "fokos/partition: Split process completed successfully.",
 			childPartitionContexts,
 		});
+	}
+
+	acknowledgeChildMigration(childDoName: string): void {
+		const splitStatus = this.splitStatus();
+		if (!splitStatus) {
+			throw new Error(`fokos/topology: acknowledgeChildMigration called when not splitting.`);
+		}
+		// Already fully completed — idempotent no-op.
+		if (splitStatus.status === "split_completed") return;
+		if (splitStatus.status !== "split_started") {
+			throw new Error(`fokos/topology: acknowledgeChildMigration called in unexpected status: ${splitStatus.status}.`);
+		}
+		if (splitStatus.migratedChildDoNames.includes(childDoName)) return;
+
+		const migratedChildDoNames = [...splitStatus.migratedChildDoNames, childDoName];
+		const allMigrated = splitStatus.childPartitionContexts.every((c) => migratedChildDoNames.includes(c.doName));
+
+		const newStatus: SplitStatusKVItem = allMigrated
+			? {
+					status: "split_completed",
+					splitType: splitStatus.splitType,
+					createdAt: Date.now(),
+					partitionContext: splitStatus.partitionContext,
+					childPartitionContexts: splitStatus.childPartitionContexts,
+					migratedChildDoNames,
+					history: [
+						...splitStatus.history,
+						{
+							status: splitStatus.status,
+							splitType: splitStatus.splitType,
+							createdAt: splitStatus.createdAt,
+							partitionContext: splitStatus.partitionContext,
+						},
+					],
+				}
+			: { ...splitStatus, migratedChildDoNames };
+
+		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
+	}
+
+	/**
+	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
+	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
+	 */
+	pickPartitionFromContext(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+		return this.#topologyRouter.pickPartitionFromContext(partitionContext, hashKey, sortKey);
 	}
 }

@@ -7,7 +7,9 @@ import {
 	PartitionContextCreator,
 	PartitionTopologyRouterImpl,
 } from "./partition-topology/partition-topology.js";
-import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
+import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
+
+type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
 describe("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
@@ -143,7 +145,7 @@ describe("PartitionDO - splitting", () => {
 		await waitForAlarm(stub);
 
 		const parentState = await stub.__internalState();
-		expect(parentState.splitStatus?.status).toBe("split_partitions_initialized");
+		expect(parentState.splitStatus?.status).toBe("split_started");
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: ctx.nsPrefix });
 
 		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
@@ -253,6 +255,93 @@ describe("PartitionDO - splitting", () => {
 		expect(splitStatus).toBeDefined();
 		expect(splitStatus?.status).toBe("split_queued");
 		expect(splitStatus?.createdAt).toBeTypeOf("number");
+	});
+
+	describe("forwarding during splits", async () => {
+		it("forwards requests to children after split starts", async ({ expect }) => {
+			// TODO
+		});
+	});
+
+	describe("migration", () => {
+		it("rejects requests to child while migrating, migrates all data to the correct child, and completes", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+			// Seed items with varied hash keys so they spread across children.
+			const seedItems = [
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1" },
+				{ hashKey: "alpha", sortKey: "s2", data: "data-alpha-2" },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
+				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1" },
+				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1" },
+				{ hashKey: "echo", sortKey: "s1", data: "data-echo-1" },
+			];
+			for (const item of seedItems) {
+				await stub.putItem(ctx, item);
+			}
+
+			// Trigger the split condition.
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await waitForAlarm(stub);
+
+			const parentState = await stub.__internalState();
+			expect(parentState.splitStatus?.status).toBe("split_started");
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			expect(childContexts).toHaveLength(2);
+
+			// Each child is initialized but migration has not started yet.
+			for (const childCtx of childContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				const state = await childStub.__internalState();
+				expect(state.migrationStatus).toBe("migration_initialized");
+			}
+
+			// Requests to children are rejected while migration is in progress.
+			// The first request also transitions the child to migration_migrating and schedules the alarm.
+			for (const childCtx of childContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				await expect(
+					runInDurableObject(childStub, async (instance: PartitionDO) => {
+						return instance.getItem(childCtx, { hashKey: "any", sortKey: "any" });
+					}),
+				).rejects.toThrow("split in progress");
+			}
+
+			// Run each child's migration alarm.
+			// Note: miniflare fires alarms set to Date.now() automatically in the background, so
+			// the alarm may already be running or complete by the time we reach here. waitForAlarm handles both.
+			for (const childCtx of childContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				await waitForAlarm(childStub);
+				const state = await childStub.__internalState();
+				expect(state.migrationStatus).toBe("migration_completed");
+			}
+
+			// Parent acknowledges all children and transitions to split_completed.
+			const finalParent = await stub.__internalState();
+			expect(finalParent.splitStatus?.status).toBe("split_completed");
+			const finalSplit = finalParent.splitStatus as SplitStartedOrCompleted;
+			expect(finalSplit.migratedChildDoNames).toHaveLength(2);
+
+			// Every seed item is found in exactly one child with the correct data.
+			const foundIds = new Set<string>();
+			for (const item of seedItems) {
+				let foundInDoName: string | undefined;
+				for (const childCtx of childContexts) {
+					const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+					const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
+					if (result.found) {
+						expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" found in multiple children`).toBeUndefined();
+						expect(result).toMatchObject({ data: item.data });
+						foundInDoName = childCtx.doName;
+						foundIds.add(foundInDoName);
+					}
+				}
+				expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" not found in any child`).toBeDefined();
+			}
+			// This might be flaky - but ideally we should have items across more than 1 children.
+			expect(foundIds.size).toBeGreaterThan(1);
+		});
 	});
 });
 

@@ -6,7 +6,7 @@
 export type PartitionNodeId = string;
 
 export type SplitType = "hash" | "range";
-export type SplitStatus = "split_queued" | "split_partitions_initialized" | "split_started" | "split_completed";
+export type SplitStatus = "split_queued" | "split_started" | "split_completed";
 
 export type PartitionTopologyEncoded = string;
 
