@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { listDurableObjectIds, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
 import {
@@ -265,7 +265,7 @@ describe("PartitionDO - splitting", () => {
 
 	describe("migration", () => {
 		it("rejects requests to child while migrating, migrates all data to the correct child, and completes", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 10, maxSizeMb: 1 } });
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
@@ -287,7 +287,7 @@ describe("PartitionDO - splitting", () => {
 			const parentState = await stub.__internalState();
 			expect(parentState.splitStatus?.status).toBe("split_started");
 			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
-			expect(childContexts).toHaveLength(2);
+			expect(childContexts).toHaveLength(10);
 
 			// Each child is initialized but migration has not started yet.
 			for (const childCtx of childContexts) {
@@ -321,7 +321,7 @@ describe("PartitionDO - splitting", () => {
 			const finalParent = await stub.__internalState();
 			expect(finalParent.splitStatus?.status).toBe("split_completed");
 			const finalSplit = finalParent.splitStatus as SplitStartedOrCompleted;
-			expect(finalSplit.migratedChildDoNames).toHaveLength(2);
+			expect(finalSplit.migratedChildDoNames).toHaveLength(10);
 
 			// Every seed item is found in exactly one child with the correct data.
 			const foundIds = new Set<string>();

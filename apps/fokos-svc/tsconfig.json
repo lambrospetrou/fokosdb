@@ -39,11 +39,11 @@
 		"types": [
 			"./worker-configuration.d.ts",
 			"node",
-			"@cloudflare/vitest-pool-workers" // provides `cloudflare:test` and `cloudflare:workers` types
+			"@cloudflare/vitest-pool-workers/types" // provides `cloudflare:test` and `cloudflare:workers` types
 		]
 	},
 	"include": [
 		"./**/*.ts",
-		"../src/worker-configuration.d.ts" // output of `wrangler types`
+		"./worker-configuration.d.ts" // output of `wrangler types`
 	]
 }
