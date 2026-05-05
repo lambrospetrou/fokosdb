@@ -28,6 +28,7 @@ type MigratedItem = {
 	sk: string | null;
 	data: string | Uint8Array;
 	ttl_epoch_utc_seconds: number | null;
+	v: number;
 };
 
 type MigrationCursor = { hk: string; sk: string | null };
@@ -145,15 +146,31 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			operationName: "putItem",
 			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
 			local: async () => {
-				const { rowsRead, rowsWritten } = this.ctx.storage.sql.exec(
-					`INSERT OR REPLACE INTO items (hk, sk, data, ttl_epoch_utc_seconds) VALUES (?, ?, ?, ?)`,
+				const res = this.ctx.storage.sql.exec<{ v: number }>(
+					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v)
+					 VALUES (?, ?, ?, ?, 1)
+					 ON CONFLICT(hk, sk) DO UPDATE SET
+					   data = excluded.data,
+					   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+					   v = v + 1
+					 RETURNING v`,
 					opts.hashKey,
 					opts.sortKey ?? null,
 					opts.data,
 					opts.ttlEpochUTCSeconds ?? null,
 				);
+				const { rowsRead, rowsWritten } = res;
+				const rows = res.toArray();
+				if (rows.length !== 1) {
+					throw new Error(`fokos/partition: putItem: RETURNING expected 1 row, got ${rows.length}`);
+				}
+				const version = rows[0].v;
+				if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+					throw new Error(`fokos/partition: putItem: unexpected version value: ${version}`);
+				}
 				const splitStatus = await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
 				return {
+					version,
 					meta: {
 						rowsRead,
 						rowsWritten,
@@ -178,7 +195,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const res = this.ctx.storage.sql.exec<{
 					data: string | ArrayBuffer;
 					ttl_epoch_utc_seconds: number | null;
-				}>(`SELECT data, ttl_epoch_utc_seconds FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? null);
+					v: number;
+				}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? null);
 				const rows = res.toArray();
 				const { rowsRead, rowsWritten } = res;
 				const result = rows[0];
@@ -191,6 +209,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					sortKey: opts.sortKey,
 					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
 					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+					version: result.v,
 					meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, served_by_instance: this.ctx.id.toString() },
 				};
 			},
@@ -413,21 +432,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
-		type Row = { hk: string; sk: string | null; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null };
+		type Row = { hk: string; sk: string | null; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null; v: number };
 
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items ORDER BY hk, sk LIMIT ?`, limit);
+			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items ORDER BY hk, sk LIMIT ?`, limit);
 		} else if (cursor.sk === null) {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items WHERE hk > ? OR (hk = ? AND sk IS NOT NULL) ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items WHERE hk > ? OR (hk = ? AND sk IS NOT NULL) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.hk,
 				limit,
 			);
 		} else {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.hk,
 				cursor.sk,
@@ -442,6 +461,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				sk: row.sk,
 				data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
 				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
+				v: row.v,
 			});
 		}
 		return items;
@@ -469,11 +489,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					// IGNORE is safer for retries — if a batch was already written before a crash we
 					// skip re-inserting those items rather than overwriting them unnecessarily.
 					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds) VALUES (?, ?, ?, ?)`,
+						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v) VALUES (?, ?, ?, ?, ?)`,
 						item.hk,
 						item.sk ?? null,
 						item.data,
 						item.ttl_epoch_utc_seconds ?? null,
+						item.v,
 					);
 				}
 			}
@@ -503,7 +524,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 function estimateItemBytes(item: MigratedItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.length * 2 + (item.sk?.length ?? 0) * 2 + dataSize + 64;
+	return item.hk.length * 2 + (item.sk?.length ?? 0) * 2 + dataSize + 8 + 64;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -518,6 +539,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 sk TEXT,
                 data ANY NOT NULL,
                 ttl_epoch_utc_seconds INTEGER,
+                v INTEGER NOT NULL,
                 PRIMARY KEY (hk, sk)
             ) WITHOUT ROWID, STRICT;`,
 	},

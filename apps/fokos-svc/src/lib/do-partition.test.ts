@@ -64,6 +64,51 @@ describe("PartitionDO - putItem / getItem", () => {
 		expect(r3).toMatchObject({ found: true, data: "c" });
 	});
 
+	it("returns version 1 on first write", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+
+		expect(result.version).toBe(1);
+	});
+
+	it("increments version on each subsequent write to the same key", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+		const r2 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+		const r3 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v3" });
+
+		expect(r1.version).toBe(1);
+		expect(r2.version).toBe(2);
+		expect(r3.version).toBe(3);
+	});
+
+	it("getItem returns the current version", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+		expect(result).toMatchObject({ found: true, version: 2 });
+	});
+
+	it("versions are independent per (hashKey, sortKey) key", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a2" });
+		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b" });
+
+		const get1 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk1" });
+		const get2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" });
+
+		expect(r1.version).toBe(1);
+		expect(get1).toMatchObject({ found: true, version: 2 });
+		expect(get2).toMatchObject({ found: true, version: 1 });
+	});
+
 	it("includes operation metrics in putItem result", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 

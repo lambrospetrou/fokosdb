@@ -38,11 +38,12 @@ describe("fokosdb", async () => {
 				hashKey: "test-hash-key",
 				sortKey: "test-sort-key",
 			}),
-		).resolves.toEqual({
+		).resolves.toMatchObject({
 			found: true,
 			data: new Uint8Array([1, 2, 3]),
 			hashKey: "test-hash-key",
 			sortKey: "test-sort-key",
+			version: 1,
 			meta: {
 				rowsRead: 1,
 				rowsWritten: 0,

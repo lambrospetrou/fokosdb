@@ -15,6 +15,7 @@ export type PutItemOptions = {
 };
 
 export type PutItemResult = {
+	version: number;
 	meta: OperationMetrics & PartitionInfo & {};
 	__debug?: DebugInfo;
 };
@@ -36,6 +37,7 @@ export type GetItemResult =
 			sortKey?: string;
 			data: Uint8Array | string;
 			ttlEpochUTCSeconds?: number;
+			version: number;
 
 			meta: OperationMetrics & PartitionInfo & {};
 
