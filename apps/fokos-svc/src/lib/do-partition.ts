@@ -517,7 +517,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return {
 			actorId: this.ctx.id.toString(),
 			actorName: this.ctx.id.name,
-			partitionContext: this.pCtx(),
+			// Always put the raw partition context in the logs for better debugging, even if it's undefined.
+			partitionContext: this.#_partitionContext ?? "",
 		};
 	}
 }

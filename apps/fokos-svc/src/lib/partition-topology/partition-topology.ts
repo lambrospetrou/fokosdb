@@ -267,7 +267,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			// Root tree index first.
 			hIdxs.push(this.hash(hashKey, this.#topology.length));
 		}
-		let hNode = this.#topology[hIdxs.at(-1)!];
+		let hNode = this.#topology[hIdxs[0]];
 		{
 			// 1 for the root, then one for each level of the tree until we reach a leaf.
 			// The level is used as additional entropy to ensure better distribution of the partitions across the children.
@@ -278,7 +278,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 					const hChild = this.hash(hashKey + level, hNode.children.length);
 					hIdxs.push(hChild);
 					hNode = hNode.children[hChild];
-				} else if (fromContext && hIdxs.length === fromContextDepth) {
+				} else if (fromContext && level === fromContextDepth) {
 					// The in-memory topology has no children for this node, but the caller is routing
 					// FROM this exact partition context — meaning it has split and we need to find the
 					// right child. Compute the virtual child bucket using the context's split conditions.
