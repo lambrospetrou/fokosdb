@@ -390,6 +390,45 @@ describe("PartitionDO - splitting", () => {
 	});
 });
 
+describe("PartitionDO - partitionId encoding", () => {
+	it("hex bytes encode depth+hashIdxs correctly and _partitionIdBytes is cached in the DO", async ({ expect }) => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+		// Root: [depth=1, hashIdx=0]
+		const rootBytes = Uint8Array.fromHex(ctx.partitionId);
+		expect(rootBytes).toEqual(new Uint8Array([1, 0]));
+
+		// After the first request ensurePartitionContext stores the context with _partitionIdBytes populated.
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v" });
+		const rootState = await stub.__internalState();
+		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
+		expect(rootState.partitionContext?._partitionIdBytes).toEqual(rootBytes);
+
+		// Trigger a split so we can verify child IDs.
+		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk2", data: "x".repeat(1 * 1024 * 1024 + 10) });
+		await waitForAlarm(stub);
+
+		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
+		for (let i = 0; i < children.length; i++) {
+			const child = children[i];
+
+			// Child: [depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
+			const childBytes = Uint8Array.fromHex(child.partitionIdOpaque);
+			expect(childBytes).toEqual(new Uint8Array([2, 0, i]));
+
+			// doName encodes the same path as text.
+			expect(child.doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
+
+			// _partitionIdBytes is also cached inside each child DO after initFromSplit.
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
+			const childState = await childStub.__internalState();
+			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
+			expect(childState.partitionContext?._partitionIdBytes).toEqual(childBytes);
+		}
+	});
+});
+
 async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	// The alarm is set to Date.now() in queueSplit(), so miniflare fires it automatically
 	// in the background after putItem returns. runDurableObjectAlarm drains any remaining
@@ -417,7 +456,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 		...base,
 		doName: rootName,
 		primaryDoIdStr: id.toString(),
-		partitionId: __encodePartitionIdOpaque({ hashIdxs: [0] }),
+		partitionId: __encodePartitionIdOpaque([0]),
 	};
 	return { ctx, stub: env.PARTITION_DO.get(id) };
 }

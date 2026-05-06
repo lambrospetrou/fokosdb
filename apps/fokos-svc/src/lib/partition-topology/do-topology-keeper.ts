@@ -63,7 +63,7 @@ export class TopologyKeeperDO extends DurableObject<Env> {
 			const doName = `${baseContext.nsPrefix}.r.${i}`;
 			const doId = env[baseContext.ns].idFromName(doName);
 			return {
-				partitionId: __encodePartitionIdOpaque({ hashIdxs: [i] }),
+				partitionId: __encodePartitionIdOpaque([i]),
 				partitionContext: {
 					doName: doId.name!,
 					primaryDoIdStr: doId.toString(),

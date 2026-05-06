@@ -37,11 +37,16 @@ export type PartitionContextResolved = PartitionContext & {
 	primaryDoIdStr: string;
 
 	// Opaque ID used internally to identify the partition.
+	// Hex-encoded bytes: [depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
 	partitionId: PartitionNodeId;
+
+	// Cached parsed bytes of partitionId. Populated inside the DO for fast routing; survives structured clone.
+	_partitionIdBytes?: Uint8Array;
 };
 
 // PartitionNodeId is re-exported from ./types.js above.
-// It is a base64-encoded JSON string with the necessary information to identify the partition (e.g. the hash index path).
+// Hex-encoded bytes: [depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
 
 export type SplitConditions = {
 	/**
@@ -76,11 +81,11 @@ export class PartitionContextCreator {
 		if (!opts.hashSplitConditions) {
 			opts.hashSplitConditions = { splitN: 16, maxSizeMb: 100 };
 		}
-		if (opts.rootTreesN < 1) {
-			throw new Error("fokos: rootTreesN must be at least 1");
+		if (opts.rootTreesN < 1 || opts.rootTreesN > 255) {
+			throw new Error("fokos: rootTreesN must be between 1 and 255");
 		}
-		if (opts.hashSplitConditions.splitN < 2) {
-			throw new Error("fokos: hashSplitConditions.splitN must be at least 2");
+		if (opts.hashSplitConditions.splitN < 2 || opts.hashSplitConditions.splitN > 255) {
+			throw new Error("fokos: hashSplitConditions.splitN must be between 2 and 255");
 		}
 		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb < 1) {
 			throw new Error("fokos: hashSplitConditions.maxSizeMb must be at least 1");
@@ -88,8 +93,8 @@ export class PartitionContextCreator {
 		if (opts.hashSplitConditions.maxItems && opts.hashSplitConditions.maxItems < 1) {
 			throw new Error("fokos: hashSplitConditions.maxItems must be at least 1");
 		}
-		if (opts.rangeSplitConditions.splitN < 2) {
-			throw new Error("fokos: rangeSplitConditions.splitN must be at least 2");
+		if (opts.rangeSplitConditions.splitN < 2 || opts.rangeSplitConditions.splitN > 255) {
+			throw new Error("fokos: rangeSplitConditions.splitN must be between 2 and 255");
 		}
 		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb < 1) {
 			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be at least 1");
@@ -151,12 +156,11 @@ export interface PartitionTopologyRouter {
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
 
-export function __encodePartitionIdOpaque({ hashIdxs }: { hashIdxs: number[] }): string {
-	return btoa(JSON.stringify({ hashIdxs }));
-}
-
-export function __decodePartitionIdOpaque(partitionIdOpaque: string): { hashIdxs: number[] } {
-	return JSON.parse(atob(partitionIdOpaque));
+export function __encodePartitionIdOpaque(hashIdxs: number[]): string {
+	const bytes = new Uint8Array(1 + hashIdxs.length);
+	bytes[0] = hashIdxs.length;
+	for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
+	return bytes.toHex();
 }
 
 /**
@@ -172,11 +176,19 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
 		this.#topology = Array.from({ length: basePartitionContext.rootTreesN }, (_, i) => {
 			const doName = `${basePartitionContext.nsPrefix}.r.${i}`;
+			if (doName.length > 1024) {
+				console.warn({
+					message:
+						"fokos: DO name length exceeds 1024 bytes, which may cause issues with DO name truncation in Cloudflare Workers. Should have used higher rootTreesN and higher hashSplitConditions.splitN to reduce the depth of the tree.",
+					doName,
+				});
+			}
 			const doId = env[basePartitionContext.ns].idFromName(doName);
 			return {
-				partitionId: __encodePartitionIdOpaque({ hashIdxs: [i] }),
+				partitionId: __encodePartitionIdOpaque([i]),
 				partitionContext: {
-					doName: doId.name!,
+					// We don't take the name from doId because it could be truncated after 1024 bytes.
+					doName: doName,
 					primaryDoIdStr: doId.toString(),
 				},
 				children: [],
@@ -191,19 +203,20 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		doName: string;
 		partitionIdOpaque: string;
 	}[] {
-		const parentPartitionIdDeOpaque = __decodePartitionIdOpaque(parentPartitionIdOpaque);
-		const parentSerializedIdxs = parentPartitionIdDeOpaque.hashIdxs.join(".");
-		const childPartitions = [];
-		for (let i = 0; i < N; i++) {
-			const childHashIdxs = [...parentPartitionIdDeOpaque.hashIdxs, i];
-			const serializedIds = `${parentSerializedIdxs}.${i}`;
-			const partitionIdOpaque = __encodePartitionIdOpaque({ hashIdxs: childHashIdxs });
-			childPartitions.push({
-				doName: `${this.basePartitionContext.nsPrefix}.h.${serializedIds}`,
-				partitionIdOpaque,
-			});
-		}
-		return childPartitions;
+		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
+		const parentDepth = parentBytes[0];
+		const parentIdxs = Array.from(parentBytes.subarray(1, 1 + parentDepth));
+		const parentSerializedIdxs = parentIdxs.join(".");
+		return Array.from({ length: N }, (_, i) => {
+			const childBytes = new Uint8Array(parentDepth + 2);
+			childBytes[0] = parentDepth + 1;
+			childBytes.set(parentBytes.subarray(1, 1 + parentDepth), 1);
+			childBytes[1 + parentDepth] = i;
+			return {
+				doName: `${this.basePartitionContext.nsPrefix}.h.${parentSerializedIdxs}.${i}`,
+				partitionIdOpaque: childBytes.toHex(),
+			};
+		});
 	}
 
 	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
@@ -214,7 +227,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		// Merge with any partition-specific context if needed.
 		const partitionContext: PartitionContextResolved = {
 			...this.basePartitionContext,
-			doName: doId.name!,
+			doName: doName,
 			primaryDoIdStr: doId.toString(),
 			partitionId: partitionIdOpaque,
 		};
@@ -236,7 +249,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		const doId = env[ns].idFromName(doName);
 		const childPartitionContext: PartitionContextResolved = {
 			...partitionContext,
-			doName: doId.name!,
+			doName: doName,
 			primaryDoIdStr: doId.toString(),
 			partitionId: partitionIdOpaque,
 		};
@@ -256,12 +269,8 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		let hIdxs: number[] = [];
 		let fromContextDepth = -1;
 		if (fromContext) {
-			// FIXME: Optimize this away by passing the hash indexes directly in the partition context instead of the opaque ID,
-			// since we need to parse it anyway to route the request.
-			// The Partition DO uses the PartitionTopologySplitter which is initialized with the resolved partition context,
-			// so it can easily pass the hash indexes directly in the context without needing to encode them in an opaque ID and parse them back here.
-			const partitionIdDeOpaque = __decodePartitionIdOpaque(fromContext.partitionId);
-			hIdxs = partitionIdDeOpaque.hashIdxs;
+			const bytes = fromContext._partitionIdBytes ?? Uint8Array.fromHex(fromContext.partitionId);
+			hIdxs = Array.from(bytes.subarray(1, 1 + bytes[0]));
 			fromContextDepth = hIdxs.length;
 		} else {
 			// Root tree index first.
@@ -295,10 +304,9 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		// TODO: Find the range partition if it exists.
 
 		const serializedIds = hIdxs.join(".");
-		const partitionIdOpaque = __encodePartitionIdOpaque({ hashIdxs: hIdxs });
 		return {
 			doName: `${nsPrefix}.h.${serializedIds}`,
-			partitionIdOpaque,
+			partitionIdOpaque: __encodePartitionIdOpaque(hIdxs),
 		};
 	}
 
@@ -484,7 +492,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 						parentPartitionContext: this.partitionContext,
 						newPartitionContext: {
 							...this.partitionContext,
-							doName: childDoId.name!,
+							doName: childIds[i].doName,
 							primaryDoIdStr: childDoId.toString(),
 							partitionId: childIds[i].partitionIdOpaque,
 						},

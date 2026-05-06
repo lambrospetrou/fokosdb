@@ -98,6 +98,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// Load partition context from storage.
 			const storedContext = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
 			if (storedContext) {
+				storedContext._partitionIdBytes = Uint8Array.fromHex(storedContext.partitionId);
 				this.#_partitionContext = storedContext;
 			}
 		});
@@ -371,6 +372,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 			return this.#_partitionContext;
 		}
+		pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 		this.#_partitionContext = pCtx;
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, pCtx);
 		return pCtx;
@@ -516,6 +518,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private logParams() {
 		return {
 			actorId: this.ctx.id.toString(),
+			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
 			// Always put the raw partition context in the logs for better debugging, even if it's undefined.
 			partitionContext: this.#_partitionContext ?? "",
