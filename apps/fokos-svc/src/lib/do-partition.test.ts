@@ -2,11 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import {
-	__encodePartitionIdOpaque,
-	PartitionContextCreator,
-	PartitionTopologyRouterImpl,
-} from "./partition-topology/partition-topology.js";
+import { PartitionContextCreator, PartitionTopologyRouterImpl } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
@@ -543,21 +539,16 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 
 function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
 	const prefix = `test.${crypto.randomUUID()}`;
-	const rootName = `${prefix}.r.0`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsPrefix: prefix,
+		// For testing determinism only one root partition.
 		rootTreesN: 1,
 		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
 		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
 		...opts,
 	});
-	const id = env.PARTITION_DO.idFromName(rootName);
-	const ctx: PartitionContextResolved = {
-		...base,
-		doName: rootName,
-		primaryDoIdStr: id.toString(),
-		partitionId: __encodePartitionIdOpaque([0]),
-	};
-	return { ctx, stub: env.PARTITION_DO.get(id) };
+
+	const pCtx = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");
+	return { ctx: pCtx.partitionContext, stub: env.PARTITION_DO.get(pCtx.doId) };
 }

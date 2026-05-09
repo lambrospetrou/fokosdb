@@ -161,11 +161,27 @@ export interface PartitionTopologyRouter {
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
 
-export function __encodePartitionIdOpaque(hashIdxs: number[]): string {
+function __encodePartitionIdOpaque(hashIdxs: number[]): { bytes: Uint8Array; hex: string } {
 	const bytes = new Uint8Array(1 + hashIdxs.length);
 	bytes[0] = hashIdxs.length;
 	for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
-	return bytes.toHex();
+	return { bytes, hex: bytes.toHex() };
+}
+
+function __encodeChildPartitionIdOpaque(parentPartitionId: Uint8Array, childIdxs: number | number[]): { bytes: Uint8Array; hex: string } {
+	if (Array.isArray(childIdxs)) {
+		const bytes = new Uint8Array(parentPartitionId.length + childIdxs.length);
+		bytes.set(parentPartitionId, 0);
+		bytes[0] += childIdxs.length;
+		for (let i = 0; i < childIdxs.length; i++) bytes[parentPartitionId.length + i] = childIdxs[i];
+		return { bytes, hex: bytes.toHex() };
+	} else {
+		const bytes = new Uint8Array(parentPartitionId.length + 1);
+		bytes.set(parentPartitionId, 0);
+		bytes[0] += 1;
+		bytes[parentPartitionId.length] = childIdxs;
+		return { bytes, hex: bytes.toHex() };
+	}
 }
 
 /**
@@ -180,7 +196,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	) {
 		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
 		this.#topology = Array.from({ length: basePartitionContext.rootTreesN }, (_, i) => {
-			const doName = `${basePartitionContext.nsPrefix}.r.${i}`;
+			const doName = `${basePartitionContext.nsPrefix}.h.${i}`;
 			if (doName.length > 1024) {
 				console.warn({
 					message:
@@ -190,7 +206,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			}
 			const doId = env[basePartitionContext.ns].idFromName(doName);
 			return {
-				partitionId: __encodePartitionIdOpaque([i]),
+				partitionId: __encodePartitionIdOpaque([i]).hex,
 				partitionContext: {
 					// We don't take the name from doId because it could be truncated after 1024 bytes.
 					doName: doName,
@@ -209,16 +225,12 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		partitionIdOpaque: string;
 	}[] {
 		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
-		const parentDepth = parentBytes[0];
-		const parentSerializedIdxs = parentBytes.subarray(1, 1 + parentDepth).join(".");
 		return Array.from({ length: N }, (_, i) => {
-			const childBytes = new Uint8Array(parentDepth + 2);
-			childBytes[0] = parentDepth + 1;
-			childBytes.set(parentBytes.subarray(1, 1 + parentDepth), 1);
-			childBytes[1 + parentDepth] = i;
+			const { bytes, hex: childHex } = __encodeChildPartitionIdOpaque(parentBytes, i);
+			const hIdxs = bytes.subarray(1, 1 + bytes[0]);
 			return {
-				doName: `${this.basePartitionContext.nsPrefix}.h.${parentSerializedIdxs}.${i}`,
-				partitionIdOpaque: childBytes.toHex(),
+				doName: `${this.basePartitionContext.nsPrefix}.h.${hIdxs.join(".")}`,
+				partitionIdOpaque: childHex,
 			};
 		});
 	}
@@ -246,8 +258,8 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
 		const hChildIdx = this.hash(hashKey + (partitionIdBytes[0] + 1), partitionContext.hashSplitConditions.splitN);
-		const hIdxs = Array.from(partitionIdBytes.subarray(1, 1 + partitionIdBytes[0]));
-		hIdxs.push(hChildIdx);
+		const { bytes, hex: childHex } = __encodeChildPartitionIdOpaque(partitionIdBytes, hChildIdx);
+		const hIdxs = bytes.subarray(1, 1 + bytes[0]);
 
 		const serializedIds = hIdxs.join(".");
 		const doName = `${partitionContext.nsPrefix}.h.${serializedIds}`;
@@ -258,7 +270,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			...partitionContext,
 			doName: doName,
 			primaryDoIdStr: doId.toString(),
-			partitionId: __encodePartitionIdOpaque(hIdxs),
+			partitionId: childHex,
 		};
 		return {
 			doId,
@@ -289,8 +301,6 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		doName: string;
 		partitionIdOpaque: string;
 	} {
-		const { nsPrefix } = this.basePartitionContext;
-
 		// First find the hash partition!
 		// Root tree index first.
 		let hIdxs: number[] = [this.hash(hashKey, this.#topology.length)];
@@ -311,10 +321,11 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 		// TODO: Find the range partition if it exists.
 
+		const { nsPrefix } = this.basePartitionContext;
 		const serializedIds = hIdxs.join(".");
 		return {
 			doName: `${nsPrefix}.h.${serializedIds}`,
-			partitionIdOpaque: __encodePartitionIdOpaque(hIdxs),
+			partitionIdOpaque: __encodePartitionIdOpaque(hIdxs).hex,
 		};
 	}
 
