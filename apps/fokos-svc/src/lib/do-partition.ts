@@ -240,18 +240,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 
-		outer: while (true) {
+		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
+
+		while (true) {
 			const page = this.queryPage(tableCursor, PAGE_SIZE);
 			if (page.length === 0) break;
 
 			for (const row of page) {
 				// Filter: only send items that belong to the requesting child partition.
-				const { partitionContext: targetCtx } = topology.pickPartitionFromContext(pCtx, row.hk, row.sk ?? undefined);
-				if (targetCtx.doName === opts.childPartitionContext.doName) {
+				if (isCorrectHashChildPartition(row.hk, row.sk ?? undefined)) {
 					const rowBytes = estimateItemBytes(row);
 					if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
 						reachedLimit = true;
-						break outer;
+						break;
 					}
 					items.push(row);
 					totalBytes += rowBytes;
@@ -259,6 +260,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// Always advance the table cursor regardless of whether the row matched.
 				tableCursor = { hk: row.hk, sk: row.sk };
 			}
+			if (reachedLimit) break;
 
 			if (page.length < PAGE_SIZE) break;
 		}
@@ -424,7 +426,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			case "ok":
 				return await local();
 			case "forward": {
-				const { doId, partitionContext } = topology.pickPartitionFromContext(ctx, hashKey, sortKey);
+				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[this.pCtx().ns].get(doId);
 				return await forward(stub, partitionContext);
 			}

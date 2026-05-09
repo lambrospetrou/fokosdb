@@ -87,8 +87,8 @@ export class PartitionContextCreator {
 		if (opts.hashSplitConditions.splitN < 2 || opts.hashSplitConditions.splitN > 255) {
 			throw new Error("fokos: hashSplitConditions.splitN must be between 2 and 255");
 		}
-		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb < 1) {
-			throw new Error("fokos: hashSplitConditions.maxSizeMb must be at least 1");
+		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb < 0.1) {
+			throw new Error("fokos: hashSplitConditions.maxSizeMb must be at least 0.1");
 		}
 		if (opts.hashSplitConditions.maxItems && opts.hashSplitConditions.maxItems < 1) {
 			throw new Error("fokos: hashSplitConditions.maxItems must be at least 1");
@@ -96,8 +96,8 @@ export class PartitionContextCreator {
 		if (opts.rangeSplitConditions.splitN < 2 || opts.rangeSplitConditions.splitN > 255) {
 			throw new Error("fokos: rangeSplitConditions.splitN must be between 2 and 255");
 		}
-		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb < 1) {
-			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be at least 1");
+		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb < 0.1) {
+			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be at least 0.1");
 		}
 		if (opts.rangeSplitConditions.maxItems && opts.rangeSplitConditions.maxItems < 1) {
 			throw new Error("fokos: rangeSplitConditions.maxItems must be at least 1");
@@ -135,7 +135,7 @@ export interface PartitionTopologyRouter {
 	 * @param hashKey
 	 * @param sortKey
 	 */
-	pickPartitionFromContext(
+	pickChildPartition(
 		partitionContext: PartitionContextResolved,
 		hashKey: string,
 		sortKey?: string,
@@ -148,6 +148,11 @@ export interface PartitionTopologyRouter {
 		doName: string;
 		partitionIdOpaque: string;
 	}[];
+
+	makeIsCorrectChildHashPartition(
+		parentContext: PartitionContextResolved,
+		childContext: PartitionContextResolved,
+	): (hashKey: string, sortKey?: string) => boolean;
 }
 
 // PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
@@ -205,8 +210,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	}[] {
 		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
 		const parentDepth = parentBytes[0];
-		const parentIdxs = Array.from(parentBytes.subarray(1, 1 + parentDepth));
-		const parentSerializedIdxs = parentIdxs.join(".");
+		const parentSerializedIdxs = parentBytes.subarray(1, 1 + parentDepth).join(".");
 		return Array.from({ length: N }, (_, i) => {
 			const childBytes = new Uint8Array(parentDepth + 2);
 			childBytes[0] = parentDepth + 1;
@@ -217,6 +221,49 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 				partitionIdOpaque: childBytes.toHex(),
 			};
 		});
+	}
+
+	makeIsCorrectChildHashPartition(
+		parentContext: PartitionContextResolved,
+		childContext: PartitionContextResolved,
+	): (hashKey: string, sortKey?: string) => boolean {
+		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
+		// The first byte is the depth (including root level).
+		const childLevel = childPartitionIdBytes[0];
+		const childIdx = childPartitionIdBytes[childLevel];
+		return (hashKey: string, sortKey?: string) => {
+			const hashedIdx = this.hash(hashKey + childLevel, childContext.hashSplitConditions.splitN);
+			return hashedIdx === childIdx;
+		};
+	}
+
+	// Used by the Partition DOs to route requests to their children during the lazy split migration of data.
+	// This routes to the child partition directly without necessary having the most up-to-date topology in-memory.
+	pickChildPartition(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
+		const hChildIdx = this.hash(hashKey + (partitionIdBytes[0] + 1), partitionContext.hashSplitConditions.splitN);
+		const hIdxs = Array.from(partitionIdBytes.subarray(1, 1 + partitionIdBytes[0]));
+		hIdxs.push(hChildIdx);
+
+		const serializedIds = hIdxs.join(".");
+		const doName = `${partitionContext.nsPrefix}.h.${serializedIds}`;
+
+		const { ns } = this.basePartitionContext;
+		const doId = env[ns].idFromName(doName);
+		const childPartitionContext: PartitionContextResolved = {
+			...partitionContext,
+			doName: doName,
+			primaryDoIdStr: doId.toString(),
+			partitionId: __encodePartitionIdOpaque(hIdxs),
+		};
+		return {
+			doId,
+			partitionContext: childPartitionContext,
+		};
 	}
 
 	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
@@ -238,66 +285,27 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		};
 	}
 
-	// Used by the Partition DOs to route requests to their children during the lazy split migration of data.
-	pickPartitionFromContext(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey, fromContext: partitionContext });
-		const { ns } = this.basePartitionContext;
-		const doId = env[ns].idFromName(doName);
-		const childPartitionContext: PartitionContextResolved = {
-			...partitionContext,
-			doName: doName,
-			primaryDoIdStr: doId.toString(),
-			partitionId: partitionIdOpaque,
-		};
-		return {
-			doId,
-			partitionContext: childPartitionContext,
-		};
-	}
-
-	private findPartition({ hashKey, sortKey, fromContext }: { hashKey: string; sortKey?: string; fromContext?: PartitionContextResolved }): {
+	private findPartition({ hashKey, sortKey }: { hashKey: string; sortKey?: string }): {
 		doName: string;
 		partitionIdOpaque: string;
 	} {
 		const { nsPrefix } = this.basePartitionContext;
 
 		// First find the hash partition!
-		let hIdxs: number[] = [];
-		let fromContextDepth = -1;
-		if (fromContext) {
-			const bytes = fromContext._partitionIdBytes ?? Uint8Array.fromHex(fromContext.partitionId);
-			hIdxs = Array.from(bytes.subarray(1, 1 + bytes[0]));
-			fromContextDepth = hIdxs.length;
-		} else {
-			// Root tree index first.
-			hIdxs.push(this.hash(hashKey, this.#topology.length));
-		}
-		let hNode = this.#topology[hIdxs[0]];
+		// Root tree index first.
+		let hIdxs: number[] = [this.hash(hashKey, this.#topology.length)];
 		{
 			// 1 for the root, then one for each level of the tree until we reach a leaf.
 			// The level is used as additional entropy to ensure better distribution of the partitions across the children.
-			let level = hIdxs.length;
-			while (true) {
-				if (hNode.children.length > 0) {
-					level++;
-					const hChild = this.hash(hashKey + level, hNode.children.length);
-					hIdxs.push(hChild);
-					hNode = hNode.children[hChild];
-				} else if (fromContext && level === fromContextDepth) {
-					// The in-memory topology has no children for this node, but the caller is routing
-					// FROM this exact partition context — meaning it has split and we need to find the
-					// right child. Compute the virtual child bucket using the context's split conditions.
-					level++;
-					const hChild = this.hash(hashKey + level, fromContext.hashSplitConditions.splitN);
-					hIdxs.push(hChild);
-					break;
-				} else {
-					break;
-				}
+			let level = 1;
+			// This should start from the root node and traverse down the tree until it reaches a leaf node,
+			// which will be the partition that should handle the request.
+			let hNode = this.#topology[hIdxs[0]];
+			while (hNode.children.length > 0) {
+				level++;
+				const hChild = this.hash(hashKey + level, hNode.children.length);
+				hIdxs.push(hChild);
+				hNode = hNode.children[hChild];
 			}
 		}
 
@@ -367,11 +375,16 @@ export interface PartitionTopologySplitter {
 	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
 	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
 	 */
-	pickPartitionFromContext(
+	pickChildPartition(
 		partitionContext: PartitionContextResolved,
 		hashKey: string,
 		sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+
+	makeIsCorrectChildHashPartition(
+		parentContext: PartitionContextResolved,
+		childContext: PartitionContextResolved,
+	): (hashKey: string, sortKey?: string) => boolean;
 
 	/**
 	 * Called by a child partition after it has fully migrated its share of data from the parent.
@@ -626,11 +639,18 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
 	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
 	 */
-	pickPartitionFromContext(
+	pickChildPartition(
 		partitionContext: PartitionContextResolved,
 		hashKey: string,
 		sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		return this.#topologyRouter.pickPartitionFromContext(partitionContext, hashKey, sortKey);
+		return this.#topologyRouter.pickChildPartition(partitionContext, hashKey, sortKey);
+	}
+
+	makeIsCorrectChildHashPartition(
+		parentContext: PartitionContextResolved,
+		childContext: PartitionContextResolved,
+	): (hashKey: string, sortKey?: string) => boolean {
+		return this.#topologyRouter.makeIsCorrectChildHashPartition(parentContext, childContext);
 	}
 }

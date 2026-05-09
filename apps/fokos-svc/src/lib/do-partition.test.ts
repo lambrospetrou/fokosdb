@@ -308,6 +308,79 @@ describe("PartitionDO - splitting", () => {
 		});
 	});
 
+	describe("multi-level splits", async () => {
+		it("keeps all items accessible after splits at multiple tree depths (~10 items per partition trigger threshold)", async ({
+			expect,
+		}) => {
+			// Items are ~1 KB each so ~10 fill 0.2 MB and trigger a split at any given partition.
+			// With splitN=3 and 100 total items, the root and multiple generations of children
+			// all split, creating a deep tree that exercises the full forwarding chain.
+			const ITEM_SIZE_BYTES = 10 * 1024;
+			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
+			const TOTAL_ITEMS = 100;
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 3, maxSizeMb: 0.1 } });
+
+			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
+
+			for (let i = 0; i < TOTAL_ITEMS; i++) {
+				const hashKey = `item-${String(i).padStart(4, "0")}`;
+				const sortKey = "sk";
+				allItems.push({ hashKey, sortKey, data: dummyData });
+
+				// Writes transiently fail while a split migration is in progress.
+				// Drain the full split tree and retry until the write lands.
+				for (let attempt = 0; attempt < 20; attempt++) {
+					try {
+						await stub.putItem(ctx, { hashKey, sortKey, data: dummyData });
+						break;
+					} catch (e: unknown) {
+						const msg = String(e);
+						if (msg.includes("split in progress") || msg.includes("exceeded its limits")) {
+							await drainSplitTree(stub);
+						} else {
+							throw e;
+						}
+					}
+				}
+			}
+
+			// Flush any in-flight splits triggered by the last few writes.
+			await drainSplitTree(stub);
+
+			// Verify every item is reachable through the root (which forwards through the tree)
+			// and record the DO instance that actually served each read.
+			const servedByInstances = new Set<string>();
+			for (const item of allItems) {
+				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
+				if (result.found) {
+					servedByInstances.add(result.meta.served_by_instance);
+				}
+			}
+
+			// With 100 items and splitN=3, the tree reaches ~4 levels deep (~16 leaf DOs).
+			// Even with hash skew, at least 4 distinct instances must serve reads.
+			expect(servedByInstances.size, "many distinct partition instances should have served requests").toBeGreaterThan(4);
+
+			// Recursively walk the entire split tree and assert every non-leaf node reached
+			// split_completed, confirming correctness at every level of the hierarchy.
+			async function assertSplitTreeComplete(nodeStub: DurableObjectStub<PartitionDO>): Promise<number> {
+				const state = await nodeStub.__internalState();
+				if (!state.splitStatus) return 0;
+				expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
+				const split = state.splitStatus as SplitStartedOrCompleted;
+				let count = 1;
+				for (const childCtx of split.childPartitionContexts) {
+					count += await assertSplitTreeComplete(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName)));
+				}
+				return count;
+			}
+
+			const totalSplitNodes = await assertSplitTreeComplete(stub);
+			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
+		});
+	}, 30_000);
+
 	describe("migration", () => {
 		it("rejects requests to child while migrating, migrates all data to the correct child, and completes", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 10, maxSizeMb: 1 } });
@@ -438,6 +511,34 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	await runInDurableObject(stub, async (instance: PartitionDO) => {
 		await vi.waitUntil(() => !instance.__testing__alarm_running, { timeout: 5000, interval: 100 });
 	});
+}
+
+/**
+ * Recursively drains all pending alarms in the split tree rooted at `stub`.
+ * For each node: runs any pending alarm (startSplit or nothing if already done),
+ * then for each child still awaiting migration triggers its alarm via a dummy request
+ * (which sets the alarm and throws "split in progress" — the error is swallowed),
+ * and finally recurses into each child to drain migration and any further splits.
+ */
+async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<void> {
+	await waitForAlarm(stub);
+	const state = await stub.__internalState();
+
+	if (!state.splitStatus || state.splitStatus.status === "split_queued") return;
+
+	const splitStatus = state.splitStatus as SplitStartedOrCompleted;
+	for (const childCtx of splitStatus.childPartitionContexts) {
+		const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+
+		// A child in migration_initialized has no alarm yet; any request to it transitions
+		// it to migration_migrating and schedules the alarm. The error is expected.
+		const childState = await childStub.__internalState();
+		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
+			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
+		}
+
+		await drainSplitTree(childStub);
+	}
 }
 
 function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
