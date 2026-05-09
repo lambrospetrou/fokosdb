@@ -118,7 +118,7 @@ describe("PartitionDO - putItem / getItem", () => {
 			rowsRead: expect.any(Number),
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
-			served_by_instance: expect.any(String),
+			servedByInstance: expect.any(String),
 		});
 	});
 
@@ -134,7 +134,7 @@ describe("PartitionDO - putItem / getItem", () => {
 				rowsRead: expect.any(Number),
 				rowsWritten: expect.any(Number),
 				databaseSize: expect.any(Number),
-				served_by_instance: expect.any(String),
+				servedByInstance: expect.any(String),
 			},
 		});
 	});
@@ -354,7 +354,7 @@ describe("PartitionDO - splitting", () => {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
 				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
 				if (result.found) {
-					servedByInstances.add(result.meta.served_by_instance);
+					servedByInstances.add(result.meta.servedByInstance);
 				}
 			}
 

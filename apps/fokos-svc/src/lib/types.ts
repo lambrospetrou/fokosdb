@@ -50,7 +50,7 @@ export type GetItemResult =
 	  };
 
 export type PartitionInfo = {
-	served_by_instance: string;
+	servedByInstance: string;
 };
 
 export type OperationMetrics = {

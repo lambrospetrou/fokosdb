@@ -176,7 +176,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						rowsRead,
 						rowsWritten,
 						databaseSize: this.ctx.storage.sql.databaseSize,
-						served_by_instance: this.ctx.id.toString(),
+						servedByInstance: this.ctx.id.toString(),
 					},
 					__debug: { splitStatus },
 				};
@@ -211,7 +211,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
 					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 					version: result.v,
-					meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, served_by_instance: this.ctx.id.toString() },
+					meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, servedByInstance: this.ctx.id.toString() },
 				};
 			},
 		});
