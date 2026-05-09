@@ -3,6 +3,7 @@ import { tryWhile } from "durable-utils/retries";
 import { xxHash32 } from "js-xxhash";
 import { InitFromSplitOptions, PartitionDO } from "../do-partition.js";
 import type { PartitionNodeId, PartitionTopologyEncoded, SplitStatus, SplitType, TopologyNode } from "./types.js";
+import { assertExists } from "../tsutils.js";
 
 type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
@@ -161,26 +162,80 @@ export interface PartitionTopologyRouter {
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
 
-function __encodePartitionIdOpaque(hashIdxs: number[]): { bytes: Uint8Array; hex: string } {
-	const bytes = new Uint8Array(1 + hashIdxs.length);
-	bytes[0] = hashIdxs.length;
-	for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
-	return { bytes, hex: bytes.toHex() };
-}
+// function __encodePartitionIdOpaque(hashIdxs: number[]): { bytes: Uint8Array; hex: string } {
+// 	const bytes = new Uint8Array(1 + hashIdxs.length);
+// 	bytes[0] = hashIdxs.length;
+// 	for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
+// 	return { bytes, hex: bytes.toHex() };
+// }
 
-function __encodeChildPartitionIdOpaque(parentPartitionId: Uint8Array, childIdxs: number | number[]): { bytes: Uint8Array; hex: string } {
-	if (Array.isArray(childIdxs)) {
-		const bytes = new Uint8Array(parentPartitionId.length + childIdxs.length);
-		bytes.set(parentPartitionId, 0);
-		bytes[0] += childIdxs.length;
-		for (let i = 0; i < childIdxs.length; i++) bytes[parentPartitionId.length + i] = childIdxs[i];
-		return { bytes, hex: bytes.toHex() };
-	} else {
-		const bytes = new Uint8Array(parentPartitionId.length + 1);
-		bytes.set(parentPartitionId, 0);
-		bytes[0] += 1;
-		bytes[parentPartitionId.length] = childIdxs;
-		return { bytes, hex: bytes.toHex() };
+// function __encodeChildPartitionIdOpaque(parentPartitionId: Uint8Array, childIdxs: number | number[]): { bytes: Uint8Array; hex: string } {
+// 	if (Array.isArray(childIdxs)) {
+// 		const bytes = new Uint8Array(parentPartitionId.length + childIdxs.length);
+// 		bytes.set(parentPartitionId, 0);
+// 		bytes[0] += childIdxs.length;
+// 		for (let i = 0; i < childIdxs.length; i++) bytes[parentPartitionId.length + i] = childIdxs[i];
+// 		return { bytes, hex: bytes.toHex() };
+// 	} else {
+// 		const bytes = new Uint8Array(parentPartitionId.length + 1);
+// 		bytes.set(parentPartitionId, 0);
+// 		bytes[0] += 1;
+// 		bytes[parentPartitionId.length] = childIdxs;
+// 		return { bytes, hex: bytes.toHex() };
+// 	}
+// }
+
+class PartitionIdHelper {
+	static doName(basePartitionContext: PartitionContext, hashIdxs: number[] | Uint8Array<ArrayBuffer>): string {
+		return `${basePartitionContext.nsPrefix}.h.${hashIdxs.join(".")}`;
+	}
+
+	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
+		const bytes = new Uint8Array(1 + hashIdxs.length);
+		bytes[0] = hashIdxs.length;
+		for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
+		return new PartitionIdHelper(basePartitionContext, bytes);
+	}
+
+	#bytes: Uint8Array | undefined;
+	#appendedHashIdxs: number[];
+
+	constructor(
+		private readonly basePartitionContext: PartitionContext,
+		// Either the opaque representation as encoded, or the bytes before encoding.
+		partitionIdOpaque?: string | Uint8Array,
+	) {
+		if (partitionIdOpaque) {
+			this.#bytes = partitionIdOpaque instanceof Uint8Array ? partitionIdOpaque : Uint8Array.fromHex(partitionIdOpaque);
+		}
+		this.#appendedHashIdxs = [];
+	}
+
+	appendHashIdx(hashIdx: number | number[]): this {
+		if (Array.isArray(hashIdx)) {
+			this.#appendedHashIdxs.push(...hashIdx);
+		} else {
+			this.#appendedHashIdxs.push(hashIdx);
+		}
+		return this;
+	}
+
+	encode(includeDoName: boolean): { bytes: Uint8Array; opaque: string; doName?: string } {
+		if (!this.#bytes && this.#appendedHashIdxs.length === 0) {
+			throw new Error("No bytes or appended hash indexes to encode");
+		}
+		const bytes = new Uint8Array((this.#bytes?.length ?? 1) + this.#appendedHashIdxs.length);
+		if (this.#bytes) bytes.set(this.#bytes, 0);
+		const bsz = this.#bytes?.length ?? 1;
+		bytes[0] = bsz - 1 + this.#appendedHashIdxs.length;
+		for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
+		let doName: string | undefined;
+		if (includeDoName) {
+			// Skip the first byte which is the number of following hash indexes, then take the hash idxs to construct the DO name.
+			const hIdxs = bytes.subarray(1, 1 + bytes[0]);
+			doName = PartitionIdHelper.doName(this.basePartitionContext, hIdxs);
+		}
+		return { bytes, opaque: bytes.toHex(), doName };
 	}
 }
 
@@ -196,7 +251,9 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	) {
 		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
 		this.#topology = Array.from({ length: basePartitionContext.rootTreesN }, (_, i) => {
-			const doName = `${basePartitionContext.nsPrefix}.h.${i}`;
+			const { doName, opaque } = PartitionIdHelper.fromHashIdxs(basePartitionContext, [i]).encode(true);
+			assertExists(doName);
+
 			if (doName.length > 1024) {
 				console.warn({
 					message:
@@ -206,7 +263,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			}
 			const doId = env[basePartitionContext.ns].idFromName(doName);
 			return {
-				partitionId: __encodePartitionIdOpaque([i]).hex,
+				partitionId: opaque,
 				partitionContext: {
 					// We don't take the name from doId because it could be truncated after 1024 bytes.
 					doName: doName,
@@ -226,11 +283,10 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	}[] {
 		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
 		return Array.from({ length: N }, (_, i) => {
-			const { bytes, hex: childHex } = __encodeChildPartitionIdOpaque(parentBytes, i);
-			const hIdxs = bytes.subarray(1, 1 + bytes[0]);
+			const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, parentBytes).appendHashIdx(i).encode(true);
 			return {
-				doName: `${this.basePartitionContext.nsPrefix}.h.${hIdxs.join(".")}`,
-				partitionIdOpaque: childHex,
+				doName: doName!,
+				partitionIdOpaque: opaque,
 			};
 		});
 	}
@@ -258,11 +314,8 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
 		const hChildIdx = this.hash(hashKey + (partitionIdBytes[0] + 1), partitionContext.hashSplitConditions.splitN);
-		const { bytes, hex: childHex } = __encodeChildPartitionIdOpaque(partitionIdBytes, hChildIdx);
-		const hIdxs = bytes.subarray(1, 1 + bytes[0]);
-
-		const serializedIds = hIdxs.join(".");
-		const doName = `${partitionContext.nsPrefix}.h.${serializedIds}`;
+		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, partitionIdBytes).appendHashIdx(hChildIdx).encode(true);
+		assertExists(doName);
 
 		const { ns } = this.basePartitionContext;
 		const doId = env[ns].idFromName(doName);
@@ -270,7 +323,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			...partitionContext,
 			doName: doName,
 			primaryDoIdStr: doId.toString(),
-			partitionId: childHex,
+			partitionId: opaque,
 		};
 		return {
 			doId,
@@ -321,11 +374,11 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 		// TODO: Find the range partition if it exists.
 
-		const { nsPrefix } = this.basePartitionContext;
-		const serializedIds = hIdxs.join(".");
+		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext).appendHashIdx(hIdxs).encode(true);
+		assertExists(doName);
 		return {
-			doName: `${nsPrefix}.h.${serializedIds}`,
-			partitionIdOpaque: __encodePartitionIdOpaque(hIdxs).hex,
+			doName: doName,
+			partitionIdOpaque: opaque,
 		};
 	}
 
