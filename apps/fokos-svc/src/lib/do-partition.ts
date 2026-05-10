@@ -10,6 +10,7 @@ import {
 } from "./partition-topology/partition-topology.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
+import invariant from "./invariant.js";
 
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
@@ -163,13 +164,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				);
 				const { rowsRead, rowsWritten } = res;
 				const rows = res.toArray();
-				if (rows.length !== 1) {
-					throw new Error(`fokos/partition: putItem: RETURNING expected 1 row, got ${rows.length}`);
-				}
+				invariant(rows.length === 1, `fokos/partition.putItem: RETURNING expected 1 row, got ${rows.length}`);
 				const version = rows[0].v;
-				if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
-					throw new Error(`fokos/partition: putItem: unexpected version value: ${version}`);
-				}
+				invariant(
+					typeof version === "number" && Number.isInteger(version) && version >= 1,
+					`fokos/partition.putItem: unexpected version value: ${version}`,
+				);
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
 					version,
@@ -232,13 +232,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: MigrationCursor | null;
 	}): Promise<GetItemsBatchResult> {
 		const splitStatus = this.ensureTopology(this.pCtx()).splitStatus();
-		if (splitStatus?.status !== "split_started") {
-			throw new Error(`fokos/partition: getItemsBatch: not in split_started status.`);
-		}
+		invariant(splitStatus?.status === "split_started", `fokos/partition.getItemsBatch: expected split_started, got ${splitStatus?.status}`);
 		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
-		if (!isKnownChild) {
-			throw new Error(`fokos/partition: getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}".`);
-		}
+		invariant(isKnownChild, `fokos/partition.getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
 
 		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
@@ -287,7 +283,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 */
 	async status() {
 		return {
-			partitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
+			partitionContext: this.pCtx(),
+			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
 			splitStatus: this.ensureTopology(this.pCtx()).splitStatus(),
 			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
@@ -361,9 +358,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private pCtx(): PartitionContextResolved {
-		if (!this.#_partitionContext) {
-			throw new Error("Partition context not initialized");
-		}
+		invariant(this.#_partitionContext, "fokos/partition: Partition context not initialized");
 		return this.#_partitionContext;
 	}
 
@@ -372,16 +367,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
 			// In a real implementation, we might want to allow some flexibility here (e.g. for certain fields)
 			// or have a more robust way to handle context updates.
-			if (this.#_partitionContext.signature !== pCtx.signature) {
-				throw new Error(
-					`Provided partition context does not match the stored context: ${this.#_partitionContext.signature} vs ${pCtx.signature}`,
-				);
-			}
+			invariant(
+				this.#_partitionContext.signature === pCtx.signature,
+				`fokos/partition.ensurePartitionContext: context mismatch: ${this.#_partitionContext.signature} vs ${pCtx.signature}`,
+			);
 			return this.#_partitionContext;
 		}
-		pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
+		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
 		this.#_partitionContext = pCtx;
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, pCtx);
+		pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 		return pCtx;
 	}
 
@@ -427,7 +422,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			local,
 		} = opts;
 		const topology = this.ensureTopology(ctx);
-		switch (topology.shouldAllow(hashKey, sortKey)) {
+		const decision = topology.shouldAllow(hashKey, sortKey);
+		switch (decision) {
 			case "ok":
 				return await local();
 			case "forward": {
@@ -438,6 +434,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 			case "reject":
 				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
+			default: {
+				const _exhaustive: never = decision;
+				invariant(false, `fokos/partition.withSplitForwarding: unexpected decision value: ${_exhaustive}`);
+			}
 		}
 	}
 
@@ -472,9 +472,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async runMigration(): Promise<void> {
 		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-		if (!parentCtx) {
-			throw new Error("fokos/partition: runMigration called but no parent partition context stored.");
-		}
+		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
 		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
@@ -508,6 +506,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			if (!nextCursor) break;
 		}
+		invariant(cursor === null, "fokos/partition.runMigration: loop exited with non-null cursor — data may be incomplete");
 
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);

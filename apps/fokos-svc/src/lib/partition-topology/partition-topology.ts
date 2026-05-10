@@ -4,6 +4,7 @@ import { xxHash32 } from "js-xxhash";
 import { InitFromSplitOptions, PartitionDO } from "../do-partition.js";
 import type { PartitionNodeId, PartitionTopologyEncoded, SplitStatus, SplitType, TopologyNode } from "./types.js";
 import { assertExists } from "../tsutils.js";
+import invariant from "../invariant.js";
 
 type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
@@ -192,6 +193,7 @@ class PartitionIdHelper {
 	}
 
 	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
+		invariant(hashIdxs.length >= 1, "fokos/topology.fromHashIdxs: hashIdxs must not be empty");
 		const bytes = new Uint8Array(2 + hashIdxs.length);
 		bytes[0] = 0; // schema version
 		bytes[1] = hashIdxs.length;
@@ -223,9 +225,8 @@ class PartitionIdHelper {
 	}
 
 	encode(includeDoName: boolean): { bytes: Uint8Array; opaque: string; doName?: string } {
-		if (!this.#bytes && this.#appendedHashIdxs.length === 0) {
-			throw new Error("No bytes or appended hash indexes to encode");
-		}
+		invariant(this.#bytes || this.#appendedHashIdxs.length > 0, "fokos/topology.encode: no bytes or appended hash indexes to encode");
+		invariant(!this.#bytes || this.#bytes[0] === 0, `fokos/topology.encode: unexpected schema version byte: ${this.#bytes?.[0]}`);
 		const bytes = new Uint8Array((this.#bytes?.length ?? 2) + this.#appendedHashIdxs.length);
 		if (this.#bytes) bytes.set(this.#bytes, 0);
 		else bytes[0] = 0; // schema version
@@ -286,13 +287,15 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		partitionIdOpaque: string;
 	}[] {
 		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
-		return Array.from({ length: N }, (_, i) => {
+		const result = Array.from({ length: N }, (_, i) => {
 			const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, parentBytes).appendHashIdx(i).encode(true);
 			return {
 				doName: doName!,
 				partitionIdOpaque: opaque,
 			};
 		});
+		invariant(result.length === N, `fokos/topology.calculateChildPartitionIds: expected ${N} children, got ${result.length}`);
+		return result;
 	}
 
 	makeIsCorrectChildHashPartition(
@@ -302,7 +305,12 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
 		// bytes[0]=version, bytes[1]=depth; hash indexes start at bytes[2].
 		const childLevel = childPartitionIdBytes[1];
+		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
 		const childIdx = childPartitionIdBytes[1 + childLevel];
+		invariant(
+			childIdx < childContext.hashSplitConditions.splitN,
+			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitConditions.splitN}`,
+		);
 		return (hashKey: string, sortKey?: string) => {
 			const hashedIdx = this.hash(hashKey + childLevel, childContext.hashSplitConditions.splitN);
 			return hashedIdx === childIdx;
@@ -318,6 +326,10 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
 		const hChildIdx = this.hash(hashKey + (partitionIdBytes[1] + 1), partitionContext.hashSplitConditions.splitN);
+		invariant(
+			hChildIdx >= 0 && hChildIdx < partitionContext.hashSplitConditions.splitN,
+			`fokos/topology.pickChildPartition: hChildIdx ${hChildIdx} out of range for splitN ${partitionContext.hashSplitConditions.splitN}`,
+		);
 		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, partitionIdBytes).appendHashIdx(hChildIdx).encode(true);
 		assertExists(doName);
 
@@ -542,7 +554,9 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			// Set an alarm to trigger the split process. The alarm handler will check the split status and perform the split if needed.
 			await this.#storage.setAlarm(Date.now());
 		}
-		return this.splitStatus()!;
+		const written = this.splitStatus();
+		invariant(written != null, "fokos/topology.queueSplit: KV write succeeded but splitStatus() returned null");
+		return written;
 	}
 
 	async startSplit() {
@@ -554,9 +568,10 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// then mark the status as `split_completed` and stop forwarding requests.
 
 		const splitStatus = this.splitStatus();
-		if (!splitStatus || splitStatus.status !== "split_queued") {
-			throw new Error("fokos/topology: Cannot start split process, split is not queued.");
-		}
+		invariant(
+			splitStatus && splitStatus.status === "split_queued",
+			"fokos/topology.startSplit: Cannot start split process, split is not queued.",
+		);
 
 		const childPartitionContexts: InitFromSplitOptions[] = [];
 		const splitType = splitStatus.splitType;
@@ -566,6 +581,12 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 					this.partitionContext.partitionId,
 					this.partitionContext.hashSplitConditions.splitN,
 				);
+				invariant(
+					childIds.length === this.partitionContext.hashSplitConditions.splitN,
+					`fokos/topology.startSplit: expected ${this.partitionContext.hashSplitConditions.splitN} children, got ${childIds.length}`,
+				);
+				const uniqueChildNames = new Set(childIds.map((c) => c.doName));
+				invariant(uniqueChildNames.size === childIds.length, "fokos/topology.startSplit: duplicate child doNames detected");
 
 				for (let i = 0; i < this.partitionContext.hashSplitConditions.splitN; i++) {
 					const childDoId = env[this.partitionContext.ns].idFromName(childIds[i].doName);
@@ -660,24 +681,27 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// try {} catch (error) {}
 
 		console.log({
-			message: "fokos/partition: Split process completed successfully.",
+			message: "fokos/topology: Split process completed successfully.",
 			childPartitionContexts,
 		});
 	}
 
 	acknowledgeChildMigration(childDoName: string): void {
 		const splitStatus = this.splitStatus();
-		if (!splitStatus) {
-			throw new Error(`fokos/topology: acknowledgeChildMigration called when not splitting.`);
-		}
+		invariant(splitStatus, "fokos/topology.acknowledgeChildMigration: splitStatus must exist to acknowledge child migration");
 		// Already fully completed — idempotent no-op.
 		if (splitStatus.status === "split_completed") return;
-		if (splitStatus.status !== "split_started") {
-			throw new Error(`fokos/topology: acknowledgeChildMigration called in unexpected status: ${splitStatus.status}.`);
-		}
+		invariant(
+			splitStatus.status === "split_started",
+			`fokos/topology.acknowledgeChildMigration: cannot acknowledge child migration in status ${splitStatus.status}`,
+		);
 		if (splitStatus.migratedChildDoNames.includes(childDoName)) return;
 
 		const migratedChildDoNames = [...splitStatus.migratedChildDoNames, childDoName];
+		invariant(
+			migratedChildDoNames.length <= splitStatus.childPartitionContexts.length,
+			`fokos/topology.acknowledgeChildMigration: more acks (${migratedChildDoNames.length}) than expected children (${splitStatus.childPartitionContexts.length})`,
+		);
 		const allMigrated = splitStatus.childPartitionContexts.every((c) => migratedChildDoNames.includes(c.doName));
 
 		const newStatus: SplitStatusKVItem = allMigrated
