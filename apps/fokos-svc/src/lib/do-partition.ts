@@ -138,11 +138,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 	}
 
-	async putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
-		this.ensurePartitionContext(ctx);
+	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
+		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration();
 		return await this.withSplitForwarding<PutItemResult>({
-			ctx,
+			ctx: pCtx,
 			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 			operationName: "putItem",
 			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
@@ -169,25 +169,27 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
 					throw new Error(`fokos/partition: putItem: unexpected version value: ${version}`);
 				}
-				await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
+				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
 					version,
+					forwarded: 0,
 					meta: {
 						rowsRead,
 						rowsWritten,
 						databaseSize: this.ctx.storage.sql.databaseSize,
-						servedByInstance: this.ctx.id.toString(),
+						servedByActorId: this.ctx.id.toString(),
+						servedByActorName: pCtx.doName,
 					},
 				};
 			},
 		});
 	}
 
-	async getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
-		this.ensurePartitionContext(ctx);
+	async getItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
+		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration();
 		return await this.withSplitForwarding<GetItemResult>({
-			ctx,
+			ctx: pCtx,
 			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 			operationName: "getItem",
 			forward: async (stub, pCtx) => await stub.getItem(pCtx, opts),
@@ -200,8 +202,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const rows = res.toArray();
 				const { rowsRead, rowsWritten } = res;
 				const result = rows[0];
+				const actorMeta = {
+					rowsRead,
+					rowsWritten,
+					databaseSize: this.ctx.storage.sql.databaseSize,
+					servedByActorId: this.ctx.id.toString(),
+					servedByActorName: pCtx.doName,
+				};
 				if (!result) {
-					return { found: false };
+					return { found: false, forwarded: 0, meta: actorMeta };
 				}
 				return {
 					found: true,
@@ -210,7 +219,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
 					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 					version: result.v,
-					meta: { rowsRead, rowsWritten, databaseSize: this.ctx.storage.sql.databaseSize, servedByInstance: this.ctx.id.toString() },
+					forwarded: 0,
+					meta: actorMeta,
 				};
 			},
 		});
@@ -401,7 +411,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		throw new Error("fokos/partition: Partition split in progress, please retry later.");
 	}
 
-	private async withSplitForwarding<T>(opts: {
+	private async withSplitForwarding<T extends { forwarded: number }>(opts: {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: string; sortKey?: string };
 		operationName: string;
@@ -422,7 +432,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			case "forward": {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[this.pCtx().ns].get(doId);
-				return await forward(stub, partitionContext);
+				const result = await forward(stub, partitionContext);
+				return { ...result, forwarded: result.forwarded + 1 } as T;
 			}
 			case "reject":
 				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);

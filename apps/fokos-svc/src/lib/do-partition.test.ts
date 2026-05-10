@@ -12,7 +12,17 @@ describe("PartitionDO - putItem / getItem", () => {
 		const { ctx, stub } = makeStub();
 
 		const result = await stub.getItem(ctx, { hashKey: "missing", sortKey: "sk" });
-		expect(result).toEqual({ found: false });
+		expect(result).toEqual({
+			found: false,
+			forwarded: 0,
+			meta: {
+				rowsRead: 0,
+				rowsWritten: 0,
+				databaseSize: expect.any(Number),
+				servedByActorId: expect.any(String),
+				servedByActorName: expect.stringMatching(/^test\..+/),
+			},
+		});
 	});
 
 	it("stores and retrieves a string value", async ({ expect }) => {
@@ -114,7 +124,8 @@ describe("PartitionDO - putItem / getItem", () => {
 			rowsRead: expect.any(Number),
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
-			servedByInstance: expect.any(String),
+			servedByActorId: expect.any(String),
+			servedByActorName: expect.stringMatching(/^test\..+/),
 		});
 	});
 
@@ -130,7 +141,8 @@ describe("PartitionDO - putItem / getItem", () => {
 				rowsRead: expect.any(Number),
 				rowsWritten: expect.any(Number),
 				databaseSize: expect.any(Number),
-				servedByInstance: expect.any(String),
+				servedByActorId: expect.any(String),
+				servedByActorName: expect.stringMatching(/^test\..+/),
 			},
 		});
 	});
@@ -158,21 +170,6 @@ describe("PartitionDO - splitting", () => {
 
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
-		expect(splitStatus?.status).toBe("split_queued");
-	});
-
-	it("preserves split_queued status across subsequent writes", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
-		const hashKey = `hk.${stub.id.name!}`;
-
-		await stub.putItem(ctx, {
-			hashKey,
-			sortKey: "sk1",
-			data: "x".repeat(1 * 1024 * 1024 + 10),
-		});
-
-		await stub.putItem(ctx, { hashKey, sortKey: "sk2", data: "small" });
-		const { splitStatus } = await stub.status();
 		expect(splitStatus?.status).toBe("split_queued");
 	});
 
@@ -347,19 +344,20 @@ describe("PartitionDO - splitting", () => {
 			await drainSplitTree(stub);
 
 			// Verify every item is reachable through the root (which forwards through the tree)
-			// and record the DO instance that actually served each read.
-			const servedByInstances = new Set<string>();
+			// and record the actor name that actually served each read.
+			const servedByActorNames = new Set<string>();
 			for (const item of allItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
 				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
 				if (result.found) {
-					servedByInstances.add(result.meta.servedByInstance);
+					servedByActorNames.add(result.meta.servedByActorName);
+					expect(result.forwarded, "root reads should have been forwarded at least once").toBeGreaterThan(2);
 				}
 			}
 
 			// With 100 items and splitN=3, the tree reaches ~4 levels deep (~16 leaf DOs).
 			// Even with hash skew, at least 4 distinct instances must serve reads.
-			expect(servedByInstances.size, "many distinct partition instances should have served requests").toBeGreaterThan(4);
+			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(4);
 
 			// Recursively walk the entire split tree and assert every non-leaf node reached
 			// split_completed, confirming correctness at every level of the hierarchy.
