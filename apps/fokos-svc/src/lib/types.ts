@@ -16,7 +16,6 @@ export type PutItemOptions = {
 
 export type PutItemResult = {
 	version: number;
-	forwarded: number;
 	meta: OperationMetrics & PartitionInfo & {};
 };
 
@@ -38,13 +37,11 @@ export type GetItemResult =
 			data: Uint8Array | string;
 			ttlEpochUTCSeconds?: number;
 			version: number;
-			forwarded: number;
 
 			meta: OperationMetrics & PartitionInfo & {};
 	  }
 	| {
 			found: false;
-			forwarded: number;
 
 			meta: OperationMetrics & PartitionInfo & {};
 	  };
@@ -52,14 +49,12 @@ export type GetItemResult =
 export type PartitionInfo = {
 	servedByActorId: string;
 	servedByActorName: string;
+	forwardCount: number;
 };
 
 export type OperationMetrics = {
 	rowsRead: number;
 	rowsWritten: number;
 	databaseSize: number;
-	timings?: {
-		total: number;
-	};
+	timings?: {};
 };
-

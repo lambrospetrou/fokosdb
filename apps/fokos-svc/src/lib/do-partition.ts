@@ -25,13 +25,13 @@ type PartitionDOStub = {
 
 type MigratedItem = {
 	hk: string;
-	sk: string | null;
+	sk: string;
 	data: string | Uint8Array;
 	ttl_epoch_utc_seconds: number | null;
 	v: number;
 };
 
-type MigrationCursor = { hk: string; sk: string | null };
+type MigrationCursor = { hk: string; sk: string };
 
 type GetItemsBatchResult = {
 	items: MigratedItem[];
@@ -83,8 +83,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
 
-	// ONLY USED FOR TESTING! DO NOT DEPEND ON THIS FLAG FOR ANY LOGIC IN THE DO.
+	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
 	__testing__alarm_running = false;
+	__testing__migrationBatchLimitBytes?: number;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -156,7 +157,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					   v = v + 1
 					 RETURNING v`,
 					opts.hashKey,
-					opts.sortKey ?? null,
+					opts.sortKey ?? "",
 					opts.data,
 					opts.ttlEpochUTCSeconds ?? null,
 				);
@@ -172,13 +173,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
 					version,
-					forwarded: 0,
 					meta: {
 						rowsRead,
 						rowsWritten,
 						databaseSize: this.ctx.storage.sql.databaseSize,
 						servedByActorId: this.ctx.id.toString(),
 						servedByActorName: pCtx.doName,
+						forwardCount: 0,
 					},
 				};
 			},
@@ -198,7 +199,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					data: string | ArrayBuffer;
 					ttl_epoch_utc_seconds: number | null;
 					v: number;
-				}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? null);
+				}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
 				const rows = res.toArray();
 				const { rowsRead, rowsWritten } = res;
 				const result = rows[0];
@@ -208,18 +209,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					databaseSize: this.ctx.storage.sql.databaseSize,
 					servedByActorId: this.ctx.id.toString(),
 					servedByActorName: pCtx.doName,
+					forwardCount: 0,
 				};
 				if (!result) {
-					return { found: false, forwarded: 0, meta: actorMeta };
+					return { found: false, meta: actorMeta };
 				}
 				return {
 					found: true,
 					hashKey: opts.hashKey,
-					sortKey: opts.sortKey,
+					sortKey: opts.sortKey || undefined,
 					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
 					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 					version: result.v,
-					forwarded: 0,
 					meta: actorMeta,
 				};
 			},
@@ -240,7 +241,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
-		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
+		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 		const items: MigratedItem[] = [];
 		let totalBytes = 0;
@@ -257,7 +258,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			for (const row of page) {
 				// Filter: only send items that belong to the requesting child partition.
-				if (isCorrectHashChildPartition(row.hk, row.sk ?? undefined)) {
+				if (isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk)) {
 					const rowBytes = estimateItemBytes(row);
 					if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
 						reachedLimit = true;
@@ -411,7 +412,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		throw new Error("fokos/partition: Partition split in progress, please retry later.");
 	}
 
-	private async withSplitForwarding<T extends { forwarded: number }>(opts: {
+	private async withSplitForwarding<T extends { meta: { forwardCount: number } }>(opts: {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: string; sortKey?: string };
 		operationName: string;
@@ -433,7 +434,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[this.pCtx().ns].get(doId);
 				const result = await forward(stub, partitionContext);
-				return { ...result, forwarded: result.forwarded + 1 } as T;
+				return { ...result, meta: { ...result.meta, forwardCount: result.meta.forwardCount + 1 } } as T;
 			}
 			case "reject":
 				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
@@ -441,18 +442,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
-		type Row = { hk: string; sk: string | null; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null; v: number };
+		type Row = { hk: string; sk: string; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null; v: number };
 
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items ORDER BY hk, sk LIMIT ?`, limit);
-		} else if (cursor.sk === null) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items WHERE hk > ? OR (hk = ? AND sk IS NOT NULL) ORDER BY hk, sk LIMIT ?`,
-				cursor.hk,
-				cursor.hk,
-				limit,
-			);
 		} else {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(
 				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
@@ -500,7 +494,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					this.ctx.storage.sql.exec(
 						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v) VALUES (?, ?, ?, ?, ?)`,
 						item.hk,
-						item.sk ?? null,
+						item.sk,
 						item.data,
 						item.ttl_epoch_utc_seconds ?? null,
 						item.v,
@@ -535,7 +529,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 function estimateItemBytes(item: MigratedItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.length * 2 + (item.sk?.length ?? 0) * 2 + dataSize + 8 + 64;
+	return item.hk.length * 2 + item.sk.length * 2 + dataSize + 8 + 64;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -547,7 +541,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
                 hk TEXT NOT NULL,
-                sk TEXT,
+                sk TEXT NOT NULL DEFAULT '',
                 data ANY NOT NULL,
                 ttl_epoch_utc_seconds INTEGER,
                 v INTEGER NOT NULL,

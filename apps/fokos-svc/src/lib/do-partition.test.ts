@@ -14,13 +14,13 @@ describe("PartitionDO - putItem / getItem", () => {
 		const result = await stub.getItem(ctx, { hashKey: "missing", sortKey: "sk" });
 		expect(result).toEqual({
 			found: false,
-			forwarded: 0,
 			meta: {
 				rowsRead: 0,
 				rowsWritten: 0,
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
 				servedByActorName: expect.stringMatching(/^test\..+/),
+				forwardCount: 0,
 			},
 		});
 	});
@@ -146,6 +146,65 @@ describe("PartitionDO - putItem / getItem", () => {
 			},
 		});
 	});
+
+	describe("TTL", () => {
+		it("stores and returns ttlEpochUTCSeconds when set on put", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+			const ttl = Math.floor(Date.now() / 1000) + 3600;
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val", ttlEpochUTCSeconds: ttl });
+			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+			expect(result).toMatchObject({ found: true, ttlEpochUTCSeconds: ttl });
+		});
+
+		it("ttlEpochUTCSeconds is absent when not set on put", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val" });
+			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+			expect(result).toMatchObject({ found: true });
+			if (result.found) expect(result.ttlEpochUTCSeconds).toBeUndefined();
+		});
+
+		it("clears ttlEpochUTCSeconds when an item is overwritten without TTL", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+			const ttl = Math.floor(Date.now() / 1000) + 3600;
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", ttlEpochUTCSeconds: ttl });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+			expect(result).toMatchObject({ found: true, data: "v2" });
+			if (result.found) expect(result.ttlEpochUTCSeconds).toBeUndefined();
+		});
+	});
+
+	it("stores and retrieves an item with no sortKey", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
+		const result = await stub.getItem(ctx, { hashKey: "hk" });
+
+		expect(result).toMatchObject({ found: true, hashKey: "hk", data: "no-sort" });
+		if (result.found) expect(result.sortKey).toBeUndefined();
+	});
+
+	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort" });
+
+		const r1 = await stub.getItem(ctx, { hashKey: "hk" });
+		const r2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+		const rMiss = await stub.getItem(ctx, { hashKey: "hk", sortKey: "other" });
+
+		expect(r1).toMatchObject({ found: true, data: "no-sort" });
+		expect(r2).toMatchObject({ found: true, data: "with-sort" });
+		expect(rMiss.found).toBe(false);
+	});
 });
 
 describe("PartitionDO - splitting", () => {
@@ -171,6 +230,28 @@ describe("PartitionDO - splitting", () => {
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
 		expect(splitStatus?.status).toBe("split_queued");
+	});
+
+	it("preserves split_queued status across subsequent writes before the alarm fires", async ({ expect }) => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+		// Both writes run inside the DO's execution context so the background alarm
+		// cannot fire between them, letting us assert the pre-alarm queued state.
+		await runInDurableObject(stub, async (instance: PartitionDO) => {
+			await instance.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk1",
+				data: "x".repeat(1 * 1024 * 1024 + 10),
+			});
+
+			const { splitStatus: after1 } = await instance.status();
+			expect(after1?.status).toBe("split_queued");
+
+			await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "small" });
+
+			const { splitStatus: after2 } = await instance.status();
+			expect(after2?.status).toBe("split_queued");
+		});
 	});
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
@@ -299,7 +380,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	describe("forwarding during splits", async () => {
-		it("forwards putItem and getItem to a child after split, reporting forwarded=1 and consistent servedByActorName", async ({
+		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,
 		}) => {
 			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
@@ -313,15 +394,27 @@ describe("PartitionDO - splitting", () => {
 
 			const hashKey = "forwarded-key";
 			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val" });
-			expect(putResult.forwarded).toBe(1);
+			expect(putResult.meta.forwardCount).toBe(1);
 			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
 			expect(childNames).toContain(putResult.meta.servedByActorName);
 
 			const getResult = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
 			expect(getResult.found).toBe(true);
-			expect(getResult.forwarded).toBe(1);
+			expect(getResult.meta.forwardCount).toBe(1);
 			// Same child serves both the write and the subsequent read.
 			expect(getResult.meta.servedByActorName).toBe(putResult.meta.servedByActorName);
+		});
+
+		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await drainSplitTree(stub);
+
+			const result = await stub.getItem(ctx, { hashKey: "definitely-missing", sortKey: "sk" });
+			expect(result.found).toBe(false);
+			expect(result.meta.forwardCount).toBe(1);
+			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
 		});
 	});
 
@@ -372,7 +465,7 @@ describe("PartitionDO - splitting", () => {
 				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
 				if (result.found) {
 					servedByActorNames.add(result.meta.servedByActorName);
-					expect(result.forwarded, "root reads should have been forwarded at least once").toBeGreaterThan(2);
+					expect(result.meta.forwardCount, "root reads should have been forwarded at least once").toBeGreaterThan(2);
 				}
 			}
 
@@ -445,6 +538,12 @@ describe("PartitionDO - splitting", () => {
 			const finalSplit = finalParent.splitStatus as SplitStartedOrCompleted;
 			expect(finalSplit.migratedChildDoNames).toHaveLength(10);
 
+			// All migrations complete: root successfully forwards each item to the correct child.
+			for (const item of seedItems) {
+				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				expect(result).toMatchObject({ found: true, data: item.data, meta: { forwardCount: 1 } });
+			}
+
 			// Every seed item is found in exactly one child with the correct data.
 			const foundIds = new Set<string>();
 			for (const item of seedItems) {
@@ -463,6 +562,51 @@ describe("PartitionDO - splitting", () => {
 			}
 			// This might be flaky - but ideally we should have items across more than 1 children.
 			expect(foundIds.size).toBeGreaterThan(1);
+		});
+
+		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
+			const seedItems = [
+				{ hashKey: "alpha", sortKey: undefined, data: "data-alpha-nosort" },
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-s1" },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
+				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1" },
+				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1" },
+			];
+			for (const item of seedItems) {
+				await stub.putItem(ctx, item);
+			}
+
+			// Trigger split and run parent alarm.
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await waitForAlarm(stub);
+
+			// Force 1-item batches on the parent so every item requires its own cursor-paginated round trip.
+			// estimateItemBytes always returns >> 1 byte, so the batch fills after the first item each time.
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				instance.__testing__migrationBatchLimitBytes = 1;
+			});
+
+			// Run all children's migrations.
+			const parentState = await stub.status();
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			for (const childCtx of childContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
+				await waitForAlarm(childStub);
+				const state = await childStub.status();
+				expect(state.migrationStatus).toBe("migration_completed");
+			}
+
+			// Every item is reachable through root via forwarding.
+			for (const item of seedItems) {
+				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				expect(result).toMatchObject({ found: true, meta: { forwardCount: 1 }, data: item.data });
+			}
+
+			await assertSplitTreeComplete(stub);
 		});
 	});
 });
