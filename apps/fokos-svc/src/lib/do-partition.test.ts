@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, it, vi } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
 import { PartitionContextCreator, PartitionTopologyRouterImpl } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
@@ -299,8 +299,29 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	describe("forwarding during splits", async () => {
-		it("forwards requests to children after split starts", async ({ expect }) => {
-			// TODO
+		it("forwards putItem and getItem to a child after split, reporting forwarded=1 and consistent servedByActorName", async ({
+			expect,
+		}) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+			// Trigger the split condition and drain the tree so all migrations complete.
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await drainSplitTree(stub);
+
+			const childNames = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2).map((c) => c.doName);
+
+			const hashKey = "forwarded-key";
+			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val" });
+			expect(putResult.forwarded).toBe(1);
+			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
+			expect(childNames).toContain(putResult.meta.servedByActorName);
+
+			const getResult = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(getResult.found).toBe(true);
+			expect(getResult.forwarded).toBe(1);
+			// Same child serves both the write and the subsequent read.
+			expect(getResult.meta.servedByActorName).toBe(putResult.meta.servedByActorName);
 		});
 	});
 
@@ -358,20 +379,6 @@ describe("PartitionDO - splitting", () => {
 			// With 100 items and splitN=3, the tree reaches ~4 levels deep (~16 leaf DOs).
 			// Even with hash skew, at least 4 distinct instances must serve reads.
 			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(4);
-
-			// Recursively walk the entire split tree and assert every non-leaf node reached
-			// split_completed, confirming correctness at every level of the hierarchy.
-			async function assertSplitTreeComplete(nodeStub: DurableObjectStub<PartitionDO>): Promise<number> {
-				const state = await nodeStub.status();
-				if (!state.splitStatus) return 0;
-				expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
-				const split = state.splitStatus as SplitStartedOrCompleted;
-				let count = 1;
-				for (const childCtx of split.childPartitionContexts) {
-					count += await assertSplitTreeComplete(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName)));
-				}
-				return count;
-			}
 
 			const totalSplitNodes = await assertSplitTreeComplete(stub);
 			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
@@ -461,40 +468,41 @@ describe("PartitionDO - splitting", () => {
 });
 
 describe("PartitionDO - partitionId encoding", () => {
-	it("hex bytes encode depth+hashIdxs correctly and _partitionIdBytes is cached in the DO", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+	it("encodes root and child partition IDs as depth-prefixed byte arrays with text doNames", ({ expect }) => {
+		const { ctx } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
 		// Root: [depth=1, hashIdx=0]
-		const rootBytes = Uint8Array.fromHex(ctx.partitionId);
-		expect(rootBytes).toEqual(new Uint8Array([1, 0]));
+		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([1, 0]));
 
-		// After the first request ensurePartitionContext stores the context with _partitionIdBytes populated.
+		// Children: [depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
+		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
+		for (let i = 0; i < children.length; i++) {
+			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([2, 0, i]));
+			expect(children[i].doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
+		}
+	});
+
+	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v" });
 		const rootState = await stub.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-		expect(rootState.partitionContext?._partitionIdBytes).toEqual(rootBytes);
+		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(ctx.partitionId));
 
-		// Trigger a split so we can verify child IDs.
+		// Trigger a split so children are initialized with their own cached bytes.
 		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk2", data: "x".repeat(1 * 1024 * 1024 + 10) });
 		await waitForAlarm(stub);
 
 		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
-		for (let i = 0; i < children.length; i++) {
-			const child = children[i];
-
-			// Child: [depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
-			const childBytes = Uint8Array.fromHex(child.partitionIdOpaque);
-			expect(childBytes).toEqual(new Uint8Array([2, 0, i]));
-
-			// doName encodes the same path as text.
-			expect(child.doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
-
-			// _partitionIdBytes is also cached inside each child DO after initFromSplit.
+		for (const child of children) {
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
 			const childState = await childStub.status();
 			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-			expect(childState.partitionContext?._partitionIdBytes).toEqual(childBytes);
+			expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.partitionIdOpaque));
 		}
 	});
 });
@@ -536,6 +544,22 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 
 		await drainSplitTree(childStub);
 	}
+}
+
+/**
+ * Recursively walks the split tree rooted at `nodeStub` and asserts every node that has split
+ * has reached split_completed. Returns the count of split nodes (non-leaf nodes).
+ */
+async function assertSplitTreeComplete(nodeStub: DurableObjectStub<PartitionDO>): Promise<number> {
+	const state = await nodeStub.status();
+	if (!state.splitStatus) return 0;
+	expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
+	const split = state.splitStatus as SplitStartedOrCompleted;
+	let count = 1;
+	for (const childCtx of split.childPartitionContexts) {
+		count += await assertSplitTreeComplete(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName)));
+	}
+	return count;
 }
 
 function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
