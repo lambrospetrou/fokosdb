@@ -379,6 +379,28 @@ describe("PartitionDO - splitting", () => {
 		expect(splitStatus?.createdAt).toBeTypeOf("number");
 	});
 
+	it("alarm with no split queued and no migration in progress does nothing", async ({ expect }) => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });
+
+		// Write something small — well below the split threshold — to initialize the partition context.
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
+
+		// No split should have been queued.
+		const { splitStatus: before } = await stub.status();
+		expect(before).toBeUndefined();
+
+		// Manually schedule an alarm to simulate a stale alarm (e.g. after a crash with no pending work).
+		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
+			await ctx.storage.setAlarm(Date.now());
+		});
+
+		// The alarm must complete without throwing, and leave the partition unchanged.
+		await expect(waitForAlarm(stub)).resolves.not.toThrow();
+
+		const { splitStatus: after } = await stub.status();
+		expect(after).toBeUndefined();
+	});
+
 	describe("forwarding during splits", async () => {
 		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,

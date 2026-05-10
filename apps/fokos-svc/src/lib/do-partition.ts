@@ -320,7 +320,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				return;
 			}
 
-			// FIXME Add a special flag in KV for this too, to allow future alarm uses too.
+			if (splitStatus?.status !== "split_queued") {
+				console.log({
+					...this.logParams(),
+					message: "fokos/partition: Alarm fired but no split is queued, nothing to do.",
+					splitStatus,
+				});
+				return;
+			}
 			console.log({
 				...this.logParams(),
 				message: "fokos/partition: Running split process.",
