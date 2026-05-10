@@ -38,7 +38,8 @@ export type PartitionContextResolved = PartitionContext & {
 	primaryDoIdStr: string;
 
 	// Opaque ID used internally to identify the partition.
-	// Hex-encoded bytes: [depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	// Hex-encoded bytes: [schemaVersion u8, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	// schemaVersion=0 is the current format.
 	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
 	partitionId: PartitionNodeId;
 
@@ -47,7 +48,7 @@ export type PartitionContextResolved = PartitionContext & {
 };
 
 // PartitionNodeId is re-exported from ./types.js above.
-// Hex-encoded bytes: [depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+// Hex-encoded bytes: [schemaVersion u8, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8]. schemaVersion=0 is the current format.
 
 export type SplitConditions = {
 	/**
@@ -191,9 +192,10 @@ class PartitionIdHelper {
 	}
 
 	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
-		const bytes = new Uint8Array(1 + hashIdxs.length);
-		bytes[0] = hashIdxs.length;
-		for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
+		const bytes = new Uint8Array(2 + hashIdxs.length);
+		bytes[0] = 0; // schema version
+		bytes[1] = hashIdxs.length;
+		for (let i = 0; i < hashIdxs.length; i++) bytes[i + 2] = hashIdxs[i];
 		return new PartitionIdHelper(basePartitionContext, bytes);
 	}
 
@@ -224,15 +226,17 @@ class PartitionIdHelper {
 		if (!this.#bytes && this.#appendedHashIdxs.length === 0) {
 			throw new Error("No bytes or appended hash indexes to encode");
 		}
-		const bytes = new Uint8Array((this.#bytes?.length ?? 1) + this.#appendedHashIdxs.length);
+		const bytes = new Uint8Array((this.#bytes?.length ?? 2) + this.#appendedHashIdxs.length);
 		if (this.#bytes) bytes.set(this.#bytes, 0);
-		const bsz = this.#bytes?.length ?? 1;
-		bytes[0] = bsz - 1 + this.#appendedHashIdxs.length;
+		else bytes[0] = 0; // schema version
+		const bsz = this.#bytes?.length ?? 2;
+		// bytes[0] is the schema version — leave it unchanged.
+		bytes[1] = bsz - 2 + this.#appendedHashIdxs.length;
 		for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
 		let doName: string | undefined;
 		if (includeDoName) {
-			// Skip the first byte which is the number of following hash indexes, then take the hash idxs to construct the DO name.
-			const hIdxs = bytes.subarray(1, 1 + bytes[0]);
+			// bytes[0]=version, bytes[1]=depth; extract hash indexes that follow.
+			const hIdxs = bytes.subarray(2, 2 + bytes[1]);
 			doName = PartitionIdHelper.doName(this.basePartitionContext, hIdxs);
 		}
 		return { bytes, opaque: bytes.toHex(), doName };
@@ -296,9 +300,9 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean {
 		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
-		// The first byte is the depth (including root level).
-		const childLevel = childPartitionIdBytes[0];
-		const childIdx = childPartitionIdBytes[childLevel];
+		// bytes[0]=version, bytes[1]=depth; hash indexes start at bytes[2].
+		const childLevel = childPartitionIdBytes[1];
+		const childIdx = childPartitionIdBytes[1 + childLevel];
 		return (hashKey: string, sortKey?: string) => {
 			const hashedIdx = this.hash(hashKey + childLevel, childContext.hashSplitConditions.splitN);
 			return hashedIdx === childIdx;
@@ -313,7 +317,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
-		const hChildIdx = this.hash(hashKey + (partitionIdBytes[0] + 1), partitionContext.hashSplitConditions.splitN);
+		const hChildIdx = this.hash(hashKey + (partitionIdBytes[1] + 1), partitionContext.hashSplitConditions.splitN);
 		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, partitionIdBytes).appendHashIdx(hChildIdx).encode(true);
 		assertExists(doName);
 

@@ -4,7 +4,6 @@ FokosDB: A global strongly-consistent key-value database ontop of Cloudflare Dur
 
 ## TODO
 
-- Add schema versioning in partitionId.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of child partitions.
 - Add range partitions (routing and splitting).

@@ -616,13 +616,13 @@ describe("PartitionDO - partitionId encoding", () => {
 		const { ctx } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
-		// Root: [depth=1, hashIdx=0]
-		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([1, 0]));
+		// Root: [version=0, depth=1, hashIdx=0]
+		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 1, 0]));
 
-		// Children: [depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
+		// Children: [version=0, depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
 		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
 		for (let i = 0; i < children.length; i++) {
-			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([2, 0, i]));
+			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 2, 0, i]));
 			expect(children[i].doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
 		}
 	});
