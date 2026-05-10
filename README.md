@@ -4,11 +4,15 @@ FokosDB: A global strongly-consistent key-value database ontop of Cloudflare Dur
 
 ## TODO
 
+- Add versioning in partitionId.
+- Add topology keeper and encoding. Schema and versioning per change (split).
+- Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of child partitions.
 - Add range partitions (routing and splitting).
-- Add partial topology caching in worker passed from response.
-- Add topology encoding.
-- Add topology keeper and propagation to workers (Workers KV).
 - Make splitting and migration non-blocking. (Not needed when we get the Durable Objects forking/cloning API)
+- Add WAE metrics per request, per split.
+- Add large items through R2.
+- Add conditional writes.
+- Add distributed transactions (CASPaxos, Paxos Commit).
 
 ## FAQ
 
