@@ -10,7 +10,6 @@ declare namespace Cloudflare {
 	interface Env {
 		MY_DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").MyDurableObject>;
 		PARTITION_DO: DurableObjectNamespace<import("./src/lib/do-partition").PartitionDO>;
-		TOPOLOGY_KEEPER_DO: DurableObjectNamespace<import("./src/lib/partition-topology/do-topology-keeper").TopologyKeeperDO>;
 	}
 }
 interface Env extends Cloudflare.Env {}

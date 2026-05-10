@@ -140,23 +140,25 @@ describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });
 
-		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
 
-		expect(result.__debug?.splitStatus).toBeUndefined();
+		const { splitStatus } = await stub.status();
+		expect(splitStatus).toBeUndefined();
 	});
 
 	it("sets split_pending status when data exceeds maxSizeMb", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
 
-		const result = await stub.putItem(ctx, {
+		await stub.putItem(ctx, {
 			hashKey: `hk.${stub.id.name!}`,
 			sortKey: "sk",
 			// Slightly over 1 MB to trigger the split condition.
 			data: "x".repeat(1 * 1024 * 1024 + 10),
 		});
 
-		expect(result.__debug?.splitStatus).toBeDefined();
-		expect(result.__debug?.splitStatus?.status).toBe("split_queued");
+		const { splitStatus } = await stub.status();
+		expect(splitStatus).toBeDefined();
+		expect(splitStatus?.status).toBe("split_queued");
 	});
 
 	it("preserves split_queued status across subsequent writes", async ({ expect }) => {
@@ -169,8 +171,9 @@ describe("PartitionDO - splitting", () => {
 			data: "x".repeat(1 * 1024 * 1024 + 10),
 		});
 
-		const followUp = await stub.putItem(ctx, { hashKey, sortKey: "sk2", data: "small" });
-		expect(followUp.__debug?.splitStatus?.status).toBe("split_queued");
+		await stub.putItem(ctx, { hashKey, sortKey: "sk2", data: "small" });
+		const { splitStatus } = await stub.status();
+		expect(splitStatus?.status).toBe("split_queued");
 	});
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
@@ -185,7 +188,7 @@ describe("PartitionDO - splitting", () => {
 		});
 		await waitForAlarm(stub);
 
-		const parentState = await stub.__internalState();
+		const parentState = await stub.status();
 		expect(parentState.splitStatus?.status).toBe("split_started");
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: ctx.nsPrefix });
 
@@ -194,7 +197,7 @@ describe("PartitionDO - splitting", () => {
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(name));
-			const childState = await childStub.__internalState();
+			const childState = await childStub.status();
 
 			expect(childState.partitionContext).toMatchObject({
 				ns: "PARTITION_DO",
@@ -225,7 +228,7 @@ describe("PartitionDO - splitting", () => {
 		await expect(childStub.initFromSplit(opts)).resolves.not.toThrow();
 
 		// State must reflect the first (and only) initialization.
-		const state = await childStub.__internalState();
+		const state = await childStub.status();
 		expect(state.partitionContext?.primaryDoIdStr).toBe(childCtx.primaryDoIdStr);
 		expect(state.parentPartitionContext?.primaryDoIdStr).toBe(parentCtx.primaryDoIdStr);
 		expect(state.parentSplitType).toBe("hash");
@@ -361,7 +364,7 @@ describe("PartitionDO - splitting", () => {
 			// Recursively walk the entire split tree and assert every non-leaf node reached
 			// split_completed, confirming correctness at every level of the hierarchy.
 			async function assertSplitTreeComplete(nodeStub: DurableObjectStub<PartitionDO>): Promise<number> {
-				const state = await nodeStub.__internalState();
+				const state = await nodeStub.status();
 				if (!state.splitStatus) return 0;
 				expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
 				const split = state.splitStatus as SplitStartedOrCompleted;
@@ -398,7 +401,7 @@ describe("PartitionDO - splitting", () => {
 			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
 			await waitForAlarm(stub);
 
-			const parentState = await stub.__internalState();
+			const parentState = await stub.status();
 			expect(parentState.splitStatus?.status).toBe("split_started");
 			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
@@ -406,7 +409,7 @@ describe("PartitionDO - splitting", () => {
 			// Each child is initialized but migration has not started yet.
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-				const state = await childStub.__internalState();
+				const state = await childStub.status();
 				expect(state.migrationStatus).toBe("migration_initialized");
 			}
 
@@ -427,12 +430,12 @@ describe("PartitionDO - splitting", () => {
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 				await waitForAlarm(childStub);
-				const state = await childStub.__internalState();
+				const state = await childStub.status();
 				expect(state.migrationStatus).toBe("migration_completed");
 			}
 
 			// Parent acknowledges all children and transitions to split_completed.
-			const finalParent = await stub.__internalState();
+			const finalParent = await stub.status();
 			expect(finalParent.splitStatus?.status).toBe("split_completed");
 			const finalSplit = finalParent.splitStatus as SplitStartedOrCompleted;
 			expect(finalSplit.migratedChildDoNames).toHaveLength(10);
@@ -470,7 +473,7 @@ describe("PartitionDO - partitionId encoding", () => {
 
 		// After the first request ensurePartitionContext stores the context with _partitionIdBytes populated.
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v" });
-		const rootState = await stub.__internalState();
+		const rootState = await stub.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
 		expect(rootState.partitionContext?._partitionIdBytes).toEqual(rootBytes);
 
@@ -491,7 +494,7 @@ describe("PartitionDO - partitionId encoding", () => {
 
 			// _partitionIdBytes is also cached inside each child DO after initFromSplit.
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
-			const childState = await childStub.__internalState();
+			const childState = await childStub.status();
 			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
 			expect(childState.partitionContext?._partitionIdBytes).toEqual(childBytes);
 		}
@@ -518,7 +521,7 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
  */
 async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<void> {
 	await waitForAlarm(stub);
-	const state = await stub.__internalState();
+	const state = await stub.status();
 
 	if (!state.splitStatus || state.splitStatus.status === "split_queued") return;
 
@@ -528,7 +531,7 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 
 		// A child in migration_initialized has no alarm yet; any request to it transitions
 		// it to migration_migrating and schedules the alarm. The error is expected.
-		const childState = await childStub.__internalState();
+		const childState = await childStub.status();
 		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
 			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
 		}

@@ -52,21 +52,4 @@ describe("fokosdb", async () => {
 			},
 		});
 	});
-
-	it("should route to the right partition DO", async ({ expect }) => {
-		const db = new FokosDB({
-			ns: env.PARTITION_DO,
-			topology: new PartitionTopologyRouterImpl("encoded-topology", {
-				...testSplitOptions,
-			}),
-		});
-
-		const res = await db.putItem({
-			hashKey: "hk1",
-			sortKey: "sk1",
-			// >1MB to trigger the condition for the split.
-			data: "x".repeat(1 * 1024 * 1024 + 10),
-		});
-		expect(res.__debug?.splitStatus).toBeDefined();
-	});
 });

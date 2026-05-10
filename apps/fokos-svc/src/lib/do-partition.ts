@@ -169,7 +169,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
 					throw new Error(`fokos/partition: putItem: unexpected version value: ${version}`);
 				}
-				const splitStatus = await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
+				await this.checkSplits(ctx, opts.hashKey, opts.sortKey);
 				return {
 					version,
 					meta: {
@@ -178,7 +178,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						databaseSize: this.ctx.storage.sql.databaseSize,
 						servedByInstance: this.ctx.id.toString(),
 					},
-					__debug: { splitStatus },
 				};
 			},
 		});
@@ -272,21 +271,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensureTopology(this.pCtx()).acknowledgeChildMigration(childDoName);
 	}
 
+	/**
+	 * INTERNAL ONLY FOR TESTING.
+	 */
 	async status() {
-		const splitStatus = this.ensureTopology(this.pCtx()).splitStatus();
 		return {
-			splitStatus,
-		};
-	}
-
-	async __internalState() {
-		const partitionContext = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
-		return {
-			partitionContext,
+			partitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
+			splitStatus: this.ensureTopology(this.pCtx()).splitStatus(),
+			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
-			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
-			splitStatus: partitionContext ? this.ensureTopology(partitionContext).splitStatus() : undefined,
 		};
 	}
 

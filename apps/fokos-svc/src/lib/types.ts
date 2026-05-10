@@ -17,7 +17,6 @@ export type PutItemOptions = {
 export type PutItemResult = {
 	version: number;
 	meta: OperationMetrics & PartitionInfo & {};
-	__debug?: DebugInfo;
 };
 
 export interface ItemGetter {
@@ -40,13 +39,9 @@ export type GetItemResult =
 			version: number;
 
 			meta: OperationMetrics & PartitionInfo & {};
-
-			__debug?: DebugInfo;
 	  }
 	| {
 			found: false;
-
-			__debug?: DebugInfo;
 	  };
 
 export type PartitionInfo = {
@@ -62,6 +57,3 @@ export type OperationMetrics = {
 	};
 };
 
-export type DebugInfo = {
-	splitStatus?: Record<string, any>;
-};
