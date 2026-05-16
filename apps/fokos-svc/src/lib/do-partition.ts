@@ -43,6 +43,7 @@ type GetItemsBatchResult = {
 type ParentPartitionDOStub = {
 	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
+	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
 };
 
 export class PartitionRpcTarget extends RpcTarget {
@@ -188,43 +189,29 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async getItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration();
+
+		if (await this.ensureMigration(false)) {
+			// Read directly from parent while this child is still migrating its share of the data.
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
+			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
+			const parentStub = this.env[parentCtx.ns].get(parentId);
+			return await parentStub.getItemDirect(opts);
+		}
+
 		return await this.withSplitForwarding<GetItemResult>({
 			ctx: pCtx,
 			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 			operationName: "getItem",
 			forward: async (stub, pCtx) => await stub.getItem(pCtx, opts),
-			local: async () => {
-				const res = this.ctx.storage.sql.exec<{
-					data: string | ArrayBuffer;
-					ttl_epoch_utc_seconds: number | null;
-					v: number;
-				}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
-				const rows = res.toArray();
-				const { rowsRead, rowsWritten } = res;
-				const result = rows[0];
-				const actorMeta = {
-					rowsRead,
-					rowsWritten,
-					databaseSize: this.ctx.storage.sql.databaseSize,
-					servedByActorId: this.ctx.id.toString(),
-					servedByActorName: pCtx.doName,
-					forwardCount: 0,
-				};
-				if (!result) {
-					return { found: false, meta: actorMeta };
-				}
-				return {
-					found: true,
-					hashKey: opts.hashKey,
-					sortKey: opts.sortKey || undefined,
-					data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
-					ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
-					version: result.v,
-					meta: actorMeta,
-				};
-			},
+			local: async () => await this.readItemLocally(pCtx, opts),
 		});
+	}
+
+	// Internal RPC: reads directly from local storage, bypassing split forwarding.
+	// Called by child partitions during migration to avoid a forwarding loop back into the child.
+	async getItemDirect(opts: GetItemOptions): Promise<GetItemResult> {
+		return await this.readItemLocally(this.pCtx(), opts);
 	}
 
 	async getItemsBatch(opts: {
@@ -396,11 +383,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_topology;
 	}
 
-	private async ensureMigration(): Promise<void> {
+	private async ensureMigration(throwIfMigrating = true): Promise<boolean> {
 		// TODO Optimize this away by keeping it in memory.
 		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 		if (!migrationStatus || migrationStatus === "migration_completed") {
-			return;
+			return false;
 		}
 		if (migrationStatus === "migration_initialized") {
 			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
@@ -409,9 +396,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!(await this.ctx.storage.getAlarm())) {
 			await this.ctx.storage.setAlarm(Date.now());
 		}
-		// TODO This will reach user requests, so refactor the callers to show something nicer.
-		// We can also consider doing a selective migration of the requested keys only.
-		throw new Error("fokos/partition: Partition split in progress, please retry later.");
+		if (throwIfMigrating) {
+			// TODO This will reach user requests, so refactor the callers to show something nicer.
+			// We can also consider doing a selective migration of the requested keys only.
+			throw new Error("fokos/partition: Partition split in progress, please retry later.");
+		}
+		return true;
 	}
 
 	private async withSplitForwarding<T extends { meta: { forwardCount: number } }>(opts: {
@@ -446,6 +436,37 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				invariant(false, `fokos/partition.withSplitForwarding: unexpected decision value: ${_exhaustive}`);
 			}
 		}
+	}
+
+	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
+		const res = this.ctx.storage.sql.exec<{
+			data: string | ArrayBuffer;
+			ttl_epoch_utc_seconds: number | null;
+			v: number;
+		}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
+		const rows = res.toArray();
+		const { rowsRead, rowsWritten } = res;
+		const result = rows[0];
+		const actorMeta = {
+			rowsRead,
+			rowsWritten,
+			databaseSize: this.ctx.storage.sql.databaseSize,
+			servedByActorId: this.ctx.id.toString(),
+			servedByActorName: pCtx.doName,
+			forwardCount: 0,
+		};
+		if (!result) {
+			return { found: false, meta: actorMeta };
+		}
+		return {
+			found: true,
+			hashKey: opts.hashKey,
+			sortKey: opts.sortKey || undefined,
+			data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
+			ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+			version: result.v,
+			meta: actorMeta,
+		};
 	}
 
 	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {

@@ -501,7 +501,7 @@ describe("PartitionDO - splitting", () => {
 	}, 30_000);
 
 	describe("migration", () => {
-		it("rejects requests to child while migrating, migrates all data to the correct child, and completes", async ({ expect }) => {
+		it("reads during migration are served from the parent; writes are rejected; all data migrated correctly", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 10, maxSizeMb: 1 } });
 
 			// Seed items with varied hash keys so they spread across children.
@@ -533,15 +533,16 @@ describe("PartitionDO - splitting", () => {
 				expect(state.migrationStatus).toBe("migration_initialized");
 			}
 
-			// Requests to children are rejected while migration is in progress.
-			// The first request also transitions the child to migration_migrating and schedules the alarm.
+			// Reads during migration are served from the parent — each child is still in
+			// migration_initialized with no alarm yet, so the first getItem triggers a
+			// read-through before migration can start. We test one item per child; testing
+			// more would risk the alarm completing between calls (making later reads hit the
+			// child's empty local DB instead of the parent).
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-				await expect(
-					runInDurableObject(childStub, async (instance: PartitionDO) => {
-						return instance.getItem(childCtx, { hashKey: "any", sortKey: "any" });
-					}),
-				).rejects.toThrow("split in progress");
+				const result = await childStub.getItem(childCtx, { hashKey: "alpha", sortKey: "s1" });
+				expect(result).toMatchObject({ found: true, data: "data-alpha-1" });
+				expect(result.meta.servedByActorName).toBe(ctx.doName); // parent served, confirming read-through
 			}
 
 			// Run each child's migration alarm.
@@ -584,6 +585,38 @@ describe("PartitionDO - splitting", () => {
 			}
 			// This might be flaky - but ideally we should have items across more than 1 children.
 			expect(foundIds.size).toBeGreaterThan(1);
+		});
+
+		it("putItem is rejected while migration is in progress", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1" });
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await waitForAlarm(stub);
+
+			// After the parent alarm, children are in migration_initialized with no alarm yet.
+			const parentState = await stub.status();
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childCtx = childContexts[0];
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+
+			// Both writes run inside the DO's execution context so the migration alarm cannot
+			// fire between them, letting us assert rejection in both migration states.
+			await runInDurableObject(childStub, async (instance: PartitionDO) => {
+				// migration_initialized → rejected, transitions to migration_migrating and schedules alarm.
+				await expect(
+					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value" }),
+				).rejects.toThrow("split in progress");
+
+				// migration_migrating → also rejected.
+				await expect(
+					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value-2" }),
+				).rejects.toThrow("split in progress");
+			});
+
+			// The second rejected putItem already scheduled the migration alarm; drain it and verify completion.
+			await waitForAlarm(childStub);
+			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
 		});
 
 		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
@@ -629,6 +662,18 @@ describe("PartitionDO - splitting", () => {
 			}
 
 			await assertSplitTreeComplete(stub);
+		});
+
+		it("getItemDirect bypasses split forwarding and reads from local storage", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "direct-value" });
+
+			const result = await stub.getItemDirect({ hashKey: "hk", sortKey: "sk" });
+			expect(result).toMatchObject({ found: true, data: "direct-value" });
+
+			const miss = await stub.getItemDirect({ hashKey: "missing", sortKey: "sk" });
+			expect(miss.found).toBe(false);
 		});
 	});
 });
