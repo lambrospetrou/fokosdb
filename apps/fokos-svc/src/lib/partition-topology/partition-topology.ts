@@ -674,6 +674,28 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			],
 		});
 
+		// Kick off migration on each child immediately so it doesn't wait for the first user request.
+		// Fire-and-forget: failures are logged but do not fail startSplit — the child will
+		// start migrating on its first incoming request if this doesn't reach it.
+		this.ctx.waitUntil(
+			Promise.all(
+				childPartitionContexts.map(async (childContext) => {
+					try {
+						const doId = env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName!);
+						const childDo = env[childContext.newPartitionContext.ns].get(doId);
+						await childDo.triggerMigration();
+					} catch (error) {
+						console.error({
+							message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
+							error: String(error),
+							errorProps: error,
+							childDoName: childContext.newPartitionContext.doName,
+						});
+					}
+				}),
+			),
+		);
+
 		// TODO Notify the TopologyKeeperDO that the split has started.
 		// We don't want this to be in the hot path of the split to allow as many partitions as necessary to do their splits.
 		// The TopologyKeeperDO can be updated asynchronously since the partitions know their topology (if they have children)

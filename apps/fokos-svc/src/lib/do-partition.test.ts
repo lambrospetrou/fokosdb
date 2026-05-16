@@ -526,28 +526,9 @@ describe("PartitionDO - splitting", () => {
 			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
 
-			// Each child is initialized but migration has not started yet.
-			for (const childCtx of childContexts) {
-				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-				const state = await childStub.status();
-				expect(state.migrationStatus).toBe("migration_initialized");
-			}
-
-			// Reads during migration are served from the parent — each child is still in
-			// migration_initialized with no alarm yet, so the first getItem triggers a
-			// read-through before migration can start. We test one item per child; testing
-			// more would risk the alarm completing between calls (making later reads hit the
-			// child's empty local DB instead of the parent).
-			for (const childCtx of childContexts) {
-				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-				const result = await childStub.getItem(childCtx, { hashKey: "alpha", sortKey: "s1" });
-				expect(result).toMatchObject({ found: true, data: "data-alpha-1" });
-				expect(result.meta.servedByActorName).toBe(ctx.doName); // parent served, confirming read-through
-			}
-
 			// Run each child's migration alarm.
-			// Note: miniflare fires alarms set to Date.now() automatically in the background, so
-			// the alarm may already be running or complete by the time we reach here. waitForAlarm handles both.
+			// startSplit fire-and-forget already triggered migration on each child, so their alarms
+			// may already be running or complete by the time we reach here. waitForAlarm handles both.
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 				await waitForAlarm(childStub);
@@ -592,30 +573,90 @@ describe("PartitionDO - splitting", () => {
 
 			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1" });
 			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+
+			// Pre-install the gate on all child partitions before the parent alarm fires.
+			// The child DO names are deterministic, and miniflare keeps the same instance when
+			// initFromSplit + triggerMigration are called during the parent alarm — so the hook
+			// is already in place when runMigration runs, blocking it before migration_completed.
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			let releaseMigration!: () => void;
+			const migrationGate = new Promise<void>((resolve) => {
+				releaseMigration = resolve;
+			});
+			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN)) {
+				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
+					instance.__testing__beforeMigrationComplete = () => migrationGate;
+				});
+			}
+
 			await waitForAlarm(stub);
 
-			// After the parent alarm, children are in migration_initialized with no alarm yet.
 			const parentState = await stub.status();
 			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
 			const childCtx = childContexts[0];
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 
-			// Both writes run inside the DO's execution context so the migration alarm cannot
-			// fire between them, letting us assert rejection in both migration states.
-			await runInDurableObject(childStub, async (instance: PartitionDO) => {
-				// migration_initialized → rejected, transitions to migration_migrating and schedules alarm.
-				await expect(
+			// Call putItem directly on the instance (not via RPC stub) so the error stays local.
+			// Going through the stub would cause workerd to log the remote throw as an uncaught
+			// exception, which Vitest surfaces as an unhandled rejection even though we catch it.
+			await expect(
+				runInDurableObject(childStub, (instance: PartitionDO) =>
 					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value" }),
-				).rejects.toThrow("split in progress");
+				),
+			).rejects.toThrow("split in progress");
 
-				// migration_migrating → also rejected.
-				await expect(
-					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value-2" }),
-				).rejects.toThrow("split in progress");
+			releaseMigration();
+			for (const { doName } of childContexts) {
+				await waitForAlarm(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)));
+			}
+			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
+		});
+
+		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+
+			const seedItems = [
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1" },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
+			];
+			for (const item of seedItems) {
+				await stub.putItem(ctx, item);
+			}
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+
+			// Pre-install gate on all children before the parent alarm fires.
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			let releaseMigration!: () => void;
+			const migrationGate = new Promise<void>((resolve) => {
+				releaseMigration = resolve;
 			});
+			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN)) {
+				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
+					instance.__testing__beforeMigrationComplete = () => migrationGate;
+				});
+			}
 
-			// The second rejected putItem already scheduled the migration alarm; drain it and verify completion.
-			await waitForAlarm(childStub);
+			await waitForAlarm(stub);
+
+			const parentState = await stub.status();
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childCtx = childContexts[0];
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+
+			// Child migration is blocked at the gate — verify it is still migrating.
+			expect((await childStub.status()).migrationStatus).toBe("migration_migrating");
+
+			// While migration is in progress, getItem on the child must read through to the parent
+			// so callers can read data that has not yet been copied to the child.
+			for (const item of seedItems) {
+				const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				expect(result).toMatchObject({ found: true, data: item.data });
+			}
+
+			releaseMigration();
+			for (const { doName } of childContexts) {
+				await waitForAlarm(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)));
+			}
 			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
 		});
 
@@ -634,22 +675,23 @@ describe("PartitionDO - splitting", () => {
 				await stub.putItem(ctx, item);
 			}
 
-			// Trigger split and run parent alarm.
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
-			await waitForAlarm(stub);
-
 			// Force 1-item batches on the parent so every item requires its own cursor-paginated round trip.
 			// estimateItemBytes always returns >> 1 byte, so the batch fills after the first item each time.
+			// This must be set before the parent alarm fires so children use the small limit when they
+			// call getItemsBatch during their migration (triggered via fire-and-forget from startSplit).
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				instance.__testing__migrationBatchLimitBytes = 1;
 			});
 
-			// Run all children's migrations.
+			// Trigger split and run parent alarm.
+			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await waitForAlarm(stub);
+
+			// Run all children's migrations. startSplit already triggered their alarms via fire-and-forget.
 			const parentState = await stub.status();
 			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-				await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
 				await waitForAlarm(childStub);
 				const state = await childStub.status();
 				expect(state.migrationStatus).toBe("migration_completed");

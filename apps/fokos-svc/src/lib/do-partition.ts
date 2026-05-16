@@ -88,6 +88,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
 	__testing__alarm_running = false;
 	__testing__migrationBatchLimitBytes?: number;
+	__testing__beforeMigrationComplete?: () => Promise<void>;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -139,6 +140,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+	}
+
+	async triggerMigration(): Promise<void> {
+		await this.ensureMigration(false);
 	}
 
 	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
@@ -536,6 +541,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 		invariant(cursor === null, "fokos/partition.runMigration: loop exited with non-null cursor — data may be incomplete");
 
+		await this.__testing__beforeMigrationComplete?.();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 		await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
