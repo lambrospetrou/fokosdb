@@ -1,10 +1,15 @@
-export interface FokosDBAPI extends ItemPutter, ItemGetter {}
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
 
 export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
 }
 
-export type PutItemCondition =
+export interface ItemDeleter {
+	deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult>;
+}
+
+export type ItemCondition =
+	| { type: "item_exists" }
 	| { type: "item_not_exists" }
 	| { type: "attribute_equals"; attribute: "v"; value: number };
 
@@ -16,11 +21,23 @@ export type PutItemOptions = {
 
 	data: Uint8Array | string;
 
-	conditions?: PutItemCondition[];
+	conditions?: ItemCondition[];
+};
+
+export type DeleteItemOptions = {
+	hashKey: string;
+	sortKey?: string;
+
+	conditions?: ItemCondition[];
 };
 
 export type PutItemResult = {
 	version: number;
+	meta: OperationMetrics & PartitionInfo & {};
+};
+
+export type DeleteItemResult = {
+	deleted: boolean;
 	meta: OperationMetrics & PartitionInfo & {};
 };
 

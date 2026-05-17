@@ -408,6 +408,258 @@ describe("PartitionDO - conditional putItem", () => {
 	});
 });
 
+describe("PartitionDO - deleteItem", () => {
+	it("returns deleted:false for a missing key", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		const result = await stub.deleteItem(ctx, { hashKey: "missing", sortKey: "sk" });
+		expect(result).toEqual({
+			deleted: false,
+			meta: {
+				rowsRead: 0,
+				rowsWritten: 0,
+				databaseSize: expect.any(Number),
+				servedByActorId: expect.any(String),
+				servedByActorName: expect.stringMatching(/^test\..+/),
+				forwardCount: 0,
+			},
+		});
+	});
+
+	it("returns deleted:true and removes the item when it exists", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+		expect(result.deleted).toBe(true);
+		const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+		expect(get.found).toBe(false);
+	});
+
+	it("is idempotent — second delete returns deleted:false", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
+		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+		expect(result.deleted).toBe(false);
+	});
+
+	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b" });
+		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk1", data: "c" });
+
+		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk1" });
+
+		expect((await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk1" })).found).toBe(false);
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" })).toMatchObject({ found: true, data: "b" });
+		expect(await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" })).toMatchObject({ found: true, data: "c" });
+	});
+
+	it("works when sortKey is absent — deletes only the no-sortKey row", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort" });
+
+		const result = await stub.deleteItem(ctx, { hashKey: "hk" });
+		expect(result.deleted).toBe(true);
+
+		expect((await stub.getItem(ctx, { hashKey: "hk" })).found).toBe(false);
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "with-sort" });
+	});
+
+	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
+		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "fresh" });
+
+		expect(result.version).toBe(1);
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "fresh", version: 1 });
+	});
+
+	it("includes operation metrics in deleteItem result", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data" });
+		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+		expect(result.meta).toMatchObject({
+			rowsRead: expect.any(Number),
+			rowsWritten: expect.any(Number),
+			databaseSize: expect.any(Number),
+			servedByActorId: expect.any(String),
+			servedByActorName: expect.stringMatching(/^test\..+/),
+		});
+	});
+
+	describe("conditional deleteItem", () => {
+		describe("item_exists", () => {
+			it("succeeds and deletes the item when it exists", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				const result = await stub.deleteItem(ctx, {
+					hashKey: "hk",
+					sortKey: "sk",
+					conditions: [{ type: "item_exists" }],
+				});
+
+				expect(result.deleted).toBe(true);
+				expect((await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).found).toBe(false);
+			});
+
+			it("throws when item does not exist, making the operation a no-op", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [{ type: "item_exists" }] }),
+					).rejects.toThrow(/item_exists.*hk=hk.*sk=sk/);
+				});
+
+				const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+				expect(get.found).toBe(false);
+			});
+
+			it("works when sortKey is absent", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, { hashKey: "hk", conditions: [{ type: "item_exists" }] }),
+					).rejects.toThrow("item_exists");
+				});
+			});
+		});
+
+		describe("attribute_equals", () => {
+			it("succeeds when v matches the expected value", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				const result = await stub.deleteItem(ctx, {
+					hashKey: "hk",
+					sortKey: "sk",
+					conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+				});
+
+				expect(result.deleted).toBe(true);
+			});
+
+			it("throws when v does not match, leaving the item untouched", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, {
+							hashKey: "hk",
+							sortKey: "sk",
+							conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						}),
+					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
+				});
+
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "v2", version: 2 });
+			});
+
+			it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, {
+							hashKey: "hk",
+							sortKey: "sk",
+							conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						}),
+					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found null/);
+				});
+			});
+		});
+
+		describe("multiple conditions", () => {
+			it("succeeds when all conditions pass", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				const result = await stub.deleteItem(ctx, {
+					hashKey: "hk",
+					sortKey: "sk",
+					conditions: [
+						{ type: "item_exists" },
+						{ type: "attribute_equals", attribute: "v", value: 1 },
+					],
+				});
+
+				expect(result.deleted).toBe(true);
+			});
+
+			it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				// item_exists is listed first and will fail since no item exists.
+				// attribute_equals would never be reached.
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, {
+							hashKey: "hk",
+							sortKey: "sk",
+							conditions: [
+								{ type: "item_exists" },
+								{ type: "attribute_equals", attribute: "v", value: 1 },
+							],
+						}),
+					).rejects.toThrow("item_exists");
+				});
+			});
+
+			it("fails on the second condition when the first passes", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+
+				// item_exists passes, then attribute_equals v=1 fails.
+				await runInDurableObject(stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.deleteItem(ctx, {
+							hashKey: "hk",
+							sortKey: "sk",
+							conditions: [
+								{ type: "item_exists" },
+								{ type: "attribute_equals", attribute: "v", value: 1 },
+							],
+						}),
+					).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
+				});
+
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "v2", version: 2 });
+			});
+
+			it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
+				const { ctx, stub } = makeStub();
+
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [] });
+
+				expect(result.deleted).toBe(true);
+			});
+		});
+	});
+});
+
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });

@@ -1,6 +1,6 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { GetItemOptions, GetItemResult, PutItemOptions, PutItemResult } from "./types.js";
+import { DeleteItemOptions, DeleteItemResult, GetItemOptions, GetItemResult, PutItemOptions, PutItemResult } from "./types.js";
 import {
 	PartitionContext,
 	PartitionContextResolved,
@@ -25,6 +25,7 @@ function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResult>;
+	deleteItem(ctx: PartitionContext, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 }
 
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
@@ -32,6 +33,7 @@ export interface PartitionAPI {
 type PartitionDOStub = {
 	putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult>;
+	deleteItem(ctx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 };
 
 type MigratedItem = {
@@ -71,6 +73,9 @@ export class PartitionRpcTarget extends RpcTarget {
 	}
 	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		return await this.partitionDO.getItem(this.partitionCtx, opts);
+	}
+	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
+		return await this.partitionDO.deleteItem(this.partitionCtx, opts);
 	}
 }
 
@@ -217,6 +222,70 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
 					version,
+					meta: {
+						rowsRead,
+						rowsWritten,
+						databaseSize: this.ctx.storage.sql.databaseSize,
+						servedByActorId: this.ctx.id.toString(),
+						servedByActorName: pCtx.doName,
+						forwardCount: 0,
+					},
+				};
+			},
+		});
+	}
+
+	async deleteItem(pCtx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult> {
+		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration();
+		return await this.withSplitForwarding<DeleteItemResult>({
+			ctx: pCtx,
+			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			operationName: "deleteItem",
+			forward: async (stub, pCtx) => await stub.deleteItem(pCtx, opts),
+			local: async () => {
+				const sk = opts.sortKey ?? "";
+				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
+				if (opts.conditions && opts.conditions.length > 0) {
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
+						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+						opts.hashKey,
+						sk,
+					);
+					const row = cRes.toArray()[0] ?? null;
+					conditionRes = cRes;
+					for (const condition of opts.conditions) {
+						if (condition.type === "item_exists") {
+							if (row === null) {
+								throw new Error(
+									`fokos/deleteItem: condition "item_exists" failed — item does not exist (hk=${opts.hashKey}, sk=${sk})`,
+								);
+							}
+						} else if (condition.type === "item_not_exists") {
+							if (row !== null) {
+								throw new Error(
+									`fokos/deleteItem: condition "item_not_exists" failed — item already exists with v=${row.v} (hk=${opts.hashKey}, sk=${sk})`,
+								);
+							}
+						} else if (condition.type === "attribute_equals") {
+							const actual = row !== null ? row[condition.attribute] : null;
+							if (actual !== condition.value) {
+								throw new Error(
+									`fokos/deleteItem: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${opts.hashKey}, sk=${sk})`,
+								);
+							}
+						}
+					}
+				}
+
+				const writeRes = this.ctx.storage.sql.exec(
+					`DELETE FROM items WHERE hk = ? AND sk = ?`,
+					opts.hashKey,
+					sk,
+				);
+				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
+				return {
+					deleted: writeRes.rowsWritten > 0,
 					meta: {
 						rowsRead,
 						rowsWritten,

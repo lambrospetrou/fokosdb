@@ -1,4 +1,4 @@
-import { GetItemOptions, PutItemOptions } from "./types.js";
+import { DeleteItemOptions, GetItemOptions, PutItemOptions } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
 import { PartitionTopologyRouter } from "./partition-topology/partition-topology.js";
 
@@ -25,5 +25,12 @@ export class FokosDB {
 		const ns = this.options.ns;
 		const stub = ns.get(doId);
 		return await stub.getItem(partitionContext, opts);
+	}
+
+	async deleteItem(opts: DeleteItemOptions) {
+		const { doId, partitionContext } = this.options.topology.pickPartition(opts.hashKey, opts.sortKey);
+		const ns = this.options.ns;
+		const stub = ns.get(doId);
+		return await stub.deleteItem(partitionContext, opts);
 	}
 }
