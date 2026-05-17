@@ -151,7 +151,7 @@ The TC assigns **one timestamp per transaction** at the moment the transaction e
 ### TransactWriteItems — Full Protocol Flow
 
 1. **Client Worker** validates request, derives TC DO name from `ClientRequestToken` (or generates a UUID), and fetches the TC DO stub.
-2. **Client Worker → TC**: `initiateWrite(payload)`. Payload includes: list of operations (`PutItem | DeleteItem | ConditionCheck` per item, each with its `hashKey + sortKey`, optional `ConditionExpression`, and data), and the `ClientRequestToken`.
+2. **Client Worker → TC**: `initiateWrite(payload)`. Payload includes: list of operations (`PutItem | DeleteItem | ConditionCheck` per item, each with its `hashKey + sortKey`, optional `ConditionExpression`, and data), and the `ClientRequestToken`, and also the partition Durable Object IDs to communicate with.
 3. **TC** (in `CREATED` state): assigns timestamp, persists full payload + timestamp + `CREATED` state. Transitions to `PREPARING`.
 4. **TC** (in `PREPARING`): fans out `prepare(...)` calls **in parallel** to all distinct `PartitionDO`s that own items referenced in the transaction.
 5. **TC** collects responses:
@@ -164,7 +164,7 @@ The TC assigns **one timestamp per transaction** at the moment the transaction e
 
 ### TransactGetItems — Full Protocol Flow (Two-Phase Writeless)
 
-1. **Client Worker → TC**: `initiateRead(payload)`. Payload is a list of `{ hashKey, sortKey }` items to read.
+1. **Client Worker → TC**: `initiateRead(payload)`. Payload is a list of `{ hashKey, sortKey }` items to read, and also the partition Durable Object IDs to communicate with.
 2. **TC** assigns timestamp, persists `CREATED` state.
 3. **TC Phase 1**: fans out `readForTransaction(...)` in parallel to all relevant `PartitionDO`s, retrieving each item's `{ value, lastCommittedTs, hasPendingWrite }`.
 4. **TC** evaluates: if any item has `hasPendingWrite: true`, abort the read transaction with `READ_CONFLICT` — the caller should retry. Otherwise proceed to Phase 2.
@@ -219,7 +219,7 @@ Single-item `GetItem`, `PutItem`, and `DeleteItem` operations must continue to f
 - Max items per `TransactWriteItems`: 100.
 - Max aggregate payload: 4 MB.
 - No duplicate `(hashKey, sortKey)` pairs within a single transaction.
-- `ClientRequestToken` idempotency window: 10 minutes (TC DO is kept alive for this period after `COMMITTED` or `CANCELLED`).
+- `ClientRequestToken` idempotency window: 10 minutes (TC DO keeps data available for this period after `COMMITTED` or `CANCELLED`).
 
 ---
 
