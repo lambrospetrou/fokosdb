@@ -498,10 +498,10 @@ return { items: results }
 
 **TODO checklist:**
 
-- [ ] Implement `prepare` with all 6 steps (single SQL transaction, idempotency by `idempotencyToken`)
-- [ ] Implement `commit` (set `last_transaction_ts = request.transactionTimestamp` for all operation types)
-- [ ] Implement `cancel`
-- [ ] Implement `readForTransaction`
+- [x] Implement `prepare` with all 6 steps (single SQL transaction, idempotency by `idempotencyToken`)
+- [x] Implement `commit` (set `last_transaction_ts = request.transactionTimestamp` for all operation types)
+- [x] Implement `cancel`
+- [x] Implement `readForTransaction`
 - [ ] Write unit tests in `do-partition.test.ts`:
   - `prepare`: accepted path, condition_failed, timestamp_conflict, pending_conflict, clock_skew, idempotent re-prepare (same `idempotencyToken` returns accepted without re-running checks)
   - `commit`: put written with correct `last_transaction_ts`, delete updates `deletion_metadata`, check-only updates `last_transaction_ts`, idempotent re-commit

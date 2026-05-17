@@ -9,6 +9,17 @@ import {
 	PutItemOptions,
 	PutItemResult,
 } from "./types.js";
+import type {
+	CancelRequest,
+	CancelResponse,
+	CommitRequest,
+	CommitResponse,
+	PrepareRequest,
+	PrepareResponse,
+	ReadForTransactionItemResult,
+	ReadForTransactionRequest,
+	ReadForTransactionResponse,
+} from "./transaction-types.js";
 import {
 	PartitionContext,
 	PartitionContextResolved,
@@ -185,11 +196,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const sk = opts.sortKey ?? "";
 
 				const pendingRow = this.ctx.storage.sql
-					.exec<{ transaction_id: string }>(
-						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					.exec<{
+						transaction_id: string;
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				if (pendingRow) {
 					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
@@ -259,11 +268,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const sk = opts.sortKey ?? "";
 
 				const pendingRow = this.ctx.storage.sql
-					.exec<{ transaction_id: string }>(
-						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					.exec<{
+						transaction_id: string;
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				if (pendingRow) {
 					// FIXME: ATC §4 optimization — see same comment in putItem.
@@ -388,6 +395,266 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
 		};
+	}
+
+	async prepare(request: PrepareRequest): Promise<PrepareResponse> {
+		const now = Date.now();
+
+		if (request.transactionTimestamp > now + 5_000) {
+			return {
+				outcome: "rejected",
+				reason: { type: "clock_skew", serverTimestampMs: now, transactionTimestampMs: request.transactionTimestamp },
+			};
+		}
+
+		let response: PrepareResponse = this.ctx.storage.transactionSync<PrepareResponse>(() => {
+			const idempotencyRow = this.ctx.storage.sql
+				.exec<{ outcome: string }>(`SELECT outcome FROM transaction_idempotency WHERE transaction_id = ? LIMIT 1`, request.transactionId)
+				.toArray()[0];
+
+			if (idempotencyRow) {
+				if (idempotencyRow.outcome === "accepted") {
+					return { outcome: "accepted" };
+				}
+				return {
+					outcome: "rejected",
+					reason: { type: "condition_failed", hashKey: "", sortKey: undefined },
+				};
+			}
+
+			for (const item of request.items) {
+				const sk = item.sortKey ?? "";
+
+				const pendingRow = this.ctx.storage.sql
+					.exec<{
+						transaction_id: string;
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
+					.toArray()[0];
+
+				if (pendingRow) {
+					if (pendingRow.transaction_id === request.transactionId) {
+						continue; // idempotent re-prepare for this item
+					}
+					return {
+						outcome: "rejected",
+						reason: {
+							type: "pending_conflict",
+							hashKey: item.hashKey,
+							sortKey: item.sortKey,
+							conflictingTransactionId: pendingRow.transaction_id,
+						},
+					};
+				}
+
+				const itemRow = this.ctx.storage.sql
+					.exec<{
+						last_transaction_ts: number;
+						v: number;
+					}>(`SELECT last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
+					.toArray()[0];
+
+				if (item.conditions && item.conditions.length > 0) {
+					const snapshot: ItemSnapshot = itemRow
+						? { found: true, hk: item.hashKey, sk, v: itemRow.v }
+						: { found: false, hk: item.hashKey, sk };
+					try {
+						evaluateConditionsOnItem(snapshot, item.conditions, "prepare");
+					} catch {
+						return {
+							outcome: "rejected",
+							reason: { type: "condition_failed", hashKey: item.hashKey, sortKey: item.sortKey },
+						};
+					}
+				}
+
+				if (itemRow) {
+					if (request.transactionTimestamp <= itemRow.last_transaction_ts) {
+						return {
+							outcome: "rejected",
+							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
+						};
+					}
+				} else if (item.operation === "put" || item.operation === "delete") {
+					const metaRow = this.ctx.storage.sql
+						.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
+						.toArray()[0];
+					if (request.transactionTimestamp <= (metaRow?.max_deleted_ts ?? 0)) {
+						return {
+							outcome: "rejected",
+							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
+						};
+					}
+				}
+			}
+
+			// All checks passed — lock every item.
+			for (const item of request.items) {
+				const sk = item.sortKey ?? "";
+				this.ctx.storage.sql.exec(
+					`INSERT OR IGNORE INTO pending_transactions
+						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					item.hashKey,
+					sk,
+					request.transactionId,
+					request.transactionTimestamp,
+					item.operation,
+					item.data ?? null,
+					item.conditions ? JSON.stringify(item.conditions) : null,
+					request.coordinatorDoName,
+					Date.now(),
+				);
+			}
+
+			this.ctx.storage.sql.exec(
+				`INSERT OR REPLACE INTO transaction_idempotency (transaction_id, transaction_ts, outcome)
+					 VALUES (?, ?, 'accepted')`,
+				request.transactionId,
+				request.transactionTimestamp,
+			);
+
+			return { outcome: "accepted" };
+		});
+
+		if (response.outcome === "accepted" && !(await this.ctx.storage.getAlarm())) {
+			await this.ctx.storage.setAlarm(Date.now() + 5_000);
+		}
+
+		return response;
+	}
+
+	async commit(request: CommitRequest): Promise<CommitResponse> {
+		const pendingCount =
+			this.ctx.storage.sql
+				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
+				.toArray()[0]?.n ?? 0;
+
+		if (pendingCount === 0) {
+			return { outcome: "committed" };
+		}
+
+		this.ctx.storage.transactionSync(() => {
+			for (const item of request.items) {
+				const sk = item.sortKey ?? "";
+				const pendingRow = this.ctx.storage.sql
+					.exec<{
+						operation: string;
+						data: string | ArrayBuffer | null;
+					}>(
+						`SELECT operation, data FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
+						item.hashKey,
+						sk,
+						request.transactionId,
+					)
+					.toArray()[0];
+
+				if (!pendingRow) continue;
+
+				if (pendingRow.operation === "put") {
+					const data = typeof pendingRow.data === "string" ? pendingRow.data : pendingRow.data ? new Uint8Array(pendingRow.data) : null;
+					this.ctx.storage.sql.exec(
+						`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts)
+						 VALUES (?, ?, ?, NULL, 1, ?)
+						 ON CONFLICT(hk, sk) DO UPDATE SET
+						   data = excluded.data,
+						   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+						   v = v + 1,
+						   last_transaction_ts = excluded.last_transaction_ts`,
+						item.hashKey,
+						sk,
+						data,
+						request.transactionTimestamp,
+					);
+				} else if (pendingRow.operation === "delete") {
+					this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, item.hashKey, sk);
+					this.ctx.storage.sql.exec(
+						`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
+						request.transactionTimestamp,
+					);
+				} else if (pendingRow.operation === "check") {
+					this.ctx.storage.sql.exec(
+						`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`,
+						request.transactionTimestamp,
+						item.hashKey,
+						sk,
+					);
+				}
+			}
+
+			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+		});
+
+		// Stale idempotency cleanup is housekeeping — runs outside the atomic transaction.
+		this.ctx.storage.sql.exec(
+			`DELETE FROM transaction_idempotency
+			 WHERE transaction_id IN (
+			   SELECT transaction_id FROM transaction_idempotency
+			   WHERE transaction_ts < ?
+			   ORDER BY transaction_ts ASC
+			   LIMIT 100
+			 )`,
+			Date.now() - 600_000,
+		);
+
+		return { outcome: "committed" };
+	}
+
+	async cancel(request: CancelRequest): Promise<CancelResponse> {
+		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+
+		// Stale idempotency cleanup is housekeeping — runs outside the atomic transaction.
+		this.ctx.storage.sql.exec(
+			`DELETE FROM transaction_idempotency
+			 WHERE transaction_id IN (
+			   SELECT transaction_id FROM transaction_idempotency
+			   WHERE transaction_ts < ?
+			   ORDER BY transaction_ts ASC
+			   LIMIT 100
+			 )`,
+			Date.now() - 600_000,
+		);
+
+		return { outcome: "cancelled" };
+	}
+
+	async readForTransaction(request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+		const results: ReadForTransactionItemResult[] = [];
+
+		for (const item of request.items) {
+			const sk = item.sortKey ?? "";
+
+			const itemRow = this.ctx.storage.sql
+				.exec<{
+					data: string | ArrayBuffer;
+					last_transaction_ts: number;
+					v: number;
+				}>(`SELECT data, last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
+				.toArray()[0];
+
+			const pendingRow = this.ctx.storage.sql
+				.exec<{
+					transaction_id: string;
+				}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
+				.toArray()[0];
+
+			const hasPendingWrite = pendingRow != null;
+			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
+
+			if (itemRow) {
+				results.push({
+					found: true,
+					hashKey: item.hashKey,
+					sortKey: item.sortKey,
+					data: typeof itemRow.data === "string" ? itemRow.data : new Uint8Array(itemRow.data),
+					lastCommittedTs,
+					hasPendingWrite,
+				});
+			} else {
+				results.push({ found: false, hashKey: item.hashKey, sortKey: item.sortKey, lastCommittedTs, hasPendingWrite });
+			}
+		}
+
+		return { items: results };
 	}
 
 	async alarm(alarmInfo: AlarmInvocationInfo): Promise<void> {
