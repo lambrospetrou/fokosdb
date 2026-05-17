@@ -1,6 +1,14 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { DeleteItemOptions, DeleteItemResult, GetItemOptions, GetItemResult, ItemCondition, PutItemOptions, PutItemResult } from "./types.js";
+import {
+	DeleteItemOptions,
+	DeleteItemResult,
+	GetItemOptions,
+	GetItemResult,
+	ItemCondition,
+	PutItemOptions,
+	PutItemResult,
+} from "./types.js";
 import {
 	PartitionContext,
 	PartitionContextResolved,
@@ -12,17 +20,13 @@ import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
 
-type ItemSnapshot =
-	| { hk: string; sk: string; found: true; v: number }
-	| { hk: string; sk: string; found: false };
+type ItemSnapshot = { hk: string; sk: string; found: true; v: number } | { hk: string; sk: string; found: false };
 
 function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
 	for (const condition of conditions) {
 		if (condition.type === "item_exists") {
 			if (!item.found) {
-				throw new Error(
-					`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`,
-				);
+				throw new Error(`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`);
 			}
 		} else if (condition.type === "item_not_exists") {
 			if (item.found) {
@@ -86,27 +90,6 @@ type ParentPartitionDOStub = {
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
 	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
 };
-
-export class PartitionRpcTarget extends RpcTarget {
-	constructor(
-		private readonly partitionDO: PartitionDO,
-		private readonly ctx: DurableObjectState,
-		private readonly storage: DurableObjectStorage,
-		private readonly partitionCtx: PartitionContextResolved,
-	) {
-		super();
-	}
-
-	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
-		return await this.partitionDO.putItem(this.partitionCtx, opts);
-	}
-	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
-		return await this.partitionDO.getItem(this.partitionCtx, opts);
-	}
-	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
-		return await this.partitionDO.deleteItem(this.partitionCtx, opts);
-	}
-}
 
 export type InitFromSplitOptions = {
 	parentPartitionContext: PartitionContextResolved;
@@ -202,11 +185,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const sk = opts.sortKey ?? "";
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
-						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					);
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
 					const row = cRes.toArray()[0];
 					conditionRes = cRes;
 					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
@@ -262,22 +241,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const sk = opts.sortKey ?? "";
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
-						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					);
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
 					const row = cRes.toArray()[0];
 					conditionRes = cRes;
 					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
 					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
 				}
 
-				const writeRes = this.ctx.storage.sql.exec(
-					`DELETE FROM items WHERE hk = ? AND sk = ?`,
-					opts.hashKey,
-					sk,
-				);
+				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					deleted: writeRes.rowsWritten > 0,
