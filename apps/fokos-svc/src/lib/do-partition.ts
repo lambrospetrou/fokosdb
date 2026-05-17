@@ -1,6 +1,6 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { DeleteItemOptions, DeleteItemResult, GetItemOptions, GetItemResult, PutItemOptions, PutItemResult } from "./types.js";
+import { DeleteItemOptions, DeleteItemResult, GetItemOptions, GetItemResult, ItemCondition, PutItemOptions, PutItemResult } from "./types.js";
 import {
 	PartitionContext,
 	PartitionContextResolved,
@@ -11,6 +11,35 @@ import {
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
+
+type ItemSnapshot =
+	| { hk: string; sk: string; found: true; v: number }
+	| { hk: string; sk: string; found: false };
+
+function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
+	for (const condition of conditions) {
+		if (condition.type === "item_exists") {
+			if (!item.found) {
+				throw new Error(
+					`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`,
+				);
+			}
+		} else if (condition.type === "item_not_exists") {
+			if (item.found) {
+				throw new Error(
+					`fokos/${operationName}: condition "item_not_exists" failed — item already exists with v=${item.v} (hk=${item.hk}, sk=${item.sk})`,
+				);
+			}
+		} else if (condition.type === "attribute_equals") {
+			const actual = item.found ? item[condition.attribute] : null;
+			if (actual !== condition.value) {
+				throw new Error(
+					`fokos/${operationName}: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${item.hk}, sk=${item.sk})`,
+				);
+			}
+		}
+	}
+}
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -178,24 +207,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						opts.hashKey,
 						sk,
 					);
-					const row = cRes.toArray()[0] ?? null;
+					const row = cRes.toArray()[0];
 					conditionRes = cRes;
-					for (const condition of opts.conditions) {
-						if (condition.type === "item_not_exists") {
-							if (row !== null) {
-								throw new Error(
-									`fokos/putItem: condition "item_not_exists" failed — item already exists with v=${row.v} (hk=${opts.hashKey}, sk=${sk})`,
-								);
-							}
-						} else if (condition.type === "attribute_equals") {
-							const actual = row !== null ? row[condition.attribute] : null;
-							if (actual !== condition.value) {
-								throw new Error(
-									`fokos/putItem: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${opts.hashKey}, sk=${sk})`,
-								);
-							}
-						}
-					}
+					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
+					evaluateConditionsOnItem(item, opts.conditions, "putItem");
 				}
 
 				const writeRes = this.ctx.storage.sql.exec<{ v: number }>(
@@ -252,30 +267,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						opts.hashKey,
 						sk,
 					);
-					const row = cRes.toArray()[0] ?? null;
+					const row = cRes.toArray()[0];
 					conditionRes = cRes;
-					for (const condition of opts.conditions) {
-						if (condition.type === "item_exists") {
-							if (row === null) {
-								throw new Error(
-									`fokos/deleteItem: condition "item_exists" failed — item does not exist (hk=${opts.hashKey}, sk=${sk})`,
-								);
-							}
-						} else if (condition.type === "item_not_exists") {
-							if (row !== null) {
-								throw new Error(
-									`fokos/deleteItem: condition "item_not_exists" failed — item already exists with v=${row.v} (hk=${opts.hashKey}, sk=${sk})`,
-								);
-							}
-						} else if (condition.type === "attribute_equals") {
-							const actual = row !== null ? row[condition.attribute] : null;
-							if (actual !== condition.value) {
-								throw new Error(
-									`fokos/deleteItem: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${opts.hashKey}, sk=${sk})`,
-								);
-							}
-						}
-					}
+					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
+					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
 				}
 
 				const writeRes = this.ctx.storage.sql.exec(

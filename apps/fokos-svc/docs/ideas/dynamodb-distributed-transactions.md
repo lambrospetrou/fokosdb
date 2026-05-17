@@ -2,9 +2,7 @@
 
 ## Context and Goal
 
-I have an existing key-value database built on Cloudflare Durable Objects (DOs) that follows the DynamoDB hash-key + sort-key model. Each data partition is a `PartitionDO` — a Durable Object that owns a contiguous key range and stores items in an internal SQLite table. I now want to introduce **distributed ACID transactions across different `PartitionDO` instances**, supporting `TransactWriteItems` and `TransactGetItems` (with conditional checks), following the design described in the _"Distributed Transactions at Scale in Amazon DynamoDB"_ USENIX ATC 2023 paper (Idziorek et al.) and the _Amazon DynamoDB_ USENIX ATC 2022 paper (Elhemali et al.).
-
-This task is **architecture and semantics only** — do not write any code yet. Produce a detailed spec of: the data models, state machines, message contracts, and invariants that the implementation must satisfy, ready to be turned into TypeScript by a subsequent implementation step.
+I have an existing key-value database built on Cloudflare Durable Objects (DOs) that follows the DynamoDB hash-key + sort-key model. Each data partition is a `PartitionDO` — a Durable Object that owns a contiguous key range and stores items in an internal SQLite table. I now want to introduce **distributed ACID transactions across different `PartitionDO` instances**, supporting `TransactWriteItems` and `TransactGetItems` (with conditional checks), following the design described in the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USENIX ATC 2023 paper (Idziorek et al.)](https://www.usenix.org/system/files/atc23-idziorek.pdf) and the [_Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service_ USENIX ATC 2022 paper (Elhemali et al.)](https://www.usenix.org/system/files/atc22-elhemali.pdf).
 
 ---
 
