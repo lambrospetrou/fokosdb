@@ -12,6 +12,16 @@ import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
 
+function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
+	let rowsRead = 0;
+	let rowsWritten = 0;
+	for (const r of results) {
+		rowsRead += r.rowsRead;
+		rowsWritten += r.rowsWritten;
+	}
+	return { rowsRead, rowsWritten };
+}
+
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResult>;
@@ -155,7 +165,35 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			operationName: "putItem",
 			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
 			local: async () => {
-				const res = this.ctx.storage.sql.exec<{ v: number }>(
+				const sk = opts.sortKey ?? "";
+				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
+				if (opts.conditions && opts.conditions.length > 0) {
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
+						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+						opts.hashKey,
+						sk,
+					);
+					const row = cRes.toArray()[0] ?? null;
+					conditionRes = cRes;
+					for (const condition of opts.conditions) {
+						if (condition.type === "item_not_exists") {
+							if (row !== null) {
+								throw new Error(
+									`fokos/putItem: condition "item_not_exists" failed — item already exists with v=${row.v} (hk=${opts.hashKey}, sk=${sk})`,
+								);
+							}
+						} else if (condition.type === "attribute_equals") {
+							const actual = row !== null ? row[condition.attribute] : null;
+							if (actual !== condition.value) {
+								throw new Error(
+									`fokos/putItem: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${opts.hashKey}, sk=${sk})`,
+								);
+							}
+						}
+					}
+				}
+
+				const writeRes = this.ctx.storage.sql.exec<{ v: number }>(
 					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v)
 					 VALUES (?, ?, ?, ?, 1)
 					 ON CONFLICT(hk, sk) DO UPDATE SET
@@ -164,12 +202,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					   v = v + 1
 					 RETURNING v`,
 					opts.hashKey,
-					opts.sortKey ?? "",
+					sk,
 					opts.data,
 					opts.ttlEpochUTCSeconds ?? null,
 				);
-				const { rowsRead, rowsWritten } = res;
-				const rows = res.toArray();
+				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
+				const rows = writeRes.toArray();
 				invariant(rows.length === 1, `fokos/partition.putItem: RETURNING expected 1 row, got ${rows.length}`);
 				const version = rows[0].v;
 				invariant(
@@ -450,7 +488,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			v: number;
 		}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
 		const rows = res.toArray();
-		const { rowsRead, rowsWritten } = res;
+		const { rowsRead, rowsWritten } = sumSqlMetrics(res);
 		const result = rows[0];
 		const actorMeta = {
 			rowsRead,

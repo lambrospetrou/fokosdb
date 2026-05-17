@@ -207,6 +207,207 @@ describe("PartitionDO - putItem / getItem", () => {
 	});
 });
 
+describe("PartitionDO - conditional putItem", () => {
+	describe("item_not_exists", () => {
+		it("succeeds and creates the item when it does not exist", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			const result = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "value",
+				conditions: [{ type: "item_not_exists" }],
+			});
+
+			expect(result.version).toBe(1);
+			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+			expect(get).toMatchObject({ found: true, data: "value" });
+		});
+
+		it("throws when item already exists, leaving it unchanged", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "overwrite", conditions: [{ type: "item_not_exists" }] }),
+				).rejects.toThrow(/item_not_exists.*v=1.*hk=hk.*sk=sk/);
+			});
+
+			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+			expect(get).toMatchObject({ found: true, data: "original", version: 1 });
+		});
+
+		it("works when sortKey is absent", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", data: "original" });
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, { hashKey: "hk", data: "overwrite", conditions: [{ type: "item_not_exists" }] }),
+				).rejects.toThrow("item_not_exists");
+			});
+
+			const get = await stub.getItem(ctx, { hashKey: "hk" });
+			expect(get).toMatchObject({ found: true, data: "original" });
+		});
+	});
+
+	describe("attribute_equals", () => {
+		it("succeeds when v matches the expected value", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first" });
+			const result = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "second",
+				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+			});
+
+			expect(result.version).toBe(2);
+		});
+
+		it("throws when v does not match, leaving the item unchanged", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						sortKey: "sk",
+						data: "stale",
+						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+					}),
+				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
+			});
+
+			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+			expect(get).toMatchObject({ found: true, data: "v2", version: 2 });
+		});
+
+		it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						sortKey: "sk",
+						data: "value",
+						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+					}),
+				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found null/);
+			});
+		});
+
+		it("allows sequential optimistic-concurrency updates at the correct version", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+			expect(r1.version).toBe(1);
+
+			const r2 = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "v2",
+				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+			});
+			expect(r2.version).toBe(2);
+
+			const r3 = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "v3",
+				conditions: [{ type: "attribute_equals", attribute: "v", value: 2 }],
+			});
+			expect(r3.version).toBe(3);
+		});
+	});
+
+	describe("multiple conditions", () => {
+		it("succeeds when all conditions pass", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first" });
+			const result = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "second",
+				conditions: [
+					{ type: "attribute_equals", attribute: "v", value: 1 },
+					{ type: "attribute_equals", attribute: "v", value: 1 },
+				],
+			});
+
+			expect(result.version).toBe(2);
+		});
+
+		it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			// item_not_exists is listed first and will fail since the item exists.
+			// attribute_equals with value=1 would pass — but we never reach it.
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						sortKey: "sk",
+						data: "overwrite",
+						conditions: [
+							{ type: "item_not_exists" },
+							{ type: "attribute_equals", attribute: "v", value: 1 },
+						],
+					}),
+				).rejects.toThrow("item_not_exists");
+			});
+
+			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+			expect(get).toMatchObject({ found: true, data: "original", version: 1 });
+		});
+
+		it("fails on the second condition when the first passes", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+
+			// attribute_equals v=2 passes, then attribute_equals v=1 fails.
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						sortKey: "sk",
+						data: "overwrite",
+						conditions: [
+							{ type: "attribute_equals", attribute: "v", value: 2 },
+							{ type: "attribute_equals", attribute: "v", value: 1 },
+						],
+					}),
+				).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
+			});
+
+			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+			expect(get).toMatchObject({ found: true, data: "v2", version: 2 });
+		});
+
+		it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+
+			const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", conditions: [] });
+
+			expect(result.version).toBe(1);
+		});
+	});
+});
+
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });

@@ -4,14 +4,19 @@ export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
 }
 
+export type PutItemCondition =
+	| { type: "item_not_exists" }
+	| { type: "attribute_equals"; attribute: "v"; value: number };
+
 export type PutItemOptions = {
-	// TODO Add options for conditional puts, TTL, etc.
 	hashKey: string;
 	sortKey?: string;
 	ttlSeconds?: number;
 	ttlEpochUTCSeconds?: number;
 
 	data: Uint8Array | string;
+
+	conditions?: PutItemCondition[];
 };
 
 export type PutItemResult = {
