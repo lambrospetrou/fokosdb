@@ -264,20 +264,8 @@ CREATE INDEX IF NOT EXISTS pending_transactions_created_at
 CREATE TABLE IF NOT EXISTS deletion_metadata (
     id              INTEGER PRIMARY KEY CHECK (id = 1),
     max_deleted_ts  INTEGER NOT NULL DEFAULT 0
-) WITHOUT ROWID, STRICT;
+) STRICT;
 INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);
-
--- Migration 5: transaction_idempotency table
--- Keyed by transaction_id (the internal per-attempt UUID).
--- idempotencyToken / clientRequestToken is a TC concern only; PartitionDO does not see it.
--- Cleaned up by commit(), cancel(), and the alarm handler — not during prepare.
-CREATE TABLE IF NOT EXISTS transaction_idempotency (
-    transaction_id      TEXT    NOT NULL PRIMARY KEY,
-    transaction_ts      INTEGER NOT NULL,
-    outcome             TEXT    NOT NULL  -- 'accepted' | 'rejected'
-) WITHOUT ROWID, STRICT;
-CREATE INDEX IF NOT EXISTS transaction_idempotency_ts
-    ON transaction_idempotency (transaction_ts);
 ```
 
 > **Design note — why `pending_transactions` is a separate table:**
@@ -325,7 +313,7 @@ ON CONFLICT(hk, sk) DO UPDATE SET
 
 **TODO checklist:**
 
-- [x] Add migrations 2–5 to `sqlMigrations` in `do-partition.ts`
+- [x] Add migrations 2–4 to `sqlMigrations` in `do-partition.ts`
 - [x] Add pending-transaction conflict check at the top of `putItem` and `deleteItem` local handlers
 - [x] Update `putItem` SQL to include `last_transaction_ts = Date.now()` in the upsert
 - [x] Update `deleteItem` to set `last_transaction_ts = Date.now()` on the deleted item's row before deleting (so any read that races sees the tombstone timestamp — actually since the row is deleted this is moot; just ensure the pending-transaction check runs first)
@@ -346,17 +334,7 @@ All checks and the final insert must run inside a **single `storage.sql` transac
    IF request.transactionTimestamp > Date.now() + 5_000:
      return { outcome: "rejected", reason: { type: "clock_skew", serverTimestampMs: Date.now(), transactionTimestampMs: request.transactionTimestamp } }
 
-2. Idempotency check (keyed by transactionId):
-   row = SELECT outcome FROM transaction_idempotency
-         WHERE transaction_id = request.transactionId
-   IF row.outcome == "accepted":
-     return { outcome: "accepted" }
-   IF row.outcome == "rejected":
-     -- The TC already recorded the real reason; returning a generic rejection here is fine
-     -- because the TC's own idempotency path will serve the stored reason to the client.
-     return { outcome: "rejected", reason: { type: "condition_failed", hashKey: "", sortKey: undefined } }
-
-3. For each item in request.items:
+2. For each item in request.items:
 
    a. Read current committed state:
       itemRow = SELECT last_transaction_ts, data, v FROM items WHERE hk = ? AND sk = ?
@@ -386,7 +364,7 @@ All checks and the final insert must run inside a **single `storage.sql` transac
         IF request.transactionTimestamp <= max_deleted_ts:
           return { outcome: "rejected", reason: { type: "timestamp_conflict", hashKey, sortKey } }
 
-4. All checks passed — lock every item:
+3. All checks passed — lock every item:
    For each item in request.items:
      INSERT OR IGNORE INTO pending_transactions
        (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json,
@@ -394,13 +372,7 @@ All checks and the final insert must run inside a **single `storage.sql` transac
      VALUES (?, ?, ?, ?, ?, ?, ?, request.coordinatorDoName, Date.now())
    -- INSERT OR IGNORE: safe for idempotent re-prepare of individual items
 
-5. Record in idempotency table:
-   INSERT OR REPLACE INTO transaction_idempotency
-     (transaction_id, transaction_ts, outcome)
-   VALUES (request.transactionId, request.transactionTimestamp, 'accepted')
-   -- Cleanup of stale entries is NOT done here; it runs in commit(), cancel(), and the alarm handler.
-
-6. return { outcome: "accepted" }
+4. return { outcome: "accepted" }
 ```
 
 ### 4b. `commit(request: CommitRequest): Promise<CommitResponse>`
@@ -443,16 +415,7 @@ All in a single SQL transaction:
 
 3. DELETE FROM pending_transactions WHERE transaction_id = request.transactionId
 
-4. Prune stale idempotency entries (oldest 100 entries older than 10 minutes):
-   DELETE FROM transaction_idempotency
-   WHERE transaction_id IN (
-     SELECT transaction_id FROM transaction_idempotency
-     WHERE transaction_ts < (Date.now() - 600_000)
-     ORDER BY transaction_ts ASC
-     LIMIT 100
-   )
-
-5. return { outcome: "committed" }
+4. return { outcome: "committed" }
 ```
 
 ### 4c. `cancel(request: CancelRequest): Promise<CancelResponse>`
@@ -460,15 +423,6 @@ All in a single SQL transaction:
 ```
 DELETE FROM pending_transactions WHERE transaction_id = request.transactionId
 -- Never touches items table — pending writes are discarded.
-
--- Prune stale idempotency entries (oldest 100 entries older than 10 minutes):
-DELETE FROM transaction_idempotency
-WHERE transaction_id IN (
-  SELECT transaction_id FROM transaction_idempotency
-  WHERE transaction_ts < (Date.now() - 600_000)
-  ORDER BY transaction_ts ASC
-  LIMIT 100
-)
 
 return { outcome: "cancelled" }
 ```
@@ -498,12 +452,12 @@ return { items: results }
 
 **TODO checklist:**
 
-- [x] Implement `prepare` with all 6 steps (single SQL transaction, idempotency by `idempotencyToken`)
+- [x] Implement `prepare` with all 4 steps (single SQL transaction, idempotency via `pending_transactions`)
 - [x] Implement `commit` (set `last_transaction_ts = request.transactionTimestamp` for all operation types)
 - [x] Implement `cancel`
 - [x] Implement `readForTransaction`
 - [ ] Write unit tests in `do-partition.test.ts`:
-  - `prepare`: accepted path, condition_failed, timestamp_conflict, pending_conflict, clock_skew, idempotent re-prepare (same `idempotencyToken` returns accepted without re-running checks)
+  - `prepare`: accepted path, condition_failed, timestamp_conflict, pending_conflict, clock_skew, idempotent re-prepare (pending row with same transactionId → accepted without re-running checks)
   - `commit`: put written with correct `last_transaction_ts`, delete updates `deletion_metadata`, check-only updates `last_transaction_ts`, idempotent re-commit
   - `cancel`: clears rows, idempotent cancel on already-cleared transaction
   - `readForTransaction`: found/not-found, `hasPendingWrite` flag set correctly
@@ -518,12 +472,11 @@ return { items: results }
 
 ### What needs to be migrated
 
-| Table                                | Migration needed                                                                                                                                                  |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `items` (with `last_transaction_ts`) | Already migrated by existing `getItemsBatch` — `last_transaction_ts` is a column on `items` so it comes along automatically                                       |
-| `pending_transactions`               | Rows for items in the child's key range must be migrated so in-flight transaction locks are preserved                                                             |
-| `deletion_metadata.max_deleted_ts`   | Child must inherit the parent's value as a safe upper bound for its key range                                                                                     |
-| `transaction_idempotency`            | Not required — if absent the prepare idempotency path falls back to the `pending_transactions` check, which is migrated. Skipping avoids unbounded migration size |
+| Table                                | Migration needed                                                                                                                          |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `items` (with `last_transaction_ts`) | Already migrated by existing `getItemsBatch` — `last_transaction_ts` is a column on `items` so it comes along automatically              |
+| `pending_transactions`               | Rows for items in the child's key range must be migrated so in-flight transaction locks are preserved                                     |
+| `deletion_metadata.max_deleted_ts`   | Child must inherit the parent's value as a safe upper bound for its key range                                                             |
 
 ### 5a. New parent RPC: `getPartitionTransactionMetadata`
 
@@ -603,9 +556,9 @@ The existing `MigratedItem` type and `getItemsBatch` response are unchanged — 
 
 **TODO checklist:**
 
-- [ ] Add `getPartitionTransactionMetadata` to `PartitionDO`
-- [ ] Extend `runMigration` in `PartitionDO` to call `getPartitionTransactionMetadata` after the items loop and apply the result
-- [ ] Verify that `getItemsBatch` already propagates `last_transaction_ts` (it should, since it reads all columns)
+- [x] Add `getPartitionTransactionMetadata` to `PartitionDO` (paginated, 20 MB per batch)
+- [x] Extend `runMigration` in `PartitionDO` to call `getPartitionTransactionMetadata` after the items loop and apply the result
+- [x] Verify that `getItemsBatch` already propagates `last_transaction_ts` (it should, since it reads all columns)
 - [ ] Write migration tests: after a split, child partition has correct `pending_transactions` and `deletion_metadata` values
 
 ---
@@ -920,18 +873,6 @@ const remaining =
 if (remaining > 0 && !(await this.ctx.storage.getAlarm())) {
 	await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
 }
-
-// Also prune stale idempotency entries (oldest 100 older than 10 minutes).
-this.ctx.storage.sql.exec(
-	`DELETE FROM transaction_idempotency
-	 WHERE transaction_id IN (
-	   SELECT transaction_id FROM transaction_idempotency
-	   WHERE transaction_ts < ?
-	   ORDER BY transaction_ts ASC
-	   LIMIT 100
-	 )`,
-	Date.now() - 600_000,
-);
 ```
 
 ### 7b. Schedule alarm on incoming `prepare`
@@ -1118,8 +1059,7 @@ M1, M2, M5 are quick (~30–60 min each). M4 and M6 are the meaty milestones.
 4. Every TC state transition writes the new state to SQLite **before** any outbound RPC for that state.
 5. `prepare`, `commit`, and `cancel` are idempotent (safe for concurrent recovery runs).
 6. TC in `PREPARED` state MUST eventually commit — it must never transition to CANCELLING from PREPARED.
-7. `transaction_idempotency` on `PartitionDO` is keyed by `transactionId` — `idempotencyToken` / `clientRequestToken` is a TC-layer concern only; `PartitionDO` never sees it.
-8. Rejection reason is stored in `tc_state.rejection_reason_json` — never in a separate KV entry.
+7. Rejection reason is stored in `tc_state.rejection_reason_json` — never in a separate KV entry.
 
 ---
 

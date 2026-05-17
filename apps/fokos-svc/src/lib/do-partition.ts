@@ -86,6 +86,27 @@ type MigratedItem = {
 	data: string | Uint8Array;
 	ttl_epoch_utc_seconds: number | null;
 	v: number;
+	last_transaction_ts: number;
+};
+
+type PendingTransactionRow = {
+	hk: string;
+	sk: string;
+	transaction_id: string;
+	transaction_ts: number;
+	operation: string;
+	data: string | Uint8Array | null;
+	conditions_json: string | null;
+	coordinator_do_name: string;
+	created_at: number;
+};
+
+type PendingTransactionCursor = { hk: string; sk: string; transaction_id: string };
+
+type GetPartitionTransactionMetadataResult = {
+	maxDeletedTs: number;
+	pendingTransactions: PendingTransactionRow[];
+	nextCursor: PendingTransactionCursor | null;
 };
 
 type MigrationCursor = { hk: string; sk: string };
@@ -98,6 +119,10 @@ type GetItemsBatchResult = {
 // Structural type for child→parent RPC calls during migration.
 type ParentPartitionDOStub = {
 	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
+	getPartitionTransactionMetadata(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PendingTransactionCursor | null;
+	}): Promise<GetPartitionTransactionMetadataResult>;
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
 	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
 };
@@ -379,6 +404,58 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { items, nextCursor: reachedLimit ? tableCursor : null };
 	}
 
+	async getPartitionTransactionMetadata(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PendingTransactionCursor | null;
+	}): Promise<GetPartitionTransactionMetadataResult> {
+		const pCtx = this.pCtx();
+		const topology = this.ensureTopology(pCtx);
+		const splitStatus = topology.splitStatus();
+		invariant(
+			splitStatus?.status === "split_started",
+			`fokos/partition.getPartitionTransactionMetadata: expected split_started, got ${splitStatus?.status}`,
+		);
+		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
+		invariant(isKnownChild, `fokos/partition.getPartitionTransactionMetadata: unknown child partition "${opts.childPartitionContext.doName}"`);
+
+		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
+
+		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
+		const PAGE_SIZE = 1000;
+		const rows: PendingTransactionRow[] = [];
+		let totalBytes = 0;
+		let tableCursor = opts.cursor;
+		let reachedLimit = false;
+
+		const maxDeletedTs =
+			this.ctx.storage.sql
+				.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
+				.toArray()[0]?.max_deleted_ts ?? 0;
+
+		while (true) {
+			const page = this.queryPendingTxPage(tableCursor, PAGE_SIZE);
+			if (page.length === 0) break;
+
+			for (const row of page) {
+				if (isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk)) {
+					const rowBytes = estimatePendingTxBytes(row);
+					if (rows.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
+						reachedLimit = true;
+						break;
+					}
+					rows.push(row);
+					totalBytes += rowBytes;
+				}
+				tableCursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
+			}
+			if (reachedLimit) break;
+
+			if (page.length < PAGE_SIZE) break;
+		}
+
+		return { maxDeletedTs, pendingTransactions: rows, nextCursor: reachedLimit ? tableCursor : null };
+	}
+
 	async acknowledgeChildMigrationComplete(childDoName: string): Promise<void> {
 		this.ensureTopology(this.pCtx()).acknowledgeChildMigration(childDoName);
 	}
@@ -408,20 +485,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		let response: PrepareResponse = this.ctx.storage.transactionSync<PrepareResponse>(() => {
-			const idempotencyRow = this.ctx.storage.sql
-				.exec<{ outcome: string }>(`SELECT outcome FROM transaction_idempotency WHERE transaction_id = ? LIMIT 1`, request.transactionId)
-				.toArray()[0];
-
-			if (idempotencyRow) {
-				if (idempotencyRow.outcome === "accepted") {
-					return { outcome: "accepted" };
-				}
-				return {
-					outcome: "rejected",
-					reason: { type: "condition_failed", hashKey: "", sortKey: undefined },
-				};
-			}
-
 			for (const item of request.items) {
 				const sk = item.sortKey ?? "";
 
@@ -506,13 +569,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				);
 			}
 
-			this.ctx.storage.sql.exec(
-				`INSERT OR REPLACE INTO transaction_idempotency (transaction_id, transaction_ts, outcome)
-					 VALUES (?, ?, 'accepted')`,
-				request.transactionId,
-				request.transactionTimestamp,
-			);
-
 			return { outcome: "accepted" };
 		});
 
@@ -584,36 +640,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 		});
 
-		// Stale idempotency cleanup is housekeeping — runs outside the atomic transaction.
-		this.ctx.storage.sql.exec(
-			`DELETE FROM transaction_idempotency
-			 WHERE transaction_id IN (
-			   SELECT transaction_id FROM transaction_idempotency
-			   WHERE transaction_ts < ?
-			   ORDER BY transaction_ts ASC
-			   LIMIT 100
-			 )`,
-			Date.now() - 600_000,
-		);
-
 		return { outcome: "committed" };
 	}
 
 	async cancel(request: CancelRequest): Promise<CancelResponse> {
 		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
-
-		// Stale idempotency cleanup is housekeeping — runs outside the atomic transaction.
-		this.ctx.storage.sql.exec(
-			`DELETE FROM transaction_idempotency
-			 WHERE transaction_id IN (
-			   SELECT transaction_id FROM transaction_idempotency
-			   WHERE transaction_ts < ?
-			   ORDER BY transaction_ts ASC
-			   LIMIT 100
-			 )`,
-			Date.now() - 600_000,
-		);
-
 		return { outcome: "cancelled" };
 	}
 
@@ -848,14 +879,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
-		type Row = { hk: string; sk: string; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null; v: number };
+		type Row = {
+			hk: string;
+			sk: string;
+			data: string | ArrayBuffer;
+			ttl_epoch_utc_seconds: number | null;
+			v: number;
+			last_transaction_ts: number;
+		};
 
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items ORDER BY hk, sk LIMIT ?`, limit);
+			sqlCursor = this.ctx.storage.sql.exec<Row>(
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items ORDER BY hk, sk LIMIT ?`,
+				limit,
+			);
 		} else {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.hk,
 				cursor.sk,
@@ -871,9 +912,51 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
 				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
 				v: row.v,
+				last_transaction_ts: row.last_transaction_ts,
 			});
 		}
 		return items;
+	}
+
+	private queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
+		type Row = {
+			hk: string;
+			sk: string;
+			transaction_id: string;
+			transaction_ts: number;
+			operation: string;
+			data: string | ArrayBuffer | null;
+			conditions_json: string | null;
+			coordinator_do_name: string;
+			created_at: number;
+		};
+
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at`;
+		let sqlCursor: SqlStorageCursor<Row>;
+		if (!cursor) {
+			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
+		} else {
+			sqlCursor = this.ctx.storage.sql.exec<Row>(
+				`SELECT ${cols} FROM pending_transactions
+				 WHERE hk > ? OR (hk = ? AND (sk > ? OR (sk = ? AND transaction_id > ?)))
+				 ORDER BY hk, sk, transaction_id LIMIT ?`,
+				cursor.hk,
+				cursor.hk,
+				cursor.sk,
+				cursor.sk,
+				cursor.transaction_id,
+				limit,
+			);
+		}
+
+		const rows: PendingTransactionRow[] = [];
+		for (const row of sqlCursor) {
+			rows.push({
+				...row,
+				data: typeof row.data === "string" ? row.data : row.data ? new Uint8Array(row.data) : null,
+			});
+		}
+		return rows;
 	}
 
 	private async runMigration(): Promise<void> {
@@ -896,12 +979,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					// IGNORE is safer for retries — if a batch was already written before a crash we
 					// skip re-inserting those items rather than overwriting them unnecessarily.
 					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v) VALUES (?, ?, ?, ?, ?)`,
+						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts) VALUES (?, ?, ?, ?, ?, ?)`,
 						item.hk,
 						item.sk,
 						item.data,
 						item.ttl_epoch_utc_seconds ?? null,
 						item.v,
+						item.last_transaction_ts,
 					);
 				}
 			}
@@ -913,6 +997,41 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (!nextCursor) break;
 		}
 		invariant(cursor === null, "fokos/partition.runMigration: loop exited with non-null cursor — data may be incomplete");
+
+		// Migrate transaction metadata: pending locks and deletion high-water mark.
+		let txCursor: PendingTransactionCursor | null = null;
+		while (true) {
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
+				childPartitionContext: pCtx,
+				cursor: txCursor,
+			});
+
+			this.ctx.storage.transactionSync(() => {
+				for (const row of pendingTransactions) {
+					this.ctx.storage.sql.exec(
+						`INSERT OR IGNORE INTO pending_transactions
+						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						row.hk,
+						row.sk,
+						row.transaction_id,
+						row.transaction_ts,
+						row.operation,
+						row.data,
+						row.conditions_json,
+						row.coordinator_do_name,
+						row.created_at,
+					);
+				}
+				this.ctx.storage.sql.exec(
+					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
+					maxDeletedTs,
+				);
+			});
+
+			if (!nextCursor) break;
+			txCursor = nextCursor;
+		}
 
 		await this.__testing__beforeMigrationComplete?.();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
@@ -936,6 +1055,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 function estimateItemBytes(item: MigratedItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
 	return item.hk.length * 2 + item.sk.length * 2 + dataSize + 8 + 64;
+}
+
+function estimatePendingTxBytes(row: PendingTransactionRow): number {
+	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
+	return row.hk.length * 2 + row.sk.length * 2 + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -982,12 +1106,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
             ) STRICT;
             INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);
 
-            CREATE TABLE IF NOT EXISTS transaction_idempotency (
-                transaction_id      TEXT    NOT NULL PRIMARY KEY,
-                transaction_ts      INTEGER NOT NULL,
-                outcome             TEXT    NOT NULL
-            ) WITHOUT ROWID, STRICT;
-            CREATE INDEX IF NOT EXISTS transaction_idempotency_ts
-                ON transaction_idempotency (transaction_ts);`,
+`,
 	},
 ];
