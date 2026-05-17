@@ -66,6 +66,7 @@ The `PartitionDO` must be extended with:
 - A **`pending_transactions` table** to record which items are currently "locked" by an accepted-but-not-yet-committed transaction.
 - A **`last_transaction_ts` column** on the `items` table: the wall-clock timestamp (milliseconds since epoch, 64-bit integer) of the most recent committed write to that item. This is the primary conflict-detection datum. This timestamp is also updated for items that only had a Condition Check evaluated even if no write happened to this specific item during the committed transaction. This prevents a future lower-timestamp write from invalidating a check that was already accepted.
 - A **`max_delete_timestamp`** stored in the `ctx.storage.kv` KV storage, or create a new table `deletion_metadata` with a single column `max_deleted_ts` which is equal to `max(max_deleted_ts, last_transaction_ts)` where `last_transaction_ts` is the timestamp of the transaction deleting any item of the partition. Updated every time an item is deleted.
+- A **`transaction_idempotency` table** with columns `transaction_id, transaction_ts, outcome` in order to be able to handle idempotent transaction requests. This table should be cleaned up periodically to delete entries far in the past, `Date.now() - transaction_ts > 10 minutes`. The cleanup is done after each transaction's final state transition (committed or aborted) and deleting the oldest 100 rows from `transaction_idempotency` exceeding our age threshold.
 
 **Design choice — pending transaction storage.** Recommend a separate `pending_transactions` table keyed by `(hashKey, sortKey, transactionId)` holding `{operation, data, conditions, timestamp}`. This keeps the `items` table clean (committed state only) and makes the acceptance check a simple join. Document why this is preferred over a "shadow write" column on `items`.
 
@@ -94,7 +95,7 @@ Idempotency: if a `Prepare` for the same `transactionId` has already been accept
 High level pseudocode for the prepare step:
 
 ```
-def processPrepare ( PrepareInput input):
+def processPrepare(PrepareInput input):
    item = readItem(input)
    if item != NONE:
       if evaluateConditionsOnItem(item, input.conditions)
@@ -107,7 +108,7 @@ def processPrepare ( PrepareInput input):
       return FAILED
 
    else: #item does not exist
-      item = new Item(input. item )
+      item = new Item(input.item)
       if evaluateConditionsOnItem(input.conditions)
          AND evaluateSystemRestrictions(input)
          AND partition.maxDeleteTimestamp < input.timestamp:
