@@ -191,9 +191,9 @@ export type {
 
 **TODO checklist:**
 
-- [ ] Create `src/lib/transaction-types.ts` with all types above
-- [ ] Add re-exports to `src/lib/types.ts`
-- [ ] Ensure it compiles (`npx tsc --noEmit`)
+- [x] Create `src/lib/transaction-types.ts` with all types above
+- [x] Add re-exports to `src/lib/types.ts`
+- [x] Ensure it compiles (`npx tsc --noEmit`)
 
 ---
 
@@ -220,9 +220,9 @@ TRANSACTION_COORDINATOR_DO: DurableObjectNamespace<TransactionCoordinatorDO>;
 
 **TODO checklist:**
 
-- [ ] Confirm `wrangler.jsonc` binding name is `TRANSACTION_COORDINATOR_DO`
-- [ ] Confirm `worker-configuration.d.ts` `Env` has `TRANSACTION_COORDINATOR_DO`
-- [ ] Run `wrangler deploy --dry-run` (or `wrangler dev`) to confirm config is valid
+- [x] Confirm `wrangler.jsonc` binding name is `TRANSACTION_COORDINATOR_DO`
+- [x] Confirm `worker-configuration.d.ts` `Env` has `TRANSACTION_COORDINATOR_DO`
+- [x] Run `wrangler deploy --dry-run` (or `wrangler dev`) to confirm config is valid
 
 ---
 
@@ -325,11 +325,11 @@ ON CONFLICT(hk, sk) DO UPDATE SET
 
 **TODO checklist:**
 
-- [ ] Add migrations 2–5 to `sqlMigrations` in `do-partition.ts`
-- [ ] Add pending-transaction conflict check at the top of `putItem` and `deleteItem` local handlers
-- [ ] Update `putItem` SQL to include `last_transaction_ts = Date.now()` in the upsert
-- [ ] Update `deleteItem` to set `last_transaction_ts = Date.now()` on the deleted item's row before deleting (so any read that races sees the tombstone timestamp — actually since the row is deleted this is moot; just ensure the pending-transaction check runs first)
-- [ ] Run existing test suite to confirm no regressions (`npm test`)
+- [x] Add migrations 2–5 to `sqlMigrations` in `do-partition.ts`
+- [x] Add pending-transaction conflict check at the top of `putItem` and `deleteItem` local handlers
+- [x] Update `putItem` SQL to include `last_transaction_ts = Date.now()` in the upsert
+- [x] Update `deleteItem` to set `last_transaction_ts = Date.now()` on the deleted item's row before deleting (so any read that races sees the tombstone timestamp — actually since the row is deleted this is moot; just ensure the pending-transaction check runs first)
+- [x] Run existing test suite to confirm no regressions (`npm test`)
 
 ---
 

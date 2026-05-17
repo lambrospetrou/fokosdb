@@ -183,6 +183,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
 			local: async () => {
 				const sk = opts.sortKey ?? "";
+
+				const pendingRow = this.ctx.storage.sql
+					.exec<{ transaction_id: string }>(
+						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
+						opts.hashKey,
+						sk,
+					)
+					.toArray()[0];
+				if (pendingRow) {
+					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
+					// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
+					throw new Error(
+						`fokos/putItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
+					);
+				}
+
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
 					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
@@ -193,17 +209,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				const writeRes = this.ctx.storage.sql.exec<{ v: number }>(
-					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v)
-					 VALUES (?, ?, ?, ?, 1)
+					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts)
+					 VALUES (?, ?, ?, ?, 1, ?)
 					 ON CONFLICT(hk, sk) DO UPDATE SET
 					   data = excluded.data,
 					   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-					   v = v + 1
+					   v = v + 1,
+					   last_transaction_ts = excluded.last_transaction_ts
 					 RETURNING v`,
 					opts.hashKey,
 					sk,
 					opts.data,
 					opts.ttlEpochUTCSeconds ?? null,
+					Date.now(),
 				);
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				const rows = writeRes.toArray();
@@ -239,6 +257,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			forward: async (stub, pCtx) => await stub.deleteItem(pCtx, opts),
 			local: async () => {
 				const sk = opts.sortKey ?? "";
+
+				const pendingRow = this.ctx.storage.sql
+					.exec<{ transaction_id: string }>(
+						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
+						opts.hashKey,
+						sk,
+					)
+					.toArray()[0];
+				if (pendingRow) {
+					// FIXME: ATC §4 optimization — see same comment in putItem.
+					throw new Error(
+						`fokos/deleteItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
+					);
+				}
+
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
 					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
@@ -653,5 +686,41 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 v INTEGER NOT NULL,
                 PRIMARY KEY (hk, sk)
             ) WITHOUT ROWID, STRICT;`,
+	},
+	{
+		idMonotonicInc: 2,
+		description: "Add last_transaction_ts to items and create transaction support tables",
+		sql: `
+            ALTER TABLE items ADD COLUMN last_transaction_ts INTEGER NOT NULL DEFAULT 0;
+
+            CREATE TABLE IF NOT EXISTS pending_transactions (
+                hk                    TEXT    NOT NULL,
+                sk                    TEXT    NOT NULL DEFAULT '',
+                transaction_id        TEXT    NOT NULL,
+                transaction_ts        INTEGER NOT NULL,
+                operation             TEXT    NOT NULL,
+                data                  ANY,
+                conditions_json       TEXT,
+                coordinator_do_name   TEXT    NOT NULL DEFAULT '',
+                created_at            INTEGER NOT NULL,
+                PRIMARY KEY (hk, sk, transaction_id)
+            ) WITHOUT ROWID, STRICT;
+
+            CREATE INDEX IF NOT EXISTS pending_transactions_created_at
+                ON pending_transactions (created_at);
+
+            CREATE TABLE IF NOT EXISTS deletion_metadata (
+                id              INTEGER PRIMARY KEY CHECK (id = 1),
+                max_deleted_ts  INTEGER NOT NULL DEFAULT 0
+            ) STRICT;
+            INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);
+
+            CREATE TABLE IF NOT EXISTS transaction_idempotency (
+                transaction_id      TEXT    NOT NULL PRIMARY KEY,
+                transaction_ts      INTEGER NOT NULL,
+                outcome             TEXT    NOT NULL
+            ) WITHOUT ROWID, STRICT;
+            CREATE INDEX IF NOT EXISTS transaction_idempotency_ts
+                ON transaction_idempotency (transaction_ts);`,
 	},
 ];

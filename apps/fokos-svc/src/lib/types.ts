@@ -80,3 +80,12 @@ export type OperationMetrics = {
 	databaseSize: number;
 	timings?: {};
 };
+
+export type {
+	InitiateWriteRequest,
+	InitiateWriteResponse,
+	InitiateReadRequest,
+	InitiateReadResponse,
+	TCWriteOperation,
+	TCReadItem,
+} from "./transaction-types.js";

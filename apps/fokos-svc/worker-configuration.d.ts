@@ -5,11 +5,12 @@
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/index");
-		durableNamespaces: "MyDurableObject" | "PartitionDO" | "TopologyKeeperDO";
+		durableNamespaces: "MyDurableObject" | "PartitionDO" | "TransactionCoordinatorDO";
 	}
 	interface Env {
 		MY_DURABLE_OBJECT: DurableObjectNamespace<import("./src/index").MyDurableObject>;
 		PARTITION_DO: DurableObjectNamespace<import("./src/lib/do-partition").PartitionDO>;
+		TRANSACTION_COORDINATOR_DO: DurableObjectNamespace<import("./src/lib/do-transaction-coordinator").TransactionCoordinatorDO>;
 	}
 }
 interface Env extends Cloudflare.Env {}
