@@ -80,16 +80,42 @@ The following describes the _logical_ interface `PartitionDO` must expose to the
 Called by TC in Phase 1. The `PartitionDO` must, **atomically within a single SQLite transaction**:
 
 1. If the `transaction.timestamp` is more than N seconds in the future (default N=5) then there is some clock skew issue and we reject this request.
-2. Evaluate all `ConditionExpression`s for items in this partition referenced by the transaction.
-3. Check, for each item the transaction would **write**, that `transaction.timestamp > item.last_transaction_ts` (no committed write is newer than this transaction's timestamp).
-4. Check, for each item the transaction would **write**, that there is no other already-accepted (pending) transaction on that item.
-5. Check, for each item the transaction would **check-only** (not write), that `transaction.timestamp > item.last_transaction_ts` and no pending write transaction is on that item.
+2. Check, for each item the transaction would **check-only** (not write), that `transaction.timestamp > item.last_transaction_ts` and no pending write transaction is on that item.
+3. Evaluate all `ConditionExpression`s for items in this partition referenced by the transaction.
+4. Check, for each item the transaction would **write**, that `transaction.timestamp > item.last_transaction_ts` (no committed write is newer than this transaction's timestamp).
+5. Check, for each item the transaction would **write**, that there is no other already-accepted (pending) transaction on that item.
 
 If all checks pass: insert rows into `pending_transactions` for every item this TC touches (write or check) and return `{ outcome: "accepted" }`.
 
 If any check fails: return `{ outcome: "rejected", reason: RejectionReason }` where `RejectionReason` is a discriminated union of `{ type: "condition_failed", itemKey }`, `{ type: "timestamp_conflict", itemKey }`, and `{ type: "pending_conflict", itemKey, conflictingTransactionId }`. **Do not modify any item or pending-transaction state on a rejection.**
 
 Idempotency: if a `Prepare` for the same `transactionId` has already been accepted, return `{ outcome: "accepted" }` without re-running checks.
+
+High level pseudocode for the prepare step:
+
+```
+def processPrepare ( PrepareInput input):
+   item = readItem(input)
+   if item != NONE:
+      if evaluateConditionsOnItem(item, input.conditions)
+         AND evaluateSystemRestrictions(item, input)
+         AND item.timestamp < input.timestamp
+         AND item.ongoingTransactions == NONE:
+            item.ongoingTransaction = input.transactionId
+            return SUCCESS
+
+      return FAILED
+
+   else: #item does not exist
+      item = new Item(input. item )
+      if evaluateConditionsOnItem(input.conditions)
+         AND evaluateSystemRestrictions(input)
+         AND partition.maxDeleteTimestamp < input.timestamp:
+            item.ongoingTransaction = input.transactionId
+            return SUCCESS
+
+   return FAILED
+```
 
 #### `commit(request: CommitRequest): CommitResponse`
 
