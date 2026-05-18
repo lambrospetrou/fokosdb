@@ -23,6 +23,7 @@ describe("fokosdb", async () => {
 			topology: new PartitionTopologyRouterImpl("encoded-topology", {
 				...testSplitOptions,
 			}),
+			transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 		});
 
 		await expect(

@@ -824,12 +824,12 @@ async recoverTransaction(): Promise<void> {
 
 **TODO checklist:**
 
-- [ ] Create TC SQLite schema (tc_state with `rejection_reason_json`, tc_participants, tc_items) with migrations
-- [ ] Implement `initiateWrite` with full 9-step algorithm (stores rejection reason in `tc_state.rejection_reason_json`)
-- [ ] Implement `runCommit` background driver with exponential backoff retry
-- [ ] Implement `initiateRead` two-phase algorithm
-- [ ] Implement alarm recovery handler covering PREPARING, COMMITTING, CANCELLING
-- [ ] Implement `recoverTransaction()` RPC
+- [x] Create TC SQLite schema (tc_state with `rejection_reason_json`, tc_participants, tc_items) with migrations
+- [x] Implement `initiateWrite` with full 9-step algorithm (stores rejection reason in `tc_state.rejection_reason_json`)
+- [x] Implement `runCommit` background driver with exponential backoff retry
+- [x] Implement `initiateRead` two-phase algorithm
+- [x] Implement alarm recovery handler covering PREPARING, COMMITTING, CANCELLING
+- [x] Implement `recoverTransaction()` RPC
 
 ---
 
@@ -887,8 +887,8 @@ if (!(await this.ctx.storage.getAlarm())) {
 
 **TODO checklist:**
 
-- [ ] Add alarm extension to `PartitionDO` (calls `tcStub.recoverTransaction()` for stale pending rows)
-- [ ] Schedule alarm in `prepare()` after successful accept
+- [x] Add alarm extension to `PartitionDO` (calls `tcStub.recoverTransaction()` for stale pending rows)
+- [x] Schedule alarm in `prepare()` after successful accept
 - [ ] Write test: pending transaction older than 60 s triggers `recoverTransaction()` call on the TC
 
 ---
@@ -969,10 +969,10 @@ function validateTransactWriteItems(ops: TCWriteOperation[]): void {
 
 **TODO checklist:**
 
-- [ ] Add `tcNs` to `FokosDBOptions`
-- [ ] Implement `transactWriteItems` with validation and TC call
-- [ ] Implement `transactGetItems` with ephemeral TC DO
-- [ ] Update `src/index.ts` worker entrypoint to pass `tcNs` when constructing `FokosDB`
+- [x] Add `transactionCoordinatorNs` to `FokosDBOptions`
+- [x] Implement `transactWriteItems` with validation and TC call
+- [x] Implement `transactGetItems` with ephemeral TC DO
+- [ ] Update `src/index.ts` worker entrypoint to pass `transactionCoordinatorNs` when constructing `FokosDB`
 
 ---
 
@@ -1069,3 +1069,27 @@ M1, M2, M5 are quick (~30–60 min each). M4 and M6 are the meaty milestones.
 - **`TransactGetItems` TC lifecycle:** Read-only TCs are ephemeral (random UUID name, no idempotency). They can expire without cleanup.
 - **`ctx.waitUntil` for background commit:** Use `this.ctx.waitUntil(runCommit(...))` in `initiateWrite` so the commit continues after the RPC returns. Ensure the DO stays alive for the background task.
 - **Non-transactional write rejection UX:** The thrown error should carry the `transactionId` of the conflicting transaction so the caller can log it. Revisit error format when implementing the ATC §4 optimization (FIXME noted in M3).
+
+---
+
+## Appendix A — Post-Implementation Fixes
+
+Fixes identified during post-implementation review and applied to the codebase.
+
+- [x] **Fix 1 — Commit invariant check.** `PartitionDO.commitLocal` now asserts a 1:1 mapping between request items and `pending_transactions` rows (count equality + every request key exists in the pending set) before applying writes.
+- [x] **Fix 2 — Client-side put-data validation.** `validateTransactWriteItems` in `db.ts` rejects `put` operations with missing `data` before the request reaches the TC.
+- [x] **Fix 3 — Bounded commit retries.** `runCommit` retry predicate changed from `() => true` to `(_err, nextAttempt) => nextAttempt < 10`.
+- [x] **Fix 4 — Missing tc_state index.** Added `CREATE INDEX IF NOT EXISTS tc_state_transaction_id ON tc_state (transaction_id)` to the TC migration, since `recoverTransaction` queries by `transaction_id` but the PK is `idempotency_token`.
+- [x] **Fix 5 — State guards on UPDATE statements.** All `UPDATE tc_state SET state = ...` statements now include `AND state = '...'` (or `AND state IN (...)`) guards to prevent stale/duplicate transitions.
+- [x] **Fix 6 — Transaction split-forwarding.** `prepare`, `commit`, `cancel`, and `readForTransaction` in PartitionDO now forward to child partitions during splits, matching the existing behavior of `putItem`/`deleteItem`. When splitting, all items must route to children — local and forwarded paths are mutually exclusive (enforced by invariant).
+
+---
+
+## Appendix B — Deviations from Plan (Improvements)
+
+Intentional deviations from the original plan that improve the design.
+
+1. **Inline idempotency in `tc_state`.** The plan called for a separate `tc_idempotency` table. The implementation stores the idempotency token as the PK of `tc_state` directly, eliminating a join and a table.
+2. **`ctx.waitUntil` for background commit.** The plan did not specify the mechanism for continuing commit after the RPC returns. The implementation uses `ctx.waitUntil(runCommit(...))` to keep the DO alive during background commit work.
+3. **`recoverTransaction` inlined into TC.** The plan suggested a separate recovery path. The implementation reuses the same `runPrepare`/`runCommit` methods with state-guard UPDATEs, making recovery and the happy path share code.
+4. **Alarm-based TC recovery.** The plan mentioned recovery but not the trigger mechanism. The implementation sets a DO alarm as a fallback that fires `recoverTransaction` if the TC stalls.

@@ -19,6 +19,7 @@ import type {
 	ReadForTransactionItemResult,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	TransactionItem,
 } from "./transaction-types.js";
 import {
 	PartitionContext,
@@ -78,6 +79,10 @@ type PartitionDOStub = {
 	putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult>;
 	deleteItem(ctx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult>;
+	prepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
+	commit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
+	cancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
+	readForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 };
 
 type MigratedItem = {
@@ -97,7 +102,7 @@ type PendingTransactionRow = {
 	operation: string;
 	data: string | Uint8Array | null;
 	conditions_json: string | null;
-	coordinator_do_name: string;
+	coordinator_do_id: string;
 	created_at: number;
 };
 
@@ -474,7 +479,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
-	async prepare(request: PrepareRequest): Promise<PrepareResponse> {
+	async prepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
+		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration();
+
+		const { local, forwarded } = this.groupItemsByRouting(request.items);
+		if (forwarded.size > 0) {
+			invariant(local.length === 0, "fokos/partition.prepare: split routing must not mix local and forwarded items");
+			for (const [, { pCtx: childPCtx, items }] of forwarded) {
+				const r = await this.getChildStub(childPCtx).prepare(childPCtx, { ...request, items });
+				if (r.outcome === "rejected") return r;
+			}
+			return { outcome: "accepted" };
+		}
+
+		return await this.prepareLocal(request);
+	}
+
+	private async prepareLocal(request: PrepareRequest): Promise<PrepareResponse> {
 		const now = Date.now();
 
 		if (request.transactionTimestamp > now + 5_000) {
@@ -555,7 +577,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const sk = item.sortKey ?? "";
 				this.ctx.storage.sql.exec(
 					`INSERT OR IGNORE INTO pending_transactions
-						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at)
+						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
 						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					item.hashKey,
 					sk,
@@ -564,7 +586,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					item.operation,
 					item.data ?? null,
 					item.conditions ? JSON.stringify(item.conditions) : null,
-					request.coordinatorDoName,
+					request.coordinatorDoId,
 					Date.now(),
 				);
 			}
@@ -579,7 +601,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return response;
 	}
 
-	async commit(request: CommitRequest): Promise<CommitResponse> {
+	async commit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
+		this.ensurePartitionContext(pCtx);
+
+		const { local, forwarded } = this.groupItemsByRouting(request.items);
+		if (forwarded.size > 0) {
+			invariant(local.length === 0, "fokos/partition.commit: split routing must not mix local and forwarded items");
+			for (const [, { pCtx: childPCtx, items }] of forwarded) {
+				await this.getChildStub(childPCtx).commit(childPCtx, { ...request, items });
+			}
+			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+			return { outcome: "committed" };
+		}
+
+		return this.commitLocal(request);
+	}
+
+	private commitLocal(request: CommitRequest): CommitResponse {
 		const pendingCount =
 			this.ctx.storage.sql
 				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
@@ -590,65 +628,125 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		this.ctx.storage.transactionSync(() => {
-			for (const item of request.items) {
-				const sk = item.sortKey ?? "";
-				const pendingRow = this.ctx.storage.sql
-					.exec<{
-						operation: string;
-						data: string | ArrayBuffer | null;
-					}>(
-						`SELECT operation, data FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
-						item.hashKey,
-						sk,
-						request.transactionId,
-					)
-					.toArray()[0];
-
-				if (!pendingRow) continue;
-
-				if (pendingRow.operation === "put") {
-					const data = typeof pendingRow.data === "string" ? pendingRow.data : pendingRow.data ? new Uint8Array(pendingRow.data) : null;
-					this.ctx.storage.sql.exec(
-						`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts)
-						 VALUES (?, ?, ?, NULL, 1, ?)
-						 ON CONFLICT(hk, sk) DO UPDATE SET
-						   data = excluded.data,
-						   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-						   v = v + 1,
-						   last_transaction_ts = excluded.last_transaction_ts`,
-						item.hashKey,
-						sk,
-						data,
-						request.transactionTimestamp,
-					);
-				} else if (pendingRow.operation === "delete") {
-					this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, item.hashKey, sk);
-					this.ctx.storage.sql.exec(
-						`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-						request.transactionTimestamp,
-					);
-				} else if (pendingRow.operation === "check") {
-					this.ctx.storage.sql.exec(
-						`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`,
-						request.transactionTimestamp,
-						item.hashKey,
-						sk,
-					);
-				}
+			const pendingRows = this.ctx.storage.sql
+				.exec<{ hk: string; sk: string }>(
+					`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`,
+					request.transactionId,
+				)
+				.toArray();
+			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
+			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
+			invariant(
+				pendingKeySet.size === requestKeySet.size,
+				`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
+			);
+			for (const key of requestKeySet) {
+				invariant(
+					pendingKeySet.has(key),
+					`fokos/partition.commit: request item ${key} not found in pending_transactions for transaction ${request.transactionId}`,
+				);
 			}
 
+			this.applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);
 			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 		});
 
 		return { outcome: "committed" };
 	}
 
-	async cancel(request: CancelRequest): Promise<CancelResponse> {
+	private applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
+		for (const item of items) {
+			const sk = item.sortKey ?? "";
+			const pendingRow = this.ctx.storage.sql
+				.exec<{
+					operation: string;
+					data: string | ArrayBuffer | null;
+				}>(
+					`SELECT operation, data FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
+					item.hashKey,
+					sk,
+					transactionId,
+				)
+				.toArray()[0];
+
+			if (!pendingRow) continue;
+
+			if (pendingRow.operation === "put") {
+				const data = typeof pendingRow.data === "string" ? pendingRow.data : pendingRow.data ? new Uint8Array(pendingRow.data) : null;
+				this.ctx.storage.sql.exec(
+					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts)
+					 VALUES (?, ?, ?, NULL, 1, ?)
+					 ON CONFLICT(hk, sk) DO UPDATE SET
+					   data = excluded.data,
+					   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+					   v = v + 1,
+					   last_transaction_ts = excluded.last_transaction_ts`,
+					item.hashKey,
+					sk,
+					data,
+					transactionTimestamp,
+				);
+			} else if (pendingRow.operation === "delete") {
+				this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, item.hashKey, sk);
+				this.ctx.storage.sql.exec(
+					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
+					transactionTimestamp,
+				);
+			} else if (pendingRow.operation === "check") {
+				this.ctx.storage.sql.exec(
+					`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`,
+					transactionTimestamp,
+					item.hashKey,
+					sk,
+				);
+			}
+		}
+	}
+
+	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
+		this.ensurePartitionContext(pCtx);
 		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+
+		const topology = this.ensureTopology(pCtx);
+		const splitStatus = topology.splitStatus();
+		if (splitStatus?.status === "split_started") {
+			for (const childPCtx of splitStatus.childPartitionContexts) {
+				try {
+					await this.getChildStub(childPCtx).cancel(childPCtx, request);
+				} catch (e) {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition.cancel: failed to forward cancel to child",
+						childDoName: childPCtx.doName,
+						transactionId: request.transactionId,
+						error: String(e),
+					});
+				}
+			}
+		}
+
 		return { outcome: "cancelled" };
 	}
 
-	async readForTransaction(request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+	async readForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration();
+
+		const { local, forwarded } = this.groupItemsByRouting(request.items);
+		if (forwarded.size > 0) {
+			invariant(local.length === 0, "fokos/partition.readForTransaction: split routing must not mix local and forwarded items");
+			const allItems: ReadForTransactionItemResult[] = [];
+			for (const [, { pCtx: childPCtx, items }] of forwarded) {
+				const r = await this.getChildStub(childPCtx).readForTransaction(childPCtx, { ...request, items });
+				allItems.push(...r.items);
+			}
+			return { items: allItems };
+		}
+
+		return this.readForTransactionLocal(request);
+	}
+
+	private readForTransactionLocal(request: ReadForTransactionRequest): ReadForTransactionResponse {
 		const results: ReadForTransactionItemResult[] = [];
 
 		for (const item of request.items) {
@@ -713,28 +811,56 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					},
 					(_error, nextAttempt) => nextAttempt <= 5,
 				);
-				return;
-			}
-
-			if (splitStatus?.status !== "split_queued") {
+			} else if (splitStatus?.status === "split_queued") {
+				console.log({
+					...this.logParams(),
+					message: "fokos/partition: Running split process.",
+					splitStatus,
+				});
+				await tryWhile(
+					async () => {
+						await topologyRouter.startSplit();
+					},
+					(_error, nextAttempt) => nextAttempt <= 5,
+				);
+			} else {
 				console.log({
 					...this.logParams(),
 					message: "fokos/partition: Alarm fired but no split is queued, nothing to do.",
 					splitStatus,
 				});
-				return;
 			}
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Running split process.",
-				splitStatus,
-			});
-			await tryWhile(
-				async () => {
-					await topologyRouter.startSplit();
-				},
-				(_error, nextAttempt) => nextAttempt <= 5,
-			);
+
+			// Poke TCs for any stale pending transaction locks so they can drive recovery.
+			const STALE_TX_MS = 5_000;
+			const staleTxRows = this.ctx.storage.sql
+				.exec<{ transaction_id: string; coordinator_do_id: string }>(
+					`SELECT DISTINCT transaction_id, coordinator_do_id
+                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
+					Date.now() - STALE_TX_MS,
+				)
+				.toArray();
+			for (const row of staleTxRows) {
+				if (!row.coordinator_do_id) continue;
+				try {
+					const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
+					await (this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }).recoverTransaction(row.transaction_id);
+				} catch (e) {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition: failed to poke stale TC",
+						transactionId: row.transaction_id,
+						error: String(e),
+					});
+				}
+			}
+
+			// Re-arm alarm if any pending transaction locks remain.
+			const pendingCount =
+				this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
+			if (pendingCount > 0 && !(await this.ctx.storage.getAlarm())) {
+				await this.ctx.storage.setAlarm(Date.now() + 5_000);
+			}
 		} catch (error) {
 			console.error({
 				...this.logParams(),
@@ -847,6 +973,39 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
+	private groupItemsByRouting<T extends { hashKey: string; sortKey?: string }>(
+		items: T[],
+	): { local: T[]; forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }> } {
+		const pCtx = this.pCtx();
+		const topology = this.ensureTopology(pCtx);
+		const local: T[] = [];
+		const forwarded = new Map<string, { pCtx: PartitionContextResolved; items: T[] }>();
+
+		for (const item of items) {
+			const decision = topology.shouldAllow(item.hashKey, item.sortKey);
+			if (decision === "ok") {
+				local.push(item);
+			} else if (decision === "forward") {
+				const { partitionContext } = topology.pickChildPartition(pCtx, item.hashKey, item.sortKey);
+				let entry = forwarded.get(partitionContext.doName);
+				if (!entry) {
+					entry = { pCtx: partitionContext, items: [] };
+					forwarded.set(partitionContext.doName, entry);
+				}
+				entry.items.push(item);
+			} else {
+				throw new Error("fokos/partition: partition exceeded its limits during transaction forwarding");
+			}
+		}
+
+		return { local, forwarded };
+	}
+
+	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
+		const childId = this.env[this.pCtx().ns].idFromName(childPCtx.doName);
+		return this.env[this.pCtx().ns].get(childId);
+	}
+
 	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
 		const res = this.ctx.storage.sql.exec<{
 			data: string | ArrayBuffer;
@@ -927,11 +1086,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			operation: string;
 			data: string | ArrayBuffer | null;
 			conditions_json: string | null;
-			coordinator_do_name: string;
+			coordinator_do_id: string;
 			created_at: number;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at`;
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
@@ -1010,7 +1169,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				for (const row of pendingTransactions) {
 					this.ctx.storage.sql.exec(
 						`INSERT OR IGNORE INTO pending_transactions
-						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_name, created_at)
+						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
 						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 						row.hk,
 						row.sk,
@@ -1019,7 +1178,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						row.operation,
 						row.data,
 						row.conditions_json,
-						row.coordinator_do_name,
+						row.coordinator_do_id,
 						row.created_at,
 					);
 				}
@@ -1092,7 +1251,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 operation             TEXT    NOT NULL,
                 data                  ANY,
                 conditions_json       TEXT,
-                coordinator_do_name   TEXT    NOT NULL DEFAULT '',
+                coordinator_do_id   TEXT    NOT NULL DEFAULT '',
                 created_at            INTEGER NOT NULL,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) WITHOUT ROWID, STRICT;

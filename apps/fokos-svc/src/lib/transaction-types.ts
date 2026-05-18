@@ -1,3 +1,5 @@
+import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
+
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
 /** Internal per-attempt identifier. Always a UUID, never reused across retries. */
@@ -25,7 +27,7 @@ export type TransactionItem = {
 export type PrepareRequest = {
 	transactionId: TransactionId;
 	/** DO name of the TC. Stored in pending_transactions so the recovery alarm can call it. */
-	coordinatorDoName: string;
+	coordinatorDoId: string;
 	transactionTimestamp: TransactionTimestamp;
 	/** All items in this partition that the transaction touches. */
 	items: TransactionItem[];
@@ -35,7 +37,8 @@ export type RejectionReason =
 	| { type: "condition_failed"; hashKey: string; sortKey?: string }
 	| { type: "timestamp_conflict"; hashKey: string; sortKey?: string }
 	| { type: "pending_conflict"; hashKey: string; sortKey?: string; conflictingTransactionId: TransactionId }
-	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number };
+	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
+	| { type: "transient_error" };
 
 export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
 
@@ -92,8 +95,8 @@ export type TCWriteOperation = {
 	operation: TransactionOperationType;
 	data?: Uint8Array | string;
 	conditions?: import("./types.js").ItemCondition[];
-	/** DO name of the PartitionDO that owns this key. Resolved by the caller. */
-	partitionDoName: string;
+	/** Resolved partition context for the PartitionDO that owns this key. */
+	partitionContext: PartitionContextResolved;
 };
 
 export type InitiateWriteRequest = {
@@ -109,8 +112,8 @@ export type InitiateWriteResponse =
 export type TCReadItem = {
 	hashKey: string;
 	sortKey?: string;
-	/** DO name of the PartitionDO that owns this key. Resolved by the caller. */
-	partitionDoName: string;
+	/** Resolved partition context for the PartitionDO that owns this key. */
+	partitionContext: PartitionContextResolved;
 };
 
 export type InitiateReadRequest = {
@@ -119,4 +122,4 @@ export type InitiateReadRequest = {
 
 export type InitiateReadResponse =
 	| { outcome: "committed"; items: ReadForTransactionItemResult[] }
-	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" };
+	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
