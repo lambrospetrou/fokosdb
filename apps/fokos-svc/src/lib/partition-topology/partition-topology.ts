@@ -39,8 +39,8 @@ export type PartitionContextResolved = PartitionContext & {
 	primaryDoIdStr: string;
 
 	// Opaque ID used internally to identify the partition.
-	// Hex-encoded bytes: [schemaVersion u8, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
-	// schemaVersion=0 is the current format.
+	// Hex-encoded bytes: [schemaVersion u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	// schemaVersion=0 is the current format. depth counts only sub-tree levels (root partitions have depth=0).
 	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
 	partitionId: PartitionNodeId;
 
@@ -49,7 +49,7 @@ export type PartitionContextResolved = PartitionContext & {
 };
 
 // PartitionNodeId is re-exported from ./types.js above.
-// Hex-encoded bytes: [schemaVersion u8, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8]. schemaVersion=0 is the current format.
+// Hex-encoded bytes: [schemaVersion u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8]. schemaVersion=0 is the current format.
 
 export type SplitConditions = {
 	/**
@@ -84,8 +84,8 @@ export class PartitionContextCreator {
 		if (!opts.hashSplitConditions) {
 			opts.hashSplitConditions = { splitN: 16, maxSizeMb: 100 };
 		}
-		if (opts.rootTreesN < 1 || opts.rootTreesN > 255) {
-			throw new Error("fokos: rootTreesN must be between 1 and 255");
+		if (opts.rootTreesN < 1 || opts.rootTreesN > 65000) {
+			throw new Error("fokos: rootTreesN must be between 1 and 65000");
 		}
 		if (opts.hashSplitConditions.splitN < 2 || opts.hashSplitConditions.splitN > 255) {
 			throw new Error("fokos: hashSplitConditions.splitN must be between 2 and 255");
@@ -164,42 +164,44 @@ export interface PartitionTopologyRouter {
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
 
-// function __encodePartitionIdOpaque(hashIdxs: number[]): { bytes: Uint8Array; hex: string } {
-// 	const bytes = new Uint8Array(1 + hashIdxs.length);
-// 	bytes[0] = hashIdxs.length;
-// 	for (let i = 0; i < hashIdxs.length; i++) bytes[i + 1] = hashIdxs[i];
-// 	return { bytes, hex: bytes.toHex() };
-// }
-
-// function __encodeChildPartitionIdOpaque(parentPartitionId: Uint8Array, childIdxs: number | number[]): { bytes: Uint8Array; hex: string } {
-// 	if (Array.isArray(childIdxs)) {
-// 		const bytes = new Uint8Array(parentPartitionId.length + childIdxs.length);
-// 		bytes.set(parentPartitionId, 0);
-// 		bytes[0] += childIdxs.length;
-// 		for (let i = 0; i < childIdxs.length; i++) bytes[parentPartitionId.length + i] = childIdxs[i];
-// 		return { bytes, hex: bytes.toHex() };
-// 	} else {
-// 		const bytes = new Uint8Array(parentPartitionId.length + 1);
-// 		bytes.set(parentPartitionId, 0);
-// 		bytes[0] += 1;
-// 		bytes[parentPartitionId.length] = childIdxs;
-// 		return { bytes, hex: bytes.toHex() };
-// 	}
-// }
-
-class PartitionIdHelper {
-	static doName(basePartitionContext: PartitionContext, hashIdxs: number[] | Uint8Array<ArrayBuffer>): string {
-		return `${basePartitionContext.nsPrefix}.h.${hashIdxs.join(".")}`;
+export class PartitionIdHelper {
+	static doName(basePartitionContext: PartitionContext, bytes: Uint8Array): string {
+		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		const root = (bytes[1] << 8) | bytes[2];
+		const depth = bytes[3];
+		const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
+		return `${basePartitionContext.nsPrefix}.h.${root}${suffix}`;
 	}
 
 	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
 		invariant(hashIdxs.length >= 1, "fokos/topology.fromHashIdxs: hashIdxs must not be empty");
-		const bytes = new Uint8Array(2 + hashIdxs.length);
+		// hashIdxs[0] is the root index (u16), hashIdxs[1..] are sub-tree child indexes (u8 each).
+		const depth = hashIdxs.length - 1;
+		const bytes = new Uint8Array(4 + depth); // [version, rootHi, rootLo, depth, child1..child_depth]
 		bytes[0] = 0; // schema version
-		bytes[1] = hashIdxs.length;
-		for (let i = 0; i < hashIdxs.length; i++) bytes[i + 2] = hashIdxs[i];
+		bytes[1] = (hashIdxs[0] >> 8) & 0xff; // root index high byte
+		bytes[2] = hashIdxs[0] & 0xff; // root index low byte
+		bytes[3] = depth; // sub-tree depth (u8)
+		for (let i = 0; i < depth; i++) bytes[4 + i] = hashIdxs[i + 1];
 		return new PartitionIdHelper(basePartitionContext, bytes);
 	}
+
+	// Readers for the encoded partition ID bytes.
+	// Format: [schemaVersion u8, rootIdx u16, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8]
+	static rootIdx(bytes: Uint8Array): number {
+		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		return (bytes[1] << 8) | bytes[2];
+	}
+	static depth(bytes: Uint8Array): number {
+		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		return bytes[3];
+	}
+	// The last child index is this partition's slot among its siblings (only valid when depth >= 1).
+	static lastChildIdx(bytes: Uint8Array): number {
+		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		return bytes[3 + bytes[3]];
+	}
+
 
 	#bytes: Uint8Array | undefined;
 	#appendedHashIdxs: number[];
@@ -227,18 +229,29 @@ class PartitionIdHelper {
 	encode(includeDoName: boolean): { bytes: Uint8Array; opaque: string; doName?: string } {
 		invariant(this.#bytes || this.#appendedHashIdxs.length > 0, "fokos/topology.encode: no bytes or appended hash indexes to encode");
 		invariant(!this.#bytes || this.#bytes[0] === 0, `fokos/topology.encode: unexpected schema version byte: ${this.#bytes?.[0]}`);
-		const bytes = new Uint8Array((this.#bytes?.length ?? 2) + this.#appendedHashIdxs.length);
-		if (this.#bytes) bytes.set(this.#bytes, 0);
-		else bytes[0] = 0; // schema version
-		const bsz = this.#bytes?.length ?? 2;
-		// bytes[0] is the schema version — leave it unchanged.
-		bytes[1] = bsz - 2 + this.#appendedHashIdxs.length;
-		for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
+		let bytes: Uint8Array;
+		if (this.#bytes) {
+			invariant(this.#bytes.length >= 4, "fokos/topology.encode: existing bytes too short to be valid");
+			// Extending an existing encoded partition: append child indexes (u8 each).
+			bytes = new Uint8Array(this.#bytes.length + this.#appendedHashIdxs.length);
+			bytes.set(this.#bytes, 0);
+			const bsz = this.#bytes.length;
+			// bytes[0..2] = version + rootIdx — leave unchanged.
+			bytes[3] = bsz - 4 + this.#appendedHashIdxs.length; // new depth (u8)
+			for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
+		} else {
+			// Fresh instance: appendedHashIdxs[0] is the root index (u16), rest are child indexes (u8 each).
+			const depth = this.#appendedHashIdxs.length - 1;
+			bytes = new Uint8Array(4 + depth);
+			bytes[0] = 0; // schema version
+			bytes[1] = (this.#appendedHashIdxs[0] >> 8) & 0xff; // root high byte
+			bytes[2] = this.#appendedHashIdxs[0] & 0xff; // root low byte
+			bytes[3] = depth;
+			for (let i = 0; i < depth; i++) bytes[4 + i] = this.#appendedHashIdxs[i + 1];
+		}
 		let doName: string | undefined;
 		if (includeDoName) {
-			// bytes[0]=version, bytes[1]=depth; extract hash indexes that follow.
-			const hIdxs = bytes.subarray(2, 2 + bytes[1]);
-			doName = PartitionIdHelper.doName(this.basePartitionContext, hIdxs);
+			doName = PartitionIdHelper.doName(this.basePartitionContext, bytes);
 		}
 		return { bytes, opaque: bytes.toHex(), doName };
 	}
@@ -303,10 +316,9 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean {
 		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
-		// bytes[0]=version, bytes[1]=depth; hash indexes start at bytes[2].
-		const childLevel = childPartitionIdBytes[1];
+		const childLevel = PartitionIdHelper.depth(childPartitionIdBytes);
 		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
-		const childIdx = childPartitionIdBytes[1 + childLevel];
+		const childIdx = PartitionIdHelper.lastChildIdx(childPartitionIdBytes);
 		invariant(
 			childIdx < childContext.hashSplitConditions.splitN,
 			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitConditions.splitN}`,
@@ -325,7 +337,10 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
-		const hChildIdx = this.hash(hashKey + (partitionIdBytes[1] + 1), partitionContext.hashSplitConditions.splitN);
+		const depth = PartitionIdHelper.depth(partitionIdBytes);
+		// depth+1 as entropy: root (depth=0) → 1, child (depth=1) → 2, etc.
+		// Ensures each tree level uses a distinct hash seed so siblings don't cluster.
+		const hChildIdx = this.hash(hashKey + (depth + 1), partitionContext.hashSplitConditions.splitN);
 		invariant(
 			hChildIdx >= 0 && hChildIdx < partitionContext.hashSplitConditions.splitN,
 			`fokos/topology.pickChildPartition: hChildIdx ${hChildIdx} out of range for splitN ${partitionContext.hashSplitConditions.splitN}`,

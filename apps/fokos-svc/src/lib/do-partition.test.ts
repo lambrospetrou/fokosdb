@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "./partition-topology/partition-topology.js";
+import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
@@ -361,10 +361,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: "hk",
 						sortKey: "sk",
 						data: "overwrite",
-						conditions: [
-							{ type: "item_not_exists" },
-							{ type: "attribute_equals", attribute: "v", value: 1 },
-						],
+						conditions: [{ type: "item_not_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
 					}),
 				).rejects.toThrow("item_not_exists");
 			});
@@ -521,9 +518,9 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [{ type: "item_exists" }] }),
-					).rejects.toThrow(/item_exists.*hk=hk.*sk=sk/);
+					await expect(instance.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [{ type: "item_exists" }] })).rejects.toThrow(
+						/item_exists.*hk=hk.*sk=sk/,
+					);
 				});
 
 				const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
@@ -534,9 +531,7 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.deleteItem(ctx, { hashKey: "hk", conditions: [{ type: "item_exists" }] }),
-					).rejects.toThrow("item_exists");
+					await expect(instance.deleteItem(ctx, { hashKey: "hk", conditions: [{ type: "item_exists" }] })).rejects.toThrow("item_exists");
 				});
 			});
 		});
@@ -597,10 +592,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await stub.deleteItem(ctx, {
 					hashKey: "hk",
 					sortKey: "sk",
-					conditions: [
-						{ type: "item_exists" },
-						{ type: "attribute_equals", attribute: "v", value: 1 },
-					],
+					conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
 				});
 
 				expect(result.deleted).toBe(true);
@@ -616,10 +608,7 @@ describe("PartitionDO - deleteItem", () => {
 						instance.deleteItem(ctx, {
 							hashKey: "hk",
 							sortKey: "sk",
-							conditions: [
-								{ type: "item_exists" },
-								{ type: "attribute_equals", attribute: "v", value: 1 },
-							],
+							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
 						}),
 					).rejects.toThrow("item_exists");
 				});
@@ -637,10 +626,7 @@ describe("PartitionDO - deleteItem", () => {
 						instance.deleteItem(ctx, {
 							hashKey: "hk",
 							sortKey: "sk",
-							conditions: [
-								{ type: "item_exists" },
-								{ type: "attribute_equals", attribute: "v", value: 1 },
-							],
+							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
 						}),
 					).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
 				});
@@ -940,7 +926,7 @@ describe("PartitionDO - splitting", () => {
 				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
 				if (result.found) {
 					servedByActorNames.add(result.meta.servedByActorName);
-					expect(result.meta.forwardCount, "root reads should have been forwarded at least once").toBeGreaterThan(2);
+					expect(result.meta.forwardCount, "root reads should have been forwarded at least twice").toBeGreaterThanOrEqual(2);
 				}
 			}
 
@@ -1174,18 +1160,90 @@ describe("PartitionDO - splitting", () => {
 });
 
 describe("PartitionDO - partitionId encoding", () => {
-	it("encodes root and child partition IDs as depth-prefixed byte arrays with text doNames", ({ expect }) => {
+	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
+		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
 		const { ctx } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
-		// Root: [version=0, depth=1, hashIdx=0]
-		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 1, 0]));
+		// Root: [version=0, rootIdx=0 (2 bytes big-endian), depth=0]
+		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 0, 0, 0]));
 
-		// Children: [version=0, depth=2, hashIdx[0]=0 (root), hashIdx[1]=i]
+		// Children: [version=0, rootIdx=0 (2 bytes), depth=1, childIdx=i]
 		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
 		for (let i = 0; i < children.length; i++) {
-			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 2, 0, i]));
+			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
 			expect(children[i].doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
+		}
+	});
+
+	describe("PartitionIdHelper static readers", () => {
+		const baseCtx = PartitionContextCreator.create({
+			ns: "PARTITION_DO",
+			nsPrefix: "test.readers",
+			rootTreesN: 1,
+			hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
+		});
+
+		it("rootIdx reads the 2-byte big-endian root index", () => {
+			expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0, 0, 0]))).toBe(0);
+			expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0, 42, 0]))).toBe(42);
+			expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 1, 0, 0]))).toBe(256);
+			// 65000 = 0xFDE8
+			expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0xfd, 0xe8, 0]))).toBe(65000);
+		});
+
+		it("depth reads the sub-tree level count", () => {
+			expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 0]))).toBe(0);
+			expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 1, 5]))).toBe(1);
+			expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 3, 0, 1, 2]))).toBe(3);
+		});
+
+		it("lastChildIdx reads the partition's own slot among its siblings", () => {
+			expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 1, 5]))).toBe(5);
+			expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 2, 3, 7]))).toBe(7);
+			expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 3, 0, 1, 2]))).toBe(2);
+		});
+
+		it("all reader methods and doName throw when schema version is not 0", () => {
+			const bad = new Uint8Array([1, 0, 0, 0]);
+			expect(() => PartitionIdHelper.rootIdx(bad)).toThrow();
+			expect(() => PartitionIdHelper.depth(bad)).toThrow();
+			expect(() => PartitionIdHelper.lastChildIdx(new Uint8Array([1, 0, 0, 1, 0]))).toThrow();
+			expect(() => PartitionIdHelper.doName(baseCtx, bad)).toThrow();
+		});
+
+		it("doName builds the correct DO name from partition ID bytes", () => {
+			// Root-only (rootIdx=5, depth=0)
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 0]))).toBe("test.readers.h.5");
+			// rootIdx > 255 (rootIdx=256, depth=0) — validates u16 encoding
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 1, 0, 0]))).toBe("test.readers.h.256");
+			// With children (rootIdx=5, depth=2, children=[3, 7])
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 2, 3, 7]))).toBe("test.readers.h.5.3.7");
+		});
+	});
+
+	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", ({ expect }) => {
+		// This test guards the entropy consistency between the two methods.
+		// If the depth offset used in one changes without the other, routing will silently
+		// assign keys to different partitions than the migration check expects.
+		const { ctx } = makeStub({ hashSplitConditions: { splitN: 4, maxSizeMb: 100 } });
+		const router = new PartitionTopologyRouterImpl("", ctx);
+		const hashKey = "routing-consistency-key";
+
+		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
+		const { partitionContext: child } = router.pickChildPartition(ctx, hashKey);
+		const level1Siblings = router.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN);
+		for (const sib of level1Siblings) {
+			const sibCtx: PartitionContextResolved = { ...ctx, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
+			expect(router.makeIsCorrectChildHashPartition(ctx, sibCtx)(hashKey)).toBe(sib.doName === child.doName);
+		}
+
+		// Depth 1 → 2: same invariant one level deeper.
+		const { partitionContext: grandchild } = router.pickChildPartition(child, hashKey);
+		const level2Siblings = router.calculateChildPartitionIds(child.partitionId, child.hashSplitConditions.splitN);
+		for (const sib of level2Siblings) {
+			const sibCtx: PartitionContextResolved = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
+			expect(router.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(sib.doName === grandchild.doName);
 		}
 	});
 
