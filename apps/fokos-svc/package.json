@@ -11,6 +11,7 @@
 		"test": "npm run check && vitest run",
 		"test:hurl": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2 test/hurl/*.hurl",
 		"test:hurl:run": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2",
+		"pre:test:hurl:remote": "rm -rf test/hurl/report-json && mkdir -p test/hurl/report-json",
 		"test:hurl:remote": "hurl --variables-file test/hurl/vars_remote.env --test --report-json test/hurl/report-json --connect-timeout 2",
 		"cf-typegen": "wrangler types"
 	},

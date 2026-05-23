@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
+import { logger } from "hono/logger";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
@@ -137,6 +138,9 @@ api.onError((err, c) => {
 	console.error(err);
 	return c.json({ error: "Internal Server Error" }, 500);
 });
+
+// FIXME Do my own logger for a single log line per request, with canonical logs too.
+api.use(logger());
 
 api.get("/hello/:name", async (c) => {
 	const name = c.req.param("name");
