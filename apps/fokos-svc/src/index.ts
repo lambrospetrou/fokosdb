@@ -1,4 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
+import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
 import { FokosDB } from "./lib/db.js";
 import { PartitionContextCreator, PartitionTopologyRouterImpl } from "./lib/partition-topology/partition-topology.js";
 
@@ -23,14 +25,23 @@ const topologyOptions = PartitionContextCreator.create({
 	rangeSplitConditions: { splitN: 2, maxSizeMb: 256 },
 });
 
+const api = new Hono<{ Bindings: Env }>().basePath("/api");
+
+api.onError((err, c) => {
+	if (err instanceof HTTPException) {
+		return err.getResponse();
+	}
+	console.error(err);
+	return c.json({ error: "Internal Server Error" }, 500);
+});
+
+api.get("/hello/:name", async (c) => {
+	const name = c.req.param("name");
+	return c.json({ message: `Hello, ${name}!` });
+});
+
 export default {
 	async fetch(request, env, ctx): Promise<Response> {
-		const db = new FokosDB({
-			ns: env.PARTITION_DO,
-			topology: new PartitionTopologyRouterImpl("encoded-topology", topologyOptions),
-			transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
-		});
-
-		return new Response("Hello, world!");
+		return api.fetch(request, env, ctx);
 	},
 } satisfies ExportedHandler<Env>;
