@@ -9,16 +9,6 @@ import type { GetItemResult, InitiateReadResponse } from "./lib/types.js";
 export { PartitionDO } from "./lib/do-partition.js";
 export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
 
-export class MyDurableObject extends DurableObject<Env> {
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-	}
-
-	async sayHello(name: string): Promise<string> {
-		return `Hello, ${name}!`;
-	}
-}
-
 // ── Valibot schemas ────────────────────────────────────────────────────────────
 
 const SplitConditionsSchema = v.object({

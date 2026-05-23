@@ -211,12 +211,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async triggerMigration(): Promise<void> {
-		await this.ensureMigration(false);
+		await this.ensureMigration("triggerMigration", false);
 	}
 
 	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration();
+		await this.ensureMigration("putItem");
 		return await this.withSplitForwarding<PutItemResult>({
 			ctx: pCtx,
 			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
@@ -289,7 +289,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async deleteItem(pCtx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration();
+		await this.ensureMigration("deleteItem");
 		return await this.withSplitForwarding<DeleteItemResult>({
 			ctx: pCtx,
 			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
@@ -340,7 +340,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async getItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
 		this.ensurePartitionContext(pCtx);
 
-		if (await this.ensureMigration(false)) {
+		if (await this.ensureMigration("getItem", false)) {
 			// Read directly from parent while this child is still migrating its share of the data.
 			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
@@ -485,7 +485,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async prepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration();
+		await this.ensureMigration("prepare");
 
 		const { local, forwarded } = this.groupItemsByRouting(request.items);
 		if (forwarded.size > 0) {
@@ -731,7 +731,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async readForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration();
+		await this.ensureMigration("readForTransaction");
 
 		const { local, forwarded } = this.groupItemsByRouting(request.items);
 		if (forwarded.size > 0) {
@@ -920,7 +920,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_topology;
 	}
 
-	private async ensureMigration(throwIfMigrating = true): Promise<boolean> {
+	private async ensureMigration(op: string, throwIfMigrating = true): Promise<boolean> {
 		// TODO Optimize this away by keeping it in memory.
 		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 		if (!migrationStatus || migrationStatus === "migration_completed") {
@@ -936,7 +936,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (throwIfMigrating) {
 			// TODO This will reach user requests, so refactor the callers to show something nicer.
 			// We can also consider doing a selective migration of the requested keys only.
-			throw new Error("fokos/partition: Partition split in progress, please retry later.");
+			throw new Error(`fokos/partition:${op}: Partition split in progress, please retry later.`);
 		}
 		return true;
 	}

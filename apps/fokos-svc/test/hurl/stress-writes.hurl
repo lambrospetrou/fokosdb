@@ -45,6 +45,8 @@ POST {{base_url}}/api/rpc/stress_001/putItem
 Content-Type: application/json
 [Options]
 repeat: 100
+retry: 5
+retry-interval: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,
@@ -67,7 +69,8 @@ Content-Type: application/json
 [Options]
 repeat: 100
 # Retries are needed to avoid 500s during partition splitting.
-retry: 3
+retry: 5
+retry-interval: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,

@@ -14,16 +14,12 @@
 	},
 	"migrations": [
 		{
-			"new_sqlite_classes": ["MyDurableObject", "PartitionDO", "TransactionCoordinatorDO"],
+			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO"],
 			"tag": "v1",
 		},
 	],
 	"durable_objects": {
 		"bindings": [
-			{
-				"class_name": "MyDurableObject",
-				"name": "MY_DURABLE_OBJECT",
-			},
 			{
 				"class_name": "PartitionDO",
 				"name": "PARTITION_DO",
@@ -36,6 +32,13 @@
 	},
 	"observability": {
 		"enabled": true,
+		"logs": {
+			"invocation_logs": false,
+		},
+		// TOO NOISY for now.
+		"traces": {
+			"enabled": false,
+		},
 	},
 	"upload_source_maps": false,
 	"compatibility_flags": ["nodejs_compat"],
