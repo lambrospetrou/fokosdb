@@ -421,7 +421,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			`fokos/partition.getPartitionTransactionMetadata: expected split_started, got ${splitStatus?.status}`,
 		);
 		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
-		invariant(isKnownChild, `fokos/partition.getPartitionTransactionMetadata: unknown child partition "${opts.childPartitionContext.doName}"`);
+		invariant(
+			isKnownChild,
+			`fokos/partition.getPartitionTransactionMetadata: unknown child partition "${opts.childPartitionContext.doName}"`,
+		);
 
 		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
@@ -433,9 +436,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		let reachedLimit = false;
 
 		const maxDeletedTs =
-			this.ctx.storage.sql
-				.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
-				.toArray()[0]?.max_deleted_ts ?? 0;
+			this.ctx.storage.sql.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`).toArray()[0]
+				?.max_deleted_ts ?? 0;
 
 		while (true) {
 			const page = this.queryPendingTxPage(tableCursor, PAGE_SIZE);
@@ -629,10 +631,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		this.ctx.storage.transactionSync(() => {
 			const pendingRows = this.ctx.storage.sql
-				.exec<{ hk: string; sk: string }>(
-					`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`,
-					request.transactionId,
-				)
+				.exec<{ hk: string; sk: string }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
 				.toArray();
 			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
 			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
@@ -844,7 +843,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				if (!row.coordinator_do_id) continue;
 				try {
 					const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-					await (this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }).recoverTransaction(row.transaction_id);
+					await (
+						this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }
+					).recoverTransaction(row.transaction_id);
 				} catch (e) {
 					console.error({
 						...this.logParams(),
@@ -856,8 +857,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			// Re-arm alarm if any pending transaction locks remain.
-			const pendingCount =
-				this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
+			const pendingCount = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
 			if (pendingCount > 0 && !(await this.ctx.storage.getAlarm())) {
 				await this.ctx.storage.setAlarm(Date.now() + 5_000);
 			}
@@ -1182,10 +1182,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						row.created_at,
 					);
 				}
-				this.ctx.storage.sql.exec(
-					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-					maxDeletedTs,
-				);
+				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
 			});
 
 			if (!nextCursor) break;

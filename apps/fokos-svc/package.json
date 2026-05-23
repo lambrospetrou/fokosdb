@@ -9,6 +9,8 @@
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
 		"test": "npm run check && vitest run",
+		"test:hurl": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2 test/hurl/*.hurl",
+		"test:hurl:run": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2",
 		"cf-typegen": "wrangler types"
 	},
 	"devDependencies": {
@@ -18,6 +20,7 @@
 		"hono": "^4.12.22",
 		"js-xxhash": "^5.0.1",
 		"typescript": "^5.9.3",
+		"valibot": "^1.4.0",
 		"vitest": "^4.1.5",
 		"wrangler": "^4.87.0"
 	}
