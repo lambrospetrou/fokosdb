@@ -20,52 +20,54 @@ txt_100k: body
 # ── putItem: fully random hashKey + sortKey (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
 
-# POST {{base_url}}/api/rpc/{{database_name}}/putItem
-# Content-Type: application/json
-# [Options]
-# repeat: 100
-# {
-#   "partitionOptions": {
-#     "rootTreesN": 2,
-#     "hashSplitConditions": {
-#       "splitN": 4,
-#       "maxSizeMb": 2
-#     }
-#   },
-#   "hashKey": "stress#{{newUuid}}",
-#   "sortKey": "{{newUuid}}",
-#   "data": "payload-{{newUuid}}"
-# }
-# HTTP 200
+POST {{base_url}}/api/rpc/stress_001/putItem
+Content-Type: application/json
+[Options]
+repeat: 100
+{
+  "partitionOptions": {
+    "rootTreesN": 2,
+    "hashSplitConditions": {
+      "splitN": 4,
+      "maxSizeMb": 2
+    }
+  },
+  "hashKey": "stress#{{newUuid}}",
+  "sortKey": "{{newUuid}}",
+  "data": "payload-{{newUuid}}"
+}
+HTTP 200
 
 # ── putItem: fully random hashKey + sortKey with 10K text (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
 
-# POST {{base_url}}/api/rpc/{{database_name}}/putItem
-# Content-Type: application/json
-# [Options]
-# repeat: 100
-# {
-#   "partitionOptions": {
-#     "rootTreesN": 2,
-#     "hashSplitConditions": {
-#       "splitN": 4,
-#       "maxSizeMb": 2
-#     }
-#   },
-#   "hashKey": "stress#{{newUuid}}",
-#   "sortKey": "{{newUuid}}",
-#   "data": "payload-{{newUuid}}-{{txt_10k}}"
-# }
-# HTTP 200
+POST {{base_url}}/api/rpc/stress_001/putItem
+Content-Type: application/json
+[Options]
+repeat: 100
+{
+  "partitionOptions": {
+    "rootTreesN": 2,
+    "hashSplitConditions": {
+      "splitN": 4,
+      "maxSizeMb": 2
+    }
+  },
+  "hashKey": "stress#{{newUuid}}",
+  "sortKey": "{{newUuid}}",
+  "data": "payload-{{newUuid}}-{{txt_10k}}"
+}
+HTTP 200
 
 # ── putItem: fully random hashKey + sortKey with 100K text (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
 
-POST {{base_url}}/api/rpc/{{database_name}}/putItem
+POST {{base_url}}/api/rpc/stress_001/putItem
 Content-Type: application/json
 [Options]
 repeat: 100
+# Retries are needed to avoid 500s during partition splitting.
+retry: 3
 {
   "partitionOptions": {
     "rootTreesN": 2,
@@ -82,7 +84,7 @@ HTTP 200
 
 # ── transactWriteItems: 10 random hashKeys in one transaction ───────────────
 
-POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
+POST {{base_url}}/api/rpc/stress_001/transactWriteItems
 Content-Type: application/json
 {
   "partitionOptions": {
@@ -111,7 +113,7 @@ HTTP 200
 # All iterations target the same hash-key bucket — exercises a hot partition.
 # hashKey is the RFC 3339 UTC datetime at the moment each request fires.
 #
-#POST {{base_url}}/api/rpc/{{database_name}}/putItem
+#POST {{base_url}}/api/rpc/stress_001/putItem
 #Content-Type: application/json
 #[Options]
 #repeat: 100

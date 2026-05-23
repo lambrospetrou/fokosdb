@@ -54,8 +54,8 @@ describe("transactions - end-to-end", () => {
 			const result = await db.getItem(key);
 			expect(result.found).toBe(true);
 			if (result.found) {
-				expect(result.data).toBe(`original-${key.hashKey}`);
-				expect(result.version).toBe(1);
+				expect(result.item.data).toBe(`original-${key.hashKey}`);
+				expect(result.item.version).toBe(1);
 			}
 		}
 
@@ -89,16 +89,16 @@ describe("transactions - end-to-end", () => {
 			const result = await db.getItem(preExistingKeys[i]);
 			expect(result.found).toBe(true);
 			invariant(result.found);
-			expect(result.data).toBe(`tx-updated-${i}`);
-			expect(result.version).toBe(2);
+			expect(result.item.data).toBe(`tx-updated-${i}`);
+			expect(result.item.version).toBe(2);
 		}
 
 		for (let i = 10; i < 100; i++) {
 			const result = await db.getItem({ hashKey: `tx-hk-${i}`, sortKey: `tx-sk-${i}` });
 			expect(result.found).toBe(true);
 			invariant(result.found);
-			expect(result.data).toBe(`tx-data-${i}`);
-			expect(result.version).toBe(1);
+			expect(result.item.data).toBe(`tx-data-${i}`);
+			expect(result.item.version).toBe(1);
 		}
 
 		expect(countDistinctPartitions(db, operations)).toBeGreaterThan(1);
@@ -144,8 +144,8 @@ describe("transactions - end-to-end", () => {
 		for (let i = 0; i < 5; i++) {
 			const result = await db.getItem({ hashKey: `atom-${i}` });
 			invariant(result.found);
-			expect(result.data).toBe(`v1-${i}`);
-			expect(result.version).toBe(1);
+			expect(result.item.data).toBe(`v1-${i}`);
+			expect(result.item.version).toBe(1);
 		}
 
 		// The non-existent item must still not exist.
@@ -183,8 +183,8 @@ describe("transactions - end-to-end", () => {
 			const result = await db.getItem(k);
 			expect(result.found).toBe(true);
 			if (result.found) {
-				expect(result.data).toBe("original");
-				expect(result.version).toBe(1);
+				expect(result.item.data).toBe("original");
+				expect(result.item.version).toBe(1);
 			}
 		}
 	});
@@ -219,11 +219,11 @@ describe("transactions - end-to-end", () => {
 			const shared = await db.getItem({ hashKey: "iso-shared" });
 			expect(shared.found).toBe(true);
 			invariant(shared.found);
-			expect(shared.data).toBe("tx-shared");
+			expect(shared.item.data).toBe("tx-shared");
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
 			expect(txOnly.found).toBe(true);
 			invariant(txOnly.found);
-			expect(txOnly.data).toBe("tx-only-data");
+			expect(txOnly.item.data).toBe("tx-only-data");
 		} else {
 			// putItem landed before prepare → transaction detects timestamp_conflict and is cancelled.
 			expect(tx.outcome).toBe("cancelled");
@@ -236,7 +236,7 @@ describe("transactions - end-to-end", () => {
 			const shared = await db.getItem({ hashKey: "iso-shared" });
 			expect(shared.found).toBe(true);
 			invariant(shared.found);
-			expect(shared.data).toBe("non-tx-write");
+			expect(shared.item.data).toBe("non-tx-write");
 		}
 	});
 
@@ -286,12 +286,12 @@ describe("transactions - end-to-end", () => {
 		if (tx1?.outcome === "committed") {
 			const a = await db.getItem({ hashKey: "c-only-a" });
 			expect(a.found).toBe(true);
-			if (a.found) expect(a.data).toBe("tx1-a");
+			if (a.found) expect(a.item.data).toBe("tx1-a");
 		}
 		if (tx2?.outcome === "committed") {
 			const b = await db.getItem({ hashKey: "c-only-b" });
 			expect(b.found).toBe(true);
-			if (b.found) expect(b.data).toBe("tx2-b");
+			if (b.found) expect(b.item.data).toBe("tx2-b");
 		}
 
 		// The shared key must reflect the committed transaction(s).
@@ -300,11 +300,11 @@ describe("transactions - end-to-end", () => {
 		invariant(shared.found);
 		if (outcomes.filter((o) => o === "committed").length === 1) {
 			const expectedData = tx1?.outcome === "committed" ? "tx1-shared" : "tx2-shared";
-			expect(shared.data).toBe(expectedData);
-			expect(shared.version).toBe(1);
+			expect(shared.item.data).toBe(expectedData);
+			expect(shared.item.version).toBe(1);
 		} else {
-			expect(shared.version).toBe(2);
-			expect(["tx1-shared", "tx2-shared"]).toContain(shared.data);
+			expect(shared.item.version).toBe(2);
+			expect(["tx1-shared", "tx2-shared"]).toContain(shared.item.data);
 		}
 	});
 
@@ -343,8 +343,8 @@ describe("transactions - end-to-end", () => {
 		const result = await db.getItem({ hashKey: "ser-key" });
 		expect(result.found).toBe(true);
 		if (result.found) {
-			expect(result.data).toBe("tx2");
-			expect(result.version).toBe(2);
+			expect(result.item.data).toBe("tx2");
+			expect(result.item.version).toBe(2);
 		}
 	});
 
@@ -395,7 +395,7 @@ describe("transactions - end-to-end", () => {
 		const item = await db.getItem({ hashKey: "idemp-1" });
 		expect(item.found).toBe(true);
 		invariant(item.found);
-		expect(item.version).toBe(1);
+		expect(item.item.version).toBe(1);
 	});
 
 	it("delete operations in a transaction remove items atomically", async () => {
@@ -426,14 +426,14 @@ describe("transactions - end-to-end", () => {
 		const item2 = await db.getItem({ hashKey: "del-2" });
 		expect(item2.found).toBe(true);
 		invariant(item2.found);
-		expect(item2.data).toBe("updated");
-		expect(item2.version).toBe(2);
+		expect(item2.item.data).toBe("updated");
+		expect(item2.item.version).toBe(2);
 
 		const item3 = await db.getItem({ hashKey: "del-3" });
 		expect(item3.found).toBe(true);
 		invariant(item3.found);
-		expect(item3.data).toBe("updated");
-		expect(item3.version).toBe(2);
+		expect(item3.item.data).toBe("updated");
+		expect(item3.item.version).toBe(2);
 	});
 
 	it("atomicity: failed condition on a delete rolls back puts in the same transaction", async () => {
@@ -460,7 +460,7 @@ describe("transactions - end-to-end", () => {
 		const result = await db.getItem({ hashKey: "rollback-put" });
 		expect(result.found).toBe(true);
 		invariant(result.found);
-		expect(result.data).toBe("original");
-		expect(result.version).toBe(1);
+		expect(result.item.data).toBe("original");
+		expect(result.item.version).toBe(1);
 	});
 });

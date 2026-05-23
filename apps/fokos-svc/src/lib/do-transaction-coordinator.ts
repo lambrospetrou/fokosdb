@@ -204,7 +204,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		if (row.state === "COMMITTED") {
-			return { outcome: "committed", transactionId, idempotencyToken };
+			const items = this.loadItems(transactionId).map((i) => (i.sk ? { hashKey: i.hk, sortKey: i.sk } : { hashKey: i.hk }));
+			return { outcome: "committed", transactionId, idempotencyToken, items };
 		}
 		if (row.state === "CANCELLED" && row.rejection_reason_json) {
 			return {

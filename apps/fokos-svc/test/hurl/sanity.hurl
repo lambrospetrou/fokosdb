@@ -37,8 +37,8 @@ Content-Type: application/json
 HTTP 200
 [Asserts]
 jsonpath "$.found" == true
-jsonpath "$.data" == "Alice"
-jsonpath "$.dataEncoding" == "utf8"
+jsonpath "$.item.data" == "Alice"
+jsonpath "$.item.dataEncoding" == "utf8"
 
 # ── getItem (not found) ────────────────────────────────────────────────────────
 
@@ -71,8 +71,8 @@ Content-Type: application/json
 HTTP 200
 [Asserts]
 jsonpath "$.found" == true
-jsonpath "$.data" == "profile-data"
-jsonpath "$.dataEncoding" == "utf8"
+jsonpath "$.item.data" == "profile-data"
+jsonpath "$.item.dataEncoding" == "utf8"
 
 # ── putItem with ttlSeconds ────────────────────────────────────────────────────
 

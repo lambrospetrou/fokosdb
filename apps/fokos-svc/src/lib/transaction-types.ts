@@ -106,7 +106,12 @@ export type InitiateWriteRequest = {
 };
 
 export type InitiateWriteResponse =
-	| { outcome: "committed"; transactionId: TransactionId; idempotencyToken: IdempotencyToken }
+	| {
+			outcome: "committed";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			items: Array<{ hashKey: string; sortKey?: string }>;
+	  }
 	| { outcome: "cancelled"; transactionId: TransactionId; idempotencyToken: IdempotencyToken; reason: RejectionReason };
 
 export type TCReadItem = {

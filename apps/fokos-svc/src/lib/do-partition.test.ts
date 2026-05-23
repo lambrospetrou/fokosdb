@@ -14,6 +14,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		const result = await stub.getItem(ctx, { hashKey: "missing", sortKey: "sk" });
 		expect(result).toEqual({
 			found: false,
+			item: { hashKey: "missing", sortKey: "sk" },
 			meta: {
 				rowsRead: 0,
 				rowsWritten: 0,
@@ -31,7 +32,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-		expect(result).toMatchObject({ found: true, hashKey: "hk", sortKey: "sk", data: "hello" });
+		expect(result).toMatchObject({ found: true, item: { hashKey: "hk", sortKey: "sk", data: "hello" } });
 	});
 
 	it("stores and retrieves binary data", async ({ expect }) => {
@@ -41,7 +42,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk-bin", sortKey: "sk-bin", data });
 		const result = await stub.getItem(ctx, { hashKey: "hk-bin", sortKey: "sk-bin" });
 
-		expect(result).toMatchObject({ found: true, data });
+		expect(result).toMatchObject({ found: true, item: { data } });
 	});
 
 	it("overwrites an existing item on repeated put", async ({ expect }) => {
@@ -51,7 +52,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "second" });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-		expect(result).toMatchObject({ found: true, data: "second" });
+		expect(result).toMatchObject({ found: true, item: { data: "second" } });
 	});
 
 	it("isolates items by (hashKey, sortKey) composite key", async ({ expect }) => {
@@ -65,9 +66,9 @@ describe("PartitionDO - putItem / getItem", () => {
 		const r2 = await stub.getItem(ctx, { hashKey: "hk1", sortKey: "sk2" });
 		const r3 = await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" });
 
-		expect(r1).toMatchObject({ found: true, data: "a" });
-		expect(r2).toMatchObject({ found: true, data: "b" });
-		expect(r3).toMatchObject({ found: true, data: "c" });
+		expect(r1).toMatchObject({ found: true, item: { data: "a" } });
+		expect(r2).toMatchObject({ found: true, item: { data: "b" } });
+		expect(r3).toMatchObject({ found: true, item: { data: "c" } });
 	});
 
 	it("returns version 1 on first write", async ({ expect }) => {
@@ -97,7 +98,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-		expect(result).toMatchObject({ found: true, version: 2 });
+		expect(result).toMatchObject({ found: true, item: { version: 2 } });
 	});
 
 	it("versions are independent per (hashKey, sortKey) key", async ({ expect }) => {
@@ -111,8 +112,8 @@ describe("PartitionDO - putItem / getItem", () => {
 		const get2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" });
 
 		expect(r1.version).toBe(1);
-		expect(get1).toMatchObject({ found: true, version: 2 });
-		expect(get2).toMatchObject({ found: true, version: 1 });
+		expect(get1).toMatchObject({ found: true, item: { version: 2 } });
+		expect(get2).toMatchObject({ found: true, item: { version: 1 } });
 	});
 
 	it("includes operation metrics in putItem result", async ({ expect }) => {
@@ -155,7 +156,7 @@ describe("PartitionDO - putItem / getItem", () => {
 			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val", ttlEpochUTCSeconds: ttl });
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-			expect(result).toMatchObject({ found: true, ttlEpochUTCSeconds: ttl });
+			expect(result).toMatchObject({ found: true, item: { ttlEpochUTCSeconds: ttl } });
 		});
 
 		it("ttlEpochUTCSeconds is absent when not set on put", async ({ expect }) => {
@@ -165,7 +166,7 @@ describe("PartitionDO - putItem / getItem", () => {
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 			expect(result).toMatchObject({ found: true });
-			if (result.found) expect(result.ttlEpochUTCSeconds).toBeUndefined();
+			if (result.found) expect(result.item.ttlEpochUTCSeconds).toBeUndefined();
 		});
 
 		it("clears ttlEpochUTCSeconds when an item is overwritten without TTL", async ({ expect }) => {
@@ -176,8 +177,8 @@ describe("PartitionDO - putItem / getItem", () => {
 			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-			expect(result).toMatchObject({ found: true, data: "v2" });
-			if (result.found) expect(result.ttlEpochUTCSeconds).toBeUndefined();
+			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
+			if (result.found) expect(result.item.ttlEpochUTCSeconds).toBeUndefined();
 		});
 	});
 
@@ -187,8 +188,8 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
 		const result = await stub.getItem(ctx, { hashKey: "hk" });
 
-		expect(result).toMatchObject({ found: true, hashKey: "hk", data: "no-sort" });
-		if (result.found) expect(result.sortKey).toBeUndefined();
+		expect(result).toMatchObject({ found: true, item: { hashKey: "hk", data: "no-sort" } });
+		if (result.found) expect(result.item.sortKey).toBeUndefined();
 	});
 
 	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({ expect }) => {
@@ -201,8 +202,8 @@ describe("PartitionDO - putItem / getItem", () => {
 		const r2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 		const rMiss = await stub.getItem(ctx, { hashKey: "hk", sortKey: "other" });
 
-		expect(r1).toMatchObject({ found: true, data: "no-sort" });
-		expect(r2).toMatchObject({ found: true, data: "with-sort" });
+		expect(r1).toMatchObject({ found: true, item: { data: "no-sort" } });
+		expect(r2).toMatchObject({ found: true, item: { data: "with-sort" } });
 		expect(rMiss.found).toBe(false);
 	});
 });
@@ -221,7 +222,7 @@ describe("PartitionDO - conditional putItem", () => {
 
 			expect(result.version).toBe(1);
 			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
-			expect(get).toMatchObject({ found: true, data: "value" });
+			expect(get).toMatchObject({ found: true, item: { data: "value" } });
 		});
 
 		it("throws when item already exists, leaving it unchanged", async ({ expect }) => {
@@ -236,7 +237,7 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 
 			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
-			expect(get).toMatchObject({ found: true, data: "original", version: 1 });
+			expect(get).toMatchObject({ found: true, item: { data: "original", version: 1 } });
 		});
 
 		it("works when sortKey is absent", async ({ expect }) => {
@@ -251,7 +252,7 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 
 			const get = await stub.getItem(ctx, { hashKey: "hk" });
-			expect(get).toMatchObject({ found: true, data: "original" });
+			expect(get).toMatchObject({ found: true, item: { data: "original" } });
 		});
 	});
 
@@ -288,7 +289,7 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 
 			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
-			expect(get).toMatchObject({ found: true, data: "v2", version: 2 });
+			expect(get).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
 		});
 
 		it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
@@ -367,7 +368,7 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 
 			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
-			expect(get).toMatchObject({ found: true, data: "original", version: 1 });
+			expect(get).toMatchObject({ found: true, item: { data: "original", version: 1 } });
 		});
 
 		it("fails on the second condition when the first passes", async ({ expect }) => {
@@ -392,7 +393,7 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 
 			const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
-			expect(get).toMatchObject({ found: true, data: "v2", version: 2 });
+			expect(get).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
 		});
 
 		it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
@@ -411,6 +412,7 @@ describe("PartitionDO - deleteItem", () => {
 
 		const result = await stub.deleteItem(ctx, { hashKey: "missing", sortKey: "sk" });
 		expect(result).toEqual({
+			item: { hashKey: "missing", sortKey: "sk" },
 			deleted: false,
 			meta: {
 				rowsRead: 0,
@@ -454,8 +456,8 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk1" });
 
 		expect((await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk1" })).found).toBe(false);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" })).toMatchObject({ found: true, data: "b" });
-		expect(await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" })).toMatchObject({ found: true, data: "c" });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" })).toMatchObject({ found: true, item: { data: "b" } });
+		expect(await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" })).toMatchObject({ found: true, item: { data: "c" } });
 	});
 
 	it("works when sortKey is absent — deletes only the no-sortKey row", async ({ expect }) => {
@@ -468,7 +470,7 @@ describe("PartitionDO - deleteItem", () => {
 		expect(result.deleted).toBe(true);
 
 		expect((await stub.getItem(ctx, { hashKey: "hk" })).found).toBe(false);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "with-sort" });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "with-sort" } });
 	});
 
 	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
@@ -480,7 +482,7 @@ describe("PartitionDO - deleteItem", () => {
 		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "fresh" });
 
 		expect(result.version).toBe(1);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "fresh", version: 1 });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "fresh", version: 1 } });
 	});
 
 	it("includes operation metrics in deleteItem result", async ({ expect }) => {
@@ -566,7 +568,7 @@ describe("PartitionDO - deleteItem", () => {
 					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
 				});
 
-				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "v2", version: 2 });
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
 			});
 
 			it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
@@ -631,7 +633,7 @@ describe("PartitionDO - deleteItem", () => {
 					).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
 				});
 
-				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, data: "v2", version: 2 });
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
 			});
 
 			it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
@@ -923,7 +925,7 @@ describe("PartitionDO - splitting", () => {
 			const servedByActorNames = new Set<string>();
 			for (const item of allItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData });
+				expect(result).toMatchObject({ found: true, item: { hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData } });
 				if (result.found) {
 					servedByActorNames.add(result.meta.servedByActorName);
 					expect(result.meta.forwardCount, "root reads should have been forwarded at least twice").toBeGreaterThanOrEqual(2);
@@ -984,7 +986,7 @@ describe("PartitionDO - splitting", () => {
 			// All migrations complete: root successfully forwards each item to the correct child.
 			for (const item of seedItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, data: item.data, meta: { forwardCount: 1 } });
+				expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { forwardCount: 1 } });
 			}
 
 			// Every seed item is found in exactly one child with the correct data.
@@ -996,7 +998,7 @@ describe("PartitionDO - splitting", () => {
 					const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
 					if (result.found) {
 						expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" found in multiple children`).toBeUndefined();
-						expect(result).toMatchObject({ data: item.data });
+						expect(result).toMatchObject({ item: { data: item.data } });
 						foundInDoName = childCtx.doName;
 						foundIds.add(foundInDoName);
 					}
@@ -1089,7 +1091,7 @@ describe("PartitionDO - splitting", () => {
 			// so callers can read data that has not yet been copied to the child.
 			for (const item of seedItems) {
 				const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, data: item.data });
+				expect(result).toMatchObject({ found: true, item: { data: item.data } });
 			}
 
 			releaseMigration();
@@ -1139,7 +1141,11 @@ describe("PartitionDO - splitting", () => {
 			// Every item is reachable through root via forwarding.
 			for (const item of seedItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, meta: { forwardCount: 1 }, data: item.data });
+				expect(result).toMatchObject({
+					found: true,
+					meta: { forwardCount: 1 },
+					item: { hashKey: item.hashKey, sortKey: item.sortKey, data: item.data },
+				});
 			}
 
 			await assertSplitTreeComplete(stub);
@@ -1151,7 +1157,7 @@ describe("PartitionDO - splitting", () => {
 			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "direct-value" });
 
 			const result = await stub.getItemDirect({ hashKey: "hk", sortKey: "sk" });
-			expect(result).toMatchObject({ found: true, data: "direct-value" });
+			expect(result).toMatchObject({ found: true, item: { hashKey: "hk", sortKey: "sk", data: "direct-value" } });
 
 			const miss = await stub.getItemDirect({ hashKey: "missing", sortKey: "sk" });
 			expect(miss.found).toBe(false);

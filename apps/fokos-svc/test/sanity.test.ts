@@ -36,10 +36,7 @@ describe("fokosdb", async () => {
 			}),
 		).resolves.toMatchObject({
 			found: true,
-			data: new Uint8Array([1, 2, 3]),
-			hashKey: "test-hash-key",
-			sortKey: "test-sort-key",
-			version: 1,
+			item: { hashKey: "test-hash-key", sortKey: "test-sort-key", data: new Uint8Array([1, 2, 3]), version: 1 },
 			meta: {
 				rowsRead: 1,
 				rowsWritten: 0,

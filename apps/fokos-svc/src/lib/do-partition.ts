@@ -272,6 +272,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				);
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
+					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					version,
 					meta: {
 						rowsRead,
@@ -321,6 +322,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
+					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					deleted: writeRes.rowsWritten > 0,
 					meta: {
 						rowsRead,
@@ -1023,16 +1025,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			forwardCount: 0,
 		};
+		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {
-			return { found: false, meta: actorMeta };
+			return { found: false, item: itemKey, meta: actorMeta };
 		}
 		return {
 			found: true,
-			hashKey: opts.hashKey,
-			sortKey: opts.sortKey || undefined,
-			data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
-			ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
-			version: result.v,
+			item: {
+				...itemKey,
+				data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
+				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+				version: result.v,
+			},
 			meta: actorMeta,
 		};
 	}

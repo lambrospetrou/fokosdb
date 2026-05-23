@@ -31,12 +31,19 @@ export type DeleteItemOptions = {
 	conditions?: ItemCondition[];
 };
 
+export type ItemKey = {
+	hashKey: string;
+	sortKey?: string;
+};
+
 export type PutItemResult = {
+	item: ItemKey;
 	version: number;
 	meta: OperationMetrics & PartitionInfo & {};
 };
 
 export type DeleteItemResult = {
+	item: ItemKey;
 	deleted: boolean;
 	meta: OperationMetrics & PartitionInfo & {};
 };
@@ -53,18 +60,18 @@ export type GetItemOptions = {
 export type GetItemResult =
 	| {
 			found: true;
-
-			hashKey: string;
-			sortKey?: string;
-			data: Uint8Array | string;
-			ttlEpochUTCSeconds?: number;
-			version: number;
-
+			item: {
+				hashKey: string;
+				sortKey?: string;
+				data: Uint8Array | string;
+				ttlEpochUTCSeconds?: number;
+				version: number;
+			};
 			meta: OperationMetrics & PartitionInfo & {};
 	  }
 	| {
 			found: false;
-
+			item: ItemKey;
 			meta: OperationMetrics & PartitionInfo & {};
 	  };
 

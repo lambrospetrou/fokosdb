@@ -120,8 +120,8 @@ function encodeData(data: Uint8Array | string): { data: string; dataEncoding: "u
 
 function serializeGetItemResult(result: GetItemResult) {
 	if (!result.found) return result;
-	const { data, ...rest } = result;
-	return { ...rest, ...encodeData(data) };
+	const { data, ...itemRest } = result.item;
+	return { ...result, item: { ...itemRest, ...encodeData(data) } };
 }
 
 function serializeTransactGetItemsResult(result: InitiateReadResponse) {
