@@ -35,7 +35,7 @@ Items are keyed by `hashKey` (required) + `sortKey` (optional, defaults to `""`)
 - At startup, `rootTreesN` root partitions are created (e.g. 10).
 - Routing uses hashing to map `hashKey` to a root partition index.
 - Partition IDs are opaque hex-encoded bytes and encodes the data partition location in the entire partitions topology. The opaque partition ID should only be accessed through the `PartitionIdHelper` class.
-- **`PartitionContext` is passed in every RPC call** — DOs cannot be configured at instantiation time in Workers RPC, so the topology config (splitN, ns, nsPrefix, etc.) travels with every request. The DO validates the context matches its stored one.
+- **`PartitionContext` is passed in every RPC call** — DOs cannot be configured at instantiation time in Workers RPC, so the topology config (splitN, ns, databaseName, etc.) travels with every request. The DO validates the context matches its stored one.
 - The `PartitionTopologyRouterImpl` is used by the client (`FokosDB`) to pick partitions. `PartitionTopologyImpl` is used inside the DOs for split management.
 
 ## Partition Splitting

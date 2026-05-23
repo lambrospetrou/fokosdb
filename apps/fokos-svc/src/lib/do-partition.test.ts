@@ -707,7 +707,7 @@ describe("PartitionDO - splitting", () => {
 
 		const parentState = await stub.status();
 		expect(parentState.splitStatus?.status).toBe("split_started");
-		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", nsPrefix: ctx.nsPrefix });
+		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", databaseName: ctx.databaseName });
 
 		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
 
@@ -718,7 +718,7 @@ describe("PartitionDO - splitting", () => {
 
 			expect(childState.partitionContext).toMatchObject({
 				ns: "PARTITION_DO",
-				nsPrefix: ctx.nsPrefix,
+				databaseName: ctx.databaseName,
 				doName: name,
 			});
 			expect(childState.parentPartitionContext).toMatchObject({
@@ -1172,14 +1172,14 @@ describe("PartitionDO - partitionId encoding", () => {
 		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
 		for (let i = 0; i < children.length; i++) {
 			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
-			expect(children[i].doName).toBe(`${ctx.nsPrefix}.h.0.${i}`);
+			expect(children[i].doName).toBe(`${ctx.databaseName}.h.0.${i}`);
 		}
 	});
 
 	describe("PartitionIdHelper static readers", () => {
 		const baseCtx = PartitionContextCreator.create({
 			ns: "PARTITION_DO",
-			nsPrefix: "test.readers",
+			databaseName: "test.readers",
 			rootTreesN: 1,
 			hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
 		});
@@ -1330,7 +1330,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 	const prefix = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		nsPrefix: prefix,
+		databaseName: prefix,
 		// For testing determinism only one root partition.
 		rootTreesN: 1,
 		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },

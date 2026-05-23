@@ -19,7 +19,7 @@ export class MyDurableObject extends DurableObject<Env> {
 
 const topologyOptions = PartitionContextCreator.create({
 	ns: "PARTITION_DO",
-	nsPrefix: "fokos",
+	databaseName: "fokos",
 	rootTreesN: 10,
 	hashSplitConditions: { splitN: 2, maxSizeMb: 256 },
 	rangeSplitConditions: { splitN: 2, maxSizeMb: 256 },

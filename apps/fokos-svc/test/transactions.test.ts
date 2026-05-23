@@ -9,7 +9,7 @@ function makeDB() {
 	const prefix = `txtest.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		nsPrefix: prefix,
+		databaseName: prefix,
 		rootTreesN: 100,
 		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
 		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },

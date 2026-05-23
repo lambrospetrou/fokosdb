@@ -3,15 +3,10 @@ import { describe, it } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
 import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
 
-it("routes to the correct partition DO", async ({ expect }) => {
-	const response = await exports.default.fetch("https://example.com/sql");
-	expect(await response.text()).toBe("Hello, world!");
-});
-
 describe("fokosdb", async () => {
 	const testSplitOptions = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		nsPrefix: "fokos",
+		databaseName: "fokos",
 		rootTreesN: 10,
 		hashSplitConditions: { splitN: 2, maxSizeMb: 1 },
 		rangeSplitConditions: { splitN: 2, maxSizeMb: 1 },

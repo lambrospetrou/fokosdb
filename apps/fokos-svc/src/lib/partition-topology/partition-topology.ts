@@ -20,7 +20,7 @@ export type PartitionContext = {
 	schema: 1; // For future compatibility, in case we need to change the structure of the context.
 
 	ns: PartitionNamespaceKey;
-	nsPrefix: string;
+	databaseName: string;
 
 	rootTreesN: number;
 	hashSplitConditions: SplitConditions;
@@ -72,7 +72,7 @@ export type SplitConditions = {
 export class PartitionContextCreator {
 	static create(opts: {
 		ns: PartitionNamespaceKey;
-		nsPrefix: string;
+		databaseName: string;
 		rootTreesN: number;
 		hashSplitConditions: SplitConditions;
 		rangeSplitConditions?: SplitConditions;
@@ -109,7 +109,7 @@ export class PartitionContextCreator {
 		const context: PartitionContext = {
 			schema: 1,
 			ns: opts.ns,
-			nsPrefix: opts.nsPrefix,
+			databaseName: opts.databaseName,
 			rootTreesN: opts.rootTreesN,
 			hashSplitConditions: opts.hashSplitConditions,
 			rangeSplitConditions: opts.rangeSplitConditions,
@@ -170,7 +170,7 @@ export class PartitionIdHelper {
 		const root = (bytes[1] << 8) | bytes[2];
 		const depth = bytes[3];
 		const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
-		return `${basePartitionContext.nsPrefix}.h.${root}${suffix}`;
+		return `${basePartitionContext.databaseName}.h.${root}${suffix}`;
 	}
 
 	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
@@ -201,7 +201,6 @@ export class PartitionIdHelper {
 		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		return bytes[3 + bytes[3]];
 	}
-
 
 	#bytes: Uint8Array | undefined;
 	#appendedHashIdxs: number[];
