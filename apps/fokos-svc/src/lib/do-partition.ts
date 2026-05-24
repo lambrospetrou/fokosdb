@@ -518,6 +518,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { local, forwarded } = this.groupItemsByRouting(request.items);
 		if (forwarded.size > 0) {
 			invariant(local.length === 0, "fokos/partition.prepare: split routing must not mix local and forwarded items");
+			// FIXME Parallelize these calls to child partitions, since they are independent of each other.
 			for (const [, { pCtx: childPCtx, items }] of forwarded) {
 				const r = await this.getChildStub(childPCtx).prepare(childPCtx, { ...request, items });
 				if (r.outcome === "rejected") return r;
@@ -1176,7 +1177,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 		this.#_backgroundWorkScheduledAt = targetTime;
 		setTimeout(() => {
-			const scheduledAt = this.#_backgroundWorkScheduledAt;
 			// FIXME We reset the timestamp for the timer after 1 second to avoid many concurrent runs
 			// when the background work takes longer than the delayMs (which is always), to avoid overhead and extra memory usage!
 			// We should consider using a more robust scheduling mechanism that allows N overlaps to avoid a stuck background job from progressing.
@@ -1185,7 +1185,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				new Promise((resolve) =>
 					setTimeout(() => {
 						// Only reset the schedule if it's the same one we set to avoid racing with a newly scheduled background work.
-						if (this.#_backgroundWorkScheduledAt === scheduledAt) {
+						if (this.#_backgroundWorkScheduledAt === targetTime) {
 							this.#_backgroundWorkScheduledAt = null;
 							// console.debug({
 							// 	...this.logParams(),
@@ -1335,7 +1335,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
 			// Always put the raw partition context in the logs for better debugging, even if it's undefined.
-			partitionContext: this.#_partitionContext ?? "",
+			partitionContext: this.#_partitionContext ?? null,
 		};
 	}
 }
