@@ -6,8 +6,10 @@ FokosDB: A global strongly-consistent key-value database ontop of Cloudflare Dur
 
 No particular order.
 
-- Reduce dependency on Alarms API for progression and use `setTimeout` as well.
+- Cleanup pending transactions from the parent once split_completed.
+- Refactor the ensurePartitionContext(pCtx) logic to check required immutable options and separate options that can change after first use.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level.
+- (perf) Allow each child partition to start migrating data before all partitions are initialized.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of child partitions.
 - Add WAE metrics per request, per split.

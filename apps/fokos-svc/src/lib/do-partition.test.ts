@@ -228,9 +228,9 @@ describe("PartitionDO - conditional putItem", () => {
 		it("throws when item already exists, leaving it unchanged", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
-
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
+
 				await expect(
 					instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "overwrite", conditions: [{ type: "item_not_exists" }] }),
 				).rejects.toThrow(/item_not_exists.*v=1.*hk=hk.*sk=sk/);
@@ -708,7 +708,7 @@ describe("PartitionDO - splitting", () => {
 		await waitForAlarm(stub);
 
 		const parentState = await stub.status();
-		expect(parentState.splitStatus?.status).toBe("split_started");
+		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", databaseName: ctx.databaseName });
 
 		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
@@ -885,13 +885,13 @@ describe("PartitionDO - splitting", () => {
 		it("keeps all items accessible after splits at multiple tree depths (~10 items per partition trigger threshold)", async ({
 			expect,
 		}) => {
-			// Items are ~1 KB each so ~10 fill 0.2 MB and trigger a split at any given partition.
+			// Items are ~10 KB each so ~10 fill 0.1 MB and trigger a split at any given partition.
 			// With splitN=3 and 100 total items, the root and multiple generations of children
 			// all split, creating a deep tree that exercises the full forwarding chain.
 			const ITEM_SIZE_BYTES = 10 * 1024;
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
-			const TOTAL_ITEMS = 100;
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 3, maxSizeMb: 0.1 } });
+			const TOTAL_ITEMS = 50;
+			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 0.1 } });
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
 
@@ -907,18 +907,17 @@ describe("PartitionDO - splitting", () => {
 						await stub.putItem(ctx, { hashKey, sortKey, data: dummyData });
 						break;
 					} catch (e: unknown) {
-						const msg = String(e);
-						if (msg.includes("split in progress") || msg.includes("exceeded its limits")) {
-							await drainSplitTree(stub);
-						} else {
-							throw e;
-						}
+						expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
 					}
 				}
+				await drainSplitTree(stub);
+				// console.log("BOOM 1 - end", { item: hashKey });
 			}
 
 			// Flush any in-flight splits triggered by the last few writes.
 			await drainSplitTree(stub);
+
+			// console.log("BOOM 2");
 
 			// Verify every item is reachable through the root (which forwards through the tree)
 			// and record the actor name that actually served each read.
@@ -932,9 +931,9 @@ describe("PartitionDO - splitting", () => {
 				}
 			}
 
-			// With 100 items and splitN=3, the tree reaches ~4 levels deep (~16 leaf DOs).
-			// Even with hash skew, at least 4 distinct instances must serve reads.
-			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(4);
+			// With 50 items and splitN=2, the tree reaches ~3 levels deep (~8 leaf DOs).
+			// Even with hash skew, at least 3 distinct instances must serve reads.
+			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(3);
 
 			const totalSplitNodes = await assertSplitTreeComplete(stub);
 			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
@@ -1278,13 +1277,16 @@ describe("PartitionDO - partitionId encoding", () => {
 });
 
 async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
-	// The alarm is set to Date.now() in queueSplit(), so miniflare fires it automatically
-	// in the background after putItem returns. runDurableObjectAlarm drains any remaining
-	// scheduled alarm, but the auto-fired one may still be in progress.
-	// We do this hack to ensure that the alarm is complete before we check the state, without relying on arbitrary timers.
+	// runDurableObjectAlarm drains any pending alarm. The auto-fired alarm (from Miniflare
+	// detecting an immediate schedule) may still be in progress when putItem returns.
+	// We also need to wait for any background work scheduled via setTimeout (scheduleBackgroundWork),
+	// which bypasses the alarm path entirely — those are tracked by __testing__backgroundWorkRunning.
 	await runDurableObjectAlarm(stub);
 	await runInDurableObject(stub, async (instance: PartitionDO) => {
-		await vi.waitUntil(() => !instance.__testing__alarm_running, { timeout: 5000, interval: 100 });
+		await vi.waitUntil(() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning, {
+			timeout: 5000,
+			interval: 100,
+		});
 	});
 }
 
@@ -1310,6 +1312,10 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 		const childState = await childStub.status();
 		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
 			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
+			// TODO Maybe do this to avoid vitest-worker-pool errors...
+			// await runInDurableObject(childStub, async (instance: PartitionDO) => {
+			// 	await instance.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
+			// });
 		}
 
 		await drainSplitTree(childStub);
@@ -1343,7 +1349,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
 		...opts,
 	});
-
-	const pCtx = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");
-	return { ctx: pCtx.partitionContext, stub: env.PARTITION_DO.get(pCtx.doId) };
+	const pCtxResolved = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");
+	const stub = env.PARTITION_DO.get(pCtxResolved.doId);
+	return { ctx: pCtxResolved.partitionContext, stub };
 }

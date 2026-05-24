@@ -539,7 +539,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	async maybeQueueSplit(_hashKey: string, _sortKey?: string): Promise<SplitStatusKVItem | undefined> {
 		const splitType = this.shouldSplit(_hashKey, _sortKey);
 		if (splitType) {
-			return await this.queueSplit(splitType);
+			return this.queueSplit(splitType);
 		}
 	}
 
@@ -554,7 +554,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		return null;
 	}
 
-	async queueSplit(splitType: SplitType): Promise<SplitStatusKVItem> {
+	queueSplit(splitType: SplitType): SplitStatusKVItem {
 		const nowStatus = this.splitStatus();
 		if (!nowStatus) {
 			this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
@@ -564,10 +564,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 				partitionContext: this.partitionContext,
 			});
 		}
-		if (!(await this.#storage.getAlarm())) {
-			// Set an alarm to trigger the split process. The alarm handler will check the split status and perform the split if needed.
-			await this.#storage.setAlarm(Date.now());
-		}
+		// Alarm scheduling is the caller's responsibility (PartitionDO.checkSplits).
 		const written = this.splitStatus();
 		invariant(written != null, "fokos/topology.queueSplit: KV write succeeded but splitStatus() returned null");
 		return written;
@@ -582,10 +579,10 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// then mark the status as `split_completed` and stop forwarding requests.
 
 		const splitStatus = this.splitStatus();
-		invariant(
-			splitStatus && splitStatus.status === "split_queued",
-			"fokos/topology.startSplit: Cannot start split process, split is not queued.",
-		);
+		if (!splitStatus || splitStatus.status !== "split_queued") {
+			// Already started or completed — idempotent no-op.
+			return;
+		}
 
 		const childPartitionContexts: InitFromSplitOptions[] = [];
 		const splitType = splitStatus.splitType;
@@ -670,7 +667,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// Final. Mark the split status as `split_started` to indicate that now there are new partitions handling requests,
 		// and the current partition is just a proxy that forwards requests to the new partitions until the split is completed and the data is migrated,
-		// then mark the status as `split_completed` and stop forwarding requests.
+		// then mark the status as `split_completed`.
 		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
 			status: "split_started",
 			splitType,
@@ -691,23 +688,22 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// Kick off migration on each child immediately so it doesn't wait for the first user request.
 		// Fire-and-forget: failures are logged but do not fail startSplit — the child will
 		// start migrating on its first incoming request if this doesn't reach it.
-		this.ctx.waitUntil(
-			Promise.all(
-				childPartitionContexts.map(async (childContext) => {
-					try {
-						const doId = env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName!);
-						const childDo = env[childContext.newPartitionContext.ns].get(doId);
-						await childDo.triggerMigration();
-					} catch (error) {
-						console.error({
-							message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
-							error: String(error),
-							errorProps: error,
-							childDoName: childContext.newPartitionContext.doName,
-						});
-					}
-				}),
-			),
+		// We do not use this.ctx.waitUntil(...) since it causes vitest errors with tangling log messages.
+		await Promise.allSettled(
+			childPartitionContexts.map(async (childContext) => {
+				try {
+					const doId = env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+					const childDo = env[childContext.newPartitionContext.ns].get(doId);
+					await childDo.triggerMigration();
+				} catch (error) {
+					console.error({
+						message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
+						error: String(error),
+						errorProps: error,
+						childDoName: childContext.newPartitionContext.doName,
+					});
+				}
+			}),
 		);
 
 		// TODO Notify the TopologyKeeperDO that the split has started.

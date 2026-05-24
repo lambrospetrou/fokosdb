@@ -149,12 +149,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
 	};
 
+	private static readonly STALE_TX_MS = 5_000;
+	private static readonly MIGRATION_FALLBACK_ALARM_MS = 10_000;
+	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
+
 	#_migrations: SQLSchemaMigrations;
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
+	#_backgroundWorkScheduledAt: number | null = null;
 
 	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
 	__testing__alarm_running = false;
+	__testing__backgroundWorkRunning = false;
 	__testing__migrationBatchLimitBytes?: number;
 	__testing__beforeMigrationComplete?: () => Promise<void>;
 
@@ -208,10 +214,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+
+		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
+		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
+		//          This is OK but if any other flow runs the background job in the child partition, the migration job will also run.
+		// Fallback: alarm fires if the DO is evicted before setTimeout runs.
+		// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
+		// Fast path: begin migration in this request's event loop turn.
+		// this.scheduleBackgroundWork(0);
 	}
 
 	async triggerMigration(): Promise<void> {
-		await this.ensureMigration("triggerMigration", false);
+		const isMigrating = await this.ensureMigration("triggerMigration", false);
+		if (isMigrating) {
+			this.scheduleBackgroundWork({ delayMs: 0, forceSchedule: true });
+		}
 	}
 
 	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
@@ -369,7 +386,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: MigrationCursor | null;
 	}): Promise<GetItemsBatchResult> {
 		const splitStatus = this.ensureTopology(this.pCtx()).splitStatus();
-		invariant(splitStatus?.status === "split_started", `fokos/partition.getItemsBatch: expected split_started, got ${splitStatus?.status}`);
+		// For now we allow this to be called when split_completed as well, since we don't delete data yet.
+		// If we decided to clean the parent partitions, then we should add another state in splitStatus so that this fails.
+		// The child partitions could have racy jobs to migrate data, hence why we end up processing requests while in split_completed.
+		invariant(
+			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
+			`fokos/partition.getItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
+		);
 		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
 		invariant(isKnownChild, `fokos/partition.getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
 
@@ -418,9 +441,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = topology.splitStatus();
+		// For now we allow this to be called when split_completed as well, since we don't delete data yet.
+		// If we decided to clean the parent partitions, then we should add another state in splitStatus so that this fails.
+		// The child partitions could have racy jobs to migrate data, hence why we end up processing requests while in split_completed.
 		invariant(
-			splitStatus?.status === "split_started",
-			`fokos/partition.getPartitionTransactionMetadata: expected split_started, got ${splitStatus?.status}`,
+			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
+			`fokos/partition.getPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
 		);
 		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
 		invariant(
@@ -472,11 +498,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	/**
 	 * INTERNAL ONLY FOR TESTING.
 	 */
-	async status() {
+	async status(pCtx?: PartitionContextResolved) {
+		// The pCtx is only provided during tests, since any other use-case in production should initialize the DO already as part of the public API.
+		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.pCtx();
 		return {
-			partitionContext: this.pCtx(),
+			partitionContext: pCtx,
 			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
-			splitStatus: this.ensureTopology(this.pCtx()).splitStatus(),
+			splitStatus: this.ensureTopology(pCtx).splitStatus(),
 			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
@@ -598,8 +626,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return { outcome: "accepted" };
 		});
 
-		if (response.outcome === "accepted" && !(await this.ctx.storage.getAlarm())) {
-			await this.ctx.storage.setAlarm(Date.now() + 5_000);
+		if (response.outcome === "accepted") {
+			await this.ensureAlarmSet(Date.now() + PartitionDO.STALE_TX_MS);
 		}
 
 		return response;
@@ -788,88 +816,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async alarm(alarmInfo: AlarmInvocationInfo): Promise<void> {
-		const topologyRouter = this.ensureTopology(this.pCtx());
-		const splitStatus = topologyRouter.splitStatus();
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
-		console.log({
-			...this.logParams(),
-			message: "fokos/partition: Alarm triggered.",
-			alarmInfo,
-			migrationStatus,
-			splitStatus,
-		});
-
+		console.log({ ...this.logParams(), message: "fokos/partition: Alarm triggered.", alarmInfo, status: await this.status() });
+		this.__testing__alarm_running = true;
 		try {
-			this.__testing__alarm_running = true;
-
-			if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
-				if (migrationStatus === "migration_initialized") {
-					this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
-				}
-				await tryWhile(
-					async () => {
-						await this.runMigration();
-					},
-					(_error, nextAttempt) => nextAttempt <= 5,
-				);
-			} else if (splitStatus?.status === "split_queued") {
-				console.log({
-					...this.logParams(),
-					message: "fokos/partition: Running split process.",
-					splitStatus,
-				});
-				await tryWhile(
-					async () => {
-						await topologyRouter.startSplit();
-					},
-					(_error, nextAttempt) => nextAttempt <= 5,
-				);
-			} else {
-				console.log({
-					...this.logParams(),
-					message: "fokos/partition: Alarm fired but no split is queued, nothing to do.",
-					splitStatus,
-				});
-			}
-
-			// Poke TCs for any stale pending transaction locks so they can drive recovery.
-			const STALE_TX_MS = 5_000;
-			const staleTxRows = this.ctx.storage.sql
-				.exec<{ transaction_id: string; coordinator_do_id: string }>(
-					`SELECT DISTINCT transaction_id, coordinator_do_id
-                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
-					Date.now() - STALE_TX_MS,
-				)
-				.toArray();
-			for (const row of staleTxRows) {
-				if (!row.coordinator_do_id) continue;
-				try {
-					const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-					await (
-						this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }
-					).recoverTransaction(row.transaction_id);
-				} catch (e) {
-					console.error({
-						...this.logParams(),
-						message: "fokos/partition: failed to poke stale TC",
-						transactionId: row.transaction_id,
-						error: String(e),
-					});
-				}
-			}
-
-			// Re-arm alarm if any pending transaction locks remain.
-			const pendingCount = this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
-			if (pendingCount > 0 && !(await this.ctx.storage.getAlarm())) {
-				await this.ctx.storage.setAlarm(Date.now() + 5_000);
-			}
-		} catch (error) {
-			console.error({
-				...this.logParams(),
-				message: "fokos/partition: Alarm process failed, will retry on the next request.",
-				error: String(error),
-				errorProps: error,
-			});
+			await this.runBackgroundWork();
 		} finally {
 			this.__testing__alarm_running = false;
 		}
@@ -879,17 +829,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const topologyRouter = this.ensureTopology(pCtx);
 		const splitStatus = await topologyRouter.maybeQueueSplit(hashKey, sortKey);
 		if (splitStatus) {
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Split conditions met.",
-				splitStatus,
-			});
+			console.log({ ...this.logParams(), message: "fokos/partition: Split conditions met.", splitStatus });
+			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+			this.scheduleBackgroundWork({ delayMs: 10 });
 		}
 		return splitStatus;
 	}
 
 	private pCtx(): PartitionContextResolved {
-		invariant(this.#_partitionContext, "fokos/partition: Partition context not initialized");
+		invariant(
+			this.#_partitionContext,
+			// FIXME Optimize this to be statically generated once only since we call pCtx() often.
+			`fokos/partition: partition context not initialized for ${this.ctx.id.toString()}[${this.ctx.id.name}]`,
+		);
 		return this.#_partitionContext;
 	}
 
@@ -929,10 +881,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (migrationStatus === "migration_initialized") {
 			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 		}
-		// Ensure the background alarm is running in case it crashed or hasn't fired yet.
-		if (!(await this.ctx.storage.getAlarm())) {
-			await this.ctx.storage.setAlarm(Date.now());
-		}
+		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
 			// TODO This will reach user requests, so refactor the callers to show something nicer.
 			// We can also consider doing a selective migration of the requested keys only.
@@ -1123,6 +1072,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async runMigration(): Promise<void> {
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+		if (migrationStatus !== "migration_migrating") {
+			console.log({ ...this.logParams(), message: "fokos/partition.runMigration: migration not migrating.", migrationStatus });
+			return;
+		}
+
 		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
@@ -1201,6 +1156,179 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		console.log({ ...this.logParams(), message: "fokos/partition: Data migration from parent completed." });
 	}
 
+	private async ensureAlarmSet(targetMs: number): Promise<void> {
+		const existing = await this.ctx.storage.getAlarm();
+		if (existing === null || targetMs < existing) {
+			await this.ctx.storage.setAlarm(targetMs);
+		}
+	}
+
+	private scheduleBackgroundWork(ops: { delayMs: number; forceSchedule?: boolean }): void {
+		const delayMs = ops.delayMs ?? 10;
+		const targetTime = Date.now() + delayMs;
+		if (!ops.forceSchedule && this.#_backgroundWorkScheduledAt !== null && this.#_backgroundWorkScheduledAt <= targetTime) {
+			return;
+		}
+		if (ops.forceSchedule && this.#_backgroundWorkScheduledAt === targetTime) {
+			// This means a background work is already scheduled for the same target time, so we can skip scheduling another one.
+			// Avoid lots of timers set for the same time which can cause a thundering herd problem and unnecessary resource usage.
+			return;
+		}
+		this.#_backgroundWorkScheduledAt = targetTime;
+		setTimeout(() => {
+			const scheduledAt = this.#_backgroundWorkScheduledAt;
+			// FIXME We reset the timestamp for the timer after 1 second to avoid many concurrent runs
+			// when the background work takes longer than the delayMs (which is always), to avoid overhead and extra memory usage!
+			// We should consider using a more robust scheduling mechanism that allows N overlaps to avoid a stuck background job from progressing.
+			void Promise.race([
+				this.runBackgroundWork(),
+				new Promise((resolve) =>
+					setTimeout(() => {
+						// Only reset the schedule if it's the same one we set to avoid racing with a newly scheduled background work.
+						if (this.#_backgroundWorkScheduledAt === scheduledAt) {
+							this.#_backgroundWorkScheduledAt = null;
+							// console.debug({
+							// 	...this.logParams(),
+							// 	message: "fokos/partition: background work timed out, resetting schedule to allow future runs.",
+							// });
+						}
+						resolve(null);
+					}, 1_000),
+				),
+			]);
+		}, delayMs);
+	}
+
+	private async runBackgroundWork(): Promise<void> {
+		/**
+		 * INVARIANTS FOR ALL BACKGROUND JOBS:
+		 * - They should be idempotent and safe to run concurrently (e.g. if the alarm fires again while a previous run is still ongoing) to avoid issues with retries and overlapping runs.
+		 * - They should be crash-safe, meaning that if they crash they should not cause the rest jobs to not run and they should be able to resume or retry their work without causing inconsistencies or data loss.
+		 * - If they encounter an error, they should log it and reschedule the next run for some time in the future ensuring progress is made eventually.
+		 */
+		this.__testing__backgroundWorkRunning = true;
+
+		try {
+			////////////////////////////////////////////////////////
+			// ── Job: Partition migration (for child partitions)
+			try {
+				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+				if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
+					if (migrationStatus === "migration_initialized") {
+						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
+					}
+					await tryWhile(
+						async () => {
+							await this.runMigration();
+						},
+						(_error, nextAttempt) => nextAttempt <= 5,
+					);
+				}
+			} catch (error) {
+				console.error({ ...this.logParams(), message: "fokos/partition: Migration job failed.", error: String(error), errorProps: error });
+			}
+
+			/////////////////////////////////////////////////////
+			// ── Job: Partition split (for parent partitions)
+			const topology = this.ensureTopology(this.pCtx());
+			try {
+				const splitStatus = topology.splitStatus();
+				if (splitStatus?.status === "split_queued") {
+					console.log({ ...this.logParams(), message: "fokos/partition: Running split process.", splitStatus });
+					await tryWhile(
+						async () => {
+							await topology.startSplit();
+						},
+						(_error, nextAttempt) => nextAttempt <= 5,
+					);
+				}
+			} catch (error) {
+				console.error({ ...this.logParams(), message: "fokos/partition: Split job failed.", error: String(error), errorProps: error });
+			}
+
+			////////////////////////////////////////
+			// ── Job: Stale transaction recovery
+			try {
+				const staleTxRows = this.ctx.storage.sql
+					.exec<{ transaction_id: string; coordinator_do_id: string }>(
+						`SELECT DISTINCT transaction_id, coordinator_do_id
+                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
+						Date.now() - PartitionDO.STALE_TX_MS,
+					)
+					.toArray();
+				for (const row of staleTxRows) {
+					if (!row.coordinator_do_id) continue;
+					try {
+						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
+						await (
+							this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }
+						).recoverTransaction(row.transaction_id);
+					} catch (e) {
+						console.error({
+							...this.logParams(),
+							message: "fokos/partition: failed to poke stale TC",
+							transactionId: row.transaction_id,
+							error: String(e),
+						});
+					}
+				}
+			} catch (error) {
+				console.error({
+					...this.logParams(),
+					message: "fokos/partition: Stale TX recovery job failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
+		} catch (error) {
+			console.error({
+				...this.logParams(),
+				message: "fokos/partition: Background work failed with unexpected error.",
+				error: String(error),
+				errorProps: error,
+				status: await this.status(),
+			});
+		} finally {
+			/////////////////////////////////////////////////
+			// Check if any job needs to set the next alarm!
+			/////////////////////////////////////////////////
+
+			let nextAlarmMs: number | null = null;
+			const wantAlarm = (ms: number) => {
+				if (nextAlarmMs === null || ms < nextAlarmMs) nextAlarmMs = ms;
+			};
+			this.ctx.storage.transactionSync(() => {
+				// Job: Partition migration for child partitions.
+				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+				if (postStatus === "migration_migrating") {
+					wantAlarm(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
+				}
+
+				// Job: Split process for parent partitions.
+				if (this.ensureTopology(this.pCtx()).splitStatus()?.status === "split_queued") {
+					wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+				}
+
+				// Job: Stale transaction recovery.
+				const pendingCount =
+					this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
+				if (pendingCount > 0) {
+					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
+				}
+			});
+
+			if (nextAlarmMs !== null) {
+				await this.ensureAlarmSet(nextAlarmMs);
+				// Schedule background work to ensure progress without waiting for the alarm.
+				this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
+			} else {
+				console.log({ ...this.logParams(), message: "fokos/partition: Background work ran, nothing to schedule forward." });
+			}
+
+			this.__testing__backgroundWorkRunning = false;
+		}
+	}
+
 	private logParams() {
 		return {
 			actorId: this.ctx.id.toString(),
@@ -1264,8 +1392,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 id              INTEGER PRIMARY KEY CHECK (id = 1),
                 max_deleted_ts  INTEGER NOT NULL DEFAULT 0
             ) STRICT;
-            INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);
-
-`,
+            INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);`,
 	},
 ];
