@@ -337,6 +337,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
+				// Bug 4: keep deletion watermark consistent with transactional deletes
+				if (writeRes.rowsWritten > 0) {
+					this.ctx.storage.sql.exec(
+						`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
+						Date.now(),
+					);
+				}
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
@@ -386,9 +393,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: MigrationCursor | null;
 	}): Promise<GetItemsBatchResult> {
 		const splitStatus = this.ensureTopology(this.pCtx()).splitStatus();
-		// For now we allow this to be called when split_completed as well, since we don't delete data yet.
-		// If we decided to clean the parent partitions, then we should add another state in splitStatus so that this fails.
-		// The child partitions could have racy jobs to migrate data, hence why we end up processing requests while in split_completed.
+		// Allowed at split_completed: the items table is not deleted at split_completed (only pending_transactions is),
+		// so children with racy migration jobs can still fetch item batches after the last sibling has acknowledged.
 		invariant(
 			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 			`fokos/partition.getItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
@@ -441,9 +447,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = topology.splitStatus();
-		// For now we allow this to be called when split_completed as well, since we don't delete data yet.
-		// If we decided to clean the parent partitions, then we should add another state in splitStatus so that this fails.
-		// The child partitions could have racy jobs to migrate data, hence why we end up processing requests while in split_completed.
+		// Allowed at split_completed: pending_transactions is deleted atomically with the split_completed transition
+		// (acknowledgeChildMigrationComplete), so a call at split_completed returns empty results, which is correct —
+		// all children already fetched their rows before the last ack landed.
 		invariant(
 			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 			`fokos/partition.getPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
@@ -492,7 +498,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async acknowledgeChildMigrationComplete(childDoName: string): Promise<void> {
-		this.ensureTopology(this.pCtx()).acknowledgeChildMigration(childDoName);
+		const topology = this.ensureTopology(this.pCtx());
+		// Bug 3: atomically transition topology and clean up parent's pending_transactions when
+		// all children have migrated. Children now own authoritative copies; parent's are redundant.
+		this.ctx.storage.transactionSync(() => {
+			topology.acknowledgeChildMigration(childDoName);
+			if (topology.splitStatus()?.status === "split_completed") {
+				this.ctx.storage.sql.exec(`DELETE FROM pending_transactions`);
+			}
+		});
 	}
 
 	/**
@@ -592,7 +606,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
 						};
 					}
-				} else if (item.operation === "put" || item.operation === "delete") {
+				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
+					// Bug 5: check on a non-existent item must also respect the deletion watermark
 					const metaRow = this.ctx.storage.sql
 						.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
 						.toArray()[0];
@@ -636,6 +651,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async commit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
 		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration("commit"); // Bug 1: reject while THIS partition is migrating
 
 		const { local, forwarded } = this.groupItemsByRouting(request.items);
 		if (forwarded.size > 0) {
@@ -735,15 +751,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration("cancel"); // Bug 6: reject while THIS partition is migrating
 		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = topology.splitStatus();
-		if (splitStatus?.status === "split_started") {
+		if (
+			splitStatus?.status === "split_started" ||
+			splitStatus?.status === "split_completed" // Bug 2: forward cancel at split_completed too
+		) {
+			const errors: unknown[] = [];
 			for (const childPCtx of splitStatus.childPartitionContexts) {
 				try {
 					await this.getChildStub(childPCtx).cancel(childPCtx, request);
 				} catch (e) {
+					// Bug 6: do NOT swallow. A migrating child throws here; surface it so the TC
+					// keeps retrying (stays CANCELLING) until migration completes and the forwarded
+					// cancel can delete the row the child copied during the race.
 					console.error({
 						...this.logParams(),
 						message: "fokos/partition.cancel: failed to forward cancel to child",
@@ -751,7 +775,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						transactionId: request.transactionId,
 						error: String(e),
 					});
+					errors.push(e);
 				}
+			}
+			if (errors.length > 0) {
+				throw new Error(`fokos/partition.cancel: ${errors.length} child cancel(s) failed for transaction ${request.transactionId}`);
 			}
 		}
 
