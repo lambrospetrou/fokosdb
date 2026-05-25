@@ -87,6 +87,17 @@ export type ReadForTransactionResponse = {
 
 export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
+// ─── TransactionCoordinatorDO — recoverTransaction ───────────────────────────
+
+export type TCTerminalState = Extract<TCState, "COMMITTED" | "CANCELLED">;
+
+export type RecoverTransactionResult =
+	| { state: TCTerminalState }
+	/** TC has no record of this transaction — caller should treat it as cancelled. */
+	| { state: "not_found" }
+	/** TC found a non-terminal state and has taken over recovery. */
+	| { state: "driving" };
+
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
 
 export type TCWriteOperation = {

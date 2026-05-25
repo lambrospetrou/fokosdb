@@ -16,6 +16,7 @@ import type {
 	ReadForTransactionItemResult,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	RecoverTransactionResult,
 	RejectionReason,
 	TCState,
 	TransactionItem,
@@ -591,16 +592,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	async recoverTransaction(transactionId: string): Promise<void> {
+	async recoverTransaction(transactionId: string): Promise<RecoverTransactionResult> {
 		const row = this.ctx.storage.sql
-			.exec<{ idempotency_token: string; state: TCState }>(
-				`SELECT idempotency_token, state FROM tc_state
-                 WHERE transaction_id = ? AND state NOT IN ('COMMITTED', 'CANCELLED')`,
-				transactionId,
-			)
+			.exec<{
+				idempotency_token: string;
+				state: TCState;
+			}>(`SELECT idempotency_token, state FROM tc_state WHERE transaction_id = ?`, transactionId)
 			.toArray()[0];
 
-		if (!row) return;
+		if (!row) return { state: "not_found" };
+		if (row.state === "COMMITTED" || row.state === "CANCELLED") return { state: row.state };
 
 		try {
 			const coordinatorDoId = this.ctx.id.toString();
@@ -629,6 +630,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				await this.ctx.storage.setAlarm(Date.now());
 			}
 		}
+		return { state: "driving" };
 	}
 
 	private loadStateRow(idempotencyToken: string): TcStateRow | undefined {

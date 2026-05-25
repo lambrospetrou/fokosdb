@@ -19,6 +19,7 @@ import type {
 	ReadForTransactionItemResult,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	RecoverTransactionResult,
 	TransactionItem,
 } from "./transaction-types.js";
 import {
@@ -339,10 +340,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
 				// Bug 4: keep deletion watermark consistent with transactional deletes
 				if (writeRes.rowsWritten > 0) {
-					this.ctx.storage.sql.exec(
-						`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-						Date.now(),
-					);
+					this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, Date.now());
 				}
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
@@ -1290,9 +1288,31 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					if (!row.coordinator_do_id) continue;
 					try {
 						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-						await (
-							this.env.TRANSACTION_COORDINATOR_DO.get(tcId) as unknown as { recoverTransaction(txId: string): Promise<void> }
-						).recoverTransaction(row.transaction_id);
+						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
+
+						if (result.state === "COMMITTED") {
+							const pendingRows = this.ctx.storage.sql
+								.exec<{
+									hk: string;
+									sk: string;
+									transaction_ts: number;
+									operation: string;
+									data: string | ArrayBuffer | null;
+								}>(`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`, row.transaction_id)
+								.toArray();
+							if (pendingRows.length > 0) {
+								const transactionTimestamp = pendingRows[0].transaction_ts;
+								const items: TransactionItem[] = pendingRows.map((r) => ({
+									hashKey: r.hk,
+									sortKey: r.sk || undefined,
+									operation: r.operation as TransactionItem["operation"],
+									data: r.data == null ? undefined : typeof r.data === "string" ? r.data : new Uint8Array(r.data),
+								}));
+								await this.commit(this.pCtx(), { transactionId: row.transaction_id, transactionTimestamp, items });
+							}
+						} else if (result.state === "CANCELLED" || result.state === "not_found") {
+							await this.cancel(this.pCtx(), { transactionId: row.transaction_id });
+						}
 					} catch (e) {
 						console.error({
 							...this.logParams(),
