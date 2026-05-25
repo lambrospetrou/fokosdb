@@ -156,6 +156,12 @@ export interface PartitionTopologyRouter {
 		parentContext: PartitionContextResolved,
 		childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean;
+
+	/**
+	 * Returns a PartitionContextResolved for every root partition in the topology.
+	 * Used as the starting points for full-tree traversal (e.g. destroy).
+	 */
+	rootPartitionContexts(): PartitionContextResolved[];
 }
 
 // PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
@@ -410,6 +416,15 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 			doName: doName,
 			partitionIdOpaque: opaque,
 		};
+	}
+
+	rootPartitionContexts(): PartitionContextResolved[] {
+		return this.#topology.map((node) => ({
+			...this.basePartitionContext,
+			doName: node.partitionContext.doName,
+			primaryDoIdStr: node.partitionContext.primaryDoIdStr,
+			partitionId: node.partitionId,
+		}));
 	}
 
 	private hash(hashKey: string, N: number): number {

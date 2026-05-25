@@ -174,10 +174,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			await this.#_migrations.runAll();
 
 			// Load partition context from storage.
-			const storedContext = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
-			if (storedContext) {
-				storedContext._partitionIdBytes = Uint8Array.fromHex(storedContext.partitionId);
-				this.#_partitionContext = storedContext;
+			const pCtx = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
+			if (pCtx) {
+				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
+				this.#_partitionContext = pCtx;
 			}
 		});
 	}
@@ -500,11 +500,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 */
 	async status(pCtx?: PartitionContextResolved) {
 		// The pCtx is only provided during tests, since any other use-case in production should initialize the DO already as part of the public API.
-		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.pCtx();
+		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
 		return {
 			partitionContext: pCtx,
 			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
-			splitStatus: this.ensureTopology(pCtx).splitStatus(),
+			splitStatus: pCtx ? this.ensureTopology(pCtx).splitStatus() : undefined,
 			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
@@ -858,10 +858,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return this.#_partitionContext;
 		}
 		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
-		this.#_partitionContext = pCtx;
-		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, pCtx);
-		pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
-		return pCtx;
+		this.#_partitionContext = { ...pCtx };
+		this.#_partitionContext._partitionIdBytes = undefined;
+		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
+		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
+		return this.#_partitionContext;
 	}
 
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
@@ -1200,6 +1201,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async runBackgroundWork(): Promise<void> {
+		invariant(this.#_partitionContext, "fokos/partition.runBackgroundWork: partition context not initialized");
 		/**
 		 * INVARIANTS FOR ALL BACKGROUND JOBS:
 		 * - They should be idempotent and safe to run concurrently (e.g. if the alarm fires again while a previous run is still ongoing) to avoid issues with retries and overlapping runs.
@@ -1327,6 +1329,32 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			this.__testing__backgroundWorkRunning = false;
 		}
+	}
+
+	async destroyPartition(): Promise<void> {
+		console.warn({ ...this.logParams(), message: "fokos/partition: Destroying partition — deleting all storage." });
+
+		await this.ctx.blockConcurrencyWhile(async () => {
+			// Hack to clear all timeouts.
+			// setTimeout returns a numeric ID which increments with each call, so we can get the highest ID and clear all timeouts up to that ID.
+			const highestId = setTimeout(() => {
+				for (let i = Number(highestId); i >= 0; i--) {
+					clearTimeout(i);
+				}
+			}, 0);
+			// Cancel the fallback alarm before wiping storage so Miniflare doesn't try to fire it
+			// on the freshly-evicted instance and produce an uncaught alarm-handler error.
+			await this.ctx.storage.deleteAlarm();
+			await this.ctx.storage.deleteAll();
+			console.warn({ ...this.logParams(), message: "fokos/partition: Partition destroyed." });
+		});
+
+		// Evict the DO instance so the next caller gets a fresh one with re-run migrations.
+		// This throws on the caller side with the sentinel message, which FokosDB.destroy() catches and ignores.
+		this.ctx.abort("__special_destroy_sentinel");
+		// await this.ctx.blockConcurrencyWhile(async () => {
+		// 	throw new Error("__special_destroy_sentinel");
+		// });
 	}
 
 	private logParams() {

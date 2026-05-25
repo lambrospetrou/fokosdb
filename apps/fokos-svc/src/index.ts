@@ -147,6 +147,24 @@ api.get("/hello/:name", async (c) => {
 	return c.json({ message: `Hello, ${name}!` });
 });
 
+api.delete("/databases/:databaseName", async (c) => {
+	const databaseName = c.req.param("databaseName");
+	let partitionOptions: PartitionOptionsInput | undefined;
+	try {
+		const body = await c.req.json();
+		const result = v.safeParse(v.object({ partitionOptions: PartitionOptionsSchema }), body);
+		if (!result.success) {
+			throw new HTTPException(400, { message: JSON.stringify({ error: "Validation failed", issues: v.flatten(result.issues) }) });
+		}
+		partitionOptions = result.output.partitionOptions;
+	} catch (e) {
+		if (e instanceof HTTPException) throw e;
+		// No body or non-JSON body is fine — use defaults.
+	}
+	await makeFokosDB(c.env, databaseName, partitionOptions).destroy();
+	return c.json({ destroyed: true });
+});
+
 api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 	const databaseName = c.req.param("databaseName");
 	const rpcAction = c.req.param("rpcAction");

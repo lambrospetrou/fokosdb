@@ -7,11 +7,11 @@ FokosDB: A global strongly-consistent key-value database ontop of Cloudflare Dur
 No particular order.
 
 - Parity in each public API invariants (split status, migration status, forwarding).
-- Implement a "walk partitions" helper RPC to get a live topology of the partitions.
 - Cleanup pending transactions from the parent once split_completed.
+- Implement a "walk partitions" helper RPC to get a live topology of the partitions.
 - Refactor the ensurePartitionContext(pCtx) logic to check required immutable options and separate options that can change after first use.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level.
-- Use StaticShardedDO for the transaction coordinators.
+- Use StaticShardedDO for the transaction coordinators or even better remove it entirely and use any of the partitions involved to be the coordinator.
 - Implement the Jump Consistent Hashing instead/in addition of xxhash32.
 - (perf) Allow each child partition to start migrating data before all partitions are initialized.
 - Add topology keeper and encoding. Schema and versioning per change (split).

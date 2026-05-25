@@ -1,7 +1,7 @@
-import { DeleteItemOptions, GetItemOptions, InitiateReadRequest, InitiateReadResponse, InitiateWriteRequest, InitiateWriteResponse, PutItemOptions } from "./types.js";
+import { DeleteItemOptions, GetItemOptions, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { PartitionTopologyRouter } from "./partition-topology/partition-topology.js";
+import { PartitionTopologyRouter, type PartitionContextResolved } from "./partition-topology/partition-topology.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import type { ItemCondition } from "./types.js";
 
@@ -57,6 +57,37 @@ export class FokosDB {
 		return await tcStub.initiateWrite({ clientRequestToken: opts.clientRequestToken, operations });
 	}
 
+	async destroy(): Promise<{ ok: true }> {
+		const ns = this.options.ns;
+
+		// TODO Move the traversal logic in the topology router.
+		const destroyPartition = async (ctx: PartitionContextResolved): Promise<void> => {
+			const stub = ns.get(ns.idFromName(ctx.doName));
+			console.warn(`Destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
+			// Discover children dynamically: the in-memory topology only knows root nodes,
+			// but split children are recorded in the DO's own split status.
+			const { splitStatus } = await stub.status(ctx);
+			if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+				for (const childCtx of splitStatus.childPartitionContexts) {
+					await destroyPartition(childCtx);
+				}
+			}
+			try {
+				await stub.destroyPartition();
+			} catch (e) {
+				// console.error(`Error destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId}):`, e);
+				if (!String(e).includes("__special_destroy_sentinel")) throw e;
+			}
+			console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
+		};
+
+		for (const rootCtx of this.options.topology.rootPartitionContexts()) {
+			await destroyPartition(rootCtx);
+		}
+
+		return { ok: true };
+	}
+
 	async transactGetItems(opts: { items: Array<{ hashKey: string; sortKey?: string }> }): Promise<InitiateReadResponse> {
 		const items: TCReadItem[] = opts.items.map((item) => {
 			const { partitionContext } = this.options.topology.pickPartition(item.hashKey, item.sortKey);
@@ -64,7 +95,9 @@ export class FokosDB {
 		});
 
 		// Read-only TCs are ephemeral — random UUID DO name, no idempotency.
-		const tcStub = this.options.transactionCoordinatorNs.get(this.options.transactionCoordinatorNs.idFromName(crypto.randomUUID().replaceAll("-", "")));
+		const tcStub = this.options.transactionCoordinatorNs.get(
+			this.options.transactionCoordinatorNs.idFromName(crypto.randomUUID().replaceAll("-", "")),
+		);
 		return await tcStub.initiateRead({ items });
 	}
 }
