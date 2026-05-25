@@ -17,6 +17,19 @@ HTTP 200
 [Captures]
 txt_100k: body
 
+# Deletes all Partition DOs created during the test, including any children created by splits.
+# DELETE {{base_url}}/api/databases/stress_001
+# {
+#   "partitionOptions": {
+#     "rootTreesN": 2,
+#     "hashSplitConditions": {
+#       "splitN": 4,
+#       "maxSizeMb": 2
+#     }
+#   }
+# }
+# HTTP 200
+
 # ── putItem: fully random hashKey + sortKey (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
 
