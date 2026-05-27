@@ -539,9 +539,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
-		// TODO If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
-		// We can track the split status in the DO's storage and check it here.
-
+		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// TODO - Keep this in memory to avoid reading it all the time from storage.
 		const splitStatus = this.#storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 		if (splitStatus && splitStatus.status !== "split_queued") {
