@@ -11,8 +11,10 @@ function makeDB() {
 		ns: "PARTITION_DO",
 		databaseName: prefix,
 		rootTreesN: 100,
-		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
-		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
+		hashSplitN: 2,
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 100 },
+		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const topology = new PartitionTopologyRouterImpl("", base);
 	return new FokosDB({

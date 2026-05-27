@@ -23,6 +23,7 @@ import type {
 	TransactionItem,
 } from "./transaction-types.js";
 import {
+	ensureImmutableOptionsEqual,
 	PartitionContext,
 	PartitionContextResolved,
 	PartitionTopologyImpl,
@@ -875,11 +876,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private ensurePartitionContext(pCtx: PartitionContextResolved): PartitionContextResolved {
 		if (this.#_partitionContext) {
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
-			// In a real implementation, we might want to allow some flexibility here (e.g. for certain fields)
-			// or have a more robust way to handle context updates.
 			invariant(
-				this.#_partitionContext.signature === pCtx.signature,
-				`fokos/partition.ensurePartitionContext: context mismatch: ${this.#_partitionContext.signature} vs ${pCtx.signature}`,
+				ensureImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
+					this.#_partitionContext.partitionId === pCtx.partitionId &&
+					this.#_partitionContext.doName === pCtx.doName,
+				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
 			return this.#_partitionContext;
 		}

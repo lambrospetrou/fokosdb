@@ -22,8 +22,8 @@ txt_100k: body
 # {
 #   "partitionOptions": {
 #     "rootTreesN": 2,
+#     "hashSplitN": 4,
 #     "hashSplitConditions": {
-#       "splitN": 4,
 #       "maxSizeMb": 2
 #     }
 #   }
@@ -40,8 +40,8 @@ repeat: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,
+    "hashSplitN": 4,
     "hashSplitConditions": {
-      "splitN": 4,
       "maxSizeMb": 2
     }
   },
@@ -63,8 +63,8 @@ retry-interval: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,
+    "hashSplitN": 4,
     "hashSplitConditions": {
-      "splitN": 4,
       "maxSizeMb": 2
     }
   },
@@ -87,8 +87,8 @@ retry-interval: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,
+    "hashSplitN": 4,
     "hashSplitConditions": {
-      "splitN": 4,
       "maxSizeMb": 2
     }
   },
@@ -105,8 +105,8 @@ Content-Type: application/json
 {
   "partitionOptions": {
     "rootTreesN": 2,
+    "hashSplitN": 4,
     "hashSplitConditions": {
-      "splitN": 4,
       "maxSizeMb": 2
     }
   },
@@ -136,8 +136,8 @@ HTTP 200
 #{
 #  "partitionOptions": {
 #    "rootTreesN": 2,
+#    "hashSplitN": 4,
 #    "hashSplitConditions": {
-#      "splitN": 4,
 #      "maxSizeMb": 2
 #    }
 #  },

@@ -10,7 +10,9 @@ import type { PartitionDO } from "../src/lib/do-partition.js";
 // maxSizeMb: 0.1 = 102 400 bytes; 2 × 50 KB items per partition → split triggers.
 const PARTITION_OPTIONS = {
 	rootTreesN: 3,
-	hashSplitConditions: { splitN: 2, maxSizeMb: 0.1 },
+	hashSplitN: 2,
+	rangeSplitN: 2,
+	hashSplitConditions: { maxSizeMb: 0.1 },
 	// rangeSplitConditions not specified here → PartitionContextCreator defaults to { splitN: 4, maxSizeMb: 500 },
 	// which matches what makeFokosDB in index.ts uses when rangeSplitConditions is omitted from the request body.
 };

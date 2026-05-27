@@ -7,7 +7,6 @@ FokosDB: A global strongly-consistent key-value database ontop of Cloudflare Dur
 No particular order.
 
 - Implement a "walk partitions" helper RPC to get a live topology of the partitions.
-- Refactor the ensurePartitionContext(pCtx) logic to check required immutable options and separate options that can change after first use.
 - Add range partitions (routing and splitting).
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
 - Implement the timestamp ordering optimizations for transactions based on Section 4 of the 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB"

@@ -22,16 +22,15 @@ export type PartitionContext = {
 	ns: PartitionNamespaceKey;
 	databaseName: string;
 
+	/**
+	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
+	 */
 	rootTreesN: number;
+	hashSplitN: number;
+	rangeSplitN?: number;
+
 	hashSplitConditions: SplitConditions;
 	rangeSplitConditions?: SplitConditions;
-
-	/**
-	 * This is used to detect changes in the topology configuration and trigger any necessary actions in the DOs,
-	 * such as rebalancing or splitting.
-	 * The actual value can be a hash of the configuration or a version number that increments on every change.
-	 */
-	signature: string;
 };
 export type PartitionContextResolved = PartitionContext & {
 	doName: string;
@@ -53,13 +52,6 @@ export type PartitionContextResolved = PartitionContext & {
 
 export type SplitConditions = {
 	/**
-	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
-	 *
-	 * The number of splits to perform when the split conditions are met. For example, if `splitN` is 4, the partition will be split into 4 new partitions.
-	 */
-	splitN: number;
-
-	/**
 	 * The maximum size of the partition in megabytes before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.
 	 */
 	maxSizeMb?: number;
@@ -69,26 +61,42 @@ export type SplitConditions = {
 	maxItems?: number;
 };
 
+export function ensureImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
+	return (
+		opts1.schema === opts2.schema &&
+		opts1.databaseName === opts2.databaseName &&
+		opts1.rootTreesN === opts2.rootTreesN &&
+		opts1.hashSplitN === opts2.hashSplitN &&
+		opts1.rangeSplitN === opts2.rangeSplitN
+	);
+}
+
 export class PartitionContextCreator {
 	static create(opts: {
 		ns: PartitionNamespaceKey;
 		databaseName: string;
 		rootTreesN: number;
+		hashSplitN: number;
 		hashSplitConditions: SplitConditions;
+		rangeSplitN?: number;
 		rangeSplitConditions?: SplitConditions;
 	}): PartitionContext {
 		// Assert the input options and default to reasonable values if not provided.
 		if (!opts.rangeSplitConditions) {
-			opts.rangeSplitConditions = { splitN: 4, maxSizeMb: 500 };
+			opts.rangeSplitN = 4;
+			opts.rangeSplitConditions = { maxSizeMb: 500 };
 		}
 		if (!opts.hashSplitConditions) {
-			opts.hashSplitConditions = { splitN: 16, maxSizeMb: 100 };
+			opts.hashSplitN = 4;
+			opts.hashSplitConditions = { maxSizeMb: 100 };
 		}
 		if (opts.rootTreesN < 1 || opts.rootTreesN > 65000) {
 			throw new Error("fokos: rootTreesN must be between 1 and 65000");
 		}
-		if (opts.hashSplitConditions.splitN < 2 || opts.hashSplitConditions.splitN > 255) {
-			throw new Error("fokos: hashSplitConditions.splitN must be between 2 and 255");
+
+		invariant(opts.hashSplitN, "fokos: hashSplitN must be provided if hashSplitConditions is provided");
+		if (opts.hashSplitN < 2 || opts.hashSplitN > 255) {
+			throw new Error("fokos: hashSplitN must be between 2 and 255");
 		}
 		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb < 0.1) {
 			throw new Error("fokos: hashSplitConditions.maxSizeMb must be at least 0.1");
@@ -96,8 +104,10 @@ export class PartitionContextCreator {
 		if (opts.hashSplitConditions.maxItems && opts.hashSplitConditions.maxItems < 1) {
 			throw new Error("fokos: hashSplitConditions.maxItems must be at least 1");
 		}
-		if (opts.rangeSplitConditions.splitN < 2 || opts.rangeSplitConditions.splitN > 255) {
-			throw new Error("fokos: rangeSplitConditions.splitN must be between 2 and 255");
+
+		invariant(opts.rangeSplitN, "fokos: rangeSplitN must be provided if rangeSplitConditions is provided");
+		if (opts.rangeSplitN < 2 || opts.rangeSplitN > 255) {
+			throw new Error("fokos: rangeSplitN must be between 2 and 255");
 		}
 		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb < 0.1) {
 			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be at least 0.1");
@@ -111,14 +121,11 @@ export class PartitionContextCreator {
 			ns: opts.ns,
 			databaseName: opts.databaseName,
 			rootTreesN: opts.rootTreesN,
+			hashSplitN: opts.hashSplitN,
+			rangeSplitN: opts.rangeSplitN,
 			hashSplitConditions: opts.hashSplitConditions,
 			rangeSplitConditions: opts.rangeSplitConditions,
-
-			// Filled properly below.
-			signature: "",
 		};
-		// FIXME: Use a proper hash function.
-		context.signature = btoa(JSON.stringify(context));
 		return context;
 	}
 }
@@ -325,11 +332,11 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
 		const childIdx = PartitionIdHelper.lastChildIdx(childPartitionIdBytes);
 		invariant(
-			childIdx < childContext.hashSplitConditions.splitN,
-			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitConditions.splitN}`,
+			childIdx < childContext.hashSplitN,
+			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitN}`,
 		);
 		return (hashKey: string, sortKey?: string) => {
-			const hashedIdx = this.hash(hashKey + childLevel, childContext.hashSplitConditions.splitN);
+			const hashedIdx = this.hash(hashKey + childLevel, childContext.hashSplitN);
 			return hashedIdx === childIdx;
 		};
 	}
@@ -345,10 +352,10 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		const depth = PartitionIdHelper.depth(partitionIdBytes);
 		// depth+1 as entropy: root (depth=0) → 1, child (depth=1) → 2, etc.
 		// Ensures each tree level uses a distinct hash seed so siblings don't cluster.
-		const hChildIdx = this.hash(hashKey + (depth + 1), partitionContext.hashSplitConditions.splitN);
+		const hChildIdx = this.hash(hashKey + (depth + 1), partitionContext.hashSplitN);
 		invariant(
-			hChildIdx >= 0 && hChildIdx < partitionContext.hashSplitConditions.splitN,
-			`fokos/topology.pickChildPartition: hChildIdx ${hChildIdx} out of range for splitN ${partitionContext.hashSplitConditions.splitN}`,
+			hChildIdx >= 0 && hChildIdx < partitionContext.hashSplitN,
+			`fokos/topology/pickChildPartition: hChildIdx ${hChildIdx} out of range for splitN ${partitionContext.hashSplitN}`,
 		);
 		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, partitionIdBytes).appendHashIdx(hChildIdx).encode(true);
 		assertExists(doName);
@@ -605,16 +612,16 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			case "hash":
 				const childIds = this.#topologyRouter.calculateChildPartitionIds(
 					this.partitionContext.partitionId,
-					this.partitionContext.hashSplitConditions.splitN,
+					this.partitionContext.hashSplitN,
 				);
 				invariant(
-					childIds.length === this.partitionContext.hashSplitConditions.splitN,
-					`fokos/topology.startSplit: expected ${this.partitionContext.hashSplitConditions.splitN} children, got ${childIds.length}`,
+					childIds.length === this.partitionContext.hashSplitN,
+					`fokos/topology/startSplit: expected ${this.partitionContext.hashSplitN} children, got ${childIds.length}`,
 				);
 				const uniqueChildNames = new Set(childIds.map((c) => c.doName));
 				invariant(uniqueChildNames.size === childIds.length, "fokos/topology.startSplit: duplicate child doNames detected");
 
-				for (let i = 0; i < this.partitionContext.hashSplitConditions.splitN; i++) {
+				for (let i = 0; i < this.partitionContext.hashSplitN; i++) {
 					const childDoId = env[this.partitionContext.ns].idFromName(childIds[i].doName);
 					childPartitionContexts.push({
 						parentPartitionContext: this.partitionContext,

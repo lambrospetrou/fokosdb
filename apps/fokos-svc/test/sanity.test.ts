@@ -8,8 +8,10 @@ describe("fokosdb", async () => {
 		ns: "PARTITION_DO",
 		databaseName: "fokos",
 		rootTreesN: 10,
-		hashSplitConditions: { splitN: 2, maxSizeMb: 1 },
-		rangeSplitConditions: { splitN: 2, maxSizeMb: 1 },
+		hashSplitN: 2,
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 1 },
+		rangeSplitConditions: { maxSizeMb: 1 },
 	});
 
 	it("should route to the right partition DO", async ({ expect }) => {

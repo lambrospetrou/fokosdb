@@ -650,7 +650,7 @@ describe("PartitionDO - deleteItem", () => {
 
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
 
@@ -659,7 +659,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("sets split_pending status when data exceeds maxSizeMb", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 		await stub.putItem(ctx, {
 			hashKey: `hk.${stub.id.name!}`,
@@ -674,7 +674,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("preserves split_queued status across subsequent writes before the alarm fires", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 		// Both writes run inside the DO's execution context so the background alarm
 		// cannot fire between them, letting us assert the pre-alarm queued state.
@@ -696,7 +696,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 		const hashKey = `hk.1`;
 
@@ -806,7 +806,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("exposes split status via status()", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 		await stub.putItem(ctx, {
 			hashKey: `hk.${stub.id.name!}`,
@@ -821,7 +821,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("alarm with no split queued and no migration in progress does nothing", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 100 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
 		// Write something small — well below the split threshold — to initialize the partition context.
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
@@ -846,14 +846,14 @@ describe("PartitionDO - splitting", () => {
 		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,
 		}) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
 			// Trigger the split condition and drain the tree so all migrations complete.
 			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
 			await drainSplitTree(stub);
 
-			const childNames = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2).map((c) => c.doName);
+			const childNames = topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN).map((c) => c.doName);
 
 			const hashKey = "forwarded-key";
 			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val" });
@@ -869,7 +869,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
 			await drainSplitTree(stub);
@@ -891,7 +891,7 @@ describe("PartitionDO - splitting", () => {
 			const ITEM_SIZE_BYTES = 10 * 1024;
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 0.1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.1 } });
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
 
@@ -942,7 +942,7 @@ describe("PartitionDO - splitting", () => {
 
 	describe("migration", () => {
 		it("reads during migration are served from the parent; writes are rejected; all data migrated correctly", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 10, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
@@ -1009,7 +1009,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("putItem is rejected while migration is in progress", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1" });
 			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
@@ -1023,7 +1023,7 @@ describe("PartitionDO - splitting", () => {
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
 			});
-			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN)) {
+			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN)) {
 				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
 					instance.__testing__beforeMigrationComplete = () => migrationGate;
 				});
@@ -1053,7 +1053,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			const seedItems = [
 				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1" },
@@ -1070,7 +1070,7 @@ describe("PartitionDO - splitting", () => {
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
 			});
-			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN)) {
+			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN)) {
 				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
 					instance.__testing__beforeMigrationComplete = () => migrationGate;
 				});
@@ -1101,7 +1101,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
 			const seedItems = [
@@ -1167,7 +1167,7 @@ describe("PartitionDO - splitting", () => {
 describe("PartitionDO - partitionId encoding", () => {
 	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
 		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
-		const { ctx } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
 		// Root: [version=0, rootIdx=0 (2 bytes big-endian), depth=0]
@@ -1186,7 +1186,8 @@ describe("PartitionDO - partitionId encoding", () => {
 			ns: "PARTITION_DO",
 			databaseName: "test.readers",
 			rootTreesN: 1,
-			hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
+			hashSplitN: 2,
+			hashSplitConditions: { maxSizeMb: 100 },
 		});
 
 		it("rootIdx reads the 2-byte big-endian root index", () => {
@@ -1231,13 +1232,13 @@ describe("PartitionDO - partitionId encoding", () => {
 		// This test guards the entropy consistency between the two methods.
 		// If the depth offset used in one changes without the other, routing will silently
 		// assign keys to different partitions than the migration check expects.
-		const { ctx } = makeStub({ hashSplitConditions: { splitN: 4, maxSizeMb: 100 } });
+		const { ctx } = makeStub({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 100 } });
 		const router = new PartitionTopologyRouterImpl("", ctx);
 		const hashKey = "routing-consistency-key";
 
 		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
 		const { partitionContext: child } = router.pickChildPartition(ctx, hashKey);
-		const level1Siblings = router.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitConditions.splitN);
+		const level1Siblings = router.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN);
 		for (const sib of level1Siblings) {
 			const sibCtx: PartitionContextResolved = { ...ctx, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
 			expect(router.makeIsCorrectChildHashPartition(ctx, sibCtx)(hashKey)).toBe(sib.doName === child.doName);
@@ -1245,7 +1246,7 @@ describe("PartitionDO - partitionId encoding", () => {
 
 		// Depth 1 → 2: same invariant one level deeper.
 		const { partitionContext: grandchild } = router.pickChildPartition(child, hashKey);
-		const level2Siblings = router.calculateChildPartitionIds(child.partitionId, child.hashSplitConditions.splitN);
+		const level2Siblings = router.calculateChildPartitionIds(child.partitionId, child.hashSplitN);
 		for (const sib of level2Siblings) {
 			const sibCtx: PartitionContextResolved = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
 			expect(router.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(sib.doName === grandchild.doName);
@@ -1253,7 +1254,7 @@ describe("PartitionDO - partitionId encoding", () => {
 	});
 
 	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { splitN: 2, maxSizeMb: 1 } });
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
@@ -1345,8 +1346,10 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 		databaseName: prefix,
 		// For testing determinism only one root partition.
 		rootTreesN: 1,
-		hashSplitConditions: { splitN: 2, maxSizeMb: 100 },
-		rangeSplitConditions: { splitN: 2, maxSizeMb: 500 },
+		hashSplitN: 2,
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 100 },
+		rangeSplitConditions: { maxSizeMb: 500 },
 		...opts,
 	});
 	const pCtxResolved = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");

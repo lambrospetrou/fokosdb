@@ -13,7 +13,6 @@ export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
 // ── Valibot schemas ────────────────────────────────────────────────────────────
 
 const SplitConditionsSchema = v.object({
-	splitN: v.number(),
 	maxSizeMb: v.optional(v.number()),
 	// maxItems: v.optional(v.number()),
 });
@@ -21,6 +20,8 @@ const SplitConditionsSchema = v.object({
 const PartitionOptionsSchema = v.optional(
 	v.object({
 		rootTreesN: v.optional(v.number()),
+		hashSplitN: v.optional(v.number()),
+		rangeSplitN: v.optional(v.number()),
 		hashSplitConditions: v.optional(SplitConditionsSchema),
 		rangeSplitConditions: v.optional(SplitConditionsSchema),
 	}),
@@ -84,8 +85,10 @@ const TransactGetItemsBodySchema = v.object({
 
 const DEFAULT_PARTITION_OPTIONS = {
 	rootTreesN: 10,
-	hashSplitConditions: { splitN: 4, maxSizeMb: 500 } as SplitConditions,
-	rangeSplitConditions: { splitN: 4, maxSizeMb: 500 } as SplitConditions,
+	hashSplitN: 4,
+	rangeSplitN: 4,
+	hashSplitConditions: { maxSizeMb: 500 } as SplitConditions,
+	rangeSplitConditions: { maxSizeMb: 500 } as SplitConditions,
 };
 
 type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
@@ -95,6 +98,8 @@ function makeFokosDB(env: Env, databaseName: string, partitionOptions?: Partitio
 		ns: "PARTITION_DO",
 		databaseName,
 		rootTreesN: partitionOptions?.rootTreesN ?? DEFAULT_PARTITION_OPTIONS.rootTreesN,
+		hashSplitN: partitionOptions?.hashSplitN ?? DEFAULT_PARTITION_OPTIONS.hashSplitN,
+		rangeSplitN: partitionOptions?.rangeSplitN ?? DEFAULT_PARTITION_OPTIONS.rangeSplitN,
 		hashSplitConditions: partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
 		rangeSplitConditions: partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
 	});
