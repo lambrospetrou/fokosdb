@@ -61,13 +61,21 @@ export type SplitConditions = {
 	maxItems?: number;
 };
 
-export function ensureImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
+export function areImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
 	return (
 		opts1.schema === opts2.schema &&
 		opts1.databaseName === opts2.databaseName &&
 		opts1.rootTreesN === opts2.rootTreesN &&
-		opts1.hashSplitN === opts2.hashSplitN &&
-		opts1.rangeSplitN === opts2.rangeSplitN
+		opts1.hashSplitN === opts2.hashSplitN
+	);
+}
+
+export function areMutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
+	return (
+		opts1.hashSplitConditions.maxSizeMb === opts2.hashSplitConditions.maxSizeMb &&
+		opts1.hashSplitConditions.maxItems === opts2.hashSplitConditions.maxItems &&
+		opts1.rangeSplitConditions?.maxSizeMb === opts2.rangeSplitConditions?.maxSizeMb &&
+		opts1.rangeSplitConditions?.maxItems === opts2.rangeSplitConditions?.maxItems
 	);
 }
 

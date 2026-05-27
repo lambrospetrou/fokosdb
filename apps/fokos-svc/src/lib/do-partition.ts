@@ -23,7 +23,8 @@ import type {
 	TransactionItem,
 } from "./transaction-types.js";
 import {
-	ensureImmutableOptionsEqual,
+	areImmutableOptionsEqual,
+	areMutableOptionsEqual,
 	PartitionContext,
 	PartitionContextResolved,
 	PartitionTopologyImpl,
@@ -877,12 +878,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (this.#_partitionContext) {
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
 			invariant(
-				ensureImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
+				areImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
 					this.#_partitionContext.partitionId === pCtx.partitionId &&
 					this.#_partitionContext.doName === pCtx.doName,
 				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
-			return this.#_partitionContext;
+			// Fall through to update to the latest version if there are changes.
+			if (areMutableOptionsEqual(this.#_partitionContext, pCtx)) {
+				return this.#_partitionContext;
+			}
 		}
 		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
 		this.#_partitionContext = { ...pCtx };
