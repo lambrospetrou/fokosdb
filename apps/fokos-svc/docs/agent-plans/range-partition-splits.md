@@ -732,3 +732,101 @@ whose hash key routes to a range partition that is in `split_started` or `split_
 resolve the destination by also matching the sort key against `range_split_children` boundaries,
 and group by the resulting DO name. Items for the same hash key but different sort key ranges
 will land in different groups and be sent to different DOs independently.
+
+---
+
+## Appendix: Review Concerns (2026-05-29)
+
+Concerns raised during a correctness/race review of this plan, grounded in the existing
+hash-split implementation (`do-partition.ts`, `partition-topology/partition-topology.ts`).
+Recorded here so they are not lost; several are addressed by a subsequent redesign.
+
+### Blocking correctness gaps
+
+**A. Mixed local + forwarded items in a transaction hard-fails.** The current
+`prepare`/`commit`/`cancel`/`readForTransaction` all assert
+`invariant(local.length === 0, "split routing must not mix local and forwarded items")`
+(`do-partition.ts:534, 658, 795`). This holds for hash splits only because `shouldAllow`
+is all-or-nothing once `split_started` (`partition-topology.ts:544-546` forwards *every*
+key). Range promotion breaks the invariant: a hash partition serves most keys locally while
+forwarding a few promoted keys to range partitions. An ordinary multi-key transaction
+touching one promoted key + one local key produces `local.length > 0 && forwarded.size > 0`
+and throws — permanently, for that key combination. Not a one-line fix: the transaction
+methods are written `local XOR forwarded`, and would need `local AND forwarded` with correct
+2PC/rollback across the local portion + N range partitions. Cleanest resolution is to make
+the routing layer aware of promotions so promoted keys are routed independently and never
+mixed into a hash partition's local `prepare`.
+
+**B. Concurrent hash split + in-flight range promotion corrupts state.** Nothing prevents a
+hash partition from hash-splitting while one of its hash keys is mid-promotion (`rp_started`).
+The hash child inherits the `range_promotions` row (still `rp_started`) *and* inherits the
+promoted key's items via the normal hash-split filter, so the key's data ends up in three
+places (old parent — items are NOT deleted at hash `split_completed`; new hash child; range
+root). The range root acks completion to its *stored* parent (the old hash partition), so the
+hash child's inherited row stays `rp_started` forever — its cleanup never runs and it forwards
+the key while holding orphaned local items. Requires explicit **mutual exclusion** between the
+two split axes (no promotion while a hash split is queued/active; no hash split while any row
+is `rp_started`), or defined re-parenting of the in-flight migration.
+
+**C. Cleanup ignores `pending_transactions` and the singleton watermark.** Hash split deletes
+*all* `pending_transactions` atomically at `split_completed` (`do-partition.ts:500-510`,
+"Bug 3"). The plan's per-key cleanup only does `DELETE FROM items WHERE hk = ?` and never
+deletes `pending_transactions` for the promoted key (or `sk >= maxSortKey` for range split),
+so copied pending rows are orphaned and the stale-tx recovery job pokes the coordinator
+forever. The pending-row deletion must also be atomic with the status transition. Separately,
+`deletion_metadata.max_deleted_ts` is a singleton shared across all hash keys
+(`do-partition.ts:737, 1450-1477`); a range partition inherits the parent's *global* watermark
+(safe but conservative), and the bare cleanup `DELETE` does not bump it (fine here, but
+document it).
+
+### Races / ordering
+
+**D. Boundary computation races with concurrent writes.** During `split_queued`, `shouldAllow`
+does NOT forward (`partition-topology.ts:544` only forwards when `status !== "split_queued"`),
+so writes keep flowing while `startSplit` runs. Computing B1/B2/B3 as three separate `OFFSET`
+queries can yield non-monotonic boundaries if inserts shift offsets between queries. Compute
+all boundaries in one `transactionSync` snapshot. (Data correctness is still safe — items are
+captured by the child's full-scan migration and deleted only after acks — but inverted
+boundaries break routing.) Also add a minimum-size guard so small partitions don't produce
+empty middle ranges.
+
+**E. `ensurePartitionContext` cannot validate a self-mutated `maxSortKey`.** The range root
+updates its own `maxSortKey` (null → B1) on split, but the hash partition forwards using the
+promotion-time `context_json` (`maxSortKey: null`, never updated). Stored vs. incoming will
+permanently mismatch. Resolution: range bounds must be locally-authoritative, *excluded* from
+the equality check (not merely "accept updates," which risks a stale forwarded context
+clobbering the real boundary), and routing must always use the stored value. Consequence: a
+promoted-and-split key is always ≥2 hops (hash partition → range root → range child); the root
+must stay alive as a pure router (it does, as child 0).
+
+**F. Two parallel child-tracking mechanisms for range split.** The plan adds the SQL table
+`range_split_children` with `migration_acked` *and* reuses `acknowledgeChildMigrationComplete`,
+which tracks completion in KV `split_status.migratedChildDoNames` and flips `split_completed`
+when all `childPartitionContexts` ack (`partition-topology.ts:749-788`). `cancel` forwarding
+also iterates `splitStatus.childPartitionContexts` (`do-partition.ts:764`). Two sources of
+truth that must stay in sync. Prefer dropping `range_split_children` and reusing
+`split_status.childPartitionContexts` (which already carries `rangePartition.min/maxSortKey`
+for routing), so `cancel`/ack/`destroy` keep working unchanged.
+
+**G. `getPartitionTransactionMetadata` range-split branch unspecified.** The plan branches it
+for range promotion (hk filter) but `runRangeSplitChildMigration` is "structurally identical
+except sk-range filter" without saying the pending-transaction metadata fetch also needs an
+sk-range branch. Specify it.
+
+### Smaller issues
+
+- **H. Garbled cleanup SQL.** `DELETE FROM items WHERE (sk >= ? OR sk IS NOT NULL) AND sk >= ?`
+  is nonsense (`sk IS NOT NULL` is always true; `sk` is `NOT NULL DEFAULT ''`). Use
+  `WHERE sk >= maxSortKey`.
+- **I. Heavy-key detection must be hard-guarded off on range partitions** (`!pCtx.rangePartition`),
+  or a range partition self-promotes its only hash key in a loop.
+- **J. Size-estimate unit mismatch.** Detection uses `SUM(LENGTH(data)+LENGTH(sk)+80)` per `hk`
+  but split conditions use `sql.databaseSize` (page-allocated, incl. indexes). Different units;
+  calibrate or document the heuristic.
+- **K. `pickChildRangeSplitPartition` must reconstruct a byte-identical context** (merge all
+  immutable fields: `ns`, `hashSplitConditions`, `rangeSplitConditions`, `partitionId`, …), or
+  the child's `ensurePartitionContext` rejects.
+- **L. DO-name length cap behavior undefined.** If `hk` + boundary exceeds the encoded cap,
+  define refuse-to-promote vs. hash-the-name; silent warn-then-truncate risks collisions.
+- **M. In-memory cache + SQL write atomicity.** The parent's `range_promotions` cache update
+  must share one `transactionSync` with the row insert/update.
