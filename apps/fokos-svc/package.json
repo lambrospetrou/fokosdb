@@ -8,7 +8,7 @@
 		"deploy": "wrangler deploy",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
-		"test": "npm run check && vitest run",
+		"test": "npm run check && vitest run --printConsoleTrace",
 		"test:hurl": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2 test/hurl/*.hurl",
 		"test:hurl:run": "hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2",
 		"pre:test:hurl:remote": "rm -rf test/hurl/report-json && mkdir -p test/hurl/report-json",
