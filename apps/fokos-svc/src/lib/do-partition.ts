@@ -29,6 +29,7 @@ import {
 	PartitionContextResolved,
 	PartitionTopologyImpl,
 	PartitionTopologySplitter,
+	RangePartitionTopologyImpl,
 	SplitStatusKVItem,
 } from "./partition-topology/partition-topology.js";
 import type { SplitType } from "./partition-topology/types.js";
@@ -195,7 +196,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 *
 	 * This is not meant to be called directly by clients.
 	 */
-	async initFromSplit(opts: InitFromSplitOptions) {
+	async initFromSplit(opts: InitFromSplitOptions, __testing__completeMigration?: boolean, __testing__splitStatus?: SplitStatusKVItem) {
 		const { parentPartitionContext, newPartitionContext, splitType } = opts;
 
 		if (this.#_partitionContext) {
@@ -221,6 +222,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+		if (newPartitionContext.rangePartition) {
+			this.ctx.storage.kv.put<string | null>(PartitionDO.KV_KEYS.RANGE_END_BOUNDARY, opts.rangeEndBoundary ?? null);
+		}
 
 		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
 		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
@@ -229,6 +233,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		// Fast path: begin migration in this request's event loop turn.
 		// this.scheduleBackgroundWork(0);
+		
+		if (__testing__completeMigration) {
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+		}
+		if (__testing__splitStatus) {
+			this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
+		}
 	}
 
 	async triggerMigration(): Promise<void> {
@@ -884,7 +895,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			invariant(
 				areImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
 					this.#_partitionContext.partitionId === pCtx.partitionId &&
-					this.#_partitionContext.doName === pCtx.doName,
+					this.#_partitionContext.doName === pCtx.doName &&
+					this.#_partitionContext.rangePartition?.hashKey === pCtx.rangePartition?.hashKey &&
+					this.#_partitionContext.rangePartition?.startBoundary === pCtx.rangePartition?.startBoundary,
 				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
 			// Fall through to update to the latest version if there are changes.
@@ -902,9 +915,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
 		if (!this.#_topology) {
-			// TODO Load the topology configuration from storage or env variables instead of hardcoding it here.
-			// We can also consider having a separate DO to manage the topology and have the partition DOs fetch the configuration from it.
-			this.#_topology = new PartitionTopologyImpl("", pCtx, this.ctx);
+			this.#_topology = pCtx.rangePartition
+				? new RangePartitionTopologyImpl("", pCtx, this.ctx)
+				: new PartitionTopologyImpl("", pCtx, this.ctx);
 		}
 		return this.#_topology;
 	}

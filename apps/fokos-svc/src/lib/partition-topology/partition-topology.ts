@@ -115,8 +115,8 @@ export class PartitionContextCreator {
 		if (opts.hashSplitN < 2 || opts.hashSplitN > 255) {
 			throw new Error("fokos: hashSplitN must be between 2 and 255");
 		}
-		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb < 0.1) {
-			throw new Error("fokos: hashSplitConditions.maxSizeMb must be at least 0.1");
+		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb <= 0) {
+			throw new Error("fokos: hashSplitConditions.maxSizeMb must be greater than 0");
 		}
 		if (opts.hashSplitConditions.maxItems && opts.hashSplitConditions.maxItems < 1) {
 			throw new Error("fokos: hashSplitConditions.maxItems must be at least 1");
@@ -126,8 +126,8 @@ export class PartitionContextCreator {
 		if (opts.rangeSplitN < 2 || opts.rangeSplitN > 255) {
 			throw new Error("fokos: rangeSplitN must be between 2 and 255");
 		}
-		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb < 0.1) {
-			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be at least 0.1");
+		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb <= 0) {
+			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be greater than 0");
 		}
 		if (opts.rangeSplitConditions.maxItems && opts.rangeSplitConditions.maxItems < 1) {
 			throw new Error("fokos: rangeSplitConditions.maxItems must be at least 1");
@@ -876,5 +876,166 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean {
 		return this.#topologyRouter.makeIsCorrectChildHashPartition(parentContext, childContext);
+	}
+}
+
+/**
+ * Topology splitter for range-structure DOs. A range DO owns exactly one hashKey and
+ * splits along the sortKey axis. It retains its leftmost slice on each split and forwards
+ * out-of-range sort keys to its accumulated right-sibling children.
+ */
+export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
+	private static readonly KV_KEYS = {
+		SPLIT_STATUS: "__split_status",
+		RANGE_END_BOUNDARY: "__range_end_boundary",
+	};
+
+	#storage: DurableObjectStorage;
+
+	constructor(
+		private readonly encoded: PartitionTopologyEncoded,
+		private readonly partitionContext: PartitionContextResolved,
+		private readonly ctx: DurableObjectState,
+	) {
+		this.#storage = ctx.storage;
+	}
+
+	splitStatus(): SplitStatusKVItem | undefined {
+		return this.#storage.kv.get<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+	}
+
+	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
+		const sk = sortKey ?? "";
+		const start = this.partitionContext.rangePartition!.startBoundary ?? "";
+		const end = this.#storage.kv.get<string | null>(RangePartitionTopologyImpl.KV_KEYS.RANGE_END_BOUNDARY) ?? null;
+		const inRange = sk >= start && (end === null || sk < end);
+
+		const splitStatus = this.splitStatus();
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			// Retained node is the leftmost owner; forward anything that fell to a right sibling.
+			return inRange ? "ok" : "forward";
+		}
+
+		if (!inRange) {
+			// Out of owned range — routing bug; should not happen via correct routing.
+			return "reject";
+		}
+
+		// Size-based backpressure (10% overage allowed, consistent with hash partition).
+		if (
+			this.partitionContext.rangeSplitConditions?.maxSizeMb &&
+			this.#storage.sql.databaseSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
+		) {
+			return "reject";
+		}
+
+		return "ok";
+	}
+
+	async maybeQueueSplit(_hashKey: string, _sortKey?: string): Promise<SplitStatusKVItem | undefined> {
+		const splitType = this.shouldSplit();
+		if (splitType) {
+			return this.queueSplit(splitType);
+		}
+	}
+
+	private shouldSplit(): SplitType | null {
+		if (!this.partitionContext.rangeSplitConditions) return null;
+		const dbSize = this.#storage.sql.databaseSize;
+		if (this.partitionContext.rangeSplitConditions.maxSizeMb && dbSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1024 * 1024) {
+			return "range";
+		}
+		return null;
+	}
+
+	private queueSplit(splitType: SplitType): SplitStatusKVItem {
+		const nowStatus = this.splitStatus();
+		if (!nowStatus) {
+			this.#storage.kv.put<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
+				status: "split_queued",
+				splitType,
+				createdAt: Date.now(),
+				partitionContext: this.partitionContext,
+			});
+		}
+		const written = this.splitStatus();
+		invariant(written != null, "fokos/range: queueSplit: KV write returned null");
+		return written;
+	}
+
+	async startSplit(): Promise<void> {
+		// Implemented in Phase 5.
+		invariant(false, "fokos/range: startSplit not yet implemented");
+	}
+
+	pickChildPartition(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+		const sk = sortKey ?? "";
+		const splitStatus = this.splitStatus();
+		invariant(
+			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
+			"fokos/range: pickChildPartition called without an active split",
+		);
+
+		// TODO: Keep childPartitionContexts sorted by startBoundary so we can break early once
+		// childStart > sk, or use binary search for arrays larger than ~10 entries.
+		// Find the child with the largest startBoundary <= sk. Accumulates across re-splits.
+		let best: PartitionContextResolved | null = null;
+		for (const childCtx of splitStatus.childPartitionContexts) {
+			const childStart = childCtx.rangePartition!.startBoundary ?? "";
+			if (childStart <= sk) {
+				if (best === null || childStart > (best.rangePartition!.startBoundary ?? "")) {
+					best = childCtx;
+				}
+			}
+		}
+		invariant(best !== null, `fokos/range: no child found for sortKey "${sk}"`);
+
+		const childId = env[partitionContext.ns].idFromName(best.doName);
+		return { doId: childId, partitionContext: best };
+	}
+
+	makeIsCorrectChildHashPartition(
+		_parentContext: PartitionContextResolved,
+		_childContext: PartitionContextResolved,
+	): (hashKey: string, sortKey?: string) => boolean {
+		// Range DOs route by sort-key range, not by hash. This method is not applicable.
+		// Range-child migration uses makeIsCorrectChildRangePartition (Phase 5).
+		invariant(false, "fokos/range: makeIsCorrectChildHashPartition is not applicable to range DOs");
+	}
+
+	acknowledgeChildMigration(childDoName: string): void {
+		const splitStatus = this.splitStatus();
+		invariant(splitStatus, "fokos/range: acknowledgeChildMigration: splitStatus must exist");
+		if (splitStatus.status === "split_completed") return; // idempotent
+		invariant(splitStatus.status === "split_started", `fokos/range: acknowledgeChildMigration: unexpected status ${splitStatus.status}`);
+		if (splitStatus.migratedChildDoNames.includes(childDoName)) return;
+
+		const migratedChildDoNames = [...splitStatus.migratedChildDoNames, childDoName];
+		invariant(
+			migratedChildDoNames.length <= splitStatus.childPartitionContexts.length,
+			`fokos/range: acknowledgeChildMigration: more acks (${migratedChildDoNames.length}) than children (${splitStatus.childPartitionContexts.length})`,
+		);
+		const allMigrated = splitStatus.childPartitionContexts.every((c) => migratedChildDoNames.includes(c.doName));
+
+		const newStatus: SplitStatusKVItem = allMigrated
+			? {
+					status: "split_completed",
+					splitType: splitStatus.splitType,
+					createdAt: Date.now(),
+					partitionContext: splitStatus.partitionContext,
+					childPartitionContexts: splitStatus.childPartitionContexts,
+					migratedChildDoNames,
+					history: [
+						...splitStatus.history,
+						{ status: splitStatus.status, splitType: splitStatus.splitType, createdAt: splitStatus.createdAt, partitionContext: splitStatus.partitionContext },
+					],
+				}
+			: { ...splitStatus, migratedChildDoNames };
+
+		this.#storage.kv.put<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
 	}
 }

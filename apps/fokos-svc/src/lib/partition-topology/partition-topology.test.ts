@@ -1,8 +1,8 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionContextCreator, PartitionIdHelper, rangePartitionDoName } from "./partition-topology.js";
-import type { PartitionContext } from "./partition-topology.js";
+import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, rangePartitionDoName } from "./partition-topology.js";
+import type { PartitionContext, PartitionContextResolved, SplitStatusKVItem } from "./partition-topology.js";
 import type { PartitionDO } from "../do-partition.js";
 
 function makeBase(): PartitionContext {
@@ -135,5 +135,157 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1) unchanged", () => {
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow();
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow();
+	});
+});
+
+// ─── Phase 2 helpers ──────────────────────────────────────────────────────────
+
+// Each Phase 2 test must use a unique base to avoid DO name collisions between tests.
+function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext {
+	return PartitionContextCreator.create({
+		ns: "PARTITION_DO",
+		databaseName: `testdb-${crypto.randomUUID()}`,
+		rootTreesN: 1,
+		hashSplitN: 4,
+		hashSplitConditions: { maxSizeMb: 100 },
+		...overrides,
+	});
+}
+
+function makeRangeCtx(base: PartitionContext, hashKey: string, startBoundary: string | null): PartitionContextResolved {
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary).encode(true);
+	const doId = env.PARTITION_DO.idFromName(doName!);
+	return {
+		...base,
+		doName: doName!,
+		primaryDoIdStr: doId.toString(),
+		partitionId: opaque,
+		rangePartition: { hashKey, startBoundary },
+	};
+}
+
+function makeHashCtx(base: PartitionContext): PartitionContextResolved {
+	return new PartitionTopologyRouterImpl("", base).pickPartition("dummyKey").partitionContext;
+}
+
+// Sets up a range DO via initFromSplit, immediately marks migration complete,
+// and optionally injects an initial split status — all over RPC, no private access.
+async function setupRangeDO(
+	stub: DurableObjectStub<PartitionDO>,
+	pCtx: PartitionContextResolved,
+	parentCtx: PartitionContextResolved,
+	endBoundary: string | null,
+	splitStatus?: SplitStatusKVItem,
+): Promise<void> {
+	await stub.initFromSplit(
+		{ parentPartitionContext: parentCtx, newPartitionContext: pCtx, splitType: "range", rangeEndBoundary: endBoundary },
+		true, // __testing__completeMigration
+		splitStatus, // __testing__splitStatus
+	);
+}
+
+// ─── Phase 2: RangePartitionTopologyImpl ──────────────────────────────────────
+
+describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key range", () => {
+	it("serves sort keys within [start, end) — putItem succeeds locally (forwardCount=0)", async () => {
+		const base = makeUniqueBase();
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		await setupRangeDO(stub, rootCtx, makeHashCtx(base), "m");
+
+		const r = await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1" });
+		expect(r.meta.forwardCount).toBe(0);
+
+		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "a" });
+		expect(g).toMatchObject({ found: true, item: { data: "v1" }, meta: { forwardCount: 0 } });
+	});
+
+	it("rejects sort keys outside [start, end) when not split", async () => {
+		const base = makeUniqueBase();
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		await setupRangeDO(stub, rootCtx, makeHashCtx(base), "m");
+
+		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x" })).rejects.toThrow(/exceeded its limits/);
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x" })).rejects.toThrow(/exceeded its limits/);
+		});
+	});
+
+	it("unbounded range (endBoundary=null) accepts any sort key", async () => {
+		const base = makeUniqueBase();
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		await setupRangeDO(stub, rootCtx, makeHashCtx(base), null);
+
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "", data: "empty-sk" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last" });
+
+		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });
+		expect(g).toMatchObject({ found: true });
+	});
+
+	it("forwards out-of-range sk to child when split is active (forwardCount=1)", async () => {
+		const base = makeUniqueBase();
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const childCtx = makeRangeCtx(base, "alice", "m");
+		const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+
+		// Child owns ["m", ∅).
+		await setupRangeDO(childStub, childCtx, rootCtx, null);
+
+		// FIXME Remove the internal injection with a proper test!
+		// Root owns [∅, "m"); inject the split state so it routes sk >= "m" to the child.
+		await setupRangeDO(rootStub, rootCtx, makeHashCtx(base), "m", {
+			status: "split_started",
+			splitType: "range",
+			createdAt: Date.now(),
+			partitionContext: rootCtx,
+			childPartitionContexts: [childCtx],
+			migratedChildDoNames: [],
+			history: [],
+		} satisfies SplitStatusKVItem);
+
+		// sk in retained slice [∅,"m") — served locally.
+		const local = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "local" });
+		expect(local.meta.forwardCount).toBe(0);
+
+		// sk in child slice ["m",∅) — forwarded once.
+		const fwd = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "remote" });
+		expect(fwd.meta.forwardCount).toBe(1);
+
+		// Item landed in the child, not the root.
+		const inChild = await childStub.getItem(childCtx, { hashKey: "alice", sortKey: "z" });
+		expect(inChild).toMatchObject({ found: true, item: { data: "remote" } });
+	});
+});
+
+describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
+	it("queues a range split when db exceeds rangeSplitConditions.maxSizeMb", async () => {
+		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		await setupRangeDO(stub, rootCtx, makeHashCtx(base), null);
+
+		const bigData = "x".repeat(50 * 1024);
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData });
+
+		const s = await stub.status(rootCtx);
+		expect(s.splitStatus?.status).toBe("split_queued");
+		expect(s.splitStatus?.splitType).toBe("range");
+	});
+
+	it("does not queue a split when db is within limits", async () => {
+		const base = makeUniqueBase(); // rangeSplitConditions.maxSizeMb=500 by default
+		const rootCtx = makeRangeCtx(base, "alice", null);
+		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		await setupRangeDO(stub, rootCtx, makeHashCtx(base), null);
+
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x" });
+
+		const s = await stub.status(rootCtx);
+		expect(s.splitStatus).toBeUndefined();
 	});
 });
