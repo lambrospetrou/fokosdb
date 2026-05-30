@@ -886,22 +886,38 @@ These confirm the asymmetric two-tier design is well-matched to the workload ske
    key ranged?" with no false positives. Cost: FST/SuRF are awkward to update incrementally; rebuild
    periodically with a small overlay of recent splits (topology changes slowly, so cheap).
 
-2. **Range tier as `{one per-key index DO} + {N dumb leaf DOs}`, instead of a self-routing tree.**
-   The biggest correctness-surface reduction available. A per-hot-key index DO owns that key's
-   boundary map; topology changes (split/merge/promote) become **single-DO transactions** — the index
-   update is the linearization point. That dissolves the distributed `split_status` + ack dance, the
-   re-split accumulation subtlety, and most migration-race reasoning. Routing = ask the index (one
-   cacheable hop) → leaf. Because boundaries become _authoritative_, transactions route directly to
-   leaves and the **forward-and-aggregate machinery disappears for the range tier** (it exists only
-   because routing is currently uncertain). It also makes **merges/demotion** trivial (this plan
-   punted on those). Cost: one extra DO per hot key and a cold-cache hop (boundary metadata is tiny
-   and read-mostly, so it caches well; the index is per-key so only as hot as that key's metadata).
+2. **Centralize the metadata — a per-key boundary authority (a per-key index DO, or a flat index
+   co-located on the range root). Rejected: single point of failure.** These two are the _same idea_
+   at different granularity — a pure metadata DO, or the same boundary list co-located on the
+   leftmost-owning data DO — so they are one option. What it would buy: re-split bookkeeping becomes a
+   trivial flat-list insert, and _if routing is made authoritative_ (the coordinator resolves the
+   exact leaf before sending) the forward-and-aggregate machinery becomes removable. What it does
+   **not** change: the data plane is identical — splitting a leaf and migrating its rows (create leaf,
+   lazy-pull, 503, ack, GC) is the same work, with the same races, in every topology. And it
+   introduces a **single point of failure** — every split must publish its boundary to the authority,
+   so if the authority is down, slow, or cannot start, splitting and scaling for that whole key stall.
+   (Note: forward-and-aggregate is a consequence of _non-authoritative routing_, not of the tree — a
+   cached succinct boundary set over the tree removes it just as well, with no central node.)
 
-3. **Cheap interim win regardless: flat index at the range root.** Today intra-key routing traverses
-   root → child → grandchild (O(depth)). If every split registers its boundary back up to the root
-   (or the root holds the full leaf list — bounded, it is one key), intra-key routing collapses to
-   ~2 hops (root → leaf) with no client cache and no new DO. This is the index-DO idea co-located at
-   the root, and it removes most of the "slow traversal" cost the plan currently accepts.
+3. **The SPOF-free way to get those benefits: authoritative tree + a soft, rebuildable index cache.**
+   Keep the self-routing tree as the source of truth — it is already SPOF-free, because each leaf
+   knows its own range authoritatively (`start` is immutable identity in the name/`partitionId`; `end`
+   is local and equals the next sibling's start), so the union of leaves _is_ the boundary set and no
+   central node is needed to know it. Then layer an index (a per-key flat index now, the client-side
+   FST later) on top as a **non-authoritative hint**, with the same contract as the bloom filter:
+   - **Splits never depend on the index.** A leaf splits via its own local `split_status` and
+     completes independently, then notifies the index best-effort. If that fails (index down), no
+     harm — the new leaf exists and is reachable through the tree. Scaling is never blocked.
+   - **The index is a hint, verified by the data plane.** Index up: ask it → leaf guess → contact it;
+     if stale, the leaf forwards (tree fallback) and the response carries the correction, which
+     updates the index. Index down: skip it, enter at the range root and traverse. Always correct,
+     never blocked.
+   - **The index rebuilds itself.** On cold start or after an outage it re-derives boundaries by
+     enumerating the tree, and self-heals from forward-correction responses — pure derived state, like
+     a search index over a database.
+     Warm case: index-speed routing (a client holding the cache can skip the root and go straight to the
+     owning leaf). Cold/down case: degrades to today's traversal. Correctness and split/scale
+     availability never touch the index.
 
 4. **(Ruled out by the confirmed requirement, recorded for completeness.)** If ordered sort-key range
    scans were _not_ needed for some table, a hot key could be sub-split by `hash(sortKey)`: balanced
@@ -909,21 +925,32 @@ These confirm the asymmetric two-tier design is well-matched to the workload ske
    trick one level down. Not applicable here since ordered scans are required, but could be a
    per-table mode if any future table opts out of ordered scans.
 
+5. **Rejected: pure-router range splits (uniform with hash splits).** Making the splitting node a pure
+   router with N new children (migrating the leftmost slice too, which is otherwise acceptable) would
+   remove re-split accumulation. But it is **incompatible with start-boundary naming**: at every level
+   the leftmost child shares the parent's start boundary, hence the same DO name, and `idFromName` is
+   deterministic so two DOs cannot share a name. Retain-leftmost (the parent shrinks its `end` instead
+   of spawning a same-named child) is therefore _forced_ by the naming. Pure-router would require
+   epoch/opaque names, sacrificing names computable from `(hashKey, startBoundary)` (the directory/FST
+   would have to store `boundary → name`). Not worth it; keep retain-leftmost and its mild re-split
+   accumulation.
+
 ### Synthesis and the open fork
 
-The architecture is sound; the leverage is concentrated in the deferred range-tier routing layer, and
-there is a real fork there that changes the end state:
+The architecture is sound, and the tree is the right substrate: distributed leaf identities make it
+SPOF-free, and the start-boundary naming that forces retain-leftmost (see #5) is what keeps DO names
+computable from `(hashKey, startBoundary)`. The leverage is concentrated in the deferred range-tier
+_routing_ layer, and the fork is **where the authoritative boundary state lives**:
 
-- **Stay decentralized (self-routing leaves):** adopt succinct FST boundaries (#1) for the client
-  cache and the flat-root index (#3) as the interim. End state: direct routing, plain 2PC, forwarding
-  only as a staleness fallback.
-- **Accept a per-key metadata DO (#2):** simpler correctness (single-DO topology mutations), direct
-  leaf routing, easy merges, and forward-and-aggregate evaporates for the range tier — at the cost of
-  one DO + a cacheable hop per hot key.
+- **Recommended — authoritative tree + soft index cache (#3).** Keep the tree as the source of truth;
+  add a rebuildable index (a per-key flat index now, the client-side succinct FST (#1) later) as a
+  non-authoritative accelerator. Gives index-speed routing, easy eventual merges, and removable
+  forward-and-aggregate (once routing is authoritative while warm) **without** a single point of
+  failure; degrades gracefully to traversal when the cache is cold or down.
+- **Rejected — centralized authoritative metadata (#2).** Simpler on paper, but makes the per-key
+  authority a hard dependency for splitting and scaling. Not worth the availability cost.
 
-Both are "no compromise" relative to the goals (LOUDS hash tier untouched, callers still ignorant of
-partitions, low client memory, fast). They differ only in _where the boundary state lives_ — client
-(FST) vs a DO (index) — which is exactly the triangle's middle choice. The decision to make next: for
-order-requiring keys, prefer **boundary-state-in-client (succinct FST)** or **boundary-state-in-a-DO
-(per-key index)**. That single choice cascades into whether forward-and-aggregate is a permanent
-fallback or removable, and how much split-correctness machinery the system carries.
+Open decision for a later session: the encoding/placement of the soft index — a per-key flat index DO
+(a cacheable hop, trivial freshness) vs a client-side succinct FST (zero hop, low client memory,
+periodic rebuild). Both are no-compromise relative to the goals; pick per the latency/memory profile
+you want.
