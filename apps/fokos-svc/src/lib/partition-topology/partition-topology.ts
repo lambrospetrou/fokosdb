@@ -38,13 +38,22 @@ export type PartitionContextResolved = PartitionContext & {
 	primaryDoIdStr: string;
 
 	// Opaque ID used internally to identify the partition.
-	// Hex-encoded bytes: [schemaVersion u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
-	// schemaVersion=0 is the current format. depth counts only sub-tree levels (root partitions have depth=0).
+	// Hex-encoded bytes: schema byte determines format.
+	//   SCHEMA_HASH_V1 (0x00): [schemaVersion u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	//   SCHEMA_RANGE_V1 (0x01): see PartitionIdHelper wire format.
+	// schemaVersion=0 is the hash format. depth counts only sub-tree levels (root partitions have depth=0).
 	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
 	partitionId: PartitionNodeId;
 
 	// Cached parsed bytes of partitionId. Populated inside the DO for fast routing; survives structured clone.
 	_partitionIdBytes?: Uint8Array;
+
+	// Present only on range-structure DOs. Immutable identity.
+	// Redundant with the decoded partitionId, but kept denormalized for cheap routing/filters.
+	rangePartition?: {
+		hashKey: string;
+		startBoundary: string | null; // null = range root (owns from ∅)
+	};
 };
 
 // PartitionNodeId is re-exported from ./types.js above.
@@ -181,17 +190,76 @@ export interface PartitionTopologyRouter {
 
 // PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
 
+// Percent-encodes any char that is not [A-Za-z0-9_-] so the literal "." delimiters in range DO names are unambiguous.
+function encodeRangeComponent(s: string): string {
+	return s.replace(/[^A-Za-z0-9_-]/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase());
+}
+
+// Range DO name. startBoundary === null means the range root (owns from ∅).
+// The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
+export function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null): string {
+	const hk = encodeRangeComponent(hashKey);
+	const sk = startBoundary === null ? "" : encodeRangeComponent(startBoundary);
+	return `${databaseName}.r.${hk}.${sk}`;
+}
+
 // Golden Ratio constant used for better hash scattering
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
 
 export class PartitionIdHelper {
+	static readonly SCHEMA_HASH_V1 = 0x00 as const;
+	static readonly SCHEMA_RANGE_V1 = 0x01 as const;
+
 	static doName(basePartitionContext: PartitionContext, bytes: Uint8Array): string {
-		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
-		const root = (bytes[1] << 8) | bytes[2];
-		const depth = bytes[3];
-		const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
-		return `${basePartitionContext.databaseName}.h.${root}${suffix}`;
+		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
+			const root = (bytes[1] << 8) | bytes[2];
+			const depth = bytes[3];
+			const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
+			return `${basePartitionContext.databaseName}.h.${root}${suffix}`;
+		}
+		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		const decoded = PartitionIdHelper.decode(bytes);
+		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
+		return rangePartitionDoName(basePartitionContext.databaseName, decoded.hashKey, decoded.startBoundary);
+	}
+
+	// Decode a partition ID bytes to a schema-specific representation.
+	static decode(
+		bytes: Uint8Array,
+	): { schema: 0; rootIdx: number; depth: number } | { schema: 1; hashKey: string; startBoundary: string | null } {
+		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
+			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
+		}
+		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology.decode: unsupported schema version: ${bytes[0]}`);
+		// SCHEMA_RANGE_V1 wire format:
+		//   byte[0]    = 0x01
+		//   byte[1]    = flags: bit0 = hasStartBoundary (0 ⇒ range root)
+		//   byte[2..5] = uint32 LE length of hashKey UTF-8 bytes
+		//   byte[6..]  = hashKey UTF-8 bytes, then (if hasStartBoundary) startBoundary UTF-8 bytes
+		const hasStart = (bytes[1] & 0x01) !== 0;
+		const hkLen = bytes[2] | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
+		const hashKey = new TextDecoder().decode(bytes.subarray(6, 6 + hkLen));
+		const startBoundary = hasStart ? new TextDecoder().decode(bytes.subarray(6 + hkLen)) : null;
+		return { schema: 1, hashKey, startBoundary };
+	}
+
+	// Creates a PartitionIdHelper for a range-structure DO.
+	static fromRangePartition(base: PartitionContext, hashKey: string, startBoundary: string | null): PartitionIdHelper {
+		const hkBytes = new TextEncoder().encode(hashKey);
+		const hasStart = startBoundary !== null;
+		const skBytes = hasStart ? new TextEncoder().encode(startBoundary) : new Uint8Array(0);
+		const bytes = new Uint8Array(6 + hkBytes.length + skBytes.length);
+		bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
+		bytes[1] = hasStart ? 0x01 : 0x00;
+		const hkLen = hkBytes.length;
+		bytes[2] = hkLen & 0xff;
+		bytes[3] = (hkLen >> 8) & 0xff;
+		bytes[4] = (hkLen >> 16) & 0xff;
+		bytes[5] = (hkLen >> 24) & 0xff;
+		bytes.set(hkBytes, 6);
+		bytes.set(skBytes, 6 + hkLen);
+		return new PartitionIdHelper(base, bytes);
 	}
 
 	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
@@ -207,19 +275,19 @@ export class PartitionIdHelper {
 		return new PartitionIdHelper(basePartitionContext, bytes);
 	}
 
-	// Readers for the encoded partition ID bytes.
+	// Readers for the encoded partition ID bytes — SCHEMA_HASH_V1 only.
 	// Format: [schemaVersion u8, rootIdx u16, depth u8, hashIdx_1 u8, ..., hashIdx_depth u8]
 	static rootIdx(bytes: Uint8Array): number {
-		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);
 		return (bytes[1] << 8) | bytes[2];
 	}
 	static depth(bytes: Uint8Array): number {
-		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);
 		return bytes[3];
 	}
 	// The last child index is this partition's slot among its siblings (only valid when depth >= 1).
 	static lastChildIdx(bytes: Uint8Array): number {
-		invariant(bytes[0] === 0, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
+		invariant(bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${bytes[0]}`);
 		return bytes[3 + bytes[3]];
 	}
 
@@ -248,11 +316,15 @@ export class PartitionIdHelper {
 
 	encode(includeDoName: boolean): { bytes: Uint8Array; opaque: string; doName?: string } {
 		invariant(this.#bytes || this.#appendedHashIdxs.length > 0, "fokos/topology.encode: no bytes or appended hash indexes to encode");
-		invariant(!this.#bytes || this.#bytes[0] === 0, `fokos/topology.encode: unexpected schema version byte: ${this.#bytes?.[0]}`);
 		let bytes: Uint8Array;
-		if (this.#bytes) {
+		if (this.#bytes && this.#bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1) {
+			// Range partition: bytes are self-contained; hash-index appending is not valid.
+			invariant(this.#appendedHashIdxs.length === 0, "fokos/topology.encode: cannot append hash indexes to a range partition ID");
+			bytes = this.#bytes;
+		} else if (this.#bytes) {
+			invariant(this.#bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology.encode: unexpected schema version byte: ${this.#bytes[0]}`);
 			invariant(this.#bytes.length >= 4, "fokos/topology.encode: existing bytes too short to be valid");
-			// Extending an existing encoded partition: append child indexes (u8 each).
+			// Extending an existing hash partition: append child indexes (u8 each).
 			bytes = new Uint8Array(this.#bytes.length + this.#appendedHashIdxs.length);
 			bytes.set(this.#bytes, 0);
 			const bsz = this.#bytes.length;
@@ -260,10 +332,10 @@ export class PartitionIdHelper {
 			bytes[3] = bsz - 4 + this.#appendedHashIdxs.length; // new depth (u8)
 			for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
 		} else {
-			// Fresh instance: appendedHashIdxs[0] is the root index (u16), rest are child indexes (u8 each).
+			// Fresh hash instance: appendedHashIdxs[0] is the root index (u16), rest are child indexes (u8 each).
 			const depth = this.#appendedHashIdxs.length - 1;
 			bytes = new Uint8Array(4 + depth);
-			bytes[0] = 0; // schema version
+			bytes[0] = PartitionIdHelper.SCHEMA_HASH_V1;
 			bytes[1] = (this.#appendedHashIdxs[0] >> 8) & 0xff; // root high byte
 			bytes[2] = this.#appendedHashIdxs[0] & 0xff; // root low byte
 			bytes[3] = depth;

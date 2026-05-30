@@ -139,6 +139,9 @@ export type InitFromSplitOptions = {
 	parentPartitionContext: PartitionContextResolved;
 	newPartitionContext: PartitionContextResolved;
 	splitType: SplitType;
+	// Initial end boundary for a range DO (mutable local state, NOT part of identity).
+	// null = unbounded (range root). Omitted for hash children.
+	rangeEndBoundary?: string | null;
 };
 
 type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
@@ -150,6 +153,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		PARENT_SPLIT_TYPE: "__parent_split_type",
 		SPLIT_MIGRATION_STATUS: "__split_migration_status",
 		SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
+		RANGE_END_BOUNDARY: "__range_end_boundary",
 	};
 
 	private static readonly STALE_TX_MS = 5_000;
@@ -1474,5 +1478,16 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 max_deleted_ts  INTEGER NOT NULL DEFAULT 0
             ) STRICT;
             INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);`,
+	},
+	{
+		idMonotonicInc: 3,
+		description: "Add range partition support: promoted_keys table",
+		sql: `
+            CREATE TABLE IF NOT EXISTS promoted_keys (
+                hash_key   TEXT NOT NULL PRIMARY KEY,
+                status     TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            ) STRICT;`,
 	},
 ];

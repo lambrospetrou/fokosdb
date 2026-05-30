@@ -1210,12 +1210,18 @@ describe("PartitionDO - partitionId encoding", () => {
 			expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 3, 0, 1, 2]))).toBe(2);
 		});
 
-		it("all reader methods and doName throw when schema version is not 0", () => {
-			const bad = new Uint8Array([1, 0, 0, 0]);
-			expect(() => PartitionIdHelper.rootIdx(bad)).toThrow();
-			expect(() => PartitionIdHelper.depth(bad)).toThrow();
-			expect(() => PartitionIdHelper.lastChildIdx(new Uint8Array([1, 0, 0, 1, 0]))).toThrow();
-			expect(() => PartitionIdHelper.doName(baseCtx, bad)).toThrow();
+		it("hash-only readers (rootIdx/depth/lastChildIdx) throw for non-hash schema bytes", () => {
+			// Schema byte 1 = SCHEMA_RANGE_V1: valid for doName/decode but not for hash-only readers.
+			const rangeBytes = new Uint8Array([1, 0, 0, 0, 0, 0]);
+			expect(() => PartitionIdHelper.rootIdx(rangeBytes)).toThrow();
+			expect(() => PartitionIdHelper.depth(rangeBytes)).toThrow();
+			expect(() => PartitionIdHelper.lastChildIdx(rangeBytes)).toThrow();
+		});
+
+		it("doName and decode throw for unknown schema bytes (>1)", () => {
+			const unknownSchema = new Uint8Array([2, 0, 0, 0]);
+			expect(() => PartitionIdHelper.doName(baseCtx, unknownSchema)).toThrow();
+			expect(() => PartitionIdHelper.decode(unknownSchema)).toThrow();
 		});
 
 		it("doName builds the correct DO name from partition ID bytes", () => {
