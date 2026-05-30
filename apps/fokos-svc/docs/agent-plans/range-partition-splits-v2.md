@@ -824,3 +824,106 @@ Each phase is independently testable; behavior is gated so earlier phases do not
 - Uniform GC for router/parent dead-weight across the hash and range tiers.
 - Eager child-cancel on partial-prepare rejection (latency optimization; the coordinator's cancel
   fan-out already guarantees correctness).
+
+---
+
+## Appendix: architecture brainstorm — is there a fundamentally better design?
+
+A final stress-test of the architecture, asking whether some other design achieves the same end goal
+(bottomless storage, hash key as the main driver, some keys with arbitrarily many sort keys,
+correctness, low client memory, fast enough) better or more simply. The conclusion: the two-tier
+shape is the right call for this workload; the leverage is in the deferred range-tier routing layer.
+
+> **Requirement confirmed: ordered sort-key range scans ARE needed.** This rules out the "drop order,
+> sub-split a hot key by `hash(sortKey)`" option below as a general replacement — range structures
+> must stay order-preserving. (Without this requirement we would just keep the hash-split approach.)
+
+### The fundamental tension (a tradeoff triangle for routing metadata)
+
+For the routing metadata you can have at most two of three cleanly:
+
+1. **Succinct** — client holds ~O(nodes) bits, no central service.
+2. **Order-preserving + data-driven balance** — boundaries chosen to split load evenly and support
+   sort-key range scans.
+3. **Zero extra hops** — resolve the owner without asking anyone.
+
+The **hash tier gets all three for free**, because its boundaries are _implicit_
+(`hash(hashKey, depth) % N`): nothing stored, perfectly succinct (1 bit/node = LOUDS), zero hops.
+That is why it is the right primitive.
+
+The **range tier cannot get all three**, because its boundaries are _data-dependent_ — arbitrary
+sort-key values that must physically live somewhere. There are exactly three places to put them, and
+the choice _is_ the architecture:
+
+- **In the client** → memory cost (the boundary directory).
+- **In a DO you ask** → hop cost (an index/router DO).
+- **Nowhere; discover by walking** → latency cost (traversal — what this plan does now).
+
+v2 chooses "traversal now, client-cache later." The real question is therefore only: _where should
+range boundaries live, and how should they be encoded?_
+
+### Alternatives that are genuinely worse (and why)
+
+- **Single uniform range tree over `(hashKey, sortKey)`** (Bigtable tablets / Cockroach ranges):
+  uniform, no promotion, but pays heavy non-succinct boundary metadata for _every_ key to serve the
+  _rare_ hot key, and loses hash scatter (sequential/write-skewed hash keys hotspot). Wrong tradeoff
+  for "most keys have few sort keys."
+- **Single order-preserving radix trie over the whole key** (succinct and uniform): a trie is
+  LOUDS-able, but it reintroduces the sequential-write hotspot that hashing solves (adjacent keys →
+  same leaf) and spends order across hash keys that are never range-scanned. Net worse.
+- **Central routing service** (Spanner-style placement driver): zero client memory, arbitrary
+  boundaries, but a global bottleneck and an extra hop — the decentralized parent-as-router avoids
+  exactly this.
+
+These confirm the asymmetric two-tier design is well-matched to the workload skew.
+
+### Alternatives that could be better without compromising
+
+1. **Make the deferred boundary directory a _succinct ordered trie_ (FST / SuRF-style), not a list.**
+   This gives all three triangle corners at once: data-driven balanced boundaries (kept) + succinct
+   client routing (a Fast Succinct Trie of the boundary keys is O(bits)) + order-preserving range
+   scans. It can also **subsume the bloom filter** — a succinct set of "ranged keys" answers "is this
+   key ranged?" with no false positives. Cost: FST/SuRF are awkward to update incrementally; rebuild
+   periodically with a small overlay of recent splits (topology changes slowly, so cheap).
+
+2. **Range tier as `{one per-key index DO} + {N dumb leaf DOs}`, instead of a self-routing tree.**
+   The biggest correctness-surface reduction available. A per-hot-key index DO owns that key's
+   boundary map; topology changes (split/merge/promote) become **single-DO transactions** — the index
+   update is the linearization point. That dissolves the distributed `split_status` + ack dance, the
+   re-split accumulation subtlety, and most migration-race reasoning. Routing = ask the index (one
+   cacheable hop) → leaf. Because boundaries become _authoritative_, transactions route directly to
+   leaves and the **forward-and-aggregate machinery disappears for the range tier** (it exists only
+   because routing is currently uncertain). It also makes **merges/demotion** trivial (this plan
+   punted on those). Cost: one extra DO per hot key and a cold-cache hop (boundary metadata is tiny
+   and read-mostly, so it caches well; the index is per-key so only as hot as that key's metadata).
+
+3. **Cheap interim win regardless: flat index at the range root.** Today intra-key routing traverses
+   root → child → grandchild (O(depth)). If every split registers its boundary back up to the root
+   (or the root holds the full leaf list — bounded, it is one key), intra-key routing collapses to
+   ~2 hops (root → leaf) with no client cache and no new DO. This is the index-DO idea co-located at
+   the root, and it removes most of the "slow traversal" cost the plan currently accepts.
+
+4. **(Ruled out by the confirmed requirement, recorded for completeness.)** If ordered sort-key range
+   scans were _not_ needed for some table, a hot key could be sub-split by `hash(sortKey)`: balanced
+   by construction, succinctly encodable (1 bit/node, no boundary directory ever), the hash tier's
+   trick one level down. Not applicable here since ordered scans are required, but could be a
+   per-table mode if any future table opts out of ordered scans.
+
+### Synthesis and the open fork
+
+The architecture is sound; the leverage is concentrated in the deferred range-tier routing layer, and
+there is a real fork there that changes the end state:
+
+- **Stay decentralized (self-routing leaves):** adopt succinct FST boundaries (#1) for the client
+  cache and the flat-root index (#3) as the interim. End state: direct routing, plain 2PC, forwarding
+  only as a staleness fallback.
+- **Accept a per-key metadata DO (#2):** simpler correctness (single-DO topology mutations), direct
+  leaf routing, easy merges, and forward-and-aggregate evaporates for the range tier — at the cost of
+  one DO + a cacheable hop per hot key.
+
+Both are "no compromise" relative to the goals (LOUDS hash tier untouched, callers still ignorant of
+partitions, low client memory, fast). They differ only in _where the boundary state lives_ — client
+(FST) vs a DO (index) — which is exactly the triangle's middle choice. The decision to make next: for
+order-requiring keys, prefer **boundary-state-in-client (succinct FST)** or **boundary-state-in-a-DO
+(per-key index)**. That single choice cascades into whether forward-and-aggregate is a permanent
+fallback or removable, and how much split-correctness machinery the system carries.
