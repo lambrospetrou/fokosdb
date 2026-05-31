@@ -33,6 +33,8 @@ import {
 	SplitStatusKVItem,
 	resolveRangePartitionContext,
 	RANGE_PROMOTION_FRACTION,
+	isHashPartition,
+	isRangePartition,
 } from "./partition-topology/partition-topology.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
@@ -239,7 +241,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
-		if (newPartitionContext.rangePartition) {
+		if (isRangePartition(newPartitionContext)) {
 			this.ctx.storage.kv.put<string | null>(PartitionDO.KV_KEYS.RANGE_END_BOUNDARY, opts.rangeEndBoundary ?? null);
 		}
 
@@ -251,6 +253,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Fast path: begin migration in this request's event loop turn.
 		// this.scheduleBackgroundWork(0);
 
+		// FIXME Remove this shit and test properly through the public API.
 		if (__testing__completeMigration) {
 			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		}
@@ -427,9 +430,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 
 		// Range-child migration (promotion or range-split).
-		if (opts.childPartitionContext.rangePartition) {
-			const hk = opts.childPartitionContext.rangePartition.hashKey;
-			if (!pCtx.rangePartition) {
+		const childPartitionContext = opts.childPartitionContext;
+		if (isRangePartition(childPartitionContext)) {
+			const hk = childPartitionContext.rangePartition.hashKey;
+			if (isHashPartition(pCtx)) {
 				// I am a hash DO; authorize via promoted_keys[hk] === 'promoting'.
 				const statusRow = this.ctx.storage.sql
 					.exec<{ status: string }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk)
@@ -557,9 +561,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				?.max_deleted_ts ?? 0;
 
 		// Range-child migration (promotion or range-split).
-		if (opts.childPartitionContext.rangePartition) {
-			const hk = opts.childPartitionContext.rangePartition.hashKey;
-			if (!pCtx.rangePartition) {
+		const childPartitionContext = opts.childPartitionContext;
+		if (isRangePartition(childPartitionContext)) {
+			const hk = childPartitionContext.rangePartition.hashKey;
+			if (isHashPartition(pCtx)) {
 				// Hash DO serving a promotion: lock-free cutover guarantees no pending_transactions for this key.
 				// Return only the deletion watermark so the range root can sync it.
 				const statusRow = this.ctx.storage.sql
@@ -899,7 +904,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Promoted-key range roots (hash DOs only).
-		if (!pCtx.rangePartition) {
+		if (isHashPartition(pCtx)) {
 			for (const [hashKey, status] of this.#_promotedKeys) {
 				if (status === "promoting" || status === "promoted") {
 					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null);
@@ -1099,7 +1104,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// On hash partitions only: forward promoted/promoting keys to their range root.
 		// The range root routes by sortKey from there. "queued" still serves locally.
-		if (!ctx.rangePartition) {
+		if (isHashPartition(ctx)) {
 			const promotedStatus = this.#_promotedKeys.get(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null);
@@ -1149,7 +1154,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		for (const item of items) {
 			// On hash partitions only: forward promoted/promoting keys to their range root.
-			if (!pCtx.rangePartition) {
+			if (isHashPartition(pCtx)) {
 				const promotedStatus = this.#_promotedKeys.get(item.hashKey);
 				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null);
@@ -1302,10 +1307,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
-		if (pCtx.rangePartition) {
-			await this.runRangeChildMigration(pCtx, parentCtx);
-		} else {
+		if (isHashPartition(pCtx)) {
 			await this.runHashChildMigration(pCtx, parentCtx);
+		} else {
+			await this.runRangeChildMigration(pCtx, parentCtx);
 		}
 	}
 
@@ -1426,7 +1431,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 
 		// Notify the parent: promotion root → acknowledgePromotionComplete; range-split child → acknowledgeChildMigrationComplete (Phase 5).
-		if (!parentCtx.rangePartition) {
+		if (isHashPartition(parentCtx)) {
 			await parentStub.acknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
 		} else {
 			await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
@@ -1578,7 +1583,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			///////////////////////////////////////////////////////////////////////////////////
 			// ── Jobs: Promotion detection, drive, and GC (hash partitions only, not routers)
 			const pCtx = this.pCtx();
-			if (!pCtx.rangePartition) {
+			if (isHashPartition(pCtx)) {
 				const topology = this.ensureTopology(pCtx);
 				const topSplitStatus = topology.splitStatus();
 				// Any non-null split status (queued, started, completed) means this DO has split or is

@@ -70,6 +70,14 @@ export type SplitConditions = {
 	maxItems?: number;
 };
 
+export function isHashPartition(ctx: PartitionContextResolved): ctx is PartitionContextResolved & { rangePartition: null | undefined } {
+	return !ctx.rangePartition;
+}
+
+export function isRangePartition(ctx: PartitionContextResolved): ctx is PartitionContextResolved & { rangePartition: NonNullable<PartitionContextResolved['rangePartition']> } {
+	return Boolean(ctx.rangePartition);
+}
+
 export function areImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
 	return (
 		opts1.schema === opts2.schema &&
