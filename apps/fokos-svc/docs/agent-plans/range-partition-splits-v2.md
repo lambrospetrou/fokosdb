@@ -827,6 +827,179 @@ Each phase is independently testable; behavior is gated so earlier phases do not
 
 ---
 
+## Revision 1 — End-boundary naming and pure-router range splits
+
+**Status.** This revision **supersedes** the conflicting parts of: Invariants 1–2, Naming,
+`__range_end_boundary` (mutable state), `RangePartitionTopologyImpl` behavior, the entire
+**Range-split lifecycle** (retain-leftmost / re-split accumulation / `parentEndAtSplit`), and appendix
+#5. Phases 1–4 were implemented against the original scheme and must be revised per the checklist at
+the end of this section. Phases 5–6 are authored directly against this revision.
+
+### Motivation
+
+The original design retains the leftmost slice on a range split: the parent keeps `[start, B1)`,
+spawns N−1 right siblings, and shrinks its own `end`. That forces **re-split accumulation** — the
+retained slice grows and the same DO splits again, so `childPartitionContexts` /
+`migratedChildDoNames` accumulate and the split state machine must re-enter `split_queued` from
+`split_completed`. Appendix #5 rejected the cleaner **pure-router** split (parent becomes a pure
+router with N new children, including a fresh leftmost) because the leftmost child would share the
+parent's start boundary → same DO name → `idFromName` collision, claiming it "requires epoch/opaque
+names." That objection is defeated by **putting the end boundary in the name too.**
+
+### The change
+
+A range DO's name and identity encode **both** boundaries: `db.r.<enc(hk)>.<start>.<end>`. On a split
+the node becomes a **pure router** over its fixed `[start, end)` and creates **N** children that tile
+the whole range — including a brand-new leftmost child `[start, B1)`, whose name differs from the
+parent's because its `end` (`B1`) differs. This restores exact symmetry with hash splits: **once a
+node splits it is purely a router; a leaf is never also a router** (no retain-leftmost, no re-split
+accumulation, no `parentEndAtSplit`).
+
+**Uniform ±∞ sentinels — name space only, not comparison space.** Boundaries live in two spaces with
+different requirements, and conflating them is what makes sentinels seem hard:
+
+- **Comparison space** (`shouldAllow`, `pickChildPartition`, the SQL `sk >= ? AND sk < ?` filters)
+  needs _ordering_. Lexicographic order over unbounded strings has a **minimum but no maximum**: `""`
+  precedes every string (so `−∞` is just `""` and `sk >= ""` is trivially true), but for any candidate
+  max `s`, `s + "x"` sorts after it — **no string is greater than all strings.** So an ordered `+∞`
+  sentinel is _impossible_, and the upper edge must be handled by branching regardless. The
+  representation here is therefore `string | null` where **`null` = unbounded** (lower `null` ⇒ treat
+  as `""`; upper `null` ⇒ omit the `< end` predicate, i.e. `end === null || sk < end`). This orders
+  correctly with no magic value, and "leftmost child sorts first" falls out of `start ?? ""`.
+- **Name space** (the DO name and `partitionId`) needs only _unambiguous identity_; ordering is
+  irrelevant. A sentinel token is materialized **only** in `rangePartitionDoName` (to avoid the empty
+  component `db.r.hk..~max`) and mapped back to `null` in `decode`. No comparison ever sees the token.
+
+The name tokens are **reserved-char, collision-proof by construction**: `encodeRangeComponent` only
+ever emits `[A-Za-z0-9_-]` and `%XX`, so a token containing `~` (e.g. `~min` / `~max`) can never equal
+an encoded real boundary — `encodeRangeComponent` escapes a literal `~` to `%7E`. **No "exclude the
+sentinel from valid sk" validation is needed** — that is precisely why `~min`/`~max` beat a
+word-character token like `___fokos_range_infinite_minus`, which passes through the encoder unescaped
+and _would_ collide with a real `sk` of that literal. The only special-case is the unavoidable
+`null ↔ token` mapping at name encode/decode. In `partitionId`, `null` is encoded as a _flag bit
+absent_ (`bit0 = hasStart`, `bit1 = hasEnd`), never as a token. Every DO — including the range root
+`db.r.<hk>.~min.~max` — thus has the identical three-component shape and the root stays addressable
+from `hashKey` alone with no cached boundaries.
+
+### Why it is collision-free for all time
+
+The intervals that ever exist form a laminar family (recursive subdivision, no merges, DOs persist).
+If two distinct parents both produced a child `[a, c)`, laminarity forces them nested, and following
+the nesting forces one to equal `[a, c)` and hold itself as a child — impossible. So
+`(hashKey, start, end)` is a permanent unique identity; appendix #5's "needs epoch names" was too
+pessimistic.
+
+### Invariants 1–2, revised
+
+- **Invariant 1 (revised).** *Both* boundaries are immutable identity. A range DO's `[start, end)` is
+  fixed for life — part of its name and validated `partitionId` / `rangePartition`. It never shrinks;
+  on split it becomes a router and its children own the sub-ranges. **`__range_end_boundary` (mutable
+  KV) is removed**; `end` is read from the validated context. There is no self-mutating state to
+  guard, and `InitFromSplitOptions.rangeEndBoundary` is removed (end comes from
+  `newPartitionContext.rangePartition.endBoundary`).
+- **Invariant 2 (revised).** The **N** children tile the parent exactly: `start[0] = parent.start`,
+  `end[i] = start[i+1]`, `end[N-1] = parent.end`. Each child's `end` is explicit in its own identity
+  (it still equals the next sibling's start, so the leaf boundary *set* reconstructs all leaves — see
+  the routing-cache note).
+
+### Routing-cache correctness (why this was non-trivial)
+
+Moving `end` into the name makes addressable identity a function of **two** boundaries. A *flat,
+partial* boundary cache can then pair a real `start` with a real `end` that were **never adjacent in
+the tree** (they straddle an un-cached higher split), fabricating the name of a DO that never existed
+→ an uninitialized DO. The original start-only naming was robust to any stale subset because the name
+was a function of the immutable `start` alone.
+
+This version stays correct **without any cache** (root-down traversal uses each router's stored
+`childPartitionContexts` and never fabricates names). For the **deferred** routing cache, end-in-name
+imposes constraints that are now load-bearing:
+
+1. **The cache must be a descendable tree, not a flat boundary list.** Route by descending from the
+   root through known routers to the deepest cached node covering `sk`; never binary-search a flat
+   boundary set. Then non-adjacent boundaries are never paired.
+2. **Ancestor-ordered propagation.** A split is published to a cache only after all its ancestor
+   splits are present (the keeper buffers out-of-order notifications). Eviction must be subtree-aware
+   (never drop an interior router while keeping a descendant).
+3. **Phantom-bounce guard — the correctness backstop (added now).** A `.r.` DO with no stored
+   `__partition_context` **must never lazy-init from a request**; it bounces the caller, which falls
+   back to the range root and traverses. This makes *any* stale/lossy/cold cache safe, so (1) and (2)
+   are pure hit-rate optimizations. No false positives: every real range DO is born through
+   `initFromSplit` (promotion creates the root; a split creates children), so "has
+   `__partition_context`" cleanly separates real from phantom. In this version the guard should never
+   fire (traversal-only), but it is the piece the deferred soft cache rests on.
+4. **Soft, non-authoritative keeper.** A split completes on the node's local `split_status`
+   regardless of the keeper; the notification `(parentDoName, nodeDoName, childDoNames)` is
+   fire-and-forget, idempotent, and self-healing (the keeper re-derives by enumerating the tree). A
+   down/lagging keeper costs only hit-rate, never correctness or scaling availability (stays on
+   appendix #3, not the rejected central authority of #2). Boundaries derive from the child names (the
+   names are the single source of truth), so the cache can never record a boundary that disagrees with
+   a name.
+
+### Cost (accepted)
+
+Every split now migrates the **leftmost slice too** (into the new `[start, B1)` DO) and leaves the old
+DO as a dead router. The leftmost slice therefore loses the original zero-downtime property — it gets
+the same 503-while-migrating window as every other child. This is the cost appendix #5 already called
+"otherwise acceptable," and it matches the hash tier's dead-router behavior. In exchange: no re-split
+accumulation, uniform leaf-xor-router semantics, and simpler migration filters (each child's
+`[start, end)` is explicit; no `parentEndAtSplit`).
+
+### Implementation revision checklist
+
+**Phase 1 (revise — `partition-topology.ts`, `do-partition.ts`).**
+
+- `rangePartition: { hashKey, startBoundary, endBoundary }` — all immutable, each
+  `string | null` where **`null` = unbounded edge** (the comparison-space representation; see the
+  ±∞-sentinels note). Routing keeps branching on `null`; it never compares against a sentinel token.
+- Add reserved-char token constants `const RANGE_MIN = "~min", RANGE_MAX = "~max"` (collision-proof:
+  `encodeRangeComponent` escapes a literal `~` to `%7E`, so a `~`-token can never equal an encoded
+  real boundary — no "exclude from valid sk" validation needed).
+- `rangePartitionDoName(db, hashKey, start, end)` → `db.r.<enc(hk)>.<startComp>.<endComp>`, where
+  `startComp = start === null ? RANGE_MIN : enc(start)` and likewise `endComp` with `RANGE_MAX`.
+- `PartitionIdHelper.fromRangePartition(base, hashKey, start, end)`: SCHEMA_RANGE_V1 wire format gains
+  a `startLen` field and the trailing `endBoundary` bytes; **`null` is encoded as a flag bit absent**
+  (`bit0 = hasStart`, `bit1 = hasEnd`), never as a token. `decode` → `{ hashKey, startBoundary,
+  endBoundary }` (component `=== RANGE_MIN/MAX` ⇒ `null` only when decoding from a name); `doName`
+  passes both through `rangePartitionDoName`.
+- `resolveRangePartitionContext(base, hashKey, start, end)`.
+- **Remove** `__range_end_boundary` KV key and `InitFromSplitOptions.rangeEndBoundary`; `initFromSplit`
+  reads `end` from `newPartitionContext.rangePartition.endBoundary`; `ensurePartitionContext`
+  validates `start` **and** `end` as immutable.
+- Update every `resolveRangePartitionContext(..., null)` root call site (`do-partition.ts` ~910, 1110,
+  1160, 1495) to pass `(null, null)` for the root `[−∞, +∞)` — which renders to the `~min.~max` name.
+
+**Phase 2 (revise — `RangePartitionTopologyImpl`).**
+
+- `shouldAllow`: read `end` from the context, not KV. If split → **always `"forward"`** (a router owns
+  nothing); delete the leftmost-local branch. Not-split + in-range → `ok` / size-`reject`;
+  out-of-range → `reject`.
+- `pickChildPartition`: same rule ("largest `start ≤ sk`"), but children now tile the whole range and
+  there are N; drop the "accumulates across re-splits" comment.
+- `acknowledgeChildMigration`: `childPartitionContexts` is set once (N children) and never accumulates;
+  remove the re-entry-from-`split_completed` allowance.
+
+**Phase 3 (revise — promotion).** Range root identity = `(null, null)` (the `~min.~max` name); drop "keeps leftmost" language;
+`initFromSplit` reads `end` from context. The init → lock-free cutover → migrate flow is otherwise
+unchanged.
+
+**Phase 4 (verify — transactions).** A range node is now pure leaf **xor** pure router, so
+`groupItemsByRouting` on a range node is "all local" or "all forwarded," never mixed. Confirm no path
+assumes a splitting range node still owns a leftmost slice. The hash partition stays mixed (local +
+promoted-key forwards + hash-child forwards).
+
+**Phase 5 (author against this revision).** `startSplit` creates **N** children including the new
+leftmost; the node becomes a pure router (no end-shrink); `childPartitionContexts` set once; migrate
+all N; after `split_completed` GC **all** rows (everything migrated), paged. Each child's migration
+filter derives from its explicit `[start, end)`; no `parentEndAtSplit`. Guard `minItemsToSplit ≥ N`.
+
+**Phase 6.** `rangeRoot(hashKey)` resolves to the root `(null, null)` / `~min.~max` name in destroy enumeration; dedupe by
+`hashKey`; inheritance unchanged.
+
+**New.** Add the phantom-bounce guard in the range-DO request entry path (`ensurePartitionContext` /
+`withSplitForwarding`).
+
+---
+
 ## Appendix: architecture brainstorm — is there a fundamentally better design?
 
 A final stress-test of the architecture, asking whether some other design achieves the same end goal
@@ -925,7 +1098,10 @@ These confirm the asymmetric two-tier design is well-matched to the workload ske
    trick one level down. Not applicable here since ordered scans are required, but could be a
    per-table mode if any future table opts out of ordered scans.
 
-5. **Rejected: pure-router range splits (uniform with hash splits).** Making the splitting node a pure
+5. **~~Rejected~~ → Adopted in Revision 1: pure-router range splits (uniform with hash splits).**
+   _Superseded — see Revision 1. The collision objection below is real for **start-only** naming but is
+   defeated by also encoding the **end** boundary in the name (`(hashKey, start, end)` is provably
+   collision-free), so pure-router splits are adopted after all._ Making the splitting node a pure
    router with N new children (migrating the leftmost slice too, which is otherwise acceptable) would
    remove re-split accumulation. But it is **incompatible with start-boundary naming**: at every level
    the leftmost child shares the parent's start boundary, hence the same DO name, and `idFromName` is
