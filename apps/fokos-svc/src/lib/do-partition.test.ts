@@ -1473,6 +1473,90 @@ describe("Phase 3 — Cutover deferral and routing", () => {
 	});
 });
 
+describe("Phase 4 — Transactions: forward-and-aggregate", () => {
+	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
+		// Promote alice, leave bob local.
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await waitForAlarm(stub);
+		// Drain migration so range root accepts writes.
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
+		await waitForAlarm(rangeRootStub);
+		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+
+		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
+		const txId = crypto.randomUUID();
+		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const prepareResp = await stub.prepare(ctx, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: coordId,
+			items: [
+				{ hashKey: "alice", sortKey: "sk2", operation: "put", data: "from-txn" },
+				{ hashKey: "bob",   sortKey: "sk1", operation: "put", data: "bob-data" },
+			],
+		});
+		expect(prepareResp.outcome).toBe("accepted");
+
+		await stub.commit(ctx, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			items: [
+				{ hashKey: "alice", sortKey: "sk2", operation: "put", data: "from-txn" },
+				{ hashKey: "bob",   sortKey: "sk1", operation: "put", data: "bob-data" },
+			],
+		});
+
+		// alice/sk2 must be in the range root; bob/sk1 must be local on the hash DO.
+		const aliceResult = await rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" });
+		expect(aliceResult).toMatchObject({ found: true, item: { data: "from-txn" } });
+
+		const bobResult = await stub.getItem(ctx, { hashKey: "bob", sortKey: "sk1" });
+		expect(bobResult).toMatchObject({ found: true, item: { data: "bob-data" } });
+	});
+
+	it("cancel via hash DO releases both local and promoted-key locks", async () => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await waitForAlarm(stub);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
+		await waitForAlarm(rangeRootStub);
+		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+
+		const txId = crypto.randomUUID();
+		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const prepareResp = await stub.prepare(ctx, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: coordId,
+			items: [
+				{ hashKey: "alice", sortKey: "sk2", operation: "put", data: "alice-data" },
+				{ hashKey: "bob",   sortKey: "sk1", operation: "put", data: "bob-data" },
+			],
+		});
+		expect(prepareResp.outcome).toBe("accepted");
+
+		// Cancel via hash DO — must fan out to range root.
+		await stub.cancel(ctx, { transactionId: txId });
+
+		// Both locks must be gone — a new prepare for the same keys must succeed.
+		const txId2 = crypto.randomUUID();
+		const prepareResp2 = await stub.prepare(ctx, {
+			transactionId: txId2,
+			transactionTimestamp: Date.now() + 1,
+			coordinatorDoId: coordId,
+			items: [
+				{ hashKey: "alice", sortKey: "sk2", operation: "put", data: "retried" },
+				{ hashKey: "bob",   sortKey: "sk1", operation: "put", data: "retried" },
+			],
+		});
+		expect(prepareResp2.outcome).toBe("accepted");
+		await stub.cancel(ctx, { transactionId: txId2 });
+	});
+});
+
 describe("Phase 3 — hash-child migration excludes promoted keys", () => {
 	it("items belonging to a promoted key are not migrated to hash split children", async () => {
 		// Use a small maxSizeMb so both promotion and hash split are triggered.

@@ -662,18 +662,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("prepare");
 
-		const { local, forwarded } = this.groupItemsByRouting(request.items);
-		if (forwarded.size > 0) {
-			invariant(local.length === 0, "fokos/partition.prepare: split routing must not mix local and forwarded items");
-			// FIXME Parallelize these calls to child partitions, since they are independent of each other.
-			for (const [, { pCtx: childPCtx, items }] of forwarded) {
-				const r = await this.getChildStub(childPCtx).prepare(childPCtx, { ...request, items });
-				if (r.outcome === "rejected") return r;
-			}
-			return { outcome: "accepted" };
-		}
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		invariant(unplaceable.length === 0, "fokos/partition.prepare: mis-routed item this node can neither own nor route");
 
-		return await this.prepareLocal(request);
+		const tasks: Promise<PrepareResponse>[] = [];
+		for (const [, { pCtx: childPCtx, items }] of forwarded) {
+			tasks.push(this.getChildStub(childPCtx).prepare(childPCtx, { ...request, items }));
+		}
+		if (local.length > 0) {
+			tasks.push(this.prepareLocal({ ...request, items: local }));
+		}
+		if (tasks.length === 0) return { outcome: "accepted" };
+		const results = await Promise.all(tasks);
+		return results.find((r) => r.outcome === "rejected") ?? { outcome: "accepted" };
 	}
 
 	private async prepareLocal(request: PrepareRequest): Promise<PrepareResponse> {
@@ -786,17 +787,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("commit"); // Bug 1: reject while THIS partition is migrating
 
-		const { local, forwarded } = this.groupItemsByRouting(request.items);
-		if (forwarded.size > 0) {
-			invariant(local.length === 0, "fokos/partition.commit: split routing must not mix local and forwarded items");
-			for (const [, { pCtx: childPCtx, items }] of forwarded) {
-				await this.getChildStub(childPCtx).commit(childPCtx, { ...request, items });
-			}
-			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
-			return { outcome: "committed" };
-		}
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
 
-		return this.commitLocal(request);
+		const tasks: Promise<CommitResponse>[] = [];
+		for (const [, { pCtx: childPCtx, items }] of forwarded) {
+			tasks.push(this.getChildStub(childPCtx).commit(childPCtx, { ...request, items }));
+		}
+		if (local.length > 0) {
+			tasks.push(Promise.resolve(this.commitLocal({ ...request, items: local })));
+		}
+		await Promise.all(tasks);
+		return { outcome: "committed" };
 	}
 
 	private commitLocal(request: CommitRequest): CommitResponse {
@@ -887,32 +889,38 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		await this.ensureMigration("cancel"); // Bug 6: reject while THIS partition is migrating
 		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 
+		const childContexts: PartitionContextResolved[] = [];
+
+		// Split children (hash or range, via existing split_status).
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = topology.splitStatus();
-		if (
-			splitStatus?.status === "split_started" ||
-			splitStatus?.status === "split_completed" // Bug 2: forward cancel at split_completed too
-		) {
-			const errors: unknown[] = [];
-			for (const childPCtx of splitStatus.childPartitionContexts) {
-				try {
-					await this.getChildStub(childPCtx).cancel(childPCtx, request);
-				} catch (e) {
-					// Bug 6: do NOT swallow. A migrating child throws here; surface it so the TC
-					// keeps retrying (stays CANCELLING) until migration completes and the forwarded
-					// cancel can delete the row the child copied during the race.
-					console.error({
-						...this.logParams(),
-						message: "fokos/partition.cancel: failed to forward cancel to child",
-						childDoName: childPCtx.doName,
-						transactionId: request.transactionId,
-						error: String(e),
-					});
-					errors.push(e);
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			childContexts.push(...splitStatus.childPartitionContexts);
+		}
+
+		// Promoted-key range roots (hash DOs only).
+		if (!pCtx.rangePartition) {
+			for (const [hashKey, status] of this.#_promotedKeys) {
+				if (status === "promoting" || status === "promoted") {
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null);
+					childContexts.push(rangeRootCtx);
 				}
 			}
-			if (errors.length > 0) {
-				throw new Error(`fokos/partition.cancel: ${errors.length} child cancel(s) failed for transaction ${request.transactionId}`);
+		}
+
+		if (childContexts.length > 0) {
+			const results = await Promise.allSettled(
+				childContexts.map((childPCtx) => this.getChildStub(childPCtx).cancel(childPCtx, request)),
+			);
+			const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+			if (failures.length > 0) {
+				console.error({
+					...this.logParams(),
+					message: "fokos/partition.cancel: child cancel(s) failed",
+					transactionId: request.transactionId,
+					failureCount: failures.length,
+				});
+				throw new Error(`fokos/partition.cancel: ${failures.length} child cancel(s) failed for transaction ${request.transactionId}`);
 			}
 		}
 
@@ -923,18 +931,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
-		const { local, forwarded } = this.groupItemsByRouting(request.items);
-		if (forwarded.size > 0) {
-			invariant(local.length === 0, "fokos/partition.readForTransaction: split routing must not mix local and forwarded items");
-			const allItems: ReadForTransactionItemResult[] = [];
-			for (const [, { pCtx: childPCtx, items }] of forwarded) {
-				const r = await this.getChildStub(childPCtx).readForTransaction(childPCtx, { ...request, items });
-				allItems.push(...r.items);
-			}
-			return { items: allItems };
-		}
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		invariant(unplaceable.length === 0, "fokos/partition.readForTransaction: mis-routed item this node can neither own nor route");
 
-		return this.readForTransactionLocal(request);
+		const tasks: Promise<ReadForTransactionResponse>[] = [];
+		for (const [, { pCtx: childPCtx, items }] of forwarded) {
+			tasks.push(this.getChildStub(childPCtx).readForTransaction(childPCtx, { ...request, items }));
+		}
+		if (local.length > 0) {
+			tasks.push(Promise.resolve(this.readForTransactionLocal({ ...request, items: local })));
+		}
+		const results = await Promise.all(tasks);
+		return { items: results.flatMap((r) => r.items) };
 	}
 
 	private readForTransactionLocal(request: ReadForTransactionRequest): ReadForTransactionResponse {
@@ -1123,30 +1131,45 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private groupItemsByRouting<T extends { hashKey: string; sortKey?: string }>(
 		items: T[],
-	): { local: T[]; forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }> } {
+	): { local: T[]; forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }>; unplaceable: T[] } {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 		const local: T[] = [];
 		const forwarded = new Map<string, { pCtx: PartitionContextResolved; items: T[] }>();
+		const unplaceable: T[] = [];
+
+		const addForwarded = (destPCtx: PartitionContextResolved, item: T) => {
+			let entry = forwarded.get(destPCtx.doName);
+			if (!entry) {
+				entry = { pCtx: destPCtx, items: [] };
+				forwarded.set(destPCtx.doName, entry);
+			}
+			entry.items.push(item);
+		};
 
 		for (const item of items) {
+			// On hash partitions only: forward promoted/promoting keys to their range root.
+			if (!pCtx.rangePartition) {
+				const promotedStatus = this.#_promotedKeys.get(item.hashKey);
+				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null);
+					addForwarded(rangeRootCtx, item);
+					continue;
+				}
+			}
+
 			const decision = topology.shouldAllow(item.hashKey, item.sortKey);
 			if (decision === "ok") {
 				local.push(item);
 			} else if (decision === "forward") {
 				const { partitionContext } = topology.pickChildPartition(pCtx, item.hashKey, item.sortKey);
-				let entry = forwarded.get(partitionContext.doName);
-				if (!entry) {
-					entry = { pCtx: partitionContext, items: [] };
-					forwarded.set(partitionContext.doName, entry);
-				}
-				entry.items.push(item);
+				addForwarded(partitionContext, item);
 			} else {
-				throw new Error("fokos/partition: partition exceeded its limits during transaction forwarding");
+				unplaceable.push(item);
 			}
 		}
 
-		return { local, forwarded };
+		return { local, forwarded, unplaceable };
 	}
 
 	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
