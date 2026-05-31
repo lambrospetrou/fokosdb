@@ -147,9 +147,6 @@ export type InitFromSplitOptions = {
 	parentPartitionContext: PartitionContextResolved;
 	newPartitionContext: PartitionContextResolved;
 	splitType: SplitType;
-	// Initial end boundary for a range DO (mutable local state, NOT part of identity).
-	// null = unbounded (range root). Omitted for hash children.
-	rangeEndBoundary?: string | null;
 };
 
 type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
@@ -161,7 +158,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		PARENT_SPLIT_TYPE: "__parent_split_type",
 		SPLIT_MIGRATION_STATUS: "__split_migration_status",
 		SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
-		RANGE_END_BOUNDARY: "__range_end_boundary",
 	};
 
 	private static readonly STALE_TX_MS = 5_000;
@@ -241,9 +237,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
-		if (isRangePartition(newPartitionContext)) {
-			this.ctx.storage.kv.put<string | null>(PartitionDO.KV_KEYS.RANGE_END_BOUNDARY, opts.rangeEndBoundary ?? null);
-		}
 
 		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
 		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
@@ -907,7 +900,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (isHashPartition(pCtx)) {
 			for (const [hashKey, status] of this.#_promotedKeys) {
 				if (status === "promoting" || status === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null);
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
 					childContexts.push(rangeRootCtx);
 				}
 			}
@@ -1044,7 +1037,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				this.#_partitionContext.partitionId === pCtx.partitionId &&
 				this.#_partitionContext.doName === pCtx.doName &&
 				this.#_partitionContext.rangePartition?.hashKey === pCtx.rangePartition?.hashKey &&
-				this.#_partitionContext.rangePartition?.startBoundary === pCtx.rangePartition?.startBoundary,
+				this.#_partitionContext.rangePartition?.startBoundary === pCtx.rangePartition?.startBoundary &&
+				this.#_partitionContext.rangePartition?.endBoundary === pCtx.rangePartition?.endBoundary,
 				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
 			// Fall through to update to the latest version if there are changes.
@@ -1107,7 +1101,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (isHashPartition(ctx)) {
 			const promotedStatus = this.#_promotedKeys.get(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null);
+				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
 				const rangeRootStub = this.env[ctx.ns].get(doId);
 				const result = await forward(rangeRootStub, rangeRootCtx);
 				return { ...result, meta: { ...result.meta, forwardCount: result.meta.forwardCount + 1 } } as T;
@@ -1157,7 +1151,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				const promotedStatus = this.#_promotedKeys.get(item.hashKey);
 				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null);
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
 					addForwarded(rangeRootCtx, item);
 					continue;
 				}
@@ -1492,7 +1486,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (splitStatus?.status === "split_queued" || splitStatus?.status === "split_started") return;
 
 		// A. Build identity for the range root.
-		const { doId: rangeRootId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null);
+		const { doId: rangeRootId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
 		const rangeRootStub = this.env[pCtx.ns].get(rangeRootId);
 
 		// B. Initialize the range root (idempotent, retry ≤5). No forwarding yet — status is still 'queued'.
@@ -1502,7 +1496,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					parentPartitionContext: pCtx,
 					newPartitionContext: rangeRootCtx,
 					splitType: "range",
-					rangeEndBoundary: null,
 				}),
 			(_err, attempt) => attempt <= 5,
 		);

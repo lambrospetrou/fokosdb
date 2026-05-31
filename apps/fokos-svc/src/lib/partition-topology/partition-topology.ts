@@ -50,9 +50,12 @@ export type PartitionContextResolved = PartitionContext & {
 
 	// Present only on range-structure DOs. Immutable identity.
 	// Redundant with the decoded partitionId, but kept denormalized for cheap routing/filters.
+	// Both boundaries are immutable: a range DO owns [startBoundary, endBoundary) for life; on split it
+	// becomes a pure router and its children own the sub-ranges.
 	rangePartition?: {
 		hashKey: string;
-		startBoundary: string | null; // null = range root (owns from ∅)
+		startBoundary: string | null; // null = unbounded lower edge (−∞)
+		endBoundary: string | null; // null = unbounded upper edge (+∞)
 	};
 };
 
@@ -198,17 +201,26 @@ export interface PartitionTopologyRouter {
 
 // PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
 
+// Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
+// routing comparisons — there boundaries stay `string | null` with null = unbounded). Collision-proof
+// by construction: encodeRangeComponent escapes a literal "~" to "%7E", so a "~"-prefixed token can
+// never equal an encoded real boundary. No "exclude from valid sk" validation is required.
+export const RANGE_MIN = "~min";
+export const RANGE_MAX = "~max";
+
 // Percent-encodes any char that is not [A-Za-z0-9_-] so the literal "." delimiters in range DO names are unambiguous.
 function encodeRangeComponent(s: string): string {
 	return s.replace(/[^A-Za-z0-9_-]/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase());
 }
 
-// Range DO name. startBoundary === null means the range root (owns from ∅).
+// Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
+// three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
 // The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
-export function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null): string {
+export function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null, endBoundary: string | null): string {
 	const hk = encodeRangeComponent(hashKey);
-	const sk = startBoundary === null ? "" : encodeRangeComponent(startBoundary);
-	return `${databaseName}.r.${hk}.${sk}`;
+	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
+	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
+	return `${databaseName}.r.${hk}.${start}.${end}`;
 }
 
 // Resolves a PartitionContextResolved for a range-structure DO (root or child).
@@ -217,8 +229,9 @@ export function resolveRangePartitionContext(
 	base: PartitionContextResolved,
 	hashKey: string,
 	startBoundary: string | null,
+	endBoundary: string | null,
 ): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary).encode(true);
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
 	const doId = env[base.ns].idFromName(doName!);
 	return {
 		doId,
@@ -228,7 +241,7 @@ export function resolveRangePartitionContext(
 			primaryDoIdStr: doId.toString(),
 			partitionId: opaque,
 			_partitionIdBytes: undefined,
-			rangePartition: { hashKey, startBoundary },
+			rangePartition: { hashKey, startBoundary, endBoundary },
 		},
 	};
 }
@@ -251,44 +264,59 @@ export class PartitionIdHelper {
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);
 		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
-		return rangePartitionDoName(basePartitionContext.databaseName, decoded.hashKey, decoded.startBoundary);
+		return rangePartitionDoName(basePartitionContext.databaseName, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
 	}
 
 	// Decode a partition ID bytes to a schema-specific representation.
 	static decode(
 		bytes: Uint8Array,
-	): { schema: 0; rootIdx: number; depth: number } | { schema: 1; hashKey: string; startBoundary: string | null } {
+	): { schema: 0; rootIdx: number; depth: number } | { schema: 1; hashKey: string; startBoundary: string | null; endBoundary: string | null } {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology.decode: unsupported schema version: ${bytes[0]}`);
-		// SCHEMA_RANGE_V1 wire format:
-		//   byte[0]    = 0x01
-		//   byte[1]    = flags: bit0 = hasStartBoundary (0 ⇒ range root)
-		//   byte[2..5] = uint32 LE length of hashKey UTF-8 bytes
-		//   byte[6..]  = hashKey UTF-8 bytes, then (if hasStartBoundary) startBoundary UTF-8 bytes
+		// SCHEMA_RANGE_V1 wire format (both boundaries are immutable identity; null = unbounded edge):
+		//   byte[0]     = 0x01
+		//   byte[1]     = flags: bit0 = hasStartBoundary, bit1 = hasEndBoundary (absent bit ⇒ unbounded)
+		//   byte[2..5]  = uint32 LE length of hashKey UTF-8 bytes (hkLen)
+		//   byte[6..9]  = uint32 LE length of startBoundary UTF-8 bytes (startLen; 0 if !hasStart)
+		//   byte[10..]  = hashKey bytes, then startBoundary bytes (startLen), then endBoundary bytes (rest, if hasEnd)
 		const hasStart = (bytes[1] & 0x01) !== 0;
+		const hasEnd = (bytes[1] & 0x02) !== 0;
 		const hkLen = bytes[2] | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
-		const hashKey = new TextDecoder().decode(bytes.subarray(6, 6 + hkLen));
-		const startBoundary = hasStart ? new TextDecoder().decode(bytes.subarray(6 + hkLen)) : null;
-		return { schema: 1, hashKey, startBoundary };
+		const startLen = bytes[6] | (bytes[7] << 8) | (bytes[8] << 16) | (bytes[9] << 24);
+		const hkStart = 10;
+		const skStart = hkStart + hkLen;
+		const endStart = skStart + startLen;
+		const hashKey = new TextDecoder().decode(bytes.subarray(hkStart, skStart));
+		const startBoundary = hasStart ? new TextDecoder().decode(bytes.subarray(skStart, endStart)) : null;
+		const endBoundary = hasEnd ? new TextDecoder().decode(bytes.subarray(endStart)) : null;
+		return { schema: 1, hashKey, startBoundary, endBoundary };
 	}
 
-	// Creates a PartitionIdHelper for a range-structure DO.
-	static fromRangePartition(base: PartitionContext, hashKey: string, startBoundary: string | null): PartitionIdHelper {
+	// Creates a PartitionIdHelper for a range-structure DO. null start/end = unbounded edge.
+	static fromRangePartition(base: PartitionContext, hashKey: string, startBoundary: string | null, endBoundary: string | null): PartitionIdHelper {
 		const hkBytes = new TextEncoder().encode(hashKey);
 		const hasStart = startBoundary !== null;
+		const hasEnd = endBoundary !== null;
 		const skBytes = hasStart ? new TextEncoder().encode(startBoundary) : new Uint8Array(0);
-		const bytes = new Uint8Array(6 + hkBytes.length + skBytes.length);
+		const endBytes = hasEnd ? new TextEncoder().encode(endBoundary) : new Uint8Array(0);
+		const bytes = new Uint8Array(10 + hkBytes.length + skBytes.length + endBytes.length);
 		bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
-		bytes[1] = hasStart ? 0x01 : 0x00;
+		bytes[1] = (hasStart ? 0x01 : 0x00) | (hasEnd ? 0x02 : 0x00);
 		const hkLen = hkBytes.length;
 		bytes[2] = hkLen & 0xff;
 		bytes[3] = (hkLen >> 8) & 0xff;
 		bytes[4] = (hkLen >> 16) & 0xff;
 		bytes[5] = (hkLen >> 24) & 0xff;
-		bytes.set(hkBytes, 6);
-		bytes.set(skBytes, 6 + hkLen);
+		const startLen = skBytes.length;
+		bytes[6] = startLen & 0xff;
+		bytes[7] = (startLen >> 8) & 0xff;
+		bytes[8] = (startLen >> 16) & 0xff;
+		bytes[9] = (startLen >> 24) & 0xff;
+		bytes.set(hkBytes, 10);
+		bytes.set(skBytes, 10 + hkLen);
+		bytes.set(endBytes, 10 + hkLen + startLen);
 		return new PartitionIdHelper(base, bytes);
 	}
 
@@ -928,7 +956,6 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	private static readonly KV_KEYS = {
 		SPLIT_STATUS: "__split_status",
-		RANGE_END_BOUNDARY: "__range_end_boundary",
 	};
 
 	#storage: DurableObjectStorage;
@@ -947,16 +974,17 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
 		const sk = sortKey ?? "";
-		const start = this.partitionContext.rangePartition!.startBoundary ?? "";
-		const end = this.#storage.kv.get<string | null>(RangePartitionTopologyImpl.KV_KEYS.RANGE_END_BOUNDARY) ?? null;
-		const inRange = sk >= start && (end === null || sk < end);
 
 		const splitStatus = this.splitStatus();
 		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-			// Retained node is the leftmost owner; forward anything that fell to a right sibling.
-			return inRange ? "ok" : "forward";
+			// Once split, this DO is a pure router (owns nothing locally) — forward everything to a child.
+			return "forward";
 		}
 
+		// Boundaries are immutable identity. null = unbounded edge.
+		const start = this.partitionContext.rangePartition!.startBoundary ?? "";
+		const end = this.partitionContext.rangePartition!.endBoundary;
+		const inRange = sk >= start && (end === null || sk < end);
 		if (!inRange) {
 			// Out of owned range — routing bug; should not happen via correct routing.
 			return "reject";
@@ -1023,7 +1051,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// TODO: Keep childPartitionContexts sorted by startBoundary so we can break early once
 		// childStart > sk, or use binary search for arrays larger than ~10 entries.
-		// Find the child with the largest startBoundary <= sk. Accumulates across re-splits.
+		// The N children tile the whole owned range; route to the one with the largest startBoundary <= sk.
 		let best: PartitionContextResolved | null = null;
 		for (const childCtx of splitStatus.childPartitionContexts) {
 			const childStart = childCtx.rangePartition!.startBoundary ?? "";

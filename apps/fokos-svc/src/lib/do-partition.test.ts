@@ -1455,7 +1455,7 @@ describe("Phase 3 — Cutover deferral and routing", () => {
 		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
 
 		// Drain the range root migration so it can serve writes.
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await waitForAlarm(rangeRootStub);
 
@@ -1480,7 +1480,7 @@ describe("Phase 4 — Transactions: forward-and-aggregate", () => {
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 		await waitForAlarm(stub);
 		// Drain migration so range root accepts writes.
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
 		await waitForAlarm(rangeRootStub);
 		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
@@ -1520,7 +1520,7 @@ describe("Phase 4 — Transactions: forward-and-aggregate", () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 		await waitForAlarm(stub);
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
 		await waitForAlarm(rangeRootStub);
 		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
@@ -1570,7 +1570,7 @@ describe("Phase 3 — hash-child migration excludes promoted keys", () => {
 		await waitForAlarm(stub);
 
 		// Drain range root migration → alice becomes 'promoted'.
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await waitForAlarm(rangeRootStub);
 
