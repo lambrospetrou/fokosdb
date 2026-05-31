@@ -1314,15 +1314,9 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 	for (const childCtx of splitStatus.childPartitionContexts) {
 		const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 
-		// A child in migration_initialized has no alarm yet; any request to it transitions
-		// it to migration_migrating and schedules the alarm. The error is expected.
 		const childState = await childStub.status();
 		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
-			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => { });
-			// TODO Maybe do this to avoid vitest-worker-pool errors...
-			// await runInDurableObject(childStub, async (instance: PartitionDO) => {
-			// 	await instance.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
-			// });
+			await childStub.triggerMigration();
 		}
 
 		await drainSplitTree(childStub);
@@ -1376,11 +1370,12 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
-		await waitForAlarm(stub);
-
-		const s = await stub.status();
-		// With no pending locks the detection + cutover runs in a single background cycle.
-		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			const s = await stub.status();
+			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+				throw new Error("not yet promoting");
+		}, { timeout: 5000, interval: 100 });
 	});
 
 	it("does not detect any key when the DB is well below the promotion threshold", async () => {
@@ -1398,11 +1393,13 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
-		// Background work: detect alice, cut over to 'promoting'. The fire-and-forget range-root migration
-		// may race to completion within the test, so alice is either 'promoting' or already 'promoted'.
-		await waitForAlarm(stub);
-		const aliceStatus = (await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status;
-		expect(["promoting", "promoted"]).toContain(aliceStatus);
+		// Wait for alice to reach 'promoting' or 'promoted' (the fire-and-forget range-root migration
+		// may race to completion within the same background cycle).
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			const aliceStatus = (await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status;
+			if (!["promoting", "promoted"].includes(aliceStatus ?? "")) throw new Error("not yet");
+		}, { timeout: 5000, interval: 100 });
 
 		// Write more data, then assert no hash split was queued. This holds in both cases:
 		//  - 'promoting': mutual exclusion blocks the split even though DB exceeds maxSizeMb.
@@ -1430,11 +1427,13 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		});
 		expect(lockResult.outcome).toBe("accepted");
 
-		await waitForAlarm(stub);
-
 		// Detection queued alice but cutover was deferred — key must still be 'queued'.
-		const s = await stub.status();
-		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("queued");
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			const s = await stub.status();
+			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "queued")
+				throw new Error("not yet queued");
+		}, { timeout: 5000, interval: 100 });
 
 		// A write to alice while 'queued' is still served locally.
 		const r = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "still-local" });
@@ -1442,29 +1441,35 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 
 		// Release the lock; next background cycle should complete the cutover.
 		await stub.cancel(ctx, { transactionId: txId });
-		await waitForAlarm(stub);
-
-		const s2 = await stub.status();
-		expect(s2.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			const s2 = await stub.status();
+			if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+				throw new Error("not yet promoting");
+		}, { timeout: 5000, interval: 100 });
 	});
 
 	it("forwards reads and writes to the range root after cutover ('promoting')", async () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
-		// Run background work: detection + cutover to 'promoting' + trigger migration.
-		await waitForAlarm(stub);
-		const s = await stub.status();
-		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
-
-		// Drain the range root migration so it can serve writes.
+		// Wait for detection + cutover to 'promoting'.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await waitForAlarm(rangeRootStub);
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			const s = await stub.status();
+			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+				throw new Error("not yet promoting");
+		}, { timeout: 5000, interval: 100 });
 
-		// Hash DO should now report 'promoted'.
-		const s2 = await stub.status();
-		expect(s2.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+		// Drain the range root migration; hash DO transitions to 'promoted'.
+		await vi.waitFor(async () => {
+			await waitForAlarm(rangeRootStub);
+			const s2 = await stub.status();
+			if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
+				throw new Error("not yet promoted");
+		}, { timeout: 5000, interval: 100 });
 
 		// Writes via the hash partition are forwarded to the range root.
 		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range" });
@@ -1481,12 +1486,14 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		// Promote alice, leave bob local.
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
-		await waitForAlarm(stub);
-		// Drain migration so range root accepts writes.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
-		await waitForAlarm(rangeRootStub);
-		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			await waitForAlarm(rangeRootStub);
+			if ((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
+				throw new Error("not yet promoted");
+		}, { timeout: 5000, interval: 100 });
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
@@ -1522,11 +1529,14 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	it("cancel via hash DO releases both local and promoted-key locks", async () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
-		await waitForAlarm(stub);
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
-		await waitForAlarm(rangeRootStub);
-		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			await waitForAlarm(rangeRootStub);
+			if ((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
+				throw new Error("not yet promoted");
+		}, { timeout: 5000, interval: 100 });
 
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
@@ -1569,16 +1579,15 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		// Write for alice — will be promoted.
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
-		// Run background: detect → queue alice → cutover to 'promoting' → trigger migration.
-		await waitForAlarm(stub);
-
-		// Drain range root migration → alice becomes 'promoted'.
+		// Wait for: detect → 'promoting' → range-root migration → 'promoted' → GC clears local alice items.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await waitForAlarm(rangeRootStub);
-
-		// Drain GC: alice='promoted' → background work deletes alice's local items.
-		await waitForAlarm(stub);
+		await vi.waitFor(async () => {
+			await waitForAlarm(stub);
+			await waitForAlarm(rangeRootStub);
+			const local = await stub.getItemDirect({ hashKey: "alice", sortKey: "sk1" });
+			if (local.found) throw new Error("alice not GC'd from hash DO yet");
+		}, { timeout: 8000, interval: 100 });
 
 		// Write two large bob items so DB exceeds hashSplitConditions.maxSizeMb even without alice.
 		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA });
@@ -1705,7 +1714,11 @@ describe("PartitionDO — range split", () => {
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
 		const N = 4;
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
-		await drainSplitTree(rootStub);
+		await vi.waitFor(async () => {
+			await drainSplitTree(rootStub);
+			const s = await rootStub.status();
+			if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+		}, { timeout: 5000, interval: 100 });
 		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
 
 		for (const sk of sks) {
@@ -1726,7 +1739,11 @@ describe("PartitionDO — range split", () => {
 
 	it("creates a brand-new leftmost child distinct from the router (no retain-leftmost)", async () => {
 		const { rootCtx, rootStub } = await makeQueuedRangeRoot(4);
-		await drainSplitTree(rootStub);
+		await vi.waitFor(async () => {
+			await drainSplitTree(rootStub);
+			const s = await rootStub.status();
+			if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+		}, { timeout: 5000, interval: 100 });
 		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
 
 		const leftmost = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null);

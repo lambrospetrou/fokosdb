@@ -1,9 +1,11 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, rangePartitionDoName } from "./partition-topology.js";
 import type { PartitionContext, PartitionContextResolved, SplitStatusKVItem } from "./partition-topology.js";
 import type { PartitionDO } from "../do-partition.js";
+
+type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
@@ -203,19 +205,16 @@ function makeHashCtx(base: PartitionContext): PartitionContextResolved {
 	return new PartitionTopologyRouterImpl("", base).pickPartition("dummyKey").partitionContext;
 }
 
-// Sets up a range DO via initFromSplit, immediately marks migration complete,
-// and optionally injects an initial split status — all over RPC, no private access.
+// Sets up a range DO via initFromSplit and immediately marks migration complete,
+// so the DO serves requests locally without needing a real parent to pull data from.
 async function setupRangeDO(
 	stub: DurableObjectStub<PartitionDO>,
 	pCtx: PartitionContextResolved,
 	parentCtx: PartitionContextResolved,
-	splitStatus?: SplitStatusKVItem,
 ): Promise<void> {
-	// The DO's owned range comes from pCtx.rangePartition (immutable identity); there is no separate end boundary.
 	await stub.initFromSplit(
 		{ parentPartitionContext: parentCtx, newPartitionContext: pCtx, splitType: "range" },
 		true, // __testing__completeMigration
-		splitStatus, // __testing__splitStatus
 	);
 }
 
@@ -261,41 +260,53 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 	});
 
 	it("once split, the node is a pure router — forwards EVERY sort key to the owning child", async () => {
-		const base = makeUniqueBase();
-		const rootCtx = makeRangeCtx(base, "alice", null, null); // pre-split: owned [∅, +∞)
-		// Split at "m" into a NEW leftmost child [∅,"m") and a right child ["m",+∞). The root keeps no slice.
-		const leftCtx = makeRangeCtx(base, "alice", null, "m");
-		const rightCtx = makeRangeCtx(base, "alice", "m", null);
+		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
+		const rootCtx = makeRangeCtx(base, "alice", null, null);
 		const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
-		const leftStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(leftCtx.doName));
-		const rightStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rightCtx.doName));
+		await setupRangeDO(rootStub, rootCtx, makeHashCtx(base));
 
-		await setupRangeDO(leftStub, leftCtx, rootCtx);
-		await setupRangeDO(rightStub, rightCtx, rootCtx);
+		// Write ~50 KB items until a range split is queued (0.1 MB threshold → ~3 items).
+		const bigData = "x".repeat(50 * 1024);
+		for (let i = 0; i < 10; i++) {
+			await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: `sk${String(i).padStart(3, "0")}`, data: bigData });
+			if ((await rootStub.status(rootCtx)).splitStatus) break;
+		}
 
-		// FIXME Remove the internal injection with a proper test!
-		// Root becomes a pure router over both children.
-		await setupRangeDO(rootStub, rootCtx, makeHashCtx(base), {
-			status: "split_started",
-			splitType: "range",
-			createdAt: Date.now(),
-			partitionContext: rootCtx,
-			childPartitionContexts: [leftCtx, rightCtx],
-			migratedChildDoNames: [],
-			history: [],
-		} satisfies SplitStatusKVItem);
+		// Run alarms until split_completed: root splits, children migrate.
+		await vi.waitFor(async () => {
+			await runDurableObjectAlarm(rootStub);
+			const s = await rootStub.status(rootCtx);
+			if (s.splitStatus?.status === "split_started") {
+				for (const childCtx of (s.splitStatus as SplitStartedOrCompleted).childPartitionContexts) {
+					const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+					await childStub.triggerMigration();
+					await runDurableObjectAlarm(childStub);
+				}
+			}
+			if ((await rootStub.status(rootCtx)).splitStatus?.status !== "split_completed")
+				throw new Error("split not completed yet");
+		}, { timeout: 8000, interval: 100 });
 
-		// sk in the leftmost slice [∅,"m") — forwarded to the new left child (NOT served locally).
-		const left = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "left" });
+		const split = (await rootStub.status(rootCtx)).splitStatus as SplitStartedOrCompleted;
+		const children = [...split.childPartitionContexts].sort(
+			(a, b) => ((a.rangePartition!.startBoundary ?? "") < (b.rangePartition!.startBoundary ?? "") ? -1 : 1),
+		);
+		expect(children).toHaveLength(2);
+		const boundary = children[0].rangePartition!.endBoundary!;
+
+		// sk below boundary — forwarded to left child (forwardCount=1, not served locally by the router).
+		const left = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk000", data: "left" });
 		expect(left.meta.forwardCount).toBe(1);
 
-		// sk in the right slice ["m",∅) — forwarded to the right child.
-		const right = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "right" });
+		// sk at boundary — forwarded to right child.
+		const right = await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: boundary, data: "right" });
 		expect(right.meta.forwardCount).toBe(1);
 
-		// Each item landed in its owning child, none on the router.
-		expect(await leftStub.getItem(leftCtx, { hashKey: "alice", sortKey: "a" })).toMatchObject({ found: true, item: { data: "left" } });
-		expect(await rightStub.getItem(rightCtx, { hashKey: "alice", sortKey: "z" })).toMatchObject({ found: true, item: { data: "right" } });
+		// Items landed in their owning children, not on the router.
+		const leftStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[0].doName));
+		const rightStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[1].doName));
+		expect(await leftStub.getItem(children[0], { hashKey: "alice", sortKey: "sk000" })).toMatchObject({ found: true, item: { data: "left" } });
+		expect(await rightStub.getItem(children[1], { hashKey: "alice", sortKey: boundary })).toMatchObject({ found: true, item: { data: "right" } });
 	});
 });
 
