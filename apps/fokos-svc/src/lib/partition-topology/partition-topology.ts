@@ -949,9 +949,10 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 }
 
 /**
- * Topology splitter for range-structure DOs. A range DO owns exactly one hashKey and
- * splits along the sortKey axis. It retains its leftmost slice on each split and forwards
- * out-of-range sort keys to its accumulated right-sibling children.
+ * Topology splitter for range-structure DOs. A range DO owns exactly one hashKey and a fixed,
+ * immutable [startBoundary, endBoundary) slice of the sortKey axis. On split it becomes a pure
+ * router (owns nothing locally) and creates N children that tile [start, end) — including a new
+ * leftmost child — then forwards every sort key to the owning child. A leaf is never also a router.
  */
 export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	private static readonly KV_KEYS = {
@@ -1033,8 +1034,114 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	async startSplit(): Promise<void> {
-		// Implemented in Phase 5.
-		invariant(false, "fokos/range: startSplit not yet implemented");
+		const splitStatus = this.splitStatus();
+		if (!splitStatus || splitStatus.status !== "split_queued") {
+			// Already started or completed — idempotent no-op.
+			return;
+		}
+
+		const rp = this.partitionContext.rangePartition;
+		invariant(rp, "fokos/range.startSplit: missing rangePartition identity");
+		const N = this.partitionContext.rangeSplitN;
+		invariant(N != null && N >= 2, "fokos/range.startSplit: rangeSplitN must be >= 2");
+
+		const hashKey = rp.hashKey;
+		const start = rp.startBoundary; // null = −∞
+		const end = rp.endBoundary; // null = +∞
+
+		// Compute N-1 split boundaries within the owned slice [start, end) in one snapshot.
+		const boundaries = this.computeRangeSplitBoundaries(hashKey, start, end, N);
+		if (!boundaries) {
+			// Not enough distinct items to split into N non-empty children — retry on a later cycle.
+			console.log({ message: "fokos/range.startSplit: insufficient items to split into N children; will retry.", doName: this.partitionContext.doName });
+			return;
+		}
+
+		// The N children tile [start, end): child i owns [starts[i], ends[i]). The leftmost child
+		// (start, B1) is a brand-new DO — this node retains no slice and becomes a pure router.
+		const starts: (string | null)[] = [start, ...boundaries];
+		const ends: (string | null)[] = [...boundaries, end];
+		const childInits: InitFromSplitOptions[] = [];
+		for (let i = 0; i < N; i++) {
+			const { partitionContext: childCtx } = resolveRangePartitionContext(this.partitionContext, hashKey, starts[i], ends[i]);
+			childInits.push({ parentPartitionContext: this.partitionContext, newPartitionContext: childCtx, splitType: "range" });
+		}
+		const uniqueNames = new Set(childInits.map((c) => c.newPartitionContext.doName));
+		invariant(uniqueNames.size === childInits.length, "fokos/range.startSplit: duplicate child doNames detected");
+
+		// Initialize all children (retry ≤5). Abort on failure; the split retries next cycle.
+		try {
+			await Promise.all(
+				childInits.map((childContext) =>
+					tryWhile(
+						async () => {
+							const doId = env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+							return await env[childContext.newPartitionContext.ns].get(doId).initFromSplit(childContext);
+						},
+						(_error, nextAttempt) => nextAttempt <= 5,
+					),
+				),
+			);
+		} catch (error) {
+			console.error({ message: "fokos/range.startSplit: child initialization failed, aborting; will retry later.", error: String(error) });
+			throw error;
+		}
+
+		// Become a pure router: persist split_started with exactly the N children (set once, never accumulates).
+		this.#storage.kv.put<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
+			status: "split_started",
+			splitType: "range",
+			createdAt: Date.now(),
+			partitionContext: this.partitionContext,
+			childPartitionContexts: childInits.map((c) => c.newPartitionContext),
+			migratedChildDoNames: [],
+			history: [{ status: splitStatus.status, splitType: splitStatus.splitType, createdAt: splitStatus.createdAt, partitionContext: splitStatus.partitionContext }],
+		});
+
+		// Kick off migration on all children immediately (fire-and-forget; each also starts on its first request).
+		await Promise.allSettled(
+			childInits.map(async (childContext) => {
+				try {
+					const doId = env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+					await env[childContext.newPartitionContext.ns].get(doId).triggerMigration();
+				} catch (error) {
+					console.error({ message: "fokos/range.startSplit: failed to trigger child migration; will start on first request.", error: String(error) });
+				}
+			}),
+		);
+	}
+
+	// Computes N-1 strictly-increasing split boundaries (count-quantiles) within [start, end) in one
+	// transactionSync snapshot. Returns null if there are fewer than N items (so every child stays non-empty).
+	private computeRangeSplitBoundaries(hashKey: string, start: string | null, end: string | null, N: number): string[] | null {
+		return this.ctx.storage.transactionSync(() => {
+			const lower = start ?? ""; // −∞ ⇒ sk >= ''
+			const cntRow =
+				end === null
+					? this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`, hashKey, lower).toArray()[0]
+					: this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ? AND sk < ?`, hashKey, lower, end).toArray()[0];
+			const cnt = cntRow?.n ?? 0;
+			if (cnt < N) return null; // need ≥ N items so each of the N children gets ≥ 1
+
+			const boundaries: string[] = [];
+			for (let i = 1; i < N; i++) {
+				const offset = Math.floor((cnt * i) / N);
+				const row =
+					end === null
+						? this.#storage.sql.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, offset).toArray()[0]
+						: this.#storage.sql
+								.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, end, offset)
+								.toArray()[0];
+				invariant(row, "fokos/range.computeRangeSplitBoundaries: expected a row at the computed offset");
+				boundaries.push(row.sk);
+			}
+			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty children).
+			for (let i = 0; i < boundaries.length; i++) {
+				if (boundaries[i] <= lower) return null;
+				if (i > 0 && boundaries[i] <= boundaries[i - 1]) return null;
+			}
+			return boundaries;
+		});
 	}
 
 	pickChildPartition(

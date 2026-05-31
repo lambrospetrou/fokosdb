@@ -1,7 +1,7 @@
 import { DeleteItemOptions, GetItemOptions, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { PartitionTopologyRouter, type PartitionContextResolved } from "./partition-topology/partition-topology.js";
+import { PartitionTopologyRouter, resolveRangePartitionContext, type PartitionContextResolved } from "./partition-topology/partition-topology.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import type { ItemCondition } from "./types.js";
 
@@ -60,17 +60,31 @@ export class FokosDB {
 	async destroy(): Promise<{ ok: true }> {
 		const ns = this.options.ns;
 
+		// Dedupe range structures: a 'promoted' entry is inherited by every hash child that took ownership,
+		// so the same global rangeRoot(hashKey) may be enumerated from multiple hash partitions.
+		const destroyedRangeRoots = new Set<string>();
+
 		// TODO Move the traversal logic in the topology router.
 		const destroyPartition = async (ctx: PartitionContextResolved): Promise<void> => {
 			const stub = ns.get(ns.idFromName(ctx.doName));
 			console.warn(`Destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 			// Discover children dynamically: the in-memory topology only knows root nodes,
 			// but split children are recorded in the DO's own split status.
-			const { splitStatus } = await stub.status(ctx);
+			const { splitStatus, promotedKeys } = await stub.status(ctx);
 			if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
 				for (const childCtx of splitStatus.childPartitionContexts) {
 					await destroyPartition(childCtx);
 				}
+			}
+			// Destroy each linked range structure BEFORE the hash partition that links it. Each range root
+			// recurses its own split children via the same path. Deduped by hashKey across the whole tree.
+			// Skip 'queued' keys — their range root is not created yet (nothing to destroy).
+			for (const { hashKey, status } of promotedKeys ?? []) {
+				if (status === "queued") continue;
+				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
+				if (destroyedRangeRoots.has(rangeRootCtx.doName)) continue;
+				destroyedRangeRoots.add(rangeRootCtx.doName);
+				await destroyPartition(rangeRootCtx);
 			}
 			try {
 				await stub.destroyPartition();

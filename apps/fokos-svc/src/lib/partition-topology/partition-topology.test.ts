@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, rangePartitionDoName } from "./partition-topology.js";
 import type { PartitionContext, PartitionContextResolved, SplitStatusKVItem } from "./partition-topology.js";
 import type { PartitionDO } from "../do-partition.js";
@@ -313,6 +313,11 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus?.status).toBe("split_queued");
 		expect(s.splitStatus?.splitType).toBe("range");
+
+		await vi.waitFor(async () => {
+			const s = await stub.status(rootCtx);
+			return s.splitStatus?.status === "split_completed" ? Promise.resolve() : Promise.reject(new Error("Split not completed yet"));
+		}, { timeout: 5000, interval: 100 });
 	});
 
 	it("does not queue a split when db is within limits", async () => {

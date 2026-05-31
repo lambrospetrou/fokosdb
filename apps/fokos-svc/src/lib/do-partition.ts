@@ -139,7 +139,13 @@ type ParentPartitionDOStub = {
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
 	acknowledgePromotionComplete(hashKey: string): Promise<void>;
 	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
+	getPromotedKeysBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PromotedKeyCursor | null;
+	}): Promise<{ rows: { hash_key: string; status: PromotedKeyStatus }[]; nextCursor: PromotedKeyCursor | null }>;
 };
+
+type PromotedKeyCursor = { hashKey: string };
 
 type PromotedKeyStatus = "queued" | "promoting" | "promoted";
 
@@ -233,7 +239,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return;
 		}
 
-		this.ensurePartitionContext(newPartitionContext);
+		this.ensurePartitionContext(newPartitionContext, /* isInit */ true);
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
@@ -432,10 +438,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					.exec<{ status: string }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk)
 					.toArray()[0];
 				invariant(statusRow?.status === "promoting", `fokos/partition.getItemsBatch: key "${hk}" is not in promoting state (got ${statusRow?.status})`);
-				return this.getItemsBatchForPromotion(hk, opts.cursor);
+				return this.getItemsBatchForRange(hk, null, null, opts.cursor);
 			}
-			// Range-split child path — Phase 5.
-			invariant(false, "fokos/partition.getItemsBatch: range-split child migration not yet implemented (Phase 5)");
+			// Range-split: I am a range DO becoming a router; authorize the child and stream its [start, end) slice.
+			const topology = this.ensureTopology(pCtx);
+			const splitStatus = topology.splitStatus();
+			invariant(
+				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
+				`fokos/partition.getItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
+			);
+			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
+			invariant(isKnownChild, `fokos/partition.getItemsBatch: unknown range child partition "${childPartitionContext.doName}"`);
+			return this.getItemsBatchForRange(hk, childPartitionContext.rangePartition.startBoundary, childPartitionContext.rangePartition.endBoundary, opts.cursor);
 		}
 
 		// Hash-child migration.
@@ -487,35 +501,40 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { items, nextCursor: reachedLimit ? tableCursor : null };
 	}
 
-	private getItemsBatchForPromotion(hashKey: string, cursor: MigrationCursor | null): GetItemsBatchResult {
+	// Streams items for a range DO child's owned slice [start, end) (start/end null = unbounded edge).
+	// Used by both promotion (start=end=null: the whole hashKey) and range-split (the child's sub-slice).
+	private getItemsBatchForRange(hashKey: string, start: string | null, end: string | null, cursor: MigrationCursor | null): GetItemsBatchResult {
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 		type Row = { hk: string; sk: string; data: string | ArrayBuffer; ttl_epoch_utc_seconds: number | null; v: number; last_transaction_ts: number };
 		const items: MigratedItem[] = [];
+		const lower = start ?? "";
 		let totalBytes = 0;
 		let tableCursor = cursor;
 		let reachedLimit = false;
 
 		while (true) {
-			let page: Row[];
-			if (!tableCursor) {
-				page = this.ctx.storage.sql
-					.exec<Row>(
-						`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk = ? ORDER BY sk LIMIT ?`,
-						hashKey,
-						PAGE_SIZE,
-					)
-					.toArray();
+			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
+			const conds: string[] = ["hk = ?"];
+			const params: unknown[] = [hashKey];
+			if (tableCursor) {
+				conds.push("sk > ?");
+				params.push(tableCursor.sk);
 			} else {
-				page = this.ctx.storage.sql
-					.exec<Row>(
-						`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk = ? AND sk > ? ORDER BY sk LIMIT ?`,
-						hashKey,
-						tableCursor.sk,
-						PAGE_SIZE,
-					)
-					.toArray();
+				conds.push("sk >= ?");
+				params.push(lower);
 			}
+			if (end !== null) {
+				conds.push("sk < ?");
+				params.push(end);
+			}
+			const page = this.ctx.storage.sql
+				.exec<Row>(
+					`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk LIMIT ?`,
+					...params,
+					PAGE_SIZE,
+				)
+				.toArray();
 
 			if (page.length === 0) break;
 
@@ -566,8 +585,45 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				invariant(statusRow?.status === "promoting", `fokos/partition.getPartitionTransactionMetadata: key "${hk}" is not in promoting state (got ${statusRow?.status})`);
 				return { maxDeletedTs, pendingTransactions: [], nextCursor: null };
 			}
-			// Range-split child path — Phase 5.
-			invariant(false, "fokos/partition.getPartitionTransactionMetadata: range-split child migration not yet implemented (Phase 5)");
+			// Range-split: stream the child's pending locks (sk ∈ [start, end)) so commit/cancel can follow.
+			const topology = this.ensureTopology(pCtx);
+			const splitStatus = topology.splitStatus();
+			invariant(
+				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
+				`fokos/partition.getPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
+			);
+			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
+			invariant(isKnownChild, `fokos/partition.getPartitionTransactionMetadata: unknown range child partition "${childPartitionContext.doName}"`);
+
+			const lower = childPartitionContext.rangePartition.startBoundary ?? "";
+			const upper = childPartitionContext.rangePartition.endBoundary; // null = unbounded
+			const inChildRange = (sk: string) => sk >= lower && (upper === null || sk < upper);
+
+			const RS_BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
+			const RS_PAGE_SIZE = 1000;
+			const rsRows: PendingTransactionRow[] = [];
+			let rsBytes = 0;
+			let rsCursor = opts.cursor;
+			let rsReachedLimit = false;
+			while (true) {
+				const page = this.queryPendingTxPage(rsCursor, RS_PAGE_SIZE);
+				if (page.length === 0) break;
+				for (const row of page) {
+					if (row.hk === hk && inChildRange(row.sk)) {
+						const rowBytes = estimatePendingTxBytes(row);
+						if (rsRows.length > 0 && rsBytes + rowBytes > RS_BATCH_LIMIT_BYTES) {
+							rsReachedLimit = true;
+							break;
+						}
+						rsRows.push(row);
+						rsBytes += rowBytes;
+					}
+					rsCursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
+				}
+				if (rsReachedLimit) break;
+				if (page.length < RS_PAGE_SIZE) break;
+			}
+			return { maxDeletedTs, pendingTransactions: rsRows, nextCursor: rsReachedLimit ? rsCursor : null };
 		}
 
 		// Hash-child migration.
@@ -629,6 +685,32 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				this.ctx.storage.sql.exec(`DELETE FROM pending_transactions`);
 			}
 		});
+	}
+
+	// Paginated promoted_keys for hash-split inheritance: a hash child pulls the promoted-key entries
+	// (forward-pointers) for the keys it now owns. Only the set transfers — never the data, which lives
+	// in the autonomous range structure (the range-root name is recomputable from the hashKey).
+	async getPromotedKeysBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PromotedKeyCursor | null;
+	}): Promise<{ rows: { hash_key: string; status: PromotedKeyStatus }[]; nextCursor: PromotedKeyCursor | null }> {
+		const pCtx = this.pCtx();
+		const isCorrectChild = this.ensureTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
+		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
+		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
+		const SCAN_LIMIT = 10_000;
+		const page = (
+			opts.cursor
+				? this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(
+						`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
+						opts.cursor.hashKey,
+						SCAN_LIMIT,
+					)
+				: this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`, SCAN_LIMIT)
+		).toArray();
+		const rows = page.filter((r) => isCorrectChild(r.hash_key));
+		const nextCursor = page.length === SCAN_LIMIT ? { hashKey: page[page.length - 1].hash_key } : null;
+		return { rows, nextCursor };
 	}
 
 	// Called by a promoted range root once its item migration is complete.
@@ -1029,7 +1111,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_partitionContext;
 	}
 
-	private ensurePartitionContext(pCtx: PartitionContextResolved): PartitionContextResolved {
+	private ensurePartitionContext(pCtx: PartitionContextResolved, isInit = false): PartitionContextResolved {
+		// Phantom-bounce guard: a range DO is born ONLY through initFromSplit (promotion creates the root,
+		// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
+		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
+		// to the range root and traverses. (A hash DO may still lazy-init, as today.)
+		if (!isInit && !this.#_partitionContext && isRangePartition(pCtx)) {
+			throw new Error(`fokos/partition: range DO "${pCtx.doName}" is not initialized; route via the range root and traverse (phantom-bounce).`);
+		}
 		if (this.#_partitionContext) {
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
 			invariant(
@@ -1375,6 +1464,31 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			txCursor = nextCursor;
 		}
 
+		// Inherit promoted-key entries for the keys this child now owns. Only the forward-pointer entry
+		// transfers — the data lives in the range structure, and hash-child item migration already excluded
+		// promoted keys. Mutual exclusion guarantees every such key is 'promoted' at hash-split time.
+		let pkCursor: PromotedKeyCursor | null = null;
+		while (true) {
+			const { rows, nextCursor } = await parentStub.getPromotedKeysBatch({ childPartitionContext: pCtx, cursor: pkCursor });
+			if (rows.length > 0) {
+				this.ctx.storage.transactionSync(() => {
+					for (const row of rows) {
+						const now = Date.now();
+						this.ctx.storage.sql.exec(
+							`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+							row.hash_key,
+							row.status,
+							now,
+							now,
+						);
+						this.#_promotedKeys.set(row.hash_key, row.status);
+					}
+				});
+			}
+			if (!nextCursor) break;
+			pkCursor = nextCursor;
+		}
+
 		await this.__testing__beforeMigrationComplete?.();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
@@ -1416,9 +1530,39 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 		invariant(cursor === null, "fokos/partition.runRangeChildMigration: loop exited with non-null cursor");
 
-		// Sync deletion watermark from parent (no pending_transactions migration — lock-free cutover guarantees none for a promotion).
-		const { maxDeletedTs } = await parentStub.getPartitionTransactionMetadata({ childPartitionContext: pCtx, cursor: null });
-		this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
+		// Migrate transaction metadata: pending locks and the deletion high-water mark.
+		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the watermark;
+		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
+		let txCursor: PendingTransactionCursor | null = null;
+		while (true) {
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
+				childPartitionContext: pCtx,
+				cursor: txCursor,
+			});
+
+			this.ctx.storage.transactionSync(() => {
+				for (const row of pendingTransactions) {
+					this.ctx.storage.sql.exec(
+						`INSERT OR IGNORE INTO pending_transactions
+						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+						row.hk,
+						row.sk,
+						row.transaction_id,
+						row.transaction_ts,
+						row.operation,
+						row.data,
+						row.conditions_json,
+						row.coordinator_do_id,
+						row.created_at,
+					);
+				}
+				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
+			});
+
+			if (!nextCursor) break;
+			txCursor = nextCursor;
+		}
 
 		await this.__testing__beforeMigrationComplete?.();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
