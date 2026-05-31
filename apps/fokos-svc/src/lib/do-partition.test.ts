@@ -1,8 +1,8 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import type { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl } from "./partition-topology/partition-topology.js";
+import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
+import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
@@ -711,7 +711,7 @@ describe("PartitionDO - splitting", () => {
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", databaseName: ctx.databaseName });
 
-		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext.partitionId, 2).map((c) => c.doName);
+		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext!.partitionId, 2).map((c) => c.doName);
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
@@ -1318,7 +1318,7 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 		// it to migration_migrating and schedules the alarm. The error is expected.
 		const childState = await childStub.status();
 		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
-			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
+			await childStub.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => { });
 			// TODO Maybe do this to avoid vitest-worker-pool errors...
 			// await runInDurableObject(childStub, async (instance: PartitionDO) => {
 			// 	await instance.getItem(childCtx, { hashKey: "_", sortKey: "_" }).catch(() => {});
@@ -1360,5 +1360,158 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 	});
 	const pCtxResolved = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");
 	const stub = env.PARTITION_DO.get(pCtxResolved.doId);
-	return { ctx: pCtxResolved.partitionContext, stub };
+	return { ctx: pCtxResolved.partitionContext, stub: stub as DurableObjectStub<PartitionDO> };
 }
+
+// ─── Phase 3: Promotion lifecycle ────────────────────────────────────────────
+
+// hashSplitConditions.maxSizeMb=0.1 → promotion threshold = 0.05 MB ≈ 52 KB.
+// Writing 55 KB for a single key exceeds it.
+const PROMOTION_TEST_MAX_SIZE_MB = 0.1;
+const PROMOTION_BIG_DATA = "x".repeat(55 * 1024);
+
+
+describe("Phase 3 — Promotion detection and queuing", () => {
+	it("detects a heavy key and immediately cuts over to 'promoting' when no locks are held", async () => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		await waitForAlarm(stub);
+
+		const s = await stub.status();
+		// With no pending locks the detection + cutover runs in a single background cycle.
+		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+	});
+
+	it("does not detect any key when the DB is well below the promotion threshold", async () => {
+		const { ctx, stub } = makeStub(); // default hashSplitConditions.maxSizeMb=100 → threshold 50 MB
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: "tiny" });
+
+		await waitForAlarm(stub); // alarm may not be set at all; waitForAlarm is a no-op if so
+		const s = await stub.status();
+		expect(s.promotedKeys).toHaveLength(0);
+	});
+
+	it("blocks hash split while a key is being promoted (mutual exclusion, inverse direction)", async () => {
+		// After detection cuts alice over to 'promoting', shouldSplit must return null even
+		// if DB is above hashSplitConditions.maxSizeMb, because alice is in-flight.
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		// Background work: detect alice, cut over to 'promoting'.
+		await waitForAlarm(stub);
+		expect((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+
+		// Write more data — DB now exceeds hashSplitConditions.maxSizeMb.
+		// shouldSplit must return null because alice is 'promoting' (inflightCount > 0).
+		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		const s = await stub.status();
+		expect(s.splitStatus).toBeUndefined();
+	});
+});
+
+describe("Phase 3 — Cutover deferral and routing", () => {
+	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
+		const txId = crypto.randomUUID();
+		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const lockResult = await stub.prepare(ctx, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: coordId,
+			items: [{ hashKey: "alice", sortKey: "sk1", operation: "put", data: "pending" }],
+		});
+		expect(lockResult.outcome).toBe("accepted");
+
+		await waitForAlarm(stub);
+
+		// Detection queued alice but cutover was deferred — key must still be 'queued'.
+		const s = await stub.status();
+		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("queued");
+
+		// A write to alice while 'queued' is still served locally.
+		const r = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "still-local" });
+		expect(r.meta.forwardCount).toBe(0);
+
+		// Release the lock; next background cycle should complete the cutover.
+		await stub.cancel(ctx, { transactionId: txId });
+		await waitForAlarm(stub);
+
+		const s2 = await stub.status();
+		expect(s2.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+	});
+
+	it("forwards reads and writes to the range root after cutover ('promoting')", async () => {
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		// Run background work: detection + cutover to 'promoting' + trigger migration.
+		await waitForAlarm(stub);
+		const s = await stub.status();
+		expect(s.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoting");
+
+		// Drain the range root migration so it can serve writes.
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
+		await waitForAlarm(rangeRootStub);
+
+		// Hash DO should now report 'promoted'.
+		const s2 = await stub.status();
+		expect(s2.promotedKeys.find((e) => e.hashKey === "alice")?.status).toBe("promoted");
+
+		// Writes via the hash partition are forwarded to the range root.
+		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range" });
+		expect(w.meta.forwardCount).toBe(1);
+
+		// Item is in the range root.
+		const g = await rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" });
+		expect(g).toMatchObject({ found: true, item: { data: "in-range" } });
+	});
+});
+
+describe("Phase 3 — hash-child migration excludes promoted keys", () => {
+	it("items belonging to a promoted key are not migrated to hash split children", async () => {
+		// Use a small maxSizeMb so both promotion and hash split are triggered.
+		// Mutual exclusion guarantees they are serialised: promote first, then hash split.
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+
+		// Write for alice — will be promoted.
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+
+		// Run background: detect → queue alice → cutover to 'promoting' → trigger migration.
+		await waitForAlarm(stub);
+
+		// Drain range root migration → alice becomes 'promoted'.
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null);
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
+		await waitForAlarm(rangeRootStub);
+
+		// Drain GC: alice='promoted' → background work deletes alice's local items.
+		await waitForAlarm(stub);
+
+		// Write two large bob items so DB exceeds hashSplitConditions.maxSizeMb even without alice.
+		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk2", data: PROMOTION_BIG_DATA });
+
+		// Background: alice='promoted' so mutual exclusion allows the hash split to proceed.
+		await drainSplitTree(stub);
+		await assertSplitTreeComplete(stub);
+
+		// alice's items must not appear in any hash child.
+		const splitStatus = (await stub.status()).splitStatus as SplitStartedOrCompleted;
+		expect(splitStatus, "hash split should have completed").toBeDefined();
+		for (const childCtx of splitStatus.childPartitionContexts) {
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+			const r = await childStub.getItem(childCtx, { hashKey: "alice", sortKey: "sk1" });
+			expect(r.found, `alice should not be in hash child ${childCtx.doName}`).toBe(false);
+		}
+
+		// bob's item must be reachable via the hash DO (forwarded to the owning child).
+		const bobResult = await stub.getItem(ctx, { hashKey: "bob", sortKey: "sk1" });
+		expect(bobResult).toMatchObject({ found: true, item: { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA } });
+	});
+});

@@ -203,6 +203,28 @@ export function rangePartitionDoName(databaseName: string, hashKey: string, star
 	return `${databaseName}.r.${hk}.${sk}`;
 }
 
+// Resolves a PartitionContextResolved for a range-structure DO (root or child).
+// Same return shape as pickPartition / pickChildPartition so callers can use the result uniformly.
+export function resolveRangePartitionContext(
+	base: PartitionContextResolved,
+	hashKey: string,
+	startBoundary: string | null,
+): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary).encode(true);
+	const doId = env[base.ns].idFromName(doName!);
+	return {
+		doId,
+		partitionContext: {
+			...base,
+			doName: doName!,
+			primaryDoIdStr: doId.toString(),
+			partitionId: opaque,
+			_partitionIdBytes: undefined,
+			rangePartition: { hashKey, startBoundary },
+		},
+	};
+}
+
 // Golden Ratio constant used for better hash scattering
 // See https://softwareengineering.stackexchange.com/a/402543
 const GOLDEN_RATIO = 0x9e3779b1;
@@ -521,20 +543,20 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 export type SplitStatusKVItem =
 	| {
-			status: Extract<SplitStatus, "split_queued">;
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-	  }
+		status: Extract<SplitStatus, "split_queued">;
+		splitType: SplitType;
+		createdAt: number;
+		partitionContext: PartitionContextResolved;
+	}
 	| {
-			status: Extract<SplitStatus, "split_started" | "split_completed">;
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-			childPartitionContexts: PartitionContextResolved[];
-			migratedChildDoNames: string[];
-			history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
-	  };
+		status: Extract<SplitStatus, "split_started" | "split_completed">;
+		splitType: SplitType;
+		createdAt: number;
+		partitionContext: PartitionContextResolved;
+		childPartitionContexts: PartitionContextResolved[];
+		migratedChildDoNames: string[];
+		history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
+	};
 
 export interface PartitionTopologySplitter {
 	splitStatus(): SplitStatusKVItem | undefined;
@@ -588,6 +610,9 @@ export interface PartitionTopologySplitter {
 	 */
 	acknowledgeChildMigration(childDoName: string): void;
 }
+
+// Fraction of rangeSplitConditions.maxSizeMb a single key must reach before it is a promotion candidate.
+export const RANGE_PROMOTION_FRACTION = 0.5;
 
 /**
  * Used by the Partition Durable Objects.
@@ -646,6 +671,14 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	shouldSplit(_hashKey: string, _sortKey?: string): SplitType | null {
 		const dbSize = this.#storage.sql.databaseSize;
 		if (this.partitionContext.hashSplitConditions.maxSizeMb && dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1024 * 1024) {
+			// Mutual exclusion: no hash split while any promoted key is queued or promoting.
+			// A split while promotion is in-flight would leave the range root acking a parent
+			// that has become a router, stranding the key's status.
+			const inflightCount =
+				this.#storage.sql
+					.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM promoted_keys WHERE status IN ('queued', 'promoting')`)
+					.toArray()[0]?.n ?? 0;
+			if (inflightCount > 0) return null;
 			return "hash";
 		}
 		// TODO Track some statistics per hashKey/sortKey in memory to track heavy hitter items.
@@ -838,22 +871,22 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const newStatus: SplitStatusKVItem = allMigrated
 			? {
-					status: "split_completed",
-					splitType: splitStatus.splitType,
-					createdAt: Date.now(),
-					partitionContext: splitStatus.partitionContext,
-					childPartitionContexts: splitStatus.childPartitionContexts,
-					migratedChildDoNames,
-					history: [
-						...splitStatus.history,
-						{
-							status: splitStatus.status,
-							splitType: splitStatus.splitType,
-							createdAt: splitStatus.createdAt,
-							partitionContext: splitStatus.partitionContext,
-						},
-					],
-				}
+				status: "split_completed",
+				splitType: splitStatus.splitType,
+				createdAt: Date.now(),
+				partitionContext: splitStatus.partitionContext,
+				childPartitionContexts: splitStatus.childPartitionContexts,
+				migratedChildDoNames,
+				history: [
+					...splitStatus.history,
+					{
+						status: splitStatus.status,
+						splitType: splitStatus.splitType,
+						createdAt: splitStatus.createdAt,
+						partitionContext: splitStatus.partitionContext,
+					},
+				],
+			}
 			: { ...splitStatus, migratedChildDoNames };
 
 		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
@@ -1023,17 +1056,17 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const newStatus: SplitStatusKVItem = allMigrated
 			? {
-					status: "split_completed",
-					splitType: splitStatus.splitType,
-					createdAt: Date.now(),
-					partitionContext: splitStatus.partitionContext,
-					childPartitionContexts: splitStatus.childPartitionContexts,
-					migratedChildDoNames,
-					history: [
-						...splitStatus.history,
-						{ status: splitStatus.status, splitType: splitStatus.splitType, createdAt: splitStatus.createdAt, partitionContext: splitStatus.partitionContext },
-					],
-				}
+				status: "split_completed",
+				splitType: splitStatus.splitType,
+				createdAt: Date.now(),
+				partitionContext: splitStatus.partitionContext,
+				childPartitionContexts: splitStatus.childPartitionContexts,
+				migratedChildDoNames,
+				history: [
+					...splitStatus.history,
+					{ status: splitStatus.status, splitType: splitStatus.splitType, createdAt: splitStatus.createdAt, partitionContext: splitStatus.partitionContext },
+				],
+			}
 			: { ...splitStatus, migratedChildDoNames };
 
 		this.#storage.kv.put<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
