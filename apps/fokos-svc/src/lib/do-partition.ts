@@ -702,10 +702,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const page = (
 			opts.cursor
 				? this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(
-						`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
-						opts.cursor.hashKey,
-						SCAN_LIMIT,
-					)
+					`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
+					opts.cursor.hashKey,
+					SCAN_LIMIT,
+				)
 				: this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`, SCAN_LIMIT)
 		).toArray();
 		const rows = page.filter((r) => isCorrectChild(r.hash_key));
@@ -715,7 +715,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	// Called by a promoted range root once its item migration is complete.
 	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
-		this.ctx.storage.sql.exec(`UPDATE promoted_keys SET status = 'promoted', updated_at = ? WHERE hash_key = ?`, Date.now(), hashKey);
+		this.ctx.storage.sql.exec(`UPDATE promoted_keys SET status = 'promoted', updated_at = ? WHERE hash_key = ? AND status = 'promoting'`, Date.now(), hashKey);
 		this.#_promotedKeys.set(hashKey, "promoted");
 		this.scheduleBackgroundWork({ delayMs: 1_000 });
 		console.log({ ...this.logParams(), message: "fokos/partition: Promotion complete.", hashKey });
@@ -1651,10 +1651,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hashKey)
 					.toArray()[0]?.n ?? 0;
 			if (lockCount > 0) return false; // deferred — retry next background cycle
-			this.ctx.storage.sql.exec(`UPDATE promoted_keys SET status = 'promoting', updated_at = ? WHERE hash_key = ?`, Date.now(), hashKey);
-			this.#_promotedKeys.set(hashKey, "promoting");
+			this.ctx.storage.sql.exec(`UPDATE promoted_keys SET status = 'promoting', updated_at = ? WHERE hash_key = ? AND status = 'queued'`, Date.now(), hashKey);
 			return true;
 		});
+		if (didCutover) {
+			this.#_promotedKeys.set(hashKey, "promoting");
+		}
 
 		if (!didCutover) {
 			console.log({ ...this.logParams(), message: "fokos/partition: Promotion cutover deferred (pending locks).", hashKey });
