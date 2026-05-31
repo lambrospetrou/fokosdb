@@ -784,7 +784,8 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 
 				break;
 			case "range":
-				// FIXME Perform a range split by calculating the new sort key ranges for each child partition.
+				// Hash-partition DOs never queue a range split; range splits are handled by RangePartitionTopologyImpl.
+				invariant(false, "fokos/topology.startSplit: unexpected splitType 'range' on a hash-partition topology");
 				break;
 		}
 
@@ -1130,8 +1131,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 					end === null
 						? this.#storage.sql.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, offset).toArray()[0]
 						: this.#storage.sql
-								.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, end, offset)
-								.toArray()[0];
+							.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, end, offset)
+							.toArray()[0];
 				invariant(row, "fokos/range.computeRangeSplitBoundaries: expected a row at the computed offset");
 				boundaries.push(row.sk);
 			}
@@ -1179,7 +1180,6 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		_childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean {
 		// Range DOs route by sort-key range, not by hash. This method is not applicable.
-		// Range-child migration uses makeIsCorrectChildRangePartition (Phase 5).
 		invariant(false, "fokos/range: makeIsCorrectChildHashPartition is not applicable to range DOs");
 	}
 

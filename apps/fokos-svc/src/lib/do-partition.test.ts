@@ -1363,7 +1363,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 	return { ctx: pCtxResolved.partitionContext, stub: stub as DurableObjectStub<PartitionDO> };
 }
 
-// ─── Phase 3: Promotion lifecycle ────────────────────────────────────────────
+// ─── Promotion lifecycle ──────────────────────────────────────────────────────
 
 // hashSplitConditions.maxSizeMb=0.1 → promotion threshold = 0.05 MB ≈ 52 KB.
 // Writing 55 KB for a single key exceeds it.
@@ -1371,7 +1371,7 @@ const PROMOTION_TEST_MAX_SIZE_MB = 0.1;
 const PROMOTION_BIG_DATA = "x".repeat(55 * 1024);
 
 
-describe("Phase 3 — Promotion detection and queuing", () => {
+describe("PartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and immediately cuts over to 'promoting' when no locks are held", async () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
@@ -1414,7 +1414,7 @@ describe("Phase 3 — Promotion detection and queuing", () => {
 	});
 });
 
-describe("Phase 3 — Cutover deferral and routing", () => {
+describe("PartitionDO — promotion cutover deferral and routing", () => {
 	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
@@ -1476,7 +1476,7 @@ describe("Phase 3 — Cutover deferral and routing", () => {
 	});
 });
 
-describe("Phase 4 — Transactions: forward-and-aggregate", () => {
+describe("PartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
@@ -1560,7 +1560,7 @@ describe("Phase 4 — Transactions: forward-and-aggregate", () => {
 	});
 });
 
-describe("Phase 3 — hash-child migration excludes promoted keys", () => {
+describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 	it("items belonging to a promoted key are not migrated to hash split children", async () => {
 		// Use a small maxSizeMb so both promotion and hash split are triggered.
 		// Mutual exclusion guarantees they are serialised: promote first, then hash split.
@@ -1625,7 +1625,7 @@ describe("Phase 3 — hash-child migration excludes promoted keys", () => {
 	});
 });
 
-// ─── Phase 5: Range split ────────────────────────────────────────────────────
+// ─── Range split ──────────────────────────────────────────────────────────────
 
 // A 1 MB threshold keeps SQLite page overhead negligible vs. item data, so the post-split children
 // (≈ total/N each) stay well under the limit and remain leaves (no surprise re-split or size reject).
@@ -1667,7 +1667,7 @@ async function makeQueuedRangeRoot(
 	return { rootCtx, rootStub, sks };
 }
 
-describe("Phase 5 — Range split", () => {
+describe("PartitionDO — range split", () => {
 	it("splits a populated leaf into N contiguous children covering [−∞, +∞); the node becomes a pure router", async () => {
 		const N = 4;
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);

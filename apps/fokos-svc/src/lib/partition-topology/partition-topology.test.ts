@@ -168,9 +168,9 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1) unchanged", () => {
 	});
 });
 
-// ─── Phase 2 helpers ──────────────────────────────────────────────────────────
+// ─── RangePartitionTopologyImpl helpers ───────────────────────────────────────
 
-// Each Phase 2 test must use a unique base to avoid DO name collisions between tests.
+// Each RangePartitionTopologyImpl test must use a unique base to avoid DO name collisions between tests.
 function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
@@ -219,7 +219,7 @@ async function setupRangeDO(
 	);
 }
 
-// ─── Phase 2: RangePartitionTopologyImpl ──────────────────────────────────────
+// ─── RangePartitionTopologyImpl — routing and split behavior ──────────────────
 
 describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key range", () => {
 	it("serves sort keys within [start, end) — putItem succeeds locally (forwardCount=0)", async () => {

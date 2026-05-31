@@ -374,7 +374,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
-				// Bug 4: keep deletion watermark consistent with transactional deletes
+				// Keep deletion watermark consistent with transactional deletes.
 				if (writeRes.rowsWritten > 0) {
 					this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, Date.now());
 				}
@@ -677,7 +677,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async acknowledgeChildMigrationComplete(childDoName: string): Promise<void> {
 		const topology = this.ensureTopology(this.pCtx());
-		// Bug 3: atomically transition topology and clean up parent's pending_transactions when
+		// Atomically transition topology and clean up parent's pending_transactions when
 		// all children have migrated. Children now own authoritative copies; parent's are redundant.
 		this.ctx.storage.transactionSync(() => {
 			topology.acknowledgeChildMigration(childDoName);
@@ -821,7 +821,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						};
 					}
 				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
-					// Bug 5: check on a non-existent item must also respect the deletion watermark
+					// A check on a non-existent item must also respect the deletion watermark.
 					const metaRow = this.ctx.storage.sql
 						.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
 						.toArray()[0];
@@ -865,7 +865,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async commit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration("commit"); // Bug 1: reject while THIS partition is migrating
+		await this.ensureMigration("commit"); // reject while this partition is migrating
 
 		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
 		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
@@ -966,7 +966,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration("cancel"); // Bug 6: reject while THIS partition is migrating
+		await this.ensureMigration("cancel"); // reject while this partition is migrating
 		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 
 		const childContexts: PartitionContextResolved[] = [];
@@ -1502,8 +1502,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
 
 		// Migrate items for this range DO's owned slice.
-		// For a promotion root the parent is a hash DO and the filter is WHERE hk = ?;
-		// for a range-split child the parent is a range DO (Phase 5).
+		// For a promotion root the parent is a hash DO (filter by hk only);
+		// for a range-split child the parent is a range DO (filter by hk and sk range).
 		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
 		while (true) {
@@ -1568,7 +1568,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 
-		// Notify the parent: promotion root → acknowledgePromotionComplete; range-split child → acknowledgeChildMigrationComplete (Phase 5).
+		// Notify the parent: a promotion root calls acknowledgePromotionComplete; a range-split child calls acknowledgeChildMigrationComplete.
 		if (isHashPartition(parentCtx)) {
 			await parentStub.acknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
 		} else {
