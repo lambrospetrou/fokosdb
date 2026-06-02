@@ -83,7 +83,7 @@ Content-Type: application/json
 repeat: 100
 # Retries are needed to avoid 500s during partition splitting.
 retry: 5
-retry-interval: 100
+retry-interval: 200
 {
   "partitionOptions": {
     "rootTreesN": 2,
@@ -125,24 +125,30 @@ Content-Type: application/json
 }
 HTTP 200
 
-# ── putItem: fixed hashKey (current datetime) + random sortKey (100x) ───────
-# All iterations target the same hash-key bucket — exercises a hot partition.
-# hashKey is the RFC 3339 UTC datetime at the moment each request fires.
-#
-#POST {{base_url}}/api/rpc/stress_001/putItem
-#Content-Type: application/json
-#[Options]
-#repeat: 100
-#{
-#  "partitionOptions": {
-#    "rootTreesN": 2,
-#    "hashSplitN": 4,
-#    "hashSplitConditions": {
-#      "maxSizeMb": 2
-#    }
-#  },
-#  "hashKey": "ts#{{newDate}}",
-#  "sortKey": "{{newUuid}}",
-#  "data": "ts-payload-{{newUuid}}"
-#}
-#HTTP 200
+# ── putItem: fixed hashKey + random sortKey with 10K text (100x) ─────────────
+# Large per-item payload drives range splits faster.
+
+# POST {{base_url}}/api/rpc/stress_001/putItem
+# Content-Type: application/json
+# [Options]
+# repeat: 100
+# retry: 5
+# # FIXME reduce this by optimizing the key promotion and range split.
+# retry-interval: 100
+# {
+#   "partitionOptions": {
+#     "rootTreesN": 2,
+#     "hashSplitN": 4,
+#     "hashSplitConditions": {
+#       "maxSizeMb": 2
+#     },
+#     "rangeSplitN": 4,
+#     "rangeSplitConditions": {
+#       "maxSizeMb": 0.1
+#     }
+#   },
+#   "hashKey": "range#stress-10k",
+#   "sortKey": "{{newUuid}}",
+#   "data": "payload-{{newUuid}}-{{txt_10k}}"
+# }
+# HTTP 200

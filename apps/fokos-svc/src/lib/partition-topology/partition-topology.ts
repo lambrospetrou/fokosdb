@@ -94,6 +94,7 @@ export function areMutableOptionsEqual(opts1: PartitionContext, opts2: Partition
 	return (
 		opts1.hashSplitConditions.maxSizeMb === opts2.hashSplitConditions.maxSizeMb &&
 		opts1.hashSplitConditions.maxItems === opts2.hashSplitConditions.maxItems &&
+		opts1.rangeSplitN === opts2.rangeSplitN &&
 		opts1.rangeSplitConditions?.maxSizeMb === opts2.rangeSplitConditions?.maxSizeMb &&
 		opts1.rangeSplitConditions?.maxItems === opts2.rangeSplitConditions?.maxItems
 	);

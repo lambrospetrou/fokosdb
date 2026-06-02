@@ -1091,9 +1091,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// the latency of waiting for that unrelated trigger.
 		//
 		// FIXME: Move this in PartitionTopologyImpl.
-		if (!pCtx.rangePartition && pCtx.hashSplitConditions.maxSizeMb) {
+		if (isHashPartition(pCtx) && pCtx.hashSplitConditions.maxSizeMb) {
 			const threshold = pCtx.hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 			if (this.ctx.storage.sql.databaseSize > threshold) {
+				// FIXME Why can I not comment this out????? Something in the scheduleBackgroundWork must be broken.
 				await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 				this.scheduleBackgroundWork({ delayMs: 10 });
 			}
@@ -1145,7 +1146,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
 		if (!this.#_topology) {
-			this.#_topology = pCtx.rangePartition
+			this.#_topology = isRangePartition(pCtx)
 				? new RangePartitionTopologyImpl("", pCtx, this.ctx)
 				: new PartitionTopologyImpl("", pCtx, this.ctx);
 		}
@@ -1719,6 +1720,63 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				console.error({ ...this.logParams(), message: "fokos/partition: Split job failed.", error: String(error), errorProps: error });
 			}
 
+			////////////////////////////////////////
+			// ── Job: Stale transaction recovery
+			try {
+				const staleTxRows = this.ctx.storage.sql
+					.exec<{ transaction_id: string; coordinator_do_id: string }>(
+						`SELECT DISTINCT transaction_id, coordinator_do_id
+                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
+						Date.now() - PartitionDO.STALE_TX_MS,
+					)
+					.toArray();
+				for (const row of staleTxRows) {
+					if (!row.coordinator_do_id) continue;
+					try {
+						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
+						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
+
+						if (result.state === "COMMITTED") {
+							const pendingRows = this.ctx.storage.sql
+								.exec<{
+									hk: string;
+									sk: string;
+									transaction_ts: number;
+									operation: string;
+									data: string | ArrayBuffer | null;
+								}>(`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`, row.transaction_id)
+								.toArray();
+							if (pendingRows.length > 0) {
+								const transactionTimestamp = pendingRows[0].transaction_ts;
+								const items: TransactionItem[] = pendingRows.map((r) => ({
+									hashKey: r.hk,
+									sortKey: r.sk || undefined,
+									operation: r.operation as TransactionItem["operation"],
+									data: r.data == null ? undefined : typeof r.data === "string" ? r.data : new Uint8Array(r.data),
+								}));
+								await this.commit(this.pCtx(), { transactionId: row.transaction_id, transactionTimestamp, items });
+							}
+						} else if (result.state === "CANCELLED" || result.state === "not_found") {
+							await this.cancel(this.pCtx(), { transactionId: row.transaction_id });
+						}
+					} catch (e) {
+						console.error({
+							...this.logParams(),
+							message: "fokos/partition: failed to poke stale TC",
+							transactionId: row.transaction_id,
+							error: String(e),
+						});
+					}
+				}
+			} catch (error) {
+				console.error({
+					...this.logParams(),
+					message: "fokos/partition: Stale TX recovery job failed.",
+					error: String(error),
+					errorProps: error,
+				});
+			}
+
 			///////////////////////////////////////////////////////////////////////////////////
 			// ── Jobs: Promotion detection, drive, and GC (hash partitions only, not routers)
 			const pCtx = this.pCtx();
@@ -1794,62 +1852,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 			}
 
-			////////////////////////////////////////
-			// ── Job: Stale transaction recovery
-			try {
-				const staleTxRows = this.ctx.storage.sql
-					.exec<{ transaction_id: string; coordinator_do_id: string }>(
-						`SELECT DISTINCT transaction_id, coordinator_do_id
-                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
-						Date.now() - PartitionDO.STALE_TX_MS,
-					)
-					.toArray();
-				for (const row of staleTxRows) {
-					if (!row.coordinator_do_id) continue;
-					try {
-						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
-
-						if (result.state === "COMMITTED") {
-							const pendingRows = this.ctx.storage.sql
-								.exec<{
-									hk: string;
-									sk: string;
-									transaction_ts: number;
-									operation: string;
-									data: string | ArrayBuffer | null;
-								}>(`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`, row.transaction_id)
-								.toArray();
-							if (pendingRows.length > 0) {
-								const transactionTimestamp = pendingRows[0].transaction_ts;
-								const items: TransactionItem[] = pendingRows.map((r) => ({
-									hashKey: r.hk,
-									sortKey: r.sk || undefined,
-									operation: r.operation as TransactionItem["operation"],
-									data: r.data == null ? undefined : typeof r.data === "string" ? r.data : new Uint8Array(r.data),
-								}));
-								await this.commit(this.pCtx(), { transactionId: row.transaction_id, transactionTimestamp, items });
-							}
-						} else if (result.state === "CANCELLED" || result.state === "not_found") {
-							await this.cancel(this.pCtx(), { transactionId: row.transaction_id });
-						}
-					} catch (e) {
-						console.error({
-							...this.logParams(),
-							message: "fokos/partition: failed to poke stale TC",
-							transactionId: row.transaction_id,
-							error: String(e),
-						});
-					}
-				}
-			} catch (error) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition: Stale TX recovery job failed.",
-					error: String(error),
-					errorProps: error,
-				});
-			}
 		} catch (error) {
 			console.error({
 				...this.logParams(),

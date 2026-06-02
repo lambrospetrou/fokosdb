@@ -210,6 +210,59 @@ Content-Type: application/json
 }
 HTTP 200
 
+# ── putItem: same hashKey, multiple sortKeys ──────────────────────────────────
+
+POST {{base_url}}/api/rpc/{{database_name}}/putItem
+Content-Type: application/json
+{
+  "hashKey": "range#001",
+  "sortKey": "sk#a",
+  "data": "range-value-a"
+}
+HTTP 200
+
+POST {{base_url}}/api/rpc/{{database_name}}/putItem
+Content-Type: application/json
+{
+  "hashKey": "range#001",
+  "sortKey": "sk#b",
+  "data": "range-value-b"
+}
+HTTP 200
+
+# each sort key is independently retrievable
+POST {{base_url}}/api/rpc/{{database_name}}/getItem
+Content-Type: application/json
+{
+  "hashKey": "range#001",
+  "sortKey": "sk#a"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.found" == true
+jsonpath "$.item.data" == "range-value-a"
+
+POST {{base_url}}/api/rpc/{{database_name}}/getItem
+Content-Type: application/json
+{
+  "hashKey": "range#001",
+  "sortKey": "sk#b"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.found" == true
+jsonpath "$.item.data" == "range-value-b"
+
+# bare hashKey lookup misses when only sort-keyed entries exist
+POST {{base_url}}/api/rpc/{{database_name}}/getItem
+Content-Type: application/json
+{
+  "hashKey": "range#001"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.found" == false
+
 # ── Error: unknown rpcAction ───────────────────────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/unknownAction
