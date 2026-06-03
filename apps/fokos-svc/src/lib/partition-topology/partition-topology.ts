@@ -160,6 +160,8 @@ export class PartitionContextCreator {
 }
 
 export interface PartitionTopologyRouter {
+	partitionContext(): PartitionContext;
+
 	/**
 	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
 	 * @param hashKey
@@ -441,6 +443,10 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 				children: [],
 			};
 		});
+	}
+
+	partitionContext(): PartitionContext {
+		return this.basePartitionContext;
 	}
 
 	calculateChildPartitionIds(

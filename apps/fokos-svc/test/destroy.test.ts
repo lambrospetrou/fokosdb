@@ -47,7 +47,7 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
 		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(databaseName);
-		const topology = db.options.topology as PartitionTopologyRouterImpl;
+		const topology = db.options().topology as PartitionTopologyRouterImpl;
 
 		// Write 50 × 50 KB items to each root partition.
 		const doNamesSet = new Set<string>();

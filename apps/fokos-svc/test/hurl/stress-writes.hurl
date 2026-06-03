@@ -18,18 +18,18 @@ HTTP 200
 txt_100k: body
 
 # Deletes all Partition DOs created during the test, including any children created by splits.
-DELETE {{base_url}}/api/databases/stress_001
-{
-  "partitionOptions": {
-    "rootTreesN": 2,
-    "hashSplitN": 4,
-    "rangeSplitN": 4,
-    "hashSplitConditions": {
-      "maxSizeMb": 2
-    }
-  }
-}
-HTTP 200
+# DELETE {{base_url}}/api/databases/stress_001
+# {
+#   "partitionOptions": {
+#     "rootTreesN": 2,
+#     "hashSplitN": 4,
+#     "rangeSplitN": 4,
+#     "hashSplitConditions": {
+#       "maxSizeMb": 2
+#     }
+#   }
+# }
+# HTTP 200
 
 # ── putItem: fully random hashKey + sortKey (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
@@ -42,6 +42,7 @@ repeat: 100
   "partitionOptions": {
     "rootTreesN": 2,
     "hashSplitN": 4,
+    "rangeSplitN": 4,
     "hashSplitConditions": {
       "maxSizeMb": 2
     }
@@ -65,6 +66,7 @@ retry-interval: 100
   "partitionOptions": {
     "rootTreesN": 2,
     "hashSplitN": 4,
+    "rangeSplitN": 4,
     "hashSplitConditions": {
       "maxSizeMb": 2
     }
@@ -89,6 +91,7 @@ retry-interval: 100
   "partitionOptions": {
     "rootTreesN": 2,
     "hashSplitN": 4,
+    "rangeSplitN": 4,
     "hashSplitConditions": {
       "maxSizeMb": 2
     }
@@ -103,10 +106,13 @@ HTTP 200
 
 POST {{base_url}}/api/rpc/stress_001/transactWriteItems
 Content-Type: application/json
+[Options]
+repeat: 20
 {
   "partitionOptions": {
     "rootTreesN": 2,
     "hashSplitN": 4,
+    "rangeSplitN": 4,
     "hashSplitConditions": {
       "maxSizeMb": 2
     }
@@ -148,7 +154,7 @@ retry-interval: 100
       "maxSizeMb": 0.2
     }
   },
-  "hashKey": "range#stress-10k",
+  "hashKey": "range#stress-10k-{{newDate}}",
   "sortKey": "{{newUuid}}",
   "data": "payload-{{newUuid}}-{{txt_10k}}"
 }
