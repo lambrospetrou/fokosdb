@@ -18,17 +18,18 @@ HTTP 200
 txt_100k: body
 
 # Deletes all Partition DOs created during the test, including any children created by splits.
-# DELETE {{base_url}}/api/databases/stress_001
-# {
-#   "partitionOptions": {
-#     "rootTreesN": 2,
-#     "hashSplitN": 4,
-#     "hashSplitConditions": {
-#       "maxSizeMb": 2
-#     }
-#   }
-# }
-# HTTP 200
+DELETE {{base_url}}/api/databases/stress_001
+{
+  "partitionOptions": {
+    "rootTreesN": 2,
+    "hashSplitN": 4,
+    "rangeSplitN": 4,
+    "hashSplitConditions": {
+      "maxSizeMb": 2
+    }
+  }
+}
+HTTP 200
 
 # ── putItem: fully random hashKey + sortKey (100x) ──────────────────────────
 # Each iteration writes to a unique key — exercises fan-out across partitions.
@@ -83,7 +84,7 @@ Content-Type: application/json
 repeat: 100
 # Retries are needed to avoid 500s during partition splitting.
 retry: 5
-retry-interval: 200
+retry-interval: 100
 {
   "partitionOptions": {
     "rootTreesN": 2,
@@ -128,27 +129,27 @@ HTTP 200
 # ── putItem: fixed hashKey + random sortKey with 10K text (100x) ─────────────
 # Large per-item payload drives range splits faster.
 
-# POST {{base_url}}/api/rpc/stress_001/putItem
-# Content-Type: application/json
-# [Options]
-# repeat: 100
-# retry: 5
-# # FIXME reduce this by optimizing the key promotion and range split.
-# retry-interval: 100
-# {
-#   "partitionOptions": {
-#     "rootTreesN": 2,
-#     "hashSplitN": 4,
-#     "hashSplitConditions": {
-#       "maxSizeMb": 2
-#     },
-#     "rangeSplitN": 4,
-#     "rangeSplitConditions": {
-#       "maxSizeMb": 0.1
-#     }
-#   },
-#   "hashKey": "range#stress-10k",
-#   "sortKey": "{{newUuid}}",
-#   "data": "payload-{{newUuid}}-{{txt_10k}}"
-# }
-# HTTP 200
+POST {{base_url}}/api/rpc/stress_001/putItem
+Content-Type: application/json
+[Options]
+repeat: 100
+retry: 5
+# FIXME reduce this by optimizing the key promotion and range split.
+retry-interval: 100
+{
+  "partitionOptions": {
+    "rootTreesN": 2,
+    "hashSplitN": 4,
+    "hashSplitConditions": {
+      "maxSizeMb": 2
+    },
+    "rangeSplitN": 4,
+    "rangeSplitConditions": {
+      "maxSizeMb": 0.2
+    }
+  },
+  "hashKey": "range#stress-10k",
+  "sortKey": "{{newUuid}}",
+  "data": "payload-{{newUuid}}-{{txt_10k}}"
+}
+HTTP 200

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
+import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, RANGE_PROMOTION_FRACTION, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
@@ -661,12 +661,7 @@ describe("PartitionDO - splitting", () => {
 	it("sets split_pending status when data exceeds maxSizeMb", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-		await stub.putItem(ctx, {
-			hashKey: `hk.${stub.id.name!}`,
-			sortKey: "sk",
-			// Slightly over 1 MB to trigger the split condition.
-			data: "x".repeat(1 * 1024 * 1024 + 10),
-		});
+		await triggerHashSplitThreshold(stub, ctx, 1);
 
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
@@ -676,19 +671,28 @@ describe("PartitionDO - splitting", () => {
 	it("preserves split_queued status across subsequent writes before the alarm fires", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-		// Both writes run inside the DO's execution context so the background alarm
+		// All writes run inside the DO's execution context so the background alarm
 		// cannot fire between them, letting us assert the pre-alarm queued state.
 		await runInDurableObject(stub, async (instance: PartitionDO) => {
-			await instance.putItem(ctx, {
-				hashKey: "hk",
-				sortKey: "sk1",
-				data: "x".repeat(1 * 1024 * 1024 + 10),
-			});
+			// Spread data across multiple keys so no single key hits the promotion threshold.
+			// Stop as soon as the split is queued to stay below the 10% reject band.
+			const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * 1 * 1024 * 1024 * 0.7);
+			const tData = "x".repeat(chunkBytes);
+			for (let i = 0; ; i++) {
+				try {
+					await instance.putItem(ctx, { hashKey: `split-trig-${i}`, sortKey: "sk", data: tData });
+				} catch (e) {
+					if (!String(e).includes("partition exceeded")) throw e;
+					break;
+				}
+				const { splitStatus: s } = await instance.status();
+				if (s?.status === "split_queued") break;
+			}
 
 			const { splitStatus: after1 } = await instance.status();
 			expect(after1?.status).toBe("split_queued");
 
-			await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "small" });
+			await instance.putItem(ctx, { hashKey: "extra", sortKey: "sk2", data: "small" });
 
 			const { splitStatus: after2 } = await instance.status();
 			expect(after2?.status).toBe("split_queued");
@@ -698,13 +702,8 @@ describe("PartitionDO - splitting", () => {
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
-		const hashKey = `hk.1`;
 
-		await stub.putItem(ctx, {
-			hashKey,
-			sortKey: "sk",
-			data: "x".repeat(1 * 1024 * 1024 + 10),
-		});
+		await triggerHashSplitThreshold(stub, ctx, 1);
 		await waitForAlarm(stub);
 
 		const parentState = await stub.status();
@@ -808,15 +807,12 @@ describe("PartitionDO - splitting", () => {
 	it("exposes split status via status()", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-		await stub.putItem(ctx, {
-			hashKey: `hk.${stub.id.name!}`,
-			sortKey: "sk",
-			data: "x".repeat(1 * 1024 * 1024 + 10),
-		});
+		await triggerHashSplitThreshold(stub, ctx, 1);
 
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
-		expect(splitStatus?.status).toBe("split_queued");
+		// Background work may advance split past split_queued before status() is called.
+		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 		expect(splitStatus?.createdAt).toBeTypeOf("number");
 	});
 
@@ -850,7 +846,7 @@ describe("PartitionDO - splitting", () => {
 			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
 
 			// Trigger the split condition and drain the tree so all migrations complete.
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
 
 			const childNames = topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN).map((c) => c.doName);
@@ -871,7 +867,7 @@ describe("PartitionDO - splitting", () => {
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
 
 			const result = await stub.getItem(ctx, { hashKey: "definitely-missing", sortKey: "sk" });
@@ -958,7 +954,7 @@ describe("PartitionDO - splitting", () => {
 			}
 
 			// Trigger the split condition.
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 			await waitForAlarm(stub);
 
 			const parentState = await stub.status();
@@ -1012,7 +1008,7 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1" });
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 
 			// Pre-install the gate on all child partitions before the parent alarm fires.
 			// The child DO names are deterministic, and miniflare keeps the same instance when
@@ -1062,7 +1058,7 @@ describe("PartitionDO - splitting", () => {
 			for (const item of seedItems) {
 				await stub.putItem(ctx, item);
 			}
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 
 			// Pre-install gate on all children before the parent alarm fires.
 			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
@@ -1124,7 +1120,7 @@ describe("PartitionDO - splitting", () => {
 			});
 
 			// Trigger split and run parent alarm.
-			await stub.putItem(ctx, { hashKey: "trigger", sortKey: "sk", data: "x".repeat(1 * 1024 * 1024 + 10) });
+			await triggerHashSplitThreshold(stub, ctx, 1);
 			await waitForAlarm(stub);
 
 			// Run all children's migrations. startSplit already triggered their alarms via fire-and-forget.
@@ -1270,7 +1266,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(ctx.partitionId));
 
 		// Trigger a split so children are initialized with their own cached bytes.
-		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk2", data: "x".repeat(1 * 1024 * 1024 + 10) });
+		await triggerHashSplitThreshold(stub, ctx, 1);
 		await waitForAlarm(stub);
 
 		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
@@ -1295,6 +1291,29 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 			interval: 100,
 		});
 	});
+}
+
+/**
+ * Writes enough data spread across multiple hash keys to push the DB over maxSizeMb
+ * without any single hash key accumulating enough data to trigger range-key promotion
+ * (which would block the hash split via mutual exclusion in shouldSplit).
+ */
+async function triggerHashSplitThreshold(stub: DurableObjectStub<PartitionDO>, ctx: PartitionContextResolved, maxSizeMb: number = 1): Promise<void> {
+	// Use 70% of promotion threshold per key so no single key triggers promotion,
+	// and the chunk fits within the 10% reject grace band for the first write past threshold.
+	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * 0.7);
+	const data = "x".repeat(chunkBytes);
+	for (let i = 0; ; i++) {
+		try {
+			await stub.putItem(ctx, { hashKey: `_split_trig_${i}`, sortKey: "sk", data });
+		} catch (e) {
+			// "partition exceeded" means we crossed the reject band — split was queued by a prior write.
+			if (!String(e).includes("partition exceeded")) throw e;
+			break;
+		}
+		const { splitStatus } = await stub.status();
+		if (splitStatus?.status === "split_queued") break;
+	}
 }
 
 /**
@@ -1373,7 +1392,8 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		await vi.waitFor(async () => {
 			await waitForAlarm(stub);
 			const s = await stub.status();
-			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+			// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
+			if (!["promoting", "promoted"].includes(s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? ""))
 				throw new Error("not yet promoting");
 		}, { timeout: 5000, interval: 100 });
 	});
@@ -1459,7 +1479,8 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		await vi.waitFor(async () => {
 			await waitForAlarm(stub);
 			const s = await stub.status();
-			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+			// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
+			if (!["promoting", "promoted"].includes(s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? ""))
 				throw new Error("not yet promoting");
 		}, { timeout: 5000, interval: 100 });
 
@@ -1572,12 +1593,13 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 	it("items belonging to a promoted key are not migrated to hash split children", async () => {
-		// Use a small maxSizeMb so both promotion and hash split are triggered.
-		// Mutual exclusion guarantees they are serialised: promote first, then hash split.
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		// Use maxSizeMb=1 so the per-child reject threshold (1.1MB) stays well above what any
+		// child receives after migration, avoiding fragile databaseSize comparisons.
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 1 } });
 
-		// Write for alice — will be promoted.
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		// Alice data exceeds the 512KB promotion threshold for maxSizeMb=1.
+		const aliceData = "x".repeat(600 * 1024);
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: aliceData });
 
 		// Wait for: detect → 'promoting' → range-root migration → 'promoted' → GC clears local alice items.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
@@ -1589,9 +1611,8 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 			if (local.found) throw new Error("alice not GC'd from hash DO yet");
 		}, { timeout: 8000, interval: 100 });
 
-		// Write two large bob items so DB exceeds hashSplitConditions.maxSizeMb even without alice.
-		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA });
-		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk2", data: PROMOTION_BIG_DATA });
+		// Trigger hash split with spread data; none exceeds the per-key promotion threshold.
+		await triggerHashSplitThreshold(stub, ctx, 1);
 
 		// Background: alice='promoted' so mutual exclusion allows the hash split to proceed.
 		await drainSplitTree(stub);
@@ -1628,9 +1649,9 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		expect(aliceRead.meta.forwardCount).toBeGreaterThanOrEqual(1);
 		expect(aliceRead.meta.servedByActorName, "alice must be served by the range structure, not the hash child").toBe(rangeRootCtx.doName);
 
-		// bob's item must be reachable via the hash DO (forwarded to the owning child).
-		const bobResult = await stub.getItem(ctx, { hashKey: "bob", sortKey: "sk1" });
-		expect(bobResult).toMatchObject({ found: true, item: { hashKey: "bob", sortKey: "sk1", data: PROMOTION_BIG_DATA } });
+		// A split-trigger key must be reachable via the hash DO (forwarded to the owning child).
+		const trigResult = await stub.getItem(ctx, { hashKey: "_split_trig_0", sortKey: "sk" });
+		expect(trigResult).toMatchObject({ found: true, item: { hashKey: "_split_trig_0", sortKey: "sk" }, meta: { forwardCount: 1 } });
 	});
 });
 
