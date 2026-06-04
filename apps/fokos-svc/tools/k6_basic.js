@@ -16,11 +16,15 @@ export const options = {
       executor: "ramping-arrival-rate",
       startRate: 0,
       timeUnit: "1s",
-      preAllocatedVUs: 50,
-      maxVUs: 300,
+      preAllocatedVUs: 300,
+      maxVUs: 1000,
       stages: [
+        // Initial warmup to wake up the DOs.
         { target: 10, duration: "5s" },
-        { target: 200, duration: "600s" },
+        // Ramp up to 500 RPS within 5s.
+        { target: 500, duration: "5s" },
+        // Sustain 500 RPS for 5 minutes.
+        { target: 500, duration: "300s" },
       ],
     },
   },
