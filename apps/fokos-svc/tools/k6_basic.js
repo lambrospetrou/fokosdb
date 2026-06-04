@@ -20,7 +20,7 @@ export const options = {
       maxVUs: 300,
       stages: [
         { target: 10, duration: "5s" },
-        { target: 200, duration: "60s" },
+        { target: 200, duration: "600s" },
       ],
     },
   },
@@ -30,19 +30,23 @@ const TXT_1KB = "x".repeat(1024);
 const TXT_10KB = "x".repeat(10 * 1024);
 
 export default function () {
-  const hk = `stress#${crypto.randomUUID()}`;
-  const sk = crypto.randomUUID();
-  const data = `payload-${crypto.randomUUID()}-${TXT_10KB}`;
-
-  const payload = JSON.stringify({
+  const dbConfig = {
     "partitionOptions": {
-      "rootTreesN": 100,
+      "rootTreesN": 10,
       "hashSplitN": 4,
       "rangeSplitN": 4,
       "hashSplitConditions": {
         "maxSizeMb": 100,
       }
     },
+  };
+
+  const hk = `stress#${crypto.randomUUID()}`;
+  const sk = crypto.randomUUID();
+  const data = `payload-${crypto.randomUUID()}-${TXT_10KB}`;
+
+  const payload = JSON.stringify({
+    ...dbConfig,
     "hashKey": hk,
     "sortKey": sk,
     "data": data,
@@ -58,14 +62,7 @@ export default function () {
   });
 
   const getPayload = JSON.stringify({
-    "partitionOptions": {
-      "rootTreesN": 100,
-      "hashSplitN": 4,
-      "rangeSplitN": 4,
-      "hashSplitConditions": {
-        "maxSizeMb": 100,
-      }
-    },
+    ...dbConfig,
     "hashKey": hk,
     "sortKey": sk,
   });
