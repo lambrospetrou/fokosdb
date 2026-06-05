@@ -1,9 +1,8 @@
 # Run with:
-#   hurl --variables-file test/hurl/vars.env test/hurl/sanity.hurl
+#   npm run test:hurl:run -- test/hurl/sanity.hurl
 #
-# Target a remote deployment:
-#   hurl --variable base_url=https://your-worker.your-subdomain.workers.dev \
-#        --variables-file test/hurl/vars.env test/hurl/sanity.hurl
+# Target the remote deployment (see test/hurl/vars_remote.env for configuration):
+#   npm run test:hurl:remote -- test/hurl/sanity.hurl
 
 # ── Hello ──────────────────────────────────────────────────────────────────────
 

@@ -1,11 +1,13 @@
 # Stress write tests — runs sequentially within this file.
 #
 # Run with:
-#   hurl --variables-file test/hurl/vars.env test/hurl/stress-writes.hurl
+#   npm run test:hurl:run -- test/hurl/stress-writes.hurl
 #
 # Repeat the whole file N times in parallel:
-#   hurl --test --repeat 10 --jobs 10 \
-#        --variables-file test/hurl/vars.env test/hurl/stress-writes.hurl
+#   npm run test:hurl:run -- --repeat 10 --jobs 10 test/hurl/stress-writes.hurl
+#
+# Target the remote deployment (see test/hurl/vars_remote.env for configuration):
+#   npm run test:hurl:remote -- test/hurl/stress-writes.hurl
 
 GET {{base_url}}/static/text_10k.txt
 HTTP 200
