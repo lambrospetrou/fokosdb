@@ -135,12 +135,27 @@ function serializeTransactGetItemsResult(result: InitiateReadResponse) {
 
 const api = new Hono<{ Bindings: Env }>().basePath("/api");
 
+let cachedValidTokens: Set<string> | null = null;
+
 api.onError((err, c) => {
 	if (err instanceof HTTPException) {
 		return err.getResponse();
 	}
 	console.error(err);
 	return c.json({ error: "Internal Server Error" }, 500);
+});
+
+api.use(async (c, next) => {
+	const token = c.req.header("x-fokos-secret-token");
+	if (!token) {
+		throw new HTTPException(401, { message: "Missing x-fokos-secret-token header" });
+	}
+	cachedValidTokens ??= new Set(c.env.FOKOS_API_TOKENS.split(",").map((t) => t.trim()).filter(Boolean));
+	const validTokens = cachedValidTokens;
+	if (!validTokens.has(token)) {
+		throw new HTTPException(401, { message: "Invalid token" });
+	}
+	await next();
 });
 
 api.use(async (c, next) => {

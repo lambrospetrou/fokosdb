@@ -52,6 +52,9 @@
 		// https://hono.dev/docs/middleware/builtin/logger#logging-details
 		"NO_COLOR": true,
 	},
+	"secrets": {
+		"required": ["FOKOS_API_TOKENS"],
+	},
 	/**
 	 * Service Bindings (communicate between multiple Workers)
 	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings

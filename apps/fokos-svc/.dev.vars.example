@@ -1,0 +1,2 @@
+# Local dev secrets — comma-separated list of valid API tokens.
+FOKOS_API_TOKENS=dev-token-1,dev-token-2,dev-token-local
