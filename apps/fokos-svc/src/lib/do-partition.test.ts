@@ -22,6 +22,8 @@ describe("PartitionDO - putItem / getItem", () => {
 				servedByActorId: expect.any(String),
 				servedByActorName: expect.stringMatching(/^test\..+/),
 				forwardCount: 0,
+				hashDepth: 0,
+				rangeDepth: 0,
 			},
 		});
 	});
@@ -421,6 +423,8 @@ describe("PartitionDO - deleteItem", () => {
 				servedByActorId: expect.any(String),
 				servedByActorName: expect.stringMatching(/^test\..+/),
 				forwardCount: 0,
+				hashDepth: 0,
+				rangeDepth: 0,
 			},
 		});
 	});
@@ -924,7 +928,13 @@ describe("PartitionDO - splitting", () => {
 				expect(result).toMatchObject({ found: true, item: { hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData } });
 				if (result.found) {
 					servedByActorNames.add(result.meta.servedByActorName);
-					expect(result.meta.forwardCount, "root reads should have been forwarded at least twice").toBeGreaterThanOrEqual(2);
+					// hashDepth is constant (total tree levels) whether the cache skips hops or not.
+					expect(result.meta.hashDepth, "root reads should span at least 2 hash tree levels").toBeGreaterThanOrEqual(2);
+					// forwardCount starts at hashDepth (cold cache, one RPC per level) and
+					// converges to 1 (warm cache, single RPC directly to the leaf). The invariant
+					// that proves the cache is reducing latency is forwardCount ≤ hashDepth.
+					expect(result.meta.forwardCount, "topology cache should reduce RPC hops to at most one per tree level").toBeLessThanOrEqual(result.meta.hashDepth);
+					expect(result.meta.forwardCount, "always at least one RPC hop from the root").toBeGreaterThanOrEqual(1);
 				}
 			}
 
@@ -934,6 +944,93 @@ describe("PartitionDO - splitting", () => {
 
 			const totalSplitNodes = await assertSplitTreeComplete(stub);
 			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
+		});
+	}, 30_000);
+
+	describe("hash topology cache", async () => {
+		// A fixed probe key used to trace a deterministic path through the tree.
+		const hashKey = "probe-key";
+
+		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+			// Root splits into two children.
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+
+			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
+			const r1 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r1.meta.hashDepth).toBe(1);
+			expect(r1.meta.forwardCount).toBe(1);
+
+			// Split the child that owns hashKey.
+			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+			await triggerHashSplitThreshold(childStub, childCtx, 1);
+			await drainSplitTree(childStub);
+
+			// root → child → grandchild: hashDepth=2. Cache is cold so forwardCount=2 (two RPC hops).
+			const r2 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r2.meta.hashDepth).toBe(2);
+			expect(r2.meta.forwardCount).toBe(2);
+		});
+
+		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+			await triggerHashSplitThreshold(childStub, childCtx, 1);
+			await drainSplitTree(childStub);
+
+			// First request: cold cache — root→child→grandchild (two hops). Root learns depth=2.
+			const r1 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r1.meta.hashDepth).toBe(2);
+			expect(r1.meta.forwardCount).toBe(2);
+
+			// Second request: warm cache — root skips directly to grandchild (one hop).
+			const r2 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r2.meta.hashDepth).toBe(2);
+			expect(r2.meta.forwardCount).toBe(1);
+		});
+
+		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+
+			// Build a two-level tree: root → child → grandchild.
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+			await triggerHashSplitThreshold(childStub, childCtx, 1);
+			await drainSplitTree(childStub);
+
+			// Warm root's cache to depth=2 with one request (root→child→grandchild).
+			const r1 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r1.meta.hashDepth).toBe(2);
+
+			// Now split the grandchild, making it a router for great-grandchildren.
+			const { partitionContext: grandchildCtx } = topologyRouter.pickDescendantHashPartition(ctx, hashKey, 2);
+			const grandchildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(grandchildCtx.doName));
+			await triggerHashSplitThreshold(grandchildStub, grandchildCtx, 1);
+			await drainSplitTree(grandchildStub);
+
+			// Stale-cache request: root targets grandchild (cached depth=2) but it is now a router.
+			// Grandchild forwards one more level → root receives hashDepth=1, updates cache to depth=3,
+			// and returns hashDepth=3. forwardCount=2: one RPC root→grandchild + grandchild→great-grandchild.
+			const r2 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r2.meta.hashDepth).toBe(3);
+			expect(r2.meta.forwardCount).toBe(2);
+
+			// Subsequent request: root skips directly to great-grandchild (one RPC hop).
+			const r3 = await stub.getItem(ctx, { hashKey, sortKey: "sk" });
+			expect(r3.meta.hashDepth).toBe(3);
+			expect(r3.meta.forwardCount).toBe(1);
 		});
 	}, 30_000);
 
@@ -1509,7 +1606,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
-		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await vi.waitFor(async () => {
 			await waitForAlarm(stub);
 			await waitForAlarm(rangeRootStub);
@@ -1552,7 +1649,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
-		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName)) as DurableObjectStub<PartitionDO>;
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await vi.waitFor(async () => {
 			await waitForAlarm(stub);
 			await waitForAlarm(rangeRootStub);
@@ -1680,7 +1777,7 @@ async function makeQueuedRangeRoot(
 	});
 	const hashParentCtx = new PartitionTopologyRouterImpl("", base).pickPartition("alice").partitionContext;
 	const { partitionContext: rootCtx } = resolveRangePartitionContext(hashParentCtx, "alice", null, null);
-	const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName)) as DurableObjectStub<PartitionDO>;
+	const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 
 	// Initialize as a ready leaf (migration complete → serves locally rather than 503).
 	await rootStub.initFromSplit(

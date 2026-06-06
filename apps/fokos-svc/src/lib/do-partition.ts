@@ -6,6 +6,7 @@ import {
 	GetItemOptions,
 	GetItemResult,
 	ItemCondition,
+	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
 } from "./types.js";
@@ -351,6 +352,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorId: this.ctx.id.toString(),
 						servedByActorName: pCtx.doName,
 						forwardCount: 0,
+						hashDepth: 0,
+						rangeDepth: 0,
 					},
 				};
 			},
@@ -414,6 +417,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorId: this.ctx.id.toString(),
 						servedByActorName: pCtx.doName,
 						forwardCount: 0,
+						hashDepth: 0,
+						rangeDepth: 0,
 					},
 				};
 			},
@@ -1204,7 +1209,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return true;
 	}
 
-	private async withSplitForwarding<T extends { meta: { forwardCount: number } }>(opts: {
+	private async withSplitForwarding<T extends { meta: PartitionInfo }>(opts: {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: string; sortKey?: string };
 		operationName: string;
@@ -1227,7 +1232,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
 				const rangeRootStub = this.env[ctx.ns].get(doId);
 				const result = await forward(rangeRootStub, rangeRootCtx);
-				return { ...result, meta: { ...result.meta, forwardCount: result.meta.forwardCount + 1 } } as T;
+				return {
+					...result,
+					meta: {
+						...result.meta,
+						forwardCount: result.meta.forwardCount + 1,
+					}
+				} as T;
 			}
 		}
 
@@ -1238,9 +1249,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				return await local();
 			case "forward": {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
-				const stub = this.env[this.pCtx().ns].get(doId);
+				const stub = this.env[ctx.ns].get(doId);
 				const result = await forward(stub, partitionContext);
-				return { ...result, meta: { ...result.meta, forwardCount: result.meta.forwardCount + 1 } } as T;
+				const depthIncrement = topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta.hashDepth);
+				const metaDepthObj = isHashPartition(ctx) ? { hashDepth: result.meta.hashDepth + depthIncrement } : {};
+				return {
+					...result,
+					meta: {
+						...result.meta,
+						...metaDepthObj,
+						forwardCount: result.meta.forwardCount + 1,
+					},
+				} as T;
 			}
 			case "reject":
 				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
@@ -1315,6 +1335,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
 			forwardCount: 0,
+			hashDepth: 0,
+			rangeDepth: 0,
 		};
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {
