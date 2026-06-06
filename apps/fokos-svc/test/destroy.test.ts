@@ -26,7 +26,7 @@ function makeDB(databaseName: string) {
 	});
 	return new FokosDB({
 		ns: env.PARTITION_DO,
-		topology: new PartitionTopologyRouterImpl("", base),
+		topology: new PartitionTopologyRouterImpl(base),
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});
 }

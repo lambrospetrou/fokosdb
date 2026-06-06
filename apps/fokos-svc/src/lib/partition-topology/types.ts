@@ -8,8 +8,6 @@ export type PartitionNodeId = string;
 export type SplitType = "hash" | "range";
 export type SplitStatus = "split_queued" | "split_started" | "split_completed";
 
-export type PartitionTopologyEncoded = string;
-
 /**
  * A node in the partition topology tree. Root nodes represent the initial set of partitions;
  * child nodes are created when a partition splits.

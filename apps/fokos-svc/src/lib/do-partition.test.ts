@@ -706,7 +706,7 @@ describe("PartitionDO - splitting", () => {
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 		await triggerHashSplitThreshold(stub, ctx, 1);
 		await waitForAlarm(stub);
@@ -848,7 +848,7 @@ describe("PartitionDO - splitting", () => {
 			expect,
 		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 			// Trigger the split condition and drain the tree so all migrations complete.
 			await triggerHashSplitThreshold(stub, ctx, 1);
@@ -953,7 +953,7 @@ describe("PartitionDO - splitting", () => {
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 			// Root splits into two children.
 			await triggerHashSplitThreshold(stub, ctx, 1);
@@ -978,7 +978,7 @@ describe("PartitionDO - splitting", () => {
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
@@ -1000,7 +1000,7 @@ describe("PartitionDO - splitting", () => {
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 			// Build a two-level tree: root → child → grandchild.
 			await triggerHashSplitThreshold(stub, ctx, 1);
@@ -1112,7 +1112,7 @@ describe("PartitionDO - splitting", () => {
 			// The child DO names are deterministic, and miniflare keeps the same instance when
 			// initFromSplit + triggerMigration are called during the parent alarm — so the hook
 			// is already in place when runMigration runs, blocking it before migration_completed.
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 			let releaseMigration!: () => void;
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
@@ -1159,7 +1159,7 @@ describe("PartitionDO - splitting", () => {
 			await triggerHashSplitThreshold(stub, ctx, 1);
 
 			// Pre-install gate on all children before the parent alarm fires.
-			const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 			let releaseMigration!: () => void;
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
@@ -1262,7 +1262,7 @@ describe("PartitionDO - partitionId encoding", () => {
 	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
 		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
 		const { ctx } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 		// Root: [version=0, rootIdx=0 (2 bytes big-endian), depth=0]
 		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 0, 0, 0]));
@@ -1333,7 +1333,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		// If the depth offset used in one changes without the other, routing will silently
 		// assign keys to different partitions than the migration check expects.
 		const { ctx } = makeStub({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 100 } });
-		const router = new PartitionTopologyRouterImpl("", ctx);
+		const router = new PartitionTopologyRouterImpl(ctx);
 		const hashKey = "routing-consistency-key";
 
 		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
@@ -1355,7 +1355,7 @@ describe("PartitionDO - partitionId encoding", () => {
 
 	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl("", ctx);
+		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v" });
@@ -1469,7 +1469,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 		rangeSplitConditions: { maxSizeMb: 500 },
 		...opts,
 	});
-	const pCtxResolved = new PartitionTopologyRouterImpl("", base).pickPartition("dummyHashKey");
+	const pCtxResolved = new PartitionTopologyRouterImpl(base).pickPartition("dummyHashKey");
 	const stub = env.PARTITION_DO.get(pCtxResolved.doId);
 	return { ctx: pCtxResolved.partitionContext, stub: stub as DurableObjectStub<PartitionDO> };
 }
@@ -1775,7 +1775,7 @@ async function makeQueuedRangeRoot(
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: RANGE_SPLIT_MAX_SIZE_MB },
 	});
-	const hashParentCtx = new PartitionTopologyRouterImpl("", base).pickPartition("alice").partitionContext;
+	const hashParentCtx = new PartitionTopologyRouterImpl(base).pickPartition("alice").partitionContext;
 	const { partitionContext: rootCtx } = resolveRangePartitionContext(hashParentCtx, "alice", null, null);
 	const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 

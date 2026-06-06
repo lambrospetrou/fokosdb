@@ -1185,8 +1185,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
-				? new RangePartitionTopologyImpl("", pCtx, this.ctx)
-				: new PartitionTopologyImpl("", pCtx, this.ctx);
+				? new RangePartitionTopologyImpl(pCtx, this.ctx)
+				: new PartitionTopologyImpl(pCtx, this.ctx);
 		}
 		return this.#_topology;
 	}

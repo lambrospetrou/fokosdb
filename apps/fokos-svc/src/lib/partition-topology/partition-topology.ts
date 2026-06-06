@@ -3,7 +3,7 @@ import { tryWhile } from "durable-utils/retries";
 import { InitFromSplitOptions, PartitionDO } from "../do-partition.js";
 import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
-import type { PartitionNodeId, PartitionTopologyEncoded, SplitStatus, SplitType, TopologyNode } from "./types.js";
+import type { PartitionNodeId, SplitStatus, SplitType } from "./types.js";
 import { assertExists } from "../tsutils.js";
 import invariant from "../invariant.js";
 
@@ -427,36 +427,16 @@ export class PartitionIdHelper {
  * Used by the FokosDB to route requests to the right partition DO based on the provided partition context and keys.
  */
 export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
-	#topology: TopologyNode[];
+	#_rootContextsCache: Map<number, PartitionContextResolved> = new Map();
 
 	constructor(
-		private readonly encoded: PartitionTopologyEncoded,
 		private readonly basePartitionContext: PartitionContext,
 	) {
 		// FIXME: This is a placeholder implementation. The actual implementation will depend on the encoding scheme used for the partition topology.
-		this.#topology = Array.from({ length: basePartitionContext.rootTreesN }, (_, i) => {
-			const { doName, opaque } = PartitionIdHelper.fromHashIdxs(basePartitionContext, [i]).encode(true);
-			assertExists(doName);
-
-			if (doName.length > 1024) {
-				console.warn({
-					message:
-						"fokos: DO name length exceeds 1024 bytes, which may cause issues with DO name truncation in Cloudflare Workers. Should have used higher rootTreesN and higher hashSplitConditions.splitN to reduce the depth of the tree.",
-					doName,
-				});
-			}
-			const doId = env[basePartitionContext.ns].idFromName(doName);
-			return {
-				partitionId: opaque,
-				partitionContext: {
-					// We don't take the name from doId because it could be truncated after 1024 bytes.
-					doName: doName,
-					primaryDoIdStr: doId.toString(),
-				},
-				children: [],
-			};
-		});
+		// this.#topology = ...
 	}
+
+
 
 	partitionContext(): PartitionContext {
 		return this.basePartitionContext;
@@ -565,21 +545,23 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	} {
 		// First find the hash partition!
 		// Root tree index first.
-		let hIdxs: number[] = [hashRootIndex(hashKey, this.#topology.length)];
-		{
-			// 1 for the root, then one for each level of the tree until we reach a leaf.
-			// The level is used as additional entropy to ensure better distribution of the partitions across the children.
-			let level = 1;
-			// This should start from the root node and traverse down the tree until it reaches a leaf node,
-			// which will be the partition that should handle the request.
-			let hNode = this.#topology[hIdxs[0]];
-			while (hNode.children.length > 0) {
-				level++;
-				const hChild = hashChildIndex(hashKey, level - 1, hNode.children.length);
-				hIdxs.push(hChild);
-				hNode = hNode.children[hChild];
-			}
-		}
+		let hIdxs: number[] = [hashRootIndex(hashKey, this.basePartitionContext.rootTreesN)];
+
+		// TODO: Based on the topology encoding and the topology cache find the right partition.
+		// {
+		// 	// 1 for the root, then one for each level of the tree until we reach a leaf.
+		// 	// The level is used as additional entropy to ensure better distribution of the partitions across the children.
+		// 	let level = 1;
+		// 	// This should start from the root node and traverse down the tree until it reaches a leaf node,
+		// 	// which will be the partition that should handle the request.
+		// 	let hNode = this.resolveRootPartitionContext(hIdxs[0]);
+		// 	while (hNode.children.length > 0) {
+		// 		level++;
+		// 		const hChild = hashChildIndex(hashKey, level - 1, hNode.children.length);
+		// 		hIdxs.push(hChild);
+		// 		hNode = hNode.children[hChild];
+		// 	}
+		// }
 
 		// TODO: Find the range partition if it exists.
 
@@ -592,12 +574,29 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	}
 
 	rootPartitionContexts(): PartitionContextResolved[] {
-		return this.#topology.map((node) => ({
+		const contexts: PartitionContextResolved[] = [];
+		for (let i = 0; i < this.basePartitionContext.rootTreesN; i++) {
+			contexts.push(this.resolveRootPartitionContext(i));
+		}
+		return contexts;
+	}
+
+	resolveRootPartitionContext(idx: number): PartitionContextResolved {
+		if (this.#_rootContextsCache.has(idx)) {
+			return this.#_rootContextsCache.get(idx)!;
+		}
+		const { doName, opaque } = PartitionIdHelper.fromHashIdxs(this.basePartitionContext, [idx]).encode(true);
+		assertExists(doName);
+		const { ns } = this.basePartitionContext;
+		const doId = env[ns].idFromName(doName);
+		const resolvedContext = {
 			...this.basePartitionContext,
-			doName: node.partitionContext.doName,
-			primaryDoIdStr: node.partitionContext.primaryDoIdStr,
-			partitionId: node.partitionId,
-		}));
+			doName,
+			primaryDoIdStr: doId.toString(),
+			partitionId: opaque,
+		};
+		this.#_rootContextsCache.set(idx, resolvedContext);
+		return resolvedContext;
 	}
 }
 
@@ -704,13 +703,12 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	#_hashTopology: HashTopology | null = null;
 
 	constructor(
-		private readonly encoded: PartitionTopologyEncoded,
 		private readonly partitionContext: PartitionContextResolved,
 		private readonly ctx: DurableObjectState,
 	) {
 		this.#storage = ctx.storage;
 		// FIXME: Parse the topology only once!
-		this.#topologyRouter = new PartitionTopologyRouterImpl(encoded, partitionContext);
+		this.#topologyRouter = new PartitionTopologyRouterImpl(partitionContext);
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
 		// first request, after blockConcurrencyWhile has completed, so synchronous KV reads are safe.
 		const ownerAbsDepth = PartitionIdHelper.depth(
@@ -1068,7 +1066,6 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	#storage: DurableObjectStorage;
 
 	constructor(
-		private readonly encoded: PartitionTopologyEncoded,
 		private readonly partitionContext: PartitionContextResolved,
 		private readonly ctx: DurableObjectState,
 	) {

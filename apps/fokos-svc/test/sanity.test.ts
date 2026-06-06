@@ -17,7 +17,7 @@ describe("fokosdb", async () => {
 	it("should route to the right partition DO", async ({ expect }) => {
 		const db = new FokosDB({
 			ns: env.PARTITION_DO,
-			topology: new PartitionTopologyRouterImpl("encoded-topology", {
+			topology: new PartitionTopologyRouterImpl({
 				...testSplitOptions,
 			}),
 			transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,

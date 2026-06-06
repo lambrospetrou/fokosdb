@@ -202,7 +202,7 @@ function makeRangeCtx(
 }
 
 function makeHashCtx(base: PartitionContext): PartitionContextResolved {
-	return new PartitionTopologyRouterImpl("", base).pickPartition("dummyKey").partitionContext;
+	return new PartitionTopologyRouterImpl(base).pickPartition("dummyKey").partitionContext;
 }
 
 // Sets up a range DO via initFromSplit and immediately marks migration complete,

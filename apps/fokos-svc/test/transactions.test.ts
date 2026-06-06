@@ -16,7 +16,7 @@ function makeDB() {
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
-	const topology = new PartitionTopologyRouterImpl("", base);
+	const topology = new PartitionTopologyRouterImpl(base);
 	return new FokosDB({
 		ns: env.PARTITION_DO,
 		topology,
@@ -493,7 +493,7 @@ describe("transactions - end-to-end", () => {
 			hashSplitConditions: { maxSizeMb: 100 },
 			rangeSplitConditions: { maxSizeMb: 500 },
 		});
-		const topology = new PartitionTopologyRouterImpl("", base);
+		const topology = new PartitionTopologyRouterImpl(base);
 		const db = new FokosDB({
 			ns: env.PARTITION_DO,
 			topology,

@@ -102,7 +102,7 @@ function makeFokosDB(env: Env, databaseName: string, partitionOptions?: Partitio
 		hashSplitConditions: partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
 		rangeSplitConditions: partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
 	});
-	const topology = new PartitionTopologyRouterImpl("", partitionContext);
+	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({ ns: env.PARTITION_DO, topology, transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO });
 }
 
