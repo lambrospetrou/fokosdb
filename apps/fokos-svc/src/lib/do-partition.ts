@@ -28,7 +28,7 @@ import {
 	areMutableOptionsEqual,
 	PartitionContext,
 	PartitionContextResolved,
-	PartitionTopologyImpl,
+	HashPartitionTopologyImpl,
 	PartitionTopologySplitter,
 	RangePartitionTopologyImpl,
 	SplitStatusKVItem,
@@ -1186,7 +1186,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
 				? new RangePartitionTopologyImpl(pCtx, this.ctx)
-				: new PartitionTopologyImpl(pCtx, this.ctx);
+				: new HashPartitionTopologyImpl(pCtx, this.ctx);
 		}
 		return this.#_topology;
 	}

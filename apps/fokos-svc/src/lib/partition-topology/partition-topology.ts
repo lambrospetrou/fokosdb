@@ -693,7 +693,7 @@ export const RANGE_PROMOTION_FRACTION = 0.5;
 /**
  * Used by the Partition Durable Objects.
  */
-export class PartitionTopologyImpl implements PartitionTopologySplitter {
+export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	private static readonly KV_KEYS = {
 		SPLIT_STATUS: "__split_status",
 	};
@@ -718,7 +718,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		if (snapshot) {
 			this.#_hashTopology = HashTopology.fromSnapshot(snapshot);
 		} else {
-			const splitStatus = ctx.storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+			const splitStatus = ctx.storage.kv.get<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 			if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
 				this.#_hashTopology = HashTopology.create(partitionContext.hashSplitN, ownerAbsDepth);
 			}
@@ -728,7 +728,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
 		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// TODO - Keep this in memory to avoid reading it all the time from storage.
-		const splitStatus = this.#storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+		const splitStatus = this.#storage.kv.get<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 		if (splitStatus && splitStatus.status !== "split_queued") {
 			return "forward";
 		}
@@ -748,7 +748,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	splitStatus(): SplitStatusKVItem | undefined {
-		return this.#storage.kv.get<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+		return this.#storage.kv.get<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 	}
 
 	async maybeQueueSplit(_hashKey: string, _sortKey?: string): Promise<SplitStatusKVItem | undefined> {
@@ -780,7 +780,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 	queueSplit(splitType: SplitType): SplitStatusKVItem {
 		const nowStatus = this.splitStatus();
 		if (!nowStatus) {
-			this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
+			this.#storage.kv.put<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
 				status: "split_queued",
 				splitType,
 				createdAt: Date.now(),
@@ -892,7 +892,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 		// Final. Mark the split status as `split_started` to indicate that now there are new partitions handling requests,
 		// and the current partition is just a proxy that forwards requests to the new partitions until the split is completed and the data is migrated,
 		// then mark the status as `split_completed`.
-		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
+		this.#storage.kv.put<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, {
 			status: "split_started",
 			splitType,
 			createdAt: Date.now(),
@@ -988,7 +988,7 @@ export class PartitionTopologyImpl implements PartitionTopologySplitter {
 			}
 			: { ...splitStatus, migratedChildDoNames };
 
-		this.#storage.kv.put<SplitStatusKVItem>(PartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
+		this.#storage.kv.put<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
 	}
 
 	pickChildPartition(
