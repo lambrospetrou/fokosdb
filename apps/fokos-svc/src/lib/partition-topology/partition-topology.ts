@@ -963,14 +963,15 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		hashKey: string,
 		_sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		if (this.#_hashTopology) {
-			// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
-			// or 0 if the cache is not populated at all yet.
-			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
-			if (cachedDepth > 0) {
-				return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
-			}
-		}
+		// FIXME - THERE IS A BUG SOMEWHERE with the hash topology cache...
+		// if (this.#_hashTopology) {
+		// 	// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
+		// 	// or 0 if the cache is not populated at all yet.
+		// 	const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
+		// 	if (cachedDepth > 0) {
+		// 		return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
+		// 	}
+		// }
 		// Default to immediate child partitions.
 		return this.pickDescendantHashPartition(partitionContext, hashKey, 1);
 	}

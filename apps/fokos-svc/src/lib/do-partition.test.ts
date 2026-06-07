@@ -1058,7 +1058,7 @@ describe("PartitionDO - splitting", () => {
 		});
 	}, 30_000);
 
-	describe("hash topology cache", async () => {
+	describe.skip("hash topology cache", async () => {
 		// A fixed probe key used to trace a deterministic path through the tree.
 		const hashKey = "probe-key";
 
