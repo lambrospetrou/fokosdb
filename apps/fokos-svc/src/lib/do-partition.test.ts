@@ -2,8 +2,9 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, RANGE_PROMOTION_FRACTION, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
+import { HashPartitionTopologyImpl, PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, RANGE_PROMOTION_FRACTION, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
 import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
+import invariant from "./invariant.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
@@ -718,7 +719,7 @@ describe("PartitionDO - splitting", () => {
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", databaseName: ctx.databaseName });
 
-		const childNames = topologyRouter.calculateChildPartitionIds(parentState.partitionContext!.partitionId, 2).map((c) => c.doName);
+		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext!).map((c) => c.doName);
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
@@ -851,13 +852,12 @@ describe("PartitionDO - splitting", () => {
 			expect,
 		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 			// Trigger the split condition and drain the tree so all migrations complete.
 			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
 
-			const childNames = topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN).map((c) => c.doName);
+			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
 			const hashKey = "forwarded-key";
 			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val" });
@@ -956,7 +956,11 @@ describe("PartitionDO - splitting", () => {
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
+			let topology: HashPartitionTopologyImpl;
+			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
+				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+			});
+			invariant(topology!, "topology should be initialized in the DO instance");
 
 			// Root splits into two children.
 			await triggerHashSplitThreshold(stub, ctx, 1);
@@ -968,7 +972,7 @@ describe("PartitionDO - splitting", () => {
 			expect(r1.meta.forwardCount).toBe(1);
 
 			// Split the child that owns hashKey.
-			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, hashKey);
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 			await triggerHashSplitThreshold(childStub, childCtx, 1);
 			await drainSplitTree(childStub);
@@ -981,11 +985,15 @@ describe("PartitionDO - splitting", () => {
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
+			let topology: HashPartitionTopologyImpl;
+			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
+				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+			});
+			invariant(topology!, "topology should be initialized in the DO instance");
 
 			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
-			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, hashKey);
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 			await triggerHashSplitThreshold(childStub, childCtx, 1);
 			await drainSplitTree(childStub);
@@ -1003,12 +1011,16 @@ describe("PartitionDO - splitting", () => {
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
+			let topology: HashPartitionTopologyImpl;
+			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
+				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+			});
+			invariant(topology!, "topology should be initialized in the DO instance");
 
 			// Build a two-level tree: root → child → grandchild.
 			await triggerHashSplitThreshold(stub, ctx, 1);
 			await drainSplitTree(stub);
-			const { partitionContext: childCtx } = topologyRouter.pickChildPartition(ctx, hashKey);
+			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, hashKey);
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 			await triggerHashSplitThreshold(childStub, childCtx, 1);
 			await drainSplitTree(childStub);
@@ -1018,7 +1030,7 @@ describe("PartitionDO - splitting", () => {
 			expect(r1.meta.hashDepth).toBe(2);
 
 			// Now split the grandchild, making it a router for great-grandchildren.
-			const { partitionContext: grandchildCtx } = topologyRouter.pickDescendantHashPartition(ctx, hashKey, 2);
+			const { partitionContext: grandchildCtx } = topology.pickDescendantHashPartition(ctx, hashKey, 2);
 			const grandchildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(grandchildCtx.doName));
 			await triggerHashSplitThreshold(grandchildStub, grandchildCtx, 1);
 			await drainSplitTree(grandchildStub);
@@ -1115,12 +1127,11 @@ describe("PartitionDO - splitting", () => {
 			// The child DO names are deterministic, and miniflare keeps the same instance when
 			// initFromSplit + triggerMigration are called during the parent alarm — so the hook
 			// is already in place when runMigration runs, blocking it before migration_completed.
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 			let releaseMigration!: () => void;
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
 			});
-			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN)) {
+			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
 				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
 					instance.__testing__beforeMigrationComplete = () => migrationGate;
 				});
@@ -1162,12 +1173,11 @@ describe("PartitionDO - splitting", () => {
 			await triggerHashSplitThreshold(stub, ctx, 1);
 
 			// Pre-install gate on all children before the parent alarm fires.
-			const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 			let releaseMigration!: () => void;
 			const migrationGate = new Promise<void>((resolve) => {
 				releaseMigration = resolve;
 			});
-			for (const { doName } of topologyRouter.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN)) {
+			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
 				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
 					instance.__testing__beforeMigrationComplete = () => migrationGate;
 				});
@@ -1271,7 +1281,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 0, 0, 0]));
 
 		// Children: [version=0, rootIdx=0 (2 bytes), depth=1, childIdx=i]
-		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
+		const children = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
 		for (let i = 0; i < children.length; i++) {
 			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
 			expect(children[i].doName).toBe(`${ctx.databaseName}.h.0.${i}`);
@@ -1331,52 +1341,61 @@ describe("PartitionDO - partitionId encoding", () => {
 		});
 	});
 
-	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", ({ expect }) => {
+	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", async ({ expect }) => {
 		// This test guards the entropy consistency between the two methods.
 		// If the depth offset used in one changes without the other, routing will silently
 		// assign keys to different partitions than the migration check expects.
-		const { ctx } = makeStub({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 100 } });
-		const router = new PartitionTopologyRouterImpl(ctx);
+		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 100 } });
+		let topology: HashPartitionTopologyImpl;
+		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
+			topology = new HashPartitionTopologyImpl(pCtx, ctx);
+		});
+		invariant(topology!, "topology should be initialized in the DO instance");
 		const hashKey = "routing-consistency-key";
 
 		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
-		const { partitionContext: child } = router.pickChildPartition(ctx, hashKey);
-		const level1Siblings = router.calculateChildPartitionIds(ctx.partitionId, ctx.hashSplitN);
+		const { partitionContext: child } = topology.pickChildPartition(pCtx, hashKey);
+		const level1Siblings = PartitionIdHelper.calculateHashChildPartitionIds(pCtx);
 		for (const sib of level1Siblings) {
-			const sibCtx: PartitionContextResolved = { ...ctx, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
-			expect(router.makeIsCorrectChildHashPartition(ctx, sibCtx)(hashKey)).toBe(sib.doName === child.doName);
+			const sibCtx: PartitionContextResolved = { ...pCtx, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
+			expect(topology.makeIsCorrectChildHashPartition(pCtx, sibCtx)(hashKey)).toBe(sib.doName === child.doName);
 		}
 
 		// Depth 1 → 2: same invariant one level deeper.
-		const { partitionContext: grandchild } = router.pickChildPartition(child, hashKey);
-		const level2Siblings = router.calculateChildPartitionIds(child.partitionId, child.hashSplitN);
+		const { partitionContext: grandchild } = topology.pickChildPartition(child, hashKey);
+		const level2Siblings = PartitionIdHelper.calculateHashChildPartitionIds(child);
 		for (const sib of level2Siblings) {
 			const sibCtx: PartitionContextResolved = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
-			expect(router.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(sib.doName === grandchild.doName);
+			expect(topology.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(sib.doName === grandchild.doName);
 		}
 	});
 
 	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
-
+		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		let topology: HashPartitionTopologyImpl;
+		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
+			topology = new HashPartitionTopologyImpl(pCtx, ctx);
+		});
+		invariant(topology!, "topology should be initialized in the DO instance");
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v" });
+		await stub.putItem(pCtx, { hashKey: "hk", sortKey: "sk", data: "v" });
 		const rootState = await stub.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(ctx.partitionId));
+		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(pCtx.partitionId));
 
 		// Trigger a split so children are initialized with their own cached bytes.
-		await triggerHashSplitThreshold(stub, ctx, 1);
+		await triggerHashSplitThreshold(stub, pCtx, 1);
 		await waitForAlarm(stub);
 
-		const children = topologyRouter.calculateChildPartitionIds(ctx.partitionId, 2);
-		for (const child of children) {
-			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
-			const childState = await childStub.status();
-			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-			expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.partitionIdOpaque));
-		}
+		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
+			const children = topology.childPartitionContexts();
+			for (const child of children!) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
+				const childState = await childStub.status();
+				expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
+				expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.partitionId));
+			}
+		});
 	});
 });
 

@@ -160,60 +160,6 @@ export class PartitionContextCreator {
 	}
 }
 
-export interface PartitionTopologyRouter {
-	partitionContext(): PartitionContext;
-
-	/**
-	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
-	 * @param hashKey
-	 * @param sortKey
-	 */
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
-
-	/**
-	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
-	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
-	 * @param partitionContext
-	 * @param hashKey
-	 * @param sortKey
-	 */
-	pickChildPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
-
-	/**
-	 * Like pickChildPartition but skips `relativeDepth` levels in one shot, computing the
-	 * descendant partition ID deterministically from the hash key and the owner's depth.
-	 * Used by the topology cache to skip known intermediate router hops.
-	 */
-	pickDescendantHashPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		relativeDepth: number,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
-
-	calculateChildPartitionIds(
-		parentPartitionIdOpaque: string,
-		N: number,
-	): {
-		doName: string;
-		partitionIdOpaque: string;
-	}[];
-
-	makeIsCorrectChildHashPartition(
-		parentContext: PartitionContextResolved,
-		childContext: PartitionContextResolved,
-	): (hashKey: string, sortKey?: string) => boolean;
-
-	/**
-	 * Returns a PartitionContextResolved for every root partition in the topology.
-	 * Used as the starting points for full-tree traversal (e.g. destroy).
-	 */
-	rootPartitionContexts(): PartitionContextResolved[];
-}
-
 // PartitionTopologyEncoded and TopologyNode are re-exported from ./types.js above.
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
@@ -385,6 +331,28 @@ export class PartitionIdHelper {
 		return bytes[3 + bytes[3]];
 	}
 
+	/**
+	 * Refactor maybe to have different classes for hash and range partition IDs, to avoid the need for schema checks in these helper methods.
+	 */
+	static calculateHashChildPartitionIds(
+		parentContext: PartitionContextResolved,
+	): {
+		doName: string;
+		partitionIdOpaque: string;
+	}[] {
+		const parentBytes = Uint8Array.fromHex(parentContext.partitionId);
+		invariant(parentBytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${parentBytes[0]}`);
+		const result = Array.from({ length: parentContext.hashSplitN }, (_, i) => {
+			const { doName, opaque } = new PartitionIdHelper(parentContext, parentBytes).appendHashIdx(i).encode(true);
+			return {
+				doName: doName!,
+				partitionIdOpaque: opaque,
+			};
+		});
+		invariant(result.length === parentContext.hashSplitN, `fokos/topology.calculateChildPartitionIds: expected ${parentContext.hashSplitN} children, got ${result.length}`);
+		return result;
+	}
+
 	#bytes: Uint8Array | undefined;
 	#appendedHashIdxs: number[];
 
@@ -443,6 +411,23 @@ export class PartitionIdHelper {
 	}
 }
 
+export interface PartitionTopologyRouter {
+	partitionContext(): PartitionContext;
+
+	/**
+	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
+	 * @param hashKey
+	 * @param sortKey
+	 */
+	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+
+	/**
+	 * Returns a PartitionContextResolved for every root partition in the topology.
+	 * Used as the starting points for full-tree traversal (e.g. destroy).
+	 */
+	rootPartitionContexts(): PartitionContextResolved[];
+}
+
 /**
  * Used by the FokosDB to route requests to the right partition DO based on the provided partition context and keys.
  */
@@ -456,90 +441,13 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		// this.#topology = ...
 	}
 
-
-
 	partitionContext(): PartitionContext {
 		return this.basePartitionContext;
 	}
 
-	calculateChildPartitionIds(
-		parentPartitionIdOpaque: string,
-		N: number,
-	): {
-		doName: string;
-		partitionIdOpaque: string;
-	}[] {
-		const parentBytes = Uint8Array.fromHex(parentPartitionIdOpaque);
-		const result = Array.from({ length: N }, (_, i) => {
-			const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, parentBytes).appendHashIdx(i).encode(true);
-			return {
-				doName: doName!,
-				partitionIdOpaque: opaque,
-			};
-		});
-		invariant(result.length === N, `fokos/topology.calculateChildPartitionIds: expected ${N} children, got ${result.length}`);
-		return result;
-	}
-
-	makeIsCorrectChildHashPartition(
-		parentContext: PartitionContextResolved,
-		childContext: PartitionContextResolved,
-	): (hashKey: string, sortKey?: string) => boolean {
-		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
-		const childLevel = PartitionIdHelper.depth(childPartitionIdBytes);
-		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
-		const childIdx = PartitionIdHelper.lastChildIdx(childPartitionIdBytes);
-		invariant(
-			childIdx < childContext.hashSplitN,
-			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitN}`,
-		);
-		return (hashKey: string, sortKey?: string) => {
-			const hashedIdx = hashChildIndex(hashKey, childLevel - 1, childContext.hashSplitN);
-			return hashedIdx === childIdx;
-		};
-	}
-
-	pickDescendantHashPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		relativeDepth: number,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
-		const depth = PartitionIdHelper.depth(partitionIdBytes);
-
-		const hashIdxs: number[] = [];
-		for (let i = 0; i < relativeDepth; i++) {
-			hashIdxs.push(hashChildIndex(hashKey, depth + i, partitionContext.hashSplitN));
-		}
-
-		const { doName, opaque } = new PartitionIdHelper(this.basePartitionContext, partitionIdBytes)
-			.appendHashIdx(hashIdxs)
-			.encode(true);
-		assertExists(doName);
-
-		const { ns } = this.basePartitionContext;
-		const doId = env[ns].idFromName(doName);
-		return {
-			doId,
-			partitionContext: {
-				...partitionContext,
-				doName,
-				primaryDoIdStr: doId.toString(),
-				partitionId: opaque,
-			},
-		};
-	}
-
-	// Used by the Partition DOs to route requests to their children during the lazy split migration of data.
-	// This routes to the child partition directly without necessary having the most up-to-date topology in-memory.
-	pickChildPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		_sortKey?: string,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		return this.pickDescendantHashPartition(partitionContext, hashKey, 1);
-	}
-
+	/**
+	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
+	 */
 	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey });
 		const { ns } = this.basePartitionContext;
@@ -638,6 +546,8 @@ export type SplitStatusKVItem =
 	};
 
 export interface PartitionTopologySplitter {
+	childPartitionContexts(): PartitionContextResolved[] | undefined;
+
 	splitStatus(): SplitStatusKVItem | undefined;
 
 	/**
@@ -678,17 +588,6 @@ export interface PartitionTopologySplitter {
 		sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 
-	pickDescendantHashPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		relativeDepth: number,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
-
-	makeIsCorrectChildHashPartition(
-		parentContext: PartitionContextResolved,
-		childContext: PartitionContextResolved,
-	): (hashKey: string, sortKey?: string) => boolean;
-
 	/**
 	 * Called after a forwarded request returns. Updates the topology cache from the response and
 	 * returns the value to add to `result.meta.hashDepth` for the caller's response (0 for range forwards).
@@ -724,9 +623,9 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	constructor(
 		private readonly partitionContext: PartitionContextResolved,
-		private readonly ctx: DurableObjectState,
+		private readonly doCtx: DurableObjectState,
 	) {
-		this.#storage = ctx.storage;
+		this.#storage = doCtx.storage;
 		// FIXME: Parse the topology only once!
 		this.#topologyRouter = new PartitionTopologyRouterImpl(partitionContext);
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
@@ -734,11 +633,11 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const ownerAbsDepth = PartitionIdHelper.depth(
 			partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId),
 		);
-		const snapshot = ctx.storage.kv.get<HashTopologySnapshot>("__topo_cache");
+		const snapshot = doCtx.storage.kv.get<HashTopologySnapshot>("__topo_cache");
 		if (snapshot) {
 			this.#_hashTopology = HashTopology.fromSnapshot(snapshot);
 		} else {
-			const splitStatus = ctx.storage.kv.get<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+			const splitStatus = doCtx.storage.kv.get<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 			if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
 				this.#_hashTopology = HashTopology.create(partitionContext.hashSplitN, ownerAbsDepth);
 			}
@@ -765,6 +664,13 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// All good!
 		return "ok";
+	}
+
+	childPartitionContexts(): PartitionContextResolved[] | undefined {
+		const splitStatus = this.splitStatus();
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			return splitStatus.childPartitionContexts;
+		}
 	}
 
 	splitStatus(): SplitStatusKVItem | undefined {
@@ -831,9 +737,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const splitType = splitStatus.splitType;
 		switch (splitType) {
 			case "hash":
-				const childIds = this.#topologyRouter.calculateChildPartitionIds(
-					this.partitionContext.partitionId,
-					this.partitionContext.hashSplitN,
+				const childIds = PartitionIdHelper.calculateHashChildPartitionIds(
+					this.partitionContext,
 				);
 				invariant(
 					childIds.length === this.partitionContext.hashSplitN,
@@ -1011,33 +916,74 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		this.#storage.kv.put<SplitStatusKVItem>(HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS, newStatus);
 	}
 
-	pickChildPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		if (this.#_hashTopology) {
-			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
-			if (cachedDepth > 1) {
-				return this.#topologyRouter.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
-			}
-		}
-		return this.#topologyRouter.pickChildPartition(partitionContext, hashKey, sortKey);
-	}
-
+	/**
+	 * Internally used by the Partition DOs to route requests to their children after a split happened.
+	 * This routes to a descendant partition directly according to the specified relative depth.
+	 *
+	 * Skips `relativeDepth` levels in one shot, computing the descendant partition ID deterministically from the hash key and the owner's depth.
+	 * Used by the topology cache to skip known intermediate router hops.
+	 */
 	pickDescendantHashPartition(
 		partitionContext: PartitionContextResolved,
 		hashKey: string,
 		relativeDepth: number,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		return this.#topologyRouter.pickDescendantHashPartition(partitionContext, hashKey, relativeDepth);
+		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
+		const depth = PartitionIdHelper.depth(partitionIdBytes);
+
+		const hashIdxs: number[] = [];
+		for (let i = 0; i < relativeDepth; i++) {
+			hashIdxs.push(hashChildIndex(hashKey, depth + i, partitionContext.hashSplitN));
+		}
+
+		const { doName, opaque } = new PartitionIdHelper(this.partitionContext, partitionIdBytes)
+			.appendHashIdx(hashIdxs)
+			.encode(true);
+		assertExists(doName);
+
+		const { ns } = this.partitionContext;
+		const doId = env[ns].idFromName(doName);
+		return {
+			doId,
+			partitionContext: {
+				...partitionContext,
+				doName,
+				primaryDoIdStr: doId.toString(),
+				partitionId: opaque,
+			},
+		};
+	}
+
+	pickChildPartition(
+		partitionContext: PartitionContextResolved,
+		hashKey: string,
+		_sortKey?: string,
+	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+		if (this.#_hashTopology) {
+			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
+			if (cachedDepth > 1) {
+				return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
+			}
+		}
+		return this.pickDescendantHashPartition(partitionContext, hashKey, 1);
 	}
 
 	makeIsCorrectChildHashPartition(
-		parentContext: PartitionContextResolved,
+		_parentContext: PartitionContextResolved,
 		childContext: PartitionContextResolved,
 	): (hashKey: string, sortKey?: string) => boolean {
-		return this.#topologyRouter.makeIsCorrectChildHashPartition(parentContext, childContext);
+		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
+		const childLevel = PartitionIdHelper.depth(childPartitionIdBytes);
+		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
+		const childIdx = PartitionIdHelper.lastChildIdx(childPartitionIdBytes);
+		invariant(
+			childIdx < childContext.hashSplitN,
+			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitN}`,
+		);
+		return (hashKey: string, sortKey?: string) => {
+			const hashedIdx = hashChildIndex(hashKey, childLevel - 1, childContext.hashSplitN);
+			return hashedIdx === childIdx;
+		};
 	}
 
 	recordForwardResult(
@@ -1094,6 +1040,14 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 	splitStatus(): SplitStatusKVItem | undefined {
 		return this.#storage.kv.get<SplitStatusKVItem>(RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
+	}
+
+	childPartitionContexts(): PartitionContextResolved[] | undefined {
+		const splitStatus = this.splitStatus();
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			return splitStatus.childPartitionContexts;
+		}
+		return undefined;
 	}
 
 	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
@@ -1295,22 +1249,6 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const childId = env[partitionContext.ns].idFromName(best.doName);
 		return { doId: childId, partitionContext: best };
-	}
-
-	pickDescendantHashPartition(
-		_partitionContext: PartitionContextResolved,
-		_hashKey: string,
-		_relativeDepth: number,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		invariant(false, "fokos/range: pickDescendantHashPartition is not applicable to range DOs");
-	}
-
-	makeIsCorrectChildHashPartition(
-		_parentContext: PartitionContextResolved,
-		_childContext: PartitionContextResolved,
-	): (hashKey: string, sortKey?: string) => boolean {
-		// Range DOs route by sort-key range, not by hash. This method is not applicable.
-		invariant(false, "fokos/range: makeIsCorrectChildHashPartition is not applicable to range DOs");
 	}
 
 	acknowledgeChildMigration(childDoName: string): void {

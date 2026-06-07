@@ -485,7 +485,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Hash-child migration.
-		const topology = this.ensureTopology(pCtx);
+		const topology = this.ensureHashTopology(pCtx);
 		const splitStatus = topology.splitStatus();
 		// Allowed at split_completed: the items table is not deleted at split_completed (only pending_transactions is),
 		// so children with racy migration jobs can still fetch item batches after the last sibling has acknowledged.
@@ -659,7 +659,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Hash-child migration.
-		const topology = this.ensureTopology(pCtx);
+		const topology = this.ensureHashTopology(pCtx);
 		const splitStatus = topology.splitStatus();
 		// Allowed at split_completed: pending_transactions is deleted atomically with the split_completed transition
 		// (acknowledgeChildMigrationComplete), so a call at split_completed returns empty results, which is correct —
@@ -727,7 +727,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: PromotedKeyCursor | null;
 	}): Promise<{ rows: { hash_key: string; status: PromotedKeyStatus }[]; nextCursor: PromotedKeyCursor | null }> {
 		const pCtx = this.pCtx();
-		const isCorrectChild = this.ensureTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
+		const isCorrectChild = this.ensureHashTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
 		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
 		const SCAN_LIMIT = 10_000;
@@ -1182,6 +1182,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
 		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
 		return this.#_partitionContext;
+	}
+
+	private ensureHashTopology(pCtx: PartitionContextResolved): HashPartitionTopologyImpl {
+		const topology = this.ensureTopology(pCtx);
+		invariant(topology instanceof HashPartitionTopologyImpl, "fokos/partition: expected hash partition topology");
+		return topology;
 	}
 
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
