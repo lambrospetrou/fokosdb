@@ -270,6 +270,26 @@ export class PartitionIdHelper {
 	static readonly SCHEMA_HASH_V1 = 0x00 as const;
 	static readonly SCHEMA_RANGE_V1 = 0x01 as const;
 
+	static partitionIdToBytes(partitionId: PartitionNodeId): Uint8Array {
+		return Uint8Array.fromHex(partitionId);
+	}
+
+	static isHashPartition(partitionId: PartitionNodeId): boolean {
+		// PartitionID are hex-encoded bytes with a schema version byte prefix,
+		// so we can peek the first byte to determine the type without full decoding.
+		// This is important for efficient routing in the DOs.
+		const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
+		return bytes === PartitionIdHelper.SCHEMA_HASH_V1;
+	}
+
+	static isRangePartition(partitionId: PartitionNodeId): boolean {
+		// PartitionID are hex-encoded bytes with a schema version byte prefix,
+		// so we can peek the first byte to determine the type without full decoding.
+		// This is important for efficient routing in the DOs.
+		const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
+		return bytes === PartitionIdHelper.SCHEMA_RANGE_V1;
+	}
+
 	static doName(basePartitionContext: PartitionContext, bytes: Uint8Array): string {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			const root = (bytes[1] << 8) | bytes[2];
