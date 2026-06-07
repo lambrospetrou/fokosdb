@@ -9,6 +9,7 @@
 		"deploy": "wrangler deploy --secrets-file .env.production",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
+		"k6:remote": "npx dotenv -e tools/.env.production -- k6 run tools/k6_basic.js",
 		"test": "npm run check && vitest run --printConsoleTrace",
 		"test:hurl": "npx dotenv -e test/hurl/.env.dev-hurl -- hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2 test/hurl/*.hurl",
 		"test:hurl:run": "npx dotenv -e test/hurl/.env.dev-hurl --  hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2",

@@ -9,6 +9,7 @@ import { check } from "k6";
 
 const BASE_URL = __ENV.BASE_URL || "http://localhost:8787";
 const DB_NAME = __ENV.DB_NAME || new Date().toDateString().replaceAll(" ", "_").toLowerCase();
+const FOKOS_API_TOKEN = __ENV.FOKOS_API_TOKEN || "dev-token-1";
 
 export const options = {
 	scenarios: {
@@ -57,7 +58,10 @@ export default function () {
 	});
 
 	const params = {
-		headers: { "Content-Type": "application/json" },
+		headers: {
+			"Content-Type": "application/json",
+			"x-fokos-secret-token": FOKOS_API_TOKEN,
+		},
 	};
 
 	const putRes = http.post(`${BASE_URL}/api/rpc/k6_${DB_NAME}/putItem`, payload, params);
