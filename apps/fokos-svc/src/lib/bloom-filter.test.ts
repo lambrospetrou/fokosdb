@@ -63,104 +63,107 @@ const CONFIGS = [
 // Core suite — runs for every configuration above
 // ---------------------------------------------------------------------------
 
-describe.each(CONFIGS)("BloomFilter — $name", ({ options, keysToAdd, expectedMinLayers, expectedMaxLayers }) => {
-	function make() {
-		return BloomFilter.create(options);
-	}
-
-	it("has() returns false for every key on a fresh empty filter", () => {
-		const f = make();
-		for (const k of absentKeys(20)) {
-			expect(f.has(k)).toBe(false);
+describe.each(CONFIGS)(
+	"BloomFilter — $name",
+	({ options, keysToAdd, expectedMinLayers, expectedMaxLayers }) => {
+		function make() {
+			return BloomFilter.create(options);
 		}
-	});
 
-	it("add() returns true for every key within capacity", () => {
-		const f = make();
-		for (const k of addedKeys(keysToAdd)) {
-			expect(f.add(k)).toBe(true);
-		}
-	});
+		it("has() returns false for every key on a fresh empty filter", () => {
+			const f = make();
+			for (const k of absentKeys(20)) {
+				expect(f.has(k)).toBe(false);
+			}
+		});
 
-	it("has() returns true for all added keys (no false negatives)", () => {
-		const f = make();
-		const keys = addedKeys(keysToAdd);
-		for (const k of keys) f.add(k);
-		for (const k of keys) {
-			expect(f.has(k)).toBe(true);
-		}
-	});
+		it("add() returns true for every key within capacity", () => {
+			const f = make();
+			for (const k of addedKeys(keysToAdd)) {
+				expect(f.add(k)).toBe(true);
+			}
+		});
 
-	it("keyCount() reflects insertions accurately", () => {
-		const f = make();
-		expect(f.keyCount()).toBe(0);
-		const keys = addedKeys(keysToAdd);
-		for (let i = 0; i < keys.length; i++) {
-			f.add(keys[i]);
-			expect(f.keyCount()).toBe(i + 1);
-		}
-	});
+		it("has() returns true for all added keys (no false negatives)", () => {
+			const f = make();
+			const keys = addedKeys(keysToAdd);
+			for (const k of keys) f.add(k);
+			for (const k of keys) {
+				expect(f.has(k)).toBe(true);
+			}
+		});
 
-	it("adding the same key twice increments keyCount twice (no deduplication)", () => {
-		const f = make();
-		f.add("dup");
-		f.add("dup");
-		expect(f.keyCount()).toBe(2);
-	});
+		it("keyCount() reflects insertions accurately", () => {
+			const f = make();
+			expect(f.keyCount()).toBe(0);
+			const keys = addedKeys(keysToAdd);
+			for (let i = 0; i < keys.length; i++) {
+				f.add(keys[i]);
+				expect(f.keyCount()).toBe(i + 1);
+			}
+		});
 
-	it("creates the expected number of layers for the given key count", () => {
-		const f = make();
-		for (const k of addedKeys(keysToAdd)) f.add(k);
-		const layerCount = f.toSnapshot().layers.length;
-		expect(layerCount).toBeGreaterThanOrEqual(expectedMinLayers);
-		expect(layerCount).toBeLessThanOrEqual(expectedMaxLayers);
-	});
+		it("adding the same key twice increments keyCount twice (no deduplication)", () => {
+			const f = make();
+			f.add("dup");
+			f.add("dup");
+			expect(f.keyCount()).toBe(2);
+		});
 
-	it("toSnapshot/fromSnapshot: restored filter finds all previously added keys", () => {
-		const f = make();
-		const keys = addedKeys(keysToAdd);
-		for (const k of keys) f.add(k);
+		it("creates the expected number of layers for the given key count", () => {
+			const f = make();
+			for (const k of addedKeys(keysToAdd)) f.add(k);
+			const layerCount = f.toSnapshot().layers.length;
+			expect(layerCount).toBeGreaterThanOrEqual(expectedMinLayers);
+			expect(layerCount).toBeLessThanOrEqual(expectedMaxLayers);
+		});
 
-		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
+		it("toSnapshot/fromSnapshot: restored filter finds all previously added keys", () => {
+			const f = make();
+			const keys = addedKeys(keysToAdd);
+			for (const k of keys) f.add(k);
 
-		for (const k of keys) {
-			expect(restored.has(k)).toBe(true);
-		}
-	});
+			const restored = BloomFilter.fromSnapshot(f.toSnapshot());
 
-	it("toSnapshot/fromSnapshot: keyCount is preserved", () => {
-		const f = make();
-		for (const k of addedKeys(keysToAdd)) f.add(k);
+			for (const k of keys) {
+				expect(restored.has(k)).toBe(true);
+			}
+		});
 
-		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
-		expect(restored.keyCount()).toBe(keysToAdd);
-	});
+		it("toSnapshot/fromSnapshot: keyCount is preserved", () => {
+			const f = make();
+			for (const k of addedKeys(keysToAdd)) f.add(k);
 
-	it("toSnapshot/fromSnapshot: snapshot fields match the creation options", () => {
-		const f = make();
-		const snap = f.toSnapshot();
+			const restored = BloomFilter.fromSnapshot(f.toSnapshot());
+			expect(restored.keyCount()).toBe(keysToAdd);
+		});
 
-		expect(snap.version).toBe(1);
-		expect(snap.errorRate).toBe(options?.errorRate ?? 0.01);
-		expect(snap.maxSizeBytes).toBe(options.maxSizeBytes);
-		expect(snap.initialCapacityN).toBe(options?.initialCapacityN ?? 1024);
-		expect(snap.layers.length).toBeGreaterThanOrEqual(1);
-	});
+		it("toSnapshot/fromSnapshot: snapshot fields match the creation options", () => {
+			const f = make();
+			const snap = f.toSnapshot();
 
-	it("toSnapshot/fromSnapshot: restored filter correctly accepts new keys after restore", () => {
-		const f = make();
-		const before = addedKeys(keysToAdd);
-		for (const k of before) f.add(k);
+			expect(snap.version).toBe(1);
+			expect(snap.errorRate).toBe(options?.errorRate ?? 0.01);
+			expect(snap.maxSizeBytes).toBe(options.maxSizeBytes);
+			expect(snap.initialCapacityN).toBe(options?.initialCapacityN ?? 1024);
+			expect(snap.layers.length).toBeGreaterThanOrEqual(1);
+		});
 
-		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
-		const after = Array.from({ length: 10 }, (_, i) => `post-restore-${i}`);
-		for (const k of after) restored.add(k);
+		it("toSnapshot/fromSnapshot: restored filter correctly accepts new keys after restore", () => {
+			const f = make();
+			const before = addedKeys(keysToAdd);
+			for (const k of before) f.add(k);
 
-		for (const k of before) expect(restored.has(k)).toBe(true);
-		for (const k of after) expect(restored.has(k)).toBe(true);
-		expect(restored.keyCount()).toBe(keysToAdd + 10);
-	});
-});
+			const restored = BloomFilter.fromSnapshot(f.toSnapshot());
+			const after = Array.from({ length: 10 }, (_, i) => `post-restore-${i}`);
+			for (const k of after) restored.add(k);
+
+			for (const k of before) expect(restored.has(k)).toBe(true);
+			for (const k of after) expect(restored.has(k)).toBe(true);
+			expect(restored.keyCount()).toBe(keysToAdd + 10);
+		});
+	},
+);
 
 // ---------------------------------------------------------------------------
 // maxSizeBytes enforcement
@@ -213,7 +216,10 @@ describe("BloomFilter — maxSizeBytes enforcement", () => {
 		// Fill to saturation.
 		let saturated = false;
 		for (let i = 0; i < 100_000; i++) {
-			if (!f.add(`key-${i}`)) { saturated = true; break; }
+			if (!f.add(`key-${i}`)) {
+				saturated = true;
+				break;
+			}
 		}
 		expect(saturated).toBe(true);
 		// All subsequent attempts must also fail.

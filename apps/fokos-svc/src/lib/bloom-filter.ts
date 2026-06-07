@@ -86,109 +86,120 @@ const TIGHTENING_RATIO = 0.5;
 const LAYER_GROWTH_FACTOR = 2;
 
 interface Layer {
-    bits: Uint8Array;
-    capacity: number;
-    count: number;
-    k: number;
-    m: number;
-    layerIndex: number;
+	bits: Uint8Array;
+	capacity: number;
+	count: number;
+	k: number;
+	m: number;
+	layerIndex: number;
 }
 
 interface LayerSnapshot {
-    bits: number[];
-    capacity: number;
-    count: number;
-    k: number;
-    m: number;
-    layerIndex: number;
+	bits: number[];
+	capacity: number;
+	count: number;
+	k: number;
+	m: number;
+	layerIndex: number;
 }
 
 export interface BloomFilterSnapshot {
-    version: 1;
-    errorRate: number;
-    maxSizeBytes: number;
-    initialCapacityN: number;
-    layers: LayerSnapshot[];
+	version: 1;
+	errorRate: number;
+	maxSizeBytes: number;
+	initialCapacityN: number;
+	layers: LayerSnapshot[];
 }
 
 export class BloomFilter {
-    private readonly layers: Layer[];
-    private readonly errorRate: number;
-    private readonly maxSizeBytes: number;
-    private readonly initialCapacityN: number;
-    private usedBytes: number;
+	private readonly layers: Layer[];
+	private readonly errorRate: number;
+	private readonly maxSizeBytes: number;
+	private readonly initialCapacityN: number;
+	private usedBytes: number;
 
-    private constructor(layers: Layer[], errorRate: number, maxSizeBytes: number, initialCapacityN: number) {
-        this.layers = layers;
-        this.errorRate = errorRate;
-        this.maxSizeBytes = maxSizeBytes;
-        this.initialCapacityN = initialCapacityN;
-        this.usedBytes = layers.reduce((sum, l) => sum + l.bits.byteLength, 0);
-    }
+	private constructor(
+		layers: Layer[],
+		errorRate: number,
+		maxSizeBytes: number,
+		initialCapacityN: number,
+	) {
+		this.layers = layers;
+		this.errorRate = errorRate;
+		this.maxSizeBytes = maxSizeBytes;
+		this.initialCapacityN = initialCapacityN;
+		this.usedBytes = layers.reduce((sum, l) => sum + l.bits.byteLength, 0);
+	}
 
-    static create(options: { errorRate?: number; maxSizeBytes: number; initialCapacityN?: number }): BloomFilter {
-        const errorRate = options.errorRate ?? DEFAULT_ERROR_RATE;
-        const initialCapacityN = options.initialCapacityN ?? DEFAULT_INITIAL_CAPACITY;
-        const firstBytes = layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
-        if (firstBytes > options.maxSizeBytes) {
-            throw new Error(
-                `maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`,
-            );
-        }
-        const first = buildLayer(0, errorRate, initialCapacityN);
-        return new BloomFilter([first], errorRate, options.maxSizeBytes, initialCapacityN);
-    }
+	static create(options: {
+		errorRate?: number;
+		maxSizeBytes: number;
+		initialCapacityN?: number;
+	}): BloomFilter {
+		const errorRate = options.errorRate ?? DEFAULT_ERROR_RATE;
+		const initialCapacityN = options.initialCapacityN ?? DEFAULT_INITIAL_CAPACITY;
+		const firstBytes = layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
+		if (firstBytes > options.maxSizeBytes) {
+			throw new Error(
+				`maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`,
+			);
+		}
+		const first = buildLayer(0, errorRate, initialCapacityN);
+		return new BloomFilter([first], errorRate, options.maxSizeBytes, initialCapacityN);
+	}
 
-    static fromSnapshot(snapshot: BloomFilterSnapshot): BloomFilter {
-        return new BloomFilter(
-            snapshot.layers.map(restoreLayer),
-            snapshot.errorRate,
-            snapshot.maxSizeBytes,
-            snapshot.initialCapacityN,
-        );
-    }
+	static fromSnapshot(snapshot: BloomFilterSnapshot): BloomFilter {
+		return new BloomFilter(
+			snapshot.layers.map(restoreLayer),
+			snapshot.errorRate,
+			snapshot.maxSizeBytes,
+			snapshot.initialCapacityN,
+		);
+	}
 
-    add(key: string): boolean {
-        const current = this.layers[this.layers.length - 1];
+	add(key: string): boolean {
+		const current = this.layers[this.layers.length - 1];
 
-        if (current.count >= current.capacity) {
-            const nextIndex = this.layers.length;
-            const nextBytes = layerByteSize(computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN));
-            if (this.usedBytes + nextBytes > this.maxSizeBytes) {
-                return false;
-            }
-            this.layers.push(buildLayer(nextIndex, this.errorRate, this.initialCapacityN));
-            this.usedBytes += nextBytes;
-        }
+		if (current.count >= current.capacity) {
+			const nextIndex = this.layers.length;
+			const nextBytes = layerByteSize(
+				computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN),
+			);
+			if (this.usedBytes + nextBytes > this.maxSizeBytes) {
+				return false;
+			}
+			this.layers.push(buildLayer(nextIndex, this.errorRate, this.initialCapacityN));
+			this.usedBytes += nextBytes;
+		}
 
-        layerAdd(this.layers[this.layers.length - 1], key);
-        return true;
-    }
+		layerAdd(this.layers[this.layers.length - 1], key);
+		return true;
+	}
 
-    has(key: string): boolean {
-        return this.layers.some((layer) => layerHas(layer, key));
-    }
+	has(key: string): boolean {
+		return this.layers.some((layer) => layerHas(layer, key));
+	}
 
-    keyCount(): number {
-        return this.layers.reduce((sum, layer) => sum + layer.count, 0);
-    }
+	keyCount(): number {
+		return this.layers.reduce((sum, layer) => sum + layer.count, 0);
+	}
 
-    toSnapshot(): BloomFilterSnapshot {
-        return {
-            version: 1,
-            errorRate: this.errorRate,
-            maxSizeBytes: this.maxSizeBytes,
-            initialCapacityN: this.initialCapacityN,
-            layers: this.layers.map((layer) => ({
-                bits: Array.from(layer.bits),
-                capacity: layer.capacity,
-                count: layer.count,
-                k: layer.k,
-                m: layer.m,
-                layerIndex: layer.layerIndex,
-            })),
-        };
-    }
+	toSnapshot(): BloomFilterSnapshot {
+		return {
+			version: 1,
+			errorRate: this.errorRate,
+			maxSizeBytes: this.maxSizeBytes,
+			initialCapacityN: this.initialCapacityN,
+			layers: this.layers.map((layer) => ({
+				bits: Array.from(layer.bits),
+				capacity: layer.capacity,
+				count: layer.count,
+				k: layer.k,
+				m: layer.m,
+				layerIndex: layer.layerIndex,
+			})),
+		};
+	}
 }
 
 /**
@@ -199,12 +210,12 @@ export class BloomFilter {
  * across all layers bounded regardless of how many layers exist.
  */
 function layerFpr(baseErrorRate: number, layerIndex: number): number {
-    return baseErrorRate * Math.pow(TIGHTENING_RATIO, layerIndex + 1);
+	return baseErrorRate * Math.pow(TIGHTENING_RATIO, layerIndex + 1);
 }
 
 /** Converts a bit count to the number of bytes needed to hold it. */
 function layerByteSize(m: number): number {
-    return Math.ceil(m / 8);
+	return Math.ceil(m / 8);
 }
 
 /**
@@ -220,10 +231,14 @@ function layerByteSize(m: number): number {
  * This function is intentionally separated from buildLayer so that the caller
  * can check whether the next layer fits within maxSizeBytes before allocating.
  */
-function computeLayerBitCount(layerIndex: number, baseErrorRate: number, initialCapacity: number): number {
-    const fpr = layerFpr(baseErrorRate, layerIndex);
-    const capacity = initialCapacity * Math.pow(LAYER_GROWTH_FACTOR, layerIndex);
-    return Math.ceil((-capacity * Math.log(fpr)) / (Math.LN2 * Math.LN2));
+function computeLayerBitCount(
+	layerIndex: number,
+	baseErrorRate: number,
+	initialCapacity: number,
+): number {
+	const fpr = layerFpr(baseErrorRate, layerIndex);
+	const capacity = initialCapacity * Math.pow(LAYER_GROWTH_FACTOR, layerIndex);
+	return Math.ceil((-capacity * Math.log(fpr)) / (Math.LN2 * Math.LN2));
 }
 
 /**
@@ -237,16 +252,23 @@ function computeLayerBitCount(layerIndex: number, baseErrorRate: number, initial
  * to at least 1 to guard against degenerate configurations at very small sizes.
  */
 function buildLayer(layerIndex: number, baseErrorRate: number, initialCapacity: number): Layer {
-    const fpr = layerFpr(baseErrorRate, layerIndex);
-    const capacity = initialCapacity * Math.pow(LAYER_GROWTH_FACTOR, layerIndex);
-    const m = Math.ceil((-capacity * Math.log(fpr)) / (Math.LN2 * Math.LN2));
-    const k = Math.max(1, Math.round((m / capacity) * Math.LN2));
-    return { bits: new Uint8Array(layerByteSize(m)), capacity, count: 0, k, m, layerIndex };
+	const fpr = layerFpr(baseErrorRate, layerIndex);
+	const capacity = initialCapacity * Math.pow(LAYER_GROWTH_FACTOR, layerIndex);
+	const m = Math.ceil((-capacity * Math.log(fpr)) / (Math.LN2 * Math.LN2));
+	const k = Math.max(1, Math.round((m / capacity) * Math.LN2));
+	return { bits: new Uint8Array(layerByteSize(m)), capacity, count: 0, k, m, layerIndex };
 }
 
 /** Restores an inner filter layer from its snapshot representation. */
 function restoreLayer(s: LayerSnapshot): Layer {
-    return { bits: new Uint8Array(s.bits), capacity: s.capacity, count: s.count, k: s.k, m: s.m, layerIndex: s.layerIndex };
+	return {
+		bits: new Uint8Array(s.bits),
+		capacity: s.capacity,
+		count: s.count,
+		k: s.k,
+		m: s.m,
+		layerIndex: s.layerIndex,
+	};
 }
 
 /**
@@ -264,13 +286,13 @@ function restoreLayer(s: LayerSnapshot): Layer {
  * is required for the combined FPR bound to hold.
  */
 function bitPositions(key: string, k: number, m: number, layerIndex: number): number[] {
-    const h1 = xxHash32(key, layerIndex * 2);
-    const h2 = xxHash32(key, layerIndex * 2 + 1) || 1;
-    const positions: number[] = [];
-    for (let i = 0; i < k; i++) {
-        positions.push((h1 + i * h2) % m);
-    }
-    return positions;
+	const h1 = xxHash32(key, layerIndex * 2);
+	const h2 = xxHash32(key, layerIndex * 2 + 1) || 1;
+	const positions: number[] = [];
+	for (let i = 0; i < k; i++) {
+		positions.push((h1 + i * h2) % m);
+	}
+	return positions;
 }
 
 /**
@@ -282,9 +304,9 @@ function bitPositions(key: string, k: number, m: number, layerIndex: number): nu
  * same positions, producing a false positive at rate layer_fpr(layerIndex).
  */
 function layerHas(layer: Layer, key: string): boolean {
-    return bitPositions(key, layer.k, layer.m, layer.layerIndex).every(
-        (pos) => (layer.bits[pos >> 3] & (1 << (pos & 7))) !== 0,
-    );
+	return bitPositions(key, layer.k, layer.m, layer.layerIndex).every(
+		(pos) => (layer.bits[pos >> 3] & (1 << (pos & 7))) !== 0,
+	);
 }
 
 /**
@@ -294,8 +316,8 @@ function layerHas(layer: Layer, key: string): boolean {
  * offset `pos & 7` (i.e. pos mod 8) within that byte.
  */
 function layerAdd(layer: Layer, key: string): void {
-    for (const pos of bitPositions(key, layer.k, layer.m, layer.layerIndex)) {
-        layer.bits[pos >> 3] |= 1 << (pos & 7);
-    }
-    layer.count++;
+	for (const pos of bitPositions(key, layer.k, layer.m, layer.layerIndex)) {
+		layer.bits[pos >> 3] |= 1 << (pos & 7);
+	}
+	layer.count++;
 }

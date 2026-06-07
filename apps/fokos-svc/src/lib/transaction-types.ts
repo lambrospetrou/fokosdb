@@ -36,11 +36,18 @@ export type PrepareRequest = {
 export type RejectionReason =
 	| { type: "condition_failed"; hashKey: string; sortKey?: string }
 	| { type: "timestamp_conflict"; hashKey: string; sortKey?: string }
-	| { type: "pending_conflict"; hashKey: string; sortKey?: string; conflictingTransactionId: TransactionId }
+	| {
+			type: "pending_conflict";
+			hashKey: string;
+			sortKey?: string;
+			conflictingTransactionId: TransactionId;
+	  }
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
 	| { type: "transient_error" };
 
-export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
+export type PrepareResponse =
+	| { outcome: "accepted" }
+	| { outcome: "rejected"; reason: RejectionReason };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -77,7 +84,13 @@ export type ReadForTransactionItemResult =
 			lastCommittedTs: TransactionTimestamp;
 			hasPendingWrite: boolean;
 	  }
-	| { found: false; hashKey: string; sortKey?: string; lastCommittedTs: TransactionTimestamp; hasPendingWrite: boolean };
+	| {
+			found: false;
+			hashKey: string;
+			sortKey?: string;
+			lastCommittedTs: TransactionTimestamp;
+			hasPendingWrite: boolean;
+	  };
 
 export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResult[];
@@ -85,7 +98,14 @@ export type ReadForTransactionResponse = {
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
-export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
+export type TCState =
+	| "CREATED"
+	| "PREPARING"
+	| "PREPARED"
+	| "COMMITTING"
+	| "COMMITTED"
+	| "CANCELLING"
+	| "CANCELLED";
 
 // ─── TransactionCoordinatorDO — recoverTransaction ───────────────────────────
 
@@ -123,7 +143,12 @@ export type InitiateWriteResponse =
 			idempotencyToken: IdempotencyToken;
 			items: Array<{ hashKey: string; sortKey?: string }>;
 	  }
-	| { outcome: "cancelled"; transactionId: TransactionId; idempotencyToken: IdempotencyToken; reason: RejectionReason };
+	| {
+			outcome: "cancelled";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			reason: RejectionReason;
+	  };
 
 export type TCReadItem = {
 	hashKey: string;

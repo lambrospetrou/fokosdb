@@ -1,7 +1,17 @@
-import { DeleteItemOptions, GetItemOptions, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
+import {
+	DeleteItemOptions,
+	GetItemOptions,
+	InitiateReadResponse,
+	InitiateWriteResponse,
+	PutItemOptions,
+} from "./types.js";
 import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { PartitionTopologyRouter, resolveRangePartitionContext, type PartitionContextResolved } from "./partition-topology/partition-topology.js";
+import {
+	PartitionTopologyRouter,
+	resolveRangePartitionContext,
+	type PartitionContextResolved,
+} from "./partition-topology/partition-topology.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
@@ -29,10 +39,16 @@ export class FokosDB {
 	constructor(options: FokosDBOptions) {
 		this.#options = {
 			...options,
-			numTransactionCoordinators: options.numTransactionCoordinators ?? DEFAULT_NUM_TRANSACTION_COORDINATORS,
+			numTransactionCoordinators:
+				options.numTransactionCoordinators ?? DEFAULT_NUM_TRANSACTION_COORDINATORS,
 		};
-		if (!Number.isInteger(this.#options.numTransactionCoordinators) || this.#options.numTransactionCoordinators <= 0) {
-			throw new Error("fokosdb: numTransactionCoordinators must be an integer greater or equal to 1");
+		if (
+			!Number.isInteger(this.#options.numTransactionCoordinators) ||
+			this.#options.numTransactionCoordinators <= 0
+		) {
+			throw new Error(
+				"fokosdb: numTransactionCoordinators must be an integer greater or equal to 1",
+			);
 		}
 		this.#staticShardedTCs = new StaticShardedDO(this.#options.transactionCoordinatorNs, {
 			numShards: this.#options.numTransactionCoordinators,
@@ -45,21 +61,30 @@ export class FokosDB {
 	}
 
 	async putItem(opts: PutItemOptions) {
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(
+			opts.hashKey,
+			opts.sortKey,
+		);
 		const ns = this.#options.ns;
 		const stub = ns.get(doId);
 		return await stub.putItem(partitionContext, opts);
 	}
 
 	async getItem(opts: GetItemOptions) {
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(
+			opts.hashKey,
+			opts.sortKey,
+		);
 		const ns = this.#options.ns;
 		const stub = ns.get(doId);
 		return await stub.getItem(partitionContext, opts);
 	}
 
 	async deleteItem(opts: DeleteItemOptions) {
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(
+			opts.hashKey,
+			opts.sortKey,
+		);
 		const ns = this.#options.ns;
 		const stub = ns.get(doId);
 		return await stub.deleteItem(partitionContext, opts);
@@ -85,24 +110,35 @@ export class FokosDB {
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
 		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
-		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
-			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, operations });
-		});
+		return await this.#staticShardedTCs.one(
+			idempotencyToken,
+			async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+				return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, operations });
+			},
+		);
 	}
 
-	async transactGetItems(opts: { items: Array<{ hashKey: string; sortKey?: string }> }): Promise<InitiateReadResponse> {
+	async transactGetItems(opts: {
+		items: Array<{ hashKey: string; sortKey?: string }>;
+	}): Promise<InitiateReadResponse> {
 		const items: TCReadItem[] = opts.items.map((item) => {
 			const { partitionContext } = this.#options.topology.pickPartition(item.hashKey, item.sortKey);
 			return { ...item, partitionContext };
 		});
 
-		return await tryWhile(async () => {
-			// Read-only TCs are ephemeral — random UUID, no client idempotency token needed.
-			// Even better using a different shard key each time to maximize chances of hitting different TCs if there is an overloaded one.
-			return await this.#staticShardedTCs.one(crypto.randomUUID(), async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
-				return await tcStub.initiateRead({ items });
-			});
-		}, (err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3);
+		return await tryWhile(
+			async () => {
+				// Read-only TCs are ephemeral — random UUID, no client idempotency token needed.
+				// Even better using a different shard key each time to maximize chances of hitting different TCs if there is an overloaded one.
+				return await this.#staticShardedTCs.one(
+					crypto.randomUUID(),
+					async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+						return await tcStub.initiateRead({ items });
+					},
+				);
+			},
+			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
+		);
 	}
 
 	async destroy(): Promise<{ ok: true }> {
@@ -129,7 +165,12 @@ export class FokosDB {
 			// Skip 'queued' keys — their range root is not created yet (nothing to destroy).
 			for (const { hashKey, status } of promotedKeys ?? []) {
 				if (status === "queued") continue;
-				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
+				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
+					ctx,
+					hashKey,
+					null,
+					null,
+				);
 				if (destroyedRangeRoots.has(rangeRootCtx.doName)) continue;
 				destroyedRangeRoots.add(rangeRootCtx.doName);
 				await destroyPartition(rangeRootCtx);
@@ -157,14 +198,22 @@ function validateTransactWriteItems(ops: TCWriteOperation[]): void {
 	let totalBytes = 0;
 	for (const op of ops) {
 		if (op.operation === "put" && op.data == null) {
-			throw new Error(`fokos: transactWriteItems "put" operation requires data (${op.hashKey}${op.sortKey ? `, ${op.sortKey}` : ""})`);
+			throw new Error(
+				`fokos: transactWriteItems "put" operation requires data (${op.hashKey}${op.sortKey ? `, ${op.sortKey}` : ""})`,
+			);
 		}
 		const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
-		if (seen.has(key)) throw new Error(`fokos: transactWriteItems duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
+		if (seen.has(key))
+			throw new Error(
+				`fokos: transactWriteItems duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`,
+			);
 		seen.add(key);
-		if (op.data) totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
+		if (op.data)
+			totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
 	}
 	if (totalBytes > DEFAULT_TRANSACTION_MAX_SIZE_BYTES) {
-		throw new Error(`fokos: transactWriteItems total payload exceeds ${DEFAULT_TRANSACTION_MAX_SIZE_BYTES / (1024 * 1024)} MB`);
+		throw new Error(
+			`fokos: transactWriteItems total payload exceeds ${DEFAULT_TRANSACTION_MAX_SIZE_BYTES / (1024 * 1024)} MB`,
+		);
 	}
 }

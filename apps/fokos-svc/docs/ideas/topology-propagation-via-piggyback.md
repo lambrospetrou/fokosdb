@@ -33,9 +33,9 @@ Depth follows the existing `PartitionIdHelper` convention: **root = depth 0**. D
 
 ```typescript
 type RoutingHint = {
-  forwardCount: number;  // +1 on every forward, regardless of partition type (existing field)
-  hashDepth: number;     // +1 only when a hash partition forwards to a hash child
-  rangeDepth: number;    // +1 only when a range partition forwards to a range child
+	forwardCount: number; // +1 on every forward, regardless of partition type (existing field)
+	hashDepth: number; // +1 only when a hash partition forwards to a hash child
+	rangeDepth: number; // +1 only when a range partition forwards to a range child
 };
 ```
 
@@ -240,21 +240,21 @@ function updateFromHint(array, nextFree, hashKey, knownDepth, leafDepth, K, maxS
 
 **Space**: each split node occupies `K × 4` bytes. The table below shows **worst-case** space (every node at depths 0 through D-1 is split) for different fanout K and depth cap D:
 
-| K \ D | 5 | 10 | 20 |
-|---|---|---|---|
-| **2** | 248 B | 8 KB | 8 MB |
-| **4** | 5.3 KB | 5.3 MB | ~5.9 TB |
-| **8** | 146 KB | 4.6 GB | — |
-| **16** | 4.3 MB | — | — |
+| K \ D  | 5      | 10     | 20      |
+| ------ | ------ | ------ | ------- |
+| **2**  | 248 B  | 8 KB   | 8 MB    |
+| **4**  | 5.3 KB | 5.3 MB | ~5.9 TB |
+| **8**  | 146 KB | 4.6 GB | —       |
+| **16** | 4.3 MB | —      | —       |
 
 Maximum depth D that stays within a 1 MB budget (worst case, fully split tree):
 
-| K | Max D in 1 MB | Max split nodes |
-|---|---|---|
-| 2 | 17 | 131,071 |
-| 4 | 8 | 21,845 |
-| 8 | 5 | 4,681 |
-| 16 | 4 | 4,369 |
+| K   | Max D in 1 MB | Max split nodes |
+| --- | ------------- | --------------- |
+| 2   | 17            | 131,071         |
+| 4   | 8             | 21,845          |
+| 8   | 5             | 4,681           |
+| 16  | 4             | 4,369           |
 
 **Tradeoffs**:
 
@@ -281,11 +281,11 @@ No fragmentation, no holes, no compaction. The array fills from the top of the t
 
 The depth limit can be tuned per-K:
 
-| K | Recommended D | Worst-case space | Hops saved |
-|---|---|---|---|
-| 2 | 15 | 256 KB | 15 |
-| 4 | 8 | 341 KB | 8 |
-| 8 | 5 | 146 KB | 5 |
+| K   | Recommended D | Worst-case space | Hops saved |
+| --- | ------------- | ---------------- | ---------- |
+| 2   | 15            | 256 KB           | 15         |
+| 4   | 8             | 341 KB           | 8          |
+| 8   | 5             | 146 KB           | 5          |
 
 **Caches compose across the chain**: if every partition in the tree caches D=8 levels and the full tree is 30 deep, a request goes: root → depth 8 → depth 16 → depth 24 → leaf. That is 4 hops instead of 30.
 
@@ -341,16 +341,16 @@ On DO startup (`blockConcurrencyWhile`), load and rebuild any derived structures
 
 ## Comparison Summary
 
-| | LOUDS (Option A) | Flat Array (Option B) |
-|---|---|---|
-| **Space per split node** | ~1 bit | K × 4 bytes |
-| **Nodes in 1 MB (K=4)** | ~8M | ~65K |
-| **Update cost** | O(N) bit shift | O(1) append |
-| **Traversal cost** | O(D) rank queries | O(D) array reads |
-| **Implementation** | Moderate (rank/select) | Simple (array index) |
-| **Serialization** | memcpy | memcpy |
-| **Eviction** | BFS tail truncation (natural) | Depth cap or budget cap |
-| **Fragmentation risk** | None | Only if blocks are freed |
+|                          | LOUDS (Option A)              | Flat Array (Option B)    |
+| ------------------------ | ----------------------------- | ------------------------ |
+| **Space per split node** | ~1 bit                        | K × 4 bytes              |
+| **Nodes in 1 MB (K=4)**  | ~8M                           | ~65K                     |
+| **Update cost**          | O(N) bit shift                | O(1) append              |
+| **Traversal cost**       | O(D) rank queries             | O(D) array reads         |
+| **Implementation**       | Moderate (rank/select)        | Simple (array index)     |
+| **Serialization**        | memcpy                        | memcpy                   |
+| **Eviction**             | BFS tail truncation (natural) | Depth cap or budget cap  |
+| **Fragmentation risk**   | None                          | Only if blocks are freed |
 
 ### When to prefer LOUDS
 

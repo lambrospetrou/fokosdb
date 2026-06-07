@@ -85,10 +85,17 @@ export type PrepareRequest = {
 export type RejectionReason =
 	| { type: "condition_failed"; hashKey: string; sortKey?: string }
 	| { type: "timestamp_conflict"; hashKey: string; sortKey?: string }
-	| { type: "pending_conflict"; hashKey: string; sortKey?: string; conflictingTransactionId: TransactionId }
+	| {
+			type: "pending_conflict";
+			hashKey: string;
+			sortKey?: string;
+			conflictingTransactionId: TransactionId;
+	  }
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number };
 
-export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
+export type PrepareResponse =
+	| { outcome: "accepted" }
+	| { outcome: "rejected"; reason: RejectionReason };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -125,7 +132,13 @@ export type ReadForTransactionItemResult =
 			lastCommittedTs: TransactionTimestamp;
 			hasPendingWrite: boolean;
 	  }
-	| { found: false; hashKey: string; sortKey?: string; lastCommittedTs: TransactionTimestamp; hasPendingWrite: boolean };
+	| {
+			found: false;
+			hashKey: string;
+			sortKey?: string;
+			lastCommittedTs: TransactionTimestamp;
+			hasPendingWrite: boolean;
+	  };
 
 export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResult[];
@@ -133,7 +146,14 @@ export type ReadForTransactionResponse = {
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
-export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
+export type TCState =
+	| "CREATED"
+	| "PREPARING"
+	| "PREPARED"
+	| "COMMITTING"
+	| "COMMITTED"
+	| "CANCELLING"
+	| "CANCELLED";
 
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
 
@@ -155,7 +175,12 @@ export type InitiateWriteRequest = {
 
 export type InitiateWriteResponse =
 	| { outcome: "committed"; transactionId: TransactionId; idempotencyToken: IdempotencyToken }
-	| { outcome: "cancelled"; transactionId: TransactionId; idempotencyToken: IdempotencyToken; reason: RejectionReason };
+	| {
+			outcome: "cancelled";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			reason: RejectionReason;
+	  };
 
 export type TCReadItem = {
 	hashKey: string;
@@ -279,11 +304,18 @@ Before executing a non-transactional write, check whether a pending transaction 
 // At the top of putItem / deleteItem local handler, before the write SQL:
 const sk = opts.sortKey ?? "";
 const pendingRow = this.ctx.storage.sql
-	.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
+	.exec<{
+		transaction_id: string;
+	}>(
+		`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
+		opts.hashKey,
+		sk,
+	)
 	.toArray()[0];
 if (pendingRow) {
 	throw new Error(
-		`fokos/partition: item is locked by an in-progress transaction ` + `(transactionId=${pendingRow.transaction_id}), retry later.`,
+		`fokos/partition: item is locked by an in-progress transaction ` +
+			`(transactionId=${pendingRow.transaction_id}), retry later.`,
 	);
 }
 // FIXME: The ATC 2023 paper §4 "Adapting timestamp ordering for key-value operations"
@@ -472,11 +504,11 @@ return { items: results }
 
 ### What needs to be migrated
 
-| Table                                | Migration needed                                                                                                                          |
-| ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| `items` (with `last_transaction_ts`) | Already migrated by existing `getItemsBatch` — `last_transaction_ts` is a column on `items` so it comes along automatically              |
-| `pending_transactions`               | Rows for items in the child's key range must be migrated so in-flight transaction locks are preserved                                     |
-| `deletion_metadata.max_deleted_ts`   | Child must inherit the parent's value as a safe upper bound for its key range                                                             |
+| Table                                | Migration needed                                                                                                            |
+| ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `items` (with `last_transaction_ts`) | Already migrated by existing `getItemsBatch` — `last_transaction_ts` is a column on `items` so it comes along automatically |
+| `pending_transactions`               | Rows for items in the child's key range must be migrated so in-flight transaction locks are preserved                       |
+| `deletion_metadata.max_deleted_ts`   | Child must inherit the parent's value as a safe upper bound for its key range                                               |
 
 ### 5a. New parent RPC: `getPartitionTransactionMetadata`
 
@@ -547,7 +579,10 @@ if (pendingTransactions.length > 0) {
 	}
 }
 // Set deletion_metadata to at least the parent's value (safe upper bound for this key range).
-this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
+this.ctx.storage.sql.exec(
+	`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
+	maxDeletedTs,
+);
 ```
 
 ### 5c. `MigratedItem` type extension
@@ -869,7 +904,9 @@ for (const row of staleTxRows) {
 
 // Re-arm alarm if any pending transactions still exist.
 const remaining =
-	this.ctx.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) as count FROM pending_transactions`).toArray()[0]?.count ?? 0;
+	this.ctx.storage.sql
+		.exec<{ count: number }>(`SELECT COUNT(*) as count FROM pending_transactions`)
+		.toArray()[0]?.count ?? 0;
 if (remaining > 0 && !(await this.ctx.storage.getAlarm())) {
 	await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
 }
@@ -959,11 +996,14 @@ function validateTransactWriteItems(ops: TCWriteOperation[]): void {
 	const seen = new Set<string>();
 	for (const op of ops) {
 		const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
-		if (seen.has(key)) throw new Error(`TransactWriteItems: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
+		if (seen.has(key))
+			throw new Error(`TransactWriteItems: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
 		seen.add(key);
-		if (op.data) totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
+		if (op.data)
+			totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
 	}
-	if (totalBytes > 4 * 1024 * 1024) throw new Error("TransactWriteItems: total payload exceeds 4 MB");
+	if (totalBytes > 4 * 1024 * 1024)
+		throw new Error("TransactWriteItems: total payload exceeds 4 MB");
 }
 ```
 

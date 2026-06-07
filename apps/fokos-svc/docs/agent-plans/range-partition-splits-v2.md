@@ -114,7 +114,11 @@ function encodeRangeComponent(s: string): string;
 // (`db.h.<root>[.<child>…]`, partition-topology.ts:194) and is REQUIRED to avoid collisions:
 // without it, a range leaf for hash key "h" with start boundary "0" would be `db.h.0`, colliding
 // with hash root partition 0.
-function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null): string {
+function rangePartitionDoName(
+	databaseName: string,
+	hashKey: string,
+	startBoundary: string | null,
+): string {
 	const hk = encodeRangeComponent(hashKey);
 	const sk = startBoundary == null ? "" : encodeRangeComponent(startBoundary);
 	return `${databaseName}.r.${hk}.${sk}`;
@@ -610,7 +614,9 @@ hk + sk-range for range split, the hash predicate otherwise.
 
 ```typescript
 (hashKey: string, sortKey?: string) =>
-	hashKey === childCtx.rangePartition!.hashKey && (start == null || (sortKey ?? "") >= start) && (end == null || (sortKey ?? "") < end);
+	hashKey === childCtx.rangePartition!.hashKey &&
+	(start == null || (sortKey ?? "") >= start) &&
+	(end == null || (sortKey ?? "") < end);
 ```
 
 ### `runMigration` — branch on `__parent_split_type` + own `rangePartition`
@@ -891,7 +897,7 @@ pessimistic.
 
 ### Invariants 1–2, revised
 
-- **Invariant 1 (revised).** *Both* boundaries are immutable identity. A range DO's `[start, end)` is
+- **Invariant 1 (revised).** _Both_ boundaries are immutable identity. A range DO's `[start, end)` is
   fixed for life — part of its name and validated `partitionId` / `rangePartition`. It never shrinks;
   on split it becomes a router and its children own the sub-ranges. **`__range_end_boundary` (mutable
   KV) is removed**; `end` is read from the validated context. There is no self-mutating state to
@@ -899,13 +905,13 @@ pessimistic.
   `newPartitionContext.rangePartition.endBoundary`).
 - **Invariant 2 (revised).** The **N** children tile the parent exactly: `start[0] = parent.start`,
   `end[i] = start[i+1]`, `end[N-1] = parent.end`. Each child's `end` is explicit in its own identity
-  (it still equals the next sibling's start, so the leaf boundary *set* reconstructs all leaves — see
+  (it still equals the next sibling's start, so the leaf boundary _set_ reconstructs all leaves — see
   the routing-cache note).
 
 ### Routing-cache correctness (why this was non-trivial)
 
-Moving `end` into the name makes addressable identity a function of **two** boundaries. A *flat,
-partial* boundary cache can then pair a real `start` with a real `end` that were **never adjacent in
+Moving `end` into the name makes addressable identity a function of **two** boundaries. A _flat,
+partial_ boundary cache can then pair a real `start` with a real `end` that were **never adjacent in
 the tree** (they straddle an un-cached higher split), fabricating the name of a DO that never existed
 → an uninitialized DO. The original start-only naming was robust to any stale subset because the name
 was a function of the immutable `start` alone.
@@ -922,7 +928,7 @@ imposes constraints that are now load-bearing:
    (never drop an interior router while keeping a descendant).
 3. **Phantom-bounce guard — the correctness backstop (added now).** A `.r.` DO with no stored
    `__partition_context` **must never lazy-init from a request**; it bounces the caller, which falls
-   back to the range root and traverses. This makes *any* stale/lossy/cold cache safe, so (1) and (2)
+   back to the range root and traverses. This makes _any_ stale/lossy/cold cache safe, so (1) and (2)
    are pure hit-rate optimizations. No false positives: every real range DO is born through
    `initFromSplit` (promotion creates the root; a split creates children), so "has
    `__partition_context`" cleanly separates real from phantom. In this version the guard should never
@@ -959,7 +965,7 @@ accumulation, uniform leaf-xor-router semantics, and simpler migration filters (
 - `PartitionIdHelper.fromRangePartition(base, hashKey, start, end)`: SCHEMA_RANGE_V1 wire format gains
   a `startLen` field and the trailing `endBoundary` bytes; **`null` is encoded as a flag bit absent**
   (`bit0 = hasStart`, `bit1 = hasEnd`), never as a token. `decode` → `{ hashKey, startBoundary,
-  endBoundary }` (component `=== RANGE_MIN/MAX` ⇒ `null` only when decoding from a name); `doName`
+endBoundary }` (component `=== RANGE_MIN/MAX` ⇒ `null` only when decoding from a name); `doName`
   passes both through `rangePartitionDoName`.
 - `resolveRangePartitionContext(base, hashKey, start, end)`.
 - **Remove** `__range_end_boundary` KV key and `InitFromSplitOptions.rangeEndBoundary`; `initFromSplit`

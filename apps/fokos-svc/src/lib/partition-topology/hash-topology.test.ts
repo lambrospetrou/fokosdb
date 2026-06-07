@@ -20,9 +20,12 @@ function divergingKey(base: string, ownerAbsDepth: number, divergeAt: number, K:
 			.every((slot, i) => hashChildIndex(candidate, ownerAbsDepth + i, K) === slot);
 		if (!prefixMatches) continue;
 		// Must diverge at the target level.
-		if (hashChildIndex(candidate, ownerAbsDepth + divergeAt, K) !== basePath[divergeAt]) return candidate;
+		if (hashChildIndex(candidate, ownerAbsDepth + divergeAt, K) !== basePath[divergeAt])
+			return candidate;
 	}
-	throw new Error("divergingKey: could not find a prefix-matching diverging key within 100 000 attempts");
+	throw new Error(
+		"divergingKey: could not find a prefix-matching diverging key within 100 000 attempts",
+	);
 }
 
 describe("HashTopology", () => {
@@ -72,8 +75,8 @@ describe("HashTopology", () => {
 		it("no-op update: already-known depth returns false without modifying findLeaf", () => {
 			const cache = HashTopology.create(4, 0);
 			cache.updateFromHint("key", 2);
-			expect(cache.updateFromHint("key", 2)).toBe(false);  // nothing new to learn
-			expect(cache.updateFromHint("key", 1)).toBe(false);  // shallower than cached
+			expect(cache.updateFromHint("key", 2)).toBe(false); // nothing new to learn
+			expect(cache.updateFromHint("key", 1)).toBe(false); // shallower than cached
 			// findLeaf unchanged
 			expect(cache.findLeaf("key")).toBe(2);
 		});

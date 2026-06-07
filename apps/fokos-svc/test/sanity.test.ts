@@ -1,7 +1,10 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
+import {
+	PartitionContextCreator,
+	PartitionTopologyRouterImpl,
+} from "../src/lib/partition-topology/partition-topology.js";
 
 describe("fokosdb", async () => {
 	const testSplitOptions = PartitionContextCreator.create({
@@ -38,7 +41,12 @@ describe("fokosdb", async () => {
 			}),
 		).resolves.toMatchObject({
 			found: true,
-			item: { hashKey: "test-hash-key", sortKey: "test-sort-key", data: new Uint8Array([1, 2, 3]), version: 1 },
+			item: {
+				hashKey: "test-hash-key",
+				sortKey: "test-sort-key",
+				data: new Uint8Array([1, 2, 3]),
+				version: 1,
+			},
 			meta: {
 				rowsRead: 1,
 				rowsWritten: 0,

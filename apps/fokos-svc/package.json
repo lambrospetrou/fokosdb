@@ -4,7 +4,8 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"check": "tsc --noEmit",
+		"check": "tsc --noEmit && oxfmt --check",
+		"fmt": "oxfmt",
 		"deploy": "wrangler deploy --secrets-file .env.production",
 		"dev": "wrangler dev",
 		"start": "wrangler dev",
@@ -23,6 +24,7 @@
 		"durable-utils": "^0.3.5",
 		"hono": "^4.12.22",
 		"js-xxhash": "^5.0.1",
+		"oxfmt": "^0.53.0",
 		"typescript": "^5.9.3",
 		"valibot": "^1.4.0",
 		"vitest": "^4.1.7",

@@ -2,11 +2,24 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import { HashPartitionTopologyImpl, PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, RANGE_PROMOTION_FRACTION, resolveRangePartitionContext } from "./partition-topology/partition-topology.js";
-import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
+import {
+	HashPartitionTopologyImpl,
+	PartitionContextCreator,
+	PartitionIdHelper,
+	PartitionTopologyRouterImpl,
+	RANGE_PROMOTION_FRACTION,
+	resolveRangePartitionContext,
+} from "./partition-topology/partition-topology.js";
+import type {
+	PartitionContextResolved,
+	SplitStatusKVItem,
+} from "./partition-topology/partition-topology.js";
 import invariant from "./invariant.js";
 
-type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
+type SplitStartedOrCompleted = Extract<
+	SplitStatusKVItem,
+	{ status: "split_started" | "split_completed" }
+>;
 
 describe("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
@@ -36,7 +49,10 @@ describe("PartitionDO - putItem / getItem", () => {
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
-		expect(result).toMatchObject({ found: true, item: { hashKey: "hk", sortKey: "sk", data: "hello" } });
+		expect(result).toMatchObject({
+			found: true,
+			item: { hashKey: "hk", sortKey: "sk", data: "hello" },
+		});
 	});
 
 	it("stores and retrieves binary data", async ({ expect }) => {
@@ -157,7 +173,12 @@ describe("PartitionDO - putItem / getItem", () => {
 			const { ctx, stub } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val", ttlEpochUTCSeconds: ttl });
+			await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "val",
+				ttlEpochUTCSeconds: ttl,
+			});
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 			expect(result).toMatchObject({ found: true, item: { ttlEpochUTCSeconds: ttl } });
@@ -177,7 +198,12 @@ describe("PartitionDO - putItem / getItem", () => {
 			const { ctx, stub } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", ttlEpochUTCSeconds: ttl });
+			await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "v1",
+				ttlEpochUTCSeconds: ttl,
+			});
 			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
@@ -196,7 +222,9 @@ describe("PartitionDO - putItem / getItem", () => {
 		if (result.found) expect(result.item.sortKey).toBeUndefined();
 	});
 
-	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({ expect }) => {
+	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({
+		expect,
+	}) => {
 		const { ctx, stub } = makeStub();
 
 		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
@@ -236,7 +264,12 @@ describe("PartitionDO - conditional putItem", () => {
 				await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
 
 				await expect(
-					instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "overwrite", conditions: [{ type: "item_not_exists" }] }),
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						sortKey: "sk",
+						data: "overwrite",
+						conditions: [{ type: "item_not_exists" }],
+					}),
 				).rejects.toThrow(/item_not_exists.*v=1.*hk=hk.*sk=sk/);
 			});
 
@@ -251,7 +284,11 @@ describe("PartitionDO - conditional putItem", () => {
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				await expect(
-					instance.putItem(ctx, { hashKey: "hk", data: "overwrite", conditions: [{ type: "item_not_exists" }] }),
+					instance.putItem(ctx, {
+						hashKey: "hk",
+						data: "overwrite",
+						conditions: [{ type: "item_not_exists" }],
+					}),
 				).rejects.toThrow("item_not_exists");
 			});
 
@@ -311,7 +348,9 @@ describe("PartitionDO - conditional putItem", () => {
 			});
 		});
 
-		it("allows sequential optimistic-concurrency updates at the correct version", async ({ expect }) => {
+		it("allows sequential optimistic-concurrency updates at the correct version", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub();
 
 			const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
@@ -353,7 +392,9 @@ describe("PartitionDO - conditional putItem", () => {
 			expect(result.version).toBe(2);
 		});
 
-		it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
+		it("fails on the first failing condition and does not evaluate the rest", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub();
 
 			// item_not_exists is listed first and will fail since the item exists.
@@ -366,7 +407,10 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: "hk",
 						sortKey: "sk",
 						data: "overwrite",
-						conditions: [{ type: "item_not_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+						conditions: [
+							{ type: "item_not_exists" },
+							{ type: "attribute_equals", attribute: "v", value: 1 },
+						],
 					}),
 				).rejects.toThrow("item_not_exists");
 			});
@@ -403,7 +447,12 @@ describe("PartitionDO - conditional putItem", () => {
 		it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", conditions: [] });
+			const result = await stub.putItem(ctx, {
+				hashKey: "hk",
+				sortKey: "sk",
+				data: "value",
+				conditions: [],
+			});
 
 			expect(result.version).toBe(1);
 		});
@@ -453,7 +502,9 @@ describe("PartitionDO - deleteItem", () => {
 		expect(result.deleted).toBe(false);
 	});
 
-	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({ expect }) => {
+	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({
+		expect,
+	}) => {
 		const { ctx, stub } = makeStub();
 
 		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a" });
@@ -463,8 +514,14 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk1" });
 
 		expect((await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk1" })).found).toBe(false);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" })).toMatchObject({ found: true, item: { data: "b" } });
-		expect(await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" })).toMatchObject({ found: true, item: { data: "c" } });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" })).toMatchObject({
+			found: true,
+			item: { data: "b" },
+		});
+		expect(await stub.getItem(ctx, { hashKey: "hk2", sortKey: "sk1" })).toMatchObject({
+			found: true,
+			item: { data: "c" },
+		});
 	});
 
 	it("works when sortKey is absent — deletes only the no-sortKey row", async ({ expect }) => {
@@ -477,7 +534,10 @@ describe("PartitionDO - deleteItem", () => {
 		expect(result.deleted).toBe(true);
 
 		expect((await stub.getItem(ctx, { hashKey: "hk" })).found).toBe(false);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "with-sort" } });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({
+			found: true,
+			item: { data: "with-sort" },
+		});
 	});
 
 	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
@@ -489,7 +549,10 @@ describe("PartitionDO - deleteItem", () => {
 		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "fresh" });
 
 		expect(result.version).toBe(1);
-		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "fresh", version: 1 } });
+		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({
+			found: true,
+			item: { data: "fresh", version: 1 },
+		});
 	});
 
 	it("includes operation metrics in deleteItem result", async ({ expect }) => {
@@ -528,9 +591,13 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(instance.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [{ type: "item_exists" }] })).rejects.toThrow(
-						/item_exists.*hk=hk.*sk=sk/,
-					);
+					await expect(
+						instance.deleteItem(ctx, {
+							hashKey: "hk",
+							sortKey: "sk",
+							conditions: [{ type: "item_exists" }],
+						}),
+					).rejects.toThrow(/item_exists.*hk=hk.*sk=sk/);
 				});
 
 				const get = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
@@ -541,7 +608,9 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(instance.deleteItem(ctx, { hashKey: "hk", conditions: [{ type: "item_exists" }] })).rejects.toThrow("item_exists");
+					await expect(
+						instance.deleteItem(ctx, { hashKey: "hk", conditions: [{ type: "item_exists" }] }),
+					).rejects.toThrow("item_exists");
 				});
 			});
 		});
@@ -576,7 +645,10 @@ describe("PartitionDO - deleteItem", () => {
 					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
 				});
 
-				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({
+					found: true,
+					item: { data: "v2", version: 2 },
+				});
 			});
 
 			it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
@@ -602,13 +674,18 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await stub.deleteItem(ctx, {
 					hashKey: "hk",
 					sortKey: "sk",
-					conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+					conditions: [
+						{ type: "item_exists" },
+						{ type: "attribute_equals", attribute: "v", value: 1 },
+					],
 				});
 
 				expect(result.deleted).toBe(true);
 			});
 
-			it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
+			it("fails on the first failing condition and does not evaluate the rest", async ({
+				expect,
+			}) => {
 				const { ctx, stub } = makeStub();
 
 				// item_exists is listed first and will fail since no item exists.
@@ -618,7 +695,10 @@ describe("PartitionDO - deleteItem", () => {
 						instance.deleteItem(ctx, {
 							hashKey: "hk",
 							sortKey: "sk",
-							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+							conditions: [
+								{ type: "item_exists" },
+								{ type: "attribute_equals", attribute: "v", value: 1 },
+							],
 						}),
 					).rejects.toThrow("item_exists");
 				});
@@ -636,12 +716,18 @@ describe("PartitionDO - deleteItem", () => {
 						instance.deleteItem(ctx, {
 							hashKey: "hk",
 							sortKey: "sk",
-							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+							conditions: [
+								{ type: "item_exists" },
+								{ type: "attribute_equals", attribute: "v", value: 1 },
+							],
 						}),
 					).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
 				});
 
-				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
+				expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({
+					found: true,
+					item: { data: "v2", version: 2 },
+				});
 			});
 
 			it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
@@ -677,7 +763,9 @@ describe("PartitionDO - splitting", () => {
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 	});
 
-	it("preserves split_queued status across subsequent writes before the alarm fires", async ({ expect }) => {
+	it("preserves split_queued status across subsequent writes before the alarm fires", async ({
+		expect,
+	}) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 		// All writes run inside the DO's execution context so the background alarm
@@ -717,9 +805,14 @@ describe("PartitionDO - splitting", () => {
 
 		const parentState = await stub.status();
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
-		expect(parentState.partitionContext).toMatchObject({ ns: "PARTITION_DO", databaseName: ctx.databaseName });
+		expect(parentState.partitionContext).toMatchObject({
+			ns: "PARTITION_DO",
+			databaseName: ctx.databaseName,
+		});
 
-		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext!).map((c) => c.doName);
+		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(
+			parentState.partitionContext!,
+		).map((c) => c.doName);
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
@@ -745,10 +838,18 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.initfromsplit-idempotent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: PartitionContextResolved = {
+			...parentCtx,
+			doName: childName,
+			primaryDoIdStr: childId.toString(),
+		};
 		const childStub = env.PARTITION_DO.get(childId);
 
-		const opts: InitFromSplitOptions = { parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "hash" };
+		const opts: InitFromSplitOptions = {
+			parentPartitionContext: parentCtx,
+			newPartitionContext: childCtx,
+			splitType: "hash",
+		};
 
 		await childStub.initFromSplit(opts);
 		// Calling again with identical opts must not throw.
@@ -765,17 +866,29 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.initfromsplit-conflict.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: PartitionContextResolved = {
+			...parentCtx,
+			doName: childName,
+			primaryDoIdStr: childId.toString(),
+		};
 		const childStub = env.PARTITION_DO.get(childId);
 
-		await childStub.initFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "hash" });
+		await childStub.initFromSplit({
+			parentPartitionContext: parentCtx,
+			newPartitionContext: childCtx,
+			splitType: "hash",
+		});
 
 		// Use runInDurableObject so the caught rejection stays inside the DO's execution context
 		// and doesn't leak as an unhandled rejection at the worker level.
 		const { ctx: otherCtx } = makeStub();
 		await runInDurableObject(childStub, async (instance: PartitionDO) => {
 			await expect(
-				instance.initFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: otherCtx, splitType: "hash" }),
+				instance.initFromSplit({
+					parentPartitionContext: parentCtx,
+					newPartitionContext: otherCtx,
+					splitType: "hash",
+				}),
 			).rejects.toThrow("conflicting options");
 		});
 	});
@@ -784,15 +897,27 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.initfromsplit-conflict-parent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: PartitionContextResolved = {
+			...parentCtx,
+			doName: childName,
+			primaryDoIdStr: childId.toString(),
+		};
 		const childStub = env.PARTITION_DO.get(childId);
 
-		await childStub.initFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "hash" });
+		await childStub.initFromSplit({
+			parentPartitionContext: parentCtx,
+			newPartitionContext: childCtx,
+			splitType: "hash",
+		});
 
 		const { ctx: differentParentCtx } = makeStub();
 		await runInDurableObject(childStub, async (instance: PartitionDO) => {
 			await expect(
-				instance.initFromSplit({ parentPartitionContext: differentParentCtx, newPartitionContext: childCtx, splitType: "hash" }),
+				instance.initFromSplit({
+					parentPartitionContext: differentParentCtx,
+					newPartitionContext: childCtx,
+					splitType: "hash",
+				}),
 			).rejects.toThrow("conflicting options");
 		});
 	});
@@ -801,14 +926,26 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.initfromsplit-conflict-splittype.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: PartitionContextResolved = {
+			...parentCtx,
+			doName: childName,
+			primaryDoIdStr: childId.toString(),
+		};
 		const childStub = env.PARTITION_DO.get(childId);
 
-		await childStub.initFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "hash" });
+		await childStub.initFromSplit({
+			parentPartitionContext: parentCtx,
+			newPartitionContext: childCtx,
+			splitType: "hash",
+		});
 
 		await runInDurableObject(childStub, async (instance: PartitionDO) => {
 			await expect(
-				instance.initFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "range" }),
+				instance.initFromSplit({
+					parentPartitionContext: parentCtx,
+					newPartitionContext: childCtx,
+					splitType: "range",
+				}),
 			).rejects.toThrow("conflicting options");
 		});
 	});
@@ -872,7 +1009,9 @@ describe("PartitionDO - splitting", () => {
 			expect(getResult.meta.servedByActorName).toBe(putResult.meta.servedByActorName);
 		});
 
-		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
+		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			await triggerHashSplitThreshold(stub, ctx, 1);
@@ -928,22 +1067,37 @@ describe("PartitionDO - splitting", () => {
 			const servedByActorNames = new Set<string>();
 			for (const item of allItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, item: { hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData } });
+				expect(result).toMatchObject({
+					found: true,
+					item: { hashKey: item.hashKey, sortKey: item.sortKey, data: dummyData },
+				});
 				if (result.found) {
 					servedByActorNames.add(result.meta.servedByActorName);
 					// hashDepth is constant (total tree levels) whether the cache skips hops or not.
-					expect(result.meta.hashDepth, "root reads should span at least 2 hash tree levels").toBeGreaterThanOrEqual(2);
+					expect(
+						result.meta.hashDepth,
+						"root reads should span at least 2 hash tree levels",
+					).toBeGreaterThanOrEqual(2);
 					// forwardCount starts at hashDepth (cold cache, one RPC per level) and
 					// converges to 1 (warm cache, single RPC directly to the leaf). The invariant
 					// that proves the cache is reducing latency is forwardCount ≤ hashDepth.
-					expect(result.meta.forwardCount, "topology cache should reduce RPC hops to at most one per tree level").toBeLessThanOrEqual(result.meta.hashDepth);
-					expect(result.meta.forwardCount, "always at least one RPC hop from the root").toBeGreaterThanOrEqual(1);
+					expect(
+						result.meta.forwardCount,
+						"topology cache should reduce RPC hops to at most one per tree level",
+					).toBeLessThanOrEqual(result.meta.hashDepth);
+					expect(
+						result.meta.forwardCount,
+						"always at least one RPC hop from the root",
+					).toBeGreaterThanOrEqual(1);
 				}
 			}
 
 			// With 50 items and splitN=2, the tree reaches ~3 levels deep (~8 leaf DOs).
 			// Even with hash skew, at least 3 distinct instances must serve reads.
-			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(3);
+			expect(
+				servedByActorNames.size,
+				"many distinct partition instances should have served requests",
+			).toBeGreaterThan(3);
 
 			const totalSplitNodes = await assertSplitTreeComplete(stub);
 			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
@@ -954,7 +1108,9 @@ describe("PartitionDO - splitting", () => {
 		// A fixed probe key used to trace a deterministic path through the tree.
 		const hashKey = "probe-key";
 
-		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
+		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
@@ -983,7 +1139,9 @@ describe("PartitionDO - splitting", () => {
 			expect(r2.meta.forwardCount).toBe(2);
 		});
 
-		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
+		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
@@ -1009,7 +1167,9 @@ describe("PartitionDO - splitting", () => {
 			expect(r2.meta.forwardCount).toBe(1);
 		});
 
-		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
+		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
@@ -1030,8 +1190,14 @@ describe("PartitionDO - splitting", () => {
 			expect(r1.meta.hashDepth).toBe(2);
 
 			// Now split the grandchild, making it a router for great-grandchildren.
-			const { partitionContext: grandchildCtx } = topology.pickDescendantHashPartition(ctx, hashKey, 2);
-			const grandchildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(grandchildCtx.doName));
+			const { partitionContext: grandchildCtx } = topology.pickDescendantHashPartition(
+				ctx,
+				hashKey,
+				2,
+			);
+			const grandchildStub = env.PARTITION_DO.get(
+				env.PARTITION_DO.idFromName(grandchildCtx.doName),
+			);
 			await triggerHashSplitThreshold(grandchildStub, grandchildCtx, 1);
 			await drainSplitTree(grandchildStub);
 
@@ -1050,7 +1216,9 @@ describe("PartitionDO - splitting", () => {
 	}, 30_000);
 
 	describe("migration", () => {
-		it("reads during migration are served from the parent; writes are rejected; all data migrated correctly", async ({ expect }) => {
+		it("reads during migration are served from the parent; writes are rejected; all data migrated correctly", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
 
 			// Seed items with varied hash keys so they spread across children.
@@ -1072,7 +1240,8 @@ describe("PartitionDO - splitting", () => {
 
 			const parentState = await stub.status();
 			expect(parentState.splitStatus?.status).toBe("split_started");
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted)
+				.childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
 
 			// Run each child's migration alarm.
@@ -1094,7 +1263,11 @@ describe("PartitionDO - splitting", () => {
 			// All migrations complete: root successfully forwards each item to the correct child.
 			for (const item of seedItems) {
 				const result = await stub.getItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { forwardCount: 1 } });
+				expect(result).toMatchObject({
+					found: true,
+					item: { data: item.data },
+					meta: { forwardCount: 1 },
+				});
 			}
 
 			// Every seed item is found in exactly one child with the correct data.
@@ -1103,15 +1276,24 @@ describe("PartitionDO - splitting", () => {
 				let foundInDoName: string | undefined;
 				for (const childCtx of childContexts) {
 					const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-					const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
+					const result = await childStub.getItem(childCtx, {
+						hashKey: item.hashKey,
+						sortKey: item.sortKey,
+					});
 					if (result.found) {
-						expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" found in multiple children`).toBeUndefined();
+						expect(
+							foundInDoName,
+							`"${item.hashKey}/${item.sortKey}" found in multiple children`,
+						).toBeUndefined();
 						expect(result).toMatchObject({ item: { data: item.data } });
 						foundInDoName = childCtx.doName;
 						foundIds.add(foundInDoName);
 					}
 				}
-				expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" not found in any child`).toBeDefined();
+				expect(
+					foundInDoName,
+					`"${item.hashKey}/${item.sortKey}" not found in any child`,
+				).toBeDefined();
 			}
 			// This might be flaky - but ideally we should have items across more than 1 children.
 			expect(foundIds.size).toBeGreaterThan(1);
@@ -1132,15 +1314,19 @@ describe("PartitionDO - splitting", () => {
 				releaseMigration = resolve;
 			});
 			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
-				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
-					instance.__testing__beforeMigrationComplete = () => migrationGate;
-				});
+				await runInDurableObject(
+					env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)),
+					async (instance: PartitionDO) => {
+						instance.__testing__beforeMigrationComplete = () => migrationGate;
+					},
+				);
 			}
 
 			await waitForAlarm(stub);
 
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted)
+				.childPartitionContexts;
 			const childCtx = childContexts[0];
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 
@@ -1160,7 +1346,9 @@ describe("PartitionDO - splitting", () => {
 			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
 		});
 
-		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
+		it("getItem on a child reads through to the parent while migration is in progress", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			const seedItems = [
@@ -1178,15 +1366,19 @@ describe("PartitionDO - splitting", () => {
 				releaseMigration = resolve;
 			});
 			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
-				await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)), async (instance: PartitionDO) => {
-					instance.__testing__beforeMigrationComplete = () => migrationGate;
-				});
+				await runInDurableObject(
+					env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)),
+					async (instance: PartitionDO) => {
+						instance.__testing__beforeMigrationComplete = () => migrationGate;
+					},
+				);
 			}
 
 			await waitForAlarm(stub);
 
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted)
+				.childPartitionContexts;
 			const childCtx = childContexts[0];
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 
@@ -1196,7 +1388,10 @@ describe("PartitionDO - splitting", () => {
 			// While migration is in progress, getItem on the child must read through to the parent
 			// so callers can read data that has not yet been copied to the child.
 			for (const item of seedItems) {
-				const result = await childStub.getItem(childCtx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				const result = await childStub.getItem(childCtx, {
+					hashKey: item.hashKey,
+					sortKey: item.sortKey,
+				});
 				expect(result).toMatchObject({ found: true, item: { data: item.data } });
 			}
 
@@ -1207,7 +1402,9 @@ describe("PartitionDO - splitting", () => {
 			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
 		});
 
-		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
+		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
@@ -1236,7 +1433,8 @@ describe("PartitionDO - splitting", () => {
 
 			// Run all children's migrations. startSplit already triggered their alarms via fire-and-forget.
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted)
+				.childPartitionContexts;
 			for (const childCtx of childContexts) {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 				await waitForAlarm(childStub);
@@ -1257,13 +1455,18 @@ describe("PartitionDO - splitting", () => {
 			await assertSplitTreeComplete(stub);
 		});
 
-		it("getItemDirect bypasses split forwarding and reads from local storage", async ({ expect }) => {
+		it("getItemDirect bypasses split forwarding and reads from local storage", async ({
+			expect,
+		}) => {
 			const { ctx, stub } = makeStub();
 
 			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "direct-value" });
 
 			const result = await stub.getItemDirect({ hashKey: "hk", sortKey: "sk" });
-			expect(result).toMatchObject({ found: true, item: { hashKey: "hk", sortKey: "sk", data: "direct-value" } });
+			expect(result).toMatchObject({
+				found: true,
+				item: { hashKey: "hk", sortKey: "sk", data: "direct-value" },
+			});
 
 			const miss = await stub.getItemDirect({ hashKey: "missing", sortKey: "sk" });
 			expect(miss.found).toBe(false);
@@ -1272,7 +1475,9 @@ describe("PartitionDO - splitting", () => {
 });
 
 describe("PartitionDO - partitionId encoding", () => {
-	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
+	it("encodes root and child partition IDs with correct byte layout and text doNames", ({
+		expect,
+	}) => {
 		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
 		const { ctx } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
@@ -1283,7 +1488,9 @@ describe("PartitionDO - partitionId encoding", () => {
 		// Children: [version=0, rootIdx=0 (2 bytes), depth=1, childIdx=i]
 		const children = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
 		for (let i = 0; i < children.length; i++) {
-			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
+			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(
+				new Uint8Array([0, 0, 0, 1, i]),
+			);
 			expect(children[i].doName).toBe(`${ctx.databaseName}.h.0.${i}`);
 		}
 	});
@@ -1333,19 +1540,30 @@ describe("PartitionDO - partitionId encoding", () => {
 
 		it("doName builds the correct DO name from partition ID bytes", () => {
 			// Root-only (rootIdx=5, depth=0)
-			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 0]))).toBe("test.readers.h.5");
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 0]))).toBe(
+				"test.readers.h.5",
+			);
 			// rootIdx > 255 (rootIdx=256, depth=0) — validates u16 encoding
-			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 1, 0, 0]))).toBe("test.readers.h.256");
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 1, 0, 0]))).toBe(
+				"test.readers.h.256",
+			);
 			// With children (rootIdx=5, depth=2, children=[3, 7])
-			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 2, 3, 7]))).toBe("test.readers.h.5.3.7");
+			expect(PartitionIdHelper.doName(baseCtx, new Uint8Array([0, 0, 5, 2, 3, 7]))).toBe(
+				"test.readers.h.5.3.7",
+			);
 		});
 	});
 
-	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", async ({ expect }) => {
+	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", async ({
+		expect,
+	}) => {
 		// This test guards the entropy consistency between the two methods.
 		// If the depth offset used in one changes without the other, routing will silently
 		// assign keys to different partitions than the migration check expects.
-		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 100 } });
+		const { ctx: pCtx, stub } = makeStub({
+			hashSplitN: 4,
+			hashSplitConditions: { maxSizeMb: 100 },
+		});
 		let topology: HashPartitionTopologyImpl;
 		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
 			topology = new HashPartitionTopologyImpl(pCtx, ctx);
@@ -1357,20 +1575,36 @@ describe("PartitionDO - partitionId encoding", () => {
 		const { partitionContext: child } = topology.pickChildPartition(pCtx, hashKey);
 		const level1Siblings = PartitionIdHelper.calculateHashChildPartitionIds(pCtx);
 		for (const sib of level1Siblings) {
-			const sibCtx: PartitionContextResolved = { ...pCtx, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
-			expect(topology.makeIsCorrectChildHashPartition(pCtx, sibCtx)(hashKey)).toBe(sib.doName === child.doName);
+			const sibCtx: PartitionContextResolved = {
+				...pCtx,
+				doName: sib.doName,
+				partitionId: sib.partitionIdOpaque,
+				primaryDoIdStr: "",
+			};
+			expect(topology.makeIsCorrectChildHashPartition(pCtx, sibCtx)(hashKey)).toBe(
+				sib.doName === child.doName,
+			);
 		}
 
 		// Depth 1 → 2: same invariant one level deeper.
 		const { partitionContext: grandchild } = topology.pickChildPartition(child, hashKey);
 		const level2Siblings = PartitionIdHelper.calculateHashChildPartitionIds(child);
 		for (const sib of level2Siblings) {
-			const sibCtx: PartitionContextResolved = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque, primaryDoIdStr: "" };
-			expect(topology.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(sib.doName === grandchild.doName);
+			const sibCtx: PartitionContextResolved = {
+				...child,
+				doName: sib.doName,
+				partitionId: sib.partitionIdOpaque,
+				primaryDoIdStr: "",
+			};
+			expect(topology.makeIsCorrectChildHashPartition(child, sibCtx)(hashKey)).toBe(
+				sib.doName === grandchild.doName,
+			);
 		}
 	});
 
-	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
+	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({
+		expect,
+	}) => {
 		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		let topology: HashPartitionTopologyImpl;
 		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
@@ -1381,7 +1615,9 @@ describe("PartitionDO - partitionId encoding", () => {
 		await stub.putItem(pCtx, { hashKey: "hk", sortKey: "sk", data: "v" });
 		const rootState = await stub.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(pCtx.partitionId));
+		expect(rootState.partitionContext?._partitionIdBytes).toEqual(
+			Uint8Array.fromHex(pCtx.partitionId),
+		);
 
 		// Trigger a split so children are initialized with their own cached bytes.
 		await triggerHashSplitThreshold(stub, pCtx, 1);
@@ -1393,7 +1629,9 @@ describe("PartitionDO - partitionId encoding", () => {
 				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(child.doName));
 				const childState = await childStub.status();
 				expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-				expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.partitionId));
+				expect(childState.partitionContext?._partitionIdBytes).toEqual(
+					Uint8Array.fromHex(child.partitionId),
+				);
 			}
 		});
 	});
@@ -1406,10 +1644,13 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	// which bypasses the alarm path entirely — those are tracked by __testing__backgroundWorkRunning.
 	await runDurableObjectAlarm(stub);
 	await runInDurableObject(stub, async (instance: PartitionDO) => {
-		await vi.waitUntil(() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning, {
-			timeout: 5000,
-			interval: 100,
-		});
+		await vi.waitUntil(
+			() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning,
+			{
+				timeout: 5000,
+				interval: 100,
+			},
+		);
 	});
 }
 
@@ -1418,7 +1659,11 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
  * without any single hash key accumulating enough data to trigger range-key promotion
  * (which would block the hash split via mutual exclusion in shouldSplit).
  */
-async function triggerHashSplitThreshold(stub: DurableObjectStub<PartitionDO>, ctx: PartitionContextResolved, maxSizeMb: number = 1): Promise<void> {
+async function triggerHashSplitThreshold(
+	stub: DurableObjectStub<PartitionDO>,
+	ctx: PartitionContextResolved,
+	maxSizeMb: number = 1,
+): Promise<void> {
 	// Use 70% of promotion threshold per key so no single key triggers promotion,
 	// and the chunk fits within the 10% reject grace band for the first write past threshold.
 	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * 0.7);
@@ -1454,7 +1699,10 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 		const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 
 		const childState = await childStub.status();
-		if (childState.migrationStatus === "migration_initialized" || childState.migrationStatus === "migration_migrating") {
+		if (
+			childState.migrationStatus === "migration_initialized" ||
+			childState.migrationStatus === "migration_migrating"
+		) {
 			await childStub.triggerMigration();
 		}
 
@@ -1469,11 +1717,16 @@ async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Promise<voi
 async function assertSplitTreeComplete(nodeStub: DurableObjectStub<PartitionDO>): Promise<number> {
 	const state = await nodeStub.status();
 	if (!state.splitStatus) return 0;
-	expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
+	expect(
+		state.splitStatus.status,
+		`DO ${state.partitionContext?.doName} should be split_completed`,
+	).toBe("split_completed");
 	const split = state.splitStatus as SplitStartedOrCompleted;
 	let count = 1;
 	for (const childCtx of split.childPartitionContexts) {
-		count += await assertSplitTreeComplete(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName)));
+		count += await assertSplitTreeComplete(
+			env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName)),
+		);
 	}
 	return count;
 }
@@ -1503,19 +1756,27 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 const PROMOTION_TEST_MAX_SIZE_MB = 0.1;
 const PROMOTION_BIG_DATA = "x".repeat(55 * 1024);
 
-
 describe("PartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and immediately cuts over to 'promoting' when no locks are held", async () => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			const s = await stub.status();
-			// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
-			if (!["promoting", "promoted"].includes(s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? ""))
-				throw new Error("not yet promoting");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				const s = await stub.status();
+				// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
+				if (
+					!["promoting", "promoted"].includes(
+						s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? "",
+					)
+				)
+					throw new Error("not yet promoting");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 	});
 
 	it("does not detect any key when the DB is well below the promotion threshold", async () => {
@@ -1530,16 +1791,23 @@ describe("PartitionDO — promotion detection and queuing", () => {
 	it("blocks hash split while a key is being promoted (mutual exclusion, inverse direction)", async () => {
 		// After detection cuts alice over to 'promoting', shouldSplit must return null even
 		// if DB is above hashSplitConditions.maxSizeMb, because alice is in-flight.
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
 		// Wait for alice to reach 'promoting' or 'promoted' (the fire-and-forget range-root migration
 		// may race to completion within the same background cycle).
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			const aliceStatus = (await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status;
-			if (!["promoting", "promoted"].includes(aliceStatus ?? "")) throw new Error("not yet");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				const aliceStatus = (await stub.status()).promotedKeys.find(
+					(e) => e.hashKey === "alice",
+				)?.status;
+				if (!["promoting", "promoted"].includes(aliceStatus ?? "")) throw new Error("not yet");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		// Write more data, then assert no hash split was queued. This holds in both cases:
 		//  - 'promoting': mutual exclusion blocks the split even though DB exceeds maxSizeMb.
@@ -1553,7 +1821,9 @@ describe("PartitionDO — promotion detection and queuing", () => {
 
 describe("PartitionDO — promotion cutover deferral and routing", () => {
 	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
@@ -1568,12 +1838,15 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		expect(lockResult.outcome).toBe("accepted");
 
 		// Detection queued alice but cutover was deferred — key must still be 'queued'.
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			const s = await stub.status();
-			if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "queued")
-				throw new Error("not yet queued");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				const s = await stub.status();
+				if (s.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "queued")
+					throw new Error("not yet queued");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		// A write to alice while 'queued' is still served locally.
 		const r = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "still-local" });
@@ -1581,36 +1854,56 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 
 		// Release the lock; next background cycle should complete the cutover.
 		await stub.cancel(ctx, { transactionId: txId });
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			const s2 = await stub.status();
-			if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
-				throw new Error("not yet promoting");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				const s2 = await stub.status();
+				if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoting")
+					throw new Error("not yet promoting");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 	});
 
 	it("forwards reads and writes to the range root after cutover ('promoting')", async () => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
 		// Wait for detection + cutover to 'promoting'.
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
+			ctx,
+			"alice",
+			null,
+			null,
+		);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			const s = await stub.status();
-			// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
-			if (!["promoting", "promoted"].includes(s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? ""))
-				throw new Error("not yet promoting");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				const s = await stub.status();
+				// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
+				if (
+					!["promoting", "promoted"].includes(
+						s.promotedKeys.find((e) => e.hashKey === "alice")?.status ?? "",
+					)
+				)
+					throw new Error("not yet promoting");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		// Drain the range root migration; hash DO transitions to 'promoted'.
-		await vi.waitFor(async () => {
-			await waitForAlarm(rangeRootStub);
-			const s2 = await stub.status();
-			if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
-				throw new Error("not yet promoted");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(rangeRootStub);
+				const s2 = await stub.status();
+				if (s2.promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
+					throw new Error("not yet promoted");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		// Writes via the hash partition are forwarded to the range root.
 		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range" });
@@ -1625,16 +1918,29 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 describe("PartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
+			ctx,
+			"alice",
+			null,
+			null,
+		);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			await waitForAlarm(rangeRootStub);
-			if ((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
-				throw new Error("not yet promoted");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				await waitForAlarm(rangeRootStub);
+				if (
+					(await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !==
+					"promoted"
+				)
+					throw new Error("not yet promoted");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
@@ -1660,7 +1966,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		});
 
 		// alice/sk2 must be in the range root; bob/sk1 must be local on the hash DO.
-		const aliceResult = await rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" });
+		const aliceResult = await rangeRootStub.getItem(rangeRootCtx, {
+			hashKey: "alice",
+			sortKey: "sk2",
+		});
 		expect(aliceResult).toMatchObject({ found: true, item: { data: "from-txn" } });
 
 		const bobResult = await stub.getItem(ctx, { hashKey: "bob", sortKey: "sk1" });
@@ -1668,16 +1977,29 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	});
 
 	it("cancel via hash DO releases both local and promoted-key locks", async () => {
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
+			ctx,
+			"alice",
+			null,
+			null,
+		);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			await waitForAlarm(rangeRootStub);
-			if ((await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !== "promoted")
-				throw new Error("not yet promoted");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				await waitForAlarm(rangeRootStub);
+				if (
+					(await stub.status()).promotedKeys.find((e) => e.hashKey === "alice")?.status !==
+					"promoted"
+				)
+					throw new Error("not yet promoted");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
@@ -1722,14 +2044,22 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: aliceData });
 
 		// Wait for: detect → 'promoting' → range-root migration → 'promoted' → GC clears local alice items.
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, "alice", null, null);
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
+			ctx,
+			"alice",
+			null,
+			null,
+		);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
-		await vi.waitFor(async () => {
-			await waitForAlarm(stub);
-			await waitForAlarm(rangeRootStub);
-			const local = await stub.getItemDirect({ hashKey: "alice", sortKey: "sk1" });
-			if (local.found) throw new Error("alice not GC'd from hash DO yet");
-		}, { timeout: 8000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				await waitForAlarm(rangeRootStub);
+				const local = await stub.getItemDirect({ hashKey: "alice", sortKey: "sk1" });
+				if (local.found) throw new Error("alice not GC'd from hash DO yet");
+			},
+			{ timeout: 8000, interval: 100 },
+		);
 
 		// Trigger hash split with spread data; none exceeds the per-key promotion threshold.
 		await triggerHashSplitThreshold(stub, ctx, 1);
@@ -1747,7 +2077,10 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		for (const childCtx of splitStatus.childPartitionContexts) {
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 			const local = await childStub.getItemDirect({ hashKey: "alice", sortKey: "sk1" });
-			expect(local.found, `alice's data must not be migrated locally into hash child ${childCtx.doName}`).toBe(false);
+			expect(
+				local.found,
+				`alice's data must not be migrated locally into hash child ${childCtx.doName}`,
+			).toBe(false);
 		}
 
 		// Exactly one hash child inherited alice's promoted-key entry; reading alice through THAT child
@@ -1758,20 +2091,42 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		for (const childCtx of splitStatus.childPartitionContexts) {
 			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 			const pk = (await childStub.status(childCtx)).promotedKeys;
-			if (pk.some((e: { hashKey: string; status: string }) => e.hashKey === "alice" && e.status === "promoted")) aliceChildCtxs.push(childCtx);
+			if (
+				pk.some(
+					(e: { hashKey: string; status: string }) =>
+						e.hashKey === "alice" && e.status === "promoted",
+				)
+			)
+				aliceChildCtxs.push(childCtx);
 		}
-		expect(aliceChildCtxs, "exactly one hash child should inherit alice's promoted entry").toHaveLength(1);
+		expect(
+			aliceChildCtxs,
+			"exactly one hash child should inherit alice's promoted entry",
+		).toHaveLength(1);
 
 		const aliceChildCtx = aliceChildCtxs[0];
 		const aliceChildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(aliceChildCtx.doName));
-		const aliceRead = await aliceChildStub.getItem(aliceChildCtx, { hashKey: "alice", sortKey: "sk1" });
-		expect(aliceRead.found, "alice must be reachable through its hash child via the inherited forward-pointer").toBe(true);
+		const aliceRead = await aliceChildStub.getItem(aliceChildCtx, {
+			hashKey: "alice",
+			sortKey: "sk1",
+		});
+		expect(
+			aliceRead.found,
+			"alice must be reachable through its hash child via the inherited forward-pointer",
+		).toBe(true);
 		expect(aliceRead.meta.forwardCount).toBeGreaterThanOrEqual(1);
-		expect(aliceRead.meta.servedByActorName, "alice must be served by the range structure, not the hash child").toBe(rangeRootCtx.doName);
+		expect(
+			aliceRead.meta.servedByActorName,
+			"alice must be served by the range structure, not the hash child",
+		).toBe(rangeRootCtx.doName);
 
 		// A split-trigger key must be reachable via the hash DO (forwarded to the owning child).
 		const trigResult = await stub.getItem(ctx, { hashKey: "_split_trig_0", sortKey: "sk" });
-		expect(trigResult).toMatchObject({ found: true, item: { hashKey: "_split_trig_0", sortKey: "sk" }, meta: { forwardCount: 1 } });
+		expect(trigResult).toMatchObject({
+			found: true,
+			item: { hashKey: "_split_trig_0", sortKey: "sk" },
+			meta: { forwardCount: 1 },
+		});
 	});
 });
 
@@ -1785,9 +2140,11 @@ const RANGE_ITEM_DATA = "x".repeat(50 * 1024); // ~50 KB/item → ~21 items cros
 // Builds a range-structure leaf owning [−∞, +∞) (parent = a hash DO), migration-complete so it serves
 // locally, then writes distinct-sk items until a range split is queued. No retain-leftmost: on split it
 // becomes a pure router over N fresh children.
-async function makeQueuedRangeRoot(
-	rangeSplitN: number,
-): Promise<{ rootCtx: PartitionContextResolved; rootStub: DurableObjectStub<PartitionDO>; sks: string[] }> {
+async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
+	rootCtx: PartitionContextResolved;
+	rootStub: DurableObjectStub<PartitionDO>;
+	sks: string[];
+}> {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		databaseName: `rangesplit.${crypto.randomUUID()}`,
@@ -1797,8 +2154,15 @@ async function makeQueuedRangeRoot(
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: RANGE_SPLIT_MAX_SIZE_MB },
 	});
-	const hashParentCtx = new PartitionTopologyRouterImpl(base).pickPartition("alice").partitionContext;
-	const { partitionContext: rootCtx } = resolveRangePartitionContext(hashParentCtx, "alice", null, null);
+	const hashParentCtx = new PartitionTopologyRouterImpl(base).pickPartition(
+		"alice",
+	).partitionContext;
+	const { partitionContext: rootCtx } = resolveRangePartitionContext(
+		hashParentCtx,
+		"alice",
+		null,
+		null,
+	);
 	const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 
 	// Initialize as a ready leaf (migration complete → serves locally rather than 503).
@@ -1823,11 +2187,16 @@ describe("PartitionDO — range split", () => {
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
 		expect(sks.length).toBeGreaterThanOrEqual(N);
 
-		await vi.waitFor(async () => {
-			await drainSplitTree(rootStub);
-			const s = await rootStub.status(rootCtx);
-			return s.splitStatus?.status === "split_completed" ? Promise.resolve() : Promise.reject(new Error("Split not completed yet"));
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await drainSplitTree(rootStub);
+				const s = await rootStub.status(rootCtx);
+				return s.splitStatus?.status === "split_completed"
+					? Promise.resolve()
+					: Promise.reject(new Error("Split not completed yet"));
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 
 		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
 		expect(status.status).toBe("split_completed");
@@ -1841,7 +2210,9 @@ describe("PartitionDO — range split", () => {
 		expect(children[N - 1].rangePartition!.endBoundary).toBeNull();
 		for (let i = 0; i < N - 1; i++) {
 			expect(children[i].rangePartition!.endBoundary).not.toBeNull();
-			expect(children[i].rangePartition!.endBoundary).toBe(children[i + 1].rangePartition!.startBoundary);
+			expect(children[i].rangePartition!.endBoundary).toBe(
+				children[i + 1].rangePartition!.startBoundary,
+			);
 		}
 
 		// Every item is still readable through the router, and each read forwards exactly once.
@@ -1855,11 +2226,14 @@ describe("PartitionDO — range split", () => {
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
 		const N = 4;
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
-		await vi.waitFor(async () => {
-			await drainSplitTree(rootStub);
-			const s = await rootStub.status();
-			if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await drainSplitTree(rootStub);
+				const s = await rootStub.status();
+				if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
 
 		for (const sk of sks) {
@@ -1874,20 +2248,27 @@ describe("PartitionDO — range split", () => {
 			// Reading through the router resolves to that exact child (servedByActorName = owning child's doName).
 			const g = await rootStub.getItem(rootCtx, { hashKey: "alice", sortKey: sk });
 			expect(g.found).toBe(true);
-			expect(g.meta.servedByActorName, `sk ${sk} should be served by its owning child`).toBe(owners[0].doName);
+			expect(g.meta.servedByActorName, `sk ${sk} should be served by its owning child`).toBe(
+				owners[0].doName,
+			);
 		}
 	});
 
 	it("creates a brand-new leftmost child distinct from the router (no retain-leftmost)", async () => {
 		const { rootCtx, rootStub } = await makeQueuedRangeRoot(4);
-		await vi.waitFor(async () => {
-			await drainSplitTree(rootStub);
-			const s = await rootStub.status();
-			if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
-		}, { timeout: 5000, interval: 100 });
+		await vi.waitFor(
+			async () => {
+				await drainSplitTree(rootStub);
+				const s = await rootStub.status();
+				if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
 		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
 
-		const leftmost = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null);
+		const leftmost = status.childPartitionContexts.find(
+			(c) => c.rangePartition!.startBoundary === null,
+		);
 		expect(leftmost, "a leftmost child [−∞, B1) must exist").toBeDefined();
 		// The router keeps no slice: the leftmost child is a different DO than the splitting node.
 		expect(leftmost!.doName).not.toBe(rootCtx.doName);

@@ -2,7 +2,10 @@ import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
+import {
+	PartitionContextCreator,
+	PartitionTopologyRouterImpl,
+} from "../src/lib/partition-topology/partition-topology.js";
 import type { PartitionContextResolved } from "../src/lib/partition-topology/partition-topology.js";
 import type { PartitionDO } from "../src/lib/do-partition.js";
 
@@ -35,16 +38,21 @@ function makeDB(databaseName: string) {
 async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	await runDurableObjectAlarm(stub);
 	await runInDurableObject(stub, async (instance: PartitionDO) => {
-		await vi.waitUntil(() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning, {
-			timeout: 5000,
-			interval: 50,
-		});
+		await vi.waitUntil(
+			() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning,
+			{
+				timeout: 5000,
+				interval: 50,
+			},
+		);
 	});
 }
 
 // FIXME Skipped because when calling destroy() the vitest integration is broken and stays hang forever even though the test completes.
 describe.skip("DELETE /api/databases/:databaseName", () => {
-	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
+	it("destroys all partitions in DFS postfix order, including children created by splits", async ({
+		expect,
+	}) => {
 		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(databaseName);
 		const topology = db.options().topology as PartitionTopologyRouterImpl;
@@ -74,17 +82,22 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 
 		// Call the HTTP DELETE endpoint, passing the same partition options so the server
 		// reconstructs the same topology (and therefore targets the same DOs).
-		const response = await exports.default.fetch(`https://example.com/api/databases/${databaseName}`, {
-			method: "DELETE",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ partitionOptions: PARTITION_OPTIONS }),
-		});
+		const response = await exports.default.fetch(
+			`https://example.com/api/databases/${databaseName}`,
+			{
+				method: "DELETE",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ partitionOptions: PARTITION_OPTIONS }),
+			},
+		);
 		expect(response.status).toBe(200);
 		expect(await response.json()).toEqual({ destroyed: true });
 
 		await expect(db.destroy()).resolves.toEqual({ ok: true });
 
-		console.log("BOOM 💥 — verifying all partitions were destroyed in DFS postfix order", { doNamesSet: Array.from(doNamesSet) });
+		console.log("BOOM 💥 — verifying all partitions were destroyed in DFS postfix order", {
+			doNamesSet: Array.from(doNamesSet),
+		});
 
 		for (const doName of doNamesSet) {
 			const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName));
@@ -99,7 +112,9 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 		}
 	});
 
-	it("is idempotent — a second DELETE on an already-destroyed database succeeds", async ({ expect }) => {
+	it("is idempotent — a second DELETE on an already-destroyed database succeeds", async ({
+		expect,
+	}) => {
 		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(databaseName);
 
@@ -116,7 +131,9 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 		}
 	});
 
-	it("is idempotent — a second DELETE on an already-destroyed database succeeds (DB directly)", async ({ expect }) => {
+	it("is idempotent — a second DELETE on an already-destroyed database succeeds (DB directly)", async ({
+		expect,
+	}) => {
 		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(databaseName);
 

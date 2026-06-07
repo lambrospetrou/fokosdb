@@ -1,4 +1,4 @@
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter { }
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
 
 export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
@@ -59,21 +59,21 @@ export type GetItemOptions = {
 
 export type GetItemResult =
 	| {
-		found: true;
-		item: {
-			hashKey: string;
-			sortKey?: string;
-			data: Uint8Array | string;
-			ttlEpochUTCSeconds?: number;
-			version: number;
-		};
-		meta: OperationMetrics & PartitionInfo & {};
-	}
+			found: true;
+			item: {
+				hashKey: string;
+				sortKey?: string;
+				data: Uint8Array | string;
+				ttlEpochUTCSeconds?: number;
+				version: number;
+			};
+			meta: OperationMetrics & PartitionInfo & {};
+	  }
 	| {
-		found: false;
-		item: ItemKey;
-		meta: OperationMetrics & PartitionInfo & {};
-	};
+			found: false;
+			item: ItemKey;
+			meta: OperationMetrics & PartitionInfo & {};
+	  };
 
 export type PartitionInfo = {
 	/**
