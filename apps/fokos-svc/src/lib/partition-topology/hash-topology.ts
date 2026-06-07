@@ -32,14 +32,7 @@ export class HashTopology {
 	private maxDepth: number;
 	private maxSlots: number;
 
-	private constructor(
-		arena: Uint32Array,
-		nextFree: number,
-		K: number,
-		ownerAbsDepth: number,
-		maxDepth: number,
-		maxSlots: number,
-	) {
+	private constructor(arena: Uint32Array, nextFree: number, K: number, ownerAbsDepth: number, maxDepth: number, maxSlots: number) {
 		this.arena = arena;
 		this.nextFree = nextFree;
 		this.K = K;
@@ -48,28 +41,14 @@ export class HashTopology {
 		this.maxSlots = maxSlots;
 	}
 
-	static create(
-		K: number,
-		ownerAbsDepth: number,
-		opts?: { maxDepth?: number; budgetBytes?: number },
-	): HashTopology {
+	static create(K: number, ownerAbsDepth: number, opts?: { maxDepth?: number; budgetBytes?: number }): HashTopology {
 		const maxSlots = Math.floor((opts?.budgetBytes ?? DEFAULT_BUDGET_BYTES) / 4);
 		const maxDepth = opts?.maxDepth ?? defaultMaxDepth(K, maxSlots);
 		const arena = new Uint32Array(maxSlots);
-		return new HashTopology(
-			arena,
-			K /* root block pre-allocated */,
-			K,
-			ownerAbsDepth,
-			maxDepth,
-			maxSlots,
-		);
+		return new HashTopology(arena, K /* root block pre-allocated */, K, ownerAbsDepth, maxDepth, maxSlots);
 	}
 
-	static fromSnapshot(
-		snapshot: HashTopologySnapshot,
-		opts?: { maxDepth?: number; budgetBytes?: number },
-	): HashTopology {
+	static fromSnapshot(snapshot: HashTopologySnapshot, opts?: { maxDepth?: number; budgetBytes?: number }): HashTopology {
 		const { K, nextFree, ownerAbsDepth } = snapshot;
 		const maxSlots = Math.floor((opts?.budgetBytes ?? DEFAULT_BUDGET_BYTES) / 4);
 		const maxDepth = opts?.maxDepth ?? defaultMaxDepth(K, maxSlots);

@@ -2,10 +2,7 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../src/lib/db.js";
-import {
-	PartitionContextCreator,
-	PartitionTopologyRouterImpl,
-} from "../src/lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
 import invariant from "../src/lib/invariant.js";
 
 function makeDB() {
@@ -27,10 +24,7 @@ function makeDB() {
 	});
 }
 
-function countDistinctPartitions(
-	db: FokosDB,
-	keys: Array<{ hashKey: string; sortKey?: string }>,
-): number {
+function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sortKey?: string }>): number {
 	const names = new Set<string>();
 	const topology = db.options().topology as PartitionTopologyRouterImpl;
 	for (const k of keys) {

@@ -1,23 +1,11 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import {
-	PartitionContextCreator,
-	PartitionIdHelper,
-	PartitionTopologyRouterImpl,
-	rangePartitionDoName,
-} from "./partition-topology.js";
-import type {
-	PartitionContext,
-	PartitionContextResolved,
-	SplitStatusKVItem,
-} from "./partition-topology.js";
+import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, rangePartitionDoName } from "./partition-topology.js";
+import type { PartitionContext, PartitionContextResolved, SplitStatusKVItem } from "./partition-topology.js";
 import type { PartitionDO } from "../do-partition.js";
 
-type SplitStartedOrCompleted = Extract<
-	SplitStatusKVItem,
-	{ status: "split_started" | "split_completed" }
->;
+type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
@@ -115,9 +103,7 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 			[null, "m", "testdb.r.x.~min.m"],
 			["m", null, "testdb.r.x.m.~max"],
 		] as const) {
-			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, "x", start, end).encode(
-				true,
-			);
+			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, "x", start, end).encode(true);
 			expect(doName).toBe(name);
 			const decoded = PartitionIdHelper.decode(bytes);
 			expect(decoded.schema).toBe(1);
@@ -130,9 +116,7 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 
 	it("handles unicode in hashKey and boundaries", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, "café☕", "töst", "zünd").encode(
-			false,
-		);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, "café☕", "töst", "zünd").encode(false);
 		const decoded = PartitionIdHelper.decode(bytes);
 		expect(decoded.schema).toBe(1);
 		if (decoded.schema === 1) {
@@ -144,9 +128,7 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 
 	it("doName dispatches correctly for range ID loaded from opaque hex", () => {
 		const base = makeBase();
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, "mykey", "start1", "end1").encode(
-			false,
-		);
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, "mykey", "start1", "end1").encode(false);
 		const bytes = Uint8Array.fromHex(opaque);
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("testdb.r.mykey.start1.end1");
 	});
@@ -173,9 +155,7 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1) unchanged", () => {
 
 	it("fromHashIdxs child: appendHashIdx extends depth", () => {
 		const base = makeBase();
-		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [2])
-			.appendHashIdx(1)
-			.encode(true);
+		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [2]).appendHashIdx(1).encode(true);
 
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_HASH_V1);
 		expect(doName).toBe("testdb.h.2.1");
@@ -212,12 +192,7 @@ function makeRangeCtx(
 	startBoundary: string | null,
 	endBoundary: string | null,
 ): PartitionContextResolved {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(
-		base,
-		hashKey,
-		startBoundary,
-		endBoundary,
-	).encode(true);
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
 	const doId = env.PARTITION_DO.idFromName(doName!);
 	return {
 		...base,
@@ -268,12 +243,8 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		await setupRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
-			await expect(
-				doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x" }),
-			).rejects.toThrow(/exceeded its limits/);
-			await expect(
-				doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x" }),
-			).rejects.toThrow(/exceeded its limits/);
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x" })).rejects.toThrow(/exceeded its limits/);
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x" })).rejects.toThrow(/exceeded its limits/);
 		});
 	});
 
@@ -313,15 +284,13 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 				await runDurableObjectAlarm(rootStub);
 				const s = await rootStub.status(rootCtx);
 				if (s.splitStatus?.status === "split_started") {
-					for (const childCtx of (s.splitStatus as SplitStartedOrCompleted)
-						.childPartitionContexts) {
+					for (const childCtx of (s.splitStatus as SplitStartedOrCompleted).childPartitionContexts) {
 						const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
 						await childStub.triggerMigration();
 						await runDurableObjectAlarm(childStub);
 					}
 				}
-				if ((await rootStub.status(rootCtx)).splitStatus?.status !== "split_completed")
-					throw new Error("split not completed yet");
+				if ((await rootStub.status(rootCtx)).splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
 			},
 			{ timeout: 8000, interval: 100 },
 		);
@@ -352,12 +321,14 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		// Items landed in their owning children, not on the router.
 		const leftStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[0].doName));
 		const rightStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[1].doName));
-		expect(
-			await leftStub.getItem(children[0], { hashKey: "alice", sortKey: "sk000" }),
-		).toMatchObject({ found: true, item: { data: "left" } });
-		expect(
-			await rightStub.getItem(children[1], { hashKey: "alice", sortKey: boundary }),
-		).toMatchObject({ found: true, item: { data: "right" } });
+		expect(await leftStub.getItem(children[0], { hashKey: "alice", sortKey: "sk000" })).toMatchObject({
+			found: true,
+			item: { data: "left" },
+		});
+		expect(await rightStub.getItem(children[1], { hashKey: "alice", sortKey: boundary })).toMatchObject({
+			found: true,
+			item: { data: "right" },
+		});
 	});
 });
 
@@ -379,9 +350,7 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		await vi.waitFor(
 			async () => {
 				const s = await stub.status(rootCtx);
-				return s.splitStatus?.status === "split_completed"
-					? Promise.resolve()
-					: Promise.reject(new Error("Split not completed yet"));
+				return s.splitStatus?.status === "split_completed" ? Promise.resolve() : Promise.reject(new Error("Split not completed yet"));
 			},
 			{ timeout: 5000, interval: 100 },
 		);

@@ -42,21 +42,13 @@ import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
 
-type ItemSnapshot =
-	| { hk: string; sk: string; found: true; v: number }
-	| { hk: string; sk: string; found: false };
+type ItemSnapshot = { hk: string; sk: string; found: true; v: number } | { hk: string; sk: string; found: false };
 
-function evaluateConditionsOnItem(
-	item: ItemSnapshot,
-	conditions: ItemCondition[],
-	operationName: string,
-): void {
+function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
 	for (const condition of conditions) {
 		if (condition.type === "item_exists") {
 			if (!item.found) {
-				throw new Error(
-					`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`,
-				);
+				throw new Error(`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`);
 			}
 		} else if (condition.type === "item_not_exists") {
 			if (item.found) {
@@ -100,10 +92,7 @@ type PartitionDOStub = {
 	prepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
 	commit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
 	cancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
-	readForTransaction(
-		ctx: PartitionContextResolved,
-		request: ReadForTransactionRequest,
-	): Promise<ReadForTransactionResponse>;
+	readForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 };
 
 type MigratedItem = {
@@ -144,10 +133,7 @@ type GetItemsBatchResult = {
 
 // Structural type for child→parent RPC calls during migration.
 type ParentPartitionDOStub = {
-	getItemsBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: MigrationCursor | null;
-	}): Promise<GetItemsBatchResult>;
+	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
 	getPartitionTransactionMetadata(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PendingTransactionCursor | null;
@@ -155,10 +141,7 @@ type ParentPartitionDOStub = {
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
 	acknowledgePromotionComplete(hashKey: string): Promise<void>;
 	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
-	getPromotedKeysBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PromotedKeyCursor | null;
-	}): Promise<{
+	getPromotedKeysBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: PromotedKeyCursor | null }): Promise<{
 		rows: { hash_key: string; status: PromotedKeyStatus }[];
 		nextCursor: PromotedKeyCursor | null;
 	}>;
@@ -174,10 +157,7 @@ export type InitFromSplitOptions = {
 	splitType: SplitType;
 };
 
-type PartitionSplitMigrationStatus =
-	| "migration_initialized"
-	| "migration_migrating"
-	| "migration_completed";
+type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
 
 export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly KV_KEYS = {
@@ -215,9 +195,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			await this.#_migrations.runAll();
 
 			// Load partition context from storage.
-			const pCtx = ctx.storage.kv.get<PartitionContextResolved>(
-				PartitionDO.KV_KEYS.PARTITION_CONTEXT,
-			);
+			const pCtx = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
 			if (pCtx) {
 				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 				this.#_partitionContext = pCtx;
@@ -239,20 +217,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 *
 	 * This is not meant to be called directly by clients.
 	 */
-	async initFromSplit(
-		opts: InitFromSplitOptions,
-		__testing__completeMigration?: boolean,
-		__testing__splitStatus?: SplitStatusKVItem,
-	) {
+	async initFromSplit(opts: InitFromSplitOptions, __testing__completeMigration?: boolean, __testing__splitStatus?: SplitStatusKVItem) {
 		const { parentPartitionContext, newPartitionContext, splitType } = opts;
 
 		if (this.#_partitionContext) {
-			const storedParent = this.ctx.storage.kv.get<PartitionContextResolved>(
-				PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT,
-			);
-			const storedSplitType = this.ctx.storage.kv.get<SplitType>(
-				PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE,
-			);
+			const storedParent = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			const storedSplitType = this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE);
 			if (
 				this.#_partitionContext.primaryDoIdStr !== newPartitionContext.primaryDoIdStr ||
 				storedParent?.primaryDoIdStr !== parentPartitionContext.primaryDoIdStr ||
@@ -270,15 +240,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		this.ensurePartitionContext(newPartitionContext, /* isInit */ true);
-		this.ctx.storage.kv.put<PartitionContextResolved>(
-			PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT,
-			parentPartitionContext,
-		);
+		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-			PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-			"migration_initialized",
-		);
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 
 		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
 		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
@@ -290,10 +254,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// FIXME Remove this shit and test properly through the public API.
 		if (__testing__completeMigration) {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-				PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-				"migration_completed",
-			);
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		}
 		if (__testing__splitStatus) {
 			this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
@@ -321,11 +282,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const pendingRow = this.ctx.storage.sql
 					.exec<{
 						transaction_id: string;
-					}>(
-						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				if (pendingRow) {
 					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
@@ -337,25 +294,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
-						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					);
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
 					const row = cRes.toArray()[0];
 					conditionRes = cRes;
-					const item: ItemSnapshot = row
-						? { found: true, hk: opts.hashKey, sk, v: row.v }
-						: { found: false, hk: opts.hashKey, sk };
+					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
 					evaluateConditionsOnItem(item, opts.conditions, "putItem");
 				}
 
 				const oldEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(
-						`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				const oldEst = oldEstRow?.est_row_bytes ?? 0;
 				const newEst = estimateRowBytes(opts.data, opts.hashKey, sk);
@@ -377,14 +324,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					Date.now(),
 					newEst,
 				);
-				const { rowsRead, rowsWritten } = conditionRes
-					? sumSqlMetrics(conditionRes, writeRes)
-					: writeRes;
+				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				const rows = writeRes.toArray();
-				invariant(
-					rows.length === 1,
-					`fokos/partition.putItem: RETURNING expected 1 row, got ${rows.length}`,
-				);
+				invariant(rows.length === 1, `fokos/partition.putItem: RETURNING expected 1 row, got ${rows.length}`);
 				const version = rows[0].v;
 				invariant(
 					typeof version === "number" && Number.isInteger(version) && version >= 1,
@@ -414,9 +356,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx)
-							? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
-							: 0,
+						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
 						rangeDepth: 0,
 					},
 				};
@@ -424,10 +364,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	async deleteItem(
-		pCtx: PartitionContextResolved,
-		opts: DeleteItemOptions,
-	): Promise<DeleteItemResult> {
+	async deleteItem(pCtx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("deleteItem");
 		return await this.withSplitForwarding<DeleteItemResult>({
@@ -441,11 +378,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const pendingRow = this.ctx.storage.sql
 					.exec<{
 						transaction_id: string;
-					}>(
-						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				if (pendingRow) {
 					// FIXME: ATC §4 optimization — see same comment in putItem.
@@ -456,48 +389,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(
-						`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					);
+					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
 					const row = cRes.toArray()[0];
 					conditionRes = cRes;
-					const item: ItemSnapshot = row
-						? { found: true, hk: opts.hashKey, sk, v: row.v }
-						: { found: false, hk: opts.hashKey, sk };
+					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
 					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
 				}
 
 				const delEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(
-						`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						opts.hashKey,
-						sk,
-					)
+					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 					.toArray()[0];
 				const delEst = delEstRow?.est_row_bytes ?? 0;
 
-				const writeRes = this.ctx.storage.sql.exec(
-					`DELETE FROM items WHERE hk = ? AND sk = ?`,
-					opts.hashKey,
-					sk,
-				);
+				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
 				// Keep deletion watermark consistent with transactional deletes.
 				if (writeRes.rowsWritten > 0) {
-					this.ctx.storage.sql.exec(
-						`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-						Date.now(),
-					);
-					this.ctx.storage.sql.exec(
-						`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`,
-						delEst,
-						opts.hashKey,
-					);
+					this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, Date.now());
+					this.ctx.storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, delEst, opts.hashKey);
 				}
-				const { rowsRead, rowsWritten } = conditionRes
-					? sumSqlMetrics(conditionRes, writeRes)
-					: writeRes;
+				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					deleted: writeRes.rowsWritten > 0,
@@ -509,9 +419,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx)
-							? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
-							: 0,
+						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
 						rangeDepth: 0,
 					},
 				};
@@ -524,13 +432,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		if (await this.ensureMigration("getItem", false)) {
 			// Read directly from parent while this child is still migrating its share of the data.
-			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(
-				PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT,
-			);
-			invariant(
-				parentCtx,
-				"fokos/partition.getItem: no parent partition context stored during migration",
-			);
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
 			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 			const parentStub = this.env[parentCtx.ns].get(parentId);
 			return await parentStub.getItemDirect(opts);
@@ -579,13 +482,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 				`fokos/partition.getItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
 			);
-			const isKnownChild = splitStatus.childPartitionContexts.some(
-				(c) => c.doName === childPartitionContext.doName,
-			);
-			invariant(
-				isKnownChild,
-				`fokos/partition.getItemsBatch: unknown range child partition "${childPartitionContext.doName}"`,
-			);
+			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
+			invariant(isKnownChild, `fokos/partition.getItemsBatch: unknown range child partition "${childPartitionContext.doName}"`);
 			return this.getItemsBatchForRange(
 				hk,
 				childPartitionContext.rangePartition.startBoundary,
@@ -603,13 +501,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 			`fokos/partition.getItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
 		);
-		const isKnownChild = splitStatus.childPartitionContexts.some(
-			(c) => c.doName === opts.childPartitionContext.doName,
-		);
-		invariant(
-			isKnownChild,
-			`fokos/partition.getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`,
-		);
+		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
+		invariant(isKnownChild, `fokos/partition.getItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
 
 		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
@@ -619,10 +512,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		let tableCursor = opts.cursor;
 		let reachedLimit = false;
 
-		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(
-			pCtx,
-			opts.childPartitionContext,
-		);
+		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
 		while (true) {
 			const page = this.queryPage(tableCursor, PAGE_SIZE);
@@ -631,10 +521,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			for (const row of page) {
 				// Filter: only items for the requesting hash child, excluding promoted keys
 				// (their data lives in range structures — hash children must not inherit local copies).
-				if (
-					isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) &&
-					!this.#_promotedKeys.has(row.hk)
-				) {
+				if (isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#_promotedKeys.has(row.hk)) {
 					const rowBytes = estimateItemBytes(row);
 					if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
 						reachedLimit = true;
@@ -734,11 +621,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}): Promise<GetPartitionTransactionMetadataResult> {
 		const pCtx = this.pCtx();
 		const maxDeletedTs =
-			this.ctx.storage.sql
-				.exec<{ max_deleted_ts: number }>(
-					`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`,
-				)
-				.toArray()[0]?.max_deleted_ts ?? 0;
+			this.ctx.storage.sql.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`).toArray()[0]
+				?.max_deleted_ts ?? 0;
 
 		// Range-child migration (promotion or range-split).
 		const childPartitionContext = opts.childPartitionContext;
@@ -763,9 +647,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 				`fokos/partition.getPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
 			);
-			const isKnownChild = splitStatus.childPartitionContexts.some(
-				(c) => c.doName === childPartitionContext.doName,
-			);
+			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
 			invariant(
 				isKnownChild,
 				`fokos/partition.getPartitionTransactionMetadata: unknown range child partition "${childPartitionContext.doName}"`,
@@ -816,18 +698,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
 			`fokos/partition.getPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
 		);
-		const isKnownChild = splitStatus.childPartitionContexts.some(
-			(c) => c.doName === opts.childPartitionContext.doName,
-		);
+		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
 		invariant(
 			isKnownChild,
 			`fokos/partition.getPartitionTransactionMetadata: unknown child partition "${opts.childPartitionContext.doName}"`,
 		);
 
-		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(
-			pCtx,
-			opts.childPartitionContext,
-		);
+		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
@@ -879,18 +756,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// Paginated promoted_keys for hash-split inheritance: a hash child pulls the promoted-key entries
 	// (forward-pointers) for the keys it now owns. Only the set transfers — never the data, which lives
 	// in the autonomous range structure (the range-root name is recomputable from the hashKey).
-	async getPromotedKeysBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PromotedKeyCursor | null;
-	}): Promise<{
+	async getPromotedKeysBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: PromotedKeyCursor | null }): Promise<{
 		rows: { hash_key: string; status: PromotedKeyStatus }[];
 		nextCursor: PromotedKeyCursor | null;
 	}> {
 		const pCtx = this.pCtx();
-		const isCorrectChild = this.ensureHashTopology(pCtx).makeIsCorrectChildHashPartition(
-			pCtx,
-			opts.childPartitionContext,
-		);
+		const isCorrectChild = this.ensureHashTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
 		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
 		const SCAN_LIMIT = 10_000;
@@ -907,8 +778,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					)
 		).toArray();
 		const rows = page.filter((r) => isCorrectChild(r.hash_key));
-		const nextCursor =
-			page.length === SCAN_LIMIT ? { hashKey: page[page.length - 1].hash_key } : null;
+		const nextCursor = page.length === SCAN_LIMIT ? { hashKey: page[page.length - 1].hash_key } : null;
 		return { rows, nextCursor };
 	}
 
@@ -932,16 +802,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
 		return {
 			partitionContext: pCtx,
-			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(
-				PartitionDO.KV_KEYS.PARTITION_CONTEXT,
-			),
+			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
 			splitStatus: pCtx ? this.ensureTopology(pCtx).splitStatus() : undefined,
-			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(
-				PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-			),
-			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(
-				PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT,
-			),
+			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
+			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
 			promotedKeys: Array.from(this.#_promotedKeys.entries()).map(([hashKey, status]) => ({
 				hashKey,
@@ -955,10 +819,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		await this.ensureMigration("prepare");
 
 		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
-		invariant(
-			unplaceable.length === 0,
-			"fokos/partition.prepare: mis-routed item this node can neither own nor route",
-		);
+		invariant(unplaceable.length === 0, "fokos/partition.prepare: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<PrepareResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -993,11 +854,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const pendingRow = this.ctx.storage.sql
 					.exec<{
 						transaction_id: string;
-					}>(
-						`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-						item.hashKey,
-						sk,
-					)
+					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 					.toArray()[0];
 
 				if (pendingRow) {
@@ -1019,11 +876,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					.exec<{
 						last_transaction_ts: number;
 						v: number;
-					}>(
-						`SELECT last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						item.hashKey,
-						sk,
-					)
+					}>(`SELECT last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 					.toArray()[0];
 
 				if (item.conditions && item.conditions.length > 0) {
@@ -1047,16 +900,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
 						};
 					}
-				} else if (
-					item.operation === "put" ||
-					item.operation === "delete" ||
-					item.operation === "check"
-				) {
+				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
 					// A check on a non-existent item must also respect the deletion watermark.
 					const metaRow = this.ctx.storage.sql
-						.exec<{ max_deleted_ts: number }>(
-							`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`,
-						)
+						.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
 						.toArray()[0];
 					if (request.transactionTimestamp <= (metaRow?.max_deleted_ts ?? 0)) {
 						return {
@@ -1101,10 +948,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		await this.ensureMigration("commit"); // reject while this partition is migrating
 
 		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
-		invariant(
-			unplaceable.length === 0,
-			"fokos/partition.commit: mis-routed item this node can neither own nor route",
-		);
+		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<CommitResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -1120,10 +964,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private commitLocal(request: CommitRequest): CommitResponse {
 		const pendingCount =
 			this.ctx.storage.sql
-				.exec<{ n: number }>(
-					`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`,
-					request.transactionId,
-				)
+				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
 				.toArray()[0]?.n ?? 0;
 
 		if (pendingCount === 0) {
@@ -1132,10 +973,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		this.ctx.storage.transactionSync(() => {
 			const pendingRows = this.ctx.storage.sql
-				.exec<{ hk: string; sk: string }>(
-					`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`,
-					request.transactionId,
-				)
+				.exec<{ hk: string; sk: string }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
 				.toArray();
 			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
 			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
@@ -1151,20 +989,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			this.applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);
-			this.ctx.storage.sql.exec(
-				`DELETE FROM pending_transactions WHERE transaction_id = ?`,
-				request.transactionId,
-			);
+			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 		});
 
 		return { outcome: "committed" };
 	}
 
-	private applyCommitItems(
-		transactionId: string,
-		transactionTimestamp: number,
-		items: TransactionItem[],
-	): void {
+	private applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
 		for (const item of items) {
 			const sk = item.sortKey ?? "";
 			const pendingRow = this.ctx.storage.sql
@@ -1182,24 +1013,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (!pendingRow) continue;
 
 			if (pendingRow.operation === "put") {
-				const data =
-					typeof pendingRow.data === "string"
-						? pendingRow.data
-						: pendingRow.data
-							? new Uint8Array(pendingRow.data)
-							: null;
+				const data = typeof pendingRow.data === "string" ? pendingRow.data : pendingRow.data ? new Uint8Array(pendingRow.data) : null;
 				const txOldEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(
-						`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						item.hashKey,
-						sk,
-					)
+					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 					.toArray()[0];
 				const txOldEst = txOldEstRow?.est_row_bytes ?? 0;
-				const txNewEst =
-					data !== null
-						? estimateRowBytes(data, item.hashKey, sk)
-						: item.hashKey.length + sk.length + 40;
+				const txNewEst = data !== null ? estimateRowBytes(data, item.hashKey, sk) : item.hashKey.length + sk.length + 40;
 				this.ctx.storage.sql.exec(
 					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes)
 					 VALUES (?, ?, ?, NULL, 1, ?, ?)
@@ -1228,11 +1047,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				this.maybeQueuePromotion(this.pCtx(), item.hashKey, txKseRow?.est_bytes ?? txNewEst);
 			} else if (pendingRow.operation === "delete") {
 				const txDelEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(
-						`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-						item.hashKey,
-						sk,
-					)
+					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 					.toArray()[0];
 				const txDelEst = txDelEstRow?.est_row_bytes ?? 0;
 				this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, item.hashKey, sk);
@@ -1240,11 +1055,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
 					transactionTimestamp,
 				);
-				this.ctx.storage.sql.exec(
-					`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`,
-					txDelEst,
-					item.hashKey,
-				);
+				this.ctx.storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, txDelEst, item.hashKey);
 			} else if (pendingRow.operation === "check") {
 				this.ctx.storage.sql.exec(
 					`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`,
@@ -1259,10 +1070,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("cancel"); // reject while this partition is migrating
-		this.ctx.storage.sql.exec(
-			`DELETE FROM pending_transactions WHERE transaction_id = ?`,
-			request.transactionId,
-		);
+		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
 
 		const childContexts: PartitionContextResolved[] = [];
 
@@ -1277,21 +1085,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (isHashPartition(pCtx)) {
 			for (const [hashKey, status] of this.#_promotedKeys) {
 				if (status === "promoting" || status === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
-						pCtx,
-						hashKey,
-						null,
-						null,
-					);
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
 					childContexts.push(rangeRootCtx);
 				}
 			}
 		}
 
 		if (childContexts.length > 0) {
-			const results = await Promise.allSettled(
-				childContexts.map((childPCtx) => this.getChildStub(childPCtx).cancel(childPCtx, request)),
-			);
+			const results = await Promise.allSettled(childContexts.map((childPCtx) => this.getChildStub(childPCtx).cancel(childPCtx, request)));
 			const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
 			if (failures.length > 0) {
 				console.error({
@@ -1300,27 +1101,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					transactionId: request.transactionId,
 					failureCount: failures.length,
 				});
-				throw new Error(
-					`fokos/partition.cancel: ${failures.length} child cancel(s) failed for transaction ${request.transactionId}`,
-				);
+				throw new Error(`fokos/partition.cancel: ${failures.length} child cancel(s) failed for transaction ${request.transactionId}`);
 			}
 		}
 
 		return { outcome: "cancelled" };
 	}
 
-	async readForTransaction(
-		pCtx: PartitionContextResolved,
-		request: ReadForTransactionRequest,
-	): Promise<ReadForTransactionResponse> {
+	async readForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
 		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
-		invariant(
-			unplaceable.length === 0,
-			"fokos/partition.readForTransaction: mis-routed item this node can neither own nor route",
-		);
+		invariant(unplaceable.length === 0, "fokos/partition.readForTransaction: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<ReadForTransactionResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -1344,21 +1137,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					data: string | ArrayBuffer;
 					last_transaction_ts: number;
 					v: number;
-				}>(
-					`SELECT data, last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-					item.hashKey,
-					sk,
-				)
+				}>(`SELECT data, last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 				.toArray()[0];
 
 			const pendingRow = this.ctx.storage.sql
 				.exec<{
 					transaction_id: string;
-				}>(
-					`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-					item.hashKey,
-					sk,
-				)
+				}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
 				.toArray()[0];
 
 			const hasPendingWrite = pendingRow != null;
@@ -1402,11 +1187,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	private async checkSplits(
-		pCtx: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
-	): Promise<SplitStatusKVItem | undefined> {
+	private async checkSplits(pCtx: PartitionContextResolved, hashKey: string, sortKey?: string): Promise<SplitStatusKVItem | undefined> {
 		const topologyRouter = this.ensureTopology(pCtx);
 		const splitStatus = await topologyRouter.maybeQueueSplit(hashKey, sortKey);
 		if (splitStatus) {
@@ -1431,10 +1212,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_partitionContext;
 	}
 
-	private ensurePartitionContext(
-		pCtx: PartitionContextResolved,
-		isInit = false,
-	): PartitionContextResolved {
+	private ensurePartitionContext(pCtx: PartitionContextResolved, isInit = false): PartitionContextResolved {
 		// Phantom-bounce guard: a range DO is born ONLY through initFromSplit (promotion creates the root,
 		// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
 		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
@@ -1451,8 +1229,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					this.#_partitionContext.partitionId === pCtx.partitionId &&
 					this.#_partitionContext.doName === pCtx.doName &&
 					this.#_partitionContext.rangePartition?.hashKey === pCtx.rangePartition?.hashKey &&
-					this.#_partitionContext.rangePartition?.startBoundary ===
-						pCtx.rangePartition?.startBoundary &&
+					this.#_partitionContext.rangePartition?.startBoundary === pCtx.rangePartition?.startBoundary &&
 					this.#_partitionContext.rangePartition?.endBoundary === pCtx.rangePartition?.endBoundary,
 				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
@@ -1461,28 +1238,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				return this.#_partitionContext;
 			}
 		}
-		invariant(
-			pCtx.partitionId.length > 0,
-			"fokos/partition.ensurePartitionContext: partitionId must not be empty",
-		);
+		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
 		this.#_partitionContext = { ...pCtx };
 		this.#_partitionContext._partitionIdBytes = undefined;
-		this.ctx.storage.kv.put<PartitionContextResolved>(
-			PartitionDO.KV_KEYS.PARTITION_CONTEXT,
-			this.#_partitionContext,
-		);
-		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(
-			this.#_partitionContext.partitionId,
-		);
+		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
+		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
 		return this.#_partitionContext;
 	}
 
 	private ensureHashTopology(pCtx: PartitionContextResolved): HashPartitionTopologyImpl {
 		const topology = this.ensureTopology(pCtx);
-		invariant(
-			topology instanceof HashPartitionTopologyImpl,
-			"fokos/partition: expected hash partition topology",
-		);
+		invariant(topology instanceof HashPartitionTopologyImpl, "fokos/partition: expected hash partition topology");
 		return topology;
 	}
 
@@ -1497,17 +1263,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async ensureMigration(op: string, throwIfMigrating = true): Promise<boolean> {
 		// TODO Optimize this away by keeping it in memory.
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(
-			PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-		);
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 		if (!migrationStatus || migrationStatus === "migration_completed") {
 			return false;
 		}
 		if (migrationStatus === "migration_initialized") {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-				PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-				"migration_migrating",
-			);
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 		}
 		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
@@ -1538,12 +1299,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (isHashPartition(ctx)) {
 			const promotedStatus = this.#_promotedKeys.get(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(
-					ctx,
-					hashKey,
-					null,
-					null,
-				);
+				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
 				const rangeRootStub = this.env[ctx.ns].get(doId);
 				const result = await forward(rangeRootStub, rangeRootCtx);
 				return {
@@ -1576,15 +1332,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				} as T;
 			}
 			case "reject":
-				throw new Error(
-					`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`,
-				);
+				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
 			default: {
 				const _exhaustive: never = decision;
-				invariant(
-					false,
-					`fokos/partition.withSplitForwarding: unexpected decision value: ${_exhaustive}`,
-				);
+				invariant(false, `fokos/partition.withSplitForwarding: unexpected decision value: ${_exhaustive}`);
 			}
 		}
 	}
@@ -1616,12 +1367,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				const promotedStatus = this.#_promotedKeys.get(item.hashKey);
 				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(
-						pCtx,
-						item.hashKey,
-						null,
-						null,
-					);
+					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
 					addForwarded(rangeRootCtx, item);
 					continue;
 				}
@@ -1651,11 +1397,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			data: string | ArrayBuffer;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
-		}>(
-			`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
-			opts.hashKey,
-			opts.sortKey ?? "",
-		);
+		}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
 		const rows = res.toArray();
 		const { rowsRead, rowsWritten } = sumSqlMetrics(res);
 		const result = rows[0];
@@ -1667,9 +1409,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx)
-				? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
-				: 0,
+			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
 			rangeDepth: 0,
 		};
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
@@ -1681,9 +1421,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			item: {
 				...itemKey,
 				data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
-				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds
-					? Number(result.ttl_epoch_utc_seconds)
-					: undefined,
+				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 				version: result.v,
 			},
 			meta: actorMeta,
@@ -1730,10 +1468,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return items;
 	}
 
-	private queryPendingTxPage(
-		cursor: PendingTransactionCursor | null,
-		limit: number,
-	): PendingTransactionRow[] {
+	private queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
 		type Row = {
 			hk: string;
 			sk: string;
@@ -1749,10 +1484,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`,
-				limit,
-			);
+			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
 		} else {
 			sqlCursor = this.ctx.storage.sql.exec<Row>(
 				`SELECT ${cols} FROM pending_transactions
@@ -1778,9 +1510,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async runMigration(): Promise<void> {
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(
-			PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-		);
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 		if (migrationStatus !== "migration_migrating") {
 			console.log({
 				...this.logParams(),
@@ -1791,9 +1521,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		const pCtx = this.pCtx();
-		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(
-			PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT,
-		);
+		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
 		if (isHashPartition(pCtx)) {
@@ -1803,15 +1531,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	private async runHashChildMigration(
-		pCtx: PartitionContextResolved,
-		parentCtx: PartitionContextResolved,
-	): Promise<void> {
+	private async runHashChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
 		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
 
-		let cursor =
-			this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
 		while (true) {
 			const { items, nextCursor } = await parentStub.getItemsBatch({
@@ -1840,26 +1564,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			// Checkpoint cursor after each batch so we can resume if interrupted.
 			cursor = nextCursor;
-			this.ctx.storage.kv.put<MigrationCursor | null>(
-				PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR,
-				cursor,
-			);
+			this.ctx.storage.kv.put<MigrationCursor | null>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
 
 			if (!nextCursor) break;
 		}
-		invariant(
-			cursor === null,
-			"fokos/partition.runHashChildMigration: loop exited with non-null cursor — data may be incomplete",
-		);
+		invariant(cursor === null, "fokos/partition.runHashChildMigration: loop exited with non-null cursor — data may be incomplete");
 
 		// Migrate transaction metadata: pending locks and deletion high-water mark.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } =
-				await parentStub.getPartitionTransactionMetadata({
-					childPartitionContext: pCtx,
-					cursor: txCursor,
-				});
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
+				childPartitionContext: pCtx,
+				cursor: txCursor,
+			});
 
 			this.ctx.storage.transactionSync(() => {
 				for (const row of pendingTransactions) {
@@ -1878,10 +1595,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						row.created_at,
 					);
 				}
-				this.ctx.storage.sql.exec(
-					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-					maxDeletedTs,
-				);
+				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
 			});
 
 			if (!nextCursor) break;
@@ -1922,10 +1636,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
 			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
 		);
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-			PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-			"migration_completed",
-		);
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 		await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
 
@@ -1935,18 +1646,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	private async runRangeChildMigration(
-		pCtx: PartitionContextResolved,
-		parentCtx: PartitionContextResolved,
-	): Promise<void> {
+	private async runRangeChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
 		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
 
 		// Migrate items for this range DO's owned slice.
 		// For a promotion root the parent is a hash DO (filter by hk only);
 		// for a range-split child the parent is a range DO (filter by hk and sk range).
-		let cursor =
-			this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
 		while (true) {
 			const { items, nextCursor } = await parentStub.getItemsBatch({
@@ -1970,28 +1677,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			cursor = nextCursor;
-			this.ctx.storage.kv.put<MigrationCursor | null>(
-				PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR,
-				cursor,
-			);
+			this.ctx.storage.kv.put<MigrationCursor | null>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
 
 			if (!nextCursor) break;
 		}
-		invariant(
-			cursor === null,
-			"fokos/partition.runRangeChildMigration: loop exited with non-null cursor",
-		);
+		invariant(cursor === null, "fokos/partition.runRangeChildMigration: loop exited with non-null cursor");
 
 		// Migrate transaction metadata: pending locks and the deletion high-water mark.
 		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the watermark;
 		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } =
-				await parentStub.getPartitionTransactionMetadata({
-					childPartitionContext: pCtx,
-					cursor: txCursor,
-				});
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
+				childPartitionContext: pCtx,
+				cursor: txCursor,
+			});
 
 			this.ctx.storage.transactionSync(() => {
 				for (const row of pendingTransactions) {
@@ -2010,10 +1710,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						row.created_at,
 					);
 				}
-				this.ctx.storage.sql.exec(
-					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-					maxDeletedTs,
-				);
+				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
 			});
 
 			if (!nextCursor) break;
@@ -2026,10 +1723,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
 			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
 		);
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-			PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-			"migration_completed",
-		);
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 
 		// Notify the parent: a promotion root calls acknowledgePromotionComplete; a range-split child calls acknowledgeChildMigrationComplete.
@@ -2055,11 +1749,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private scheduleBackgroundWork(ops: { delayMs: number; forceSchedule?: boolean }): void {
 		const delayMs = ops.delayMs ?? 10;
 		const targetTime = Date.now() + delayMs;
-		if (
-			!ops.forceSchedule &&
-			this.#_backgroundWorkScheduledAt !== null &&
-			this.#_backgroundWorkScheduledAt <= targetTime
-		) {
+		if (!ops.forceSchedule && this.#_backgroundWorkScheduledAt !== null && this.#_backgroundWorkScheduledAt <= targetTime) {
 			return;
 		}
 		if (ops.forceSchedule && this.#_backgroundWorkScheduledAt === targetTime) {
@@ -2101,12 +1791,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (splitStatus?.status === "split_queued" || splitStatus?.status === "split_started") return;
 
 		// A. Build identity for the range root.
-		const { doId: rangeRootId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(
-			pCtx,
-			hashKey,
-			null,
-			null,
-		);
+		const { doId: rangeRootId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
 		const rangeRootStub = this.env[pCtx.ns].get(rangeRootId);
 
 		// B. Initialize the range root (idempotent, retry ≤5). No forwarding yet — status is still 'queued'.
@@ -2123,12 +1808,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// C. Cutover queued→promoting in one transactionSync, only if the key has no pending locks.
 		const didCutover = this.ctx.storage.transactionSync(() => {
 			const lockCount =
-				this.ctx.storage.sql
-					.exec<{ n: number }>(
-						`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`,
-						hashKey,
-					)
-					.toArray()[0]?.n ?? 0;
+				this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hashKey).toArray()[0]?.n ??
+				0;
 			if (lockCount > 0) return false; // deferred — retry next background cycle
 			this.ctx.storage.sql.exec(
 				`UPDATE promoted_keys SET status = 'promoting', updated_at = ? WHERE hash_key = ? AND status = 'queued'`,
@@ -2165,8 +1846,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private maybeQueuePromotion(pCtx: PartitionContextResolved, hk: string, newKeyEst: number): void {
 		if (!isHashPartition(pCtx)) return;
-		const threshold =
-			(pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
+		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.#_promotedKeys.has(hk)) return;
 		const now = Date.now();
 		this.ctx.storage.sql.exec(
@@ -2187,10 +1867,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async runBackgroundWork(): Promise<void> {
-		invariant(
-			this.#_partitionContext,
-			"fokos/partition.runBackgroundWork: partition context not initialized",
-		);
+		invariant(this.#_partitionContext, "fokos/partition.runBackgroundWork: partition context not initialized");
 		/**
 		 * INVARIANTS FOR ALL BACKGROUND JOBS:
 		 * - They should be idempotent and safe to run concurrently (e.g. if the alarm fires again while a previous run is still ongoing) to avoid issues with retries and overlapping runs.
@@ -2203,18 +1880,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			////////////////////////////////////////////////////////
 			// ── Job: Partition migration (for child partitions)
 			try {
-				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(
-					PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-				);
-				if (
-					migrationStatus === "migration_initialized" ||
-					migrationStatus === "migration_migrating"
-				) {
+				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+				if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
 					if (migrationStatus === "migration_initialized") {
-						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(
-							PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-							"migration_migrating",
-						);
+						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 					}
 					await tryWhile(
 						async () => {
@@ -2273,9 +1942,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					if (!row.coordinator_do_id) continue;
 					try {
 						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(
-							row.transaction_id,
-						);
+						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
 
 						if (result.state === "COMMITTED") {
 							const pendingRows = this.ctx.storage.sql
@@ -2285,10 +1952,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 									transaction_ts: number;
 									operation: string;
 									data: string | ArrayBuffer | null;
-								}>(
-									`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`,
-									row.transaction_id,
-								)
+								}>(`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`, row.transaction_id)
 								.toArray();
 							if (pendingRows.length > 0) {
 								const transactionTimestamp = pendingRows[0].transaction_ts;
@@ -2296,12 +1960,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 									hashKey: r.hk,
 									sortKey: r.sk || undefined,
 									operation: r.operation as TransactionItem["operation"],
-									data:
-										r.data == null
-											? undefined
-											: typeof r.data === "string"
-												? r.data
-												: new Uint8Array(r.data),
+									data: r.data == null ? undefined : typeof r.data === "string" ? r.data : new Uint8Array(r.data),
 								}));
 								await this.commit(this.pCtx(), {
 									transactionId: row.transaction_id,
@@ -2360,9 +2019,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 								hashKey,
 							);
 							this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hashKey);
-							const residual = this.ctx.storage.sql
-								.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey)
-								.toArray()[0];
+							const residual = this.ctx.storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey).toArray()[0];
 							if (!residual) {
 								this.ctx.storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hashKey);
 							}
@@ -2396,9 +2053,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			};
 			this.ctx.storage.transactionSync(() => {
 				// Job: Partition migration for child partitions.
-				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(
-					PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS,
-				);
+				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 				if (postStatus === "migration_migrating") {
 					wantAlarm(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 				}
@@ -2413,18 +2068,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					if (status === "queued" || status === "promoting") {
 						wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 					} else if (status === "promoted") {
-						const residual = this.ctx.storage.sql
-							.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey)
-							.toArray()[0];
+						const residual = this.ctx.storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey).toArray()[0];
 						if (residual) wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 					}
 				}
 
 				// Job: Stale transaction recovery.
 				const pendingCount =
-					this.ctx.storage.sql
-						.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`)
-						.toArray()[0]?.n ?? 0;
+					this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
 				if (pendingCount > 0) {
 					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
 				}
@@ -2500,18 +2151,8 @@ function estimateItemBytes(item: MigratedItem): number {
 }
 
 function estimatePendingTxBytes(row: PendingTransactionRow): number {
-	const dataSize =
-		row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return (
-		row.hk.length * 2 +
-		row.sk.length * 2 +
-		32 +
-		8 +
-		8 +
-		dataSize +
-		(row.conditions_json?.length ?? 0) * 2 +
-		64
-	);
+	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
+	return row.hk.length * 2 + row.sk.length * 2 + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
 }
 
 const sqlMigrations: SQLSchemaMigration[] = [
@@ -2571,8 +2212,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 	{
 		idMonotonicInc: 4,
-		description:
-			"Add per-row size estimate and key-level size summary for efficient promotion detection",
+		description: "Add per-row size estimate and key-level size summary for efficient promotion detection",
 		sql: `
             CREATE TABLE IF NOT EXISTS key_size_estimates (
                 hk        TEXT    NOT NULL PRIMARY KEY,

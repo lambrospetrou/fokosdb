@@ -3,11 +3,7 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
-import {
-	PartitionContextCreator,
-	PartitionTopologyRouterImpl,
-	type SplitConditions,
-} from "./lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator, PartitionTopologyRouterImpl, type SplitConditions } from "./lib/partition-topology/partition-topology.js";
 import type { GetItemResult, InitiateReadResponse } from "./lib/types.js";
 
 export { PartitionDO } from "./lib/do-partition.js";
@@ -96,21 +92,15 @@ const DEFAULT_PARTITION_OPTIONS = {
 
 type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
 
-function makeFokosDB(
-	env: Env,
-	databaseName: string,
-	partitionOptions?: PartitionOptionsInput,
-): FokosDB {
+function makeFokosDB(env: Env, databaseName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
 	const partitionContext = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		databaseName,
 		rootTreesN: partitionOptions?.rootTreesN ?? DEFAULT_PARTITION_OPTIONS.rootTreesN,
 		hashSplitN: partitionOptions?.hashSplitN ?? DEFAULT_PARTITION_OPTIONS.hashSplitN,
 		rangeSplitN: partitionOptions?.rangeSplitN ?? DEFAULT_PARTITION_OPTIONS.rangeSplitN,
-		hashSplitConditions:
-			partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
-		rangeSplitConditions:
-			partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
+		hashSplitConditions: partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
+		rangeSplitConditions: partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
 	});
 	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({
@@ -223,9 +213,7 @@ api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 		throw new HTTPException(400, { message: "Invalid JSON body" });
 	}
 
-	function parseBody<S extends v.BaseSchema<unknown, unknown, v.BaseIssue<unknown>>>(
-		schema: S,
-	): v.InferOutput<S> {
+	function parseBody<S extends v.BaseSchema<unknown, unknown, v.BaseIssue<unknown>>>(schema: S): v.InferOutput<S> {
 		const result = v.safeParse(schema, rawBody);
 		if (!result.success) {
 			throw new HTTPException(400, {
@@ -244,11 +232,7 @@ api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
-			return c.json(
-				serializeGetItemResult(
-					await makeFokosDB(c.env, databaseName, partitionOptions).getItem(opts),
-				),
-			);
+			return c.json(serializeGetItemResult(await makeFokosDB(c.env, databaseName, partitionOptions).getItem(opts)));
 		}
 		case "deleteItem": {
 			const { partitionOptions, ...opts } = parseBody(DeleteItemBodySchema);
@@ -256,17 +240,11 @@ api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 		}
 		case "transactWriteItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactWriteItemsBodySchema);
-			return c.json(
-				await makeFokosDB(c.env, databaseName, partitionOptions).transactWriteItems(opts),
-			);
+			return c.json(await makeFokosDB(c.env, databaseName, partitionOptions).transactWriteItems(opts));
 		}
 		case "transactGetItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactGetItemsBodySchema);
-			return c.json(
-				serializeTransactGetItemsResult(
-					await makeFokosDB(c.env, databaseName, partitionOptions).transactGetItems(opts),
-				),
-			);
+			return c.json(serializeTransactGetItemsResult(await makeFokosDB(c.env, databaseName, partitionOptions).transactGetItems(opts)));
 		}
 		default:
 			throw new HTTPException(404, { message: `Unknown rpcAction: ${rpcAction}` });

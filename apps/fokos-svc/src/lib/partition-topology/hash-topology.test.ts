@@ -15,17 +15,12 @@ function divergingKey(base: string, ownerAbsDepth: number, divergeAt: number, K:
 	for (let n = 0; n < 100_000; n++) {
 		const candidate = `${base}_alt${n}`;
 		// Must share every level before divergeAt.
-		const prefixMatches = basePath
-			.slice(0, divergeAt)
-			.every((slot, i) => hashChildIndex(candidate, ownerAbsDepth + i, K) === slot);
+		const prefixMatches = basePath.slice(0, divergeAt).every((slot, i) => hashChildIndex(candidate, ownerAbsDepth + i, K) === slot);
 		if (!prefixMatches) continue;
 		// Must diverge at the target level.
-		if (hashChildIndex(candidate, ownerAbsDepth + divergeAt, K) !== basePath[divergeAt])
-			return candidate;
+		if (hashChildIndex(candidate, ownerAbsDepth + divergeAt, K) !== basePath[divergeAt]) return candidate;
 	}
-	throw new Error(
-		"divergingKey: could not find a prefix-matching diverging key within 100 000 attempts",
-	);
+	throw new Error("divergingKey: could not find a prefix-matching diverging key within 100 000 attempts");
 }
 
 describe("HashTopology", () => {

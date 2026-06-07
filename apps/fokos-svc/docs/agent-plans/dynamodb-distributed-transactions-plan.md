@@ -93,9 +93,7 @@ export type RejectionReason =
 	  }
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number };
 
-export type PrepareResponse =
-	| { outcome: "accepted" }
-	| { outcome: "rejected"; reason: RejectionReason };
+export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -146,14 +144,7 @@ export type ReadForTransactionResponse = {
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
-export type TCState =
-	| "CREATED"
-	| "PREPARING"
-	| "PREPARED"
-	| "COMMITTING"
-	| "COMMITTED"
-	| "CANCELLING"
-	| "CANCELLED";
+export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
 
@@ -306,16 +297,11 @@ const sk = opts.sortKey ?? "";
 const pendingRow = this.ctx.storage.sql
 	.exec<{
 		transaction_id: string;
-	}>(
-		`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`,
-		opts.hashKey,
-		sk,
-	)
+	}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
 	.toArray()[0];
 if (pendingRow) {
 	throw new Error(
-		`fokos/partition: item is locked by an in-progress transaction ` +
-			`(transactionId=${pendingRow.transaction_id}), retry later.`,
+		`fokos/partition: item is locked by an in-progress transaction ` + `(transactionId=${pendingRow.transaction_id}), retry later.`,
 	);
 }
 // FIXME: The ATC 2023 paper §4 "Adapting timestamp ordering for key-value operations"
@@ -579,10 +565,7 @@ if (pendingTransactions.length > 0) {
 	}
 }
 // Set deletion_metadata to at least the parent's value (safe upper bound for this key range).
-this.ctx.storage.sql.exec(
-	`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-	maxDeletedTs,
-);
+this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
 ```
 
 ### 5c. `MigratedItem` type extension
@@ -904,9 +887,7 @@ for (const row of staleTxRows) {
 
 // Re-arm alarm if any pending transactions still exist.
 const remaining =
-	this.ctx.storage.sql
-		.exec<{ count: number }>(`SELECT COUNT(*) as count FROM pending_transactions`)
-		.toArray()[0]?.count ?? 0;
+	this.ctx.storage.sql.exec<{ count: number }>(`SELECT COUNT(*) as count FROM pending_transactions`).toArray()[0]?.count ?? 0;
 if (remaining > 0 && !(await this.ctx.storage.getAlarm())) {
 	await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
 }
@@ -996,14 +977,11 @@ function validateTransactWriteItems(ops: TCWriteOperation[]): void {
 	const seen = new Set<string>();
 	for (const op of ops) {
 		const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
-		if (seen.has(key))
-			throw new Error(`TransactWriteItems: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
+		if (seen.has(key)) throw new Error(`TransactWriteItems: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
 		seen.add(key);
-		if (op.data)
-			totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
+		if (op.data) totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
 	}
-	if (totalBytes > 4 * 1024 * 1024)
-		throw new Error("TransactWriteItems: total payload exceeds 4 MB");
+	if (totalBytes > 4 * 1024 * 1024) throw new Error("TransactWriteItems: total payload exceeds 4 MB");
 }
 ```
 

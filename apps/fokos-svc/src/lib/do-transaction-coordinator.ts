@@ -26,10 +26,7 @@ type PartitionDOStub = {
 	prepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
 	commit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
 	cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
-	readForTransaction(
-		pCtx: PartitionContextResolved,
-		request: ReadForTransactionRequest,
-	): Promise<ReadForTransactionResponse>;
+	readForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 };
 
 type TcStateRow = {
@@ -178,10 +175,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId);
 	}
 
-	private async resumeTransaction(
-		existingRow: TcStateRow,
-		idempotencyToken: string,
-	): Promise<InitiateWriteResponse> {
+	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
 		const { transaction_id: transactionId } = existingRow;
 		switch (existingRow.state) {
 			case "COMMITTED":
@@ -208,16 +202,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private loadFinalResponse(
-		transactionId: string,
-		idempotencyToken: string,
-		existingRow?: TcStateRow,
-	): InitiateWriteResponse {
+	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		if (row.state === "COMMITTED") {
-			const items = this.loadItems(transactionId).map((i) =>
-				i.sk ? { hashKey: i.hk, sortKey: i.sk } : { hashKey: i.hk },
-			);
+			const items = this.loadItems(transactionId).map((i) => (i.sk ? { hashKey: i.hk, sortKey: i.sk } : { hashKey: i.hk }));
 			return { outcome: "committed", transactionId, idempotencyToken, items };
 		}
 		if (row.state === "CANCELLED" && row.rejection_reason_json) {
@@ -225,22 +213,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				outcome: "cancelled",
 				transactionId,
 				idempotencyToken,
-				reason: JSON.parse(
-					row.rejection_reason_json ?? '{"type":"transient_error"}',
-				) as RejectionReason,
+				reason: JSON.parse(row.rejection_reason_json ?? '{"type":"transient_error"}') as RejectionReason,
 			};
 		}
 		// Some participants didn't respond during recovery; alarm will retry.
-		throw new Error(
-			`fokos/tc: transaction ${transactionId} still in progress (state=${row.state}), retry later`,
-		);
+		throw new Error(`fokos/tc: transaction ${transactionId} still in progress (state=${row.state}), retry later`);
 	}
 
-	private async drivePrepare(
-		transactionId: string,
-		idempotencyToken: string,
-		coordinatorDoId: string,
-	): Promise<InitiateWriteResponse> {
+	private async drivePrepare(transactionId: string, idempotencyToken: string, coordinatorDoId: string): Promise<InitiateWriteResponse> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'PREPARING' WHERE idempotency_token = ? AND state = 'CREATED'`,
 			idempotencyToken,
@@ -357,10 +337,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		// Defensive: only advance to COMMITTED when all participants confirmed.
 		const uncommitted =
 			this.ctx.storage.sql
-				.exec<{ n: number }>(
-					`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`,
-					transactionId,
-				)
+				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`, transactionId)
 				.toArray()[0]?.n ?? 0;
 		if (uncommitted === 0) {
 			this.ctx.storage.sql.exec(
@@ -499,10 +476,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 
 		// Group items by partition, keeping the context alongside.
-		const partitionMap = new Map<
-			string,
-			{ pCtx: PartitionContextResolved; items: InitiateReadRequest["items"] }
-		>();
+		const partitionMap = new Map<string, { pCtx: PartitionContextResolved; items: InitiateReadRequest["items"] }>();
 		for (const item of request.items) {
 			const doName = item.partitionContext.doName;
 			let entry = partitionMap.get(doName);
@@ -621,9 +595,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		const remaining =
 			this.ctx.storage.sql
-				.exec<{ n: number }>(
-					`SELECT COUNT(*) as n FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED')`,
-				)
+				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED')`)
 				.toArray()[0]?.n ?? 0;
 		if (remaining > 0) {
 			await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
@@ -702,28 +674,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	private getPartitionStub(partitionDoName: string): PartitionDOStub {
-		return this.env.PARTITION_DO.get(
-			this.env.PARTITION_DO.idFromName(partitionDoName),
-		) as unknown as PartitionDOStub;
+		return this.env.PARTITION_DO.get(this.env.PARTITION_DO.idFromName(partitionDoName)) as unknown as PartitionDOStub;
 	}
 
 	private validateWriteRequest(request: InitiateWriteRequest): void {
-		if (request.operations.length === 0)
-			throw new Error("fokos/tc: TransactWriteItems requires at least 1 item");
+		if (request.operations.length === 0) throw new Error("fokos/tc: TransactWriteItems requires at least 1 item");
 		if (request.operations.length > MAX_ITEMS_PER_TRANSACTION) {
-			throw new Error(
-				`fokos/tc: TransactWriteItems supports at most ${MAX_ITEMS_PER_TRANSACTION} items`,
-			);
+			throw new Error(`fokos/tc: TransactWriteItems supports at most ${MAX_ITEMS_PER_TRANSACTION} items`);
 		}
 		const seen = new Set<string>();
 		let totalBytes = 0;
 		for (const op of request.operations) {
 			const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
-			if (seen.has(key))
-				throw new Error(`fokos/tc: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
+			if (seen.has(key)) throw new Error(`fokos/tc: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
 			seen.add(key);
-			if (op.data)
-				totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
+			if (op.data) totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
 		}
 		if (totalBytes > MAX_PAYLOAD_BYTES) throw new Error("fokos/tc: total payload exceeds 4 MB");
 	}

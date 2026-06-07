@@ -118,12 +118,7 @@ export class BloomFilter {
 	private readonly initialCapacityN: number;
 	private usedBytes: number;
 
-	private constructor(
-		layers: Layer[],
-		errorRate: number,
-		maxSizeBytes: number,
-		initialCapacityN: number,
-	) {
+	private constructor(layers: Layer[], errorRate: number, maxSizeBytes: number, initialCapacityN: number) {
 		this.layers = layers;
 		this.errorRate = errorRate;
 		this.maxSizeBytes = maxSizeBytes;
@@ -131,30 +126,19 @@ export class BloomFilter {
 		this.usedBytes = layers.reduce((sum, l) => sum + l.bits.byteLength, 0);
 	}
 
-	static create(options: {
-		errorRate?: number;
-		maxSizeBytes: number;
-		initialCapacityN?: number;
-	}): BloomFilter {
+	static create(options: { errorRate?: number; maxSizeBytes: number; initialCapacityN?: number }): BloomFilter {
 		const errorRate = options.errorRate ?? DEFAULT_ERROR_RATE;
 		const initialCapacityN = options.initialCapacityN ?? DEFAULT_INITIAL_CAPACITY;
 		const firstBytes = layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
 		if (firstBytes > options.maxSizeBytes) {
-			throw new Error(
-				`maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`,
-			);
+			throw new Error(`maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`);
 		}
 		const first = buildLayer(0, errorRate, initialCapacityN);
 		return new BloomFilter([first], errorRate, options.maxSizeBytes, initialCapacityN);
 	}
 
 	static fromSnapshot(snapshot: BloomFilterSnapshot): BloomFilter {
-		return new BloomFilter(
-			snapshot.layers.map(restoreLayer),
-			snapshot.errorRate,
-			snapshot.maxSizeBytes,
-			snapshot.initialCapacityN,
-		);
+		return new BloomFilter(snapshot.layers.map(restoreLayer), snapshot.errorRate, snapshot.maxSizeBytes, snapshot.initialCapacityN);
 	}
 
 	add(key: string): boolean {
@@ -162,9 +146,7 @@ export class BloomFilter {
 
 		if (current.count >= current.capacity) {
 			const nextIndex = this.layers.length;
-			const nextBytes = layerByteSize(
-				computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN),
-			);
+			const nextBytes = layerByteSize(computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN));
 			if (this.usedBytes + nextBytes > this.maxSizeBytes) {
 				return false;
 			}
@@ -231,11 +213,7 @@ function layerByteSize(m: number): number {
  * This function is intentionally separated from buildLayer so that the caller
  * can check whether the next layer fits within maxSizeBytes before allocating.
  */
-function computeLayerBitCount(
-	layerIndex: number,
-	baseErrorRate: number,
-	initialCapacity: number,
-): number {
+function computeLayerBitCount(layerIndex: number, baseErrorRate: number, initialCapacity: number): number {
 	const fpr = layerFpr(baseErrorRate, layerIndex);
 	const capacity = initialCapacity * Math.pow(LAYER_GROWTH_FACTOR, layerIndex);
 	return Math.ceil((-capacity * Math.log(fpr)) / (Math.LN2 * Math.LN2));
@@ -304,9 +282,7 @@ function bitPositions(key: string, k: number, m: number, layerIndex: number): nu
  * same positions, producing a false positive at rate layer_fpr(layerIndex).
  */
 function layerHas(layer: Layer, key: string): boolean {
-	return bitPositions(key, layer.k, layer.m, layer.layerIndex).every(
-		(pos) => (layer.bits[pos >> 3] & (1 << (pos & 7))) !== 0,
-	);
+	return bitPositions(key, layer.k, layer.m, layer.layerIndex).every((pos) => (layer.bits[pos >> 3] & (1 << (pos & 7))) !== 0);
 }
 
 /**

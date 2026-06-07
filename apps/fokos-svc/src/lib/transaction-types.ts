@@ -45,9 +45,7 @@ export type RejectionReason =
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
 	| { type: "transient_error" };
 
-export type PrepareResponse =
-	| { outcome: "accepted" }
-	| { outcome: "rejected"; reason: RejectionReason };
+export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -98,14 +96,7 @@ export type ReadForTransactionResponse = {
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
-export type TCState =
-	| "CREATED"
-	| "PREPARING"
-	| "PREPARED"
-	| "COMMITTING"
-	| "COMMITTED"
-	| "CANCELLING"
-	| "CANCELLED";
+export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
 // ─── TransactionCoordinatorDO — recoverTransaction ───────────────────────────
 

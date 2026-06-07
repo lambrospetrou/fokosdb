@@ -114,11 +114,7 @@ function encodeRangeComponent(s: string): string;
 // (`db.h.<root>[.<child>…]`, partition-topology.ts:194) and is REQUIRED to avoid collisions:
 // without it, a range leaf for hash key "h" with start boundary "0" would be `db.h.0`, colliding
 // with hash root partition 0.
-function rangePartitionDoName(
-	databaseName: string,
-	hashKey: string,
-	startBoundary: string | null,
-): string {
+function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const sk = startBoundary == null ? "" : encodeRangeComponent(startBoundary);
 	return `${databaseName}.r.${hk}.${sk}`;
@@ -614,9 +610,7 @@ hk + sk-range for range split, the hash predicate otherwise.
 
 ```typescript
 (hashKey: string, sortKey?: string) =>
-	hashKey === childCtx.rangePartition!.hashKey &&
-	(start == null || (sortKey ?? "") >= start) &&
-	(end == null || (sortKey ?? "") < end);
+	hashKey === childCtx.rangePartition!.hashKey && (start == null || (sortKey ?? "") >= start) && (end == null || (sortKey ?? "") < end);
 ```
 
 ### `runMigration` — branch on `__parent_split_type` + own `rangePartition`
