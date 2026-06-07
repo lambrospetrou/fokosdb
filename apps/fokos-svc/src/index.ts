@@ -137,7 +137,9 @@ function serializeTransactGetItemsResult(result: InitiateReadResponse) {
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
-const api = new Hono<{ Bindings: Env }>().basePath("/api");
+type HonoVariables = { dbItemMeta?: object };
+
+const api = new Hono<{ Bindings: Env; Variables: HonoVariables }>().basePath("/api");
 
 let cachedValidTokens: Set<string> | null = null;
 
@@ -145,7 +147,11 @@ api.onError((err, c) => {
 	if (err instanceof HTTPException) {
 		return err.getResponse();
 	}
-	console.error(err);
+	console.error({
+		message: "Unexpected error in catch-all",
+		error: String(err),
+		errorProps: err,
+	});
 	return c.json({ error: "Internal Server Error" }, 500);
 });
 
@@ -174,6 +180,7 @@ api.use(async (c, next) => {
 		status: c.res.status,
 		path: c.req.path,
 		durationMs: Date.now() - start,
+		dbItemMeta: c.get("dbItemMeta"),
 	});
 });
 
@@ -228,15 +235,21 @@ api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 	switch (rpcAction) {
 		case "putItem": {
 			const { partitionOptions, ...opts } = parseBody(PutItemBodySchema);
-			return c.json(await makeFokosDB(c.env, databaseName, partitionOptions).putItem(opts));
+			const result = await makeFokosDB(c.env, databaseName, partitionOptions).putItem(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(result);
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
-			return c.json(serializeGetItemResult(await makeFokosDB(c.env, databaseName, partitionOptions).getItem(opts)));
+			const result = await makeFokosDB(c.env, databaseName, partitionOptions).getItem(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(serializeGetItemResult(result));
 		}
 		case "deleteItem": {
 			const { partitionOptions, ...opts } = parseBody(DeleteItemBodySchema);
-			return c.json(await makeFokosDB(c.env, databaseName, partitionOptions).deleteItem(opts));
+			const result = await makeFokosDB(c.env, databaseName, partitionOptions).deleteItem(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(result);
 		}
 		case "transactWriteItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactWriteItemsBodySchema);
