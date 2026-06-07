@@ -22,10 +22,12 @@ Once there is a stable version ready, I will properly refactor the directory str
 
 No particular order.
 
+- Bloom filter in partial hash topology per partition.
+- Range partition boundaries only to make the split instead of the entire range key.
 - Implement queryItems with pagination.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add WAE metrics per request, per split.
-- Add canonical logs per request in the service.
+- Add canonical logs per request in the service with an overridable requestId.
 - Add optimization for single-partition transactions to not do 2PC.
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
