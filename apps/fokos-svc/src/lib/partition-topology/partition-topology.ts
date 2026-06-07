@@ -625,20 +625,20 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 
 export type SplitStatusKVItem =
 	| {
-			status: Extract<SplitStatus, "split_queued">;
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-	  }
+		status: Extract<SplitStatus, "split_queued">;
+		splitType: SplitType;
+		createdAt: number;
+		partitionContext: PartitionContextResolved;
+	}
 	| {
-			status: Extract<SplitStatus, "split_started" | "split_completed">;
-			splitType: SplitType;
-			createdAt: number;
-			partitionContext: PartitionContextResolved;
-			childPartitionContexts: PartitionContextResolved[];
-			migratedChildDoNames: string[];
-			history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
-	  };
+		status: Extract<SplitStatus, "split_started" | "split_completed">;
+		splitType: SplitType;
+		createdAt: number;
+		partitionContext: PartitionContextResolved;
+		childPartitionContexts: PartitionContextResolved[];
+		migratedChildDoNames: string[];
+		history: Pick<SplitStatusKVItem, "status" | "splitType" | "createdAt" | "partitionContext">[];
+	};
 
 export interface PartitionTopologySplitter {
 	childPartitionContexts(): PartitionContextResolved[] | undefined;
@@ -684,15 +684,14 @@ export interface PartitionTopologySplitter {
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 
 	/**
-	 * Called after a forwarded request returns. Updates the topology cache from the response and
-	 * returns the value to add to `result.meta.hashDepth` for the caller's response (0 for range forwards).
+	 * Called after a forwarded request returns. Updates the topology cache from the response.
 	 */
 	recordForwardResult(
 		hashKey: string,
 		fromCtx: PartitionContextResolved,
 		toCtx: PartitionContextResolved,
 		responseHashDepth: number,
-	): number;
+	): void;
 
 	/**
 	 * Called by a child partition after it has fully migrated its share of data from the parent.
@@ -956,7 +955,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		if (!this.#_hashTopology) {
 			const ownerAbsDepth = PartitionIdHelper.depth(
 				this.partitionContext._partitionIdBytes ??
-					Uint8Array.fromHex(this.partitionContext.partitionId),
+				Uint8Array.fromHex(this.partitionContext.partitionId),
 			);
 			this.#_hashTopology = HashTopology.create(this.partitionContext.hashSplitN, ownerAbsDepth);
 		}
@@ -1022,22 +1021,22 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const newStatus: SplitStatusKVItem = allMigrated
 			? {
-					status: "split_completed",
-					splitType: splitStatus.splitType,
-					createdAt: Date.now(),
-					partitionContext: splitStatus.partitionContext,
-					childPartitionContexts: splitStatus.childPartitionContexts,
-					migratedChildDoNames,
-					history: [
-						...splitStatus.history,
-						{
-							status: splitStatus.status,
-							splitType: splitStatus.splitType,
-							createdAt: splitStatus.createdAt,
-							partitionContext: splitStatus.partitionContext,
-						},
-					],
-				}
+				status: "split_completed",
+				splitType: splitStatus.splitType,
+				createdAt: Date.now(),
+				partitionContext: splitStatus.partitionContext,
+				childPartitionContexts: splitStatus.childPartitionContexts,
+				migratedChildDoNames,
+				history: [
+					...splitStatus.history,
+					{
+						status: splitStatus.status,
+						splitType: splitStatus.splitType,
+						createdAt: splitStatus.createdAt,
+						partitionContext: splitStatus.partitionContext,
+					},
+				],
+			}
 			: { ...splitStatus, migratedChildDoNames };
 
 		this.#storage.kv.put<SplitStatusKVItem>(
@@ -1050,21 +1049,21 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	 * Internally used by the Partition DOs to route requests to their children after a split happened.
 	 * This routes to a descendant partition directly according to the specified relative depth.
 	 *
-	 * Skips `relativeDepth` levels in one shot, computing the descendant partition ID deterministically from the hash key and the owner's depth.
+	 * Skips `relativeDepthToLeaf` levels in one shot, computing the descendant partition ID deterministically from the hash key and the owner's depth.
 	 * Used by the topology cache to skip known intermediate router hops.
 	 */
 	pickDescendantHashPartition(
 		partitionContext: PartitionContextResolved,
 		hashKey: string,
-		relativeDepth: number,
+		relativeDepthToLeaf: number,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes =
 			partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
-		const depth = PartitionIdHelper.depth(partitionIdBytes);
+		const parentDepth = PartitionIdHelper.depth(partitionIdBytes);
 
 		const hashIdxs: number[] = [];
-		for (let i = 0; i < relativeDepth; i++) {
-			hashIdxs.push(hashChildIndex(hashKey, depth + i, partitionContext.hashSplitN));
+		for (let i = 0; i < relativeDepthToLeaf; i++) {
+			hashIdxs.push(hashChildIndex(hashKey, parentDepth + i, partitionContext.hashSplitN));
 		}
 
 		const { doName, opaque } = new PartitionIdHelper(this.partitionContext, partitionIdBytes)
@@ -1091,11 +1090,14 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		_sortKey?: string,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		if (this.#_hashTopology) {
+			// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
+			// or 0 if the cache is not populated at all yet.
 			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
-			if (cachedDepth > 1) {
+			if (cachedDepth > 0) {
 				return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
 			}
 		}
+		// Default to immediate child partitions.
 		return this.pickDescendantHashPartition(partitionContext, hashKey, 1);
 	}
 
@@ -1126,9 +1128,11 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		fromCtx: PartitionContextResolved,
 		toCtx: PartitionContextResolved,
 		responseHashDepth: number,
-	): number {
-		// A hash→range forward contributes nothing to hashDepth (range DOs are a separate axis).
-		if (isRangePartition(toCtx)) return 0;
+	): void {
+		// This logic only makes sense for both being hash partitions.
+		// FIXME Support learning during when a hash partition forwards to a range partition,
+		// which can happen with promoted hash keys.
+		if (!isHashPartition(fromCtx) || !isHashPartition(toCtx)) return;
 
 		// targetRelDepth: how many hash-tree levels this single RPC hop crossed.
 		// pickChildPartition may have skipped the cache (e.g. depth-2 skip goes straight to the
@@ -1139,24 +1143,28 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const toAbsDepth = PartitionIdHelper.depth(
 			toCtx._partitionIdBytes ?? Uint8Array.fromHex(toCtx.partitionId),
 		);
-		const targetRelDepth = toAbsDepth - fromAbsDepth;
+		invariant(
+			toAbsDepth > fromAbsDepth,
+			`fokos/topology.recordForwardResult: toCtx must be a descendant of fromCtx, got fromAbsDepth ${fromAbsDepth} and toAbsDepth ${toAbsDepth}`,
+		);
+		// The actual response hash depth may be larger than the targetRelDepth
+		// if the target partition is itself a router that forwarded further.
+		// It could also be the case that the target hash partition forwarded to a range partition,
+		// and in that case the responseHashDepth would be equal to the target partition depth.
+		invariant(
+			responseHashDepth >= toAbsDepth,
+			`fokos/topology.recordForwardResult: responseHashDepth must be >= toAbsDepth, got responseHashDepth ${responseHashDepth} and toAbsDepth ${toAbsDepth}`,
+		);
 
-		// actualRelDepth: total hash levels from fromCtx to the true leaf that served the request.
-		// The target may itself be a router that forwarded further — responseHashDepth captures that
-		// additional depth. So the full path is targetRelDepth (our skip) + responseHashDepth (their skip).
-		if (this.#_hashTopology && responseHashDepth > 0) {
-			const actualRelDepth = targetRelDepth + responseHashDepth;
-			if (this.#_hashTopology.updateFromHint(hashKey, actualRelDepth)) {
+		const targetRelDepth = responseHashDepth - fromAbsDepth;
+		if (this.#_hashTopology && targetRelDepth > 0) {
+			if (this.#_hashTopology.updateFromHint(hashKey, targetRelDepth)) {
 				this.#storage.kv.put<HashTopologySnapshot>(
 					"__topo_cache",
 					this.#_hashTopology.toSnapshot(),
 				);
 			}
 		}
-
-		// The caller adds this to result.meta.hashDepth, which accumulates total hash levels
-		// traversed on the path from the root partition to the leaf that ultimately served the request.
-		return targetRelDepth;
 	}
 }
 
@@ -1214,7 +1222,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		if (
 			this.partitionContext.rangeSplitConditions?.maxSizeMb &&
 			this.#storage.sql.databaseSize >
-				this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
+			this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
 			return "reject";
 		}
@@ -1385,20 +1393,20 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			const cntRow =
 				end === null
 					? this.#storage.sql
-							.exec<{ n: number }>(
-								`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`,
-								hashKey,
-								lower,
-							)
-							.toArray()[0]
+						.exec<{ n: number }>(
+							`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`,
+							hashKey,
+							lower,
+						)
+						.toArray()[0]
 					: this.#storage.sql
-							.exec<{ n: number }>(
-								`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ? AND sk < ?`,
-								hashKey,
-								lower,
-								end,
-							)
-							.toArray()[0];
+						.exec<{ n: number }>(
+							`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ? AND sk < ?`,
+							hashKey,
+							lower,
+							end,
+						)
+						.toArray()[0];
 			const cnt = cntRow?.n ?? 0;
 			if (cnt < N) return null; // need ≥ N items so each of the N children gets ≥ 1
 
@@ -1408,22 +1416,22 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 				const row =
 					end === null
 						? this.#storage.sql
-								.exec<{ sk: string }>(
-									`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`,
-									hashKey,
-									lower,
-									offset,
-								)
-								.toArray()[0]
+							.exec<{ sk: string }>(
+								`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`,
+								hashKey,
+								lower,
+								offset,
+							)
+							.toArray()[0]
 						: this.#storage.sql
-								.exec<{ sk: string }>(
-									`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`,
-									hashKey,
-									lower,
-									end,
-									offset,
-								)
-								.toArray()[0];
+							.exec<{ sk: string }>(
+								`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`,
+								hashKey,
+								lower,
+								end,
+								offset,
+							)
+							.toArray()[0];
 				invariant(
 					row,
 					"fokos/range.computeRangeSplitBoundaries: expected a row at the computed offset",
@@ -1490,22 +1498,22 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const newStatus: SplitStatusKVItem = allMigrated
 			? {
-					status: "split_completed",
-					splitType: splitStatus.splitType,
-					createdAt: Date.now(),
-					partitionContext: splitStatus.partitionContext,
-					childPartitionContexts: splitStatus.childPartitionContexts,
-					migratedChildDoNames,
-					history: [
-						...splitStatus.history,
-						{
-							status: splitStatus.status,
-							splitType: splitStatus.splitType,
-							createdAt: splitStatus.createdAt,
-							partitionContext: splitStatus.partitionContext,
-						},
-					],
-				}
+				status: "split_completed",
+				splitType: splitStatus.splitType,
+				createdAt: Date.now(),
+				partitionContext: splitStatus.partitionContext,
+				childPartitionContexts: splitStatus.childPartitionContexts,
+				migratedChildDoNames,
+				history: [
+					...splitStatus.history,
+					{
+						status: splitStatus.status,
+						splitType: splitStatus.splitType,
+						createdAt: splitStatus.createdAt,
+						partitionContext: splitStatus.partitionContext,
+					},
+				],
+			}
 			: { ...splitStatus, migratedChildDoNames };
 
 		this.#storage.kv.put<SplitStatusKVItem>(
@@ -1519,7 +1527,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		_fromCtx: PartitionContextResolved,
 		_toCtx: PartitionContextResolved,
 		_responseHashDepth: number,
-	): number {
-		return 0;
+	): void {
+		return;
 	}
 }

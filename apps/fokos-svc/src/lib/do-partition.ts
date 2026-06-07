@@ -36,6 +36,7 @@ import {
 	RANGE_PROMOTION_FRACTION,
 	isHashPartition,
 	isRangePartition,
+	PartitionIdHelper,
 } from "./partition-topology/partition-topology.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
@@ -413,7 +414,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: 0,
+						hashDepth: isHashPartition(pCtx)
+							? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
+							: 0,
 						rangeDepth: 0,
 					},
 				};
@@ -506,7 +509,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: 0,
+						hashDepth: isHashPartition(pCtx)
+							? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
+							: 0,
 						rangeDepth: 0,
 					},
 				};
@@ -1545,6 +1550,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					...result,
 					meta: {
 						...result.meta,
+						hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!),
 						forwardCount: result.meta.forwardCount + 1,
 					},
 				} as T;
@@ -1560,20 +1566,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[ctx.ns].get(doId);
 				const result = await forward(stub, partitionContext);
-				const depthIncrement = topology.recordForwardResult(
-					hashKey,
-					ctx,
-					partitionContext,
-					result.meta.hashDepth,
-				);
-				const metaDepthObj = isHashPartition(ctx)
-					? { hashDepth: result.meta.hashDepth + depthIncrement }
-					: {};
+				topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta.hashDepth);
 				return {
 					...result,
 					meta: {
 						...result.meta,
-						...metaDepthObj,
 						forwardCount: result.meta.forwardCount + 1,
 					},
 				} as T;
@@ -1670,7 +1667,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
-			hashDepth: 0,
+			hashDepth: isHashPartition(pCtx)
+				? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!)
+				: 0,
 			rangeDepth: 0,
 		};
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };

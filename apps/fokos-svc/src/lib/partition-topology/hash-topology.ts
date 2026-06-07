@@ -107,7 +107,7 @@ export class HashTopology {
 	/**
 	 * Learn topology from a forwarded response.
 	 * @param hashKey The hash key to look up.
-	 * @param actualRelDepth The actual relative depth of the target (targetRelDepth + response.meta.hashDepth).
+	 * @param actualRelDepth The actual relative depth of the target partition that served the request (non-split leaf).
 	 * @return true if the cache was modified (caller should persist).
 	 */
 	updateFromHint(hashKey: string, actualRelDepth: number): boolean {
