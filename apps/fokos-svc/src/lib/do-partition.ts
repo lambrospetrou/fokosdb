@@ -436,7 +436,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
 			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 			const parentStub = this.env[parentCtx.ns].get(parentId);
-			return await parentStub.getItemDirect(opts);
+			const result = await parentStub.getItemDirect(opts);
+			// The parent returns its own hashDepth, but the caller forwarded to this child partition.
+			// recordForwardResult on the caller requires responseHashDepth >= toAbsDepth (this child's depth).
+			if (isHashPartition(pCtx)) {
+				return {
+					...result,
+					meta: { ...result.meta, hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) },
+				};
+			}
+			return result;
 		}
 
 		return await this.withSplitForwarding<GetItemResult>({
