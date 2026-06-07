@@ -76,9 +76,27 @@ export type GetItemResult =
 	};
 
 export type PartitionInfo = {
+	/**
+	 * The DurableObjectId of the partition that served the request.
+	 * Useful for correlating with partition topology information in logs,
+	 * and to debug the underlying Durable Objects.
+	 */
 	servedByActorId: string;
+	/** The human-readable name of the partition that served the request, if available. */
 	servedByActorName: string;
+	/** Opaque identifier for the partition that served the request.
+	 * Useful for correlating with partition topology information in logs, but not meaningful to clients.
+	 */
+	servedByPartitionId: string;
+	/**
+	 * The number of times the request was forwarded between partitions before reaching the final partition that served it.
+	 */
 	forwardCount: number;
+	/**
+	 * The depth of the hash partition in the partition topology tree. Root partitions have depth 0, their children have depth 1, and so on.
+	 * Will be zero for range partitions since they don't have a depth in the hash partition tree,
+	 * but can be useful for debugging and monitoring the partition topology.
+	 */
 	hashDepth: number;
 };
 

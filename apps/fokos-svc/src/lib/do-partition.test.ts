@@ -21,6 +21,7 @@ describe("PartitionDO - putItem / getItem", () => {
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
 				servedByActorName: expect.stringMatching(/^test\..+/),
+				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
 				rangeDepth: 0,
@@ -422,6 +423,7 @@ describe("PartitionDO - deleteItem", () => {
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
 				servedByActorName: expect.stringMatching(/^test\..+/),
+				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
 				rangeDepth: 0,
@@ -501,6 +503,7 @@ describe("PartitionDO - deleteItem", () => {
 			databaseSize: expect.any(Number),
 			servedByActorId: expect.any(String),
 			servedByActorName: expect.stringMatching(/^test\..+/),
+			servedByPartitionId: expect.any(String),
 		});
 	});
 
