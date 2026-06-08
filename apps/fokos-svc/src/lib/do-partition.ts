@@ -262,6 +262,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async triggerMigration(): Promise<void> {
+		invariant(this.pCtx(), "fokos/partition.triggerMigration: partition context is required");
 		const isMigrating = await this.ensureMigration("triggerMigration", false);
 		if (isMigrating) {
 			this.scheduleBackgroundWork({ delayMs: 0, forceSchedule: true });
@@ -770,6 +771,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		nextCursor: PromotedKeyCursor | null;
 	}> {
 		const pCtx = this.pCtx();
+		invariant(isHashPartition(pCtx), "fokos/partition.getPromotedKeysBatch: only hash partitions have promoted keys");
+
 		const isCorrectChild = this.ensureHashTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
 		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
@@ -793,6 +796,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	// Called by a promoted range root once its item migration is complete.
 	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
+		const pCtx = this.pCtx();
+		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
+
 		this.ctx.storage.sql.exec(
 			`UPDATE promoted_keys SET status = 'promoted', updated_at = ? WHERE hash_key = ? AND status = 'promoting'`,
 			Date.now(),
