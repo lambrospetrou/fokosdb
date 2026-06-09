@@ -358,7 +358,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
 						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
-						rangeDepth: 0,
 					},
 				};
 			},
@@ -421,7 +420,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
 						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
-						rangeDepth: 0,
 					},
 				};
 			},
@@ -1425,7 +1423,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
 			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
-			rangeDepth: 0,
 		};
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {

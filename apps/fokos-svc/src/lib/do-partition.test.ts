@@ -32,7 +32,6 @@ describe("PartitionDO - putItem / getItem", () => {
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
-				rangeDepth: 0,
 			},
 		});
 	});
@@ -461,7 +460,6 @@ describe("PartitionDO - deleteItem", () => {
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
-				rangeDepth: 0,
 			},
 		});
 	});
