@@ -26,6 +26,7 @@ No particular order.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
 - Range partition boundaries only to make the split instead of the entire range key.
 - Implement queryItems with pagination.
+- Think about backups and export in a consistent fashion.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
