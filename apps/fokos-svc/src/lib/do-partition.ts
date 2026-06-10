@@ -32,12 +32,7 @@ import {
 	type InitFromSplitOptions,
 } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
-import {
-	HashPartitionTopologyImpl,
-	PartitionTopologySplitter,
-	RangePartitionTopologyImpl,
-	RANGE_PROMOTION_FRACTION,
-} from "./partition-topology/split-policy.js";
+import { HashPartitionTopologyImpl, PartitionTopologySplitter, RangePartitionTopologyImpl } from "./partition-topology/split-policy.js";
 import { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
@@ -63,6 +58,7 @@ import {
 	type PartitionPeer,
 } from "./partition/partition-peer.js";
 import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./partition/migration.js";
+import { PromotionManager } from "./partition/hash-key-promotion.js";
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -108,11 +104,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
 
 	#store: PartitionStore;
+	#promotion: PromotionManager;
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
 	#_backgroundWorkScheduledAt: number | null = null;
-	// In-memory cache of promoted_keys, loaded at DO startup. Hash DOs only.
-	#_promotedKeys: Map<string, PromotedKeyStatus> = new Map();
 
 	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
 	__testing__alarm_running = false;
@@ -123,6 +118,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
+		this.#promotion = new PromotionManager({
+			store: this.#store,
+			// Boundary rule: only the DO acquires stubs — the manager receives this factory.
+			getRangeRootPeer: (rangeRootCtx) => this.env[rangeRootCtx.ns].get(this.env[rangeRootCtx.ns].idFromName(rangeRootCtx.doName)),
+			scheduleWork: (opts) => this.scheduleBackgroundWork(opts),
+			logParams: () => this.logParams(),
+		});
 		void ctx.blockConcurrencyWhile(async () => {
 			await this.#store.runMigrations();
 
@@ -134,9 +136,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			// Load promoted keys into in-memory cache (hash DOs only; range DOs never have rows).
-			for (const row of this.#store.listPromotedKeys()) {
-				this.#_promotedKeys.set(row.hash_key, row.status);
-			}
+			this.#promotion.loadFromStorage();
 		});
 	}
 
@@ -236,7 +236,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					lastTransactionTs: Date.now(),
 				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
-				this.maybeQueuePromotion(pCtx, opts.hashKey, writeRes.keyEstBytes);
+				this.#promotion.maybeQueuePromotion(pCtx, opts.hashKey, writeRes.keyEstBytes);
 
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
@@ -399,7 +399,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			// Filter: only items for the requesting hash child, excluding promoted keys
 			// (their data lives in range structures — hash children must not inherit local copies).
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#_promotedKeys.has(row.hk),
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#promotion.has(row.hk),
 			estimateBytes: estimateItemBytes,
 			budgetBytes: BATCH_LIMIT_BYTES,
 			pageSize: PAGE_SIZE,
@@ -564,19 +564,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
-
-		const { updated } = this.#store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
-		if (updated) {
-			this.#_promotedKeys.set(hashKey, "promoted");
-		} else {
-			// No row transitioned (e.g. idempotent re-ack of an already-promoted key) — sync the
-			// cache from storage's truth rather than assuming the transition happened.
-			const stored = this.#store.getPromotedKeyStatus(hashKey);
-			if (stored) this.#_promotedKeys.set(hashKey, stored);
-			else this.#_promotedKeys.delete(hashKey);
-		}
-		this.scheduleBackgroundWork({ delayMs: 1_000 });
-		console.log({ ...this.logParams(), message: "fokos/partition: Promotion complete.", hashKey });
+		this.#promotion.acknowledgePromotionComplete(hashKey);
 	}
 
 	/**
@@ -592,10 +580,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
-			promotedKeys: Array.from(this.#_promotedKeys.entries()).map(([hashKey, status]) => ({
-				hashKey,
-				status,
-			})),
+			promotedKeys: this.#promotion.snapshot(),
 		};
 	}
 
@@ -776,7 +761,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					ttlEpochUtcSeconds: null,
 					lastTransactionTs: transactionTimestamp,
 				});
-				this.maybeQueuePromotion(this.pCtx(), item.hashKey, res.keyEstBytes);
+				this.#promotion.maybeQueuePromotion(this.pCtx(), item.hashKey, res.keyEstBytes);
 			} else if (pendingRow.operation === "delete") {
 				this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
 			} else if (pendingRow.operation === "check") {
@@ -801,11 +786,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// Promoted-key range roots (hash DOs only).
 		if (isHashPartition(pCtx)) {
-			for (const [hashKey, status] of this.#_promotedKeys) {
-				if (status === "promoting" || status === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
-					childContexts.push(rangeRootCtx);
-				}
+			for (const hashKey of this.#promotion.activeRangeRootHashKeys()) {
+				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
+				childContexts.push(rangeRootCtx);
 			}
 		}
 
@@ -897,7 +880,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private async checkSplits(pCtx: PartitionContextResolved, hashKey: string, sortKey?: string): Promise<SplitStatusKVItem | undefined> {
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey, {
-			hasInFlightPromotions: this.hasInFlightPromotions(),
+			hasInFlightPromotions: this.#promotion.hasInFlightPromotions(),
 		});
 		if (splitStatus) {
 			console.log({
@@ -910,15 +893,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		return splitStatus;
-	}
-
-	// Promotion⇄hash-split mutual exclusion input for the split policy, answered from the
-	// in-memory promoted-keys cache (no storage read needed).
-	private hasInFlightPromotions(): boolean {
-		for (const status of this.#_promotedKeys.values()) {
-			if (status === "queued" || status === "promoting") return true;
-		}
-		return false;
 	}
 
 	/**
@@ -1128,7 +1102,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// On hash partitions only: forward promoted/promoting keys to their range root.
 		// The range root routes by sortKey from there. "queued" still serves locally.
 		if (isHashPartition(ctx)) {
-			const promotedStatus = this.#_promotedKeys.get(hashKey);
+			const promotedStatus = this.#promotion.statusFor(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
 				const rangeRootStub = this.env[ctx.ns].get(doId);
@@ -1196,7 +1170,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		for (const item of items) {
 			// On hash partitions only: forward promoted/promoting keys to their range root.
 			if (isHashPartition(pCtx)) {
-				const promotedStatus = this.#_promotedKeys.get(item.hashKey);
+				const promotedStatus = this.#promotion.statusFor(item.hashKey);
 				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
 					addForwarded(rangeRootCtx, item);
@@ -1268,7 +1242,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			storage: this.ctx.storage,
 			parent,
 			logParams: () => this.logParams(),
-			onPromotedKeyInherited: (hashKey, status) => this.#_promotedKeys.set(hashKey, status),
+			onPromotedKeyInherited: (hashKey, status) => this.#promotion.inheritKey(hashKey, status),
 			beforeComplete: async () => {
 				await this.__testing__beforeMigrationComplete?.();
 			},
@@ -1316,100 +1290,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				),
 			]);
 		}, delayMs);
-	}
-
-	// Drives the queued→promoting→migrated lifecycle for a single hash key.
-	// Idempotent — safe to call repeatedly across background cycles.
-	private async startPromotion(hashKey: string): Promise<void> {
-		const pCtx = this.pCtx();
-
-		// Mutual exclusion: skip if a hash split is already in progress.
-		const splitStatus = this.ensureTopology(pCtx).splitStatus();
-		if (splitStatus?.status === "split_queued" || splitStatus?.status === "split_started") return;
-
-		// A. Build identity for the range root.
-		const { doId: rangeRootId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
-		const rangeRootStub = this.env[pCtx.ns].get(rangeRootId);
-
-		// B. Initialize the range root (idempotent, retry ≤5). No forwarding yet — status is still 'queued'.
-		await tryWhile(
-			() =>
-				rangeRootStub.initFromSplit({
-					parentPartitionContext: pCtx,
-					newPartitionContext: rangeRootCtx,
-					splitType: "range",
-				}),
-			(_err, attempt) => attempt <= 5,
-		);
-
-		// C. Cutover queued→promoting in one transactionSync, only if the key has no pending locks.
-		const cutover = this.#store.transactionSync((): "cutover" | "deferred" | "stale" => {
-			const lockCount = this.#store.pendingLockCountForHashKey(hashKey);
-			if (lockCount > 0) return "deferred"; // retry next background cycle
-			const { updated } = this.#store.updatePromotedKeyStatus(hashKey, "queued", "promoting", Date.now());
-			return updated ? "cutover" : "stale";
-		});
-		if (cutover === "cutover") {
-			this.#_promotedKeys.set(hashKey, "promoting");
-		} else if (cutover === "stale") {
-			// Storage disagrees with the in-memory cache (the key is no longer 'queued') — sync the
-			// cache from storage's truth and skip; the background loop acts on the real status.
-			const stored = this.#store.getPromotedKeyStatus(hashKey);
-			if (stored) this.#_promotedKeys.set(hashKey, stored);
-			else this.#_promotedKeys.delete(hashKey);
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Promotion cutover skipped (key no longer queued in storage).",
-				hashKey,
-				storedStatus: stored ?? null,
-			});
-			return;
-		}
-
-		if (cutover === "deferred") {
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Promotion cutover deferred (pending locks).",
-				hashKey,
-			});
-			return;
-		}
-
-		// D. Trigger migration on the range root (fire-and-forget).
-		try {
-			await rangeRootStub.triggerMigration();
-		} catch (e) {
-			console.error({
-				...this.logParams(),
-				message: "fokos/partition: Failed to trigger promotion migration.",
-				hashKey,
-				error: String(e),
-			});
-		}
-	}
-
-	private maybeQueuePromotion(pCtx: PartitionContextResolved, hk: string, newKeyEst: number): void {
-		if (!isHashPartition(pCtx)) return;
-		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
-		if (threshold <= 0 || newKeyEst < threshold || this.#_promotedKeys.has(hk)) return;
-		const { inserted } = this.#store.insertPromotedKey(hk, "queued", Date.now());
-		if (!inserted) {
-			// A row already existed (the in-memory cache was stale, e.g. after crash recovery) —
-			// resync the cache from storage instead of clobbering a possibly-advanced status
-			// (promoting/promoted) back to queued.
-			const stored = this.#store.getPromotedKeyStatus(hk);
-			if (stored) this.#_promotedKeys.set(hk, stored);
-			return;
-		}
-		this.#_promotedKeys.set(hk, "queued");
-		this.scheduleBackgroundWork({ delayMs: 10 });
-		console.log({
-			...this.logParams(),
-			message: "fokos/partition: Key queued for promotion.",
-			hk,
-			newKeyEst,
-			totalPromotedKeys: this.#_promotedKeys.size,
-		});
 	}
 
 	private async runBackgroundWork(): Promise<void> {
@@ -1526,40 +1406,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const pCtx = this.pCtx();
 			if (isHashPartition(pCtx)) {
 				// Drive: advance each queued key through init → cutover → migrate.
-				for (const [hashKey, status] of this.#_promotedKeys) {
-					if (status === "queued") {
-						try {
-							await this.startPromotion(hashKey);
-						} catch (error) {
-							console.error({
-								...this.logParams(),
-								message: "fokos/partition: Promotion drive job failed.",
-								hashKey,
-								error: String(error),
-							});
-						}
-					}
-				}
+				await this.#promotion.drive(pCtx, () => this.ensureTopology(pCtx).splitStatus());
 
 				// GC: delete local items and pending_transactions for fully-promoted keys.
-				for (const [hashKey, status] of this.#_promotedKeys) {
-					if (status === "promoted") {
-						try {
-							this.#store.deleteItemsBatchForHashKey(hashKey, 1000);
-							this.#store.deletePendingTxForHashKey(hashKey);
-							if (!this.#store.hasItemsForHashKey(hashKey)) {
-								this.#store.deleteKeySizeEstimate(hashKey);
-							}
-						} catch (error) {
-							console.error({
-								...this.logParams(),
-								message: "fokos/partition: Promotion GC job failed.",
-								hashKey,
-								error: String(error),
-							});
-						}
-					}
-				}
+				this.#promotion.runGC();
 			}
 		} catch (error) {
 			console.error({
@@ -1591,12 +1441,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				// Jobs: Promotion drive (queued keys) and GC (promoted keys with residual items).
-				for (const [hashKey, status] of this.#_promotedKeys) {
-					if (status === "queued" || status === "promoting") {
-						wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-					} else if (status === "promoted") {
-						if (this.#store.hasItemsForHashKey(hashKey)) wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-					}
+				if (this.#promotion.needsBackgroundWork()) {
+					wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 				}
 
 				// Job: Stale transaction recovery.
