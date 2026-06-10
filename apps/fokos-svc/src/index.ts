@@ -3,7 +3,8 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl, type SplitConditions } from "./lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
+import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
 import type { GetItemResult, InitiateReadResponse } from "./lib/types.js";
 
 export { PartitionDO } from "./lib/do-partition.js";

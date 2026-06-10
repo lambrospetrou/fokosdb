@@ -370,6 +370,47 @@ export class PartitionStore {
 		return this.#storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hk).toArray().length > 0;
 	}
 
+	// Computes N-1 strictly-increasing split boundaries (count-quantiles) within [start, end) in one
+	// transactionSync snapshot. Returns null if there are fewer than N items (so every child stays non-empty).
+	// A data query on the items table — it lives with the store; the DO passes the result into the
+	// range split policy's prepareSplit.
+	computeRangeSplitBoundaries(hashKey: string, start: string | null, end: string | null, N: number): string[] | null {
+		return this.#storage.transactionSync(() => {
+			const lower = start ?? ""; // −∞ ⇒ sk >= ''
+			const cntRow =
+				end === null
+					? this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`, hashKey, lower).toArray()[0]
+					: this.#storage.sql
+							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ? AND sk < ?`, hashKey, lower, end)
+							.toArray()[0];
+			const cnt = cntRow?.n ?? 0;
+			if (cnt < N) return null; // need ≥ N items so each of the N children gets ≥ 1
+
+			const boundaries: string[] = [];
+			for (let i = 1; i < N; i++) {
+				const offset = Math.floor((cnt * i) / N);
+				const row =
+					end === null
+						? this.#storage.sql
+								.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, offset)
+								.toArray()[0]
+						: this.#storage.sql
+								.exec<{
+									sk: string;
+								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, end, offset)
+								.toArray()[0];
+				invariant(row, "fokos/range.computeRangeSplitBoundaries: expected a row at the computed offset");
+				boundaries.push(row.sk);
+			}
+			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty children).
+			for (let i = 0; i < boundaries.length; i++) {
+				if (boundaries[i] <= lower) return null;
+				if (i > 0 && boundaries[i] <= boundaries[i - 1]) return null;
+			}
+			return boundaries;
+		});
+	}
+
 	/** Promotion GC: deletes up to `limit` rows of a promoted key per call (bounded work per cycle). */
 	deleteItemsBatchForHashKey(hk: string, limit: number): void {
 		this.#storage.sql.exec(

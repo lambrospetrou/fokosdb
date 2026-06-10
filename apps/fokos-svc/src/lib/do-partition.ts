@@ -25,18 +25,20 @@ import type {
 import {
 	areImmutableOptionsEqual,
 	areMutableOptionsEqual,
+	isHashPartition,
+	isRangePartition,
 	PartitionContext,
 	PartitionContextResolved,
+	type InitFromSplitOptions,
+} from "./partition-topology/partition-context.js";
+import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
+import {
 	HashPartitionTopologyImpl,
 	PartitionTopologySplitter,
 	RangePartitionTopologyImpl,
-	SplitStatusKVItem,
-	resolveRangePartitionContext,
 	RANGE_PROMOTION_FRACTION,
-	isHashPartition,
-	isRangePartition,
-	PartitionIdHelper,
-} from "./partition-topology/partition-topology.js";
+} from "./partition-topology/split-policy.js";
+import { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
@@ -110,11 +112,9 @@ type ParentPartitionDOStub = {
 	}>;
 };
 
-export type InitFromSplitOptions = {
-	parentPartitionContext: PartitionContextResolved;
-	newPartitionContext: PartitionContextResolved;
-	splitType: SplitType;
-};
+// Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
+// lives in partition-topology/partition-context.ts.
+export type { InitFromSplitOptions };
 
 type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
 
@@ -912,7 +912,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async checkSplits(pCtx: PartitionContextResolved, hashKey: string, sortKey?: string): Promise<SplitStatusKVItem | undefined> {
 		const topology = this.ensureTopology(pCtx);
-		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey);
+		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey, {
+			hasInFlightPromotions: this.hasInFlightPromotions(),
+		});
 		if (splitStatus) {
 			console.log({
 				...this.logParams(),
@@ -924,6 +926,128 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		return splitStatus;
+	}
+
+	// Promotion⇄hash-split mutual exclusion input for the split policy, answered from the
+	// in-memory promoted-keys cache (no storage read needed).
+	private hasInFlightPromotions(): boolean {
+		for (const status of this.#_promotedKeys.values()) {
+			if (status === "queued" || status === "promoting") return true;
+		}
+		return false;
+	}
+
+	/**
+	 * Orchestrates the split fan-out: the policy decides (prepareSplit), the DO performs the RPCs
+	 * (boundary rule: only DO classes and FokosDB hold stubs). Failure ordering matches the old
+	 * topology startSplit exactly — if any child init fails we abort BEFORE the split_started KV
+	 * transition, so the retry path is unchanged.
+	 */
+	private async runSplit(topology: PartitionTopologySplitter): Promise<void> {
+		const splitStatus = topology.splitStatus();
+		if (!splitStatus || splitStatus.status !== "split_queued") {
+			// Already started or completed — idempotent no-op.
+			return;
+		}
+
+		// Range splits need boundaries computed from the data (a store query); the policy receives them as input.
+		let boundaries: string[] | null = null;
+		if (splitStatus.splitType === "range") {
+			const pCtx = this.pCtx();
+			const rp = pCtx.rangePartition;
+			invariant(rp, "fokos/range.startSplit: missing rangePartition identity");
+			const N = pCtx.rangeSplitN;
+			invariant(N != null && N >= 2, "fokos/range.startSplit: rangeSplitN must be >= 2");
+			// Compute N-1 split boundaries within the owned slice [start, end) in one snapshot.
+			boundaries = this.#store.computeRangeSplitBoundaries(rp.hashKey, rp.startBoundary, rp.endBoundary, N);
+			if (!boundaries) {
+				// Not enough distinct items to split into N non-empty children — retry on a later cycle.
+				console.log({
+					message: "fokos/range.startSplit: insufficient items to split into N children; will retry.",
+					doName: pCtx.doName,
+				});
+				return;
+			}
+		}
+
+		const childInits = topology.prepareSplit({ boundaries });
+		if (!childInits) return;
+
+		// Call the new DOs at `initFromSplit()` to initialize them with the right context and their
+		// parent partition info that they will use to get data during migration (retry ≤5 each).
+		const promises = childInits.map(async (childContext) => {
+			const doId = this.env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+			try {
+				return await tryWhile(
+					async () => {
+						const childDo = this.env[childContext.newPartitionContext.ns].get(doId);
+						return await childDo.initFromSplit(childContext);
+					},
+					(_error, nextAttempt) => {
+						return nextAttempt <= 5; // Retry up to 5 times
+					},
+				);
+			} catch (error) {
+				// Handle initialization errors
+				console.error({
+					message: "fokos/topology: Split initialization failed, aborting split process. Will retry later.",
+					error: String(error),
+					errorProps: error,
+					doId: doId.toString(),
+					childContext,
+				});
+				throw error; // Rethrow to be caught by the outer try-catch and trigger a retry of the split process.
+			}
+		});
+
+		// If any of the initializations fail we abort for now, and retry later.
+		// Ideally even partial initializations should be handled gracefully, but for now we can just rely on retries to get to a consistent state.
+		// The partition DOs should be the source of truth for everything so until the split initialization succeeds, this parent DO is the owner.
+		// FIXME Improve this by allowing some child partitions to not be initialized, which will need a topology router functionality to ask the parent for the context again, which is doable!
+		try {
+			await Promise.all(promises);
+		} catch (error) {
+			console.error({
+				message: "fokos/topology: Some split initialization failed, aborting split process. Will retry later.",
+				error: String(error),
+				errorProps: error,
+				parentPartitionContext: this.pCtx(),
+			});
+
+			// By throwing here we stop the split process. The next request will call `queueSplit()` again
+			// setting a new alarm, which will retry the split process and hopefully succeed if the errors were transient.
+			throw error;
+		}
+
+		// Mark the split status as `split_started`: the new partitions now handle requests and this
+		// partition is just a proxy that forwards to them until migration completes (split_completed).
+		topology.commitSplitStarted(childInits.map((c) => c.newPartitionContext));
+
+		// Kick off migration on each child immediately so it doesn't wait for the first user request.
+		// Fire-and-forget: failures are logged but do not fail the split — the child will
+		// start migrating on its first incoming request if this doesn't reach it.
+		// We do not use this.ctx.waitUntil(...) since it causes vitest errors with tangling log messages.
+		await Promise.allSettled(
+			childInits.map(async (childContext) => {
+				try {
+					const doId = this.env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+					const childDo = this.env[childContext.newPartitionContext.ns].get(doId);
+					await childDo.triggerMigration();
+				} catch (error) {
+					console.error({
+						message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
+						error: String(error),
+						errorProps: error,
+						childDoName: childContext.newPartitionContext.doName,
+					});
+				}
+			}),
+		);
+
+		console.log({
+			message: "fokos/topology: Split process completed successfully.",
+			childPartitionContexts: childInits,
+		});
 	}
 
 	private pCtx(): PartitionContextResolved {
@@ -1420,6 +1544,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.#_promotedKeys.has(hk)) return;
 		this.#store.insertPromotedKey(hk, "queued", Date.now());
+		// FIXME Only set this if the storage insert succeeded to avoid races and inconsistencies.
 		this.#_promotedKeys.set(hk, "queued");
 		this.scheduleBackgroundWork({ delayMs: 10 });
 		console.log({
@@ -1479,7 +1604,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					});
 					await tryWhile(
 						async () => {
-							await topology.startSplit();
+							await this.runSplit(topology);
 						},
 						(_error, nextAttempt) => nextAttempt <= 5,
 					);

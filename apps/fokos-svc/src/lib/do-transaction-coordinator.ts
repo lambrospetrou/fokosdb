@@ -2,7 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
 import { validateTransactWriteOperations } from "./transaction-limits.js";
-import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
+import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type {
 	CancelRequest,
 	CancelResponse,

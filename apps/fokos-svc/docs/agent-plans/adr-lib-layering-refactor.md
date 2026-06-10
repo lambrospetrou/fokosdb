@@ -357,7 +357,7 @@ size-estimate bookkeeping across put/overwrite/delete, watermark monotonicity).
 the DO for now — they move in later phases); five scan loops replaced by one helper; full suite
 green with no test edits.
 
-### Phase 2 — topology split
+### Phase 2 — topology split — ✅ DONE (2026-06-10)
 
 **Goal:** `partition-topology.ts` split by responsibility; no RPC, no `env` access, and no SQL on
 partition tables anywhere in topology; import cycle with `do-partition.ts` eliminated; the
@@ -415,7 +415,11 @@ pausable.
 6. Delete the two hand-written structural stub types (`PartitionDOStub` in both DOs stays for
    now — TC's copy is fine; the one in `do-partition.ts` survives until phase 3 removes the
    parent-stub variant) — at minimum, the `partition-topology.ts` → `do-partition.ts` import is
-   gone. Verify: `grep -rn "from \"../do-partition\|from \"./do-partition\" src/lib/partition-topology/` returns nothing.
+   gone. Verify: `grep -rn "from \"../do-partition\|from \"./do-partition\" src/lib/partition-topology/` returns ONLY the
+   single `import type { PartitionDO }` in `partition-context.ts` — type-only, erased at emit, so
+   no runtime module cycle; it exists because the `PartitionNamespaceKey` filter needs the class
+   identity (structural alternatives collapse to `any` when resolved mid-cycle from
+   `do-partition.ts` itself; decided with Lambros 2026-06-10).
 
 **Tests:** new `partition-id.test.ts` (hash + range codec round-trips, `doName` formatting,
 `depth`/`rootIdx`/`lastChildIdx` readers, append/encode paths) and `split-state.test.ts` for the
