@@ -1201,8 +1201,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async checkSplits(pCtx: PartitionContextResolved, hashKey: string, sortKey?: string): Promise<SplitStatusKVItem | undefined> {
-		const topologyRouter = this.ensureTopology(pCtx);
-		const splitStatus = await topologyRouter.maybeQueueSplit(hashKey, sortKey);
+		const topology = this.ensureTopology(pCtx);
+		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey);
 		if (splitStatus) {
 			console.log({
 				...this.logParams(),

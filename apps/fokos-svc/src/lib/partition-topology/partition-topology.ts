@@ -628,7 +628,6 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	};
 
 	#storage: DurableObjectStorage;
-	#topologyRouter: PartitionTopologyRouter;
 	#_hashTopology: HashTopology | null = null;
 
 	constructor(
@@ -636,8 +635,6 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		private readonly doCtx: DurableObjectState,
 	) {
 		this.#storage = doCtx.storage;
-		// FIXME: Parse the topology only once!
-		this.#topologyRouter = new PartitionTopologyRouterImpl(partitionContext);
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
 		// first request, after blockConcurrencyWhile has completed, so synchronous KV reads are safe.
 		const ownerAbsDepth = PartitionIdHelper.depth(partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId));

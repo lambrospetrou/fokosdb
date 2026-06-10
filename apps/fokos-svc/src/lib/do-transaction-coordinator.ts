@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
+import { validateTransactWriteOperations } from "./transaction-limits.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
 import type {
 	CancelRequest,
@@ -58,8 +59,6 @@ type TcItemRow = {
 };
 
 const STALE_THRESHOLD_MS = 5_000;
-const MAX_ITEMS_PER_TRANSACTION = 100;
-const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
 
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
@@ -678,19 +677,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	private validateWriteRequest(request: InitiateWriteRequest): void {
-		if (request.operations.length === 0) throw new Error("fokos/tc: TransactWriteItems requires at least 1 item");
-		if (request.operations.length > MAX_ITEMS_PER_TRANSACTION) {
-			throw new Error(`fokos/tc: TransactWriteItems supports at most ${MAX_ITEMS_PER_TRANSACTION} items`);
-		}
-		const seen = new Set<string>();
-		let totalBytes = 0;
-		for (const op of request.operations) {
-			const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
-			if (seen.has(key)) throw new Error(`fokos/tc: duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
-			seen.add(key);
-			if (op.data) totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
-		}
-		if (totalBytes > MAX_PAYLOAD_BYTES) throw new Error("fokos/tc: total payload exceeds 4 MB");
+		validateTransactWriteOperations(request.operations);
 	}
 }
 
