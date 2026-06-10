@@ -672,26 +672,37 @@ export class PartitionStore {
 			?.status;
 	}
 
-	/** Idempotent: used both when queueing a new promotion and when inheriting entries on hash split. */
-	insertPromotedKey(hk: string, status: PromotedKeyStatus, now: number): void {
-		this.#storage.sql.exec(
+	/**
+	 * Idempotent: used both when queueing a new promotion and when inheriting entries on hash
+	 * split. Returns whether a new row was actually inserted — false means the key already had a
+	 * row (whose status may differ from `status`), so callers keeping an in-memory cache must
+	 * resync from storage instead of assuming `status` was written.
+	 */
+	insertPromotedKey(hk: string, status: PromotedKeyStatus, now: number): { inserted: boolean } {
+		const res = this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, ?, ?, ?)`,
 			hk,
 			status,
 			now,
 			now,
 		);
+		return { inserted: res.rowsWritten > 0 };
 	}
 
-	/** Guarded transition: only updates when the row is currently in `fromStatus`. */
-	updatePromotedKeyStatus(hk: string, fromStatus: PromotedKeyStatus, toStatus: PromotedKeyStatus, updatedAt: number): void {
-		this.#storage.sql.exec(
+	/**
+	 * Guarded transition: only updates when the row is currently in `fromStatus`. Returns whether
+	 * a row actually transitioned — false means the key was absent or in a different status, so
+	 * callers keeping an in-memory cache must resync from storage instead of assuming `toStatus`.
+	 */
+	updatePromotedKeyStatus(hk: string, fromStatus: PromotedKeyStatus, toStatus: PromotedKeyStatus, updatedAt: number): { updated: boolean } {
+		const res = this.#storage.sql.exec(
 			`UPDATE promoted_keys SET status = ?, updated_at = ? WHERE hash_key = ? AND status = ?`,
 			toStatus,
 			updatedAt,
 			hk,
 			fromStatus,
 		);
+		return { updated: res.rowsWritten > 0 };
 	}
 
 	/** Pages promoted_keys in hash_key order, strictly after `cursor`. */

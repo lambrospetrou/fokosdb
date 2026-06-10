@@ -190,15 +190,20 @@ describe("PartitionStore - pending transactions", () => {
 describe("PartitionStore - promoted keys", () => {
 	it("insertPromotedKey is idempotent and updatePromotedKeyStatus is guarded by fromStatus", async () => {
 		await withStore((store) => {
-			store.insertPromotedKey("hk", "queued", 1000);
-			store.insertPromotedKey("hk", "promoting", 2000); // ignored — already present
+			expect(store.insertPromotedKey("hk", "queued", 1000)).toEqual({ inserted: true });
+			// Ignored — already present; callers must resync any cache from storage.
+			expect(store.insertPromotedKey("hk", "promoting", 2000)).toEqual({ inserted: false });
 			expect(store.getPromotedKeyStatus("hk")).toBe("queued");
 
-			store.updatePromotedKeyStatus("hk", "promoting", "promoted", 3000); // wrong fromStatus — no-op
+			// Wrong fromStatus — no-op, reported so cache holders can resync.
+			expect(store.updatePromotedKeyStatus("hk", "promoting", "promoted", 3000)).toEqual({ updated: false });
 			expect(store.getPromotedKeyStatus("hk")).toBe("queued");
 
-			store.updatePromotedKeyStatus("hk", "queued", "promoting", 3000);
+			expect(store.updatePromotedKeyStatus("hk", "queued", "promoting", 3000)).toEqual({ updated: true });
 			expect(store.getPromotedKeyStatus("hk")).toBe("promoting");
+
+			// Absent key — also reported as not updated.
+			expect(store.updatePromotedKeyStatus("missing", "queued", "promoting", 3000)).toEqual({ updated: false });
 			expect(store.listPromotedKeys()).toEqual([{ hash_key: "hk", status: "promoting" }]);
 		});
 	});

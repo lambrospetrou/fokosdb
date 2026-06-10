@@ -589,8 +589,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
 
-		this.#store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
-		this.#_promotedKeys.set(hashKey, "promoted");
+		const { updated } = this.#store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
+		if (updated) {
+			this.#_promotedKeys.set(hashKey, "promoted");
+		} else {
+			// No row transitioned (e.g. idempotent re-ack of an already-promoted key) — sync the
+			// cache from storage's truth rather than assuming the transition happened.
+			const stored = this.#store.getPromotedKeyStatus(hashKey);
+			if (stored) this.#_promotedKeys.set(hashKey, stored);
+			else this.#_promotedKeys.delete(hashKey);
+		}
 		this.scheduleBackgroundWork({ delayMs: 1_000 });
 		console.log({ ...this.logParams(), message: "fokos/partition: Promotion complete.", hashKey });
 	}
@@ -1507,17 +1515,30 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		);
 
 		// C. Cutover queued→promoting in one transactionSync, only if the key has no pending locks.
-		const didCutover = this.#store.transactionSync(() => {
+		const cutover = this.#store.transactionSync((): "cutover" | "deferred" | "stale" => {
 			const lockCount = this.#store.pendingLockCountForHashKey(hashKey);
-			if (lockCount > 0) return false; // deferred — retry next background cycle
-			this.#store.updatePromotedKeyStatus(hashKey, "queued", "promoting", Date.now());
-			return true;
+			if (lockCount > 0) return "deferred"; // retry next background cycle
+			const { updated } = this.#store.updatePromotedKeyStatus(hashKey, "queued", "promoting", Date.now());
+			return updated ? "cutover" : "stale";
 		});
-		if (didCutover) {
+		if (cutover === "cutover") {
 			this.#_promotedKeys.set(hashKey, "promoting");
+		} else if (cutover === "stale") {
+			// Storage disagrees with the in-memory cache (the key is no longer 'queued') — sync the
+			// cache from storage's truth and skip; the background loop acts on the real status.
+			const stored = this.#store.getPromotedKeyStatus(hashKey);
+			if (stored) this.#_promotedKeys.set(hashKey, stored);
+			else this.#_promotedKeys.delete(hashKey);
+			console.log({
+				...this.logParams(),
+				message: "fokos/partition: Promotion cutover skipped (key no longer queued in storage).",
+				hashKey,
+				storedStatus: stored ?? null,
+			});
+			return;
 		}
 
-		if (!didCutover) {
+		if (cutover === "deferred") {
 			console.log({
 				...this.logParams(),
 				message: "fokos/partition: Promotion cutover deferred (pending locks).",
@@ -1543,8 +1564,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.#_promotedKeys.has(hk)) return;
-		this.#store.insertPromotedKey(hk, "queued", Date.now());
-		// FIXME Only set this if the storage insert succeeded to avoid races and inconsistencies.
+		const { inserted } = this.#store.insertPromotedKey(hk, "queued", Date.now());
+		if (!inserted) {
+			// A row already existed (the in-memory cache was stale, e.g. after crash recovery) —
+			// resync the cache from storage instead of clobbering a possibly-advanced status
+			// (promoting/promoted) back to queued.
+			const stored = this.#store.getPromotedKeyStatus(hk);
+			if (stored) this.#_promotedKeys.set(hk, stored);
+			return;
+		}
 		this.#_promotedKeys.set(hk, "queued");
 		this.scheduleBackgroundWork({ delayMs: 10 });
 		console.log({
