@@ -56,6 +56,13 @@ import {
 	type PromotedKeyCursor,
 	type PromotedKeyStatus,
 } from "./partition/partition-store.js";
+import {
+	type GetItemsBatchResult,
+	type GetPartitionTransactionMetadataResult,
+	type GetPromotedKeysBatchResult,
+	type PartitionPeer,
+} from "./partition/partition-peer.js";
+import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./partition/migration.js";
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -85,46 +92,15 @@ type PartitionDOStub = {
 	readForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 };
 
-type GetPartitionTransactionMetadataResult = {
-	maxDeletedTs: number;
-	pendingTransactions: PendingTransactionRow[];
-	nextCursor: PendingTransactionCursor | null;
-};
-
-type GetItemsBatchResult = {
-	items: MigratedItem[];
-	nextCursor: MigrationCursor | null;
-};
-
-// Structural type for child→parent RPC calls during migration.
-type ParentPartitionDOStub = {
-	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
-	getPartitionTransactionMetadata(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PendingTransactionCursor | null;
-	}): Promise<GetPartitionTransactionMetadataResult>;
-	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
-	acknowledgePromotionComplete(hashKey: string): Promise<void>;
-	getItemDirect(opts: GetItemOptions): Promise<GetItemResult>;
-	getPromotedKeysBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: PromotedKeyCursor | null }): Promise<{
-		rows: { hash_key: string; status: PromotedKeyStatus }[];
-		nextCursor: PromotedKeyCursor | null;
-	}>;
-};
-
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
 // lives in partition-topology/partition-context.ts.
 export type { InitFromSplitOptions };
-
-type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
 
 export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly KV_KEYS = {
 		PARTITION_CONTEXT: "__partition_context",
 		PARENT_PARTITION_CONTEXT: "__parent_partition_context",
 		PARENT_SPLIT_TYPE: "__parent_split_type",
-		SPLIT_MIGRATION_STATUS: "__split_migration_status",
-		SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
 	};
 
 	private static readonly STALE_TX_MS = 5_000;
@@ -195,7 +171,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(newPartitionContext, /* isInit */ true);
 		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 
 		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
 		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
@@ -207,7 +183,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// FIXME Remove this shit and test properly through the public API.
 		if (__testing__completeMigration) {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		}
 		if (__testing__splitStatus) {
 			this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
@@ -561,10 +537,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// Paginated promoted_keys for hash-split inheritance: a hash child pulls the promoted-key entries
 	// (forward-pointers) for the keys it now owns. Only the set transfers — never the data, which lives
 	// in the autonomous range structure (the range-root name is recomputable from the hashKey).
-	async getPromotedKeysBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: PromotedKeyCursor | null }): Promise<{
-		rows: { hash_key: string; status: PromotedKeyStatus }[];
-		nextCursor: PromotedKeyCursor | null;
-	}> {
+	async getPromotedKeysBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PromotedKeyCursor | null;
+	}): Promise<GetPromotedKeysBatchResult> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.getPromotedKeysBatch: only hash partitions have promoted keys");
 
@@ -613,7 +589,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			partitionContext: pCtx,
 			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
 			splitStatus: pCtx ? this.ensureTopology(pCtx).splitStatus() : undefined,
-			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS),
+			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
 			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
 			promotedKeys: Array.from(this.#_promotedKeys.entries()).map(([hashKey, status]) => ({
@@ -1118,12 +1094,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async ensureMigration(op: string, throwIfMigrating = true): Promise<boolean> {
 		// TODO Optimize this away by keeping it in memory.
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
 		if (!migrationStatus || migrationStatus === "migration_completed") {
 			return false;
 		}
 		if (migrationStatus === "migration_initialized") {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 		}
 		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
@@ -1277,175 +1253,27 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
+	// The driver loops live in partition/migration.ts (SplitMigration); the DO only resolves the
+	// parent stub (boundary rule: only DO classes and FokosDB acquire stubs) and wires the deps.
 	private async runMigration(): Promise<void> {
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
-		if (migrationStatus !== "migration_migrating") {
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition.runMigration: migration not migrating.",
-				migrationStatus,
-			});
-			return;
-		}
-
 		const pCtx = this.pCtx();
 		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
-		if (isHashPartition(pCtx)) {
-			await this.runHashChildMigration(pCtx, parentCtx);
-		} else {
-			await this.runRangeChildMigration(pCtx, parentCtx);
-		}
-	}
-
-	private async runHashChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
 		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
-		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
+		const parent: PartitionPeer = this.env[parentCtx.ns].get(parentId);
 
-		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
-
-		while (true) {
-			const { items, nextCursor } = await parentStub.getItemsBatch({
-				childPartitionContext: pCtx,
-				cursor,
-			});
-
-			if (items.length > 0) {
-				for (const item of items) {
-					// INSERT OR IGNORE rather than OR REPLACE: all writes to this partition are rejected
-					// with 503 while migration_migrating, so no user write can have arrived yet.
-					// IGNORE is safer for retries — if a batch was already written before a crash we
-					// skip re-inserting those items rather than overwriting them unnecessarily.
-					this.#store.insertItemIfAbsent(item);
-				}
-			}
-
-			// Checkpoint cursor after each batch so we can resume if interrupted.
-			cursor = nextCursor;
-			this.ctx.storage.kv.put<MigrationCursor | null>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
-
-			if (!nextCursor) break;
-		}
-		invariant(cursor === null, "fokos/partition.runHashChildMigration: loop exited with non-null cursor — data may be incomplete");
-
-		// Migrate transaction metadata: pending locks and deletion high-water mark.
-		let txCursor: PendingTransactionCursor | null = null;
-		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
-				childPartitionContext: pCtx,
-				cursor: txCursor,
-			});
-
-			this.#store.transactionSync(() => {
-				for (const row of pendingTransactions) {
-					this.#store.insertPendingLock(row);
-				}
-				this.#store.bumpMaxDeletedTs(maxDeletedTs);
-			});
-
-			if (!nextCursor) break;
-			txCursor = nextCursor;
-		}
-
-		// Inherit promoted-key entries for the keys this child now owns. Only the forward-pointer entry
-		// transfers — the data lives in the range structure, and hash-child item migration already excluded
-		// promoted keys. Mutual exclusion guarantees every such key is 'promoted' at hash-split time.
-		let pkCursor: PromotedKeyCursor | null = null;
-		while (true) {
-			const { rows, nextCursor } = await parentStub.getPromotedKeysBatch({
-				childPartitionContext: pCtx,
-				cursor: pkCursor,
-			});
-			if (rows.length > 0) {
-				this.#store.transactionSync(() => {
-					for (const row of rows) {
-						this.#store.insertPromotedKey(row.hash_key, row.status, Date.now());
-						this.#_promotedKeys.set(row.hash_key, row.status);
-					}
-				});
-			}
-			if (!nextCursor) break;
-			pkCursor = nextCursor;
-		}
-
-		await this.__testing__beforeMigrationComplete?.();
-		this.#store.rebuildKeySizeEstimates();
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
-		await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
-
-		console.log({
-			...this.logParams(),
-			message: "fokos/partition: Hash child migration completed.",
+		const migration = new SplitMigration({
+			store: this.#store,
+			storage: this.ctx.storage,
+			parent,
+			logParams: () => this.logParams(),
+			onPromotedKeyInherited: (hashKey, status) => this.#_promotedKeys.set(hashKey, status),
+			beforeComplete: async () => {
+				await this.__testing__beforeMigrationComplete?.();
+			},
 		});
-	}
-
-	private async runRangeChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
-		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
-		const parentStub = this.env[parentCtx.ns].get(parentId) as unknown as ParentPartitionDOStub;
-
-		// Migrate items for this range DO's owned slice.
-		// For a promotion root the parent is a hash DO (filter by hk only);
-		// for a range-split child the parent is a range DO (filter by hk and sk range).
-		let cursor = this.ctx.storage.kv.get<MigrationCursor>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
-
-		while (true) {
-			const { items, nextCursor } = await parentStub.getItemsBatch({
-				childPartitionContext: pCtx,
-				cursor,
-			});
-
-			if (items.length > 0) {
-				for (const item of items) {
-					this.#store.insertItemIfAbsent(item);
-				}
-			}
-
-			cursor = nextCursor;
-			this.ctx.storage.kv.put<MigrationCursor | null>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
-
-			if (!nextCursor) break;
-		}
-		invariant(cursor === null, "fokos/partition.runRangeChildMigration: loop exited with non-null cursor");
-
-		// Migrate transaction metadata: pending locks and the deletion high-water mark.
-		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the watermark;
-		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
-		let txCursor: PendingTransactionCursor | null = null;
-		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parentStub.getPartitionTransactionMetadata({
-				childPartitionContext: pCtx,
-				cursor: txCursor,
-			});
-
-			this.#store.transactionSync(() => {
-				for (const row of pendingTransactions) {
-					this.#store.insertPendingLock(row);
-				}
-				this.#store.bumpMaxDeletedTs(maxDeletedTs);
-			});
-
-			if (!nextCursor) break;
-			txCursor = nextCursor;
-		}
-
-		await this.__testing__beforeMigrationComplete?.();
-		this.#store.rebuildKeySizeEstimates();
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
-
-		// Notify the parent: a promotion root calls acknowledgePromotionComplete; a range-split child calls acknowledgeChildMigrationComplete.
-		if (isHashPartition(parentCtx)) {
-			await parentStub.acknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
-		} else {
-			await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
-		}
-
-		console.log({
-			...this.logParams(),
-			message: "fokos/partition: Range child migration completed.",
-		});
+		await migration.runMigration(pCtx, parentCtx);
 	}
 
 	private async ensureAlarmSet(targetMs: number): Promise<void> {
@@ -1598,10 +1426,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			////////////////////////////////////////////////////////
 			// ── Job: Partition migration (for child partitions)
 			try {
-				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
 				if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
 					if (migrationStatus === "migration_initialized") {
-						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
+						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 					}
 					await tryWhile(
 						async () => {
@@ -1752,7 +1580,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			};
 			this.#store.transactionSync(() => {
 				// Job: Partition migration for child partitions.
-				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
+				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
 				if (postStatus === "migration_migrating") {
 					wantAlarm(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 				}

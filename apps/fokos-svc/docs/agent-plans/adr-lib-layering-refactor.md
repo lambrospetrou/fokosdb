@@ -431,7 +431,7 @@ more-acks-than-children invariant — tested once, covering both impls. Existing
 resolution in `partition-id.ts`/`router.ts`; no `.get(` stub acquisition and no
 `sql.exec` on `items`/`promoted_keys` anywhere in `partition-topology/`; suite green.
 
-### Phase 3 — `partition/partition-peer.ts` + `partition/migration.ts`
+### Phase 3 — `partition/partition-peer.ts` + `partition/migration.ts` — ✅ DONE (2026-06-10)
 
 **Goal:** one gateway interface for all peer-DO calls; the child-side migration driver is a
 component with crash/resume covered by direct tests. Parent-side batch serving is deliberately
