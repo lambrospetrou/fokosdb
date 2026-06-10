@@ -275,7 +275,7 @@ and report what changed.
 - Do not touch `bloom-filter.ts`, the 2PC wire types (`transaction-types.ts`), or the public
   result shapes in `types.ts`.
 
-### Phase 0 — independent quick wins
+### Phase 0 — independent quick wins — ✅ DONE (2026-06-10)
 
 **Goal:** zero-risk cleanups with no dependency on any other phase.
 
@@ -295,7 +295,7 @@ and report what changed.
 **Acceptance:** one definition of the transaction limits; no `topologyRouter` references; suite
 green. Each of the two items is independently a green checkpoint.
 
-### Phase 1 — `partition/partition-store.ts` + `partition/batch-scan.ts`
+### Phase 1 — `partition/partition-store.ts` + `partition/batch-scan.ts` — ✅ DONE (2026-06-10)
 
 **Goal:** all SQL on partition-owned tables lives in one class; the byte-budgeted cursor scan has
 one implementation.

@@ -1,5 +1,4 @@
 import { DurableObject, RpcTarget } from "cloudflare:workers";
-import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import {
 	DeleteItemOptions,
 	DeleteItemResult,
@@ -41,31 +40,20 @@ import {
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
-
-type ItemSnapshot = { hk: string; sk: string; found: true; v: number } | { hk: string; sk: string; found: false };
-
-function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
-	for (const condition of conditions) {
-		if (condition.type === "item_exists") {
-			if (!item.found) {
-				throw new Error(`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`);
-			}
-		} else if (condition.type === "item_not_exists") {
-			if (item.found) {
-				throw new Error(
-					`fokos/${operationName}: condition "item_not_exists" failed — item already exists with v=${item.v} (hk=${item.hk}, sk=${item.sk})`,
-				);
-			}
-		} else if (condition.type === "attribute_equals") {
-			const actual = item.found ? item[condition.attribute] : null;
-			if (actual !== condition.value) {
-				throw new Error(
-					`fokos/${operationName}: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${item.hk}, sk=${item.sk})`,
-				);
-			}
-		}
-	}
-}
+import { collectBatch } from "./partition/batch-scan.js";
+import {
+	estimateItemBytes,
+	estimatePendingTxBytes,
+	evaluateConditionsOnItem,
+	PartitionStore,
+	type ItemSnapshot,
+	type MigratedItem,
+	type MigrationCursor,
+	type PendingTransactionCursor,
+	type PendingTransactionRow,
+	type PromotedKeyCursor,
+	type PromotedKeyStatus,
+} from "./partition/partition-store.js";
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -95,36 +83,11 @@ type PartitionDOStub = {
 	readForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 };
 
-type MigratedItem = {
-	hk: string;
-	sk: string;
-	data: string | Uint8Array;
-	ttl_epoch_utc_seconds: number | null;
-	v: number;
-	last_transaction_ts: number;
-};
-
-type PendingTransactionRow = {
-	hk: string;
-	sk: string;
-	transaction_id: string;
-	transaction_ts: number;
-	operation: string;
-	data: string | Uint8Array | null;
-	conditions_json: string | null;
-	coordinator_do_id: string;
-	created_at: number;
-};
-
-type PendingTransactionCursor = { hk: string; sk: string; transaction_id: string };
-
 type GetPartitionTransactionMetadataResult = {
 	maxDeletedTs: number;
 	pendingTransactions: PendingTransactionRow[];
 	nextCursor: PendingTransactionCursor | null;
 };
-
-type MigrationCursor = { hk: string; sk: string };
 
 type GetItemsBatchResult = {
 	items: MigratedItem[];
@@ -147,10 +110,6 @@ type ParentPartitionDOStub = {
 	}>;
 };
 
-type PromotedKeyCursor = { hashKey: string };
-
-type PromotedKeyStatus = "queued" | "promoting" | "promoted";
-
 export type InitFromSplitOptions = {
 	parentPartitionContext: PartitionContextResolved;
 	newPartitionContext: PartitionContextResolved;
@@ -172,7 +131,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly MIGRATION_FALLBACK_ALARM_MS = 10_000;
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
 
-	#_migrations: SQLSchemaMigrations;
+	#store: PartitionStore;
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
 	#_backgroundWorkScheduledAt: number | null = null;
@@ -187,12 +146,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.#_migrations = new SQLSchemaMigrations({
-			migrations: sqlMigrations,
-			doStorage: ctx.storage,
-		});
+		this.#store = new PartitionStore(ctx.storage);
 		void ctx.blockConcurrencyWhile(async () => {
-			await this.#_migrations.runAll();
+			await this.#store.runMigrations();
 
 			// Load partition context from storage.
 			const pCtx = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
@@ -202,11 +158,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			// Load promoted keys into in-memory cache (hash DOs only; range DOs never have rows).
-			const promotedRows = ctx.storage.sql
-				.exec<{ hash_key: string; status: string }>(`SELECT hash_key, status FROM promoted_keys`)
-				.toArray();
-			for (const row of promotedRows) {
-				this.#_promotedKeys.set(row.hash_key, row.status as PromotedKeyStatus);
+			for (const row of this.#store.listPromotedKeys()) {
+				this.#_promotedKeys.set(row.hash_key, row.status);
 			}
 		});
 	}
@@ -280,11 +233,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			local: async () => {
 				const sk = opts.sortKey ?? "";
 
-				const pendingRow = this.ctx.storage.sql
-					.exec<{
-						transaction_id: string;
-					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
-					.toArray()[0];
+				const pendingRow = this.#store.pendingLockFor(opts.hashKey, sk);
 				if (pendingRow) {
 					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
 					// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
@@ -295,64 +244,32 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
-					const row = cRes.toArray()[0];
-					conditionRes = cRes;
-					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
+					const stamp = this.#store.getItemStamp(opts.hashKey, sk);
+					conditionRes = stamp;
+					const item: ItemSnapshot = stamp.row
+						? { found: true, hk: opts.hashKey, sk, v: stamp.row.v }
+						: { found: false, hk: opts.hashKey, sk };
 					evaluateConditionsOnItem(item, opts.conditions, "putItem");
 				}
 
-				const oldEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
-					.toArray()[0];
-				const oldEst = oldEstRow?.est_row_bytes ?? 0;
-				const newEst = estimateRowBytes(opts.data, opts.hashKey, sk);
-
-				const writeRes = this.ctx.storage.sql.exec<{ v: number }>(
-					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes)
-					 VALUES (?, ?, ?, ?, 1, ?, ?)
-					 ON CONFLICT(hk, sk) DO UPDATE SET
-					   data = excluded.data,
-					   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-					   v = v + 1,
-					   last_transaction_ts = excluded.last_transaction_ts,
-					   est_row_bytes = excluded.est_row_bytes
-					 RETURNING v`,
-					opts.hashKey,
+				const writeRes = this.#store.upsertItem({
+					hk: opts.hashKey,
 					sk,
-					opts.data,
-					opts.ttlEpochUTCSeconds ?? null,
-					Date.now(),
-					newEst,
-				);
+					data: opts.data,
+					ttlEpochUtcSeconds: opts.ttlEpochUTCSeconds ?? null,
+					lastTransactionTs: Date.now(),
+				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
-				const rows = writeRes.toArray();
-				invariant(rows.length === 1, `fokos/partition.putItem: RETURNING expected 1 row, got ${rows.length}`);
-				const version = rows[0].v;
-				invariant(
-					typeof version === "number" && Number.isInteger(version) && version >= 1,
-					`fokos/partition.putItem: unexpected version value: ${version}`,
-				);
-				const kseRow = this.ctx.storage.sql
-					.exec<{ est_bytes: number }>(
-						`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-						 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
-						 RETURNING est_bytes`,
-						opts.hashKey,
-						newEst,
-						oldEst,
-					)
-					.toArray()[0];
-				this.maybeQueuePromotion(pCtx, opts.hashKey, kseRow?.est_bytes ?? newEst);
+				this.maybeQueuePromotion(pCtx, opts.hashKey, writeRes.keyEstBytes);
 
 				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
-					version,
+					version: writeRes.version,
 					meta: {
 						rowsRead,
 						rowsWritten,
-						databaseSize: this.ctx.storage.sql.databaseSize,
+						databaseSize: this.#store.databaseSize,
 						servedByActorId: this.ctx.id.toString(),
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
@@ -375,11 +292,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			local: async () => {
 				const sk = opts.sortKey ?? "";
 
-				const pendingRow = this.ctx.storage.sql
-					.exec<{
-						transaction_id: string;
-					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
-					.toArray()[0];
+				const pendingRow = this.#store.pendingLockFor(opts.hashKey, sk);
 				if (pendingRow) {
 					// FIXME: ATC §4 optimization — see same comment in putItem.
 					throw new Error(
@@ -389,32 +302,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const cRes = this.ctx.storage.sql.exec<{ v: number }>(`SELECT v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk);
-					const row = cRes.toArray()[0];
-					conditionRes = cRes;
-					const item: ItemSnapshot = row ? { found: true, hk: opts.hashKey, sk, v: row.v } : { found: false, hk: opts.hashKey, sk };
+					const stamp = this.#store.getItemStamp(opts.hashKey, sk);
+					conditionRes = stamp;
+					const item: ItemSnapshot = stamp.row
+						? { found: true, hk: opts.hashKey, sk, v: stamp.row.v }
+						: { found: false, hk: opts.hashKey, sk };
 					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
 				}
 
-				const delEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, sk)
-					.toArray()[0];
-				const delEst = delEstRow?.est_row_bytes ?? 0;
-
-				const writeRes = this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hashKey, sk);
 				// Keep deletion watermark consistent with transactional deletes.
-				if (writeRes.rowsWritten > 0) {
-					this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, Date.now());
-					this.ctx.storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, delEst, opts.hashKey);
-				}
+				const writeRes = this.#store.deleteItem({ hk: opts.hashKey, sk, watermarkTs: Date.now() });
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
-					deleted: writeRes.rowsWritten > 0,
+					deleted: writeRes.deleted,
 					meta: {
 						rowsRead,
 						rowsWritten,
-						databaseSize: this.ctx.storage.sql.databaseSize,
+						databaseSize: this.#store.databaseSize,
 						servedByActorId: this.ctx.id.toString(),
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
@@ -474,13 +379,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const hk = childPartitionContext.rangePartition.hashKey;
 			if (isHashPartition(pCtx)) {
 				// I am a hash DO; authorize via promoted_keys[hk] === 'promoting'.
-				const statusRow = this.ctx.storage.sql
-					.exec<{ status: string }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk)
-					.toArray()[0];
-				invariant(
-					statusRow?.status === "promoting",
-					`fokos/partition.getItemsBatch: key "${hk}" is not in promoting state (got ${statusRow?.status})`,
-				);
+				const status = this.#store.getPromotedKeyStatus(hk);
+				invariant(status === "promoting", `fokos/partition.getItemsBatch: key "${hk}" is not in promoting state (got ${status})`);
 				return this.getItemsBatchForRange(hk, null, null, opts.cursor);
 			}
 			// Range-split: I am a range DO becoming a router; authorize the child and stream its [start, end) slice.
@@ -515,38 +415,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
-		const items: MigratedItem[] = [];
-		let totalBytes = 0;
-		let tableCursor = opts.cursor;
-		let reachedLimit = false;
 
 		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
-		while (true) {
-			const page = this.queryPage(tableCursor, PAGE_SIZE);
-			if (page.length === 0) break;
-
-			for (const row of page) {
-				// Filter: only items for the requesting hash child, excluding promoted keys
-				// (their data lives in range structures — hash children must not inherit local copies).
-				if (isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#_promotedKeys.has(row.hk)) {
-					const rowBytes = estimateItemBytes(row);
-					if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
-						reachedLimit = true;
-						break;
-					}
-					items.push(row);
-					totalBytes += rowBytes;
-				}
-				// Always advance the table cursor regardless of whether the row matched.
-				tableCursor = { hk: row.hk, sk: row.sk };
-			}
-			if (reachedLimit) break;
-
-			if (page.length < PAGE_SIZE) break;
-		}
-
-		return { items, nextCursor: reachedLimit ? tableCursor : null };
+		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
+			fetchPage: (cursor, pageSize) => this.#store.queryItemsPage(cursor, pageSize),
+			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
+			// Filter: only items for the requesting hash child, excluding promoted keys
+			// (their data lives in range structures — hash children must not inherit local copies).
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#_promotedKeys.has(row.hk),
+			estimateBytes: estimateItemBytes,
+			budgetBytes: BATCH_LIMIT_BYTES,
+			pageSize: PAGE_SIZE,
+			startCursor: opts.cursor,
+		});
+		return { items: rows, nextCursor };
 	}
 
 	// Streams items for a range DO child's owned slice [start, end) (start/end null = unbounded edge).
@@ -559,68 +442,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	): GetItemsBatchResult {
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
-		type Row = {
-			hk: string;
-			sk: string;
-			data: string | ArrayBuffer;
-			ttl_epoch_utc_seconds: number | null;
-			v: number;
-			last_transaction_ts: number;
-		};
-		const items: MigratedItem[] = [];
 		const lower = start ?? "";
-		let totalBytes = 0;
-		let tableCursor = cursor;
-		let reachedLimit = false;
 
-		while (true) {
+		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
 			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
-			const conds: string[] = ["hk = ?"];
-			const params: unknown[] = [hashKey];
-			if (tableCursor) {
-				conds.push("sk > ?");
-				params.push(tableCursor.sk);
-			} else {
-				conds.push("sk >= ?");
-				params.push(lower);
-			}
-			if (end !== null) {
-				conds.push("sk < ?");
-				params.push(end);
-			}
-			const page = this.ctx.storage.sql
-				.exec<Row>(
-					`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk LIMIT ?`,
-					...params,
-					PAGE_SIZE,
-				)
-				.toArray();
-
-			if (page.length === 0) break;
-
-			for (const row of page) {
-				const item: MigratedItem = {
-					hk: row.hk,
-					sk: row.sk,
-					data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
-					ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
-					v: row.v,
-					last_transaction_ts: row.last_transaction_ts,
-				};
-				const rowBytes = estimateItemBytes(item);
-				if (items.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
-					reachedLimit = true;
-					break;
-				}
-				items.push(item);
-				totalBytes += rowBytes;
-				tableCursor = { hk: row.hk, sk: row.sk };
-			}
-			if (reachedLimit) break;
-			if (page.length < PAGE_SIZE) break;
-		}
-
-		return { items, nextCursor: reachedLimit ? tableCursor : null };
+			fetchPage: (pageCursor, pageSize) =>
+				this.#store.queryRangeItemsPage({ hk: hashKey, lower, end, cursor: pageCursor, limit: pageSize }),
+			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
+			estimateBytes: estimateItemBytes,
+			budgetBytes: BATCH_LIMIT_BYTES,
+			pageSize: PAGE_SIZE,
+			startCursor: cursor,
+		});
+		return { items: rows, nextCursor };
 	}
 
 	async getPartitionTransactionMetadata(opts: {
@@ -628,9 +462,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: PendingTransactionCursor | null;
 	}): Promise<GetPartitionTransactionMetadataResult> {
 		const pCtx = this.pCtx();
-		const maxDeletedTs =
-			this.ctx.storage.sql.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`).toArray()[0]
-				?.max_deleted_ts ?? 0;
+		const maxDeletedTs = this.#store.getMaxDeletedTs();
 
 		// Range-child migration (promotion or range-split).
 		const childPartitionContext = opts.childPartitionContext;
@@ -639,12 +471,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				// Hash DO serving a promotion: lock-free cutover guarantees no pending_transactions for this key.
 				// Return only the deletion watermark so the range root can sync it.
-				const statusRow = this.ctx.storage.sql
-					.exec<{ status: string }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk)
-					.toArray()[0];
+				const status = this.#store.getPromotedKeyStatus(hk);
 				invariant(
-					statusRow?.status === "promoting",
-					`fokos/partition.getPartitionTransactionMetadata: key "${hk}" is not in promoting state (got ${statusRow?.status})`,
+					status === "promoting",
+					`fokos/partition.getPartitionTransactionMetadata: key "${hk}" is not in promoting state (got ${status})`,
 				);
 				return { maxDeletedTs, pendingTransactions: [], nextCursor: null };
 			}
@@ -665,34 +495,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const upper = childPartitionContext.rangePartition.endBoundary; // null = unbounded
 			const inChildRange = (sk: string) => sk >= lower && (upper === null || sk < upper);
 
-			const RS_BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
-			const RS_PAGE_SIZE = 1000;
-			const rsRows: PendingTransactionRow[] = [];
-			let rsBytes = 0;
-			let rsCursor = opts.cursor;
-			let rsReachedLimit = false;
-			while (true) {
-				const page = this.queryPendingTxPage(rsCursor, RS_PAGE_SIZE);
-				if (page.length === 0) break;
-				for (const row of page) {
-					if (row.hk === hk && inChildRange(row.sk)) {
-						const rowBytes = estimatePendingTxBytes(row);
-						if (rsRows.length > 0 && rsBytes + rowBytes > RS_BATCH_LIMIT_BYTES) {
-							rsReachedLimit = true;
-							break;
-						}
-						rsRows.push(row);
-						rsBytes += rowBytes;
-					}
-					rsCursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
-				}
-				if (rsReachedLimit) break;
-				if (page.length < RS_PAGE_SIZE) break;
-			}
+			const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
+				fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
+				advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
+				include: (row) => row.hk === hk && inChildRange(row.sk),
+				estimateBytes: estimatePendingTxBytes,
+				budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+				pageSize: 1000,
+				startCursor: opts.cursor,
+			});
 			return {
 				maxDeletedTs,
-				pendingTransactions: rsRows,
-				nextCursor: rsReachedLimit ? rsCursor : null,
+				pendingTransactions: rows,
+				nextCursor,
 			};
 		}
 
@@ -714,38 +529,20 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
-		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
-		const PAGE_SIZE = 1000;
-		const rows: PendingTransactionRow[] = [];
-		let totalBytes = 0;
-		let tableCursor = opts.cursor;
-		let reachedLimit = false;
-
-		while (true) {
-			const page = this.queryPendingTxPage(tableCursor, PAGE_SIZE);
-			if (page.length === 0) break;
-
-			for (const row of page) {
-				if (isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk)) {
-					const rowBytes = estimatePendingTxBytes(row);
-					if (rows.length > 0 && totalBytes + rowBytes > BATCH_LIMIT_BYTES) {
-						reachedLimit = true;
-						break;
-					}
-					rows.push(row);
-					totalBytes += rowBytes;
-				}
-				tableCursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
-			}
-			if (reachedLimit) break;
-
-			if (page.length < PAGE_SIZE) break;
-		}
+		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
+			fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
+			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk),
+			estimateBytes: estimatePendingTxBytes,
+			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+			pageSize: 1000,
+			startCursor: opts.cursor,
+		});
 
 		return {
 			maxDeletedTs,
 			pendingTransactions: rows,
-			nextCursor: reachedLimit ? tableCursor : null,
+			nextCursor,
 		};
 	}
 
@@ -753,10 +550,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const topology = this.ensureTopology(this.pCtx());
 		// Atomically transition topology and clean up parent's pending_transactions when
 		// all children have migrated. Children now own authoritative copies; parent's are redundant.
-		this.ctx.storage.transactionSync(() => {
+		this.#store.transactionSync(() => {
 			topology.acknowledgeChildMigration(childDoName);
 			if (topology.splitStatus()?.status === "split_completed") {
-				this.ctx.storage.sql.exec(`DELETE FROM pending_transactions`);
+				this.#store.deleteAllPendingTx();
 			}
 		});
 	}
@@ -775,20 +572,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
 		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
 		const SCAN_LIMIT = 10_000;
-		const page = (
-			opts.cursor
-				? this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(
-						`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
-						opts.cursor.hashKey,
-						SCAN_LIMIT,
-					)
-				: this.ctx.storage.sql.exec<{ hash_key: string; status: PromotedKeyStatus }>(
-						`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`,
-						SCAN_LIMIT,
-					)
-		).toArray();
-		const rows = page.filter((r) => isCorrectChild(r.hash_key));
-		const nextCursor = page.length === SCAN_LIMIT ? { hashKey: page[page.length - 1].hash_key } : null;
+		const { rows, nextCursor } = collectBatch<{ hash_key: string; status: PromotedKeyStatus }, PromotedKeyCursor>({
+			fetchPage: (cursor, pageSize) => this.#store.queryPromotedKeysPage(cursor, pageSize),
+			advanceCursor: (row) => ({ hashKey: row.hash_key }),
+			include: (row) => isCorrectChild(row.hash_key),
+			estimateBytes: (row) => row.hash_key.length * 2 + 16,
+			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+			pageSize: SCAN_LIMIT,
+			startCursor: opts.cursor,
+		});
 		return { rows, nextCursor };
 	}
 
@@ -797,11 +589,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
 
-		this.ctx.storage.sql.exec(
-			`UPDATE promoted_keys SET status = 'promoted', updated_at = ? WHERE hash_key = ? AND status = 'promoting'`,
-			Date.now(),
-			hashKey,
-		);
+		this.#store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
 		this.#_promotedKeys.set(hashKey, "promoted");
 		this.scheduleBackgroundWork({ delayMs: 1_000 });
 		console.log({ ...this.logParams(), message: "fokos/partition: Promotion complete.", hashKey });
@@ -860,15 +648,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			};
 		}
 
-		let response: PrepareResponse = this.ctx.storage.transactionSync<PrepareResponse>(() => {
+		let response: PrepareResponse = this.#store.transactionSync<PrepareResponse>(() => {
 			for (const item of request.items) {
 				const sk = item.sortKey ?? "";
 
-				const pendingRow = this.ctx.storage.sql
-					.exec<{
-						transaction_id: string;
-					}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-					.toArray()[0];
+				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
 				if (pendingRow) {
 					if (pendingRow.transaction_id === request.transactionId) {
@@ -885,12 +669,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					};
 				}
 
-				const itemRow = this.ctx.storage.sql
-					.exec<{
-						last_transaction_ts: number;
-						v: number;
-					}>(`SELECT last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-					.toArray()[0];
+				const itemRow = this.#store.getItemStamp(item.hashKey, sk).row;
 
 				if (item.conditions && item.conditions.length > 0) {
 					const snapshot: ItemSnapshot = itemRow
@@ -915,10 +694,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					}
 				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
 					// A check on a non-existent item must also respect the deletion watermark.
-					const metaRow = this.ctx.storage.sql
-						.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`)
-						.toArray()[0];
-					if (request.transactionTimestamp <= (metaRow?.max_deleted_ts ?? 0)) {
+					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
 						return {
 							outcome: "rejected",
 							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
@@ -930,20 +706,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// All checks passed — lock every item.
 			for (const item of request.items) {
 				const sk = item.sortKey ?? "";
-				this.ctx.storage.sql.exec(
-					`INSERT OR IGNORE INTO pending_transactions
-						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-					item.hashKey,
+				this.#store.insertPendingLock({
+					hk: item.hashKey,
 					sk,
-					request.transactionId,
-					request.transactionTimestamp,
-					item.operation,
-					item.data ?? null,
-					item.conditions ? JSON.stringify(item.conditions) : null,
-					request.coordinatorDoId,
-					Date.now(),
-				);
+					transaction_id: request.transactionId,
+					transaction_ts: request.transactionTimestamp,
+					operation: item.operation,
+					data: item.data ?? null,
+					conditions_json: item.conditions ? JSON.stringify(item.conditions) : null,
+					coordinator_do_id: request.coordinatorDoId,
+					created_at: Date.now(),
+				});
 			}
 
 			return { outcome: "accepted" };
@@ -975,19 +748,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private commitLocal(request: CommitRequest): CommitResponse {
-		const pendingCount =
-			this.ctx.storage.sql
-				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
-				.toArray()[0]?.n ?? 0;
+		const pendingCount = this.#store.pendingTxCountFor(request.transactionId);
 
 		if (pendingCount === 0) {
 			return { outcome: "committed" };
 		}
 
-		this.ctx.storage.transactionSync(() => {
-			const pendingRows = this.ctx.storage.sql
-				.exec<{ hk: string; sk: string }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, request.transactionId)
-				.toArray();
+		this.#store.transactionSync(() => {
+			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
 			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
 			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
 			invariant(
@@ -1002,7 +770,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 
 			this.applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);
-			this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+			this.#store.deletePendingTx(request.transactionId);
 		});
 
 		return { outcome: "committed" };
@@ -1011,71 +779,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
 		for (const item of items) {
 			const sk = item.sortKey ?? "";
-			const pendingRow = this.ctx.storage.sql
-				.exec<{
-					operation: string;
-					data: string | ArrayBuffer | null;
-				}>(
-					`SELECT operation, data FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
-					item.hashKey,
-					sk,
-					transactionId,
-				)
-				.toArray()[0];
+			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
 
 			if (!pendingRow) continue;
 
 			if (pendingRow.operation === "put") {
-				const data = typeof pendingRow.data === "string" ? pendingRow.data : pendingRow.data ? new Uint8Array(pendingRow.data) : null;
-				const txOldEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-					.toArray()[0];
-				const txOldEst = txOldEstRow?.est_row_bytes ?? 0;
-				const txNewEst = data !== null ? estimateRowBytes(data, item.hashKey, sk) : item.hashKey.length + sk.length + 40;
-				this.ctx.storage.sql.exec(
-					`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes)
-					 VALUES (?, ?, ?, NULL, 1, ?, ?)
-					 ON CONFLICT(hk, sk) DO UPDATE SET
-					   data = excluded.data,
-					   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-					   v = v + 1,
-					   last_transaction_ts = excluded.last_transaction_ts,
-					   est_row_bytes = excluded.est_row_bytes`,
-					item.hashKey,
+				invariant(pendingRow.data !== null, `fokos/partition.commit: pending "put" row has no data (hk=${item.hashKey}, sk=${sk})`);
+				const res = this.#store.upsertItem({
+					hk: item.hashKey,
 					sk,
-					data,
-					transactionTimestamp,
-					txNewEst,
-				);
-				const txKseRow = this.ctx.storage.sql
-					.exec<{ est_bytes: number }>(
-						`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
-						 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
-						 RETURNING est_bytes`,
-						item.hashKey,
-						txNewEst,
-						txOldEst,
-					)
-					.toArray()[0];
-				this.maybeQueuePromotion(this.pCtx(), item.hashKey, txKseRow?.est_bytes ?? txNewEst);
+					data: pendingRow.data,
+					ttlEpochUtcSeconds: null,
+					lastTransactionTs: transactionTimestamp,
+				});
+				this.maybeQueuePromotion(this.pCtx(), item.hashKey, res.keyEstBytes);
 			} else if (pendingRow.operation === "delete") {
-				const txDelEstRow = this.ctx.storage.sql
-					.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-					.toArray()[0];
-				const txDelEst = txDelEstRow?.est_row_bytes ?? 0;
-				this.ctx.storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, item.hashKey, sk);
-				this.ctx.storage.sql.exec(
-					`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`,
-					transactionTimestamp,
-				);
-				this.ctx.storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, txDelEst, item.hashKey);
+				this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
 			} else if (pendingRow.operation === "check") {
-				this.ctx.storage.sql.exec(
-					`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`,
-					transactionTimestamp,
-					item.hashKey,
-					sk,
-				);
+				this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
 			}
 		}
 	}
@@ -1083,7 +804,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("cancel"); // reject while this partition is migrating
-		this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, request.transactionId);
+		this.#store.deletePendingTx(request.transactionId);
 
 		const childContexts: PartitionContextResolved[] = [];
 
@@ -1145,19 +866,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		for (const item of request.items) {
 			const sk = item.sortKey ?? "";
 
-			const itemRow = this.ctx.storage.sql
-				.exec<{
-					data: string | ArrayBuffer;
-					last_transaction_ts: number;
-					v: number;
-				}>(`SELECT data, last_transaction_ts, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-				.toArray()[0];
-
-			const pendingRow = this.ctx.storage.sql
-				.exec<{
-					transaction_id: string;
-				}>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, item.hashKey, sk)
-				.toArray()[0];
+			const itemRow = this.#store.getItem(item.hashKey, sk).row;
+			const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
 			const hasPendingWrite = pendingRow != null;
 			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
@@ -1167,7 +877,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					found: true,
 					hashKey: item.hashKey,
 					sortKey: item.sortKey,
-					data: typeof itemRow.data === "string" ? itemRow.data : new Uint8Array(itemRow.data),
+					data: itemRow.data,
 					lastCommittedTs,
 					hasPendingWrite,
 				});
@@ -1406,18 +1116,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
-		const res = this.ctx.storage.sql.exec<{
-			data: string | ArrayBuffer;
-			ttl_epoch_utc_seconds: number | null;
-			v: number;
-		}>(`SELECT data, ttl_epoch_utc_seconds, v FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hashKey, opts.sortKey ?? "");
-		const rows = res.toArray();
-		const { rowsRead, rowsWritten } = sumSqlMetrics(res);
-		const result = rows[0];
+		const res = this.#store.getItem(opts.hashKey, opts.sortKey ?? "");
+		const { rowsRead, rowsWritten } = res;
+		const result = res.row;
 		const actorMeta = {
 			rowsRead,
 			rowsWritten,
-			databaseSize: this.ctx.storage.sql.databaseSize,
+			databaseSize: this.#store.databaseSize,
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
@@ -1432,93 +1137,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			found: true,
 			item: {
 				...itemKey,
-				data: typeof result.data === "string" ? result.data : new Uint8Array(result.data),
+				data: result.data,
 				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 				version: result.v,
 			},
 			meta: actorMeta,
 		};
-	}
-
-	private queryPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
-		type Row = {
-			hk: string;
-			sk: string;
-			data: string | ArrayBuffer;
-			ttl_epoch_utc_seconds: number | null;
-			v: number;
-			last_transaction_ts: number;
-		};
-
-		let sqlCursor: SqlStorageCursor<Row>;
-		if (!cursor) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items ORDER BY hk, sk LIMIT ?`,
-				limit,
-			);
-		} else {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
-				cursor.hk,
-				cursor.hk,
-				cursor.sk,
-				limit,
-			);
-		}
-
-		const items: MigratedItem[] = [];
-		for (const row of sqlCursor) {
-			items.push({
-				hk: row.hk,
-				sk: row.sk,
-				data: typeof row.data === "string" ? row.data : new Uint8Array(row.data),
-				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
-				v: row.v,
-				last_transaction_ts: row.last_transaction_ts,
-			});
-		}
-		return items;
-	}
-
-	private queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
-		type Row = {
-			hk: string;
-			sk: string;
-			transaction_id: string;
-			transaction_ts: number;
-			operation: string;
-			data: string | ArrayBuffer | null;
-			conditions_json: string | null;
-			coordinator_do_id: string;
-			created_at: number;
-		};
-
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at`;
-		let sqlCursor: SqlStorageCursor<Row>;
-		if (!cursor) {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
-		} else {
-			sqlCursor = this.ctx.storage.sql.exec<Row>(
-				`SELECT ${cols} FROM pending_transactions
-				 WHERE hk > ? OR (hk = ? AND (sk > ? OR (sk = ? AND transaction_id > ?)))
-				 ORDER BY hk, sk, transaction_id LIMIT ?`,
-				cursor.hk,
-				cursor.hk,
-				cursor.sk,
-				cursor.sk,
-				cursor.transaction_id,
-				limit,
-			);
-		}
-
-		const rows: PendingTransactionRow[] = [];
-		for (const row of sqlCursor) {
-			rows.push({
-				...row,
-				data: typeof row.data === "string" ? row.data : row.data ? new Uint8Array(row.data) : null,
-			});
-		}
-		return rows;
 	}
 
 	private async runMigration(): Promise<void> {
@@ -1561,16 +1185,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					// with 503 while migration_migrating, so no user write can have arrived yet.
 					// IGNORE is safer for retries — if a batch was already written before a crash we
 					// skip re-inserting those items rather than overwriting them unnecessarily.
-					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-						item.hk,
-						item.sk,
-						item.data,
-						item.ttl_epoch_utc_seconds ?? null,
-						item.v,
-						item.last_transaction_ts,
-						estimateRowBytes(item.data, item.hk, item.sk),
-					);
+					this.#store.insertItemIfAbsent(item);
 				}
 			}
 
@@ -1590,24 +1205,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				cursor: txCursor,
 			});
 
-			this.ctx.storage.transactionSync(() => {
+			this.#store.transactionSync(() => {
 				for (const row of pendingTransactions) {
-					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO pending_transactions
-						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-						row.hk,
-						row.sk,
-						row.transaction_id,
-						row.transaction_ts,
-						row.operation,
-						row.data,
-						row.conditions_json,
-						row.coordinator_do_id,
-						row.created_at,
-					);
+					this.#store.insertPendingLock(row);
 				}
-				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
+				this.#store.bumpMaxDeletedTs(maxDeletedTs);
 			});
 
 			if (!nextCursor) break;
@@ -1624,16 +1226,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				cursor: pkCursor,
 			});
 			if (rows.length > 0) {
-				this.ctx.storage.transactionSync(() => {
+				this.#store.transactionSync(() => {
 					for (const row of rows) {
-						const now = Date.now();
-						this.ctx.storage.sql.exec(
-							`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-							row.hash_key,
-							row.status,
-							now,
-							now,
-						);
+						this.#store.insertPromotedKey(row.hash_key, row.status, Date.now());
 						this.#_promotedKeys.set(row.hash_key, row.status);
 					}
 				});
@@ -1643,11 +1238,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		await this.__testing__beforeMigrationComplete?.();
-		this.ctx.storage.sql.exec(
-			`INSERT INTO key_size_estimates (hk, est_bytes)
-			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
-			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
-		);
+		this.#store.rebuildKeySizeEstimates();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 		await parentStub.acknowledgeChildMigrationComplete(pCtx.doName);
@@ -1675,16 +1266,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			if (items.length > 0) {
 				for (const item of items) {
-					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-						item.hk,
-						item.sk,
-						item.data,
-						item.ttl_epoch_utc_seconds ?? null,
-						item.v,
-						item.last_transaction_ts,
-						estimateRowBytes(item.data, item.hk, item.sk),
-					);
+					this.#store.insertItemIfAbsent(item);
 				}
 			}
 
@@ -1705,24 +1287,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				cursor: txCursor,
 			});
 
-			this.ctx.storage.transactionSync(() => {
+			this.#store.transactionSync(() => {
 				for (const row of pendingTransactions) {
-					this.ctx.storage.sql.exec(
-						`INSERT OR IGNORE INTO pending_transactions
-						   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
-						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-						row.hk,
-						row.sk,
-						row.transaction_id,
-						row.transaction_ts,
-						row.operation,
-						row.data,
-						row.conditions_json,
-						row.coordinator_do_id,
-						row.created_at,
-					);
+					this.#store.insertPendingLock(row);
 				}
-				this.ctx.storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, maxDeletedTs);
+				this.#store.bumpMaxDeletedTs(maxDeletedTs);
 			});
 
 			if (!nextCursor) break;
@@ -1730,11 +1299,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		await this.__testing__beforeMigrationComplete?.();
-		this.ctx.storage.sql.exec(
-			`INSERT INTO key_size_estimates (hk, est_bytes)
-			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
-			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
-		);
+		this.#store.rebuildKeySizeEstimates();
 		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		this.ctx.storage.kv.delete(PartitionDO.KV_KEYS.SPLIT_MIGRATION_CURSOR);
 
@@ -1818,16 +1383,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		);
 
 		// C. Cutover queued→promoting in one transactionSync, only if the key has no pending locks.
-		const didCutover = this.ctx.storage.transactionSync(() => {
-			const lockCount =
-				this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hashKey).toArray()[0]?.n ??
-				0;
+		const didCutover = this.#store.transactionSync(() => {
+			const lockCount = this.#store.pendingLockCountForHashKey(hashKey);
 			if (lockCount > 0) return false; // deferred — retry next background cycle
-			this.ctx.storage.sql.exec(
-				`UPDATE promoted_keys SET status = 'promoting', updated_at = ? WHERE hash_key = ? AND status = 'queued'`,
-				Date.now(),
-				hashKey,
-			);
+			this.#store.updatePromotedKeyStatus(hashKey, "queued", "promoting", Date.now());
 			return true;
 		});
 		if (didCutover) {
@@ -1860,13 +1419,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.#_promotedKeys.has(hk)) return;
-		const now = Date.now();
-		this.ctx.storage.sql.exec(
-			`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, 'queued', ?, ?)`,
-			hk,
-			now,
-			now,
-		);
+		this.#store.insertPromotedKey(hk, "queued", Date.now());
 		this.#_promotedKeys.set(hk, "queued");
 		this.scheduleBackgroundWork({ delayMs: 10 });
 		console.log({
@@ -1943,13 +1496,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			////////////////////////////////////////
 			// ── Job: Stale transaction recovery
 			try {
-				const staleTxRows = this.ctx.storage.sql
-					.exec<{ transaction_id: string; coordinator_do_id: string }>(
-						`SELECT DISTINCT transaction_id, coordinator_do_id
-                     FROM pending_transactions WHERE created_at < ? LIMIT 10`,
-						Date.now() - PartitionDO.STALE_TX_MS,
-					)
-					.toArray();
+				const staleTxRows = this.#store.listStalePendingTx(Date.now() - PartitionDO.STALE_TX_MS, 10);
 				for (const row of staleTxRows) {
 					if (!row.coordinator_do_id) continue;
 					try {
@@ -1957,22 +1504,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
 
 						if (result.state === "COMMITTED") {
-							const pendingRows = this.ctx.storage.sql
-								.exec<{
-									hk: string;
-									sk: string;
-									transaction_ts: number;
-									operation: string;
-									data: string | ArrayBuffer | null;
-								}>(`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`, row.transaction_id)
-								.toArray();
+							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 							if (pendingRows.length > 0) {
 								const transactionTimestamp = pendingRows[0].transaction_ts;
 								const items: TransactionItem[] = pendingRows.map((r) => ({
 									hashKey: r.hk,
 									sortKey: r.sk || undefined,
 									operation: r.operation as TransactionItem["operation"],
-									data: r.data == null ? undefined : typeof r.data === "string" ? r.data : new Uint8Array(r.data),
+									data: r.data ?? undefined,
 								}));
 								await this.commit(this.pCtx(), {
 									transactionId: row.transaction_id,
@@ -2025,15 +1564,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				for (const [hashKey, status] of this.#_promotedKeys) {
 					if (status === "promoted") {
 						try {
-							this.ctx.storage.sql.exec(
-								`DELETE FROM items WHERE hk = ? AND sk IN (SELECT sk FROM items WHERE hk = ? ORDER BY sk LIMIT 1000)`,
-								hashKey,
-								hashKey,
-							);
-							this.ctx.storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hashKey);
-							const residual = this.ctx.storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey).toArray()[0];
-							if (!residual) {
-								this.ctx.storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hashKey);
+							this.#store.deleteItemsBatchForHashKey(hashKey, 1000);
+							this.#store.deletePendingTxForHashKey(hashKey);
+							if (!this.#store.hasItemsForHashKey(hashKey)) {
+								this.#store.deleteKeySizeEstimate(hashKey);
 							}
 						} catch (error) {
 							console.error({
@@ -2063,7 +1597,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const wantAlarm = (ms: number) => {
 				if (nextAlarmMs === null || ms < nextAlarmMs) nextAlarmMs = ms;
 			};
-			this.ctx.storage.transactionSync(() => {
+			this.#store.transactionSync(() => {
 				// Job: Partition migration for child partitions.
 				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(PartitionDO.KV_KEYS.SPLIT_MIGRATION_STATUS);
 				if (postStatus === "migration_migrating") {
@@ -2080,15 +1614,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					if (status === "queued" || status === "promoting") {
 						wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 					} else if (status === "promoted") {
-						const residual = this.ctx.storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hashKey).toArray()[0];
-						if (residual) wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+						if (this.#store.hasItemsForHashKey(hashKey)) wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 					}
 				}
 
 				// Job: Stale transaction recovery.
-				const pendingCount =
-					this.ctx.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
-				if (pendingCount > 0) {
+				if (this.#store.pendingTxTotalCount() > 0) {
 					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
 				}
 			});
@@ -2147,88 +1678,3 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 }
-
-function estimateRowBytes(data: string | Uint8Array, hk: string, sk: string): number {
-	const dataBytes = typeof data === "string" ? data.length : data.byteLength;
-	// hk and sk are variable-length and physically stored in every row (WITHOUT ROWID PK),
-	// so a long hk with many sort keys contributes significant storage that must be counted per-row.
-	// 40 = fixed overhead: integer columns (v, ttl_epoch_utc_seconds, last_transaction_ts, est_row_bytes ≈ 4×8 = 32 bytes)
-	//      + SQLite B-tree record metadata (header varints, null bitmap ≈ 8 bytes).
-	return dataBytes + hk.length + sk.length + 40;
-}
-
-function estimateItemBytes(item: MigratedItem): number {
-	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.length * 2 + item.sk.length * 2 + dataSize + 8 + 64;
-}
-
-function estimatePendingTxBytes(row: PendingTransactionRow): number {
-	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return row.hk.length * 2 + row.sk.length * 2 + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
-}
-
-const sqlMigrations: SQLSchemaMigration[] = [
-	{
-		idMonotonicInc: 1,
-		description: "Create items table",
-		// The type of `data` is ANY to allow SQLite to retain the input type (e.g. BLOB vs TEXT) and avoid unnecessary conversions.
-		// The Durable Object API only accepts strings and Uint8Arrays, so we can safely store them as-is and retrieve them with the correct type.
-		sql: `
-            CREATE TABLE IF NOT EXISTS items (
-                hk                    TEXT    NOT NULL,
-                sk                    TEXT    NOT NULL DEFAULT '',
-                data                  ANY     NOT NULL,
-                ttl_epoch_utc_seconds INTEGER,
-                v                     INTEGER NOT NULL,
-                last_transaction_ts   INTEGER NOT NULL DEFAULT 0,
-                est_row_bytes         INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (hk, sk)
-            ) WITHOUT ROWID, STRICT;`,
-	},
-	{
-		idMonotonicInc: 2,
-		description: "Add last_transaction_ts to items and create transaction support tables",
-		sql: `
-            CREATE TABLE IF NOT EXISTS pending_transactions (
-                hk                    TEXT    NOT NULL,
-                sk                    TEXT    NOT NULL DEFAULT '',
-                transaction_id        TEXT    NOT NULL,
-                transaction_ts        INTEGER NOT NULL,
-                operation             TEXT    NOT NULL,
-                data                  ANY,
-                conditions_json       TEXT,
-                coordinator_do_id   TEXT    NOT NULL DEFAULT '',
-                created_at            INTEGER NOT NULL,
-                PRIMARY KEY (hk, sk, transaction_id)
-            ) WITHOUT ROWID, STRICT;
-
-            CREATE INDEX IF NOT EXISTS pending_transactions_created_at
-                ON pending_transactions (created_at);
-
-            CREATE TABLE IF NOT EXISTS deletion_metadata (
-                id              INTEGER PRIMARY KEY CHECK (id = 1),
-                max_deleted_ts  INTEGER NOT NULL DEFAULT 0
-            ) STRICT;
-            INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);`,
-	},
-	{
-		idMonotonicInc: 3,
-		description: "Add range partition support: promoted_keys table",
-		sql: `
-            CREATE TABLE IF NOT EXISTS promoted_keys (
-                hash_key   TEXT NOT NULL PRIMARY KEY,
-                status     TEXT NOT NULL,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            ) STRICT;`,
-	},
-	{
-		idMonotonicInc: 4,
-		description: "Add per-row size estimate and key-level size summary for efficient promotion detection",
-		sql: `
-            CREATE TABLE IF NOT EXISTS key_size_estimates (
-                hk        TEXT    NOT NULL PRIMARY KEY,
-                est_bytes INTEGER NOT NULL DEFAULT 0
-            ) STRICT;`,
-	},
-];
