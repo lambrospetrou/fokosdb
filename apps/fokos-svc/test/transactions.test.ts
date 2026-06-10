@@ -2,7 +2,8 @@ import { env } from "cloudflare:workers";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator } from "../src/lib/partition-topology/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
 import invariant from "../src/lib/invariant.js";
 
 function makeDB() {

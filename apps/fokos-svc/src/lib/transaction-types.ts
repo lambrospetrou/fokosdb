@@ -1,4 +1,4 @@
-import type { PartitionContextResolved } from "./partition-topology/partition-topology.js";
+import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 

@@ -2,8 +2,9 @@ import { env, exports } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
-import type { PartitionContextResolved } from "../src/lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator } from "../src/lib/partition-topology/partition-context.js";
+import type { PartitionContextResolved } from "../src/lib/partition-topology/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
 import type { PartitionDO } from "../src/lib/do-partition.js";
 
 // 3 root partitions, each splits into 2 children.

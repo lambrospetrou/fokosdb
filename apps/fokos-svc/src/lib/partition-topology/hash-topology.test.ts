@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { HashTopology } from "./hash-topology.js";
-import { hashChildIndex } from "./partition-topology.js";
+import { hashChildIndex } from "./hash-primitives.js";
 
 // Compute the relative path (sequence of child-slot indices) that a hashKey takes
 // through the cache starting from ownerAbsDepth, for `depth` levels.

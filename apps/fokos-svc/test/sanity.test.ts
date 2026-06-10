@@ -1,7 +1,8 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/lib/db.js";
-import { PartitionContextCreator, PartitionTopologyRouterImpl } from "../src/lib/partition-topology/partition-topology.js";
+import { PartitionContextCreator } from "../src/lib/partition-topology/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
 
 describe("fokosdb", async () => {
 	const testSplitOptions = PartitionContextCreator.create({

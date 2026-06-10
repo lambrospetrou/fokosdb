@@ -1,10 +1,9 @@
-import { DurableObject, RpcTarget } from "cloudflare:workers";
+import { DurableObject } from "cloudflare:workers";
 import {
 	DeleteItemOptions,
 	DeleteItemResult,
 	GetItemOptions,
 	GetItemResult,
-	ItemCondition,
 	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
@@ -16,10 +15,8 @@ import type {
 	CommitResponse,
 	PrepareRequest,
 	PrepareResponse,
-	ReadForTransactionItemResult,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
-	RecoverTransactionResult,
 	TransactionItem,
 } from "./transaction-types.js";
 import {
@@ -59,6 +56,7 @@ import {
 } from "./partition/partition-peer.js";
 import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./partition/migration.js";
 import { PromotionManager } from "./partition/hash-key-promotion.js";
+import { TransactionParticipant } from "./partition/transaction-participant.js";
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -104,6 +102,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
 
 	#store: PartitionStore;
+	#participant: TransactionParticipant;
 	#promotion: PromotionManager;
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
@@ -118,6 +117,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
+		this.#participant = new TransactionParticipant({
+			store: this.#store,
+			// Committed transactional puts feed the same promotion queue check as non-transactional puts.
+			onItemUpserted: (hashKey, keyEstBytes) => this.#promotion.maybeQueuePromotion(this.pCtx(), hashKey, keyEstBytes),
+		});
 		this.#promotion = new PromotionManager({
 			store: this.#store,
 			// Boundary rule: only the DO acquires stubs — the manager receives this factory.
@@ -604,92 +608,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async prepareLocal(request: PrepareRequest): Promise<PrepareResponse> {
-		const now = Date.now();
-
-		if (request.transactionTimestamp > now + 5_000) {
-			return {
-				outcome: "rejected",
-				reason: {
-					type: "clock_skew",
-					serverTimestampMs: now,
-					transactionTimestampMs: request.transactionTimestamp,
-				},
-			};
-		}
-
-		let response: PrepareResponse = this.#store.transactionSync<PrepareResponse>(() => {
-			for (const item of request.items) {
-				const sk = item.sortKey ?? "";
-
-				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
-
-				if (pendingRow) {
-					if (pendingRow.transaction_id === request.transactionId) {
-						continue; // idempotent re-prepare for this item
-					}
-					return {
-						outcome: "rejected",
-						reason: {
-							type: "pending_conflict",
-							hashKey: item.hashKey,
-							sortKey: item.sortKey,
-							conflictingTransactionId: pendingRow.transaction_id,
-						},
-					};
-				}
-
-				const itemRow = this.#store.getItemStamp(item.hashKey, sk).row;
-
-				if (item.conditions && item.conditions.length > 0) {
-					const snapshot: ItemSnapshot = itemRow
-						? { found: true, hk: item.hashKey, sk, v: itemRow.v }
-						: { found: false, hk: item.hashKey, sk };
-					try {
-						evaluateConditionsOnItem(snapshot, item.conditions, "prepare");
-					} catch {
-						return {
-							outcome: "rejected",
-							reason: { type: "condition_failed", hashKey: item.hashKey, sortKey: item.sortKey },
-						};
-					}
-				}
-
-				if (itemRow) {
-					if (request.transactionTimestamp <= itemRow.last_transaction_ts) {
-						return {
-							outcome: "rejected",
-							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
-						};
-					}
-				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
-					// A check on a non-existent item must also respect the deletion watermark.
-					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
-						return {
-							outcome: "rejected",
-							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
-						};
-					}
-				}
-			}
-
-			// All checks passed — lock every item.
-			for (const item of request.items) {
-				const sk = item.sortKey ?? "";
-				this.#store.insertPendingLock({
-					hk: item.hashKey,
-					sk,
-					transaction_id: request.transactionId,
-					transaction_ts: request.transactionTimestamp,
-					operation: item.operation,
-					data: item.data ?? null,
-					conditions_json: item.conditions ? JSON.stringify(item.conditions) : null,
-					coordinator_do_id: request.coordinatorDoId,
-					created_at: Date.now(),
-				});
-			}
-
-			return { outcome: "accepted" };
-		});
+		const response = this.#participant.prepareLocal(request);
 
 		if (response.outcome === "accepted") {
 			await this.ensureAlarmSet(Date.now() + PartitionDO.STALE_TX_MS);
@@ -710,70 +629,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			tasks.push(this.getChildStub(childPCtx).commit(childPCtx, { ...request, items }));
 		}
 		if (local.length > 0) {
-			tasks.push(Promise.resolve(this.commitLocal({ ...request, items: local })));
+			tasks.push(Promise.resolve(this.#participant.commitLocal({ ...request, items: local })));
 		}
 		await Promise.all(tasks);
 		return { outcome: "committed" };
 	}
 
-	private commitLocal(request: CommitRequest): CommitResponse {
-		const pendingCount = this.#store.pendingTxCountFor(request.transactionId);
-
-		if (pendingCount === 0) {
-			return { outcome: "committed" };
-		}
-
-		this.#store.transactionSync(() => {
-			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
-			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
-			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
-			invariant(
-				pendingKeySet.size === requestKeySet.size,
-				`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
-			);
-			for (const key of requestKeySet) {
-				invariant(
-					pendingKeySet.has(key),
-					`fokos/partition.commit: request item ${key} not found in pending_transactions for transaction ${request.transactionId}`,
-				);
-			}
-
-			this.applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);
-			this.#store.deletePendingTx(request.transactionId);
-		});
-
-		return { outcome: "committed" };
-	}
-
-	private applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
-		for (const item of items) {
-			const sk = item.sortKey ?? "";
-			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
-
-			if (!pendingRow) continue;
-
-			if (pendingRow.operation === "put") {
-				invariant(pendingRow.data !== null, `fokos/partition.commit: pending "put" row has no data (hk=${item.hashKey}, sk=${sk})`);
-				const res = this.#store.upsertItem({
-					hk: item.hashKey,
-					sk,
-					data: pendingRow.data,
-					ttlEpochUtcSeconds: null,
-					lastTransactionTs: transactionTimestamp,
-				});
-				this.#promotion.maybeQueuePromotion(this.pCtx(), item.hashKey, res.keyEstBytes);
-			} else if (pendingRow.operation === "delete") {
-				this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
-			} else if (pendingRow.operation === "check") {
-				this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
-			}
-		}
-	}
-
 	async cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("cancel"); // reject while this partition is migrating
-		this.#store.deletePendingTx(request.transactionId);
+		this.#participant.cancelLocal(request.transactionId);
 
 		const childContexts: PartitionContextResolved[] = [];
 
@@ -821,45 +686,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			tasks.push(this.getChildStub(childPCtx).readForTransaction(childPCtx, { ...request, items }));
 		}
 		if (local.length > 0) {
-			tasks.push(Promise.resolve(this.readForTransactionLocal({ ...request, items: local })));
+			tasks.push(Promise.resolve(this.#participant.readForTransactionLocal({ ...request, items: local })));
 		}
 		const results = await Promise.all(tasks);
 		return { items: results.flatMap((r) => r.items) };
-	}
-
-	private readForTransactionLocal(request: ReadForTransactionRequest): ReadForTransactionResponse {
-		const results: ReadForTransactionItemResult[] = [];
-
-		for (const item of request.items) {
-			const sk = item.sortKey ?? "";
-
-			const itemRow = this.#store.getItem(item.hashKey, sk).row;
-			const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
-
-			const hasPendingWrite = pendingRow != null;
-			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
-
-			if (itemRow) {
-				results.push({
-					found: true,
-					hashKey: item.hashKey,
-					sortKey: item.sortKey,
-					data: itemRow.data,
-					lastCommittedTs,
-					hasPendingWrite,
-				});
-			} else {
-				results.push({
-					found: false,
-					hashKey: item.hashKey,
-					sortKey: item.sortKey,
-					lastCommittedTs,
-					hasPendingWrite,
-				});
-			}
-		}
-
-		return { items: results };
 	}
 
 	async alarm(alarmInfo: AlarmInvocationInfo): Promise<void> {
@@ -1357,7 +1187,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			////////////////////////////////////////
 			// ── Job: Stale transaction recovery
 			try {
-				const staleTxRows = this.#store.listStalePendingTx(Date.now() - PartitionDO.STALE_TX_MS, 10);
+				const staleTxRows = this.#participant.listStaleTransactions(PartitionDO.STALE_TX_MS, 10);
 				for (const row of staleTxRows) {
 					if (!row.coordinator_do_id) continue;
 					try {

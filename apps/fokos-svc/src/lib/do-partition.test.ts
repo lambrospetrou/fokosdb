@@ -2,15 +2,12 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
-import {
-	HashPartitionTopologyImpl,
-	PartitionContextCreator,
-	PartitionIdHelper,
-	PartitionTopologyRouterImpl,
-	RANGE_PROMOTION_FRACTION,
-	resolveRangePartitionContext,
-} from "./partition-topology/partition-topology.js";
-import type { PartitionContextResolved, SplitStatusKVItem } from "./partition-topology/partition-topology.js";
+import { PartitionContextCreator } from "./partition-topology/partition-context.js";
+import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
+import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
+import { PartitionTopologyRouterImpl } from "./partition-topology/router.js";
+import { HashPartitionTopologyImpl, RANGE_PROMOTION_FRACTION } from "./partition-topology/split-policy.js";
+import type { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import invariant from "./invariant.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;

@@ -1,8 +1,11 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { PartitionContextCreator, PartitionIdHelper, PartitionTopologyRouterImpl, rangePartitionDoName } from "./partition-topology.js";
-import type { PartitionContext, PartitionContextResolved, SplitStatusKVItem } from "./partition-topology.js";
+import { PartitionContextCreator } from "./partition-context.js";
+import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
+import { PartitionIdHelper, rangePartitionDoName } from "./partition-id.js";
+import { PartitionTopologyRouterImpl } from "./router.js";
+import type { SplitStatusKVItem } from "./split-state.js";
 import type { PartitionDO } from "../do-partition.js";
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;

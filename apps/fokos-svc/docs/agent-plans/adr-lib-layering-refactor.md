@@ -497,7 +497,7 @@ deferred under pending locks, idempotent re-drive, GC residual handling) with fa
 **Acceptance:** no promotion lifecycle logic or `#_promotedKeys` access outside
 `PromotionManager`; suite green.
 
-### Phase 5 — `partition/transaction-participant.ts` + cleanup
+### Phase 5 — `partition/transaction-participant.ts` + cleanup — ✅ DONE (2026-06-10)
 
 **Goal:** the 2PC participant is an isolated, heavily-tested component; transitional scaffolding
 is removed.
@@ -526,6 +526,14 @@ timestamp bump.
 
 **Acceptance:** prepare/commit semantics testable without a TC or routing; barrel gone; suite
 green.
+
+**Execution note (2026-06-10):** `__testing__migrationBatchLimitBytes` and
+`__testing__beforeMigrationComplete` stay on the DO. The batch limit governs the PARENT-side
+serving endpoints, which deliberately stayed in the DO (phase 3) — it never became a component
+option. `beforeComplete` IS a `SplitMigration` option (used directly by `migration.test.ts`),
+but the two `do-partition.test.ts` integration tests gate migrations on real DOs driven via
+alarms, where the DO constructs the component internally — a DO-level hook is the only injection
+channel, which is exactly the sanctioned "`__testing__*` hooks on the DO only" pattern.
 
 ### Phase 6 — `partition/background-scheduler.ts` (last; independent of the rest)
 
