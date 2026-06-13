@@ -57,6 +57,12 @@ import {
 import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./partition/migration.js";
 import { PromotionManager } from "./partition/hash-key-promotion.js";
 import { TransactionParticipant } from "./partition/transaction-participant.js";
+import { AddResult } from "./bloom-filter.js";
+import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "./partition-topology/partial-range-topology.js";
+
+function isPhantomBounceError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes("phantom-bounce");
+}
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
 	let rowsRead = 0;
@@ -95,6 +101,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		PARTITION_CONTEXT: "__partition_context",
 		PARENT_PARTITION_CONTEXT: "__parent_partition_context",
 		PARENT_SPLIT_TYPE: "__parent_split_type",
+		PARTIAL_RANGE_TOPOLOGY: "__partial_range_topology",
 	};
 
 	private static readonly STALE_TX_MS = 5_000;
@@ -106,6 +113,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#promotion: PromotionManager;
 	#_partitionContext?: PartitionContextResolved;
 	#_topology?: PartitionTopologySplitter;
+	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
 
 	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
@@ -137,6 +145,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (pCtx) {
 				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 				this.#_partitionContext = pCtx;
+			}
+
+			const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
+			if (prtSnap) {
+				this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
 			}
 
 			// Load promoted keys into in-memory cache (hash DOs only; range DOs never have rows).
@@ -914,6 +927,39 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return true;
 	}
 
+	private async forwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
+		ctx: PartitionContextResolved,
+		hashKey: string,
+		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+	): Promise<T> {
+		const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
+		const rangeRootStub = this.env[ctx.ns].get(doId);
+		const result = await forward(rangeRootStub, rangeRootCtx);
+		return {
+			...result,
+			meta: {
+				...result.meta,
+				forwardCount: result.meta.forwardCount + 1,
+				...(isHashPartition(ctx) ? { hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) } : {}),
+			},
+		} as T;
+	}
+
+	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
+		ctx: PartitionContextResolved,
+		hashKey: string,
+		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+	): Promise<T | null> {
+		try {
+			return await this.forwardToRangeRootPartition(ctx, hashKey, forward);
+		} catch (e) {
+			if (isPhantomBounceError(e)) {
+				return null;
+			}
+			throw e;
+		}
+	}
+
 	private async withSplitForwarding<T extends { meta: PartitionInfo }>(opts: {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: string; sortKey?: string };
@@ -929,22 +975,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			local,
 		} = opts;
 
-		// On hash partitions only: forward promoted/promoting keys to their range root.
-		// The range root routes by sortKey from there. "queued" still serves locally.
 		if (isHashPartition(ctx)) {
+			// Step 1: Authoritative promotion check.
 			const promotedStatus = this.#promotion.statusFor(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-				const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
-				const rangeRootStub = this.env[ctx.ns].get(doId);
-				const result = await forward(rangeRootStub, rangeRootCtx);
-				return {
-					...result,
-					meta: {
-						...result.meta,
-						hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!),
-						forwardCount: result.meta.forwardCount + 1,
-					},
-				} as T;
+				return await this.forwardToRangeRootPartition(ctx, hashKey, forward);
+			}
+
+			// Step 2: Speculative bloom filter check — learned promotions from descendants.
+			const prt = this.#_partialRangeTopology;
+			if (prt?.maybePromoted(hashKey)) {
+				const result = await this.maybeForwardToRangeRootPartition(ctx, hashKey, forward);
+				if (result) return result;
 			}
 		}
 
@@ -958,6 +1000,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const stub = this.env[ctx.ns].get(doId);
 				const result = await forward(stub, partitionContext);
 				topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta.hashDepth);
+
+				if (isHashPartition(ctx) && PartitionIdHelper.isRangePartition(result.meta.servedByPartitionId)) {
+					const prt = this.getOrCreatePartialRangeTopology();
+					const learnResult = prt.learnPromotedKey(hashKey);
+					if (learnResult === AddResult.Added) {
+						this.persistPartialRangeTopology();
+					} else if (learnResult === AddResult.Full) {
+						console.info({
+							...this.logParams(),
+							message: "fokos/partition: partial range topology bloom filter is full, " + "cannot learn promoted key.",
+							hashKey,
+						});
+					}
+				}
+
 				return {
 					...result,
 					meta: {
@@ -975,6 +1032,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
+	// FIXME: Add PartialRangeTopology bloom filter check for promoted keys in transaction routing
+	// (prepare/commit/readForTransaction). Currently only the authoritative PromotionManager is
+	// checked. The bloom filter would save hops for keys promoted by descendant partitions, but
+	// false positives need careful handling in multi-item transaction flows.
 	private groupItemsByRouting<T extends { hashKey: string; sortKey?: string }>(
 		items: T[],
 	): {
@@ -1241,6 +1302,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// GC: delete local items and pending_transactions for fully-promoted keys.
 				this.#promotion.runGC();
 			}
+
+			///////////////////////////////////////////////////////////////////////////
+			// ── Sync promoted keys into the partial range topology bloom filter.
+			// Only update an existing bloom filter (created via per-request learning from forwarded
+			// responses). The owning partition routes promoted keys authoritatively via
+			// PromotionManager.statusFor(); creating a bloom filter eagerly would bloat databaseSize.
+			if (isHashPartition(this.pCtx()) && this.#_partialRangeTopology) {
+				const promotedHashKeys = this.#promotion
+					.snapshot()
+					.filter(({ status }) => status === "promoting" || status === "promoted")
+					.map(({ hashKey }) => hashKey);
+				if (promotedHashKeys.length > 0) {
+					if (this.#_partialRangeTopology.learnPromotedKeys(promotedHashKeys)) {
+						this.persistPartialRangeTopology();
+					}
+				}
+			}
 		} catch (error) {
 			console.error({
 				...this.logParams(),
@@ -1323,6 +1401,38 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// await this.ctx.blockConcurrencyWhile(async () => {
 		// 	throw new Error("__special_destroy_sentinel");
 		// });
+	}
+
+	private getOrCreatePartialRangeTopology(): PartialRangeTopology {
+		if (!this.#_partialRangeTopology) {
+			this.#_partialRangeTopology = PartialRangeTopology.create({
+				errorRate: 0.01,
+				// I want this to not be more than about 1MB, but we give 1.5MB for extra buffer.
+				// Here's the growth until we cross 1 MB:
+				//    node ./tools/bloom-filter-sizing.js 300000 1MB
+				//
+				// Initial capacity: 300,000 items | Max size: 1.00 MB | Error rate: 0.01
+				//
+				// Layer      Capacity   Per-layer FPR        Size   Running Total  k
+				// -------------------------------------------------------------------
+				// 0           300,000         0.5000%    403.8 KB        403.8 KB   8
+				// 1           600,000         0.2500%    913.4 KB         1.29 MB   9
+				//
+				maxSizeBytes: 1.5 * 1024 * 1024,
+				// WARNING: This cannot change after the first addition of something in the bloom filter!
+				initialCapacityN: 300_000,
+			});
+		}
+		return this.#_partialRangeTopology;
+	}
+
+	private persistPartialRangeTopology(): void {
+		if (this.#_partialRangeTopology) {
+			this.ctx.storage.kv.put<PartialRangeTopologySnapshot>(
+				PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY,
+				this.#_partialRangeTopology.toSnapshot(),
+			);
+		}
 	}
 
 	private logParams() {

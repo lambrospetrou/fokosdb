@@ -141,28 +141,41 @@ export class BloomFilter {
 		return new BloomFilter(snapshot.layers.map(restoreLayer), snapshot.errorRate, snapshot.maxSizeBytes, snapshot.initialCapacityN);
 	}
 
-	add(key: string): boolean {
-		const current = this.layers[this.layers.length - 1];
-
-		if (current.count >= current.capacity) {
-			const nextIndex = this.layers.length;
-			const nextBytes = layerByteSize(computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN));
-			if (this.usedBytes + nextBytes > this.maxSizeBytes) {
-				return false;
-			}
-			this.layers.push(buildLayer(nextIndex, this.errorRate, this.initialCapacityN));
-			this.usedBytes += nextBytes;
+	add(key: string): AddResult {
+		for (let i = 0; i < this.layers.length - 1; i++) {
+			if (layerHas(this.layers[i], key)) return AddResult.AlreadyPresent;
 		}
 
-		layerAdd(this.layers[this.layers.length - 1], key);
-		return true;
+		let current = this.layers[this.layers.length - 1];
+
+		if (current.count < current.capacity) {
+			return layerAddIfAbsent(current, key);
+		}
+
+		// Current layer is at capacity — check if key already exists before growing.
+		if (layerHas(current, key)) return AddResult.AlreadyPresent;
+
+		const nextIndex = this.layers.length;
+		const nextBytes = layerByteSize(computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN));
+		if (this.usedBytes + nextBytes > this.maxSizeBytes) {
+			return AddResult.Full;
+		}
+		this.layers.push(buildLayer(nextIndex, this.errorRate, this.initialCapacityN));
+		this.usedBytes += nextBytes;
+		current = this.layers[this.layers.length - 1];
+
+		layerAddIfAbsent(current, key);
+		return AddResult.Added;
 	}
 
 	has(key: string): boolean {
-		return this.layers.some((layer) => layerHas(layer, key));
+		for (let i = 0; i < this.layers.length; i++) {
+			if (layerHas(this.layers[i], key)) return true;
+		}
+		return false;
 	}
 
-	keyCount(): number {
+	additionsCount(): number {
 		return this.layers.reduce((sum, layer) => sum + layer.count, 0);
 	}
 
@@ -249,51 +262,48 @@ function restoreLayer(s: LayerSnapshot): Layer {
 	};
 }
 
+export enum AddResult {
+	AlreadyPresent,
+	Added,
+	Full,
+}
+
 /**
- * Returns the k bit positions for a key within a layer using double hashing.
+ * Checks membership and inserts in a single pass over k bit positions using
+ * Kirsch-Mitzenmacker double hashing (h1 + i*h2) mod m.
  *
- * Only two xxHash32 calls are made (h1 and h2 with different seeds). All k
- * positions are then derived via the Kirsch–Mitzenmacher formula:
- *
- *   position_i = (h1 + i × h2) mod m     for i = 0 … k-1
- *
- * h2 is forced to at least 1 to prevent all positions collapsing to `h1 mod m`
- * in the rare case where xxHash32 returns 0 for the given key and seed.
- *
- * Seeds are offset by layerIndex so each layer hashes keys independently, which
- * is required for the combined FPR bound to hold.
+ * If all k bits are already set the key is (probably) present - count is not
+ * incremented and no bits change. Otherwise every unset bit is flipped and
+ * count increases by one.
  */
-function bitPositions(key: string, k: number, m: number, layerIndex: number): number[] {
-	const h1 = xxHash32(key, layerIndex * 2);
-	const h2 = xxHash32(key, layerIndex * 2 + 1) || 1;
-	const positions: number[] = [];
-	for (let i = 0; i < k; i++) {
-		positions.push((h1 + i * h2) % m);
+function layerAddIfAbsent(layer: Layer, key: string): AddResult {
+	const h1 = xxHash32(key, layer.layerIndex * 2);
+	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
+	let allSet = true;
+	for (let i = 0; i < layer.k; i++) {
+		const pos = (h1 + i * h2) % layer.m;
+		const byteIdx = pos >> 3;
+		const bitMask = 1 << (pos & 7);
+		if ((layer.bits[byteIdx] & bitMask) === 0) {
+			allSet = false;
+			layer.bits[byteIdx] |= bitMask;
+		}
 	}
-	return positions;
+	if (allSet) return AddResult.AlreadyPresent;
+	layer.count++;
+	return AddResult.Added;
 }
 
 /**
  * Returns true if all k bit positions for the key are set in this layer.
- *
- * A bloom filter has no false negatives: if the key was added to this layer
- * every one of its k positions was set, so all k checks pass. The converse is
- * not guaranteed — another key (or set of keys) may have coincidentally set the
- * same positions, producing a false positive at rate layer_fpr(layerIndex).
+ * Computes positions inline with early exit on the first unset bit.
  */
 function layerHas(layer: Layer, key: string): boolean {
-	return bitPositions(key, layer.k, layer.m, layer.layerIndex).every((pos) => (layer.bits[pos >> 3] & (1 << (pos & 7))) !== 0);
-}
-
-/**
- * Sets the k bit positions for the key in this layer's bit array.
- *
- * Bit position `pos` maps to byte index `pos >> 3` (i.e. pos ÷ 8) and bit
- * offset `pos & 7` (i.e. pos mod 8) within that byte.
- */
-function layerAdd(layer: Layer, key: string): void {
-	for (const pos of bitPositions(key, layer.k, layer.m, layer.layerIndex)) {
-		layer.bits[pos >> 3] |= 1 << (pos & 7);
+	const h1 = xxHash32(key, layer.layerIndex * 2);
+	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
+	for (let i = 0; i < layer.k; i++) {
+		const pos = (h1 + i * h2) % layer.m;
+		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) return false;
 	}
-	layer.count++;
+	return true;
 }
