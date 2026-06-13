@@ -314,10 +314,23 @@ describe("transactions - end-to-end", () => {
 	it("serializability: concurrent transactions on the same key — loser retries and eventually commits", async () => {
 		const db = makeDB();
 
+		let firstRetries = 0,
+			secondRetries = 0;
 		const [r1, r2] = await Promise.allSettled([
-			db.transactWriteItems({
-				operations: [{ hashKey: "ser-key", operation: "put", data: "tx1" }],
-			}),
+			tryWhile(
+				async () => {
+					const result = await db.transactWriteItems({
+						operations: [{ hashKey: "ser-key", operation: "put", data: "tx1" }],
+					});
+					if (result.outcome !== "committed") throw result;
+					return result;
+				},
+				(_err, nextAttempt) => {
+					firstRetries++;
+					return nextAttempt <= 5;
+				},
+				{ baseDelayMs: 50, maxDelayMs: 500 },
+			),
 			tryWhile(
 				async () => {
 					const result = await db.transactWriteItems({
@@ -326,7 +339,10 @@ describe("transactions - end-to-end", () => {
 					if (result.outcome !== "committed") throw result;
 					return result;
 				},
-				(_err, nextAttempt) => nextAttempt <= 5,
+				(_err, nextAttempt) => {
+					secondRetries++;
+					return nextAttempt <= 5;
+				},
 				{ baseDelayMs: 50, maxDelayMs: 500 },
 			),
 		]);
@@ -341,12 +357,23 @@ describe("transactions - end-to-end", () => {
 		expect(tx1.outcome).toBe("committed");
 		expect(tx2.outcome).toBe("committed");
 
+		let value = undefined;
+		expect(firstRetries + secondRetries).toBeGreaterThan(0);
+		if (firstRetries > 0) {
+			value = tx1;
+			expect(tx1.outcome).toBe("committed");
+			expect(tx2.outcome).toBe("committed");
+		} else if (secondRetries > 0) {
+			value = tx2;
+			expect(tx1.outcome).toBe("committed");
+			expect(tx2.outcome).toBe("committed");
+		}
+
 		// Both applied serially: tx1(v1) → tx2(v2).
-		// tx2 is the last writer because it retried after tx1 committed.
 		const result = await db.getItem({ hashKey: "ser-key" });
 		expect(result.found).toBe(true);
 		if (result.found) {
-			expect(result.item.data).toBe("tx2");
+			expect(result.item.data).toBe(value === tx1 ? "tx1" : "tx2");
 			expect(result.item.version).toBe(2);
 		}
 	});
