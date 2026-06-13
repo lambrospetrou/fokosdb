@@ -535,7 +535,7 @@ but the two `do-partition.test.ts` integration tests gate migrations on real DOs
 alarms, where the DO constructs the component internally — a DO-level hook is the only injection
 channel, which is exactly the sanctioned "`__testing__*` hooks on the DO only" pattern.
 
-### Phase 6 — `partition/background-scheduler.ts` (last; independent of the rest)
+### Phase 6 — `partition/background-scheduler.ts` (last; independent of the rest) — ✅ DONE (2026-06-10)
 
 **Goal:** the scheduling machinery is generic, isolated, and tested. Deliberately last: no other
 phase depends on it, and it carries the plan's largest sanctioned behavior change.
@@ -562,6 +562,33 @@ phase depends on it, and it carries the plan's largest sanctioned behavior chang
 
 **Acceptance:** no `setTimeout`/`Promise.race` scheduling logic left inline in
 `do-partition.ts`; suite green.
+
+**Execution notes (2026-06-10):**
+
+- The single class became three in `background-scheduler.ts`, separating concerns that the plan
+  had merged (decided with Lambros): **`BackgroundJobRunner`** (the jobs: sequential run with
+  per-job failure isolation, resolves and RETURNS the min `nextAlarmMs` — trigger-agnostic),
+  **`AlarmScheduler`** (`ensureAlarmSet`, the reliable eviction-proof progress mechanism; also
+  called directly by the DO's request paths), and **`BackgroundScheduler`** (the setTimeout fast
+  path + run-concurrency policy; takes `runner` and `alarm` as narrow constructor deps, so it is
+  unit-tested with in-memory fakes). Parts 1+2 alone keep the partition correct at alarm cadence;
+  part 3 is pure acceleration.
+- The sanctioned behavior change shipped as **race-stuck-runs**, not the plan's plain
+  single-flight (decided with Lambros after reviewing the stuck-run risk): a trigger with no run
+  active runs immediately; a trigger while a run is in flight arms ONE racer timer for the moment
+  the newest run turns `allowOverlapAfterMs` old (default 5 s). If the run completes in time the
+  racer is cancelled — nothing is lost because triggers persist job state before scheduling and
+  every completing run self-schedules from its end-of-run `nextAlarmMs` sweep of that state; if
+  the racer fires first, a racing run starts alongside the presumed-stuck one (e.g. blocked on a
+  long remote RPC), escalating one race per `allowOverlapAfterMs` up to `maxConcurrentRuns`
+  (default 2). At capacity, triggers are dropped — completions self-schedule and the fallback
+  alarm backstops progress. The jobs' idempotent/concurrent-safe invariant remains load-bearing.
+- Log-shape delta: promotion drive/GC failures now log
+  `fokos/partition: Promotion job failed.` via the generic per-job catch; the outer
+  `Background work failed with unexpected error.` catch-all (their previous channel) is gone.
+- `__testing__backgroundWorkRunning` is now a DO getter forwarding to
+  `BackgroundScheduler.isRunning`; `destroyPartition` uses `dispose()` instead of the
+  clear-every-timer-ID hack, cancelling only scheduler-owned timers.
 
 ## Consequences
 

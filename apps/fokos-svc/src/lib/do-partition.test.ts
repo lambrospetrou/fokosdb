@@ -1694,7 +1694,9 @@ describe("PartitionDO — promotion detection and queuing", () => {
 });
 
 describe("PartitionDO — promotion cutover deferral and routing", () => {
-	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
+	// Two sequential 5s waitFor phases (plus waitForAlarm's own 5s waits) can legitimately exceed
+	// the 5s default test timeout under full-suite load — budget the test for its phases.
+	it("defers cutover to 'promoting' while the key has a pending transaction lock", { timeout: 15_000 }, async () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
