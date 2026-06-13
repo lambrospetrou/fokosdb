@@ -109,7 +109,10 @@ export const hashRootIndex = _hashRootIndex;
 
 export class PartitionIdHelper {
 	static readonly SCHEMA_HASH_V1 = 0x00 as const;
+	static readonly SCHEMA_HASH_V1_STR = "00" as const;
+
 	static readonly SCHEMA_RANGE_V1 = 0x01 as const;
+	static readonly SCHEMA_RANGE_V1_STR = "01" as const;
 
 	static partitionIdToBytes(partitionId: PartitionNodeId): Uint8Array {
 		return Uint8Array.fromHex(partitionId);
@@ -119,16 +122,16 @@ export class PartitionIdHelper {
 		// PartitionID are hex-encoded bytes with a schema version byte prefix,
 		// so we can peek the first byte to determine the type without full decoding.
 		// This is important for efficient routing in the DOs.
-		const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
-		return bytes === PartitionIdHelper.SCHEMA_HASH_V1;
+		// const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
+		// return bytes === PartitionIdHelper.SCHEMA_HASH_V1;
+		return partitionId.startsWith(PartitionIdHelper.SCHEMA_HASH_V1_STR);
 	}
 
 	static isRangePartition(partitionId: PartitionNodeId): boolean {
 		// PartitionID are hex-encoded bytes with a schema version byte prefix,
 		// so we can peek the first byte to determine the type without full decoding.
 		// This is important for efficient routing in the DOs.
-		const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
-		return bytes === PartitionIdHelper.SCHEMA_RANGE_V1;
+		return partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR);
 	}
 
 	static doName(basePartitionContext: PartitionContext, bytes: Uint8Array): string {
