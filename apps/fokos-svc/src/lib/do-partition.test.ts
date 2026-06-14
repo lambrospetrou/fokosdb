@@ -2082,4 +2082,89 @@ describe("PartitionDO — range split", () => {
 		// The router keeps no slice: the leftmost child is a different DO than the splitting node.
 		expect(leftmost!.doName).not.toBe(rootCtx.doName);
 	});
+
+	describe("PartialRangeTopology", () => {
+		it("reduces getItem forwardCount from 2 to 1 on second access when bloom filter has learned a key promoted from a hash-depth-2 leaf", async () => {
+			const hashKey = "probe-key";
+			const { ctx, stub } = makeStub({
+				hashSplitN: 2,
+				hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+			});
+			let topology: HashPartitionTopologyImpl;
+			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
+				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+			});
+			invariant(topology!, "topology should be initialized in the DO instance");
+
+			// Build a two-level hash tree: root → child → grandchild (leaf at depth=2).
+			await triggerHashSplitThreshold(stub, ctx, PROMOTION_TEST_MAX_SIZE_MB);
+			await drainSplitTree(stub);
+			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, hashKey);
+			const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+			await triggerHashSplitThreshold(childStub, childCtx, PROMOTION_TEST_MAX_SIZE_MB);
+			await drainSplitTree(childStub);
+
+			// Warm the root's hash topology cache so it can reach the depth-2 leaf in a single hop.
+			// Cold: root→child→leaf (forwardCount=2). Warm: root→leaf directly (forwardCount=1).
+			const rCold = await stub.getItem(ctx, { hashKey, sortKey: "sk1" });
+			expect(rCold.meta.forwardCount).toBe(2);
+			const rWarm = await stub.getItem(ctx, { hashKey, sortKey: "sk1" });
+			expect(rWarm.meta.forwardCount).toBe(1);
+
+			// Promote hashKey on the leaf (depth=2) that owns it.
+			const { partitionContext: leafCtx } = topology.pickDescendantHashPartition(ctx, hashKey, 2);
+			const leafStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(leafCtx.doName));
+			await leafStub.putItem(leafCtx, { hashKey, sortKey: "sk1", data: PROMOTION_BIG_DATA });
+			// Force an alarm so waitForAlarm drives the background work cycle that advances the
+			// promotion. The putItem schedules via setTimeout(10ms), but a stale
+			// #_backgroundWorkScheduledAt from the prior split drain suppresses new schedules.
+			await runInDurableObject(leafStub, async (_instance: PartitionDO, doCtx: DurableObjectState) => {
+				await doCtx.storage.setAlarm(Date.now());
+			});
+
+			// Wait for promotion to complete: leaf detects heavy key → cutover ("promoting") →
+			// range root migrates data → leaf acknowledges ("promoted").
+			const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(leafCtx, hashKey, null, null);
+			const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
+			await vi.waitFor(
+				async () => {
+					await waitForAlarm(leafStub);
+					const s = await leafStub.status();
+					if (
+						!["promoting", "promoted"].includes(
+							s.promotedKeys.find((e: { hashKey: string; status: string }) => e.hashKey === hashKey)?.status ?? "",
+						)
+					)
+						throw new Error("not yet promoting");
+				},
+				{ timeout: 5000, interval: 100 },
+			);
+			await vi.waitFor(
+				async () => {
+					await waitForAlarm(rangeRootStub);
+					if (
+						(await leafStub.status()).promotedKeys.find((e: { hashKey: string; status: string }) => e.hashKey === hashKey)?.status !==
+						"promoted"
+					)
+						throw new Error("not yet promoted");
+				},
+				{ timeout: 5000, interval: 100 },
+			);
+
+			// First getItem through root after promotion:
+			// Topology cache is warm → root goes directly to the leaf (1 hash hop).
+			// Leaf's PromotionManager says "promoted" → forwards to range root (1 more hop).
+			// Total forwardCount=2. Root also learns hashKey in its PartialRangeTopology bloom filter.
+			const r1 = await stub.getItem(ctx, { hashKey, sortKey: "sk1" });
+			expect(r1.found).toBe(true);
+			expect(r1.meta.forwardCount).toBe(2);
+
+			// Second getItem through root:
+			// Bloom filter now has hashKey → root bypasses the hash tree and goes directly to
+			// the range root (1 hop) instead of the usual 2 hops (leaf → range root).
+			const r2 = await stub.getItem(ctx, { hashKey, sortKey: "sk1" });
+			expect(r2.found).toBe(true);
+			expect(r2.meta.forwardCount).toBe(1);
+		}, 30_000);
+	});
 });
