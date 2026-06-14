@@ -765,11 +765,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			invariant(N != null && N >= 2, "fokos/range.startSplit: rangeSplitN must be >= 2");
 			// Compute N-1 split boundaries within the owned slice [start, end) in one snapshot.
 			boundaries = this.#store.computeRangeSplitBoundaries(rp.hashKey, rp.startBoundary, rp.endBoundary, N);
+			console.log({ message: "BOOM", boundaries, rp, N });
 			if (!boundaries) {
 				// Not enough distinct items to split into N non-empty children — retry on a later cycle.
-				console.log({
+				console.error({
+					...this.logParams(),
 					message: "fokos/range.startSplit: insufficient items to split into N children; will retry.",
-					doName: pCtx.doName,
+					hashKey: rp.hashKey,
+					startBoundary: rp.startBoundary,
+					endBoundary: rp.endBoundary,
 				});
 				return;
 			}

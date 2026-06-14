@@ -1990,7 +1990,8 @@ async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
 
 	const sks: string[] = [];
 	for (let i = 0; i < 100; i++) {
-		const sk = `sk${String(i).padStart(3, "0")}`;
+		// The random part at the end is to check the short boundaries computation if we want.
+		const sk = `sk${String(i).padStart(3, "0")}-${crypto.randomUUID()}`;
 		await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: sk, data: RANGE_ITEM_DATA });
 		sks.push(sk);
 		if ((await rootStub.status()).splitStatus?.status === "split_queued") break;
@@ -2027,6 +2028,7 @@ describe("PartitionDO — range split", () => {
 			expect(children[i].rangePartition!.endBoundary).not.toBeNull();
 			expect(children[i].rangePartition!.endBoundary).toBe(children[i + 1].rangePartition!.startBoundary);
 		}
+		expect(children.map((c) => c.rangePartition!.endBoundary)).toEqual(["sk004", "sk009", "sk014", null]);
 
 		// Every item is still readable through the router, and each read forwards exactly once.
 		for (const sk of sks) {

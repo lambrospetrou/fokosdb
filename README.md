@@ -23,7 +23,6 @@ Once there is a stable version ready, I will properly refactor the directory str
 No particular order.
 
 - Implement queryItems with pagination.
-- Range partition boundaries as short as necessary to achieve the split instead of the entire range keys, since this will allow the topology encoding to be smaller in size.
 - Update partial range topology within each partition to maintain also range boundaries.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.

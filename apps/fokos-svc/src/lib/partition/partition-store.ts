@@ -59,6 +59,20 @@ export type ItemSnapshot = { hk: string; sk: string; found: true; v: number } | 
 // Pure helpers
 // ---------------------------------------------------------------------------
 
+// Returns the shortest string p where lo < p ≤ hi, treating characters as UTF-16 code units
+// (matching JavaScript string comparison and SQLite TEXT collation). Pre-condition: lo < hi.
+function shortestSeparator(lo: string, hi: string): string {
+	const minLen = Math.min(lo.length, hi.length);
+	for (let i = 0; i < minLen; i++) {
+		if (lo.charCodeAt(i) !== hi.charCodeAt(i)) {
+			// At index i, hi[i] > lo[i]; hi[0..i+1] is the shortest prefix of hi that exceeds lo.
+			return hi.substring(0, i + 1);
+		}
+	}
+	// lo is a proper prefix of hi; one extra character makes the result exceed lo.
+	return hi.substring(0, lo.length + 1);
+}
+
 /**
  * Pure condition evaluation shared by the non-transactional putItem/deleteItem and the
  * transactional prepare path. Lives with the store (NOT the transaction participant) because
@@ -374,6 +388,8 @@ export class PartitionStore {
 
 	// Computes N-1 strictly-increasing split boundaries (count-quantiles) within [start, end) in one
 	// transactionSync snapshot. Returns null if there are fewer than N items (so every child stays non-empty).
+	// Each boundary is shortened to the minimum prefix that still separates adjacent data keys (the
+	// "shortest separator" of the predecessor and boundary key), keeping doNames and topology encoding compact.
 	// A data query on the items table — it lives with the store; the DO passes the result into the
 	// range split policy's prepareSplit.
 	computeRangeSplitBoundaries(hashKey: string, start: string | null, end: string | null, N: number): string[] | null {
@@ -391,18 +407,25 @@ export class PartitionStore {
 			const boundaries: string[] = [];
 			for (let i = 1; i < N; i++) {
 				const offset = Math.floor((cnt * i) / N);
-				const row =
+				// Fetch the predecessor (offset - 1) and the boundary key (offset) in one scan.
+				// offset >= 1 always because cnt >= N guarantees floor(cnt * 1 / N) >= 1.
+				const rows =
 					end === null
 						? this.#storage.sql
-								.exec<{ sk: string }>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, offset)
-								.toArray()[0]
+								.exec<{
+									sk: string;
+								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, offset - 1)
+								.toArray()
 						: this.#storage.sql
 								.exec<{
 									sk: string;
-								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 1 OFFSET ?`, hashKey, lower, end, offset)
-								.toArray()[0];
-				invariant(row, "fokos/range.computeRangeSplitBoundaries: expected a row at the computed offset");
-				boundaries.push(row.sk);
+								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, end, offset - 1)
+								.toArray();
+				invariant(
+					rows.length === 2,
+					"fokos/range.computeRangeSplitBoundaries: expected predecessor + boundary rows at the computed offset",
+				);
+				boundaries.push(shortestSeparator(rows[0].sk, rows[1].sk));
 			}
 			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty children).
 			for (let i = 0; i < boundaries.length; i++) {

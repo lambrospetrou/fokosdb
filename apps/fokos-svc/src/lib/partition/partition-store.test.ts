@@ -220,3 +220,88 @@ describe("PartitionStore - promoted keys", () => {
 		});
 	});
 });
+
+describe("PartitionStore - computeRangeSplitBoundaries", () => {
+	function put(store: PartitionStore, hk: string, ...sks: string[]) {
+		for (const sk of sks) {
+			store.upsertItem({ hk, sk, data: "d", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+		}
+	}
+
+	it("returns null when fewer than N items exist", async () => {
+		await withStore((store) => {
+			put(store, "hk", "a");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toBeNull();
+		});
+	});
+
+	it("returns null when the hash key has no items", async () => {
+		await withStore((store) => {
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toBeNull();
+		});
+	});
+
+	it("N=2: returns the shortest separator between the two halves", async () => {
+		await withStore((store) => {
+			// 4 items; boundary at offset floor(4/2)=2 → predecessor="cherry", boundary="mango"
+			// shortestSeparator("cherry","mango"): 'c'!='m' at i=0 → "m"
+			put(store, "hk", "apple", "cherry", "mango", "peach");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toEqual(["m"]);
+		});
+	});
+
+	it("returns boundary unchanged when no prefix shortening is possible (single-char keys)", async () => {
+		await withStore((store) => {
+			// predecessor="a", boundary="b" → shortestSeparator → "b" (already minimal)
+			put(store, "hk", "a", "b");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toEqual(["b"]);
+		});
+	});
+
+	it("shortens a long common prefix (only last char differs)", async () => {
+		await withStore((store) => {
+			// predecessor="prefix_aaa", boundary="prefix_bbb"
+			// shortestSeparator: first diff at i=7 ('a'!='b') → "prefix_b"
+			put(store, "hk", "prefix_aaa", "prefix_bbb");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toEqual(["prefix_b"]);
+		});
+	});
+
+	it("shortens when predecessor is a prefix of the boundary", async () => {
+		await withStore((store) => {
+			// predecessor="app", boundary="apple" (predecessor is proper prefix)
+			// shortestSeparator: loop exhausts at minLen=3, return "apple".substring(0,4) = "appl"
+			put(store, "hk", "app", "apple");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 2)).toEqual(["appl"]);
+		});
+	});
+
+	it("N=3: produces two strictly-increasing shortened boundaries", async () => {
+		await withStore((store) => {
+			// 6 items; boundary1 at offset 2, boundary2 at offset 4
+			// sorted: "aardvark","cherry","mango","strawberry","vanilla","zebra"
+			// b1: predecessor="cherry", boundary="mango" → shortestSeparator → "m"
+			// b2: predecessor="strawberry", boundary="vanilla" → shortestSeparator → "v"
+			put(store, "hk", "aardvark", "cherry", "mango", "strawberry", "vanilla", "zebra");
+			expect(store.computeRangeSplitBoundaries("hk", null, null, 3)).toEqual(["m", "v"]);
+		});
+	});
+
+	it("respects start/end range bounds and excludes out-of-range items", async () => {
+		await withStore((store) => {
+			// All items: "apple","banana","cherry","mango","peach","strawberry"
+			// Range [banana, peach) → in-range items: "banana","cherry","mango" (3 items)
+			// N=2: boundary at offset 1 → predecessor="banana", boundary="cherry" → "c"
+			put(store, "hk", "apple", "banana", "cherry", "mango", "peach", "strawberry");
+			expect(store.computeRangeSplitBoundaries("hk", "banana", "peach", 2)).toEqual(["c"]);
+		});
+	});
+
+	it("returns null when range slice has fewer than N items", async () => {
+		await withStore((store) => {
+			put(store, "hk", "apple", "banana", "cherry", "mango", "peach");
+			// Range [cherry, mango) → only "cherry" qualifies (mango excluded) — 1 item < N=2
+			expect(store.computeRangeSplitBoundaries("hk", "cherry", "mango", 2)).toBeNull();
+		});
+	});
+});
