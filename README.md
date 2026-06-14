@@ -22,12 +22,13 @@ Once there is a stable version ready, I will properly refactor the directory str
 
 No particular order.
 
-- Bloom filter in partial hash topology per partition.
 - Implement queryItems with pagination.
-- Range partition boundaries only to make the split instead of the entire range key.
-- Think about backups and export in a consistent fashion.
+- Range partition boundaries as short as necessary to achieve the split instead of the entire range keys, since this will allow the topology encoding to be smaller in size.
+- Update partial range topology within each partition to maintain also range boundaries.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
+- Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Add topology keeper and encoding. Schema and versioning per change (split).
+- Think about backups and export in a consistent fashion.
 - User provided code running inside the DO for N+1 operations. ONLY for library or self-hosted mode where the user controls the Durable Object class used, otherwise we would need Dynamic Workers and the `pipe()` operator.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
