@@ -17,7 +17,7 @@ export type PromotionManagerDeps = {
 	 */
 	getRangeRootPeer: (ctx: PartitionContextResolved) => PromotionPeer;
 	/** Requests a background-work run via the DO's scheduling machinery. */
-	scheduleWork: (opts: { delayMs: number }) => void;
+	scheduleWork: (opts: { delayMs: number }) => Promise<void>;
 	/** Structured-log context (the DO's logParams), so extracted logs keep their shape. */
 	logParams: () => Record<string, unknown>;
 	/** Max item rows deleted per promoted key per GC cycle (bounded work per cycle). */
@@ -84,7 +84,7 @@ export class PromotionManager {
 		return Array.from(this.#keys.entries()).map(([hashKey, status]) => ({ hashKey, status }));
 	}
 
-	maybeQueuePromotion(pCtx: PartitionContextResolved, hk: string, newKeyEst: number): void {
+	async maybeQueuePromotion(pCtx: PartitionContextResolved, hk: string, newKeyEst: number): Promise<void> {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.#keys.has(hk)) return;
@@ -98,7 +98,7 @@ export class PromotionManager {
 			return;
 		}
 		this.#keys.set(hk, "queued");
-		this.deps.scheduleWork({ delayMs: 10 });
+		await this.deps.scheduleWork({ delayMs: 10 });
 		console.log({
 			...this.deps.logParams(),
 			message: "fokos/partition: Key queued for promotion.",
@@ -108,7 +108,7 @@ export class PromotionManager {
 		});
 	}
 
-	acknowledgePromotionComplete(hashKey: string): void {
+	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
 		const { updated } = this.deps.store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
 		if (updated) {
 			this.#keys.set(hashKey, "promoted");
@@ -119,7 +119,7 @@ export class PromotionManager {
 			if (stored) this.#keys.set(hashKey, stored);
 			else this.#keys.delete(hashKey);
 		}
-		this.deps.scheduleWork({ delayMs: 1_000 });
+		await this.deps.scheduleWork({ delayMs: 1_000 });
 		console.log({ ...this.deps.logParams(), message: "fokos/partition: Promotion complete.", hashKey });
 	}
 

@@ -134,7 +134,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			store: this.#store,
 			// Boundary rule: only the DO acquires stubs — the manager receives this factory.
 			getRangeRootPeer: (rangeRootCtx) => this.env[rangeRootCtx.ns].get(this.env[rangeRootCtx.ns].idFromName(rangeRootCtx.doName)),
-			scheduleWork: (opts) => this.scheduleBackgroundWork(opts),
+			scheduleWork: async (opts) => {
+				this.scheduleBackgroundWork(opts);
+				await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+			},
 			logParams: () => this.logParams(),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
@@ -581,7 +584,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
-		this.#promotion.acknowledgePromotionComplete(hashKey);
+		await this.#promotion.acknowledgePromotionComplete(hashKey);
 	}
 
 	/**

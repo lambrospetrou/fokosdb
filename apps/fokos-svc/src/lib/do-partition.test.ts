@@ -2115,12 +2115,6 @@ describe("PartitionDO — range split", () => {
 			const { partitionContext: leafCtx } = topology.pickDescendantHashPartition(ctx, hashKey, 2);
 			const leafStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(leafCtx.doName));
 			await leafStub.putItem(leafCtx, { hashKey, sortKey: "sk1", data: PROMOTION_BIG_DATA });
-			// Force an alarm so waitForAlarm drives the background work cycle that advances the
-			// promotion. The putItem schedules via setTimeout(10ms), but a stale
-			// #_backgroundWorkScheduledAt from the prior split drain suppresses new schedules.
-			await runInDurableObject(leafStub, async (_instance: PartitionDO, doCtx: DurableObjectState) => {
-				await doCtx.storage.setAlarm(Date.now());
-			});
 
 			// Wait for promotion to complete: leaf detects heavy key → cutover ("promoting") →
 			// range root migrates data → leaf acknowledges ("promoted").

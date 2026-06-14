@@ -166,14 +166,14 @@ describe("PromotionManager — acknowledgePromotionComplete", () => {
 			await manager.drive(pCtx, () => undefined);
 			scheduled.length = 0;
 
-			manager.acknowledgePromotionComplete("alice");
+			await manager.acknowledgePromotionComplete("alice");
 			expect(manager.statusFor("alice")).toBe("promoted");
 			expect(store.getPromotedKeyStatus("alice")).toBe("promoted");
 			expect(scheduled).toEqual([1_000]);
 			expect(manager.hasInFlightPromotions()).toBe(false);
 			expect(manager.activeRangeRootHashKeys()).toEqual(["alice"]);
 
-			manager.acknowledgePromotionComplete("alice");
+			await manager.acknowledgePromotionComplete("alice");
 			expect(manager.statusFor("alice")).toBe("promoted");
 			expect(store.getPromotedKeyStatus("alice")).toBe("promoted");
 		});
@@ -187,7 +187,9 @@ describe("PromotionManager — GC", () => {
 			const manager = new PromotionManager({
 				store,
 				getRangeRootPeer: () => makePeer(calls),
-				scheduleWork: (opts) => scheduled.push(opts.delayMs),
+				scheduleWork: async (opts) => {
+					scheduled.push(opts.delayMs);
+				},
 				logParams: () => ({ test: "promotion.test.ts" }),
 				gcBatchLimit: 2,
 			});
@@ -320,7 +322,9 @@ async function withPromotionEnv(fn: (penv: PromotionEnv) => Promise<void>): Prom
 		const manager = new PromotionManager({
 			store,
 			getRangeRootPeer: () => makePeer(calls),
-			scheduleWork: (opts) => scheduled.push(opts.delayMs),
+			scheduleWork: async (opts) => {
+				scheduled.push(opts.delayMs);
+			},
 			logParams: () => ({ test: "promotion.test.ts" }),
 		});
 		await fn({ base, pCtx, store, manager, calls, scheduled });
