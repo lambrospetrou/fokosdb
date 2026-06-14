@@ -167,14 +167,16 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 	{
 		idMonotonicInc: 3,
-		description: "Add range partition support: promoted_keys table",
+		description: "Add range partition support: promoted_keys table (WITHOUT ROWID; gc_done flag; status index)",
 		sql: `
             CREATE TABLE IF NOT EXISTS promoted_keys (
-                hash_key   TEXT NOT NULL PRIMARY KEY,
-                status     TEXT NOT NULL,
+                hash_key   TEXT    NOT NULL PRIMARY KEY,
+                status     TEXT    NOT NULL,
+                gc_done    INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
-            ) STRICT;`,
+            ) WITHOUT ROWID, STRICT;
+            CREATE INDEX IF NOT EXISTS idx_promoted_keys_status ON promoted_keys (status, gc_done);`,
 	},
 	{
 		idMonotonicInc: 4,
@@ -183,12 +185,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE TABLE IF NOT EXISTS key_size_estimates (
                 hk        TEXT    NOT NULL PRIMARY KEY,
                 est_bytes INTEGER NOT NULL DEFAULT 0
-            ) STRICT;`,
-	},
-	{
-		idMonotonicInc: 5,
-		description: "Index promoted_keys by status for O(1) in-flight existence checks",
-		sql: `CREATE INDEX IF NOT EXISTS idx_promoted_keys_status ON promoted_keys (status);`,
+            ) WITHOUT ROWID, STRICT;`,
 	},
 ];
 
@@ -686,10 +683,25 @@ export class PartitionStore {
 
 	hasResidualItemsForPromotedKeys(): boolean {
 		return (
-			this.#storage.sql
-				.exec<{ one: 1 }>(`SELECT 1 AS one FROM items WHERE hk IN (SELECT hash_key FROM promoted_keys WHERE status = 'promoted') LIMIT 1`)
-				.toArray().length > 0
+			this.#storage.sql.exec<{ one: 1 }>(`SELECT 1 AS one FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0 LIMIT 1`).toArray()
+				.length > 0
 		);
+	}
+
+	listPromotedKeysNeedingGC(limit?: number): string[] {
+		return this.#storage.sql
+			.exec<{ hash_key: string }>(
+				limit != null
+					? `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0 LIMIT ?`
+					: `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0`,
+				...(limit != null ? [limit] : []),
+			)
+			.toArray()
+			.map((r) => r.hash_key);
+	}
+
+	markPromotedKeyGcDone(hk: string): void {
+		this.#storage.sql.exec(`UPDATE promoted_keys SET gc_done = 1 WHERE hash_key = ?`, hk);
 	}
 
 	/**

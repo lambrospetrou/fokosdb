@@ -218,22 +218,21 @@ export class PromotionManager {
 	 * Per-key failures are logged and never block the remaining keys.
 	 */
 	runGC(): void {
-		for (const [hashKey, status] of this.#keys) {
-			if (status === "promoted") {
-				try {
-					this.deps.store.deleteItemsBatchForHashKey(hashKey, this.deps.gcBatchLimit ?? 1000);
-					this.deps.store.deletePendingTxForHashKey(hashKey);
-					if (!this.deps.store.hasItemsForHashKey(hashKey)) {
-						this.deps.store.deleteKeySizeEstimate(hashKey);
-					}
-				} catch (error) {
-					console.error({
-						...this.deps.logParams(),
-						message: "fokos/partition: Promotion GC job failed.",
-						hashKey,
-						error: String(error),
-					});
+		for (const hashKey of this.deps.store.listPromotedKeysNeedingGC(1000)) {
+			try {
+				this.deps.store.deleteItemsBatchForHashKey(hashKey, this.deps.gcBatchLimit ?? 1000);
+				this.deps.store.deletePendingTxForHashKey(hashKey);
+				if (!this.deps.store.hasItemsForHashKey(hashKey)) {
+					this.deps.store.deleteKeySizeEstimate(hashKey);
+					this.deps.store.markPromotedKeyGcDone(hashKey);
 				}
+			} catch (error) {
+				console.error({
+					...this.deps.logParams(),
+					message: "fokos/partition: Promotion GC job failed.",
+					hashKey,
+					error: String(error),
+				});
 			}
 		}
 	}
