@@ -666,6 +666,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Promoted-key range roots (hash DOs only).
+		// FIXME(perf): We should only forward to the range roots (hash keys) that actually have pending locks for this transaction.
 		if (isHashPartition(pCtx)) {
 			for (const hashKey of this.#promotion.activeRangeRootHashKeys()) {
 				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);

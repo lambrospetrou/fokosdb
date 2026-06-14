@@ -684,6 +684,14 @@ export class PartitionStore {
 		);
 	}
 
+	hasResidualItemsForPromotedKeys(): boolean {
+		return (
+			this.#storage.sql
+				.exec<{ one: 1 }>(`SELECT 1 AS one FROM items WHERE hk IN (SELECT hash_key FROM promoted_keys WHERE status = 'promoted') LIMIT 1`)
+				.toArray().length > 0
+		);
+	}
+
 	/**
 	 * Idempotent: used both when queueing a new promotion and when inheriting entries on hash
 	 * split. Returns whether a new row was actually inserted — false means the key already had a

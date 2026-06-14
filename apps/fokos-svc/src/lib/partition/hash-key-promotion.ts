@@ -243,10 +243,6 @@ export class PromotionManager {
 	 * (promoted keys with local items left). Feeds the DO's next-alarm computation.
 	 */
 	needsBackgroundWork(): boolean {
-		if (this.deps.store.hasInFlightPromotedKeys()) return true;
-		for (const [hashKey, status] of this.#keys) {
-			if (status === "promoted" && this.deps.store.hasItemsForHashKey(hashKey)) return true;
-		}
-		return false;
+		return this.deps.store.hasInFlightPromotedKeys() || this.deps.store.hasResidualItemsForPromotedKeys();
 	}
 }
