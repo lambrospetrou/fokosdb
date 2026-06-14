@@ -36,7 +36,7 @@ export class FokosDB {
 		}
 		this.#staticShardedTCs = new StaticShardedDO(this.#options.transactionCoordinatorNs, {
 			numShards: this.#options.numTransactionCoordinators,
-			shardGroupName: `${this.#options.topology.partitionContext().databaseName}.tc`,
+			shardGroupName: `${this.#options.topology.partitionContext().tableName}.tc`,
 		});
 	}
 

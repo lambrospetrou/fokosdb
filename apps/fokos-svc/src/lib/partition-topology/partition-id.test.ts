@@ -5,7 +5,7 @@ import { PartitionIdHelper, rangePartitionDoName } from "./partition-id.js";
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: "iddb",
+		tableName: "iddb",
 		rootTreesN: 4,
 		hashSplitN: 4,
 		hashSplitConditions: { maxSizeMb: 100 },

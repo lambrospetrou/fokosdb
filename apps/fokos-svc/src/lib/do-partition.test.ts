@@ -770,7 +770,7 @@ describe("PartitionDO - splitting", () => {
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({
 			ns: "PARTITION_DO",
-			databaseName: ctx.databaseName,
+			tableName: ctx.tableName,
 		});
 
 		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext!).map((c) => c.doName);
@@ -782,7 +782,7 @@ describe("PartitionDO - splitting", () => {
 
 			expect(childState.partitionContext).toMatchObject({
 				ns: "PARTITION_DO",
-				databaseName: ctx.databaseName,
+				tableName: ctx.tableName,
 				doName: name,
 			});
 			expect(childState.parentPartitionContext).toMatchObject({
@@ -1400,14 +1400,14 @@ describe("PartitionDO - partitionId encoding", () => {
 		const children = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
 		for (let i = 0; i < children.length; i++) {
 			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
-			expect(children[i].doName).toBe(`${ctx.databaseName}.h.0.${i}`);
+			expect(children[i].doName).toBe(`${ctx.tableName}.h.0.${i}`);
 		}
 	});
 
 	describe("PartitionIdHelper static readers", () => {
 		const baseCtx = PartitionContextCreator.create({
 			ns: "PARTITION_DO",
-			databaseName: "test.readers",
+			tableName: "test.readers",
 			rootTreesN: 1,
 			hashSplitN: 2,
 			hashSplitConditions: { maxSizeMb: 100 },
@@ -1615,7 +1615,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 	const prefix = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: prefix,
+		tableName: prefix,
 		// For testing determinism only one root partition.
 		rootTreesN: 1,
 		hashSplitN: 2,
@@ -1971,7 +1971,7 @@ async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
 }> {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: `rangesplit.${crypto.randomUUID()}`,
+		tableName: `rangesplit.${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,
 		rangeSplitN,

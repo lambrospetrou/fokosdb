@@ -32,7 +32,7 @@ Grandparent → Range root (serves request)   // skips the child hop
 - **Append-only.** Promotions are permanent (keys are never un-promoted), so the bloom filter only
   grows — which is fine since standard bloom filters cannot remove entries.
 - **Range root names are deterministic.** `resolveRangePartitionContext` computes the range root DO
-  name purely from `(databaseName, hashKey, startBoundary, endBoundary)`. It does NOT depend on
+  name purely from `(tableName, hashKey, startBoundary, endBoundary)`. It does NOT depend on
   the calling partition's identity. Any ancestor can compute the same range root name and route
   directly. (See `rangePartitionDoName` in `partition-id.ts`.)
 

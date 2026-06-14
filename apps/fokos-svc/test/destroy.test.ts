@@ -19,10 +19,10 @@ const PARTITION_OPTIONS = {
 };
 const ITEM_DATA = "x".repeat(50 * 1024); // 50 KB
 
-function makeDB(databaseName: string) {
+function makeDB(tableName: string) {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName,
+		tableName,
 		...PARTITION_OPTIONS,
 	});
 	return new FokosDB({
@@ -44,10 +44,10 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 }
 
 // FIXME Skipped because when calling destroy() the vitest integration is broken and stays hang forever even though the test completes.
-describe.skip("DELETE /api/databases/:databaseName", () => {
+describe.skip("DELETE /api/databases/:tableName", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
-		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
-		const db = makeDB(databaseName);
+		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const db = makeDB(tableName);
 		const topology = db.options().topology as PartitionTopologyRouterImpl;
 
 		// Write 50 × 50 KB items to each root partition.
@@ -75,7 +75,7 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 
 		// Call the HTTP DELETE endpoint, passing the same partition options so the server
 		// reconstructs the same topology (and therefore targets the same DOs).
-		const response = await exports.default.fetch(`https://example.com/api/databases/${databaseName}`, {
+		const response = await exports.default.fetch(`https://example.com/api/databases/${tableName}`, {
 			method: "DELETE",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ partitionOptions: PARTITION_OPTIONS }),
@@ -103,13 +103,13 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 	});
 
 	it("is idempotent — a second DELETE on an already-destroyed database succeeds", async ({ expect }) => {
-		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
-		const db = makeDB(databaseName);
+		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const db = makeDB(tableName);
 
 		await db.putItem({ hashKey: "idem-hk", data: "some-data" });
 
 		for (let i = 0; i < 2; i++) {
-			const res = await exports.default.fetch(`https://example.com/api/databases/${databaseName}`, {
+			const res = await exports.default.fetch(`https://example.com/api/databases/${tableName}`, {
 				method: "DELETE",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify({ partitionOptions: PARTITION_OPTIONS }),
@@ -120,8 +120,8 @@ describe.skip("DELETE /api/databases/:databaseName", () => {
 	});
 
 	it("is idempotent — a second DELETE on an already-destroyed database succeeds (DB directly)", async ({ expect }) => {
-		const databaseName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
-		const db = makeDB(databaseName);
+		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
+		const db = makeDB(tableName);
 
 		await db.putItem({ hashKey: "idem-hk", data: "some-data" });
 

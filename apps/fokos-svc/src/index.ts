@@ -93,10 +93,10 @@ const DEFAULT_PARTITION_OPTIONS = {
 
 type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
 
-function makeFokosDB(env: Env, databaseName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
+function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
 	const partitionContext = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName,
+		tableName,
 		rootTreesN: partitionOptions?.rootTreesN ?? DEFAULT_PARTITION_OPTIONS.rootTreesN,
 		hashSplitN: partitionOptions?.hashSplitN ?? DEFAULT_PARTITION_OPTIONS.hashSplitN,
 		rangeSplitN: partitionOptions?.rangeSplitN ?? DEFAULT_PARTITION_OPTIONS.rangeSplitN,
@@ -190,8 +190,8 @@ api.get("/hello/:name", async (c) => {
 	return c.json({ message: `Hello, ${name}!` });
 });
 
-api.delete("/databases/:databaseName", async (c) => {
-	const databaseName = c.req.param("databaseName");
+api.delete("/databases/:tableName", async (c) => {
+	const tableName = c.req.param("tableName");
 	let partitionOptions: PartitionOptionsInput | undefined;
 	try {
 		const body = await c.req.json();
@@ -206,12 +206,12 @@ api.delete("/databases/:databaseName", async (c) => {
 		if (e instanceof HTTPException) throw e;
 		// No body or non-JSON body is fine — use defaults.
 	}
-	await makeFokosDB(c.env, databaseName, partitionOptions).destroy();
+	await makeFokosDB(c.env, tableName, partitionOptions).destroy();
 	return c.json({ destroyed: true });
 });
 
-api.post("/rpc/:databaseName/:rpcAction", async (c) => {
-	const databaseName = c.req.param("databaseName");
+api.post("/rpc/:tableName/:rpcAction", async (c) => {
+	const tableName = c.req.param("tableName");
 	const rpcAction = c.req.param("rpcAction");
 
 	let rawBody: unknown;
@@ -232,33 +232,33 @@ api.post("/rpc/:databaseName/:rpcAction", async (c) => {
 	}
 
 	// TODO The following creates a new FokosDB instance (and therefore reconstructs the partition topology) on every request, which is inefficient.
-	// We should cache these instances keyed by databaseName + partitionOptions.
+	// We should cache these instances keyed by tableName + partitionOptions.
 	switch (rpcAction) {
 		case "putItem": {
 			const { partitionOptions, ...opts } = parseBody(PutItemBodySchema);
-			const result = await makeFokosDB(c.env, databaseName, partitionOptions).putItem(opts);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).putItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(result);
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
-			const result = await makeFokosDB(c.env, databaseName, partitionOptions).getItem(opts);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeGetItemResult(result));
 		}
 		case "deleteItem": {
 			const { partitionOptions, ...opts } = parseBody(DeleteItemBodySchema);
-			const result = await makeFokosDB(c.env, databaseName, partitionOptions).deleteItem(opts);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).deleteItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(result);
 		}
 		case "transactWriteItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactWriteItemsBodySchema);
-			return c.json(await makeFokosDB(c.env, databaseName, partitionOptions).transactWriteItems(opts));
+			return c.json(await makeFokosDB(c.env, tableName, partitionOptions).transactWriteItems(opts));
 		}
 		case "transactGetItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactGetItemsBodySchema);
-			return c.json(serializeTransactGetItemsResult(await makeFokosDB(c.env, databaseName, partitionOptions).transactGetItems(opts)));
+			return c.json(serializeTransactGetItemsResult(await makeFokosDB(c.env, tableName, partitionOptions).transactGetItems(opts)));
 		}
 		default:
 			throw new HTTPException(404, { message: `Unknown rpcAction: ${rpcAction}` });

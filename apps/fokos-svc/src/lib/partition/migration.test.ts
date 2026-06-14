@@ -184,7 +184,7 @@ describe("SplitMigration — status gate", () => {
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: `migration-${crypto.randomUUID()}`,
+		tableName: `migration-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 100 },
@@ -200,7 +200,7 @@ function rangeCtx(base: PartitionContext, hashKey: string, start: string | null,
 	const { opaque } = PartitionIdHelper.fromRangePartition(base, hashKey, start, end).encode(false);
 	return {
 		...base,
-		doName: rangePartitionDoName(base.databaseName, hashKey, start, end),
+		doName: rangePartitionDoName(base.tableName, hashKey, start, end),
 		primaryDoIdStr: "",
 		partitionId: opaque,
 		rangePartition: { hashKey, startBoundary: start, endBoundary: end },

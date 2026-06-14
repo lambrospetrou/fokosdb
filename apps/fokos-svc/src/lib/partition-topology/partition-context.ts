@@ -20,7 +20,7 @@ export type PartitionContext = {
 	schema: 1; // For future compatibility, in case we need to change the structure of the context.
 
 	ns: PartitionNamespaceKey;
-	databaseName: string;
+	tableName: string;
 
 	/**
 	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
@@ -94,7 +94,7 @@ export function isRangePartition(ctx: PartitionContextResolved): ctx is Partitio
 export function areImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {
 	return (
 		opts1.schema === opts2.schema &&
-		opts1.databaseName === opts2.databaseName &&
+		opts1.tableName === opts2.tableName &&
 		opts1.rootTreesN === opts2.rootTreesN &&
 		opts1.hashSplitN === opts2.hashSplitN
 	);
@@ -113,7 +113,7 @@ export function areMutableOptionsEqual(opts1: PartitionContext, opts2: Partition
 export class PartitionContextCreator {
 	static create(opts: {
 		ns: PartitionNamespaceKey;
-		databaseName: string;
+		tableName: string;
 		rootTreesN: number;
 		hashSplitN: number;
 		hashSplitConditions: SplitConditions;
@@ -158,7 +158,7 @@ export class PartitionContextCreator {
 		const context: PartitionContext = {
 			schema: 1,
 			ns: opts.ns,
-			databaseName: opts.databaseName,
+			tableName: opts.tableName,
 			rootTreesN: opts.rootTreesN,
 			hashSplitN: opts.hashSplitN,
 			rangeSplitN: opts.rangeSplitN,

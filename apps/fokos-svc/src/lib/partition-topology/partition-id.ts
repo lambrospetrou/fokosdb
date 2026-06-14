@@ -27,16 +27,11 @@ function encodeRangeComponent(s: string): string {
 // Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
 // three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
 // The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
-export function rangePartitionDoName(
-	databaseName: string,
-	hashKey: string,
-	startBoundary: string | null,
-	endBoundary: string | null,
-): string {
+export function rangePartitionDoName(tableName: string, hashKey: string, startBoundary: string | null, endBoundary: string | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
 	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
-	return `${databaseName}.r.${hk}.${start}.${end}`;
+	return `${tableName}.r.${hk}.${start}.${end}`;
 }
 
 // Resolves a PartitionContextResolved for a range-structure DO (root or child).
@@ -139,12 +134,12 @@ export class PartitionIdHelper {
 			const root = (bytes[1] << 8) | bytes[2];
 			const depth = bytes[3];
 			const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
-			return `${basePartitionContext.databaseName}.h.${root}${suffix}`;
+			return `${basePartitionContext.tableName}.h.${root}${suffix}`;
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);
 		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
-		return rangePartitionDoName(basePartitionContext.databaseName, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
+		return rangePartitionDoName(basePartitionContext.tableName, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
 	}
 
 	// Decode a partition ID bytes to a schema-specific representation.

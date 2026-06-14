@@ -13,7 +13,7 @@ type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_start
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: "testdb",
+		tableName: "testdb",
 		rootTreesN: 1,
 		hashSplitN: 4,
 		hashSplitConditions: { maxSizeMb: 100 },
@@ -181,7 +181,7 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1) unchanged", () => {
 function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: `testdb-${crypto.randomUUID()}`,
+		tableName: `testdb-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 4,
 		hashSplitConditions: { maxSizeMb: 100 },

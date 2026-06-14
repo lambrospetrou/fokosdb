@@ -114,10 +114,10 @@ function encodeRangeComponent(s: string): string;
 // (`db.h.<root>[.<child>…]`, partition-topology.ts:194) and is REQUIRED to avoid collisions:
 // without it, a range leaf for hash key "h" with start boundary "0" would be `db.h.0`, colliding
 // with hash root partition 0.
-function rangePartitionDoName(databaseName: string, hashKey: string, startBoundary: string | null): string {
+function rangePartitionDoName(tableName: string, hashKey: string, startBoundary: string | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const sk = startBoundary == null ? "" : encodeRangeComponent(startBoundary);
-	return `${databaseName}.r.${hk}.${sk}`;
+	return `${tableName}.r.${hk}.${sk}`;
 }
 ```
 

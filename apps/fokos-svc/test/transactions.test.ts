@@ -10,7 +10,7 @@ function makeDB() {
 	const prefix = `txtest.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
-		databaseName: prefix,
+		tableName: prefix,
 		rootTreesN: 100,
 		hashSplitN: 2,
 		rangeSplitN: 2,
@@ -514,7 +514,7 @@ describe("transactions - end-to-end", () => {
 		const dbName = `tcdist.${crypto.randomUUID()}`;
 		const base = PartitionContextCreator.create({
 			ns: "PARTITION_DO",
-			databaseName: dbName,
+			tableName: dbName,
 			rootTreesN: 100,
 			hashSplitN: 2,
 			rangeSplitN: 2,
@@ -547,7 +547,7 @@ describe("transactions - end-to-end", () => {
 		// One idFromName call per transactWriteItems.
 		expect(calledTCNames).toHaveLength(10);
 
-		// StaticShardedDO names shards as `${shardGroupName}-${index}`, and shardGroupName is `${databaseName}.tc.`
+		// StaticShardedDO names shards as `${shardGroupName}-${index}`, and shardGroupName is `${tableName}.tc.`
 		const expectedTCNames = new Set([`${dbName}.tc-0`, `${dbName}.tc-1`, `${dbName}.tc-2`]);
 		for (const name of calledTCNames) {
 			expect(expectedTCNames.has(name)).toBe(true);
