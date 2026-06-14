@@ -1311,6 +1311,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// Only update an existing bloom filter (created via per-request learning from forwarded
 			// responses). The owning partition routes promoted keys authoritatively via
 			// PromotionManager.statusFor(); creating a bloom filter eagerly would bloat databaseSize.
+			//
+			// TODO: Do we need this here??? Why not let it learn from responses only?
+			//
 			if (isHashPartition(this.pCtx()) && this.#_partialRangeTopology) {
 				const promotedHashKeys = this.#promotion
 					.snapshot()

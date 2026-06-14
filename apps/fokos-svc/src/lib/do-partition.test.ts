@@ -736,7 +736,7 @@ describe("PartitionDO - splitting", () => {
 		await runInDurableObject(stub, async (instance: PartitionDO) => {
 			// Spread data across multiple keys so no single key hits the promotion threshold.
 			// Stop as soon as the split is queued to stay below the 10% reject band.
-			const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * 1 * 1024 * 1024 * 0.7);
+			const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * 1 * 1024 * 1024 * 0.65);
 			const tData = "x".repeat(chunkBytes);
 			for (let i = 0; ; i++) {
 				try {

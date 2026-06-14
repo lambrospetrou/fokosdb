@@ -185,6 +185,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 est_bytes INTEGER NOT NULL DEFAULT 0
             ) STRICT;`,
 	},
+	{
+		idMonotonicInc: 5,
+		description: "Index promoted_keys by status for O(1) in-flight existence checks",
+		sql: `CREATE INDEX IF NOT EXISTS idx_promoted_keys_status ON promoted_keys (status);`,
+	},
 ];
 
 // ---------------------------------------------------------------------------
@@ -670,6 +675,13 @@ export class PartitionStore {
 	getPromotedKeyStatus(hk: string): PromotedKeyStatus | undefined {
 		return this.#storage.sql.exec<{ status: PromotedKeyStatus }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk).toArray()[0]
 			?.status;
+	}
+
+	hasInFlightPromotedKeys(): boolean {
+		return (
+			this.#storage.sql.exec<{ one: 1 }>(`SELECT 1 AS one FROM promoted_keys WHERE status IN ('queued', 'promoting') LIMIT 1`).toArray()
+				.length > 0
+		);
 	}
 
 	/**

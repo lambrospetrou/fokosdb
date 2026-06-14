@@ -54,13 +54,9 @@ export class PromotionManager {
 		return this.#keys.has(hashKey);
 	}
 
-	// Promotion⇄hash-split mutual exclusion input for the split policy, answered from the
-	// in-memory cache (no storage read needed).
+	// Promotion⇄hash-split mutual exclusion input for the split policy.
 	hasInFlightPromotions(): boolean {
-		for (const status of this.#keys.values()) {
-			if (status === "queued" || status === "promoting") return true;
-		}
-		return false;
+		return this.deps.store.hasInFlightPromotedKeys();
 	}
 
 	/**
@@ -247,8 +243,8 @@ export class PromotionManager {
 	 * (promoted keys with local items left). Feeds the DO's next-alarm computation.
 	 */
 	needsBackgroundWork(): boolean {
+		if (this.deps.store.hasInFlightPromotedKeys()) return true;
 		for (const [hashKey, status] of this.#keys) {
-			if (status === "queued" || status === "promoting") return true;
 			if (status === "promoted" && this.deps.store.hasItemsForHashKey(hashKey)) return true;
 		}
 		return false;
