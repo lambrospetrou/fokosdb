@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper, hashRootIndex, resolveRangePartitionContext } from "./partition-id.js";
+import { KeyCodec } from "./key-codec.js";
 import type { SplitStatusKVItem } from "./split-state.js";
 import { assertExists } from "../tsutils.js";
 
@@ -77,7 +78,9 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	} {
 		// First find the hash partition!
 		// Root tree index first.
-		let hIdxs: number[] = [hashRootIndex(hashKey, this.basePartitionContext.rootTreesN)];
+		// TEMP (M1 adapter, removed in M5): the router still speaks `string` keys; encode at this
+		// boundary so the hash primitives operate on canonical KeyBytes. M5 encodes once at db.ts entry.
+		let hIdxs: number[] = [hashRootIndex(KeyCodec.encode(hashKey), this.basePartitionContext.rootTreesN)];
 
 		// TODO: Based on the topology encoding and the topology cache find the right partition.
 		// {

@@ -1,4 +1,5 @@
 import { hashChildIndex } from "./hash-primitives.js";
+import type { KeyBytes } from "./key-codec.js";
 
 export type HashTopologySnapshot = {
 	// Zero-copy Uint8Array view over the used portion of the arena buffer (nextFree * 4 bytes).
@@ -70,7 +71,7 @@ export class HashTopology {
 	 * Traverse the cache for hashKey. Returns the relative depth of the deepest known descendant.
 	 * @return relative depth (0 = immediate child is the target; no deeper split recorded yet)
 	 */
-	findLeaf(hashKey: string): number {
+	findLeaf(hashKey: KeyBytes): number {
 		let block = 0;
 		let relDepth = 0;
 		while (true) {
@@ -89,7 +90,7 @@ export class HashTopology {
 	 * @param actualRelDepth The actual relative depth of the target partition that served the request (non-split leaf).
 	 * @return true if the cache was modified (caller should persist).
 	 */
-	updateFromHint(hashKey: string, actualRelDepth: number): boolean {
+	updateFromHint(hashKey: KeyBytes, actualRelDepth: number): boolean {
 		let block = 0;
 		let updated = false;
 		for (let rd = 0; rd < actualRelDepth; rd++) {

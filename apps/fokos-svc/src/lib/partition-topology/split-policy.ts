@@ -1,5 +1,6 @@
 import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { hashChildIndex } from "./hash-primitives.js";
+import { KeyCodec } from "./key-codec.js";
 import type { SplitType } from "./types.js";
 import { isHashPartition, type InitFromSplitOptions, type PartitionContextResolved } from "./partition-context.js";
 import {
@@ -249,9 +250,11 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
 		const parentDepth = PartitionIdHelper.depth(partitionIdBytes);
 
+		// TEMP (M1 adapter, removed in M3): this method still speaks `string`; encode once here.
+		const hashKeyBytes = KeyCodec.encode(hashKey);
 		const hashIdxs: number[] = [];
 		for (let i = 0; i < relativeDepthToLeaf; i++) {
-			hashIdxs.push(hashChildIndex(hashKey, parentDepth + i, partitionContext.hashSplitN));
+			hashIdxs.push(hashChildIndex(hashKeyBytes, parentDepth + i, partitionContext.hashSplitN));
 		}
 
 		return resolveDescendantHashPartitionContext(this.partitionContext, partitionContext, partitionIdBytes, hashIdxs);
@@ -265,7 +268,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		if (this.#_hashTopology) {
 			// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
 			// or 0 if the cache is not populated at all yet.
-			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
+			// TEMP (M1 adapter, removed in M3): encode the string key for the byte-typed topology cache.
+			const cachedDepth = this.#_hashTopology.findLeaf(KeyCodec.encode(hashKey));
 			if (cachedDepth > 0) {
 				return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
 			}
@@ -287,7 +291,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitN}`,
 		);
 		return (hashKey: string, sortKey?: string) => {
-			const hashedIdx = hashChildIndex(hashKey, childLevel - 1, childContext.hashSplitN);
+			// TEMP (M1 adapter, removed in M3): encode the string key for byte-typed hashing.
+			const hashedIdx = hashChildIndex(KeyCodec.encode(hashKey), childLevel - 1, childContext.hashSplitN);
 			return hashedIdx === childIdx;
 		};
 	}
@@ -323,7 +328,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const targetRelDepth = responseHashDepth - fromAbsDepth;
 		if (this.#_hashTopology && targetRelDepth > 0) {
-			if (this.#_hashTopology.updateFromHint(hashKey, targetRelDepth)) {
+			// TEMP (M1 adapter, removed in M3): encode the string key for the byte-typed topology cache.
+			if (this.#_hashTopology.updateFromHint(KeyCodec.encode(hashKey), targetRelDepth)) {
 				this.#storage.kv.put<HashTopologySnapshot>("__topo_cache", this.#_hashTopology.toSnapshot());
 			}
 		}
