@@ -1,5 +1,5 @@
 import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
-import { hashChildIndex } from "./hash-primitives.js";
+import { hashChildIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
 import { isHashPartition, type InitFromSplitOptions, type PartitionContextResolved } from "./partition-context.js";
@@ -487,13 +487,17 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		for (const childCtx of splitStatus.childPartitionContexts) {
 			const childStart = childCtx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
 			if (KeyCodec.compare(childStart, sk) <= 0) {
-				if (best === null || KeyCodec.compare(childStart, bestStart!) > 0) {
+				if (best === null || bestStart === null || KeyCodec.compare(childStart, bestStart) > 0) {
 					best = childCtx;
 					bestStart = childStart;
 				}
 			}
 		}
-		invariant(best !== null, `fokos/range: no child found for sortKey "${KeyCodec.keyForLog(sk)}"`);
+		if (best === null) {
+			// This should never happen: the children tile the whole range, so at least the leftmost
+			// child must have startBoundary <= sk.
+			throw new Error(`fokos/range: no child found for sortKey ${KeyCodec.keyForLog(sk)}`);
+		}
 
 		return { doId: resolveDoId(partitionContext.ns, best.doName), partitionContext: best };
 	}

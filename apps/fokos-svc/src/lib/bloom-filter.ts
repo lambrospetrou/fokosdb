@@ -1,4 +1,4 @@
-import { xxHash32 } from "js-xxhash";
+import { hash32 } from "./hash-primitives.js";
 
 /**
  * Layered Bloom Filter
@@ -277,8 +277,8 @@ export enum AddResult {
  * count increases by one.
  */
 function layerAddIfAbsent(layer: Layer, key: string | Uint8Array): AddResult {
-	const h1 = xxHash32(key, layer.layerIndex * 2);
-	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
+	const h1 = hash32(key, layer.layerIndex * 2);
+	const h2 = hash32(key, layer.layerIndex * 2 + 1) || 1;
 	let allSet = true;
 	for (let i = 0; i < layer.k; i++) {
 		const pos = (h1 + i * h2) % layer.m;
@@ -299,8 +299,8 @@ function layerAddIfAbsent(layer: Layer, key: string | Uint8Array): AddResult {
  * Computes positions inline with early exit on the first unset bit.
  */
 function layerHas(layer: Layer, key: string | Uint8Array): boolean {
-	const h1 = xxHash32(key, layer.layerIndex * 2);
-	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
+	const h1 = hash32(key, layer.layerIndex * 2);
+	const h2 = hash32(key, layer.layerIndex * 2 + 1) || 1;
 	for (let i = 0; i < layer.k; i++) {
 		const pos = (h1 + i * h2) % layer.m;
 		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) return false;

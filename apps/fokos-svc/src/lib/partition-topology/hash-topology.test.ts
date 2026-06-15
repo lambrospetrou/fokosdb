@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { HashTopology } from "./hash-topology.js";
-import { hashChildIndex } from "./hash-primitives.js";
+import { hashChildIndex } from "../hash-primitives.js";
 import { KeyCodec } from "./key-codec.js";
 
 // The topology cache and hash primitives now speak KeyBytes; encode at the test boundary.

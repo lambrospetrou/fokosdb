@@ -73,7 +73,7 @@ export function validateTransactWriteOperations(ops: readonly TransactWriteOpera
 			);
 		}
 		// Collision-proof composite identity for arbitrary key bytes.
-		const key = KeyCodec.pairKey(KeyCodec.encode(op.hashKey), KeyCodec.encodeOptional(op.sortKey));
+		const key = `${op.hashKey.length}:${op.hashKey}:${op.sortKey ?? ""}`;
 		if (seen.has(key)) {
 			throw new Error(
 				`fokos: transactWriteItems duplicate key (${KeyCodec.keyForLog(KeyCodec.encode(op.hashKey))}, ${op.sortKey ? KeyCodec.keyForLog(KeyCodec.encode(op.sortKey)) : ""})`,

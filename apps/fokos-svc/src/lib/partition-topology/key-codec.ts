@@ -14,6 +14,8 @@
  * from RPC and BLOB reads — a zero-cost cast).
  */
 
+import { hash64 } from "../hash-primitives.js";
+
 declare const KEY_BRAND: unique symbol;
 export type KeyBytes = Uint8Array & { readonly [KEY_BRAND]: true };
 
@@ -133,27 +135,30 @@ function shortestSeparator(lo: KeyBytes, hi: KeyBytes): KeyBytes {
 
 /**
  * Human-readable rendering of a key for logs and error messages. Valid UTF-8
- * strings render as `"text"`; binary (0xFF-tagged) and the empty sentinel render as `hex:...`. Never
+ * strings render as `"text"`; binary (0xFF-tagged) and the empty sentinel render as `b64:...`. Never
  * used for comparison or identity — display only. Raw `KeyBytes` must never print as a bare array.
  */
 function keyForLog(k: KeyBytes): string {
 	if (k.length === 0) return "<empty>";
-	if (k[0] === BINARY_TAG) return `hex:${k.toHex()}`;
+	if (k[0] === BINARY_TAG) return `b64:${k.toBase64({ alphabet: "base64url" })}`;
 	try {
 		// fatal:true throws on invalid UTF-8 so we fall back to hex rather than emitting U+FFFD garbage.
+		// TODO: Do we need the stringification here or just return whatever decode() returns?
 		return JSON.stringify(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(k));
 	} catch {
-		return `hex:${k.toHex()}`;
+		return `b64:${k.toBase64({ alphabet: "base64url" })}`;
 	}
 }
 
 /**
  * Stable, collision-free string identity for a single key, for use as a Map/Set key (a raw
- * `Uint8Array` can't be a Map key — it compares by reference). Hex of the canonical bytes: distinct
- * keys ⇒ distinct strings. Display only via `keyForLog`; this one is for identity/lookup.
+ * `Uint8Array` can't be a Map key — it compares by reference).
+ * We could use Base64 but it requires a copy of a string each time.
  */
-function mapKey(k: KeyBytes): string {
-	return k.toHex();
+function mapKey(k: KeyBytes): bigint {
+	// This can lead to collisions though when using xxhash32, which can happen once we go couple tens of thousands of keys.
+	// We use xxhash64 to get a bigint identity for the key, which is stable and has a very low collision probability.
+	return hash64(k);
 }
 
 /**
@@ -162,8 +167,10 @@ function mapKey(k: KeyBytes): string {
  * contain 0x00. Hex is a fixed alphabet that never contains ':', so the separator is unambiguous for
  * arbitrary bytes. Used for 2PC keyset comparison and duplicate detection.
  */
-function pairKey(hk: KeyBytes, sk: KeyBytes): string {
-	return `${hk.toHex()}:${sk.toHex()}`;
+function pairKey(hk: KeyBytes, sk: KeyBytes): bigint {
+	const hkHash = mapKey(hk);
+	const skHash = mapKey(sk);
+	return (hkHash << 64n) | skHash;
 }
 
 export const KeyCodec = {

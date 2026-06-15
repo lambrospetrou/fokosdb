@@ -148,15 +148,17 @@ export class TransactionParticipant {
 			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
 			const pendingKeySet = new Set(pendingRows.map((r) => KeyCodec.pairKey(r.hk, r.sk)));
 			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
-			invariant(
-				pendingKeySet.size === requestKeySet.size,
-				`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
-			);
-			for (const key of requestKeySet) {
-				invariant(
-					pendingKeySet.has(key),
-					`fokos/partition.commit: request item ${key} not found in pending_transactions for transaction ${request.transactionId}`,
+			if (pendingKeySet.size !== requestKeySet.size) {
+				throw new Error(
+					`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
 				);
+			}
+			for (const key of requestKeySet) {
+				if (!pendingKeySet.has(key)) {
+					throw new Error(
+						`fokos/partition.commit: request item ${key} not found in pending_transactions for transaction ${request.transactionId}`,
+					);
+				}
 			}
 
 			this.#applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);

@@ -379,7 +379,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const status = this.#store.getPromotedKeyStatus(hk);
 				invariant(
 					status === "promoting",
-					`fokos/partition.getItemsBatch: key "${KeyCodec.keyForLog(hk)}" is not in promoting state (got ${status})`,
+					() => `fokos/partition.getItemsBatch: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
 				);
 				return this.getItemsBatchForRange(hk, null, null, opts.cursor);
 			}
@@ -474,7 +474,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const status = this.#store.getPromotedKeyStatus(hk);
 				invariant(
 					status === "promoting",
-					`fokos/partition.getPartitionTransactionMetadata: key "${KeyCodec.keyForLog(hk)}" is not in promoting state (got ${status})`,
+					() => `fokos/partition.getPartitionTransactionMetadata: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
 				);
 				return { maxDeletedTs, pendingTransactions: [], nextCursor: null };
 			}

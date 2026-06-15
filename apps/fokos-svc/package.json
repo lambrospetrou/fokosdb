@@ -29,6 +29,7 @@
 		"typescript": "^5.9.3",
 		"valibot": "^1.4.0",
 		"vitest": "^4.1.7",
-		"wrangler": "^4.94.0"
+		"wrangler": "^4.94.0",
+		"xxhash-wasm": "^1.1.0"
 	}
 }

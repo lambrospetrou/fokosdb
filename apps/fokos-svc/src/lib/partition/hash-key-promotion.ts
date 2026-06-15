@@ -42,10 +42,16 @@ export type PromotionManagerDeps = {
  * Hash DOs only: range DOs never have promoted_keys rows, so every method is a no-op there.
  */
 export class PromotionManager {
-	// In-memory cache of promoted_keys, loaded at DO startup via loadFromStorage(). Keyed by the
-	// stable hex identity of the hashKey (a Uint8Array can't be a Map key); the KeyBytes is kept in
+	// In-memory cache of promoted_keys, loaded at DO startup via loadFromStorage().
+	// Keyed by a stable identity of the hashKey (a Uint8Array can't be a Map key); the KeyBytes is kept in
 	// the value so callers get the real key back.
-	#keys: Map<string, { key: KeyBytes; status: PromotedKeyStatus }> = new Map();
+	//
+	// We can use key.toHex()/toBase64() as the stable identity, but that allocates a string per request on the hot routing path (statusFor()/has()).
+	// We can use KeyCodec.mapKey(hashKey) to get a stable number identity for the key, which avoids the string allocation and is faster to compare.
+	//
+	// For full correctness we could simply just scrap the in-memory cache and only rely on the store but that would lead to extra rows read charges.
+	// We might decide that it's fine in the end, but for now we will keep the in-memory cache.
+	#keys: Map<bigint, { key: KeyBytes; status: PromotedKeyStatus }> = new Map();
 
 	constructor(private readonly deps: PromotionManagerDeps) {}
 
@@ -221,6 +227,7 @@ export class PromotionManager {
 				message: "fokos/partition: Failed to trigger promotion migration.",
 				hashKey: KeyCodec.keyForLog(hashKey),
 				error: String(e),
+				errorProps: e,
 			});
 		}
 	}
@@ -244,6 +251,7 @@ export class PromotionManager {
 					message: "fokos/partition: Promotion GC job failed.",
 					hashKey: KeyCodec.keyForLog(hashKey),
 					error: String(error),
+					errorProps: error,
 				});
 			}
 		}

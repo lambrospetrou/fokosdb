@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { GOLDEN_RATIO, hashChildIndex, hashRootIndex } from "./hash-primitives.js";
-import { KeyCodec } from "./key-codec.js";
+import { KeyCodec } from "./partition-topology/key-codec.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 

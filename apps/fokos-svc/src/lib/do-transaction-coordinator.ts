@@ -560,8 +560,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		// Key-based comparison guards against any future reordering in PartitionDO. Re-encode the
 		// decoded result keys to a collision-proof composite identity for arbitrary key bytes.
-		const resultKey = (r: ReadForTransactionItemResult): string =>
-			KeyCodec.pairKey(KeyCodec.encode(r.hashKey), KeyCodec.encodeOptional(r.sortKey));
+		const resultKey = (r: ReadForTransactionItemResult): string => `${r.hashKey.length}:${r.hashKey}:${r.sortKey ?? ""}`;
 		const phase2ByKey = new Map(phase2Flat.map((r) => [resultKey(r), r]));
 		for (const p1 of phase1Flat) {
 			const p2 = phase2ByKey.get(resultKey(p1));

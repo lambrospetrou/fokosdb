@@ -1,4 +1,4 @@
-import { hashChildIndex } from "./hash-primitives.js";
+import { hashChildIndex } from "../hash-primitives.js";
 import type { KeyBytes } from "./key-codec.js";
 
 export type HashTopologySnapshot = {

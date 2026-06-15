@@ -287,7 +287,7 @@ type PeerCalls = {
 	inits: InitFromSplitOptions[];
 	triggers: number;
 	/** Hash keys whose range-root initFromSplit should keep failing (exhausting the retry loop). */
-	failInitFor: Set<string>;
+	failInitFor: Set<bigint>;
 };
 
 function makePeer(calls: PeerCalls): PromotionPeer {

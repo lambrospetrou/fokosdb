@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved, PartitionNamespaceKey } from "./partition-context.js";
 import type { PartitionNodeId } from "./types.js";
-import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
+import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { assertExists } from "../tsutils.js";
 import invariant from "../invariant.js";
