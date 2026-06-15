@@ -2091,6 +2091,130 @@ describe("PartitionDO — range split", () => {
 		expect(leftmost!.doName).not.toBe(rootCtx.doName);
 	});
 
+	describe("queryItems across the split range tree", () => {
+		// Build a promoted range root, populate it, and complete its split into N leaf children.
+		const buildSplitTree = async (N: number) => {
+			const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
+			expect(sks.length).toBeGreaterThanOrEqual(N);
+			await vi.waitFor(
+				async () => {
+					await drainSplitTree(rootStub);
+					const s = await rootStub.status();
+					if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+				},
+				{ timeout: 5000, interval: 100 },
+			);
+			return { rootCtx, rootStub, sks };
+		};
+
+		const queryPage = (
+			rootStub: DurableObjectStub<PartitionDO>,
+			rootCtx: PartitionContextResolved,
+			overrides: Partial<Parameters<PartitionDO["queryItems"]>[1]> = {},
+		) =>
+			rootStub.queryItems(rootCtx, {
+				hashKey: kb("alice"),
+				interval: {}, // whole hashKey
+				direction: "asc",
+				budgetBytes: 64 * 1024 * 1024,
+				remainingLimit: null,
+				maxPartitionVisits: 1000,
+				cursor: null,
+				...overrides,
+			});
+
+		// Page through the whole result set, accumulating decoded sort keys and the set of leaf DOs touched.
+		const collect = async (
+			rootStub: DurableObjectStub<PartitionDO>,
+			rootCtx: PartitionContextResolved,
+			overrides: Partial<Parameters<PartitionDO["queryItems"]>[1]> = {},
+		) => {
+			const out: Array<string | Uint8Array> = [];
+			const leaves = new Set<string>();
+			let cursor: Parameters<PartitionDO["queryItems"]>[1]["cursor"] = null;
+			let pages = 0;
+			for (;;) {
+				const res = await queryPage(rootStub, rootCtx, { ...overrides, cursor });
+				pages++;
+				for (const it of res.items) out.push(KeyCodec.decode(it.sk));
+				for (const m of res.partitionMetas) leaves.add(m.servedByActorName);
+				if (res.nextCursor === null) break;
+				cursor = res.nextCursor;
+				invariant(pages < 1000, "queryItems pagination did not terminate");
+			}
+			return { sks: out, leaves, pages };
+		};
+
+		it("returns every item across all N leaves in a single page (regression: must not stop at the leftmost leaf)", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+
+			const res = await queryPage(rootStub, rootCtx);
+			expect(res.nextCursor).toBeNull();
+			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+
+			// The fan-out actually touched every leaf — before the fix it routed by the sentinel sort key
+			// to the single leftmost leaf and silently dropped the rest.
+			const leaves = new Set(res.partitionMetas.map((m) => m.servedByActorName));
+			expect(leaves.size).toBe(N);
+			// partitionMetas is leaf-only: N leaves, the router contributes no entry but is counted in forwardCount.
+			expect(res.partitionMetas).toHaveLength(N);
+			expect(res.meta.forwardCount).toBe(N);
+		});
+
+		it("paginates across leaves under a tight byte budget without dropping or duplicating items", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+
+			const { sks: got, leaves, pages } = await collect(rootStub, rootCtx, { budgetBytes: 130 * 1024 });
+			expect(pages).toBeGreaterThan(1); // genuinely multi-page
+			expect(leaves.size).toBe(N); // every leaf eventually visited
+			expect(got).toEqual([...sks].sort()); // complete and ordered
+			expect(new Set(got.map(String)).size).toBe(got.length); // no duplicates
+		});
+
+		it("walks leaves in descending order for scanIndexForward=false", async () => {
+			const { rootCtx, rootStub, sks } = await buildSplitTree(4);
+
+			const { sks: got, leaves } = await collect(rootStub, rootCtx, { direction: "desc", budgetBytes: 130 * 1024 });
+			expect(leaves.size).toBe(4);
+			expect(got).toEqual([...sks].sort().reverse());
+		});
+
+		it("honors remainingLimit across the walk (stops mid-fan-out with a resumable cursor)", async () => {
+			const { rootCtx, rootStub, sks } = await buildSplitTree(4);
+			expect(sks.length).toBeGreaterThanOrEqual(6);
+
+			const res = await queryPage(rootStub, rootCtx, { remainingLimit: 5 });
+			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort().slice(0, 5));
+			expect(res.nextCursor).not.toBeNull();
+		});
+
+		it("caps the fan-out per page (maxPartitionVisits) and resumes via a boundary cursor without gaps or duplicates", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+
+			// One leaf per page forces the boundary continuation cursor on every page but the last; a
+			// generous byte/limit budget ensures only the partition-visit cap drives pagination.
+			const { sks: got, leaves, pages } = await collect(rootStub, rootCtx, { maxPartitionVisits: 1 });
+			expect(pages).toBeGreaterThanOrEqual(N); // one leaf per page → at least N pages
+			expect(leaves.size).toBe(N);
+			expect(got).toEqual([...sks].sort());
+			expect(new Set(got.map(String)).size).toBe(got.length); // no duplicates (boundary key not dropped or repeated)
+		});
+
+		it("caps the fan-out per page for descending scans too", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+
+			const { sks: got, leaves, pages } = await collect(rootStub, rootCtx, { direction: "desc", maxPartitionVisits: 1 });
+			expect(pages).toBeGreaterThanOrEqual(N);
+			expect(leaves.size).toBe(N);
+			expect(got).toEqual([...sks].sort().reverse());
+			expect(new Set(got.map(String)).size).toBe(got.length);
+		});
+	});
+
 	describe("PartialRangeTopology", () => {
 		it("reduces getItem forwardCount from 2 to 1 on second access when bloom filter has learned a key promoted from a hash-depth-2 leaf", async () => {
 			const hashKey = "probe-key";

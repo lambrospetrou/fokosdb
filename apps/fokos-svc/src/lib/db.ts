@@ -1,5 +1,15 @@
-import { DeleteItemOptions, GetItemOptions, GetItemResult, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
-import { PartitionDO } from "./do-partition.js";
+import {
+	DeleteItemOptions,
+	GetItemOptions,
+	GetItemResult,
+	InitiateReadResponse,
+	InitiateWriteResponse,
+	PutItemOptions,
+	QueryItemsMeta,
+	QueryItemsOptions,
+	QueryItemsResult,
+} from "./types.js";
+import { PartitionDO, type QueryItemsRpcRequest } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
@@ -9,6 +19,9 @@ import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { isErrorRetryable } from "durable-utils/do-utils";
+import { normalizeSkInterval } from "./query/sk-interval.js";
+import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
+import { PageBudget } from "./query/page-budget.js";
 
 export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
 
@@ -152,6 +165,133 @@ export class FokosDB {
 			},
 			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
 		);
+	}
+
+	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+		if (opts.queries.length === 0) {
+			throw new Error("fokos/queryItems: queries must not be empty");
+		}
+		if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit <= 0)) {
+			throw new Error("fokos/queryItems: limit must be a positive integer when provided");
+		}
+		if (opts.maxPageBytes !== undefined && (!Number.isSafeInteger(opts.maxPageBytes) || opts.maxPageBytes <= 0)) {
+			throw new Error("fokos/queryItems: maxPageBytes must be a positive integer when provided");
+		}
+
+		const normalizedQueries = opts.queries.map((q) => {
+			const direction = (q.scanIndexForward ?? true) ? ("asc" as const) : ("desc" as const);
+			return {
+				hashKey: encodeHashKey(q.hashKey),
+				interval: normalizeSkInterval(q.sort, encodeSortKey),
+				direction,
+				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
+			};
+		});
+		const fingerprint = computeCursorFingerprint(normalizedQueries);
+
+		const DEFAULT_MAX_PAGE_BYTES = 3 * 1024 * 1024;
+		const SERVER_MAX_PAGE_BYTES = 16 * 1024 * 1024;
+		const budget = new PageBudget(Math.min(opts.maxPageBytes ?? DEFAULT_MAX_PAGE_BYTES, SERVER_MAX_PAGE_BYTES), opts.limit ?? null, 100);
+
+		let startQueryIdx = 0;
+		let startInner: DecodedCursor["inner"] = null;
+		if (opts.cursor !== undefined) {
+			const decoded = decodeCursor(opts.cursor);
+			if (decoded.queryIdx >= normalizedQueries.length) throw new Error("fokos/queryItems: cursor queryIdx out of range");
+			if (decoded.direction !== normalizedQueries[decoded.queryIdx].cursorDirection)
+				throw new Error("fokos/queryItems: cursor direction mismatch — scanIndexForward differs from the page that issued this cursor");
+			if (decoded.fingerprint !== fingerprint) throw new Error("fokos/queryItems: cursor fingerprint mismatch — re-send the same request");
+			startQueryIdx = decoded.queryIdx;
+			startInner = decoded.inner;
+		}
+
+		const items: QueryItemsResult["items"] = [];
+		const partitionMetas: QueryItemsResult["partitionMetas"] = [];
+		let forwardCount = 0;
+		let cursor: string | undefined;
+
+		for (let qi = startQueryIdx; qi < normalizedQueries.length; qi++) {
+			const query = normalizedQueries[qi];
+			if (query.interval === null) continue;
+
+			const rpcCursor: QueryItemsRpcRequest["cursor"] =
+				qi === startQueryIdx && startInner !== null
+					? { hk: startInner.hashKey, sk: startInner.sortKey, inclusive: startInner.inclusive }
+					: null;
+
+			const { doId, partitionContext } = this.#options.topology.pickPartition(query.hashKey, KeyCodec.encodeOptional(undefined));
+			const stub = this.#options.ns.get(doId);
+
+			const rpcResult = await stub.queryItems(partitionContext, {
+				hashKey: query.hashKey,
+				interval: query.interval,
+				direction: query.direction,
+				budgetBytes: budget.remainingBytes,
+				remainingLimit: budget.remainingLimit,
+				maxPartitionVisits: budget.remainingVisits,
+				cursor: rpcCursor,
+			});
+
+			for (const item of rpcResult.items) {
+				items.push({
+					hashKey: KeyCodec.decode(item.hk),
+					sortKey: item.sk.byteLength === 0 ? undefined : KeyCodec.decode(item.sk),
+					data: item.data,
+					ttlEpochUTCSeconds: item.ttl_epoch_utc_seconds ?? undefined,
+					version: item.v,
+				});
+			}
+			partitionMetas.push(...rpcResult.partitionMetas);
+			forwardCount += rpcResult.meta.forwardCount;
+			budget.consume(rpcResult.bytesConsumed, rpcResult.items.length, rpcResult.partitionMetas.length);
+
+			if (rpcResult.nextCursor !== null) {
+				cursor = encodeCursor({
+					version: CURSOR_VERSION,
+					direction: query.cursorDirection,
+					fingerprint,
+					queryIdx: qi,
+					inner: {
+						hashKey: rpcResult.nextCursor.hk,
+						sortKey: rpcResult.nextCursor.sk,
+						inclusive: rpcResult.nextCursor.inclusive ?? false,
+					},
+				});
+				break;
+			}
+
+			if (budget.exhausted) {
+				if (budget.visitsExhausted) {
+					console.warn("fokos/queryItems: maxPartitionVisits budget exhausted across sub-queries, paginating early");
+				}
+				let nextQueryIdx = -1;
+				for (let j = qi + 1; j < normalizedQueries.length; j++) {
+					if (normalizedQueries[j].interval !== null) {
+						nextQueryIdx = j;
+						break;
+					}
+				}
+				if (nextQueryIdx !== -1) {
+					cursor = encodeCursor({
+						version: CURSOR_VERSION,
+						direction: normalizedQueries[nextQueryIdx].cursorDirection,
+						fingerprint,
+						queryIdx: nextQueryIdx,
+						inner: null,
+					});
+				}
+				break;
+			}
+		}
+
+		const meta: QueryItemsMeta = {
+			rowsRead: partitionMetas.reduce((s, m) => s + m.rowsRead, 0),
+			rowsReturned: items.length,
+			forwardCount,
+			partitionsVisited: partitionMetas.length,
+		};
+
+		return { items, count: items.length, cursor, meta, partitionMetas };
 	}
 
 	async destroy(): Promise<{ ok: true }> {

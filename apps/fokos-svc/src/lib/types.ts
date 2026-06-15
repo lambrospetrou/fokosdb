@@ -115,3 +115,47 @@ export type {
 	TCWriteOperation,
 	TCReadItem,
 } from "./transaction-types.js";
+
+// ─── queryItems public API ────────────────────────────────────────────────────
+
+export type SortKeyCondition =
+	| { op: "eq"; value: string | Uint8Array }
+	| { op: "lt" | "lte" | "gt" | "gte"; value: string | Uint8Array }
+	| { op: "between"; lower: string | Uint8Array; upper: string | Uint8Array }
+	| { op: "begins_with"; prefix: string | Uint8Array }
+	| {
+			op: "range";
+			lower?: { value: string | Uint8Array; inclusive: boolean };
+			upper?: { value: string | Uint8Array; inclusive: boolean };
+	  };
+
+export type QueryItemsOptions = {
+	queries: Array<{ hashKey: string | Uint8Array; sort?: SortKeyCondition; scanIndexForward?: boolean }>;
+	limit?: number;
+	maxPageBytes?: number;
+	cursor?: string;
+};
+
+export type QueryItemsMeta = {
+	rowsRead: number;
+	rowsReturned: number;
+	forwardCount: number;
+	partitionsVisited: number;
+};
+
+export type QueryItemsResult = {
+	// FIXME: `data` is the raw stored representation (string | Uint8Array) — the HTTP layer
+	// re-encodes it via `encodeData`. Consider aligning this type with the wire format or
+	// introducing a separate HTTP response type.
+	items: Array<{
+		hashKey: string | Uint8Array;
+		sortKey?: string | Uint8Array;
+		data: string | Uint8Array;
+		ttlEpochUTCSeconds?: number;
+		version: number;
+	}>;
+	count: number;
+	cursor?: string;
+	meta: QueryItemsMeta;
+	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+};

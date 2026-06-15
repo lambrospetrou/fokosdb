@@ -490,15 +490,29 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Pages one hashKey's items within the slice [lower, end) in sk order. Resumes strictly after
-	 * `cursor` when provided, otherwise starts at the slice's lower bound; `end === null` = unbounded.
+	 * Pages one hashKey's items in the given direction with explicit per-end inclusivity.
+	 *
+	 * - `lower`: start bound (value + inclusive flag). When cursor is absent, emits `sk >= lower`
+	 *   (inclusive) or `sk > lower` (exclusive). When cursor is present, resumes after the cursor
+	 *   (`sk > cursor.sk`, or `sk >= cursor.sk` when `cursorInclusive`) — the lower bound is ignored.
+	 * - `upper`: end bound (value + inclusive flag), or `null` for unbounded. Emits `sk <= upper`
+	 *   (inclusive) or `sk < upper` (exclusive).
+	 * - `cursorInclusive`: when a cursor is present, include the cursor row itself instead of
+	 *   resuming strictly past it. Used by the range-walk's boundary continuation cursor.
+	 *
+	 * Callers that always want lower-inclusive / upper-exclusive (e.g. migration) pass
+	 * `lowerInclusive: true, upperInclusive: false`.
 	 */
 	queryRangeItemsPage(opts: {
 		hk: KeyBytes;
 		lower: KeyBytes;
-		end: KeyBytes | null;
+		lowerInclusive: boolean;
+		upper: KeyBytes | null;
+		upperInclusive: boolean;
 		cursor: MigrationCursor | null;
+		cursorInclusive?: boolean;
 		limit: number;
+		direction: "asc" | "desc";
 	}): MigratedItem[] {
 		type Row = {
 			hk: ArrayBuffer;
@@ -510,20 +524,41 @@ export class PartitionStore {
 		};
 		const conds: string[] = ["hk = ?"];
 		const params: unknown[] = [opts.hk];
-		if (opts.cursor) {
-			conds.push("sk > ?");
-			params.push(opts.cursor.sk);
+
+		if (opts.direction === "asc") {
+			// Near-bound (start): cursor wins; else use lower bound.
+			if (opts.cursor) {
+				conds.push(opts.cursorInclusive ? "sk >= ?" : "sk > ?");
+				params.push(opts.cursor.sk);
+			} else {
+				conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
+				params.push(opts.lower);
+			}
+			// Far-bound (end): upper.
+			if (opts.upper !== null) {
+				conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
+				params.push(opts.upper);
+			}
 		} else {
-			conds.push("sk >= ?");
-			params.push(opts.lower);
+			// Near-bound (start descending): cursor wins; else use upper bound.
+			if (opts.cursor) {
+				conds.push(opts.cursorInclusive ? "sk <= ?" : "sk < ?");
+				params.push(opts.cursor.sk);
+			} else if (opts.upper !== null) {
+				conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
+				params.push(opts.upper);
+			}
+			// Far-bound (end descending): lower. Skip the condition when it's the zero-length
+			// sentinel with inclusive=true — that matches all keys and adds nothing to the query.
+			if (opts.lower.byteLength > 0 || !opts.lowerInclusive) {
+				conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
+				params.push(opts.lower);
+			}
 		}
-		if (opts.end !== null) {
-			conds.push("sk < ?");
-			params.push(opts.end);
-		}
+
 		const page = this.#storage.sql
 			.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk LIMIT ?`,
+				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
 				...params,
 				opts.limit,
 			)
