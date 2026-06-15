@@ -23,6 +23,7 @@ Once there is a stable version ready, I will properly refactor the directory str
 No particular order.
 
 - Implement queryItems with pagination similar to the PartiQL execution though that allows multiple hash keys too.
+- Enforce the expiration ttl for items.
 - Batch item operations (non-transactions).
 - Allow check conditions and filter conditions on any attribute if the data is not bytes.
 - Update partial range topology within each partition to maintain also range boundaries.
