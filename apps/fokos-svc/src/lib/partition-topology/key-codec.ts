@@ -162,10 +162,8 @@ function mapKey(k: KeyBytes): bigint {
 }
 
 /**
- * Stable, collision-free string identity for a (hashKey, sortKey) pair — replaces the old
- * `` `${hashKey}\0${sortKey}` `` joiner, which is NOT collision-proof now that binary keys may legally
- * contain 0x00. Hex is a fixed alphabet that never contains ':', so the separator is unambiguous for
- * arbitrary bytes. Used for 2PC keyset comparison and duplicate detection.
+ * Stable, collision-free string identity for a (hashKey, sortKey) pair.
+ * Used for 2PC keyset comparison and duplicate detection.
  */
 function pairKey(hk: KeyBytes, sk: KeyBytes): bigint {
 	const hkHash = mapKey(hk);

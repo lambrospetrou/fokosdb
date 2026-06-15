@@ -24,6 +24,7 @@ import {
 	areMutableOptionsEqual,
 	isHashPartition,
 	isRangePartition,
+	pCtxForLog,
 	PartitionContext,
 	PartitionContextResolved,
 	type InitFromSplitOptions,
@@ -719,7 +720,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			...this.logParams(),
 			message: "fokos/partition: Alarm triggered.",
 			alarmInfo,
-			status: await this.status(),
 		});
 		this.__testing__alarm_running = true;
 		try {
@@ -738,7 +738,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			console.log({
 				...this.logParams(),
 				message: "fokos/partition: Split conditions met.",
-				splitStatus,
+				splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
 			});
 			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 			this.scheduleBackgroundWork({ delayMs: 10 });
@@ -807,7 +807,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					error: String(error),
 					errorProps: error,
 					doId: doId.toString(),
-					childContext,
+					childContext: {
+						parentPartitionContext: pCtxForLog(childContext.parentPartitionContext),
+						newPartitionContext: pCtxForLog(childContext.newPartitionContext),
+						splitType: childContext.splitType,
+					},
 				});
 				throw error; // Rethrow to be caught by the outer try-catch and trigger a retry of the split process.
 			}
@@ -824,7 +828,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				message: "fokos/topology: Some split initialization failed, aborting split process. Will retry later.",
 				error: String(error),
 				errorProps: error,
-				parentPartitionContext: this.pCtx(),
+				parentPartitionContext: pCtxForLog(this.pCtx()),
 			});
 
 			// By throwing here we stop the split process. The next request will call `queueSplit()` again
@@ -859,7 +863,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		console.log({
 			message: "fokos/topology: Split process completed successfully.",
-			childPartitionContexts: childInits,
+			childPartitionContexts: childInits.map((c) => ({
+				parentPartitionContext: pCtxForLog(c.parentPartitionContext),
+				newPartitionContext: pCtxForLog(c.newPartitionContext),
+				splitType: c.splitType,
+			})),
 		});
 	}
 
@@ -1254,7 +1262,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					console.log({
 						...this.logParams(),
 						message: "fokos/partition: Running split process.",
-						splitStatus,
+						splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
 					});
 					await tryWhile(
 						async () => {
@@ -1355,7 +1363,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				message: "fokos/partition: Background work failed with unexpected error.",
 				error: String(error),
 				errorProps: error,
-				status: await this.status(),
 			});
 		} finally {
 			/////////////////////////////////////////////////
@@ -1470,8 +1477,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			actorId: this.ctx.id.toString(),
 			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
-			// Always put the raw partition context in the logs for better debugging, even if it's undefined.
-			partitionContext: this.#_partitionContext ?? null,
+			// Always put the partition context in the logs for better debugging, even if it's undefined.
+			// KeyBytes fields are rendered via keyForLog so they never appear as bare Uint8Array.
+			partitionContext: pCtxForLog(this.#_partitionContext),
 		};
 	}
 }

@@ -1,5 +1,5 @@
 import type { PartitionNodeId, SplitType } from "./types.js";
-import type { KeyBytes } from "./key-codec.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
 // Type-only import: erased at emit, so it creates NO runtime module cycle with do-partition.ts
 // (the value-level cycle is what the layering refactor eliminated). It exists solely so the
 // namespace-key filter below can match by class identity — structural alternatives collapse to
@@ -92,6 +92,25 @@ export function isRangePartition(ctx: PartitionContextResolved): ctx is Partitio
 	rangePartition: NonNullable<PartitionContextResolved["rangePartition"]>;
 } {
 	return Boolean(ctx.rangePartition);
+}
+
+/**
+ * Log-safe rendering of a PartitionContextResolved. Converts KeyBytes fields in rangePartition to
+ * human-readable strings via keyForLog so they never appear as bare Uint8Array in operational logs.
+ */
+export function pCtxForLog(ctx: PartitionContextResolved | null | undefined): Record<string, unknown> {
+	if (!ctx) return { partitionContext: null };
+	const { rangePartition, ...rest } = ctx;
+	return {
+		...rest,
+		rangePartition: rangePartition
+			? {
+					hashKey: KeyCodec.keyForLog(rangePartition.hashKey),
+					startBoundary: rangePartition.startBoundary !== null ? KeyCodec.keyForLog(rangePartition.startBoundary) : null,
+					endBoundary: rangePartition.endBoundary !== null ? KeyCodec.keyForLog(rangePartition.endBoundary) : null,
+				}
+			: rangePartition,
+	};
 }
 
 export function areImmutableOptionsEqual(opts1: PartitionContext, opts2: PartitionContext): boolean {

@@ -5,7 +5,7 @@ import { PartitionDO } from "../do-partition.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
 import { estimateRowBytes, PartitionStore } from "./partition-store.js";
 
-const kb = (s: string) => KeyCodec.encode(s);
+const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
 // Runs `fn` against a PartitionStore over REAL Durable Object storage (vitest-pool-workers).
 // The PartitionDO constructor has already run the schema migrations by the time the callback runs;
@@ -306,6 +306,37 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			put(store, "hk", "apple", "banana", "cherry", "mango", "peach");
 			// Range [cherry, mango) → only "cherry" qualifies (mango excluded) — 1 item < N=2
 			expect(store.computeRangeSplitBoundaries(kb("hk"), kb("cherry"), kb("mango"), 2)).toBeNull();
+		});
+	});
+
+	it("handles astral (U+FFFF vs emoji) and binary sort keys in byte order", async () => {
+		// The canonical byte-order divergence: UTF-8 for U+FFFF is EF BF BF (3 bytes),
+		// UTF-8 for 😀 (U+1F600) is F0 9F 98 80 (4 bytes, leading F0 > EF).
+		// KeyCodec.compare and SQLite BLOB ORDER BY must both place "￿" before "😀".
+		// This was broken by the old UTF-16 shortestSeparator and is now a regression guard.
+		const uFFFF = "￿"; // U+FFFF, UTF-8: EF BF BF
+		const emoji = "😀"; // U+1F600, UTF-8: F0 9F 98 80
+		const bin = new Uint8Array([0x01, 0x02]); // binary key, 0xFF-tagged → FF 01 02
+
+		await withStore(async (store) => {
+			// Insert in a non-sorted order so the DB sort is doing real work.
+			for (const sk of [emoji, bin, uFFFF]) {
+				store.upsertItem({
+					hk: kb("hk"),
+					sk: kb(sk),
+					data: new Uint8Array(0),
+					ttlEpochUtcSeconds: null,
+					lastTransactionTs: 0,
+				});
+			}
+			// N=2 → 1 boundary between the 3 items in byte order: uFFFF < emoji < binary
+			// Boundary should lie between uFFFF and emoji (both are sort keys).
+			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 2);
+			expect(boundaries).not.toBeNull();
+			expect(boundaries!.length).toBe(1);
+			// Boundary must satisfy: encode(uFFFF) < boundary <= encode(emoji)
+			expect(KeyCodec.compare(kb(uFFFF), boundaries![0])).toBeLessThan(0);
+			expect(KeyCodec.compare(boundaries![0], kb(emoji))).toBeLessThanOrEqual(0);
 		});
 	});
 });

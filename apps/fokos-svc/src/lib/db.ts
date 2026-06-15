@@ -4,13 +4,36 @@ import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import { validateItemKeys, validateTransactWriteOperations } from "./transaction-limits.js";
-import { KeyCodec } from "./partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { isErrorRetryable } from "durable-utils/do-utils";
 
 export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
+
+// DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
+// DynamoDB uses 2KB for hashKey and 1KB for sortKey.
+// We start stricter and we can raise later.
+const MAX_HASH_KEY_BYTES = 1024;
+const MAX_SORT_KEY_BYTES = 512;
+
+function encodeHashKey(k: string | Uint8Array): KeyBytes {
+	const bytes = KeyCodec.encode(k);
+	if (bytes.byteLength > MAX_HASH_KEY_BYTES) {
+		throw new Error(`fokos: hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+	}
+	return bytes;
+}
+
+function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
+	if (k === undefined) return KeyCodec.encodeOptional(undefined);
+	const bytes = KeyCodec.encode(k);
+	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
+		throw new Error(`fokos: sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+	}
+	return bytes;
+}
 
 export type FokosDBOptions = {
 	ns: DurableObjectNamespace<PartitionDO>;
@@ -47,8 +70,8 @@ export class FokosDB {
 
 	async putItem(opts: PutItemOptions) {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const hashKey = KeyCodec.encode(opts.hashKey);
-		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey);
+		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
 		const res = await stub.putItem(partitionContext, { ...opts, hashKey, sortKey });
@@ -58,8 +81,8 @@ export class FokosDB {
 
 	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const hashKey = KeyCodec.encode(opts.hashKey);
-		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey);
+		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
 		const res = await stub.getItem(partitionContext, { ...opts, hashKey, sortKey });
@@ -72,8 +95,8 @@ export class FokosDB {
 
 	async deleteItem(opts: DeleteItemOptions) {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const hashKey = KeyCodec.encode(opts.hashKey);
-		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey);
+		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
 		const res = await stub.deleteItem(partitionContext, { ...opts, hashKey, sortKey });
@@ -94,8 +117,8 @@ export class FokosDB {
 		// Validate raw keys at the single boundary, then encode once and route on the encoded keys.
 		validateTransactWriteOperations(opts.operations);
 		const operations: TCWriteOperation[] = opts.operations.map((op) => {
-			const hashKey = KeyCodec.encode(op.hashKey);
-			const sortKey = KeyCodec.encodeOptional(op.sortKey);
+			const hashKey = encodeHashKey(op.hashKey);
+			const sortKey = encodeSortKey(op.sortKey);
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 			return { ...op, hashKey, sortKey, partitionContext };
 		});
@@ -113,8 +136,8 @@ export class FokosDB {
 	}): Promise<InitiateReadResponse> {
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
-			const hashKey = KeyCodec.encode(item.hashKey);
-			const sortKey = KeyCodec.encodeOptional(item.sortKey);
+			const hashKey = encodeHashKey(item.hashKey);
+			const sortKey = encodeSortKey(item.sortKey);
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 			return { ...item, hashKey, sortKey, partitionContext };
 		});
