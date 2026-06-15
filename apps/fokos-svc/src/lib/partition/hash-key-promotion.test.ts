@@ -4,11 +4,14 @@ import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../do-partition.js";
 import { PartitionContextCreator, type PartitionContext, type PartitionContextResolved } from "../partition-topology/partition-context.js";
 import { PartitionIdHelper, rangePartitionDoName } from "../partition-topology/partition-id.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { RANGE_PROMOTION_FRACTION } from "../partition-topology/split-policy.js";
 import type { SplitStatusKVItem } from "../partition-topology/split-state.js";
 import { PromotionManager, type PromotionPeer } from "./hash-key-promotion.js";
 import { PartitionStore } from "./partition-store.js";
 import type { InitFromSplitOptions } from "../partition-topology/partition-context.js";
+
+const kb = (s: string) => KeyCodec.encode(s);
 
 const MAX_SIZE_MB = 1;
 const THRESHOLD_BYTES = MAX_SIZE_MB * RANGE_PROMOTION_FRACTION * 1024 * 1024;
@@ -18,14 +21,14 @@ describe("PromotionManager — queue threshold", () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, scheduled } = penv;
 
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES - 1);
-			expect(manager.statusFor("alice")).toBeUndefined();
-			expect(store.getPromotedKeyStatus("alice")).toBeUndefined();
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES - 1);
+			expect(manager.statusFor(kb("alice"))).toBeUndefined();
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBeUndefined();
 			expect(scheduled).toEqual([]);
 
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
-			expect(manager.statusFor("alice")).toBe("queued");
-			expect(store.getPromotedKeyStatus("alice")).toBe("queued");
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
+			expect(manager.statusFor(kb("alice"))).toBe("queued");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("queued");
 			expect(scheduled).toEqual([10]);
 			expect(manager.hasInFlightPromotions()).toBe(true);
 			expect(manager.needsBackgroundWork()).toBe(true);
@@ -36,11 +39,11 @@ describe("PromotionManager — queue threshold", () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, base, store, scheduled } = penv;
 
-			manager.maybeQueuePromotion(rangeCtx(base, "alice", null, null), "alice", THRESHOLD_BYTES * 10);
-			expect(store.getPromotedKeyStatus("alice")).toBeUndefined();
+			manager.maybeQueuePromotion(rangeCtx(base, kb("alice"), null, null), kb("alice"), THRESHOLD_BYTES * 10);
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBeUndefined();
 
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES * 10);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES * 10);
 			expect(scheduled).toEqual([10]); // only the first call queued anything
 		});
 	});
@@ -49,12 +52,12 @@ describe("PromotionManager — queue threshold", () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, scheduled } = penv;
 			// The row advanced in storage (e.g. before a crash) but this manager's cache is empty.
-			store.insertPromotedKey("alice", "queued", 1);
-			store.updatePromotedKeyStatus("alice", "queued", "promoting", 2);
+			store.insertPromotedKey(kb("alice"), "queued", 1);
+			store.updatePromotedKeyStatus(kb("alice"), "queued", "promoting", 2);
 
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
-			expect(manager.statusFor("alice")).toBe("promoting");
-			expect(store.getPromotedKeyStatus("alice")).toBe("promoting");
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
+			expect(manager.statusFor(kb("alice"))).toBe("promoting");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoting");
 			expect(scheduled).toEqual([]);
 		});
 	});
@@ -64,80 +67,80 @@ describe("PromotionManager — drive and cutover", () => {
 	it("drives a queued key: init range root → cutover to 'promoting' → trigger migration", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 
 			await manager.drive(pCtx, () => undefined);
 
 			expect(calls.inits).toHaveLength(1);
 			expect(calls.inits[0].splitType).toBe("range");
 			expect(calls.inits[0].parentPartitionContext.doName).toBe(pCtx.doName);
-			expect(calls.inits[0].newPartitionContext.rangePartition).toEqual({ hashKey: "alice", startBoundary: null, endBoundary: null });
+			expect(calls.inits[0].newPartitionContext.rangePartition).toEqual({ hashKey: kb("alice"), startBoundary: null, endBoundary: null });
 			expect(calls.triggers).toBe(1);
-			expect(manager.statusFor("alice")).toBe("promoting");
-			expect(store.getPromotedKeyStatus("alice")).toBe("promoting");
-			expect(manager.activeRangeRootHashKeys()).toEqual(["alice"]);
+			expect(manager.statusFor(kb("alice"))).toBe("promoting");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoting");
+			expect(manager.activeRangeRootHashKeys()).toEqual([kb("alice")]);
 		});
 	});
 
 	it("defers cutover while the key holds a pending lock, then completes on re-drive", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
-			insertLock(store, "alice", "tx1");
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
+			insertLock(store, kb("alice"), "tx1");
 
 			await manager.drive(pCtx, () => undefined);
 			expect(calls.inits).toHaveLength(1); // root init happens before the cutover check
 			expect(calls.triggers).toBe(0);
-			expect(manager.statusFor("alice")).toBe("queued");
-			expect(store.getPromotedKeyStatus("alice")).toBe("queued");
+			expect(manager.statusFor(kb("alice"))).toBe("queued");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("queued");
 			expect(manager.needsBackgroundWork()).toBe(true); // retried on a later cycle
 
 			store.deletePendingTx("tx1");
 			await manager.drive(pCtx, () => undefined);
 			expect(calls.triggers).toBe(1);
-			expect(manager.statusFor("alice")).toBe("promoting");
+			expect(manager.statusFor(kb("alice"))).toBe("promoting");
 		});
 	});
 
 	it("re-drive after a successful cutover is a no-op (idempotent)", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 
 			await manager.drive(pCtx, () => undefined);
 			await manager.drive(pCtx, () => undefined);
 
 			expect(calls.inits).toHaveLength(1);
 			expect(calls.triggers).toBe(1);
-			expect(manager.statusFor("alice")).toBe("promoting");
+			expect(manager.statusFor(kb("alice"))).toBe("promoting");
 		});
 	});
 
 	it("skips promotion entirely while a hash split is queued or started (mutual exclusion)", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 			const splitQueued: SplitStatusKVItem = { status: "split_queued", splitType: "hash", createdAt: 0, partitionContext: pCtx };
 
 			await manager.drive(pCtx, () => splitQueued);
 
 			expect(calls.inits).toHaveLength(0);
 			expect(calls.triggers).toBe(0);
-			expect(manager.statusFor("alice")).toBe("queued");
+			expect(manager.statusFor(kb("alice"))).toBe("queued");
 		});
 	});
 
 	it("a per-key failure is logged and does not block the remaining queued keys", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
-			manager.maybeQueuePromotion(pCtx, "bob", THRESHOLD_BYTES);
-			calls.failInitFor.add("alice"); // every init for alice fails (exhausts the ≤5 retries)
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("bob"), THRESHOLD_BYTES);
+			calls.failInitFor.add(KeyCodec.mapKey(kb("alice"))); // every init for alice fails (exhausts the ≤5 retries)
 
 			await manager.drive(pCtx, () => undefined);
 
-			expect(manager.statusFor("alice")).toBe("queued");
-			expect(store.getPromotedKeyStatus("bob")).toBe("promoting");
+			expect(manager.statusFor(kb("alice"))).toBe("queued");
+			expect(store.getPromotedKeyStatus(kb("bob"))).toBe("promoting");
 			expect(calls.triggers).toBe(1);
 		});
 	});
@@ -145,15 +148,15 @@ describe("PromotionManager — drive and cutover", () => {
 	it("cutover races: storage no longer 'queued' → cache resynced, no migration trigger", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, calls } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 			// The status advanced in storage behind this cache (e.g. a concurrent ack path).
-			store.updatePromotedKeyStatus("alice", "queued", "promoting", 2);
-			store.updatePromotedKeyStatus("alice", "promoting", "promoted", 3);
+			store.updatePromotedKeyStatus(kb("alice"), "queued", "promoting", 2);
+			store.updatePromotedKeyStatus(kb("alice"), "promoting", "promoted", 3);
 
 			await manager.drive(pCtx, () => undefined);
 
 			expect(calls.triggers).toBe(0);
-			expect(manager.statusFor("alice")).toBe("promoted");
+			expect(manager.statusFor(kb("alice"))).toBe("promoted");
 		});
 	});
 });
@@ -162,20 +165,20 @@ describe("PromotionManager — acknowledgePromotionComplete", () => {
 	it("transitions promoting → promoted and schedules the GC cycle; re-ack is idempotent", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, store, scheduled } = penv;
-			manager.maybeQueuePromotion(pCtx, "alice", THRESHOLD_BYTES);
+			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 			await manager.drive(pCtx, () => undefined);
 			scheduled.length = 0;
 
-			await manager.acknowledgePromotionComplete("alice");
-			expect(manager.statusFor("alice")).toBe("promoted");
-			expect(store.getPromotedKeyStatus("alice")).toBe("promoted");
+			await manager.acknowledgePromotionComplete(kb("alice"));
+			expect(manager.statusFor(kb("alice"))).toBe("promoted");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoted");
 			expect(scheduled).toEqual([1_000]);
 			expect(manager.hasInFlightPromotions()).toBe(false);
-			expect(manager.activeRangeRootHashKeys()).toEqual(["alice"]);
+			expect(manager.activeRangeRootHashKeys()).toEqual([kb("alice")]);
 
-			await manager.acknowledgePromotionComplete("alice");
-			expect(manager.statusFor("alice")).toBe("promoted");
-			expect(store.getPromotedKeyStatus("alice")).toBe("promoted");
+			await manager.acknowledgePromotionComplete(kb("alice"));
+			expect(manager.statusFor(kb("alice"))).toBe("promoted");
+			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoted");
 		});
 	});
 });
@@ -194,23 +197,23 @@ describe("PromotionManager — GC", () => {
 				gcBatchLimit: 2,
 			});
 			for (const sk of ["1", "2", "3"]) {
-				store.upsertItem({ hk: "alice", sk, data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
+				store.upsertItem({ hk: kb("alice"), sk: kb(sk), data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
 			}
-			store.upsertItem({ hk: "bob", sk: "1", data: "y", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
-			insertLock(store, "alice", "tx1");
-			store.insertPromotedKey("alice", "promoted", 1);
+			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
+			insertLock(store, kb("alice"), "tx1");
+			store.insertPromotedKey(kb("alice"), "promoted", 1);
 			manager.loadFromStorage();
 
 			// Cycle 1: bounded batch (2 of 3 rows) — residual work remains.
 			manager.runGC();
-			expect(store.hasItemsForHashKey("alice")).toBe(true);
-			expect(store.pendingLockFor("alice", "1")).toBeUndefined();
+			expect(store.hasItemsForHashKey(kb("alice"))).toBe(true);
+			expect(store.pendingLockFor(kb("alice"), kb("1"))).toBeUndefined();
 			expect(manager.needsBackgroundWork()).toBe(true);
 
 			// Cycle 2: drains the residue.
 			manager.runGC();
-			expect(store.hasItemsForHashKey("alice")).toBe(false);
-			expect(store.hasItemsForHashKey("bob")).toBe(true);
+			expect(store.hasItemsForHashKey(kb("alice"))).toBe(false);
+			expect(store.hasItemsForHashKey(kb("bob"))).toBe(true);
 			expect(manager.needsBackgroundWork()).toBe(false);
 		});
 	});
@@ -220,20 +223,20 @@ describe("PromotionManager — cache views", () => {
 	it("loadFromStorage + snapshot + inheritKey expose the storage truth", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, store } = penv;
-			store.insertPromotedKey("alice", "promoted", 1);
-			store.insertPromotedKey("bob", "queued", 1);
+			store.insertPromotedKey(kb("alice"), "promoted", 1);
+			store.insertPromotedKey(kb("bob"), "queued", 1);
 			manager.loadFromStorage();
 
-			expect(manager.snapshot().sort((a, b) => a.hashKey.localeCompare(b.hashKey))).toEqual([
-				{ hashKey: "alice", status: "promoted" },
-				{ hashKey: "bob", status: "queued" },
+			expect(manager.snapshot().sort((a, b) => KeyCodec.compare(a.hashKey, b.hashKey))).toEqual([
+				{ hashKey: kb("alice"), status: "promoted" },
+				{ hashKey: kb("bob"), status: "queued" },
 			]);
-			expect(manager.has("alice")).toBe(true);
-			expect(manager.statusFor("bob")).toBe("queued");
+			expect(manager.has(kb("alice"))).toBe(true);
+			expect(manager.statusFor(kb("bob"))).toBe("queued");
 
-			manager.inheritKey("carol", "promoting");
-			expect(manager.statusFor("carol")).toBe("promoting");
-			expect(manager.activeRangeRootHashKeys().sort()).toEqual(["alice", "carol"]);
+			manager.inheritKey(kb("carol"), "promoting");
+			expect(manager.statusFor(kb("carol"))).toBe("promoting");
+			expect(manager.activeRangeRootHashKeys().sort()).toEqual([kb("alice"), kb("carol")].sort());
 		});
 	});
 });
@@ -255,7 +258,7 @@ function hashCtx(base: PartitionContext, idxs: number[]): PartitionContextResolv
 	return { ...base, doName: doName!, primaryDoIdStr: "", partitionId: opaque };
 }
 
-function rangeCtx(base: PartitionContext, hashKey: string, start: string | null, end: string | null): PartitionContextResolved {
+function rangeCtx(base: PartitionContext, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): PartitionContextResolved {
 	const { opaque } = PartitionIdHelper.fromRangePartition(base, hashKey, start, end).encode(false);
 	return {
 		...base,
@@ -266,10 +269,10 @@ function rangeCtx(base: PartitionContext, hashKey: string, start: string | null,
 	};
 }
 
-function insertLock(store: PartitionStore, hk: string, transactionId: string): void {
+function insertLock(store: PartitionStore, hk: KeyBytes, transactionId: string): void {
 	store.insertPendingLock({
 		hk,
-		sk: "1",
+		sk: kb("1"),
 		transaction_id: transactionId,
 		transaction_ts: 123,
 		operation: "put",
@@ -290,7 +293,7 @@ type PeerCalls = {
 function makePeer(calls: PeerCalls): PromotionPeer {
 	return {
 		async initFromSplit(opts) {
-			const hk = opts.newPartitionContext.rangePartition?.hashKey ?? "";
+			const hk = KeyCodec.mapKey(opts.newPartitionContext.rangePartition?.hashKey ?? KeyCodec.encodeOptional(undefined));
 			if (calls.failInitFor.has(hk)) throw new Error("simulated range-root init failure");
 			calls.inits.push(opts);
 		},

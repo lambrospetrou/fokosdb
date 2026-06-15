@@ -14,8 +14,8 @@ export type ItemCondition =
 	| { type: "attribute_equals"; attribute: "v"; value: number };
 
 export type PutItemOptions = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 	ttlSeconds?: number;
 	ttlEpochUTCSeconds?: number;
 
@@ -25,15 +25,15 @@ export type PutItemOptions = {
 };
 
 export type DeleteItemOptions = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 
 	conditions?: ItemCondition[];
 };
 
 export type ItemKey = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 };
 
 export type PutItemResult = {
@@ -53,16 +53,16 @@ export interface ItemGetter {
 }
 
 export type GetItemOptions = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 };
 
 export type GetItemResult =
 	| {
 			found: true;
 			item: {
-				hashKey: string;
-				sortKey?: string;
+				hashKey: string | Uint8Array;
+				sortKey?: string | Uint8Array;
 				data: Uint8Array | string;
 				ttlEpochUTCSeconds?: number;
 				version: number;

@@ -1,4 +1,5 @@
 import { isHashPartition, type PartitionContextResolved } from "../partition-topology/partition-context.js";
+import type { KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore, MigrationCursor, PendingTransactionCursor, PromotedKeyCursor, PromotedKeyStatus } from "./partition-store.js";
 import type { PartitionPeer } from "./partition-peer.js";
 import invariant from "../invariant.js";
@@ -21,7 +22,7 @@ export type SplitMigrationDeps = {
 	/** Structured-log context (the DO's logParams), so extracted logs keep their shape. */
 	logParams: () => Record<string, unknown>;
 	/** Keeps the DO's in-memory promoted-keys cache in sync with inherited entries. */
-	onPromotedKeyInherited: (hashKey: string, status: PromotedKeyStatus) => void;
+	onPromotedKeyInherited: (hashKey: KeyBytes, status: PromotedKeyStatus) => void;
 	/** Test hook: awaited just before the final status transition + parent acknowledgement. */
 	beforeComplete?: () => Promise<void>;
 };

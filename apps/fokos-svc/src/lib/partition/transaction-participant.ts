@@ -9,7 +9,13 @@ import type {
 	TransactionItem,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { evaluateConditionsOnItem, type ItemSnapshot, type PartitionStore } from "./partition-store.js";
+
+// Decode a sort key for a user-facing result: the empty sentinel ([]) maps back to an absent sortKey.
+function decodeSortKey(sk: KeyBytes): string | Uint8Array | undefined {
+	return sk.length === 0 ? undefined : KeyCodec.decode(sk);
+}
 
 export type TransactionParticipantDeps = {
 	store: PartitionStore;
@@ -19,7 +25,7 @@ export type TransactionParticipantDeps = {
 	 * Called after a committed "put" lands, with the key's updated size estimate — the DO wires
 	 * this to the promotion manager's queue check so the participant stays promotion-agnostic.
 	 */
-	onItemUpserted?: (hashKey: string, keyEstBytes: number) => void;
+	onItemUpserted?: (hashKey: KeyBytes, keyEstBytes: number) => void;
 };
 
 /**
@@ -34,7 +40,7 @@ export class TransactionParticipant {
 
 	#store: PartitionStore;
 	#now: () => number;
-	#onItemUpserted?: (hashKey: string, keyEstBytes: number) => void;
+	#onItemUpserted?: (hashKey: KeyBytes, keyEstBytes: number) => void;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
@@ -58,7 +64,8 @@ export class TransactionParticipant {
 
 		return this.#store.transactionSync<PrepareResponse>(() => {
 			for (const item of request.items) {
-				const sk = item.sortKey ?? "";
+				const sk = item.sortKey;
+				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
 
 				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
@@ -70,8 +77,7 @@ export class TransactionParticipant {
 						outcome: "rejected",
 						reason: {
 							type: "pending_conflict",
-							hashKey: item.hashKey,
-							sortKey: item.sortKey,
+							...rejectionKeys,
 							conflictingTransactionId: pendingRow.transaction_id,
 						},
 					};
@@ -88,7 +94,7 @@ export class TransactionParticipant {
 					} catch {
 						return {
 							outcome: "rejected",
-							reason: { type: "condition_failed", hashKey: item.hashKey, sortKey: item.sortKey },
+							reason: { type: "condition_failed", ...rejectionKeys },
 						};
 					}
 				}
@@ -97,7 +103,7 @@ export class TransactionParticipant {
 					if (request.transactionTimestamp <= itemRow.last_transaction_ts) {
 						return {
 							outcome: "rejected",
-							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
+							reason: { type: "timestamp_conflict", ...rejectionKeys },
 						};
 					}
 				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
@@ -105,7 +111,7 @@ export class TransactionParticipant {
 					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
 						return {
 							outcome: "rejected",
-							reason: { type: "timestamp_conflict", hashKey: item.hashKey, sortKey: item.sortKey },
+							reason: { type: "timestamp_conflict", ...rejectionKeys },
 						};
 					}
 				}
@@ -113,7 +119,7 @@ export class TransactionParticipant {
 
 			// All checks passed — lock every item.
 			for (const item of request.items) {
-				const sk = item.sortKey ?? "";
+				const sk = item.sortKey;
 				this.#store.insertPendingLock({
 					hk: item.hashKey,
 					sk,
@@ -140,8 +146,8 @@ export class TransactionParticipant {
 
 		this.#store.transactionSync(() => {
 			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
-			const pendingKeySet = new Set(pendingRows.map((r) => `${r.hk}\0${r.sk}`));
-			const requestKeySet = new Set(request.items.map((i) => `${i.hashKey}\0${i.sortKey ?? ""}`));
+			const pendingKeySet = new Set(pendingRows.map((r) => KeyCodec.pairKey(r.hk, r.sk)));
+			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
 			invariant(
 				pendingKeySet.size === requestKeySet.size,
 				`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
@@ -162,13 +168,17 @@ export class TransactionParticipant {
 
 	#applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
 		for (const item of items) {
-			const sk = item.sortKey ?? "";
+			const sk = item.sortKey;
 			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
 
 			if (!pendingRow) continue;
 
 			if (pendingRow.operation === "put") {
-				invariant(pendingRow.data !== null, `fokos/partition.commit: pending "put" row has no data (hk=${item.hashKey}, sk=${sk})`);
+				invariant(
+					pendingRow.data !== null,
+					() =>
+						`fokos/partition.commit: pending "put" row has no data (hk=${KeyCodec.keyForLog(item.hashKey)}, sk=${KeyCodec.keyForLog(sk)})`,
+				);
 				const res = this.#store.upsertItem({
 					hk: item.hashKey,
 					sk,
@@ -193,19 +203,22 @@ export class TransactionParticipant {
 		const results: ReadForTransactionItemResult[] = [];
 
 		for (const item of request.items) {
-			const sk = item.sortKey ?? "";
+			const sk = item.sortKey;
 
 			const itemRow = this.#store.getItem(item.hashKey, sk).row;
 			const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
 			const hasPendingWrite = pendingRow != null;
 			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
+			// Decode the requested keys back to the public form for the result echo.
+			const hashKey = KeyCodec.decode(item.hashKey);
+			const sortKey = decodeSortKey(sk);
 
 			if (itemRow) {
 				results.push({
 					found: true,
-					hashKey: item.hashKey,
-					sortKey: item.sortKey,
+					hashKey,
+					sortKey,
 					data: itemRow.data,
 					lastCommittedTs,
 					hasPendingWrite,
@@ -213,8 +226,8 @@ export class TransactionParticipant {
 			} else {
 				results.push({
 					found: false,
-					hashKey: item.hashKey,
-					sortKey: item.sortKey,
+					hashKey,
+					sortKey,
 					lastCommittedTs,
 					hasPendingWrite,
 				});

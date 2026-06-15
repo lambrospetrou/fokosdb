@@ -1,4 +1,5 @@
 import type { PartitionNodeId, SplitType } from "./types.js";
+import type { KeyBytes } from "./key-codec.js";
 // Type-only import: erased at emit, so it creates NO runtime module cycle with do-partition.ts
 // (the value-level cycle is what the layering refactor eliminated). It exists solely so the
 // namespace-key filter below can match by class identity — structural alternatives collapse to
@@ -52,10 +53,12 @@ export type PartitionContextResolved = PartitionContext & {
 	// Redundant with the decoded partitionId, but kept denormalized for cheap routing/filters.
 	// Both boundaries are immutable: a range DO owns [startBoundary, endBoundary) for life; on split it
 	// becomes a pure router and its children own the sub-ranges.
+	// Canonical KeyBytes in memory (derived from the opaque partitionId on load; the partitionId is
+	// their serialized carrier — survives structured clone / KV / RPC). Compared only via KeyCodec.
 	rangePartition?: {
-		hashKey: string;
-		startBoundary: string | null; // null = unbounded lower edge (−∞)
-		endBoundary: string | null; // null = unbounded upper edge (+∞)
+		hashKey: KeyBytes;
+		startBoundary: KeyBytes | null; // null = unbounded lower edge (−∞)
+		endBoundary: KeyBytes | null; // null = unbounded upper edge (+∞)
 	};
 };
 

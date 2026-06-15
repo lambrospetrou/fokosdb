@@ -5,6 +5,9 @@ import { PartitionDO } from "../do-partition.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest } from "../transaction-types.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+
+const kb = (s: string) => KeyCodec.encode(s);
 
 const BASE_NOW = 1_000_000;
 
@@ -12,7 +15,7 @@ type Harness = {
 	participant: TransactionParticipant;
 	store: PartitionStore;
 	clock: { now: number };
-	upserts: Array<{ hashKey: string; keyEstBytes: number }>;
+	upserts: Array<{ hashKey: KeyBytes; keyEstBytes: number }>;
 };
 
 // Runs `fn` against a TransactionParticipant over REAL Durable Object storage (vitest-pool-workers).
@@ -24,7 +27,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const clock = { now: BASE_NOW };
-		const upserts: Array<{ hashKey: string; keyEstBytes: number }> = [];
+		const upserts: Array<{ hashKey: KeyBytes; keyEstBytes: number }> = [];
 		const participant = new TransactionParticipant({
 			store,
 			now: () => clock.now,
@@ -48,14 +51,14 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({
 				items: [
-					{ hashKey: "hk1", sortKey: "sk1", operation: "put", data: "v1" },
-					{ hashKey: "hk2", operation: "delete" },
+					{ hashKey: kb("hk1"), sortKey: kb("sk1"), operation: "put", data: "v1" },
+					{ hashKey: kb("hk2"), sortKey: KeyCodec.encodeOptional(undefined), operation: "delete" },
 				],
 			});
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.pendingLockFor("hk1", "sk1")?.transaction_id).toBe(request.transactionId);
-			expect(store.pendingLockFor("hk2", "")?.transaction_id).toBe(request.transactionId);
+			expect(store.pendingLockFor(kb("hk1"), kb("sk1"))?.transaction_id).toBe(request.transactionId);
+			expect(store.pendingLockFor(kb("hk2"), KeyCodec.encodeOptional(undefined))?.transaction_id).toBe(request.transactionId);
 
 			// Idempotent re-prepare: accepted again, no duplicate locks.
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -65,10 +68,10 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with pending_conflict when another transaction holds the lock", async () => {
 		await withParticipant(({ participant, store }) => {
-			const first = prepareReq({ items: [{ hashKey: "hk", sortKey: "sk", operation: "put", data: "v1" }] });
+			const first = prepareReq({ items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v1" }] });
 			expect(participant.prepareLocal(first)).toEqual({ outcome: "accepted" });
 
-			const second = prepareReq({ items: [{ hashKey: "hk", sortKey: "sk", operation: "put", data: "v2" }] });
+			const second = prepareReq({ items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2" }] });
 			expect(participant.prepareLocal(second)).toEqual({
 				outcome: "rejected",
 				reason: {
@@ -84,10 +87,10 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with condition_failed when an item condition does not hold", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: "hk", sk: "sk", data: "existing", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "existing", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
 
 			const request = prepareReq({
-				items: [{ hashKey: "hk", sortKey: "sk", operation: "put", data: "v", conditions: [{ type: "item_not_exists" }] }],
+				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v", conditions: [{ type: "item_not_exists" }] }],
 			});
 			expect(participant.prepareLocal(request)).toEqual({
 				outcome: "rejected",
@@ -99,11 +102,11 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with timestamp_conflict when the item's last transaction is not older", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: "hk", sk: "sk", data: "v", ttlEpochUtcSeconds: null, lastTransactionTs: BASE_NOW + 50 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "v", ttlEpochUtcSeconds: null, lastTransactionTs: BASE_NOW + 50 });
 
 			const atTs = prepareReq({
 				transactionTimestamp: BASE_NOW + 50, // equal to last_transaction_ts → conflict
-				items: [{ hashKey: "hk", sortKey: "sk", operation: "put", data: "v2" }],
+				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2" }],
 			});
 			expect(participant.prepareLocal(atTs)).toEqual({
 				outcome: "rejected",
@@ -112,7 +115,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			const aboveTs = prepareReq({
 				transactionTimestamp: BASE_NOW + 51,
-				items: [{ hashKey: "hk", sortKey: "sk", operation: "put", data: "v2" }],
+				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2" }],
 			});
 			expect(participant.prepareLocal(aboveTs)).toEqual({ outcome: "accepted" });
 		});
@@ -121,11 +124,11 @@ describe("TransactionParticipant - prepare", () => {
 	it("rejects with timestamp_conflict for an ABSENT item via the deletion watermark", async () => {
 		await withParticipant(({ participant, store }) => {
 			// A transactional delete bumps the watermark even though the row never existed.
-			store.deleteItem({ hk: "gone", sk: "", watermarkTs: BASE_NOW + 200, bumpWatermarkAlways: true });
+			store.deleteItem({ hk: kb("gone"), sk: KeyCodec.encodeOptional(undefined), watermarkTs: BASE_NOW + 200, bumpWatermarkAlways: true });
 
 			const atWatermark = prepareReq({
 				transactionTimestamp: BASE_NOW + 200,
-				items: [{ hashKey: "absent", operation: "check" }],
+				items: [{ hashKey: kb("absent"), sortKey: KeyCodec.encodeOptional(undefined), operation: "check" }],
 			});
 			expect(participant.prepareLocal(atWatermark)).toEqual({
 				outcome: "rejected",
@@ -134,7 +137,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			const aboveWatermark = prepareReq({
 				transactionTimestamp: BASE_NOW + 201,
-				items: [{ hashKey: "absent", operation: "check" }],
+				items: [{ hashKey: kb("absent"), sortKey: KeyCodec.encodeOptional(undefined), operation: "check" }],
 			});
 			expect(participant.prepareLocal(aboveWatermark)).toEqual({ outcome: "accepted" });
 		});
@@ -144,7 +147,7 @@ describe("TransactionParticipant - prepare", () => {
 		await withParticipant(({ participant, clock }) => {
 			const skewed = prepareReq({
 				transactionTimestamp: clock.now + TransactionParticipant.MAX_CLOCK_SKEW_MS + 1,
-				items: [{ hashKey: "hk", operation: "put", data: "v" }],
+				items: [{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" }],
 			});
 			expect(participant.prepareLocal(skewed)).toEqual({
 				outcome: "rejected",
@@ -158,7 +161,7 @@ describe("TransactionParticipant - prepare", () => {
 			// Exactly at the skew bound is allowed.
 			const atBound = prepareReq({
 				transactionTimestamp: clock.now + TransactionParticipant.MAX_CLOCK_SKEW_MS,
-				items: [{ hashKey: "hk", operation: "put", data: "v" }],
+				items: [{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" }],
 			});
 			expect(participant.prepareLocal(atBound)).toEqual({ outcome: "accepted" });
 		});
@@ -166,13 +169,19 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("locks nothing when any item in the request is rejected", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: "conflicting", sk: "", data: "v", ttlEpochUtcSeconds: null, lastTransactionTs: BASE_NOW + 500 });
+			store.upsertItem({
+				hk: kb("conflicting"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "v",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: BASE_NOW + 500,
+			});
 
 			const request = prepareReq({
 				transactionTimestamp: BASE_NOW + 100,
 				items: [
-					{ hashKey: "fine", operation: "put", data: "v" },
-					{ hashKey: "conflicting", operation: "put", data: "v" },
+					{ hashKey: kb("fine"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
+					{ hashKey: kb("conflicting"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({
@@ -180,7 +189,7 @@ describe("TransactionParticipant - prepare", () => {
 				reason: { type: "timestamp_conflict", hashKey: "conflicting", sortKey: undefined },
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
-			expect(store.pendingLockFor("fine", "")).toBeUndefined();
+			expect(store.pendingLockFor(kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
 		});
 	});
 });
@@ -188,14 +197,26 @@ describe("TransactionParticipant - prepare", () => {
 describe("TransactionParticipant - commit", () => {
 	it("applies put, delete, and check operations and clears the locks", async () => {
 		await withParticipant(({ participant, store, upserts }) => {
-			store.upsertItem({ hk: "to-delete", sk: "", data: "old", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk: "to-check", sk: "", data: "kept", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			store.upsertItem({
+				hk: kb("to-delete"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "old",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: 1,
+			});
+			store.upsertItem({
+				hk: kb("to-check"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "kept",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: 1,
+			});
 
 			const request = prepareReq({
 				items: [
-					{ hashKey: "to-put", operation: "put", data: "new-value" },
-					{ hashKey: "to-delete", operation: "delete" },
-					{ hashKey: "to-check", operation: "check" },
+					{ hashKey: kb("to-put"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "new-value" },
+					{ hashKey: kb("to-delete"), sortKey: KeyCodec.encodeOptional(undefined), operation: "delete" },
+					{ hashKey: kb("to-check"), sortKey: KeyCodec.encodeOptional(undefined), operation: "check" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -206,16 +227,19 @@ describe("TransactionParticipant - commit", () => {
 			).toEqual({ outcome: "committed" });
 
 			// put: written with the commit timestamp, and the promotion hook saw the upsert.
-			const put = store.getItem("to-put", "").row;
+			const put = store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row;
 			expect(put).toMatchObject({ data: "new-value", last_transaction_ts: commitTs });
-			expect(upserts).toEqual([{ hashKey: "to-put", keyEstBytes: expect.any(Number) }]);
+			expect(upserts).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
 			// delete: row gone and the deletion watermark advanced to the commit timestamp.
-			expect(store.getItem("to-delete", "").row).toBeUndefined();
+			expect(store.getItem(kb("to-delete"), KeyCodec.encodeOptional(undefined)).row).toBeUndefined();
 			expect(store.getMaxDeletedTs()).toBe(commitTs);
 
 			// check: data untouched, timestamp bumped.
-			expect(store.getItem("to-check", "").row).toMatchObject({ data: "kept", last_transaction_ts: commitTs });
+			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toMatchObject({
+				data: "kept",
+				last_transaction_ts: commitTs,
+			});
 
 			// All locks for the transaction are gone.
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
@@ -236,8 +260,8 @@ describe("TransactionParticipant - commit", () => {
 		await withParticipant(({ participant }) => {
 			const request = prepareReq({
 				items: [
-					{ hashKey: "a", operation: "put", data: "v" },
-					{ hashKey: "b", operation: "put", data: "v" },
+					{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
+					{ hashKey: kb("b"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -256,8 +280,8 @@ describe("TransactionParticipant - commit", () => {
 		await withParticipant(({ participant }) => {
 			const request = prepareReq({
 				items: [
-					{ hashKey: "a", operation: "put", data: "v" },
-					{ hashKey: "b", operation: "put", data: "v" },
+					{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
+					{ hashKey: kb("b"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -266,7 +290,7 @@ describe("TransactionParticipant - commit", () => {
 				participant.commitLocal({
 					transactionId: request.transactionId,
 					transactionTimestamp: request.transactionTimestamp,
-					items: [request.items[0], { hashKey: "c", operation: "put", data: "v" }],
+					items: [request.items[0], { hashKey: kb("c"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" }],
 				}),
 			).toThrow(/not found in pending_transactions/);
 		});
@@ -278,8 +302,8 @@ describe("TransactionParticipant - cancel", () => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({
 				items: [
-					{ hashKey: "a", operation: "put", data: "v" },
-					{ hashKey: "b", operation: "put", data: "v" },
+					{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
+					{ hashKey: kb("b"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
@@ -287,7 +311,9 @@ describe("TransactionParticipant - cancel", () => {
 			participant.cancelLocal(request.transactionId);
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 
-			const retry = prepareReq({ items: [{ hashKey: "a", operation: "put", data: "v2" }] });
+			const retry = prepareReq({
+				items: [{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v2" }],
+			});
 			expect(participant.prepareLocal(retry)).toEqual({ outcome: "accepted" });
 		});
 	});
@@ -296,17 +322,42 @@ describe("TransactionParticipant - cancel", () => {
 describe("TransactionParticipant - readForTransaction", () => {
 	it("returns data, lastCommittedTs, and hasPendingWrite per item", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: "existing", sk: "sk", data: "value", ttlEpochUtcSeconds: null, lastTransactionTs: 42 });
-			const lock = prepareReq({ items: [{ hashKey: "locked-absent", operation: "put", data: "v" }] });
+			store.upsertItem({
+				hk: kb("existing"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "value",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: 42,
+			});
+			const lock = prepareReq({
+				items: [{ hashKey: kb("locked-absent"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" }],
+			});
 			expect(participant.prepareLocal(lock)).toEqual({ outcome: "accepted" });
 
 			const response = participant.readForTransactionLocal({
 				transactionId: "read-tx",
-				items: [{ hashKey: "existing", sortKey: "sk" }, { hashKey: "locked-absent" }, { hashKey: "missing" }],
+				items: [
+					{ hashKey: kb("existing"), sortKey: KeyCodec.encodeOptional(undefined) },
+					{ hashKey: kb("locked-absent"), sortKey: KeyCodec.encodeOptional(undefined) },
+					{ hashKey: kb("missing"), sortKey: KeyCodec.encodeOptional(undefined) },
+				],
 			});
 			expect(response.items).toEqual([
-				{ found: true, hashKey: "existing", sortKey: "sk", data: "value", lastCommittedTs: 42, hasPendingWrite: false },
-				{ found: false, hashKey: "locked-absent", sortKey: undefined, lastCommittedTs: 0, hasPendingWrite: true },
+				{
+					found: true,
+					hashKey: "existing",
+					sortKey: undefined,
+					data: "value",
+					lastCommittedTs: 42,
+					hasPendingWrite: false,
+				},
+				{
+					found: false,
+					hashKey: "locked-absent",
+					sortKey: undefined,
+					lastCommittedTs: 0,
+					hasPendingWrite: true,
+				},
 				{ found: false, hashKey: "missing", sortKey: undefined, lastCommittedTs: 0, hasPendingWrite: false },
 			]);
 		});
@@ -318,8 +369,8 @@ describe("TransactionParticipant - stale transactions", () => {
 		await withParticipant(({ participant, clock }) => {
 			const request = prepareReq({
 				items: [
-					{ hashKey: "a", operation: "put", data: "v" },
-					{ hashKey: "b", operation: "put", data: "v" },
+					{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
+					{ hashKey: kb("b"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v" },
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });

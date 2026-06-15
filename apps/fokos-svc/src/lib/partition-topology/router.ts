@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper, hashRootIndex, resolveRangePartitionContext } from "./partition-id.js";
-import { KeyCodec } from "./key-codec.js";
+import type { KeyBytes } from "./key-codec.js";
 import type { SplitStatusKVItem } from "./split-state.js";
 import { assertExists } from "../tsutils.js";
 
@@ -13,7 +13,7 @@ export interface PartitionTopologyRouter {
 	 * @param hashKey
 	 * @param sortKey
 	 */
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+	pickPartition(hashKey: KeyBytes, sortKey?: KeyBytes): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 
 	/**
 	 * Returns a PartitionContextResolved for every root partition in the topology.
@@ -29,7 +29,7 @@ export interface PartitionTopologyRouter {
 	traverseForDestroy(
 		getStatus: (ctx: PartitionContextResolved) => Promise<{
 			splitStatus?: SplitStatusKVItem;
-			promotedKeys?: { hashKey: string; status: string }[];
+			promotedKeys?: { hashKey: KeyBytes; status: string }[];
 		}>,
 		visit: (ctx: PartitionContextResolved) => Promise<void>,
 	): Promise<void>;
@@ -53,7 +53,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	/**
 	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
 	 */
-	pickPartition(hashKey: string, sortKey?: string): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+	pickPartition(hashKey: KeyBytes, sortKey?: KeyBytes): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey });
 		const { ns } = this.basePartitionContext;
 		// Use idFromName to ensure the DO itself will have the `.name` populated within itself.
@@ -72,15 +72,13 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		};
 	}
 
-	private findPartition({ hashKey, sortKey }: { hashKey: string; sortKey?: string }): {
+	private findPartition({ hashKey, sortKey }: { hashKey: KeyBytes; sortKey?: KeyBytes }): {
 		doName: string;
 		partitionIdOpaque: string;
 	} {
 		// First find the hash partition!
-		// Root tree index first.
-		// TEMP (M1 adapter, removed in M5): the router still speaks `string` keys; encode at this
-		// boundary so the hash primitives operate on canonical KeyBytes. M5 encodes once at db.ts entry.
-		let hIdxs: number[] = [hashRootIndex(KeyCodec.encode(hashKey), this.basePartitionContext.rootTreesN)];
+		// Root tree index first. Keys arrive already-encoded (db.ts encodes at entry).
+		let hIdxs: number[] = [hashRootIndex(hashKey, this.basePartitionContext.rootTreesN)];
 
 		// TODO: Based on the topology encoding and the topology cache find the right partition.
 		// {
@@ -137,7 +135,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	async traverseForDestroy(
 		getStatus: (ctx: PartitionContextResolved) => Promise<{
 			splitStatus?: SplitStatusKVItem;
-			promotedKeys?: { hashKey: string; status: string }[];
+			promotedKeys?: { hashKey: KeyBytes; status: string }[];
 		}>,
 		visit: (ctx: PartitionContextResolved) => Promise<void>,
 	): Promise<void> {

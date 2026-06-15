@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved, PartitionNamespaceKey } from "./partition-context.js";
 import type { PartitionNodeId } from "./types.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { assertExists } from "../tsutils.js";
 import invariant from "../invariant.js";
 
@@ -13,21 +14,42 @@ import invariant from "../invariant.js";
  */
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
-// routing comparisons — there boundaries stay `string | null` with null = unbounded). Collision-proof
-// by construction: encodeRangeComponent escapes a literal "~" to "%7E", so a "~"-prefixed token can
-// never equal an encoded real boundary. No "exclude from valid sk" validation is required.
+// routing comparisons — there boundaries stay `KeyBytes | null` with null = unbounded). Collision-proof
+// by construction: encodeRangeComponent escapes the byte 0x7E ("~") to "%7E", so a "~"-prefixed token
+// can never equal an encoded real boundary. No "exclude from valid sk" validation is required.
 export const RANGE_MIN = "~min";
 export const RANGE_MAX = "~max";
 
-// Percent-encodes any char that is not [A-Za-z0-9_-] so the literal "." delimiters in range DO names are unambiguous.
-function encodeRangeComponent(s: string): string {
-	return s.replace(/[^A-Za-z0-9_-]/g, (c) => "%" + c.charCodeAt(0).toString(16).padStart(2, "0").toUpperCase());
+// Byte-correct percent-encoder for range DO names (SPEC sharp-edge #3). Each byte either passes through
+// literally (safe-set: printable ASCII 0x21–0x7D minus the reserved bytes below) or becomes %XX. This
+// is identity/serialization ONLY — never sorted or range-compared (ordering is always on KeyBytes).
+// Reserved (always escaped): % (the escape), . (our DO-name component delimiter), " and \ (JSON/log
+// cleanliness), and 0x7E ("~", reserved for the RANGE_MIN/RANGE_MAX sentinels). Control/high/binary
+// bytes (incl. the 0xFF binary-key tag) escape too — readable for ASCII text, reversible for any bytes.
+function isSafeNameByte(b: number): boolean {
+	if (b < 0x21 || b > 0x7d) return false; // control, space, DEL, and 0x7E (~, sentinel-reserved)
+	return b !== 0x22 /* " */ && b !== 0x25 /* % */ && b !== 0x2e /* . */ && b !== 0x5c /* \\ */;
+}
+
+// No matching decoder by design: the DO name is identity/serialization ONLY and is never decoded back
+// to keys in business logic — the in-memory rangePartition KeyBytes come from the opaque partitionId.
+function encodeRangeComponent(bytes: KeyBytes): string {
+	let out = "";
+	for (const b of bytes) {
+		out += isSafeNameByte(b) ? String.fromCharCode(b) : "%" + b.toString(16).padStart(2, "0").toUpperCase();
+	}
+	return out;
 }
 
 // Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
 // three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
 // The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
-export function rangePartitionDoName(tableName: string, hashKey: string, startBoundary: string | null, endBoundary: string | null): string {
+export function rangePartitionDoName(
+	tableName: string,
+	hashKey: KeyBytes,
+	startBoundary: KeyBytes | null,
+	endBoundary: KeyBytes | null,
+): string {
 	const hk = encodeRangeComponent(hashKey);
 	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
 	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
@@ -38,9 +60,9 @@ export function rangePartitionDoName(tableName: string, hashKey: string, startBo
 // Same return shape as pickPartition / pickChildPartition so callers can use the result uniformly.
 export function resolveRangePartitionContext(
 	base: PartitionContextResolved,
-	hashKey: string,
-	startBoundary: string | null,
-	endBoundary: string | null,
+	hashKey: KeyBytes,
+	startBoundary: KeyBytes | null,
+	endBoundary: KeyBytes | null,
 ): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
 	const doId = env[base.ns].idFromName(doName!);
@@ -147,16 +169,17 @@ export class PartitionIdHelper {
 		bytes: Uint8Array,
 	):
 		| { schema: 0; rootIdx: number; depth: number }
-		| { schema: 1; hashKey: string; startBoundary: string | null; endBoundary: string | null } {
+		| { schema: 1; hashKey: KeyBytes; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null } {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology.decode: unsupported schema version: ${bytes[0]}`);
-		// SCHEMA_RANGE_V1 wire format (both boundaries are immutable identity; null = unbounded edge):
+		// SCHEMA_RANGE_V1 wire format (both boundaries are immutable identity; null = unbounded edge).
+		// hashKey/start/end are stored as RAW canonical KeyBytes (no re-encoding — they already are bytes):
 		//   byte[0]     = 0x01
 		//   byte[1]     = flags: bit0 = hasStartBoundary, bit1 = hasEndBoundary (absent bit ⇒ unbounded)
-		//   byte[2..5]  = uint32 LE length of hashKey UTF-8 bytes (hkLen)
-		//   byte[6..9]  = uint32 LE length of startBoundary UTF-8 bytes (startLen; 0 if !hasStart)
+		//   byte[2..5]  = uint32 LE length of hashKey bytes (hkLen)
+		//   byte[6..9]  = uint32 LE length of startBoundary bytes (startLen; 0 if !hasStart)
 		//   byte[10..]  = hashKey bytes, then startBoundary bytes (startLen), then endBoundary bytes (rest, if hasEnd)
 		const hasStart = (bytes[1] & 0x01) !== 0;
 		const hasEnd = (bytes[1] & 0x02) !== 0;
@@ -165,24 +188,25 @@ export class PartitionIdHelper {
 		const hkStart = 10;
 		const skStart = hkStart + hkLen;
 		const endStart = skStart + startLen;
-		const hashKey = new TextDecoder().decode(bytes.subarray(hkStart, skStart));
-		const startBoundary = hasStart ? new TextDecoder().decode(bytes.subarray(skStart, endStart)) : null;
-		const endBoundary = hasEnd ? new TextDecoder().decode(bytes.subarray(endStart)) : null;
+		const hashKey = KeyCodec.asKeyBytes(bytes.subarray(hkStart, skStart));
+		const startBoundary = hasStart ? KeyCodec.asKeyBytes(bytes.subarray(skStart, endStart)) : null;
+		const endBoundary = hasEnd ? KeyCodec.asKeyBytes(bytes.subarray(endStart)) : null;
 		return { schema: 1, hashKey, startBoundary, endBoundary };
 	}
 
 	// Creates a PartitionIdHelper for a range-structure DO. null start/end = unbounded edge.
 	static fromRangePartition(
 		base: PartitionContext,
-		hashKey: string,
-		startBoundary: string | null,
-		endBoundary: string | null,
+		hashKey: KeyBytes,
+		startBoundary: KeyBytes | null,
+		endBoundary: KeyBytes | null,
 	): PartitionIdHelper {
-		const hkBytes = new TextEncoder().encode(hashKey);
+		// Boundaries are already canonical KeyBytes — store them raw (no TextEncoder).
+		const hkBytes = hashKey;
 		const hasStart = startBoundary !== null;
 		const hasEnd = endBoundary !== null;
-		const skBytes = hasStart ? new TextEncoder().encode(startBoundary) : new Uint8Array(0);
-		const endBytes = hasEnd ? new TextEncoder().encode(endBoundary) : new Uint8Array(0);
+		const skBytes = hasStart ? startBoundary : new Uint8Array(0);
+		const endBytes = hasEnd ? endBoundary : new Uint8Array(0);
 		const bytes = new Uint8Array(10 + hkBytes.length + skBytes.length + endBytes.length);
 		bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
 		bytes[1] = (hasStart ? 0x01 : 0x00) | (hasEnd ? 0x02 : 0x00);

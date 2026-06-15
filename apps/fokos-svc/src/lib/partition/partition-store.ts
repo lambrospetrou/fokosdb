@@ -1,5 +1,6 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import type { ItemCondition } from "../types.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 
 /**
@@ -20,9 +21,11 @@ import invariant from "../invariant.js";
 // Row, cursor, and snapshot types
 // ---------------------------------------------------------------------------
 
+// hk/sk are canonical KeyBytes everywhere in the store: they bind to SQLite BLOB columns and compare
+// by memcmp (the same total order as KeyCodec.compare). The ONLY producer of KeyBytes is KeyCodec.
 export type MigratedItem = {
-	hk: string;
-	sk: string;
+	hk: KeyBytes;
+	sk: KeyBytes;
 	data: string | Uint8Array;
 	ttl_epoch_utc_seconds: number | null;
 	v: number;
@@ -30,8 +33,8 @@ export type MigratedItem = {
 };
 
 export type PendingTransactionRow = {
-	hk: string;
-	sk: string;
+	hk: KeyBytes;
+	sk: KeyBytes;
 	transaction_id: string;
 	transaction_ts: number;
 	operation: string;
@@ -41,36 +44,34 @@ export type PendingTransactionRow = {
 	created_at: number;
 };
 
-export type PendingTransactionCursor = { hk: string; sk: string; transaction_id: string };
+export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
-export type MigrationCursor = { hk: string; sk: string };
+export type MigrationCursor = { hk: KeyBytes; sk: KeyBytes };
 
-export type PromotedKeyCursor = { hashKey: string };
+export type PromotedKeyCursor = { hashKey: KeyBytes };
 
 export type PromotedKeyStatus = "queued" | "promoting" | "promoted";
 
-export type PromotedKeyRow = { hash_key: string; status: PromotedKeyStatus };
+export type PromotedKeyRow = { hash_key: KeyBytes; status: PromotedKeyStatus };
 
 export type SqlMetrics = { rowsRead: number; rowsWritten: number };
 
-export type ItemSnapshot = { hk: string; sk: string; found: true; v: number } | { hk: string; sk: string; found: false };
+export type ItemSnapshot = { hk: KeyBytes; sk: KeyBytes; found: true; v: number } | { hk: KeyBytes; sk: KeyBytes; found: false };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-// Returns the shortest string p where lo < p ≤ hi, treating characters as UTF-16 code units
-// (matching JavaScript string comparison and SQLite TEXT collation). Pre-condition: lo < hi.
-function shortestSeparator(lo: string, hi: string): string {
-	const minLen = Math.min(lo.length, hi.length);
-	for (let i = 0; i < minLen; i++) {
-		if (lo.charCodeAt(i) !== hi.charCodeAt(i)) {
-			// At index i, hi[i] > lo[i]; hi[0..i+1] is the shortest prefix of hi that exceeds lo.
-			return hi.substring(0, i + 1);
-		}
-	}
-	// lo is a proper prefix of hi; one extra character makes the result exceed lo.
-	return hi.substring(0, lo.length + 1);
+// Boundary synthesis lives in KeyCodec.shortestSeparator (byte space), keeping JS-side splits and
+// SQLite BLOB scans on the same total order.
+
+/**
+ * SQLite returns BLOB key columns as ArrayBuffer (or Uint8Array). Materialize them as KeyBytes via a
+ * trusted re-brand — they were written as canonical bytes, so this is the asKeyBytes path (no copy of
+ * a Uint8Array; a thin view over an ArrayBuffer). Every store row-reading method funnels hk/sk here.
+ */
+function fromSqlKey(value: ArrayBuffer | Uint8Array): KeyBytes {
+	return KeyCodec.asKeyBytes(value instanceof Uint8Array ? value : new Uint8Array(value));
 }
 
 /**
@@ -79,45 +80,45 @@ function shortestSeparator(lo: string, hi: string): string {
  * both paths evaluate the same conditions against the same item snapshot shape.
  */
 export function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
+	const where = () => `hk=${KeyCodec.keyForLog(item.hk)}, sk=${KeyCodec.keyForLog(item.sk)}`;
 	for (const condition of conditions) {
 		if (condition.type === "item_exists") {
 			if (!item.found) {
-				throw new Error(`fokos/${operationName}: condition "item_exists" failed — item does not exist (hk=${item.hk}, sk=${item.sk})`);
+				throw new Error(`fokos/${operationName}: condition item_exists failed — item does not exist (${where()})`);
 			}
 		} else if (condition.type === "item_not_exists") {
 			if (item.found) {
-				throw new Error(
-					`fokos/${operationName}: condition "item_not_exists" failed — item already exists with v=${item.v} (hk=${item.hk}, sk=${item.sk})`,
-				);
+				throw new Error(`fokos/${operationName}: condition item_not_exists failed — item already exists with v=${item.v} (${where()})`);
 			}
 		} else if (condition.type === "attribute_equals") {
 			const actual = item.found ? item[condition.attribute] : null;
 			if (actual !== condition.value) {
 				throw new Error(
-					`fokos/${operationName}: condition "attribute_equals" failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (hk=${item.hk}, sk=${item.sk})`,
+					`fokos/${operationName}: condition attribute_equals failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (${where()})`,
 				);
 			}
 		}
 	}
 }
 
-export function estimateRowBytes(data: string | Uint8Array, hk: string, sk: string): number {
+export function estimateRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes): number {
 	const dataBytes = typeof data === "string" ? data.length : data.byteLength;
 	// hk and sk are variable-length and physically stored in every row (WITHOUT ROWID PK),
 	// so a long hk with many sort keys contributes significant storage that must be counted per-row.
+	// Keys are canonical bytes now, so byteLength is the exact stored size.
 	// 40 = fixed overhead: integer columns (v, ttl_epoch_utc_seconds, last_transaction_ts, est_row_bytes ≈ 4×8 = 32 bytes)
 	//      + SQLite B-tree record metadata (header varints, null bitmap ≈ 8 bytes).
-	return dataBytes + hk.length + sk.length + 40;
+	return dataBytes + hk.byteLength + sk.byteLength + 40;
 }
 
 export function estimateItemBytes(item: MigratedItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.length * 2 + item.sk.length * 2 + dataSize + 8 + 64;
+	return item.hk.byteLength + item.sk.byteLength + dataSize + 8 + 64;
 }
 
 export function estimatePendingTxBytes(row: PendingTransactionRow): number {
 	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return row.hk.length * 2 + row.sk.length * 2 + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
+	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
 }
 
 /**
@@ -143,8 +144,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// The Durable Object API only accepts strings and Uint8Arrays, so we can safely store them as-is and retrieve them with the correct type.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
-                hk                    TEXT    NOT NULL,
-                sk                    TEXT    NOT NULL DEFAULT '',
+                hk                    BLOB    NOT NULL,
+                sk                    BLOB    NOT NULL DEFAULT x'',
                 data                  ANY     NOT NULL,
                 ttl_epoch_utc_seconds INTEGER,
                 v                     INTEGER NOT NULL,
@@ -158,8 +159,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		description: "Add last_transaction_ts to items and create transaction support tables",
 		sql: `
             CREATE TABLE IF NOT EXISTS pending_transactions (
-                hk                    TEXT    NOT NULL,
-                sk                    TEXT    NOT NULL DEFAULT '',
+                hk                    BLOB    NOT NULL,
+                sk                    BLOB    NOT NULL DEFAULT x'',
                 transaction_id        TEXT    NOT NULL,
                 transaction_ts        INTEGER NOT NULL,
                 operation             TEXT    NOT NULL,
@@ -184,7 +185,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		description: "Add range partition support: promoted_keys table (WITHOUT ROWID; gc_done flag; status index)",
 		sql: `
             CREATE TABLE IF NOT EXISTS promoted_keys (
-                hash_key   TEXT    NOT NULL PRIMARY KEY,
+                hash_key   BLOB    NOT NULL PRIMARY KEY,
                 status     TEXT    NOT NULL,
                 gc_done    INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
@@ -197,7 +198,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		description: "Add per-row size estimate and key-level size summary for efficient promotion detection",
 		sql: `
             CREATE TABLE IF NOT EXISTS key_size_estimates (
-                hk        TEXT    NOT NULL PRIMARY KEY,
+                hk        BLOB    NOT NULL PRIMARY KEY,
                 est_bytes INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID, STRICT;`,
 	},
@@ -239,8 +240,8 @@ export class PartitionStore {
 
 	/** Metrics cover the single SELECT (what the DO surfaced in read meta). */
 	getItem(
-		hk: string,
-		sk: string,
+		hk: KeyBytes,
+		sk: KeyBytes,
 	): {
 		row?: { data: string | Uint8Array; ttl_epoch_utc_seconds: number | null; v: number; last_transaction_ts: number };
 		rowsRead: number;
@@ -264,7 +265,7 @@ export class PartitionStore {
 	 * Lightweight existence/version/timestamp read for condition evaluation and prepare checks.
 	 * Metrics cover the single SELECT (counted into putItem/deleteItem meta when conditions exist).
 	 */
-	getItemStamp(hk: string, sk: string): { row?: { v: number; last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
+	getItemStamp(hk: KeyBytes, sk: KeyBytes): { row?: { v: number; last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
 		const res = this.#storage.sql.exec<{ v: number; last_transaction_ts: number }>(
 			`SELECT v, last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
 			hk,
@@ -281,7 +282,13 @@ export class PartitionStore {
 	 * Metrics cover ONLY the items upsert statement (matching the DO's previous meta math —
 	 * the old-estimate read and the key_size_estimates upsert were never counted).
 	 */
-	upsertItem(opts: { hk: string; sk: string; data: string | Uint8Array; ttlEpochUtcSeconds: number | null; lastTransactionTs: number }): {
+	upsertItem(opts: {
+		hk: KeyBytes;
+		sk: KeyBytes;
+		data: string | Uint8Array;
+		ttlEpochUtcSeconds: number | null;
+		lastTransactionTs: number;
+	}): {
 		version: number;
 		keyEstBytes: number;
 		rowsRead: number;
@@ -339,7 +346,7 @@ export class PartitionStore {
 	 * only when a row was actually deleted.
 	 * Metrics cover ONLY the DELETE statement (matching the DO's previous meta math).
 	 */
-	deleteItem(opts: { hk: string; sk: string; watermarkTs: number; bumpWatermarkAlways?: boolean }): {
+	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; watermarkTs: number; bumpWatermarkAlways?: boolean }): {
 		deleted: boolean;
 		rowsRead: number;
 		rowsWritten: number;
@@ -359,7 +366,7 @@ export class PartitionStore {
 	}
 
 	/** The transactional "check" operation: bumps the item's timestamp without changing data. */
-	bumpItemLastTransactionTs(hk: string, sk: string, ts: number): void {
+	bumpItemLastTransactionTs(hk: KeyBytes, sk: KeyBytes, ts: number): void {
 		this.#storage.sql.exec(`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`, ts, hk, sk);
 	}
 
@@ -382,7 +389,7 @@ export class PartitionStore {
 		);
 	}
 
-	hasItemsForHashKey(hk: string): boolean {
+	hasItemsForHashKey(hk: KeyBytes): boolean {
 		return this.#storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hk).toArray().length > 0;
 	}
 
@@ -392,9 +399,9 @@ export class PartitionStore {
 	// "shortest separator" of the predecessor and boundary key), keeping doNames and topology encoding compact.
 	// A data query on the items table — it lives with the store; the DO passes the result into the
 	// range split policy's prepareSplit.
-	computeRangeSplitBoundaries(hashKey: string, start: string | null, end: string | null, N: number): string[] | null {
+	computeRangeSplitBoundaries(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): KeyBytes[] | null {
 		return this.#storage.transactionSync(() => {
-			const lower = start ?? ""; // −∞ ⇒ sk >= ''
+			const lower = start ?? KeyCodec.encodeOptional(undefined); // −∞ ⇒ sk >= x'' (the empty sentinel)
 			const cntRow =
 				end === null
 					? this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`, hashKey, lower).toArray()[0]
@@ -404,40 +411,42 @@ export class PartitionStore {
 			const cnt = cntRow?.n ?? 0;
 			if (cnt < N) return null; // need ≥ N items so each of the N children gets ≥ 1
 
-			const boundaries: string[] = [];
+			const boundaries: KeyBytes[] = [];
 			for (let i = 1; i < N; i++) {
 				const offset = Math.floor((cnt * i) / N);
 				// Fetch the predecessor (offset - 1) and the boundary key (offset) in one scan.
 				// offset >= 1 always because cnt >= N guarantees floor(cnt * 1 / N) >= 1.
-				const rows =
+				const rows = (
 					end === null
 						? this.#storage.sql
 								.exec<{
-									sk: string;
+									sk: ArrayBuffer;
 								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, offset - 1)
 								.toArray()
 						: this.#storage.sql
 								.exec<{
-									sk: string;
+									sk: ArrayBuffer;
 								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, end, offset - 1)
-								.toArray();
+								.toArray()
+				).map((r) => fromSqlKey(r.sk));
 				invariant(
 					rows.length === 2,
 					"fokos/range.computeRangeSplitBoundaries: expected predecessor + boundary rows at the computed offset",
 				);
-				boundaries.push(shortestSeparator(rows[0].sk, rows[1].sk));
+				// Byte-space separator: the boundary's UTF-8 position now matches the SQL scans that migrate the data.
+				boundaries.push(KeyCodec.shortestSeparator(rows[0], rows[1]));
 			}
 			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty children).
 			for (let i = 0; i < boundaries.length; i++) {
-				if (boundaries[i] <= lower) return null;
-				if (i > 0 && boundaries[i] <= boundaries[i - 1]) return null;
+				if (KeyCodec.compare(boundaries[i], lower) <= 0) return null;
+				if (i > 0 && KeyCodec.compare(boundaries[i], boundaries[i - 1]) <= 0) return null;
 			}
 			return boundaries;
 		});
 	}
 
 	/** Promotion GC: deletes up to `limit` rows of a promoted key per call (bounded work per cycle). */
-	deleteItemsBatchForHashKey(hk: string, limit: number): void {
+	deleteItemsBatchForHashKey(hk: KeyBytes, limit: number): void {
 		this.#storage.sql.exec(
 			`DELETE FROM items WHERE hk = ? AND sk IN (SELECT sk FROM items WHERE hk = ? ORDER BY sk LIMIT ?)`,
 			hk,
@@ -449,8 +458,8 @@ export class PartitionStore {
 	/** Pages the items table in (hk, sk) order, strictly after `cursor`. */
 	queryItemsPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
 		type Row = {
-			hk: string;
-			sk: string;
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
@@ -475,7 +484,7 @@ export class PartitionStore {
 
 		const items: MigratedItem[] = [];
 		for (const row of sqlCursor) {
-			items.push({ ...row, data: fromSqlData(row.data) });
+			items.push({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) });
 		}
 		return items;
 	}
@@ -485,15 +494,15 @@ export class PartitionStore {
 	 * `cursor` when provided, otherwise starts at the slice's lower bound; `end === null` = unbounded.
 	 */
 	queryRangeItemsPage(opts: {
-		hk: string;
-		lower: string;
-		end: string | null;
+		hk: KeyBytes;
+		lower: KeyBytes;
+		end: KeyBytes | null;
 		cursor: MigrationCursor | null;
 		limit: number;
 	}): MigratedItem[] {
 		type Row = {
-			hk: string;
-			sk: string;
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
@@ -519,12 +528,12 @@ export class PartitionStore {
 				opts.limit,
 			)
 			.toArray();
-		return page.map((row) => ({ ...row, data: fromSqlData(row.data) }));
+		return page.map((row) => ({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) }));
 	}
 
 	// ─── pending_transactions ───────────────────────────────────────────────
 
-	pendingLockFor(hk: string, sk: string): { transaction_id: string } | undefined {
+	pendingLockFor(hk: KeyBytes, sk: KeyBytes): { transaction_id: string } | undefined {
 		return this.#storage.sql
 			.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
 			.toArray()[0];
@@ -560,17 +569,18 @@ export class PartitionStore {
 		return this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions`).toArray()[0]?.n ?? 0;
 	}
 
-	pendingLockCountForHashKey(hk: string): number {
+	pendingLockCountForHashKey(hk: KeyBytes): number {
 		return this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hk).toArray()[0]?.n ?? 0;
 	}
 
-	listPendingTxKeys(transactionId: string): { hk: string; sk: string }[] {
+	listPendingTxKeys(transactionId: string): { hk: KeyBytes; sk: KeyBytes }[] {
 		return this.#storage.sql
-			.exec<{ hk: string; sk: string }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, transactionId)
-			.toArray();
+			.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, transactionId)
+			.toArray()
+			.map((r) => ({ hk: fromSqlKey(r.hk), sk: fromSqlKey(r.sk) }));
 	}
 
-	getPendingTxOp(hk: string, sk: string, transactionId: string): { operation: string; data: string | Uint8Array | null } | undefined {
+	getPendingTxOp(hk: KeyBytes, sk: KeyBytes, transactionId: string): { operation: string; data: string | Uint8Array | null } | undefined {
 		const row = this.#storage.sql
 			.exec<{
 				operation: string;
@@ -583,14 +593,14 @@ export class PartitionStore {
 	/** Stale-transaction recovery: the locked items of one transaction, data converted. */
 	listPendingTxItems(
 		transactionId: string,
-	): { hk: string; sk: string; transaction_ts: number; operation: string; data: string | Uint8Array | null }[] {
+	): { hk: KeyBytes; sk: KeyBytes; transaction_ts: number; operation: string; data: string | Uint8Array | null }[] {
 		return this.#storage.sql
-			.exec<{ hk: string; sk: string; transaction_ts: number; operation: string; data: string | ArrayBuffer | null }>(
+			.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; transaction_ts: number; operation: string; data: string | ArrayBuffer | null }>(
 				`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`,
 				transactionId,
 			)
 			.toArray()
-			.map((row) => ({ ...row, data: fromSqlData(row.data) }));
+			.map((row) => ({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) }));
 	}
 
 	listStalePendingTx(staleBeforeTs: number, limit: number): { transaction_id: string; coordinator_do_id: string }[] {
@@ -609,7 +619,7 @@ export class PartitionStore {
 	}
 
 	/** Promotion GC: a fully-promoted key can have no live locks here anymore. */
-	deletePendingTxForHashKey(hk: string): void {
+	deletePendingTxForHashKey(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hk);
 	}
 
@@ -621,8 +631,8 @@ export class PartitionStore {
 	/** Pages pending_transactions in (hk, sk, transaction_id) order, strictly after `cursor`. */
 	queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
 		type Row = {
-			hk: string;
-			sk: string;
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
 			transaction_id: string;
 			transaction_ts: number;
 			operation: string;
@@ -652,7 +662,7 @@ export class PartitionStore {
 
 		const rows: PendingTransactionRow[] = [];
 		for (const row of sqlCursor) {
-			rows.push({ ...row, data: fromSqlData(row.data) });
+			rows.push({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) });
 		}
 		return rows;
 	}
@@ -673,7 +683,7 @@ export class PartitionStore {
 
 	// ─── key_size_estimates ─────────────────────────────────────────────────
 
-	deleteKeySizeEstimate(hk: string): void {
+	deleteKeySizeEstimate(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hk);
 	}
 
@@ -689,10 +699,13 @@ export class PartitionStore {
 	// ─── promoted_keys ──────────────────────────────────────────────────────
 
 	listPromotedKeys(): PromotedKeyRow[] {
-		return this.#storage.sql.exec<PromotedKeyRow>(`SELECT hash_key, status FROM promoted_keys`).toArray();
+		return this.#storage.sql
+			.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(`SELECT hash_key, status FROM promoted_keys`)
+			.toArray()
+			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
 	}
 
-	getPromotedKeyStatus(hk: string): PromotedKeyStatus | undefined {
+	getPromotedKeyStatus(hk: KeyBytes): PromotedKeyStatus | undefined {
 		return this.#storage.sql.exec<{ status: PromotedKeyStatus }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk).toArray()[0]
 			?.status;
 	}
@@ -711,19 +724,19 @@ export class PartitionStore {
 		);
 	}
 
-	listPromotedKeysNeedingGC(limit?: number): string[] {
+	listPromotedKeysNeedingGC(limit?: number): KeyBytes[] {
 		return this.#storage.sql
-			.exec<{ hash_key: string }>(
+			.exec<{ hash_key: ArrayBuffer }>(
 				limit != null
 					? `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0 LIMIT ?`
 					: `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0`,
 				...(limit != null ? [limit] : []),
 			)
 			.toArray()
-			.map((r) => r.hash_key);
+			.map((r) => fromSqlKey(r.hash_key));
 	}
 
-	markPromotedKeyGcDone(hk: string): void {
+	markPromotedKeyGcDone(hk: KeyBytes): void {
 		this.#storage.sql.exec(`UPDATE promoted_keys SET gc_done = 1 WHERE hash_key = ?`, hk);
 	}
 
@@ -733,7 +746,7 @@ export class PartitionStore {
 	 * row (whose status may differ from `status`), so callers keeping an in-memory cache must
 	 * resync from storage instead of assuming `status` was written.
 	 */
-	insertPromotedKey(hk: string, status: PromotedKeyStatus, now: number): { inserted: boolean } {
+	insertPromotedKey(hk: KeyBytes, status: PromotedKeyStatus, now: number): { inserted: boolean } {
 		const res = this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, ?, ?, ?)`,
 			hk,
@@ -749,7 +762,12 @@ export class PartitionStore {
 	 * a row actually transitioned — false means the key was absent or in a different status, so
 	 * callers keeping an in-memory cache must resync from storage instead of assuming `toStatus`.
 	 */
-	updatePromotedKeyStatus(hk: string, fromStatus: PromotedKeyStatus, toStatus: PromotedKeyStatus, updatedAt: number): { updated: boolean } {
+	updatePromotedKeyStatus(
+		hk: KeyBytes,
+		fromStatus: PromotedKeyStatus,
+		toStatus: PromotedKeyStatus,
+		updatedAt: number,
+	): { updated: boolean } {
 		const res = this.#storage.sql.exec(
 			`UPDATE promoted_keys SET status = ?, updated_at = ? WHERE hash_key = ? AND status = ?`,
 			toStatus,
@@ -764,12 +782,17 @@ export class PartitionStore {
 	queryPromotedKeysPage(cursor: PromotedKeyCursor | null, limit: number): PromotedKeyRow[] {
 		return (
 			cursor
-				? this.#storage.sql.exec<PromotedKeyRow>(
+				? this.#storage.sql.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(
 						`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
 						cursor.hashKey,
 						limit,
 					)
-				: this.#storage.sql.exec<PromotedKeyRow>(`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`, limit)
-		).toArray();
+				: this.#storage.sql.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(
+						`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`,
+						limit,
+					)
+		)
+			.toArray()
+			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
 	}
 }

@@ -141,7 +141,7 @@ export class BloomFilter {
 		return new BloomFilter(snapshot.layers.map(restoreLayer), snapshot.errorRate, snapshot.maxSizeBytes, snapshot.initialCapacityN);
 	}
 
-	add(key: string): AddResult {
+	add(key: string | Uint8Array): AddResult {
 		for (let i = 0; i < this.layers.length - 1; i++) {
 			if (layerHas(this.layers[i], key)) return AddResult.AlreadyPresent;
 		}
@@ -168,7 +168,7 @@ export class BloomFilter {
 		return AddResult.Added;
 	}
 
-	has(key: string): boolean {
+	has(key: string | Uint8Array): boolean {
 		for (let i = 0; i < this.layers.length; i++) {
 			if (layerHas(this.layers[i], key)) return true;
 		}
@@ -276,7 +276,7 @@ export enum AddResult {
  * incremented and no bits change. Otherwise every unset bit is flipped and
  * count increases by one.
  */
-function layerAddIfAbsent(layer: Layer, key: string): AddResult {
+function layerAddIfAbsent(layer: Layer, key: string | Uint8Array): AddResult {
 	const h1 = xxHash32(key, layer.layerIndex * 2);
 	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
 	let allSet = true;
@@ -298,7 +298,7 @@ function layerAddIfAbsent(layer: Layer, key: string): AddResult {
  * Returns true if all k bit positions for the key are set in this layer.
  * Computes positions inline with early exit on the first unset bit.
  */
-function layerHas(layer: Layer, key: string): boolean {
+function layerHas(layer: Layer, key: string | Uint8Array): boolean {
 	const h1 = xxHash32(key, layer.layerIndex * 2);
 	const h2 = xxHash32(key, layer.layerIndex * 2 + 1) || 1;
 	for (let i = 0; i < layer.k; i++) {

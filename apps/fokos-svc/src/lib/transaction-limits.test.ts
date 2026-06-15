@@ -15,7 +15,7 @@ describe("validateItemKeys", () => {
 	it("accepts ordinary keys", () => {
 		expect(() => validateItemKeys("hk", "sk")).not.toThrow();
 		expect(() => validateItemKeys("hk")).not.toThrow();
-		expect(() => validateItemKeys("hk", "")).not.toThrow();
+		expect(() => validateItemKeys("hk")).not.toThrow();
 	});
 
 	it("rejects a NUL character anywhere in the hashKey", () => {
@@ -63,7 +63,7 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("treats a missing sortKey as the empty sortKey for duplicate detection", () => {
-		expect(() => validateTransactWriteOperations([putOp("a"), putOp("a", "")])).toThrow(/duplicate key/);
+		expect(() => validateTransactWriteOperations([putOp("a"), putOp("a")])).toThrow(/duplicate key/);
 	});
 
 	it("allows the same hashKey with different sortKeys", () => {

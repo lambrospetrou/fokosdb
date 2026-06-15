@@ -5,6 +5,7 @@ import { FokosDB } from "../src/lib/db.js";
 import { PartitionContextCreator } from "../src/lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
 import invariant from "../src/lib/invariant.js";
+import { KeyCodec } from "../src/lib/partition-topology/key-codec.js";
 
 function makeDB() {
 	const prefix = `txtest.${crypto.randomUUID()}`;
@@ -29,7 +30,7 @@ function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sor
 	const names = new Set<string>();
 	const topology = db.options().topology as PartitionTopologyRouterImpl;
 	for (const k of keys) {
-		names.add(topology.pickPartition(k.hashKey, k.sortKey).partitionContext.doName);
+		names.add(topology.pickPartition(KeyCodec.encode(k.hashKey), KeyCodec.encodeOptional(k.sortKey)).partitionContext.doName);
 	}
 	return names.size;
 }

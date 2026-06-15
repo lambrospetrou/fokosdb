@@ -29,6 +29,7 @@ import {
 	type InitFromSplitOptions,
 } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
+import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import { HashPartitionTopologyImpl, PartitionTopologySplitter, RangePartitionTopologyImpl } from "./partition-topology/split-policy.js";
 import { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import type { SplitType } from "./partition-topology/types.js";
@@ -221,15 +222,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("putItem");
+		const hashKey = PartitionDO.keyIn(opts.hashKey);
+		const sortKey = PartitionDO.optKeyIn(opts.sortKey);
 		return await this.withSplitForwarding<PutItemResult>({
 			ctx: pCtx,
-			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			keys: { hashKey, sortKey },
 			operationName: "putItem",
 			forward: async (stub, pCtx) => await stub.putItem(pCtx, opts),
 			local: async () => {
-				const sk = opts.sortKey ?? "";
-
-				const pendingRow = this.#store.pendingLockFor(opts.hashKey, sk);
+				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 				if (pendingRow) {
 					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
 					// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
@@ -240,25 +241,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const stamp = this.#store.getItemStamp(opts.hashKey, sk);
+					const stamp = this.#store.getItemStamp(hashKey, sortKey);
 					conditionRes = stamp;
 					const item: ItemSnapshot = stamp.row
-						? { found: true, hk: opts.hashKey, sk, v: stamp.row.v }
-						: { found: false, hk: opts.hashKey, sk };
+						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
+						: { found: false, hk: hashKey, sk: sortKey };
 					evaluateConditionsOnItem(item, opts.conditions, "putItem");
 				}
 
 				const writeRes = this.#store.upsertItem({
-					hk: opts.hashKey,
-					sk,
+					hk: hashKey,
+					sk: sortKey,
 					data: opts.data,
 					ttlEpochUtcSeconds: opts.ttlEpochUTCSeconds ?? null,
 					lastTransactionTs: Date.now(),
 				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
-				this.#promotion.maybeQueuePromotion(pCtx, opts.hashKey, writeRes.keyEstBytes);
+				this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
 
-				await this.checkSplits(pCtx, opts.hashKey, opts.sortKey);
+				await this.checkSplits(pCtx, hashKey, sortKey);
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					version: writeRes.version,
@@ -280,15 +281,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async deleteItem(pCtx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("deleteItem");
+		const hashKey = PartitionDO.keyIn(opts.hashKey);
+		const sortKey = PartitionDO.optKeyIn(opts.sortKey);
 		return await this.withSplitForwarding<DeleteItemResult>({
 			ctx: pCtx,
-			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			keys: { hashKey, sortKey },
 			operationName: "deleteItem",
 			forward: async (stub, pCtx) => await stub.deleteItem(pCtx, opts),
 			local: async () => {
-				const sk = opts.sortKey ?? "";
-
-				const pendingRow = this.#store.pendingLockFor(opts.hashKey, sk);
+				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 				if (pendingRow) {
 					// FIXME: ATC §4 optimization — see same comment in putItem.
 					throw new Error(
@@ -298,16 +299,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
 				if (opts.conditions && opts.conditions.length > 0) {
-					const stamp = this.#store.getItemStamp(opts.hashKey, sk);
+					const stamp = this.#store.getItemStamp(hashKey, sortKey);
 					conditionRes = stamp;
 					const item: ItemSnapshot = stamp.row
-						? { found: true, hk: opts.hashKey, sk, v: stamp.row.v }
-						: { found: false, hk: opts.hashKey, sk };
+						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
+						: { found: false, hk: hashKey, sk: sortKey };
 					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
 				}
 
 				// Keep deletion watermark consistent with transactional deletes.
-				const writeRes = this.#store.deleteItem({ hk: opts.hashKey, sk, watermarkTs: Date.now() });
+				const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
@@ -350,7 +351,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		return await this.withSplitForwarding<GetItemResult>({
 			ctx: pCtx,
-			keys: { hashKey: opts.hashKey, sortKey: opts.sortKey },
+			keys: { hashKey: PartitionDO.keyIn(opts.hashKey), sortKey: PartitionDO.optKeyIn(opts.sortKey) },
 			operationName: "getItem",
 			forward: async (stub, pCtx) => await stub.getItem(pCtx, opts),
 			local: async () => await this.readItemLocally(pCtx, opts),
@@ -376,7 +377,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				// I am a hash DO; authorize via promoted_keys[hk] === 'promoting'.
 				const status = this.#store.getPromotedKeyStatus(hk);
-				invariant(status === "promoting", `fokos/partition.getItemsBatch: key "${hk}" is not in promoting state (got ${status})`);
+				invariant(
+					status === "promoting",
+					`fokos/partition.getItemsBatch: key "${KeyCodec.keyForLog(hk)}" is not in promoting state (got ${status})`,
+				);
 				return this.getItemsBatchForRange(hk, null, null, opts.cursor);
 			}
 			// Range-split: I am a range DO becoming a router; authorize the child and stream its [start, end) slice.
@@ -419,7 +423,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			// Filter: only items for the requesting hash child, excluding promoted keys
 			// (their data lives in range structures — hash children must not inherit local copies).
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk) && !this.#promotion.has(row.hk),
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk) && !this.#promotion.has(row.hk),
 			estimateBytes: estimateItemBytes,
 			budgetBytes: BATCH_LIMIT_BYTES,
 			pageSize: PAGE_SIZE,
@@ -431,14 +435,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// Streams items for a range DO child's owned slice [start, end) (start/end null = unbounded edge).
 	// Used by both promotion (start=end=null: the whole hashKey) and range-split (the child's sub-slice).
 	private getItemsBatchForRange(
-		hashKey: string,
-		start: string | null,
-		end: string | null,
+		hashKey: KeyBytes,
+		start: KeyBytes | null,
+		end: KeyBytes | null,
 		cursor: MigrationCursor | null,
 	): GetItemsBatchResult {
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
-		const lower = start ?? "";
+		const lower = start ?? KeyCodec.encodeOptional(undefined);
 
 		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
 			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
@@ -470,7 +474,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const status = this.#store.getPromotedKeyStatus(hk);
 				invariant(
 					status === "promoting",
-					`fokos/partition.getPartitionTransactionMetadata: key "${hk}" is not in promoting state (got ${status})`,
+					`fokos/partition.getPartitionTransactionMetadata: key "${KeyCodec.keyForLog(hk)}" is not in promoting state (got ${status})`,
 				);
 				return { maxDeletedTs, pendingTransactions: [], nextCursor: null };
 			}
@@ -487,14 +491,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				`fokos/partition.getPartitionTransactionMetadata: unknown range child partition "${childPartitionContext.doName}"`,
 			);
 
-			const lower = childPartitionContext.rangePartition.startBoundary ?? "";
+			const lower = childPartitionContext.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined);
 			const upper = childPartitionContext.rangePartition.endBoundary; // null = unbounded
-			const inChildRange = (sk: string) => sk >= lower && (upper === null || sk < upper);
+			const inChildRange = (sk: KeyBytes) => KeyCodec.compare(sk, lower) >= 0 && (upper === null || KeyCodec.compare(sk, upper) < 0);
 
 			const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
 				fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
 				advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
-				include: (row) => row.hk === hk && inChildRange(row.sk),
+				include: (row) => KeyCodec.compare(row.hk, hk) === 0 && inChildRange(row.sk),
 				estimateBytes: estimatePendingTxBytes,
 				budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
 				pageSize: 1000,
@@ -528,7 +532,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
 			fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk === "" ? undefined : row.sk),
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk),
 			estimateBytes: estimatePendingTxBytes,
 			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
 			pageSize: 1000,
@@ -568,11 +572,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
 		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
 		const SCAN_LIMIT = 10_000;
-		const { rows, nextCursor } = collectBatch<{ hash_key: string; status: PromotedKeyStatus }, PromotedKeyCursor>({
+		const { rows, nextCursor } = collectBatch<{ hash_key: KeyBytes; status: PromotedKeyStatus }, PromotedKeyCursor>({
 			fetchPage: (cursor, pageSize) => this.#store.queryPromotedKeysPage(cursor, pageSize),
 			advanceCursor: (row) => ({ hashKey: row.hash_key }),
 			include: (row) => isCorrectChild(row.hash_key),
-			estimateBytes: (row) => row.hash_key.length * 2 + 16,
+			estimateBytes: (row) => row.hash_key.byteLength + 16,
 			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
 			pageSize: SCAN_LIMIT,
 			startCursor: opts.cursor,
@@ -581,10 +585,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	// Called by a promoted range root once its item migration is complete.
-	async acknowledgePromotionComplete(hashKey: string): Promise<void> {
+	async acknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.acknowledgePromotionComplete: only hash partitions can have promoted keys");
-		await this.#promotion.acknowledgePromotionComplete(hashKey);
+		// RPC erases the brand; re-brand the incoming bytes before passing inward.
+		await this.#promotion.acknowledgePromotionComplete(PartitionDO.keyIn(hashKey));
 	}
 
 	/**
@@ -724,7 +729,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	private async checkSplits(pCtx: PartitionContextResolved, hashKey: string, sortKey?: string): Promise<SplitStatusKVItem | undefined> {
+	private async checkSplits(pCtx: PartitionContextResolved, hashKey: KeyBytes, sortKey?: KeyBytes): Promise<SplitStatusKVItem | undefined> {
 		const topology = this.ensureTopology(pCtx);
 		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey, {
 			hasInFlightPromotions: this.#promotion.hasInFlightPromotions(),
@@ -756,7 +761,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// Range splits need boundaries computed from the data (a store query); the policy receives them as input.
-		let boundaries: string[] | null = null;
+		let boundaries: KeyBytes[] | null = null;
 		if (splitStatus.splitType === "range") {
 			const pCtx = this.pCtx();
 			const rp = pCtx.rangePartition;
@@ -765,15 +770,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			invariant(N != null && N >= 2, "fokos/range.startSplit: rangeSplitN must be >= 2");
 			// Compute N-1 split boundaries within the owned slice [start, end) in one snapshot.
 			boundaries = this.#store.computeRangeSplitBoundaries(rp.hashKey, rp.startBoundary, rp.endBoundary, N);
-			console.log({ message: "BOOM", boundaries, rp, N });
 			if (!boundaries) {
 				// Not enough distinct items to split into N non-empty children — retry on a later cycle.
 				console.error({
 					...this.logParams(),
 					message: "fokos/range.startSplit: insufficient items to split into N children; will retry.",
-					hashKey: rp.hashKey,
-					startBoundary: rp.startBoundary,
-					endBoundary: rp.endBoundary,
+					hashKey: KeyCodec.keyForLog(rp.hashKey),
+					startBoundary: rp.startBoundary === null ? null : KeyCodec.keyForLog(rp.startBoundary),
+					endBoundary: rp.endBoundary === null ? null : KeyCodec.keyForLog(rp.endBoundary),
 				});
 				return;
 			}
@@ -859,6 +863,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
+	// RPC erases the KeyBytes brand: keys reach the DO already-encoded as Uint8Array (db.ts encodes at
+	// the public entry). Re-brand on this trust boundary without re-encoding. A raw string (e.g. a direct
+	// in-process test call) is encoded so the DO always works on canonical KeyBytes.
+	private static keyIn(k: string | Uint8Array): KeyBytes {
+		return typeof k === "string" ? KeyCodec.encode(k) : KeyCodec.asKeyBytes(k);
+	}
+
+	// As keyIn, but an absent key maps to the empty KeyBytes sentinel ([]).
+	private static optKeyIn(k: string | Uint8Array | undefined): KeyBytes {
+		return k === undefined ? KeyCodec.encodeOptional(undefined) : PartitionDO.keyIn(k);
+	}
+
 	private pCtx(): PartitionContextResolved {
 		invariant(
 			this.#_partitionContext,
@@ -879,14 +895,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			);
 		}
 		if (this.#_partitionContext) {
+			// rangePartition boundaries are KeyBytes — compare by bytes (null = unbounded), never by reference.
+			const keyEq = (a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean =>
+				a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
 			invariant(
 				areImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
 					this.#_partitionContext.partitionId === pCtx.partitionId &&
 					this.#_partitionContext.doName === pCtx.doName &&
-					this.#_partitionContext.rangePartition?.hashKey === pCtx.rangePartition?.hashKey &&
-					this.#_partitionContext.rangePartition?.startBoundary === pCtx.rangePartition?.startBoundary &&
-					this.#_partitionContext.rangePartition?.endBoundary === pCtx.rangePartition?.endBoundary,
+					keyEq(this.#_partitionContext.rangePartition?.hashKey, pCtx.rangePartition?.hashKey) &&
+					keyEq(this.#_partitionContext.rangePartition?.startBoundary, pCtx.rangePartition?.startBoundary) &&
+					keyEq(this.#_partitionContext.rangePartition?.endBoundary, pCtx.rangePartition?.endBoundary),
 				`fokos/partition.ensurePartitionContext: partition context mismatch`,
 			);
 			// Fall through to update to the latest version if there are changes.
@@ -937,7 +956,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async forwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
 		ctx: PartitionContextResolved,
-		hashKey: string,
+		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
 	): Promise<T> {
 		const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
@@ -955,7 +974,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
 		ctx: PartitionContextResolved,
-		hashKey: string,
+		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
 	): Promise<T | null> {
 		try {
@@ -970,7 +989,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private async withSplitForwarding<T extends { meta: PartitionInfo }>(opts: {
 		ctx: PartitionContextResolved;
-		keys: { hashKey: string; sortKey?: string };
+		keys: { hashKey: KeyBytes; sortKey: KeyBytes };
 		operationName: string;
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>;
 		local: () => Promise<T>;
@@ -1018,7 +1037,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						console.info({
 							...this.logParams(),
 							message: "fokos/partition: partial range topology bloom filter is full, " + "cannot learn promoted key.",
-							hashKey,
+							hashKey: KeyCodec.keyForLog(hashKey),
 						});
 					}
 				}
@@ -1044,7 +1063,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// (prepare/commit/readForTransaction). Currently only the authoritative PromotionManager is
 	// checked. The bloom filter would save hops for keys promoted by descendant partitions, but
 	// false positives need careful handling in multi-item transaction flows.
-	private groupItemsByRouting<T extends { hashKey: string; sortKey?: string }>(
+	private groupItemsByRouting<T extends { hashKey: KeyBytes; sortKey?: KeyBytes }>(
 		items: T[],
 	): {
 		local: T[];
@@ -1097,7 +1116,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
-		const res = this.#store.getItem(opts.hashKey, opts.sortKey ?? "");
+		const res = this.#store.getItem(PartitionDO.keyIn(opts.hashKey), PartitionDO.optKeyIn(opts.sortKey));
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
 		const actorMeta = {
@@ -1269,7 +1288,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 								const transactionTimestamp = pendingRows[0].transaction_ts;
 								const items: TransactionItem[] = pendingRows.map((r) => ({
 									hashKey: r.hk,
-									sortKey: r.sk || undefined,
+									sortKey: r.sk,
 									operation: r.operation as TransactionItem["operation"],
 									data: r.data ?? undefined,
 								}));

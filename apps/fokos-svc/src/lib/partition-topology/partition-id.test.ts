@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { PartitionContextCreator, type PartitionContext } from "./partition-context.js";
+import { KeyCodec } from "./key-codec.js";
 import { PartitionIdHelper, rangePartitionDoName } from "./partition-id.js";
+
+const kb = (s: string) => KeyCodec.encode(s);
 
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
@@ -68,7 +71,7 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	it("encode throws with nothing to encode and when appending to a range ID", () => {
 		const base = makeBase();
 		expect(() => new PartitionIdHelper(base).encode(false)).toThrow(/no bytes or appended hash indexes/);
-		const range = PartitionIdHelper.fromRangePartition(base, "k", null, null).encode(false);
+		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(/cannot append hash indexes/);
 	});
 
@@ -101,23 +104,25 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 			["m", null],
 			["b1", "b2"],
 		] as const) {
-			const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, "alice", start, end).encode(false);
+			const startKb = start === null ? null : kb(start);
+			const endKb = end === null ? null : kb(end);
+			const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, kb("alice"), startKb, endKb).encode(false);
 			expect(PartitionIdHelper.isRangePartition(opaque)).toBe(true);
 			const decoded = PartitionIdHelper.decode(bytes);
-			expect(decoded).toEqual({ schema: 1, hashKey: "alice", startBoundary: start, endBoundary: end });
+			expect(decoded).toEqual({ schema: 1, hashKey: kb("alice"), startBoundary: startKb, endBoundary: endKb });
 		}
 	});
 
 	it("doName formats range IDs via rangePartitionDoName", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, "alice", "b1", null).encode(false);
-		expect(PartitionIdHelper.doName(base, bytes)).toBe(rangePartitionDoName("iddb", "alice", "b1", null));
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), null).encode(false);
+		expect(PartitionIdHelper.doName(base, bytes)).toBe(rangePartitionDoName("iddb", kb("alice"), kb("b1"), null));
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.alice.b1.~max");
 	});
 
 	it("hash-only readers reject range IDs", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, "k", null, null).encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(/expected hash schema/);
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow(/expected hash schema/);
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow(/expected hash schema/);

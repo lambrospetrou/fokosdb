@@ -1,4 +1,5 @@
 import type { InitFromSplitOptions, PartitionContextResolved } from "../partition-topology/partition-context.js";
+import type { KeyBytes } from "../partition-topology/key-codec.js";
 import type {
 	MigratedItem,
 	MigrationCursor,
@@ -20,7 +21,7 @@ export type GetPartitionTransactionMetadataResult = {
 };
 
 export type GetPromotedKeysBatchResult = {
-	rows: { hash_key: string; status: PromotedKeyStatus }[];
+	rows: { hash_key: KeyBytes; status: PromotedKeyStatus }[];
 	nextCursor: PromotedKeyCursor | null;
 };
 
@@ -47,7 +48,7 @@ export interface PartitionPeer {
 		cursor: PromotedKeyCursor | null;
 	}): Promise<GetPromotedKeysBatchResult>;
 	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
-	acknowledgePromotionComplete(hashKey: string): Promise<void>;
+	acknowledgePromotionComplete(hashKey: KeyBytes): Promise<void>;
 	initFromSplit(opts: InitFromSplitOptions): Promise<void>;
 	triggerMigration(): Promise<void>;
 }

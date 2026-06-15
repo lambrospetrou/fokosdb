@@ -1,6 +1,6 @@
 import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { hashChildIndex } from "./hash-primitives.js";
-import { KeyCodec } from "./key-codec.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
 import { isHashPartition, type InitFromSplitOptions, type PartitionContextResolved } from "./partition-context.js";
 import {
@@ -36,7 +36,7 @@ export type PrepareSplitInputs = {
 	 * null = not enough distinct items to split yet; prepareSplit returns null and the caller
 	 * retries on a later cycle.
 	 */
-	boundaries?: string[] | null;
+	boundaries?: KeyBytes[] | null;
 };
 
 /**
@@ -58,7 +58,7 @@ export interface PartitionTopologySplitter {
 	 *
 	 * This should be extremely fast since it's called in every request!
 	 */
-	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok";
+	shouldAllow(hashKey: KeyBytes, sortKey?: KeyBytes): "forward" | "reject" | "ok";
 
 	/**
 	 * Determines whether a partition should be split based on the provided context, storage, and keys.
@@ -70,7 +70,7 @@ export interface PartitionTopologySplitter {
 	 *
 	 * Automatically queues a split if the conditions are met, so the caller doesn't need to worry about it.
 	 */
-	maybeQueueSplit(hashKey: string, sortKey: string | undefined, inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
+	maybeQueueSplit(hashKey: KeyBytes, sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
 
 	/**
 	 * Computes and validates the child partition contexts for the queued split. Pure decision —
@@ -92,14 +92,19 @@ export interface PartitionTopologySplitter {
 	 */
 	pickChildPartition(
 		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
+		hashKey: KeyBytes,
+		sortKey?: KeyBytes,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 
 	/**
 	 * Called after a forwarded request returns. Updates the topology cache from the response.
 	 */
-	recordForwardResult(hashKey: string, fromCtx: PartitionContextResolved, toCtx: PartitionContextResolved, responseHashDepth: number): void;
+	recordForwardResult(
+		hashKey: KeyBytes,
+		fromCtx: PartitionContextResolved,
+		toCtx: PartitionContextResolved,
+		responseHashDepth: number,
+	): void;
 
 	/**
 	 * Called by a child partition after it has fully migrated its share of data from the parent.
@@ -143,7 +148,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 	}
 
-	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
+	shouldAllow(_hashKey: KeyBytes, _sortKey?: KeyBytes): "forward" | "reject" | "ok" {
 		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// TODO - Keep this in memory to avoid reading it all the time from storage.
 		const splitStatus = this.#splitState.splitStatus();
@@ -173,14 +178,18 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		return this.#splitState.splitStatus();
 	}
 
-	async maybeQueueSplit(hashKey: string, sortKey: string | undefined, inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined> {
+	async maybeQueueSplit(
+		hashKey: KeyBytes,
+		sortKey: KeyBytes | undefined,
+		inputs: SplitDecisionInputs,
+	): Promise<SplitStatusKVItem | undefined> {
 		const splitType = this.shouldSplit(hashKey, sortKey, inputs);
 		if (splitType) {
 			return this.#splitState.queueSplit(splitType, this.partitionContext);
 		}
 	}
 
-	shouldSplit(_hashKey: string, _sortKey: string | undefined, inputs: SplitDecisionInputs): SplitType | null {
+	shouldSplit(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): SplitType | null {
 		const dbSize = this.#storage.sql.databaseSize;
 		if (this.partitionContext.hashSplitConditions.maxSizeMb && dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1024 * 1024) {
 			// Mutual exclusion: no hash split while any promoted key is queued or promoting.
@@ -244,17 +253,15 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	 */
 	pickDescendantHashPartition(
 		partitionContext: PartitionContextResolved,
-		hashKey: string,
+		hashKey: KeyBytes,
 		relativeDepthToLeaf: number,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
 		const parentDepth = PartitionIdHelper.depth(partitionIdBytes);
 
-		// TEMP (M1 adapter, removed in M3): this method still speaks `string`; encode once here.
-		const hashKeyBytes = KeyCodec.encode(hashKey);
 		const hashIdxs: number[] = [];
 		for (let i = 0; i < relativeDepthToLeaf; i++) {
-			hashIdxs.push(hashChildIndex(hashKeyBytes, parentDepth + i, partitionContext.hashSplitN));
+			hashIdxs.push(hashChildIndex(hashKey, parentDepth + i, partitionContext.hashSplitN));
 		}
 
 		return resolveDescendantHashPartitionContext(this.partitionContext, partitionContext, partitionIdBytes, hashIdxs);
@@ -262,14 +269,13 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	pickChildPartition(
 		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		_sortKey?: string,
+		hashKey: KeyBytes,
+		_sortKey?: KeyBytes,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		if (this.#_hashTopology) {
 			// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
 			// or 0 if the cache is not populated at all yet.
-			// TEMP (M1 adapter, removed in M3): encode the string key for the byte-typed topology cache.
-			const cachedDepth = this.#_hashTopology.findLeaf(KeyCodec.encode(hashKey));
+			const cachedDepth = this.#_hashTopology.findLeaf(hashKey);
 			if (cachedDepth > 0) {
 				return this.pickDescendantHashPartition(partitionContext, hashKey, cachedDepth);
 			}
@@ -281,7 +287,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	makeIsCorrectChildHashPartition(
 		_parentContext: PartitionContextResolved,
 		childContext: PartitionContextResolved,
-	): (hashKey: string, sortKey?: string) => boolean {
+	): (hashKey: KeyBytes, sortKey?: KeyBytes) => boolean {
 		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
 		const childLevel = PartitionIdHelper.depth(childPartitionIdBytes);
 		invariant(childLevel >= 1, `fokos/topology.makeIsCorrectChildHashPartition: childLevel must be >= 1, got ${childLevel}`);
@@ -290,15 +296,14 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 			childIdx < childContext.hashSplitN,
 			`fokos/topology.makeIsCorrectChildHashPartition: childIdx ${childIdx} out of range for splitN ${childContext.hashSplitN}`,
 		);
-		return (hashKey: string, sortKey?: string) => {
-			// TEMP (M1 adapter, removed in M3): encode the string key for byte-typed hashing.
-			const hashedIdx = hashChildIndex(KeyCodec.encode(hashKey), childLevel - 1, childContext.hashSplitN);
+		return (hashKey: KeyBytes, _sortKey?: KeyBytes) => {
+			const hashedIdx = hashChildIndex(hashKey, childLevel - 1, childContext.hashSplitN);
 			return hashedIdx === childIdx;
 		};
 	}
 
 	recordForwardResult(
-		hashKey: string,
+		hashKey: KeyBytes,
 		fromCtx: PartitionContextResolved,
 		toCtx: PartitionContextResolved,
 		responseHashDepth: number,
@@ -328,8 +333,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 		const targetRelDepth = responseHashDepth - fromAbsDepth;
 		if (this.#_hashTopology && targetRelDepth > 0) {
-			// TEMP (M1 adapter, removed in M3): encode the string key for the byte-typed topology cache.
-			if (this.#_hashTopology.updateFromHint(KeyCodec.encode(hashKey), targetRelDepth)) {
+			if (this.#_hashTopology.updateFromHint(hashKey, targetRelDepth)) {
 				this.#storage.kv.put<HashTopologySnapshot>("__topo_cache", this.#_hashTopology.toSnapshot());
 			}
 		}
@@ -366,8 +370,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		return this.#splitState.childPartitionContexts();
 	}
 
-	shouldAllow(hashKey: string, sortKey?: string): "forward" | "reject" | "ok" {
-		const sk = sortKey ?? "";
+	shouldAllow(_hashKey: KeyBytes, sortKey?: KeyBytes): "forward" | "reject" | "ok" {
+		const sk = sortKey ?? KeyCodec.encodeOptional(undefined);
 
 		const splitStatus = this.splitStatus();
 		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
@@ -376,9 +380,9 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 
 		// Boundaries are immutable identity. null = unbounded edge.
-		const start = this.partitionContext.rangePartition!.startBoundary ?? "";
+		const start = this.partitionContext.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
 		const end = this.partitionContext.rangePartition!.endBoundary;
-		const inRange = sk >= start && (end === null || sk < end);
+		const inRange = KeyCodec.compare(sk, start) >= 0 && (end === null || KeyCodec.compare(sk, end) < 0);
 		if (!inRange) {
 			// Out of owned range — routing bug; should not happen via correct routing.
 			return "reject";
@@ -396,8 +400,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	async maybeQueueSplit(
-		_hashKey: string,
-		_sortKey: string | undefined,
+		_hashKey: KeyBytes,
+		_sortKey: KeyBytes | undefined,
 		_inputs: SplitDecisionInputs,
 	): Promise<SplitStatusKVItem | undefined> {
 		const splitType = this.shouldSplit();
@@ -438,8 +442,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// The N children tile [start, end): child i owns [starts[i], ends[i]). The leftmost child
 		// (start, B1) is a brand-new DO — this node retains no slice and becomes a pure router.
-		const starts: (string | null)[] = [rp.startBoundary, ...boundaries];
-		const ends: (string | null)[] = [...boundaries, rp.endBoundary];
+		const starts: (KeyBytes | null)[] = [rp.startBoundary, ...boundaries];
+		const ends: (KeyBytes | null)[] = [...boundaries, rp.endBoundary];
 		const childInits: InitFromSplitOptions[] = [];
 		for (let i = 0; i < N; i++) {
 			const { partitionContext: childCtx } = resolveRangePartitionContext(this.partitionContext, rp.hashKey, starts[i], ends[i]);
@@ -465,10 +469,10 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 	pickChildPartition(
 		partitionContext: PartitionContextResolved,
-		hashKey: string,
-		sortKey?: string,
+		_hashKey: KeyBytes,
+		sortKey?: KeyBytes,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		const sk = sortKey ?? "";
+		const sk = sortKey ?? KeyCodec.encodeOptional(undefined);
 		const splitStatus = this.splitStatus();
 		invariant(
 			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
@@ -479,21 +483,23 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		// childStart > sk, or use binary search for arrays larger than ~10 entries.
 		// The N children tile the whole owned range; route to the one with the largest startBoundary <= sk.
 		let best: PartitionContextResolved | null = null;
+		let bestStart: KeyBytes | null = null;
 		for (const childCtx of splitStatus.childPartitionContexts) {
-			const childStart = childCtx.rangePartition!.startBoundary ?? "";
-			if (childStart <= sk) {
-				if (best === null || childStart > (best.rangePartition!.startBoundary ?? "")) {
+			const childStart = childCtx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
+			if (KeyCodec.compare(childStart, sk) <= 0) {
+				if (best === null || KeyCodec.compare(childStart, bestStart!) > 0) {
 					best = childCtx;
+					bestStart = childStart;
 				}
 			}
 		}
-		invariant(best !== null, `fokos/range: no child found for sortKey "${sk}"`);
+		invariant(best !== null, `fokos/range: no child found for sortKey "${KeyCodec.keyForLog(sk)}"`);
 
 		return { doId: resolveDoId(partitionContext.ns, best.doName), partitionContext: best };
 	}
 
 	recordForwardResult(
-		_hashKey: string,
+		_hashKey: KeyBytes,
 		_fromCtx: PartitionContextResolved,
 		_toCtx: PartitionContextResolved,
 		_responseHashDepth: number,

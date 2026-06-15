@@ -12,6 +12,9 @@ import type {
 	PartitionPeer,
 } from "./partition-peer.js";
 import { PartitionStore, type MigratedItem, type MigrationCursor, type PromotedKeyStatus } from "./partition-store.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+
+const kb = (s: string) => KeyCodec.encode(s);
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
@@ -28,7 +31,7 @@ describe("SplitMigration — hash child", () => {
 
 			// All items ingested exactly once, in resumable batches.
 			expect(menv.store.queryItemsPage(null, 100)).toHaveLength(all.length);
-			expect(calls.itemCursors).toEqual([null, { hk: "a", sk: "2" }, { hk: "b", sk: "2" }]);
+			expect(calls.itemCursors).toEqual([null, { hk: kb("a"), sk: kb("2") }, { hk: kb("b"), sk: kb("2") }]);
 
 			// Completion: status transitioned, cursor checkpoint removed, parent acked with this child's doName.
 			expect(menv.status()).toBe("migration_completed");
@@ -49,14 +52,14 @@ describe("SplitMigration — hash child", () => {
 			const run1 = makeFakePeer({ items: pagedItemBatches(all, 2), failItemsCall: 2 });
 			await expect(menv.makeMigration(run1.peer).runMigration(pCtx, parentCtx)).rejects.toThrow(/simulated parent crash/);
 			expect(menv.status()).toBe("migration_migrating");
-			expect(menv.cursor()).toEqual({ hk: "a", sk: "2" });
+			expect(menv.cursor()).toEqual({ hk: kb("a"), sk: kb("2") });
 			expect(run1.calls.childAcks).toEqual([]);
 
 			// Run 2 (fresh driver, same storage): resumes strictly after the checkpoint — batch 1 is
 			// NOT re-fetched — and completes.
 			const run2 = makeFakePeer({ items: pagedItemBatches(all, 2) });
 			await menv.makeMigration(run2.peer).runMigration(pCtx, parentCtx);
-			expect(run2.calls.itemCursors[0]).toEqual({ hk: "a", sk: "2" });
+			expect(run2.calls.itemCursors[0]).toEqual({ hk: kb("a"), sk: kb("2") });
 			expect(menv.store.queryItemsPage(null, 100)).toHaveLength(all.length);
 			expect(menv.status()).toBe("migration_completed");
 			expect(run2.calls.childAcks).toEqual([pCtx.doName]);
@@ -79,7 +82,7 @@ describe("SplitMigration — hash child", () => {
 			const rows = menv.store.queryItemsPage(null, 100);
 			expect(rows).toHaveLength(2);
 			// The pre-existing row was NOT overwritten.
-			expect(rows[0]).toMatchObject({ hk: "a", sk: "1", data: "already-written", v: 7 });
+			expect(rows[0]).toMatchObject({ hk: kb("a"), sk: kb("1"), data: "already-written", v: 7 });
 		});
 	});
 
@@ -88,8 +91,8 @@ describe("SplitMigration — hash child", () => {
 		const pCtx = hashCtx(base, [0, 1]);
 		const parentCtx = hashCtx(base, [0]);
 		const lock = {
-			hk: "a",
-			sk: "1",
+			hk: kb("a"),
+			sk: kb("1"),
 			transaction_id: "tx1",
 			transaction_ts: 123,
 			operation: "put",
@@ -105,7 +108,7 @@ describe("SplitMigration — hash child", () => {
 			});
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
-			expect(menv.store.pendingLockFor("a", "1")?.transaction_id).toBe("tx1");
+			expect(menv.store.pendingLockFor(kb("a"), kb("1"))?.transaction_id).toBe("tx1");
 			expect(menv.store.getMaxDeletedTs()).toBe(4567);
 		});
 	});
@@ -117,12 +120,12 @@ describe("SplitMigration — hash child", () => {
 
 		await withMigrationEnv(async (menv) => {
 			const { peer } = makeFakePeer({
-				pkBatches: [{ rows: [{ hash_key: "big-key", status: "promoted" }], nextCursor: null }],
+				pkBatches: [{ rows: [{ hash_key: kb("big-key"), status: "promoted" }], nextCursor: null }],
 			});
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
-			expect(menv.store.getPromotedKeyStatus("big-key")).toBe("promoted");
-			expect(menv.inherited).toEqual([["big-key", "promoted"]]);
+			expect(menv.store.getPromotedKeyStatus(kb("big-key"))).toBe("promoted");
+			expect(menv.inherited).toEqual([[kb("big-key"), "promoted"]]);
 		});
 	});
 });
@@ -137,7 +140,7 @@ describe("SplitMigration — range child ack routing", () => {
 			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("big-key", "1")], 10) });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
-			expect(calls.promotionAcks).toEqual(["big-key"]);
+			expect(calls.promotionAcks).toEqual([kb("big-key")]);
 			expect(calls.childAcks).toEqual([]);
 			// Range children never pull promoted-key entries.
 			expect(calls.pkCalls).toBe(0);
@@ -197,25 +200,42 @@ function hashCtx(base: PartitionContext, idxs: number[]): PartitionContextResolv
 }
 
 function rangeCtx(base: PartitionContext, hashKey: string, start: string | null, end: string | null): PartitionContextResolved {
-	const { opaque } = PartitionIdHelper.fromRangePartition(base, hashKey, start, end).encode(false);
+	const startKey = start === null ? undefined : start;
+	const endKey = end === null ? undefined : end;
+	const { opaque } = PartitionIdHelper.fromRangePartition(
+		base,
+		kb(hashKey),
+		KeyCodec.encodeOptional(startKey),
+		KeyCodec.encodeOptional(endKey),
+	).encode(false);
 	return {
 		...base,
-		doName: rangePartitionDoName(base.tableName, hashKey, start, end),
+		doName: rangePartitionDoName(base.tableName, kb(hashKey), KeyCodec.encodeOptional(startKey), KeyCodec.encodeOptional(endKey)),
 		primaryDoIdStr: "",
 		partitionId: opaque,
-		rangePartition: { hashKey, startBoundary: start, endBoundary: end },
+		rangePartition: {
+			hashKey: kb(hashKey),
+			startBoundary: KeyCodec.encodeOptional(startKey),
+			endBoundary: KeyCodec.encodeOptional(endKey),
+		},
 	};
 }
 
 function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): MigratedItem {
-	return { hk, sk, data, ttl_epoch_utc_seconds: null, v, last_transaction_ts: 0 };
+	return { hk: kb(hk), sk: kb(sk), data, ttl_epoch_utc_seconds: null, v, last_transaction_ts: 0 };
 }
 
 // Serves `all` (already in (hk, sk) order) in pages of `batchSize`, honoring the resume cursor —
 // mirrors the parent's real batch-serving contract (nextCursor non-null only when more remains).
 function pagedItemBatches(all: MigratedItem[], batchSize: number) {
 	return (cursor: MigrationCursor | null): GetItemsBatchResult => {
-		const start = cursor === null ? 0 : all.findIndex((i) => i.hk > cursor.hk || (i.hk === cursor.hk && i.sk > cursor.sk));
+		const start =
+			cursor === null
+				? 0
+				: all.findIndex(
+						(i) =>
+							KeyCodec.compare(i.hk, cursor.hk) > 0 || (KeyCodec.compare(i.hk, cursor.hk) === 0 && KeyCodec.compare(i.sk, cursor.sk) > 0),
+					);
 		const items = start === -1 ? [] : all.slice(start, start + batchSize);
 		const hasMore = start !== -1 && start + batchSize < all.length;
 		const last = items[items.length - 1];
@@ -237,7 +257,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 		txCalls: 0,
 		pkCalls: 0,
 		childAcks: [] as string[],
-		promotionAcks: [] as string[],
+		promotionAcks: [] as KeyBytes[],
 	};
 	let txIdx = 0;
 	let pkIdx = 0;
@@ -274,7 +294,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 type MigrationEnv = {
 	store: PartitionStore;
 	storage: DurableObjectStorage;
-	inherited: [string, PromotedKeyStatus][];
+	inherited: [KeyBytes, PromotedKeyStatus][];
 	makeMigration: (peer: PartitionPeer) => SplitMigration;
 	status: () => PartitionSplitMigrationStatus | undefined;
 	cursor: () => MigrationCursor | null | undefined;
@@ -286,7 +306,7 @@ async function withMigrationEnv(fn: (menv: MigrationEnv) => Promise<void>): Prom
 	const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(`migration-test.${crypto.randomUUID()}`));
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		const inherited: [string, PromotedKeyStatus][] = [];
+		const inherited: [KeyBytes, PromotedKeyStatus][] = [];
 		state.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 		await fn({
 			store,

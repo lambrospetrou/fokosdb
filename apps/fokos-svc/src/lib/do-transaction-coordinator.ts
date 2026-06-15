@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
-import { validateTransactWriteOperations } from "./transaction-limits.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
+import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import type {
 	CancelRequest,
 	CancelResponse,
@@ -50,13 +50,30 @@ type TcParticipantRow = {
 
 type TcItemRow = {
 	transaction_id: string;
-	hk: string;
-	sk: string;
+	hk: ArrayBuffer;
+	sk: ArrayBuffer;
 	operation: string;
 	data: string | ArrayBuffer | null;
 	conditions_json: string | null;
 	partition_do_name: string;
 };
+
+// tc_state.rejection_reason_json must round-trip binary (Uint8Array) keys through JSON, which plain
+// JSON.stringify mangles. These tag/restore Uint8Array values so a rejected transaction over binary
+// keys still reports the exact key after reload.
+function stringifyReason(reason: RejectionReason): string {
+	return JSON.stringify(reason, (_k, v) => (v instanceof Uint8Array ? { $u8: Array.from(v) } : v));
+}
+function parseReason(json: string): RejectionReason {
+	return JSON.parse(json, (_k, v) =>
+		v && typeof v === "object" && Array.isArray((v as { $u8?: unknown }).$u8) ? new Uint8Array((v as { $u8: number[] }).$u8) : v,
+	) as RejectionReason;
+}
+
+// tc_items hk/sk are BLOB; materialize a read column as KeyBytes (trusted re-brand, no copy of bytes).
+function keyFromBlob(value: ArrayBuffer): KeyBytes {
+	return KeyCodec.asKeyBytes(new Uint8Array(value));
+}
 
 const STALE_THRESHOLD_MS = 5_000;
 
@@ -88,8 +105,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE TABLE IF NOT EXISTS tc_items (
                 transaction_id      TEXT    NOT NULL,
-                hk                  TEXT    NOT NULL,
-                sk                  TEXT    NOT NULL DEFAULT '',
+                hk                  BLOB    NOT NULL,
+                sk                  BLOB    NOT NULL DEFAULT x'',
                 operation           TEXT    NOT NULL,
                 data                ANY,
                 conditions_json     TEXT,
@@ -124,7 +141,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return await this.resumeTransaction(existingRow, idempotencyToken);
 		}
 
-		this.validateWriteRequest(request);
+		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC
+		// receives already-validated, already-encoded operations.
 
 		// TODO: append DO shard suffix for tie-breaking when TC pooling is introduced
 		const transactionTs = Date.now();
@@ -150,7 +168,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
                      VALUES (?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
-					op.sortKey ?? "",
+					op.sortKey,
 					op.operation,
 					op.data ?? null,
 					op.conditions ? JSON.stringify(op.conditions) : null,
@@ -204,7 +222,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		if (row.state === "COMMITTED") {
-			const items = this.loadItems(transactionId).map((i) => (i.sk ? { hashKey: i.hk, sortKey: i.sk } : { hashKey: i.hk }));
+			// Decode keys to the public form; the empty sentinel ([]) maps back to an absent sortKey.
+			const items = this.loadItems(transactionId).map((i) => {
+				const hk = keyFromBlob(i.hk);
+				const sk = keyFromBlob(i.sk);
+				return sk.length === 0 ? { hashKey: KeyCodec.decode(hk) } : { hashKey: KeyCodec.decode(hk), sortKey: KeyCodec.decode(sk) };
+			});
 			return { outcome: "committed", transactionId, idempotencyToken, items };
 		}
 		if (row.state === "CANCELLED" && row.rejection_reason_json) {
@@ -212,7 +235,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				outcome: "cancelled",
 				transactionId,
 				idempotencyToken,
-				reason: JSON.parse(row.rejection_reason_json ?? '{"type":"transient_error"}') as RejectionReason,
+				reason: parseReason(row.rejection_reason_json),
 			};
 		}
 		// Some participants didn't respond during recovery; alarm will retry.
@@ -285,7 +308,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ? WHERE idempotency_token = ? AND state = 'PREPARING'`,
-			JSON.stringify(firstRejectionReason),
+			stringifyReason(firstRejectionReason),
 			idempotencyToken,
 		);
 		await this.runCancel(transactionId, idempotencyToken);
@@ -457,9 +480,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			);
 			await this.runCommit(transactionId, idempotencyToken);
 		} else if (anyRejected) {
-			const reasonJson = firstNewRejectionReason
-				? JSON.stringify(firstNewRejectionReason)
-				: JSON.stringify({ type: "transient_error" } satisfies RejectionReason);
+			const reasonJson = firstNewRejectionReason ? stringifyReason(firstNewRejectionReason) : stringifyReason({ type: "transient_error" });
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = COALESCE(rejection_reason_json, ?)
                  WHERE idempotency_token = ? AND state = 'PREPARING'`,
@@ -537,10 +558,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return { outcome: "aborted", reason: "pending_write" };
 		}
 
-		// Key-based comparison guards against any future reordering in PartitionDO.
-		const phase2ByKey = new Map(phase2Flat.map((r) => [`${r.hashKey}\0${r.sortKey ?? ""}`, r]));
+		// Key-based comparison guards against any future reordering in PartitionDO. Re-encode the
+		// decoded result keys to a collision-proof composite identity for arbitrary key bytes.
+		const resultKey = (r: ReadForTransactionItemResult): string =>
+			KeyCodec.pairKey(KeyCodec.encode(r.hashKey), KeyCodec.encodeOptional(r.sortKey));
+		const phase2ByKey = new Map(phase2Flat.map((r) => [resultKey(r), r]));
 		for (const p1 of phase1Flat) {
-			const p2 = phase2ByKey.get(`${p1.hashKey}\0${p1.sortKey ?? ""}`);
+			const p2 = phase2ByKey.get(resultKey(p1));
 			if (!p2 || p1.lastCommittedTs !== p2.lastCommittedTs) {
 				return { outcome: "aborted", reason: "read_conflict" };
 			}
@@ -675,10 +699,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private getPartitionStub(partitionDoName: string): PartitionDOStub {
 		return this.env.PARTITION_DO.get(this.env.PARTITION_DO.idFromName(partitionDoName)) as unknown as PartitionDOStub;
 	}
-
-	private validateWriteRequest(request: InitiateWriteRequest): void {
-		validateTransactWriteOperations(request.operations);
-	}
 }
 
 function deserializePartitionContext(json: string): PartitionContextResolved {
@@ -700,8 +720,8 @@ function groupByPartition(items: TcItemRow[]): Map<string, TcItemRow[]> {
 
 function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 	return rows.map((row) => ({
-		hashKey: row.hk,
-		sortKey: row.sk === "" ? undefined : row.sk,
+		hashKey: keyFromBlob(row.hk),
+		sortKey: keyFromBlob(row.sk), // empty KeyBytes ([]) is the absent sentinel
 		operation: row.operation as TransactionItem["operation"],
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
 		conditions: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,

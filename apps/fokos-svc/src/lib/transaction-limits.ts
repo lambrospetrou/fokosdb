@@ -5,6 +5,7 @@
  */
 
 import type { TransactionOperationType } from "./transaction-types.js";
+import { KeyCodec } from "./partition-topology/key-codec.js";
 
 export const MAX_ITEMS_PER_TRANSACTION = 100;
 export const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MB
@@ -14,31 +15,46 @@ export const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MB
  * client-facing operations input satisfy this structurally.
  */
 export type TransactWriteOperationLike = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 	operation: TransactionOperationType;
 	data?: Uint8Array | string;
 };
 
+function isEmptyKey(k: string | Uint8Array): boolean {
+	return typeof k === "string" ? k.length === 0 : k.byteLength === 0;
+}
+
 /**
- * Item keys must never contain the NUL character: composite keys are encoded as
- * `${hashKey}\0${sortKey}` in duplicate detection here and in the 2PC keyset comparisons
- * (PartitionDO.commitLocal, TransactionCoordinatorDO.initiateRead). Rejecting NUL at the API
- * boundary is what makes that encoding collision-proof — without it, a NUL inside a key could
- * shift the separator boundary and make two distinct (hashKey, sortKey) pairs indistinguishable.
+ * The single key-validation boundary, run on public keys before encoding. Rejects:
+ * - empty hashKey / empty sortKey (key attributes cannot be empty); an absent sortKey is allowed,
+ * - lone-surrogate strings (invalid UTF-16),
+ * - the NUL character in STRING keys. Binary (Uint8Array) keys may contain any byte, including 0x00.
  */
-export function validateItemKeys(hashKey: string, sortKey?: string): void {
-	if (hashKey.includes("\0")) {
-		throw new Error("fokos: hashKey must not contain the NUL (\\0) character");
+export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string | Uint8Array): void {
+	if (isEmptyKey(hashKey)) {
+		throw new Error("fokos: hashKey must not be empty");
 	}
-	if (sortKey?.includes("\0")) {
-		throw new Error("fokos: sortKey must not contain the NUL (\\0) character");
+	if (sortKey !== undefined && isEmptyKey(sortKey)) {
+		throw new Error("fokos: sortKey must not be empty (omit it for a single-key item)");
+	}
+	for (const [name, k] of [
+		["hashKey", hashKey],
+		["sortKey", sortKey],
+	] as const) {
+		if (typeof k !== "string") continue;
+		if (k.includes("\0")) {
+			throw new Error(`fokos: ${name} must not contain the NUL (\\0) character`);
+		}
+		if (k.isWellFormed?.() === false) {
+			throw new Error(`fokos: ${name} string contains a lone surrogate (not well-formed UTF-16)`);
+		}
 	}
 }
 
 /**
- * Validates a transact-write operation set: NUL-free keys, item count, duplicate keys,
- * total payload bytes, and that every "put" carries data. Throws on the first violation.
+ * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
+ * bytes, and that every "put" carries data. Throws on the first violation. Runs on RAW public keys.
  */
 export function validateTransactWriteOperations(ops: readonly TransactWriteOperationLike[]): void {
 	if (ops.length === 0) {
@@ -52,11 +68,16 @@ export function validateTransactWriteOperations(ops: readonly TransactWriteOpera
 	for (const op of ops) {
 		validateItemKeys(op.hashKey, op.sortKey);
 		if (op.operation === "put" && op.data == null) {
-			throw new Error(`fokos: transactWriteItems "put" operation requires data (${op.hashKey}${op.sortKey ? `, ${op.sortKey}` : ""})`);
+			throw new Error(
+				`fokos: transactWriteItems "put" operation requires data (${KeyCodec.keyForLog(KeyCodec.encode(op.hashKey))}${op.sortKey ? `, ${KeyCodec.keyForLog(KeyCodec.encode(op.sortKey))}` : ""})`,
+			);
 		}
-		const key = `${op.hashKey}\0${op.sortKey ?? ""}`;
+		// Collision-proof composite identity for arbitrary key bytes.
+		const key = KeyCodec.pairKey(KeyCodec.encode(op.hashKey), KeyCodec.encodeOptional(op.sortKey));
 		if (seen.has(key)) {
-			throw new Error(`fokos: transactWriteItems duplicate key (${op.hashKey}, ${op.sortKey ?? ""})`);
+			throw new Error(
+				`fokos: transactWriteItems duplicate key (${KeyCodec.keyForLog(KeyCodec.encode(op.hashKey))}, ${op.sortKey ? KeyCodec.keyForLog(KeyCodec.encode(op.sortKey)) : ""})`,
+			);
 		}
 		seen.add(key);
 		if (op.data) {

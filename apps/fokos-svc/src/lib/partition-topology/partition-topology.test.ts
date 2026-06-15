@@ -7,6 +7,9 @@ import { PartitionIdHelper, rangePartitionDoName } from "./partition-id.js";
 import { PartitionTopologyRouterImpl } from "./router.js";
 import type { SplitStatusKVItem } from "./split-state.js";
 import type { PartitionDO } from "../do-partition.js";
+import { KeyCodec } from "./key-codec.js";
+
+const kb = (s: string) => KeyCodec.encode(s);
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
@@ -22,39 +25,39 @@ function makeBase(): PartitionContext {
 
 describe("rangePartitionDoName", () => {
 	it("produces root name (null start/end → ~min/~max sentinels)", () => {
-		expect(rangePartitionDoName("mydb", "alice", null, null)).toBe("mydb.r.alice.~min.~max");
+		expect(rangePartitionDoName("mydb", kb("alice"), null, null)).toBe("mydb.r.alice.~min.~max");
 	});
 
 	it("produces child name with explicit start and end boundaries", () => {
-		expect(rangePartitionDoName("mydb", "alice", "b1", "b2")).toBe("mydb.r.alice.b1.b2");
+		expect(rangePartitionDoName("mydb", kb("alice"), kb("b1"), kb("b2"))).toBe("mydb.r.alice.b1.b2");
 	});
 
 	it("renders half-bounded edges with one sentinel (leftmost / rightmost child)", () => {
-		expect(rangePartitionDoName("mydb", "alice", null, "m")).toBe("mydb.r.alice.~min.m");
-		expect(rangePartitionDoName("mydb", "alice", "m", null)).toBe("mydb.r.alice.m.~max");
+		expect(rangePartitionDoName("mydb", kb("alice"), null, kb("m"))).toBe("mydb.r.alice.~min.m");
+		expect(rangePartitionDoName("mydb", kb("alice"), kb("m"), null)).toBe("mydb.r.alice.m.~max");
 	});
 
 	it("escapes a real boundary that looks like a sentinel (collision-proofness)", () => {
 		// A literal "~min" boundary value is escaped (~ → %7E), so it can never collide with the sentinel.
-		expect(rangePartitionDoName("mydb", "k", "~min", null)).toBe("mydb.r.k.%7Emin.~max");
+		expect(rangePartitionDoName("mydb", kb("k"), kb("~min"), null)).toBe("mydb.r.k.%7Emin.~max");
 	});
 
 	it("percent-encodes dots in hashKey and boundaries", () => {
-		expect(rangePartitionDoName("mydb", "a.b", "c.d", "e.f")).toBe("mydb.r.a%2Eb.c%2Ed.e%2Ef");
+		expect(rangePartitionDoName("mydb", kb("a.b"), kb("c.d"), kb("e.f"))).toBe("mydb.r.a%2Eb.c%2Ed.e%2Ef");
 	});
 
-	it("percent-encodes slashes", () => {
-		expect(rangePartitionDoName("mydb", "a/b", "c/d", "e/f")).toBe("mydb.r.a%2Fb.c%2Fd.e%2Ff");
+	it("leaves slashes literal (0x2F is a safe name byte, not reserved)", () => {
+		expect(rangePartitionDoName("mydb", kb("a/b"), kb("c/d"), kb("e/f"))).toBe("mydb.r.a/b.c/d.e/f");
 	});
 
 	it("leaves [A-Za-z0-9_-] unchanged", () => {
-		expect(rangePartitionDoName("db", "Hello_World-123", "sk_value-99", "sk_value-zz")).toBe(
+		expect(rangePartitionDoName("db", kb("Hello_World-123"), kb("sk_value-99"), kb("sk_value-zz"))).toBe(
 			"db.r.Hello_World-123.sk_value-99.sk_value-zz",
 		);
 	});
 
 	it("keeps range names disjoint from hash names (.r. vs .h.)", () => {
-		const rangeName = rangePartitionDoName("db", "0", null, null);
+		const rangeName = rangePartitionDoName("db", kb("0"), null, null);
 		expect(rangeName).toBe("db.r.0.~min.~max");
 		// Hash root 0 is "db.h.0" — no collision.
 		expect(rangeName).not.toBe("db.h.0");
@@ -64,7 +67,7 @@ describe("rangePartitionDoName", () => {
 describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	it("fromRangePartition root: encode then decode round-trips (both boundaries null)", () => {
 		const base = makeBase();
-		const helper = PartitionIdHelper.fromRangePartition(base, "alice", null, null);
+		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), null, null);
 		const { bytes, opaque, doName } = helper.encode(true);
 
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_RANGE_V1);
@@ -73,7 +76,7 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 		const decoded = PartitionIdHelper.decode(bytes);
 		expect(decoded.schema).toBe(1);
 		if (decoded.schema === 1) {
-			expect(decoded.hashKey).toBe("alice");
+			expect(decoded.hashKey).toEqual(kb("alice"));
 			expect(decoded.startBoundary).toBeNull();
 			expect(decoded.endBoundary).toBeNull();
 		}
@@ -85,7 +88,7 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 
 	it("fromRangePartition child: encode then decode round-trips with both boundaries", () => {
 		const base = makeBase();
-		const helper = PartitionIdHelper.fromRangePartition(base, "alice", "b1", "b2");
+		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), kb("b2"));
 		const { bytes, doName } = helper.encode(true);
 
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_RANGE_V1);
@@ -94,44 +97,44 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 		const decoded = PartitionIdHelper.decode(bytes);
 		expect(decoded.schema).toBe(1);
 		if (decoded.schema === 1) {
-			expect(decoded.hashKey).toBe("alice");
-			expect(decoded.startBoundary).toBe("b1");
-			expect(decoded.endBoundary).toBe("b2");
+			expect(decoded.hashKey).toEqual(kb("alice"));
+			expect(decoded.startBoundary).toEqual(kb("b1"));
+			expect(decoded.endBoundary).toEqual(kb("b2"));
 		}
 	});
 
 	it("round-trips half-bounded edges (leftmost: null start; rightmost: null end)", () => {
 		const base = makeBase();
 		for (const [start, end, name] of [
-			[null, "m", "testdb.r.x.~min.m"],
-			["m", null, "testdb.r.x.m.~max"],
+			[null, kb("m"), "testdb.r.x.~min.m"],
+			[kb("m"), null, "testdb.r.x.m.~max"],
 		] as const) {
-			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, "x", start, end).encode(true);
+			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, kb("x"), start, end).encode(true);
 			expect(doName).toBe(name);
 			const decoded = PartitionIdHelper.decode(bytes);
 			expect(decoded.schema).toBe(1);
 			if (decoded.schema === 1) {
-				expect(decoded.startBoundary).toBe(start);
-				expect(decoded.endBoundary).toBe(end);
+				expect(decoded.startBoundary).toEqual(start);
+				expect(decoded.endBoundary).toEqual(end);
 			}
 		}
 	});
 
 	it("handles unicode in hashKey and boundaries", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, "café☕", "töst", "zünd").encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("café☕"), kb("töst"), kb("zünd")).encode(false);
 		const decoded = PartitionIdHelper.decode(bytes);
 		expect(decoded.schema).toBe(1);
 		if (decoded.schema === 1) {
-			expect(decoded.hashKey).toBe("café☕");
-			expect(decoded.startBoundary).toBe("töst");
-			expect(decoded.endBoundary).toBe("zünd");
+			expect(decoded.hashKey).toEqual(kb("café☕"));
+			expect(decoded.startBoundary).toEqual(kb("töst"));
+			expect(decoded.endBoundary).toEqual(kb("zünd"));
 		}
 	});
 
 	it("doName dispatches correctly for range ID loaded from opaque hex", () => {
 		const base = makeBase();
-		const { opaque } = PartitionIdHelper.fromRangePartition(base, "mykey", "start1", "end1").encode(false);
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("mykey"), kb("start1"), kb("end1")).encode(false);
 		const bytes = Uint8Array.fromHex(opaque);
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("testdb.r.mykey.start1.end1");
 	});
@@ -168,7 +171,7 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1) unchanged", () => {
 
 	it("rootIdx, depth, lastChildIdx assert SCHEMA_HASH_V1", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, "k", null, null).encode(false);
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow();
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow();
@@ -195,19 +198,22 @@ function makeRangeCtx(
 	startBoundary: string | null,
 	endBoundary: string | null,
 ): PartitionContextResolved {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
+	const hashKeyBytes = kb(hashKey);
+	const startBytes = startBoundary === null ? null : kb(startBoundary);
+	const endBytes = endBoundary === null ? null : kb(endBoundary);
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKeyBytes, startBytes, endBytes).encode(true);
 	const doId = env.PARTITION_DO.idFromName(doName!);
 	return {
 		...base,
 		doName: doName!,
 		primaryDoIdStr: doId.toString(),
 		partitionId: opaque,
-		rangePartition: { hashKey, startBoundary, endBoundary },
+		rangePartition: { hashKey: hashKeyBytes, startBoundary: startBytes, endBoundary: endBytes },
 	};
 }
 
 function makeHashCtx(base: PartitionContext): PartitionContextResolved {
-	return new PartitionTopologyRouterImpl(base).pickPartition("dummyKey").partitionContext;
+	return new PartitionTopologyRouterImpl(base).pickPartition(kb("dummyKey")).partitionContext;
 }
 
 // Sets up a range DO via initFromSplit and immediately marks migration complete,
@@ -257,7 +263,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 		await setupRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "", data: "empty-sk" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk" });
 		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last" });
 
 		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });

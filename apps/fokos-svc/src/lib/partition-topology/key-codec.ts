@@ -131,6 +131,41 @@ function shortestSeparator(lo: KeyBytes, hi: KeyBytes): KeyBytes {
 	return asKeyBytes(hi.slice(0, lo.length + 1));
 }
 
+/**
+ * Human-readable rendering of a key for logs and error messages. Valid UTF-8
+ * strings render as `"text"`; binary (0xFF-tagged) and the empty sentinel render as `hex:...`. Never
+ * used for comparison or identity — display only. Raw `KeyBytes` must never print as a bare array.
+ */
+function keyForLog(k: KeyBytes): string {
+	if (k.length === 0) return "<empty>";
+	if (k[0] === BINARY_TAG) return `hex:${k.toHex()}`;
+	try {
+		// fatal:true throws on invalid UTF-8 so we fall back to hex rather than emitting U+FFFD garbage.
+		return JSON.stringify(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(k));
+	} catch {
+		return `hex:${k.toHex()}`;
+	}
+}
+
+/**
+ * Stable, collision-free string identity for a single key, for use as a Map/Set key (a raw
+ * `Uint8Array` can't be a Map key — it compares by reference). Hex of the canonical bytes: distinct
+ * keys ⇒ distinct strings. Display only via `keyForLog`; this one is for identity/lookup.
+ */
+function mapKey(k: KeyBytes): string {
+	return k.toHex();
+}
+
+/**
+ * Stable, collision-free string identity for a (hashKey, sortKey) pair — replaces the old
+ * `` `${hashKey}\0${sortKey}` `` joiner, which is NOT collision-proof now that binary keys may legally
+ * contain 0x00. Hex is a fixed alphabet that never contains ':', so the separator is unambiguous for
+ * arbitrary bytes. Used for 2PC keyset comparison and duplicate detection.
+ */
+function pairKey(hk: KeyBytes, sk: KeyBytes): string {
+	return `${hk.toHex()}:${sk.toHex()}`;
+}
+
 export const KeyCodec = {
 	encode,
 	encodeOptional,
@@ -139,4 +174,7 @@ export const KeyCodec = {
 	successor,
 	shortestSeparator,
 	asKeyBytes,
+	keyForLog,
+	mapKey,
+	pairKey,
 } as const;

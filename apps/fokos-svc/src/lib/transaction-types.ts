@@ -1,4 +1,5 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
+import type { KeyBytes } from "./partition-topology/key-codec.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -14,9 +15,11 @@ export type TransactionTimestamp = number; // Date.now() ms
 
 export type TransactionOperationType = "put" | "delete" | "check";
 
+// Wire-IN type (db.ts/TC → PartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
+// sortKey is always present — the empty KeyBytes ([]) is the absent sentinel.
 export type TransactionItem = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
 	operation: TransactionOperationType;
 	/** Required for "put". */
 	data?: Uint8Array | string;
@@ -33,13 +36,15 @@ export type PrepareRequest = {
 	items: TransactionItem[];
 };
 
+// Result/OUT type: keys are decoded to the public form (string for UTF-8, Uint8Array for binary) by
+// the producing participant, so rejections are user-readable and JSON-serializable for the TC.
 export type RejectionReason =
-	| { type: "condition_failed"; hashKey: string; sortKey?: string }
-	| { type: "timestamp_conflict"; hashKey: string; sortKey?: string }
+	| { type: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { type: "timestamp_conflict"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| {
 			type: "pending_conflict";
-			hashKey: string;
-			sortKey?: string;
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
 			conflictingTransactionId: TransactionId;
 	  }
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
@@ -70,22 +75,23 @@ export type CancelResponse = { outcome: "cancelled" };
 
 export type ReadForTransactionRequest = {
 	transactionId: TransactionId;
-	items: Array<{ hashKey: string; sortKey?: string }>;
+	items: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }>;
 };
 
+// Result/OUT type: keys decoded to the public form by the producing participant.
 export type ReadForTransactionItemResult =
 	| {
 			found: true;
-			hashKey: string;
-			sortKey?: string;
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
 			data: Uint8Array | string;
 			lastCommittedTs: TransactionTimestamp;
 			hasPendingWrite: boolean;
 	  }
 	| {
 			found: false;
-			hashKey: string;
-			sortKey?: string;
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
 			lastCommittedTs: TransactionTimestamp;
 			hasPendingWrite: boolean;
 	  };
@@ -111,9 +117,10 @@ export type RecoverTransactionResult =
 
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
 
+// Wire-IN type (db.ts → TC): keys are canonical KeyBytes (sortKey [] = absent).
 export type TCWriteOperation = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
 	operation: TransactionOperationType;
 	data?: Uint8Array | string;
 	conditions?: import("./types.js").ItemCondition[];
@@ -132,7 +139,8 @@ export type InitiateWriteResponse =
 			outcome: "committed";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
-			items: Array<{ hashKey: string; sortKey?: string }>;
+			// Decoded to the public form by the TC when assembling the final response.
+			items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
 	  }
 	| {
 			outcome: "cancelled";
@@ -141,9 +149,10 @@ export type InitiateWriteResponse =
 			reason: RejectionReason;
 	  };
 
+// Wire-IN type (db.ts → TC): keys are canonical KeyBytes (sortKey [] = absent).
 export type TCReadItem = {
-	hashKey: string;
-	sortKey?: string;
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };

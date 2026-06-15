@@ -1,4 +1,5 @@
 import { AddResult, BloomFilter, type BloomFilterSnapshot } from "../bloom-filter.js";
+import type { KeyBytes } from "./key-codec.js";
 
 export type PartialRangeTopologySnapshot = {
 	version: 1;
@@ -23,18 +24,18 @@ export class PartialRangeTopology {
 	/**
 	 * @returns True if the key is probably promoted (may be a false positive), false if definitely not promoted.
 	 */
-	maybePromoted(hashKey: string): boolean {
+	maybePromoted(hashKey: KeyBytes): boolean {
 		return this.bloom.has(hashKey);
 	}
 
-	learnPromotedKey(hashKey: string): AddResult {
+	learnPromotedKey(hashKey: KeyBytes): AddResult {
 		return this.bloom.add(hashKey);
 	}
 
 	/**
 	 * @returns True if any key was newly added to the bloom filter (i.e. the filter was modified).
 	 */
-	learnPromotedKeys(hashKeys: Iterable<string>): boolean {
+	learnPromotedKeys(hashKeys: Iterable<KeyBytes>): boolean {
 		let anyAdded = false;
 		for (const key of hashKeys) {
 			if (this.bloom.add(key) === AddResult.Added) anyAdded = true;

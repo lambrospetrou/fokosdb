@@ -1,9 +1,10 @@
-import { DeleteItemOptions, GetItemOptions, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
+import { DeleteItemOptions, GetItemOptions, GetItemResult, InitiateReadResponse, InitiateWriteResponse, PutItemOptions } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import { validateItemKeys, validateTransactWriteOperations } from "./transaction-limits.js";
+import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
@@ -46,44 +47,58 @@ export class FokosDB {
 
 	async putItem(opts: PutItemOptions) {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
-		const ns = this.#options.ns;
-		const stub = ns.get(doId);
-		return await stub.putItem(partitionContext, opts);
+		const hashKey = KeyCodec.encode(opts.hashKey);
+		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+		const stub = this.#options.ns.get(doId);
+		const res = await stub.putItem(partitionContext, { ...opts, hashKey, sortKey });
+		// Echo the caller's original keys (no decode needed).
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
 	}
 
-	async getItem(opts: GetItemOptions) {
+	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
-		const ns = this.#options.ns;
-		const stub = ns.get(doId);
-		return await stub.getItem(partitionContext, opts);
+		const hashKey = KeyCodec.encode(opts.hashKey);
+		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+		const stub = this.#options.ns.get(doId);
+		const res = await stub.getItem(partitionContext, { ...opts, hashKey, sortKey });
+		// Echo the caller's original keys (no decode needed); preserve the found/not-found discriminant.
+		if (res.found) {
+			return { found: true, item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
+		}
+		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
 	}
 
 	async deleteItem(opts: DeleteItemOptions) {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const { doId, partitionContext } = this.#options.topology.pickPartition(opts.hashKey, opts.sortKey);
-		const ns = this.#options.ns;
-		const stub = ns.get(doId);
-		return await stub.deleteItem(partitionContext, opts);
+		const hashKey = KeyCodec.encode(opts.hashKey);
+		const sortKey = KeyCodec.encodeOptional(opts.sortKey);
+		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+		const stub = this.#options.ns.get(doId);
+		const res = await stub.deleteItem(partitionContext, { ...opts, hashKey, sortKey });
+		// Echo the caller's original keys (no decode needed).
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
 	}
 
 	async transactWriteItems(opts: {
 		operations: Array<{
-			hashKey: string;
-			sortKey?: string;
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
 			operation: "put" | "delete" | "check";
 			data?: Uint8Array | string;
 			conditions?: ItemCondition[];
 		}>;
 		clientRequestToken?: string;
 	}): Promise<InitiateWriteResponse> {
+		// Validate raw keys at the single boundary, then encode once and route on the encoded keys.
+		validateTransactWriteOperations(opts.operations);
 		const operations: TCWriteOperation[] = opts.operations.map((op) => {
-			const { partitionContext } = this.#options.topology.pickPartition(op.hashKey, op.sortKey);
-			return { ...op, partitionContext };
+			const hashKey = KeyCodec.encode(op.hashKey);
+			const sortKey = KeyCodec.encodeOptional(op.sortKey);
+			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			return { ...op, hashKey, sortKey, partitionContext };
 		});
-
-		validateTransactWriteOperations(operations);
 
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
 		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
@@ -93,11 +108,15 @@ export class FokosDB {
 		});
 	}
 
-	async transactGetItems(opts: { items: Array<{ hashKey: string; sortKey?: string }> }): Promise<InitiateReadResponse> {
+	async transactGetItems(opts: {
+		items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
+	}): Promise<InitiateReadResponse> {
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
-			const { partitionContext } = this.#options.topology.pickPartition(item.hashKey, item.sortKey);
-			return { ...item, partitionContext };
+			const hashKey = KeyCodec.encode(item.hashKey);
+			const sortKey = KeyCodec.encodeOptional(item.sortKey);
+			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			return { ...item, hashKey, sortKey, partitionContext };
 		});
 
 		return await tryWhile(
