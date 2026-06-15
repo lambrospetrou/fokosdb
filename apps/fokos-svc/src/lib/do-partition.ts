@@ -4,6 +4,7 @@ import {
 	DeleteItemResult,
 	GetItemOptions,
 	GetItemResult,
+	OperationMetrics,
 	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
@@ -61,6 +62,17 @@ import { PromotionManager } from "./partition/hash-key-promotion.js";
 import { TransactionParticipant } from "./partition/transaction-participant.js";
 import { AddResult } from "./bloom-filter.js";
 import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "./partition-topology/partial-range-topology.js";
+import {
+	clipToChildRange,
+	cursorFallsInChild,
+	isChildFullyBeforeCursor,
+	isOriginalInclusiveCursor,
+	makeBoundaryCursor,
+	rangeIntersects,
+	type QueryCursor,
+	type SkInterval,
+} from "./query/sk-interval.js";
+import { PageBudget } from "./query/page-budget.js";
 
 function isPhantomBounceError(e: unknown): boolean {
 	return e instanceof Error && e.message.includes("phantom-bounce");
@@ -82,6 +94,41 @@ export interface PartitionAPI {
 	deleteItem(ctx: PartitionContext, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 }
 
+// ─── queryItems internal types ────────────────────────────────────────────────
+
+export type { SkInterval, QueryCursor } from "./query/sk-interval.js";
+
+export type QueryItemsRpcRequest = {
+	hashKey: KeyBytes;
+	interval: SkInterval;
+	direction: "asc" | "desc";
+	budgetBytes: number;
+	remainingLimit: number | null;
+	/**
+	 * Max number of leaf partitions this request may scan before stopping and returning a
+	 * continuation cursor. Bounds the cross-DO subrequest fan-out of a single page over a
+	 * heavily-split (or sparse) range subtree. Decremented as the walk descends.
+	 */
+	maxPartitionVisits: number;
+	cursor: QueryCursor | null;
+};
+
+export type QueryItemsRpcResult = {
+	items: MigratedItem[];
+	nextCursor: QueryCursor | null;
+	bytesConsumed: number;
+	/**
+	 * The serving DO's own bookkeeping record (servedBy*, hashDepth) — NOT part of the public
+	 * partitionMetas. Its `forwardCount` is subtree-cumulative: withSplitForwarding adds 1 per hash hop,
+	 * and a range router adds its child fan-out plus every descendant router's forwards.
+	 */
+	meta: OperationMetrics & PartitionInfo;
+	/** Leaf-only debugging trail: hash leaves and non-split range partitions that actually scanned rows. Routers (hash or range) are excluded. */
+	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
 // DurableObjectStub<PartitionDO> → PartitionDO → withSplitForwarding → DurableObjectStub<PartitionDO>.
 type PartitionDOStub = {
@@ -92,6 +139,8 @@ type PartitionDOStub = {
 	commit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
 	cancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
 	readForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
+	queryItems(ctx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult>;
+	queryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult>;
 };
 
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
@@ -365,6 +414,205 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return await this.readItemLocally(this.pCtx(), opts);
 	}
 
+	async queryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult> {
+		this.ensurePartitionContext(pCtx);
+
+		// If still migrating, read directly from the parent (mirrors getItem / getItemDirect).
+		if (await this.ensureMigration("queryItems", false)) {
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			invariant(parentCtx, "fokos/partition.queryItems: no parent partition context stored during migration");
+			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
+			const parentStub = this.env[parentCtx.ns].get(parentId) as PartitionDOStub;
+			const result = await parentStub.queryItemsDirect(req);
+			if (isHashPartition(pCtx)) {
+				const myDepth = PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!);
+				return { ...result, meta: { ...result.meta, hashDepth: myDepth } };
+			}
+			return result;
+		}
+
+		// Range partitions (the range root reached via promotion-forward, or a range child reached via
+		// walkRangeChildren) must NOT go through withSplitForwarding: its range-topology shouldAllow
+		// returns "forward" for a split router and would single-child-route by the sentinel sort key,
+		// bypassing the fan-out. The range-tree walk owns multi-leaf traversal instead.
+		if (isRangePartition(pCtx)) {
+			return await this.queryItemsAsRangeNode(pCtx, req);
+		}
+
+		// Hash partitions: withSplitForwarding handles promotion (forward to the range root), the
+		// learned-promotion bloom filter, and hash-split forwarding. The sentinel sort key routes by
+		// hash key only — all sks of a non-promoted key live on one leaf, so `local` is a leaf scan.
+		return await this.withSplitForwarding<QueryItemsRpcResult>({
+			ctx: pCtx,
+			keys: { hashKey: PartitionDO.keyIn(req.hashKey), sortKey: KeyCodec.encodeOptional(undefined) },
+			operationName: "queryItems",
+			forward: async (stub, childPCtx) => await stub.queryItems(childPCtx, req),
+			local: async () => await this.queryItemsLocal(this.pCtx(), req),
+		});
+	}
+
+	// Direct read bypassing split forwarding — used by migrating children to avoid forwarding loops
+	// (same rationale as getItemDirect).
+	async queryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult> {
+		const pCtx = this.pCtx();
+		if (isRangePartition(pCtx)) {
+			return await this.queryItemsAsRangeNode(pCtx, req);
+		}
+		return this.queryItemsLocal(pCtx, req);
+	}
+
+	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResult {
+		const hk = PartitionDO.keyIn(req.hashKey);
+		const { interval, cursor, budgetBytes, remainingLimit } = req;
+
+		const lower = interval.lower?.value ?? KeyCodec.encodeOptional(undefined);
+		const lowerInclusive = interval.lower?.inclusive ?? true;
+		const upper = interval.upper?.value ?? null;
+		const upperInclusive = interval.upper?.inclusive ?? false;
+
+		let rowsScanned = 0;
+		const PAGE_SIZE = 1000;
+
+		const {
+			rows,
+			nextCursor,
+			totalBytes: bytesConsumed,
+		} = collectBatch<MigratedItem, MigrationCursor>({
+			fetchPage: (pageCursor, pageSize) => {
+				const cursorInclusive = isOriginalInclusiveCursor(pageCursor, cursor);
+				const page = this.#store.queryRangeItemsPage({
+					hk,
+					lower,
+					lowerInclusive,
+					upper,
+					upperInclusive,
+					cursor: pageCursor,
+					cursorInclusive,
+					limit: pageSize,
+					direction: req.direction,
+				});
+				rowsScanned += page.length;
+				return page;
+			},
+			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
+			estimateBytes: estimateItemBytes,
+			budgetBytes,
+			maxItems: remainingLimit ?? undefined,
+			pageSize: PAGE_SIZE,
+			startCursor: cursor,
+		});
+
+		// A leaf (hash leaf or non-split range partition) is the only kind of DO that scans rows, so it
+		// is the only kind that contributes a `partitionMetas` entry. Routers (hash or range) are
+		// excluded — they appear only numerically via `forwardCount`.
+		const meta: OperationMetrics & PartitionInfo = {
+			rowsRead: rowsScanned,
+			rowsWritten: 0,
+			databaseSize: this.#store.databaseSize,
+			servedByActorId: this.ctx.id.toString(),
+			servedByActorName: pCtx.doName,
+			servedByPartitionId: pCtx.partitionId,
+			forwardCount: 0,
+			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
+		};
+
+		return { items: rows, nextCursor, bytesConsumed, meta, partitionMetas: [meta] };
+	}
+
+	private async queryItemsAsRangeNode(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult> {
+		const topology = this.ensureTopology(pCtx);
+		const splitStatus = topology.splitStatus();
+
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			return await this.walkRangeChildren(pCtx, splitStatus.childPartitionContexts, req);
+		}
+
+		return this.queryItemsLocal(pCtx, req);
+	}
+
+	private async walkRangeChildren(
+		pCtx: PartitionContextResolved,
+		children: PartitionContextResolved[],
+		req: QueryItemsRpcRequest,
+	): Promise<QueryItemsRpcResult> {
+		const { interval, cursor, direction } = req;
+		const budget = new PageBudget(req.budgetBytes, req.remainingLimit, req.maxPartitionVisits);
+
+		const allItems: MigratedItem[] = [];
+		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
+		// contribute nothing of their own; they're captured numerically via `forwardCount`.
+		const leafMetas: Array<OperationMetrics & PartitionInfo> = [];
+		let nextCursor: QueryCursor | null = null;
+		let totalBytesConsumed = 0;
+		let childrenCalled = 0;
+		// Sum of forwards performed by descendant routers, so this node's `forwardCount` is cumulative.
+		let descendantForwards = 0;
+
+		// Children are stored in ascending boundary order; reverse for desc.
+		const orderedChildren = direction === "desc" ? [...children].reverse() : children;
+
+		for (let i = 0; i < orderedChildren.length; i++) {
+			const childCtx = orderedChildren[i];
+			const rp = childCtx.rangePartition;
+			invariant(rp, "fokos/partition.walkRangeChildren: child has no rangePartition context");
+			const childStart = rp.startBoundary ?? KeyCodec.encodeOptional(undefined);
+			const childEnd = rp.endBoundary;
+
+			if (!rangeIntersects(childStart, childEnd, interval)) continue;
+			if (cursor && isChildFullyBeforeCursor(childStart, childEnd, cursor, direction)) continue;
+
+			const childCursor = cursor && cursorFallsInChild(childStart, childEnd, cursor) ? cursor : null;
+			const clippedInterval = clipToChildRange(interval, rp.startBoundary, childEnd);
+			const childStub = this.getChildStub(childCtx);
+			const childResult = await childStub.queryItems(childCtx, {
+				...req,
+				interval: clippedInterval,
+				budgetBytes: budget.remainingBytes,
+				remainingLimit: budget.remainingLimit,
+				maxPartitionVisits: budget.remainingVisits,
+				cursor: childCursor,
+			});
+
+			allItems.push(...childResult.items);
+			leafMetas.push(...childResult.partitionMetas);
+			descendantForwards += childResult.meta.forwardCount;
+			totalBytesConsumed += childResult.bytesConsumed;
+			budget.consume(childResult.bytesConsumed, childResult.items.length, childResult.partitionMetas.length);
+			childrenCalled++;
+
+			if (childResult.nextCursor !== null) {
+				nextCursor = childResult.nextCursor;
+				break;
+			}
+			if (budget.budgetExhausted) {
+				const lastItem = allItems[allItems.length - 1];
+				if (lastItem) nextCursor = { hk: lastItem.hk, sk: lastItem.sk };
+				break;
+			}
+			if (budget.visitsExhausted && i < orderedChildren.length - 1) {
+				console.warn(`fokos/partition.walkRangeChildren: maxPartitionVisits reached (${req.maxPartitionVisits}), emitting boundary cursor`);
+				nextCursor = makeBoundaryCursor(req.hashKey, childStart, childEnd, direction);
+				break;
+			}
+		}
+
+		// This range router is a pure router: it reads no rows and is NOT listed in `partitionMetas`.
+		// Its `meta` exists only for routing bookkeeping (servedBy*, hashDepth) and to carry the
+		// subtree-cumulative `forwardCount` (its own child fan-out plus every descendant router's).
+		const meta: OperationMetrics & PartitionInfo = {
+			rowsRead: 0,
+			rowsWritten: 0,
+			databaseSize: this.#store.databaseSize,
+			servedByActorId: this.ctx.id.toString(),
+			servedByActorName: pCtx.doName,
+			servedByPartitionId: pCtx.partitionId,
+			forwardCount: childrenCalled + descendantForwards,
+			hashDepth: 0,
+		};
+
+		return { items: allItems, nextCursor, bytesConsumed: totalBytesConsumed, meta, partitionMetas: leafMetas };
+	}
+
 	async getItemsBatch(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: MigrationCursor | null;
@@ -448,7 +696,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
 			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
 			fetchPage: (pageCursor, pageSize) =>
-				this.#store.queryRangeItemsPage({ hk: hashKey, lower, end, cursor: pageCursor, limit: pageSize }),
+				this.#store.queryRangeItemsPage({
+					hk: hashKey,
+					lower,
+					lowerInclusive: true,
+					upper: end,
+					upperInclusive: false,
+					cursor: pageCursor,
+					limit: pageSize,
+					direction: "asc",
+				}),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			estimateBytes: estimateItemBytes,
 			budgetBytes: BATCH_LIMIT_BYTES,

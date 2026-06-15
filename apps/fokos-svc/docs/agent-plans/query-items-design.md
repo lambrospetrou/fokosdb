@@ -73,7 +73,7 @@ type QueryItemsMeta = {
   rowsRead: number;          // total rows scanned (incl. filtered) across all visited DOs
   rowsReturned: number;      // total items returned this page (== count; differs under countOnly)
   forwardCount: number;      // total cross-partition forwards performed
-  partitionsVisited: number; // number of DOs (routers + leaves) that participated
+  partitionsVisited: number; // number of leaf DOs that scanned rows (== partitionMetas.length; routers excluded)
 };
 
 type QueryItemsResult = {
@@ -83,15 +83,24 @@ type QueryItemsResult = {
   count: number;
   cursor?: string;                     // present iff more results remain
   meta: QueryItemsMeta;                // aggregatable scalars only
-  partitionMetas: Array<OperationMetrics & PartitionInfo>; // full per-DO meta, one entry per partition touched
+  partitionMetas: Array<OperationMetrics & PartitionInfo>; // leaf-only: hash leaves + non-split range partitions (no routers)
 };
 ```
 
 `meta` carries only the fields that are meaningful when summed across DOs. The per-DO fields that are
 *not* summable — `databaseSize`, `servedByActorId/Name`, `servedByPartitionId`, `hashDepth` — live only
-in `partitionMetas`, which holds the full `OperationMetrics & PartitionInfo` object from every partition
-that participated (a pure router contributes an entry with `rowsRead: 0`, its own `forwardCount`, and its
-id — the per-partition debugging trail).
+in `partitionMetas`, which holds the full `OperationMetrics & PartitionInfo` object from **every
+data-bearing leaf** that scanned rows: a hash leaf (Case A) or a non-split range partition (the leaves of
+a promoted key's range tree). A non-split range partition counts because it *holds data*; once it splits
+it becomes a pure router and drops out.
+
+**Routers are not enumerated — neither hash nor range.** Only leaves appear in `partitionMetas`, so
+`partitionsVisited === partitionMetas.length` counts data-bearing DOs only. Every forwarding hop is still
+captured numerically: each `QueryItemsRpcResult.meta.forwardCount` is **subtree-cumulative** — the shared
+`withSplitForwarding` (also used by `getItem`/`putItem`/`deleteItem`) adds 1 per hash hop, and a range
+router adds its child fan-out plus every descendant router's forwards. `FokosDB.queryItems` reads the
+aggregate `forwardCount` straight off the top-level `meta` (not by summing the array). This keeps
+`partitionMetas` a clean per-leaf debugging trail while `forwardCount` still reflects full routing depth.
 
 **Budget resolution (public → internal).** `limit`/`maxPageBytes` are user-facing and optional;
 `FokosDB.queryItems` resolves them into the internal RPC budget before fan-out: `maxPageBytes` →
@@ -220,8 +229,9 @@ budgetBytes, remainingLimit, cursor)`:
      (`sk > lastSk`) and the walk advances to the next child — one redundant (cheap) child visit per
      resume, in exchange for a purely logical cursor.
    - Else continue to the next child.
-5. If all children drain within budget → `nextCursor = null` (this subtree is complete). A router with
-   no scanned rows still contributes its own `partitionMetas` entry (`rowsRead: 0`, its `forwardCount`).
+5. If all children drain within budget → `nextCursor = null` (this subtree is complete). A range router
+   contributes **no** `partitionMetas` entry (only leaves do); it folds its child fan-out and every
+   descendant router's forwards into its `meta.forwardCount`, which propagates up as a cumulative count.
 
 A **leaf** range DO (and a Case-A hash leaf) runs the same contract over its local `items` slice via the
 generalized `queryRangeItemsPage` + extended `collectBatch` (§6) — `getItemsBatchForRange`
@@ -229,42 +239,47 @@ generalized `queryRangeItemsPage` + extended `collectBatch` (§6) — `getItemsB
 
 ## 5. Pagination / cursor design
 
-Opaque, forward-only, base64 token storing **logical position, not physical DO identity**. The key
-fields carry **`KeyBytes`** (base64-encoded raw bytes), not strings: binary keys aren't representable
-as strings, and resumption re-routes through `KeyBytes`-native routing, so carrying bytes avoids
-re-encoding and any "was this string or binary?" ambiguity:
+Opaque, forward-only token storing **logical position, not physical DO identity**. The key fields
+carry **`KeyBytes`** (raw bytes), not strings: binary keys aren't representable as strings, and
+resumption re-routes through `KeyBytes`-native routing, so carrying bytes avoids re-encoding and any
+"was this string or binary?" ambiguity:
 
 ```ts
 type DecodedCursor = {
   version: number;         // cursor format version; unknown → reject (forward-compat, §11)
-  fingerprint: number;     // hash32 of the request identity (validation, below)
-  queryIdx: number;        // index into the `queries` sub-query list (0 in phase 1)
+  fingerprint: bigint;     // hash64 of the request identity (validation, below)
   direction: "fwd" | "rev";// pinned at first page; mismatch on resume is rejected
-  lastHashKey: KeyBytes;   // resume position
-  lastSortKey: KeyBytes;   // resume strictly after (before, if reverse) this sk
+  queryIdx: number;        // index into the `queries` sub-query list to resume at
+  // resume position within queries[queryIdx], or null to start that sub-query from its first row
+  inner: { hashKey: KeyBytes; sortKey: KeyBytes; inclusive: boolean } | null;
 };
 ```
 
-**Wire encoding.** A compact binary layout, then base64url (keys are bytes, so binary beats JSON):
+The `queryIdx` + optional `inner` split is what makes the cursor *cross-sub-query*: a page that
+stops mid-slice resumes the **same** sub-query at `inner` (Stop 1); a page that exhausts the global
+budget right as a sub-query drains resumes the **next** non-empty sub-query with `inner = null`
+(Stop 2, "start fresh"). `inner.inclusive` is the boundary-continuation flag the range-walk's
+fan-out cap emits; row-derived cursors are exclusive.
 
-```
-[version:u8][direction:u8][fingerprint:u32 LE][queryIdx:u32 LE]
-[hkLen:u32 LE][hk…][skLen:u32 LE][sk…]
-```
+**Wire encoding.** `JSON.stringify`, then base64url — keys are base64'd inside the JSON and the
+`bigint` fingerprint is a decimal string (JSON has no bigint). Chosen for simplicity over a
+hand-rolled binary layout; the token is opaque and only needs to round-trip.
 
-Decode validates: known `version`, exact length, `direction` matches the request, `fingerprint`
-matches. Any failure → error (§2 validation).
+Decode validates: known `version`, well-formed JSON, `direction` matches the request, in-range
+`queryIdx`, parseable `fingerprint`, and (if present) decodable `inner` keys — then the
+`fingerprint` is compared. Any failure → error (§2 validation).
 
 **Cursor ↔ request binding (DynamoDB-style logical cursor).** The cursor is logical-only; the caller
-**must re-send the same request** on resume. We guard accidental misuse with a `fingerprint = hash32(...)`
+**must re-send the same request** on resume. We guard accidental misuse with a `fingerprint = hash64(...)`
 (`hash-primitives`) over the request's *identity-determining* fields **only**: the ordered `queries[]`
-(each `hashKey` bytes + its normalized `SkInterval` bounds + inclusivity flags) and `direction`. It does
+(each `hashKey` bytes + its normalized `SkInterval` bounds + inclusivity flags, with **empty intervals
+explicitly marked** so the list — and thus every `queryIdx` — is stable) and `direction`. It does
 **not** cover `limit` / `maxPageBytes` / `countOnly` — those may legitimately change between pages (as
 DynamoDB allows changing `Limit`). Build a length-delimited canonical `Uint8Array` of those fields and
-hash it; on resume recompute and compare. This is best-effort (32-bit ⇒ ~1-in-4B collision) — a guard
-against accidental misuse (edited/swapped request, cross-query token reuse), **not** a security boundary.
+hash it; on resume recompute and compare. This is best-effort — a guard against accidental misuse
+(edited/swapped request, cross-query token reuse), **not** a security boundary.
 
-Resumption re-routes `lastHashKey`/`lastSortKey` through normal routing, so the logical boundary is
+Resumption re-routes the cursor's `hashKey`/`sortKey` through normal routing, so the logical boundary is
 stable across splits/promotions. `collectBatch`'s contract is reused (extended with `maxItems`, §6):
 the cursor advances past every scanned row; the first matched row is always included even if oversized;
 `nextCursor` is non-null **only** when the byte budget *or* item cap stopped the scan. An empty page with
@@ -361,16 +376,20 @@ cap landed exactly on the last row, so the next page is empty with a null cursor
   **optional** — absent means uncapped (only the byte budget bounds the page).
 - Each DO hop does bounded work (the range walk honors the remaining budget) — no unbounded hop. No
   artificial cap on leaves-per-page; the byte/item budget is the backstop.
-- `meta` aggregates `rowsRead`/`rowsReturned`/`forwardCount`/`partitionsVisited` across all visited DOs;
-  `partitionMetas` carries the full per-DO `OperationMetrics & PartitionInfo` (§2, §10).
+- `meta` aggregates `rowsRead`/`rowsReturned`/`forwardCount`/`partitionsVisited`; `partitionMetas`
+  carries the full `OperationMetrics & PartitionInfo` for **leaf DOs only** (routers excluded, §2, §10).
 
 ## 10. Phasing
 
-1. **Phase 1** — single sub-query (A+B), forward direction, all sk operators incl. `beginsWith`,
-   byte+limit pagination, opaque cursor, lock = return-committed. Delivers DynamoDB-Query parity for one
-   key. `beginsWith` uses the existing `KeyCodec.successor()` — no new key-synthesis code.
-2. **Phase 2** — `scanIndexForward=false` (D) end-to-end (store + reverse range walk).
-3. **Phase 3** — multi-sub-query fan-out (C) + cross-query cursor (grouped-by-hashKey).
+1. **Phase 1 — ✅ DONE** — single sub-query (A+B), forward direction, all sk operators incl.
+   `beginsWith`, byte+limit pagination, opaque cursor, lock = return-committed. Delivers DynamoDB-Query
+   parity for one key. `beginsWith` uses the existing `KeyCodec.successor()` — no new key-synthesis code.
+2. **Phase 2 — ✅ DONE** — `scanIndexForward=false` (D) end-to-end (store + reverse range walk).
+3. **Phase 3 — ✅ DONE** — multi-sub-query fan-out (C) + cross-query cursor (grouped-by-hashKey).
+   `FokosDB.queryItems` walks `queries[]` in list order under one global byte/limit/visit budget,
+   concatenating each sub-query's group; the cursor carries `queryIdx` plus an optional in-sub-query
+   resume position (absent = start the next sub-query fresh). The fingerprint covers the full ordered
+   list (incl. empty intervals). The cursor is now JSON+base64url (was a hand-rolled binary layout).
 4. **Phase 4 (optional)** — `countOnly`, first-class `OR`/multi-range, lock-aware modes.
 
 ## 11. Decisions locked
@@ -397,7 +416,9 @@ cap landed exactly on the last row, so the next page is empty with a null cursor
   `hash32` **request fingerprint** (queries + direction only) plus a leading **version** byte; binary
   layout, base64url. Decode/version/direction/fingerprint failures are errors.
 - `meta`: **aggregatable scalars** at top level (`rowsRead`, `rowsReturned`, `forwardCount`,
-  `partitionsVisited`) **+ `partitionMetas`** array of full per-DO meta.
+  `partitionsVisited`) **+ `partitionMetas`** array of full per-DO meta for **leaf DOs only** (hash
+  leaves + non-split range partitions; routers excluded, captured numerically via cumulative
+  `forwardCount`).
 - Budget inputs (`limit`, `maxPageBytes`) are **user-optional with defaults**; resolved to the internal
   RPC's `remainingLimit`/`budgetBytes`. `limit` absent = uncapped.
 - Range-router walk: **explicit algorithm** in §4 (boundary-ordered children, interval clip, budget

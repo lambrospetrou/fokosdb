@@ -5,7 +5,7 @@ import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
 import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
-import type { GetItemResult, InitiateReadResponse } from "./lib/types.js";
+import type { GetItemResult, InitiateReadResponse, QueryItemsResult } from "./lib/types.js";
 
 export { PartitionDO } from "./lib/do-partition.js";
 export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
@@ -81,6 +81,30 @@ const TransactGetItemsBodySchema = v.object({
 	partitionOptions: PartitionOptionsSchema,
 });
 
+// FIXME: the HTTP API only accepts string keys; support Uint8Array (binary) keys via a
+// keyEncoding discriminator or base64-encoded binary form (see queryItems design §2).
+const SortKeyConditionSchema = v.union([
+	v.object({ op: v.literal("eq"), value: v.string() }),
+	v.object({ op: v.union([v.literal("lt"), v.literal("lte"), v.literal("gt"), v.literal("gte")]), value: v.string() }),
+	v.object({ op: v.literal("between"), lower: v.string(), upper: v.string() }),
+	v.object({ op: v.literal("begins_with"), prefix: v.string() }),
+	v.object({
+		op: v.literal("range"),
+		lower: v.optional(v.object({ value: v.string(), inclusive: v.boolean() })),
+		upper: v.optional(v.object({ value: v.string(), inclusive: v.boolean() })),
+	}),
+]);
+
+const PositiveIntSchema = v.pipe(v.number(), v.integer(), v.minValue(1));
+
+const QueryItemsBodySchema = v.object({
+	queries: v.array(v.object({ hashKey: v.string(), sort: v.optional(SortKeyConditionSchema), scanIndexForward: v.optional(v.boolean()) })),
+	limit: v.optional(PositiveIntSchema),
+	maxPageBytes: v.optional(PositiveIntSchema),
+	cursor: v.optional(v.string()),
+	partitionOptions: PartitionOptionsSchema,
+});
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const DEFAULT_PARTITION_OPTIONS = {
@@ -122,6 +146,24 @@ function serializeGetItemResult(result: GetItemResult) {
 	if (!result.found) return result;
 	const { data, ...itemRest } = result.item;
 	return { ...result, item: { ...itemRest, ...encodeData(data) } };
+}
+
+function serializeQueryItemsResult(result: QueryItemsResult) {
+	return {
+		...result,
+		items: result.items.map((item) => {
+			const { data, hashKey, sortKey, ...rest } = item;
+			// The HTTP surface is string-only for keys (every endpoint uses v.string()), so writes can
+			// only produce UTF-8 keys and a scan can only decode strings back. A Uint8Array key here
+			// means a binary key reached the store via the programmatic/RPC API — it would serialize to
+			// `{"0":..}` over c.json. Fail loudly rather than emit broken JSON; binary keys over HTTP
+			// would need a keyEncoding discriminator (see queryItems design §2), not yet wired.
+			if (hashKey instanceof Uint8Array || sortKey instanceof Uint8Array) {
+				throw new HTTPException(500, { message: "fokos/queryItems: binary keys are not supported over the HTTP API" });
+			}
+			return { ...rest, hashKey, sortKey, ...encodeData(data) };
+		}),
+	};
 }
 
 function serializeTransactGetItemsResult(result: InitiateReadResponse) {
@@ -261,6 +303,12 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 		case "transactGetItems": {
 			const { partitionOptions, ...opts } = parseBody(TransactGetItemsBodySchema);
 			return c.json(serializeTransactGetItemsResult(await makeFokosDB(c.env, tableName, partitionOptions).transactGetItems(opts)));
+		}
+		case "queryItems": {
+			const { partitionOptions, ...opts } = parseBody(QueryItemsBodySchema);
+			const result = await makeFokosDB(c.env, tableName, partitionOptions).queryItems(opts);
+			c.set("dbItemMeta", result.meta);
+			return c.json(serializeQueryItemsResult(result));
 		}
 		default:
 			throw new HTTPException(404, { message: `Unknown rpcAction: ${rpcAction}` });

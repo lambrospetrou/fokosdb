@@ -22,6 +22,12 @@ export type CollectBatchOptions<TRow, TCursor> = {
 	estimateBytes: (row: TRow) => number;
 	/** Stop collecting once accumulated bytes would exceed this (after the first matched row). */
 	budgetBytes: number;
+	/**
+	 * Optional item-count cap. Checked *after* advancing the cursor past an included row, so the
+	 * row is never re-emitted on resume (unlike the byte-budget break, which re-fetches the
+	 * oversized row). When omitted, only the byte budget bounds the scan.
+	 */
+	maxItems?: number;
 	pageSize: number;
 	startCursor: TCursor | null;
 };
@@ -29,10 +35,12 @@ export type CollectBatchOptions<TRow, TCursor> = {
 export type CollectBatchResult<TRow, TCursor> = {
 	rows: TRow[];
 	nextCursor: TCursor | null;
+	/** Sum of `estimateBytes` over the included rows (the bytes that counted against `budgetBytes`). */
+	totalBytes: number;
 };
 
 export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCursor>): CollectBatchResult<TRow, TCursor> {
-	const { fetchPage, advanceCursor, include, estimateBytes, budgetBytes, pageSize } = opts;
+	const { fetchPage, advanceCursor, include, estimateBytes, budgetBytes, maxItems, pageSize } = opts;
 
 	const rows: TRow[] = [];
 	let totalBytes = 0;
@@ -57,11 +65,17 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 			}
 			// Always advance the table cursor regardless of whether the row matched.
 			cursor = advanceCursor(row);
+
+			// Item-count cap: checked *after* advancing the cursor so the included row is not re-emitted.
+			if (maxItems !== undefined && rows.length >= maxItems) {
+				reachedLimit = true;
+				break;
+			}
 		}
 		if (reachedLimit) break;
 
 		if (page.length < pageSize) break;
 	}
 
-	return { rows, nextCursor: reachedLimit ? cursor : null };
+	return { rows, nextCursor: reachedLimit ? cursor : null, totalBytes };
 }
