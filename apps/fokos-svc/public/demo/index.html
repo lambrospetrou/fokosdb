@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<meta name="color-scheme" content="light dark" />
+		<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.orange.min.css" />
+		<title>FokosDB Demo</title>
+		<style>
+			pre {
+				background: var(--pico-code-background-color);
+				border-radius: var(--pico-border-radius);
+				padding: 1rem;
+				overflow-x: auto;
+				font-size: 0.75rem;
+				max-height: 400px;
+			}
+			.empty {
+				text-align: center;
+				color: var(--pico-muted-color);
+				padding: 2rem;
+			}
+			.error {
+				color: var(--pico-del-color);
+				font-size: 0.875rem;
+				margin-top: 0.25rem;
+			}
+			.spinner {
+				display: inline-block;
+				width: 1rem;
+				height: 1rem;
+				border: 2px solid currentColor;
+				border-top-color: transparent;
+				border-radius: 50%;
+				animation: spin 0.6s linear infinite;
+				vertical-align: middle;
+				margin-right: 0.3rem;
+			}
+			@keyframes spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+			.tabs {
+				display: flex;
+				gap: 0.5rem;
+				border-bottom: 1px solid var(--pico-muted-border-color);
+				margin-bottom: 1.5rem;
+			}
+			.tab-btn {
+				background: none;
+				border: none;
+				border-bottom: 2px solid transparent;
+				padding: 0.5rem 0.75rem;
+				cursor: pointer;
+				color: var(--pico-muted-color);
+				font-size: 0.9rem;
+				margin-bottom: -1px;
+			}
+			.tab-btn.active {
+				border-bottom-color: var(--pico-primary);
+				color: var(--pico-color);
+			}
+			nav select {
+				margin: 0;
+				width: auto;
+			}
+		</style>
+		<script type="importmap">
+			{
+				"imports": {
+					"preact": "https://esm.sh/preact@10.23.1",
+					"preact/": "https://esm.sh/preact@10.23.1/",
+					"@preact/signals": "https://esm.sh/@preact/signals@1.3.0?external=preact",
+					"htm/preact": "https://esm.sh/htm@3.1.1/preact?external=preact"
+				}
+			}
+		</script>
+	</head>
+	<body>
+		<div id="root"></div>
+
+		<script type="module">
+			import { h, render } from "preact";
+			import { useState } from "preact/hooks";
+			import { signal, effect } from "@preact/signals";
+			import { html } from "htm/preact";
+
+			// ── Demos registry ────────────────────────────────────────────────────────────
+			const DEMOS = [
+				{ id: "split", label: "Split Demo" },
+			];
+
+			// ── State ────────────────────────────────────────────────────────────────────
+			const activeDemo = signal(DEMOS[0].id);
+			const secretToken = signal(localStorage.getItem("fokos-secret-token") ?? "");
+
+			effect(() => {
+				localStorage.setItem("fokos-secret-token", secretToken.value);
+			});
+
+			// ── API helpers ───────────────────────────────────────────────────────────────
+			async function apiFetch(path, opts = {}) {
+				const res = await fetch(`/api${path}`, {
+					headers: {
+						"Content-Type": "application/json",
+						"x-fokos-secret-token": secretToken.value,
+						...opts.headers,
+					},
+					...opts,
+				});
+				const text = await res.text();
+				let body;
+				try {
+					body = JSON.parse(text);
+				} catch {
+					body = text;
+				}
+				if (!res.ok) throw new Error(body?.error || body?.message || `HTTP ${res.status}`);
+				return body;
+			}
+
+			// ── Shared UI helpers ─────────────────────────────────────────────────────────
+			function Spinner() {
+				return html`<span class="spinner"></span>`;
+			}
+
+			function CopyButton({ text }) {
+				const [copied, setCopied] = useState(false);
+				async function copy() {
+					await navigator.clipboard.writeText(text);
+					setCopied(true);
+					setTimeout(() => setCopied(false), 1500);
+				}
+				return html`<button class="secondary outline" onClick=${copy}>${copied ? "✓ Copied" : "Copy"}</button>`;
+			}
+
+			// ── Demo components ───────────────────────────────────────────────────────────
+			function SplitDemo() {
+				return html`<p class="empty">Split demo — coming soon.</p>`;
+			}
+
+			const DEMO_COMPONENTS = {
+				split: SplitDemo,
+			};
+
+			// ── Admin tools ───────────────────────────────────────────────────────────────
+			function AdminTools() {
+				return html`
+					<details>
+						<summary><strong>Admin tools</strong></summary>
+						<label>
+							Secret token
+							<input
+								type="password"
+								placeholder="x-fokos-secret-token"
+								value=${secretToken.value}
+								onInput=${(e) => (secretToken.value = e.target.value)}
+							/>
+						</label>
+					</details>
+				`;
+			}
+
+			// ── App shell ─────────────────────────────────────────────────────────────────
+			function App() {
+				const DemoComp = DEMO_COMPONENTS[activeDemo.value] ?? (() => html`<p class="empty">Unknown demo.</p>`);
+				return html`
+					<div>
+						<nav class="container">
+							<ul>
+								<li><strong>FokosDB Demo</strong></li>
+							</ul>
+							<ul>
+								<li>
+									<select onChange=${(e) => (activeDemo.value = e.target.value)}>
+										${DEMOS.map(
+											(d) => html`<option key=${d.id} value=${d.id} selected=${activeDemo.value === d.id}>${d.label}</option>`,
+										)}
+									</select>
+								</li>
+							</ul>
+						</nav>
+						<main class="container">
+							<${DemoComp} />
+						</main>
+						<footer class="container">
+							<hr />
+							<${AdminTools} />
+						</footer>
+					</div>
+				`;
+			}
+
+			// ── Boot ──────────────────────────────────────────────────────────────────────
+			render(html`<${App} />`, document.getElementById("root"));
+		</script>
+	</body>
+</html>
