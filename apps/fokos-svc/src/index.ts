@@ -176,11 +176,13 @@ api.use(async (c, next) => {
 api.use(async (c, next) => {
 	const start = Date.now();
 	await next();
+	const durationMs = Date.now() - start;
+	c.header("Server-Timing", `worker;dur=${durationMs}`);
 	console.log({
 		message: `${c.req.method} ${c.req.path} - ${c.res.status}`,
 		status: c.res.status,
 		path: c.req.path,
-		durationMs: Date.now() - start,
+		durationMs,
 		dbItemMeta: c.get("dbItemMeta"),
 	});
 });

@@ -18,12 +18,7 @@
 			.empty {
 				text-align: center;
 				color: var(--pico-muted-color);
-				padding: 2rem;
-			}
-			.error {
-				color: var(--pico-del-color);
-				font-size: 0.875rem;
-				margin-top: 0.25rem;
+				padding: 2rem 0;
 			}
 			.spinner {
 				display: inline-block;
@@ -33,6 +28,7 @@
 				border-top-color: transparent;
 				border-radius: 50%;
 				animation: spin 0.6s linear infinite;
+				animation-play-state: running;
 				vertical-align: middle;
 				margin-right: 0.3rem;
 			}
@@ -41,29 +37,68 @@
 					transform: rotate(360deg);
 				}
 			}
-			.tabs {
-				display: flex;
-				gap: 0.5rem;
-				border-bottom: 1px solid var(--pico-muted-border-color);
-				margin-bottom: 1.5rem;
-			}
-			.tab-btn {
-				background: none;
-				border: none;
-				border-bottom: 2px solid transparent;
-				padding: 0.5rem 0.75rem;
-				cursor: pointer;
-				color: var(--pico-muted-color);
-				font-size: 0.9rem;
-				margin-bottom: -1px;
-			}
-			.tab-btn.active {
-				border-bottom-color: var(--pico-primary);
-				color: var(--pico-color);
-			}
 			nav select {
 				margin: 0;
 				width: auto;
+			}
+			.stat-grid {
+				display: grid;
+				grid-template-columns: repeat(6, 1fr);
+				gap: 1rem;
+				margin-bottom: 1rem;
+			}
+			.stat-box {
+				background: var(--pico-card-background-color);
+				border: 1px solid var(--pico-muted-border-color);
+				border-radius: var(--pico-border-radius);
+				padding: 0.75rem 1rem;
+			}
+			.stat-box small {
+				color: var(--pico-muted-color);
+				font-size: 0.75rem;
+				display: block;
+				margin-bottom: 0.2rem;
+			}
+			.stat-box strong {
+				font-size: 1.3rem;
+			}
+			.actor-row {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				padding: 0.3rem 0;
+				border-bottom: 1px solid var(--pico-muted-border-color);
+				font-size: 0.8rem;
+				gap: 0.5rem;
+			}
+			.actor-row:last-child {
+				border-bottom: none;
+			}
+			.actor-row code {
+				font-size: 0.75rem;
+				word-break: break-all;
+			}
+			.actor-bar-wrap {
+				display: flex;
+				align-items: center;
+				gap: 0.4rem;
+				min-width: 120px;
+			}
+			.actor-bar {
+				height: 6px;
+				background: var(--pico-primary);
+				border-radius: 3px;
+				flex-shrink: 0;
+			}
+			article > header {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+			}
+			article > header button {
+				margin: 0;
+				padding: 0.2rem 0.6rem;
+				font-size: 0.8rem;
 			}
 		</style>
 		<script type="importmap">
@@ -78,28 +113,23 @@
 		</script>
 	</head>
 	<body>
-		<div id="root"></div>
+		<div id="root" style="padding-bottom: 4rem"></div>
 
 		<script type="module">
 			import { h, render } from "preact";
-			import { useState } from "preact/hooks";
-			import { signal, effect } from "@preact/signals";
+			import { signal, computed, effect, batch } from "@preact/signals";
 			import { html } from "htm/preact";
 
 			// ── Demos registry ────────────────────────────────────────────────────────────
-			const DEMOS = [
-				{ id: "split", label: "Split Demo" },
-			];
+			const DEMOS = [{ id: "split", label: "Split Demo" }];
 
-			// ── State ────────────────────────────────────────────────────────────────────
+			// ── Global state ──────────────────────────────────────────────────────────────
 			const activeDemo = signal(DEMOS[0].id);
 			const secretToken = signal(localStorage.getItem("fokos-secret-token") ?? "");
 
-			effect(() => {
-				localStorage.setItem("fokos-secret-token", secretToken.value);
-			});
+			effect(() => localStorage.setItem("fokos-secret-token", secretToken.value));
 
-			// ── API helpers ───────────────────────────────────────────────────────────────
+			// ── API ───────────────────────────────────────────────────────────────────────
 			async function apiFetch(path, opts = {}) {
 				const res = await fetch(`/api${path}`, {
 					headers: {
@@ -117,32 +147,333 @@
 					body = text;
 				}
 				if (!res.ok) throw new Error(body?.error || body?.message || `HTTP ${res.status}`);
-				return body;
+
+				const st = res.headers.get("server-timing");
+				let workerDurMs = null;
+				if (st) {
+					const m = st.match(/worker;dur=([\d.]+)/);
+					if (m) workerDurMs = parseFloat(m[1]);
+				}
+				return { body, workerDurMs };
 			}
 
-			// ── Shared UI helpers ─────────────────────────────────────────────────────────
+			// ── Shared components ─────────────────────────────────────────────────────────
 			function Spinner() {
 				return html`<span class="spinner"></span>`;
 			}
 
-			function CopyButton({ text }) {
-				const [copied, setCopied] = useState(false);
-				async function copy() {
-					await navigator.clipboard.writeText(text);
-					setCopied(true);
-					setTimeout(() => setCopied(false), 1500);
+			// ── Split Demo ────────────────────────────────────────────────────────────────
+
+			const MAX_SAMPLES = 1_000;
+
+			// Partition config
+			const cfgTableName = signal("demo");
+			const cfgRootTreesN = signal(3);
+			const cfgHashSplitN = signal(4);
+			const cfgHashMaxMb = signal(5);
+			const cfgRangeSplitN = signal(4);
+			const cfgRangeMaxMb = signal(5);
+
+			// Load config
+			const loadParallelN = signal(10);
+			const loadKbPerItem = signal(50);
+			const loadHashMode = signal("random"); // "random" | "same" | "custom"
+			const loadHashValue = signal("fokos-hash-key");
+			const loadSortMode = signal("random");
+			const loadSortValue = signal("fokos-sort-key");
+			const loadRunning = signal(false);
+			const destroying = signal(false);
+
+			// Stats
+			const sActorHits = signal({});
+			const sBrowserLats = signal([]);
+			const sWorkerLats = signal([]);
+			const sCount = signal(0);
+			const sErrors = signal(0);
+			const sRunStart = signal(null);
+			const sReqPerSec = signal(0);
+
+			const sAvgBrowser = computed(() => avg(sBrowserLats.value));
+			const sP99Browser = computed(() => p99(sBrowserLats.value));
+			const sAvgWorker = computed(() => avg(sWorkerLats.value));
+			const sP99Worker = computed(() => p99(sWorkerLats.value));
+
+			// ── Stats helpers ─────────────────────────────────────────────────────────────
+			function avg(arr) {
+				return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
+			}
+			function p99(arr) {
+				if (!arr.length) return null;
+				const sorted = [...arr].sort((a, b) => a - b);
+				return sorted[Math.max(0, Math.ceil(sorted.length * 0.99) - 1)];
+			}
+			function fmtMs(ms) {
+				return ms === null ? "—" : ms.toFixed(1) + " ms";
+			}
+			function appendCapped(arr, val) {
+				return arr.length >= MAX_SAMPLES ? [...arr.slice(1), val] : [...arr, val];
+			}
+
+			function resetStats() {
+				batch(() => {
+					sActorHits.value = {};
+					sBrowserLats.value = [];
+					sWorkerLats.value = [];
+					sCount.value = 0;
+					sErrors.value = 0;
+					sRunStart.value = loadRunning.value ? Date.now() : null;
+					sReqPerSec.value = 0;
+				});
+			}
+
+			function recordResponse(browserMs, workerMs, actorValue, dbSize) {
+				batch(() => {
+					const count = sCount.value + 1;
+					sCount.value = count;
+					sBrowserLats.value = appendCapped(sBrowserLats.value, browserMs);
+					if (workerMs !== null) sWorkerLats.value = appendCapped(sWorkerLats.value, workerMs);
+					if (actorValue != null) {
+						const key = typeof actorValue === "string" ? actorValue : JSON.stringify(actorValue);
+						const hits = { ...sActorHits.value };
+						const prev = hits[key] ?? { count: 0, dbSize: null };
+						hits[key] = { count: prev.count + 1, dbSize: dbSize ?? prev.dbSize };
+						sActorHits.value = hits;
+					}
+					const elapsed = (Date.now() - (sRunStart.value ?? Date.now())) / 1000;
+					sReqPerSec.value = elapsed > 0.1 ? count / elapsed : 0;
+				});
+			}
+
+			// ── Load runner ───────────────────────────────────────────────────────────────
+			async function destroyDB() {
+				if (destroying.value) return;
+				destroying.value = true;
+				try {
+					await apiFetch(`/databases/${cfgTableName.value}`, {
+						method: "DELETE",
+						body: JSON.stringify({
+							partitionOptions: {
+								rootTreesN: cfgRootTreesN.value,
+								hashSplitN: cfgHashSplitN.value,
+								rangeSplitN: cfgRangeSplitN.value,
+								hashSplitConditions: { maxSizeMb: cfgHashMaxMb.value },
+								rangeSplitConditions: { maxSizeMb: cfgRangeMaxMb.value },
+							},
+						}),
+					});
+					resetStats();
+				} finally {
+					destroying.value = false;
 				}
-				return html`<button class="secondary outline" onClick=${copy}>${copied ? "✓ Copied" : "Copy"}</button>`;
 			}
 
-			// ── Demo components ───────────────────────────────────────────────────────────
+			let splitAbort = null;
+
+			function resolveKey(mode, custom, same) {
+				if (mode === "random") return crypto.randomUUID();
+				if (mode === "same") return same;
+				return custom;
+			}
+
+			async function splitWorker(abortSignal, sameHash, sameSort, data) {
+				while (!abortSignal.aborted) {
+					const hashKey = resolveKey(loadHashMode.value, loadHashValue.value, sameHash);
+					const sortKey = resolveKey(loadSortMode.value, loadSortValue.value, sameSort);
+					const t0 = performance.now();
+					try {
+						const { body, workerDurMs } = await apiFetch(`/rpc/${cfgTableName.value}/putItem`, {
+							method: "POST",
+							body: JSON.stringify({
+								hashKey,
+								sortKey,
+								data,
+								partitionOptions: {
+									rootTreesN: cfgRootTreesN.value,
+									hashSplitN: cfgHashSplitN.value,
+									rangeSplitN: cfgRangeSplitN.value,
+									hashSplitConditions: { maxSizeMb: cfgHashMaxMb.value },
+									rangeSplitConditions: { maxSizeMb: cfgRangeMaxMb.value },
+								},
+							}),
+							signal: abortSignal,
+						});
+						recordResponse(performance.now() - t0, workerDurMs, body?.meta?.servedByActorName ?? null, body?.meta?.databaseSize ?? null);
+					} catch (e) {
+						if (abortSignal.aborted) break;
+						sErrors.value += 1;
+					}
+				}
+			}
+
+			async function startSplit() {
+				if (loadRunning.value) return;
+				splitAbort = new AbortController();
+				const sameHash = crypto.randomUUID();
+				const sameSort = crypto.randomUUID();
+				const data = "x".repeat(Math.max(1, Math.floor(loadKbPerItem.value * 1024)));
+				sRunStart.value = Date.now();
+				loadRunning.value = true;
+				await Promise.allSettled(
+					Array.from({ length: loadParallelN.value }, () => splitWorker(splitAbort.signal, sameHash, sameSort, data)),
+				);
+				loadRunning.value = false;
+			}
+
+			function stopSplit() {
+				splitAbort?.abort();
+			}
+
+			// ── Split Demo components ─────────────────────────────────────────────────────
+			function NumInput({ label, sig, min = 1, step = 1 }) {
+				return html`
+					<label>
+						${label}
+						<input type="number" min=${min} step=${step} value=${sig.value} onInput=${(e) => (sig.value = Number(e.target.value))} />
+					</label>
+				`;
+			}
+
+			function KeyConfig({ label, modeSignal, valueSignal }) {
+				const mode = modeSignal.value;
+				return html`
+					<div>
+						<label style="margin-bottom:0.25rem">${label}</label>
+						<select value=${mode} onChange=${(e) => (modeSignal.value = e.target.value)}>
+							<option value="random">Random — unique per request</option>
+							<option value="same">Same — fixed once per run</option>
+							<option value="custom">Custom</option>
+						</select>
+						${mode === "custom" &&
+						html`
+							<input
+								type="text"
+								placeholder="key value"
+								value=${valueSignal.value}
+								onInput=${(e) => (valueSignal.value = e.target.value)}
+								style="margin-top:0.4rem"
+							/>
+						`}
+						${mode === "same" &&
+						html`
+							<small style="color:var(--pico-muted-color)"
+								>One random value is generated when the run starts and reused for all requests.</small
+							>
+						`}
+					</div>
+				`;
+			}
+
 			function SplitDemo() {
-				return html`<p class="empty">Split demo — coming soon.</p>`;
+				const actors = sActorHits.value;
+				const actorList = Object.entries(actors).sort((a, b) => a[1].count - b[1].count);
+				const total = sCount.value;
+				const maxHits = actorList.at(-1)?.[1].count ?? 1;
+
+				return html`
+					<article>
+						<details open>
+							<summary style="display:flex;align-items:center;justify-content:space-between">
+								<strong>Partition Context</strong>
+								<button
+									class="secondary outline"
+									style="margin:0;padding:0.2rem 0.6rem;font-size:0.8rem"
+									disabled=${destroying.value || loadRunning.value}
+									onClick=${(e) => {
+										e.preventDefault();
+										destroyDB();
+									}}
+								>
+									${destroying.value ? html`<${Spinner} />Destroying…` : "Destroy DB"}
+								</button>
+							</summary>
+							<div class="grid" style="margin-top:0.75rem">
+								<label
+									>Table name
+									<input type="text" value=${cfgTableName.value} onInput=${(e) => (cfgTableName.value = e.target.value)} />
+								</label>
+								<${NumInput} label="Root trees (N)" sig=${cfgRootTreesN} />
+							</div>
+							<div class="grid">
+								<${NumInput} label="Hash partitions (N)" sig=${cfgHashSplitN} />
+								<${NumInput} label="Hash max size (MB)" sig=${cfgHashMaxMb} />
+							</div>
+							<div class="grid">
+								<${NumInput} label="Range partitions (N)" sig=${cfgRangeSplitN} />
+								<${NumInput} label="Range max size (MB)" sig=${cfgRangeMaxMb} />
+							</div>
+						</details>
+					</article>
+
+					<article>
+						<header><strong>Load Generator</strong></header>
+						<div class="grid">
+							<${NumInput} label="Parallel requests" sig=${loadParallelN} />
+							<${NumInput} label="KB per item" sig=${loadKbPerItem} min=${0.1} step=${0.1} />
+						</div>
+						<details>
+							<summary>Key options</summary>
+							<div class="grid" style="margin-top:0.75rem">
+								<${KeyConfig} label="Hash key" modeSignal=${loadHashMode} valueSignal=${loadHashValue} />
+								<${KeyConfig} label="Sort key" modeSignal=${loadSortMode} valueSignal=${loadSortValue} />
+							</div>
+						</details>
+						<div style="display:flex;gap:0.5rem;margin-top:1rem">
+							<button onClick=${startSplit} disabled=${loadRunning.value}>
+								${loadRunning.value ? html`<${Spinner} />Running…` : "Start"}
+							</button>
+							<button class="secondary" onClick=${stopSplit} disabled=${!loadRunning.value}>Stop</button>
+						</div>
+					</article>
+
+					<article>
+						<header>
+							<strong>Results</strong>
+							<button class="secondary outline" onClick=${resetStats}>Reset</button>
+						</header>
+
+						<div class="stat-grid">
+							<div class="stat-box"><small>Requests</small><strong>${total.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Errors</small><strong>${sErrors.value.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Req / s</small><strong>${sReqPerSec.value.toFixed(1)}</strong></div>
+							<div class="stat-box"><small>Unique actors</small><strong>${actorList.length}</strong></div>
+							<div class="stat-box">
+								<small>Browser avg / p99</small><strong>${fmtMs(sAvgBrowser.value)} / ${fmtMs(sP99Browser.value)}</strong>
+							</div>
+							<div class="stat-box">
+								<small>Worker avg / p99</small><strong>${fmtMs(sAvgWorker.value)} / ${fmtMs(sP99Worker.value)}</strong>
+							</div>
+						</div>
+						<small style="color:var(--pico-muted-color)">Latency based on last ${MAX_SAMPLES.toLocaleString()} samples.</small>
+
+						<div style="margin-top:1rem">
+							<strong>Actor distribution</strong>
+							<div style="margin-top:0.5rem">
+								${actorList.length === 0
+									? html`<p class="empty">No data yet.</p>`
+									: actorList.map(
+											([name, { count, dbSize }]) => html`
+												<div class="actor-row" key=${name}>
+													<code>${name}</code>
+													<span style="color:var(--pico-muted-color);font-size:0.72rem;margin-left:0.5rem;white-space:nowrap">
+														${dbSize !== null ? (dbSize / 1024 / 1024).toFixed(2) + " MB" : ""}
+													</span>
+													<div class="actor-bar-wrap" style="margin-left:auto">
+														<div class="actor-bar" style="width:${Math.round((count / maxHits) * 80)}px"></div>
+														<span style="white-space:nowrap;font-size:0.75rem">
+															${count.toLocaleString()} (${total > 0 ? ((count / total) * 100).toFixed(1) : "0"}%)
+														</span>
+													</div>
+												</div>
+											`,
+										)}
+							</div>
+						</div>
+					</article>
+				`;
 			}
 
-			const DEMO_COMPONENTS = {
-				split: SplitDemo,
-			};
+			// ── Demo registry ─────────────────────────────────────────────────────────────
+			const DEMO_COMPONENTS = { split: SplitDemo };
 
 			// ── Admin tools ───────────────────────────────────────────────────────────────
 			function AdminTools() {
@@ -174,9 +505,7 @@
 							<ul>
 								<li>
 									<select onChange=${(e) => (activeDemo.value = e.target.value)}>
-										${DEMOS.map(
-											(d) => html`<option key=${d.id} value=${d.id} selected=${activeDemo.value === d.id}>${d.label}</option>`,
-										)}
+										${DEMOS.map((d) => html` <option key=${d.id} value=${d.id} selected=${activeDemo.value === d.id}>${d.label}</option> `)}
 									</select>
 								</li>
 							</ul>
