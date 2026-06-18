@@ -114,7 +114,7 @@ export interface PartitionTopologySplitter {
 }
 
 // Fraction of rangeSplitConditions.maxSizeMb a single key must reach before it is a promotion candidate.
-export const RANGE_PROMOTION_FRACTION = 0.5;
+export const RANGE_PROMOTION_FRACTION = 0.25;
 
 /**
  * Used by the Partition Durable Objects.
