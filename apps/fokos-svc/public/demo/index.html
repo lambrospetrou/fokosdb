@@ -43,7 +43,7 @@
 			}
 			.stat-grid {
 				display: grid;
-				grid-template-columns: repeat(6, 1fr);
+				grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
 				gap: 1rem;
 				margin-bottom: 1rem;
 			}
@@ -188,6 +188,7 @@
 			const sActorHits = signal({});
 			const sBrowserLats = signal([]);
 			const sWorkerLats = signal([]);
+			const sForwardCounts = signal([]);
 			const sCount = signal(0);
 			const sErrors = signal(0);
 			const sRunStart = signal(null);
@@ -197,6 +198,8 @@
 			const sP99Browser = computed(() => p99(sBrowserLats.value));
 			const sAvgWorker = computed(() => avg(sWorkerLats.value));
 			const sP99Worker = computed(() => p99(sWorkerLats.value));
+			const sAvgForward = computed(() => avg(sForwardCounts.value));
+			const sP99Forward = computed(() => p99(sForwardCounts.value));
 
 			// ── Stats helpers ─────────────────────────────────────────────────────────────
 			function avg(arr) {
@@ -219,6 +222,7 @@
 					sActorHits.value = {};
 					sBrowserLats.value = [];
 					sWorkerLats.value = [];
+					sForwardCounts.value = [];
 					sCount.value = 0;
 					sErrors.value = 0;
 					sRunStart.value = loadRunning.value ? Date.now() : null;
@@ -226,12 +230,13 @@
 				});
 			}
 
-			function recordResponse(browserMs, workerMs, actorValue, dbSize) {
+			function recordResponse(browserMs, workerMs, actorValue, dbSize, forwardCount) {
 				batch(() => {
 					const count = sCount.value + 1;
 					sCount.value = count;
 					sBrowserLats.value = appendCapped(sBrowserLats.value, browserMs);
 					if (workerMs !== null) sWorkerLats.value = appendCapped(sWorkerLats.value, workerMs);
+					if (forwardCount !== null) sForwardCounts.value = appendCapped(sForwardCounts.value, forwardCount);
 					if (actorValue != null) {
 						const key = typeof actorValue === "string" ? actorValue : JSON.stringify(actorValue);
 						const hits = { ...sActorHits.value };
@@ -297,7 +302,7 @@
 							}),
 							signal: abortSignal,
 						});
-						recordResponse(performance.now() - t0, workerDurMs, body?.meta?.servedByActorName ?? null, body?.meta?.databaseSize ?? null);
+						recordResponse(performance.now() - t0, workerDurMs, body?.meta?.servedByActorName ?? null, body?.meta?.databaseSize ?? null, body?.meta?.forwardCount ?? null);
 					} catch (e) {
 						if (abortSignal.aborted) break;
 						sErrors.value += 1;
@@ -441,6 +446,9 @@
 							</div>
 							<div class="stat-box">
 								<small>Worker avg / p99</small><strong>${fmtMs(sAvgWorker.value)} / ${fmtMs(sP99Worker.value)}</strong>
+							</div>
+							<div class="stat-box">
+								<small>Forwards avg / p99</small><strong>${sAvgForward.value?.toFixed(1) ?? "—"} / ${sP99Forward.value?.toFixed(1) ?? "—"}</strong>
 							</div>
 						</div>
 						<small style="color:var(--pico-muted-color)">Latency based on last ${MAX_SAMPLES.toLocaleString()} samples.</small>
