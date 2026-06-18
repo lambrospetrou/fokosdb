@@ -100,6 +100,27 @@
 				padding: 0.2rem 0.6rem;
 				font-size: 0.8rem;
 			}
+			.account-grid {
+				display: grid;
+				grid-template-columns: repeat(auto-fill, minmax(5.5rem, 1fr));
+				gap: 0.4rem;
+			}
+			.account-box {
+				background: var(--pico-card-background-color);
+				border: 1px solid var(--pico-muted-border-color);
+				border-radius: var(--pico-border-radius);
+				padding: 0.35rem 0.6rem;
+				line-height: 1.3;
+			}
+			.account-box small {
+				color: var(--pico-muted-color);
+				font-size: 0.65rem;
+				display: block;
+			}
+			.account-box span {
+				font-size: 0.9rem;
+				font-weight: 600;
+			}
 		</style>
 		<script type="importmap">
 			{
@@ -121,13 +142,46 @@
 			import { html } from "htm/preact";
 
 			// ── Demos registry ────────────────────────────────────────────────────────────
-			const DEMOS = [{ id: "split", label: "Split Demo" }];
+			const DEMOS = [
+				{ id: "split", label: "Split Demo" },
+				{ id: "transactions", label: "Transactions Demo" },
+			];
 
 			// ── Global state ──────────────────────────────────────────────────────────────
-			const activeDemo = signal(DEMOS[0].id);
+			const hashId = location.hash.slice(1);
+			const activeDemo = signal(DEMOS.some((d) => d.id === hashId) ? hashId : DEMOS[0].id);
 			const secretToken = signal(localStorage.getItem("fokos-secret-token") ?? "");
 
-			effect(() => localStorage.setItem("fokos-secret-token", secretToken.value));
+			effect(() => {
+				localStorage.setItem("fokos-secret-token", secretToken.value);
+			});
+			effect(() => {
+				history.replaceState(null, "", "#" + activeDemo.value);
+			});
+			window.addEventListener("hashchange", () => {
+				const id = location.hash.slice(1);
+				if (DEMOS.some((d) => d.id === id)) activeDemo.value = id;
+			});
+
+			// ── Shared partition config ───────────────────────────────────────────────────
+			const cfg = {
+				tableName: signal("demo"),
+				rootTreesN: signal(3),
+				hashSplitN: signal(4),
+				hashMaxMb: signal(5),
+				rangeSplitN: signal(4),
+				rangeMaxMb: signal(5),
+			};
+
+			function getPartitionOptions() {
+				return {
+					rootTreesN: cfg.rootTreesN.value,
+					hashSplitN: cfg.hashSplitN.value,
+					rangeSplitN: cfg.rangeSplitN.value,
+					hashSplitConditions: { maxSizeMb: cfg.hashMaxMb.value },
+					rangeSplitConditions: { maxSizeMb: cfg.rangeMaxMb.value },
+				};
+			}
 
 			// ── API ───────────────────────────────────────────────────────────────────────
 			async function apiFetch(path, opts = {}) {
@@ -157,51 +211,9 @@
 				return { body, workerDurMs };
 			}
 
-			// ── Shared components ─────────────────────────────────────────────────────────
-			function Spinner() {
-				return html`<span class="spinner"></span>`;
-			}
-
-			// ── Split Demo ────────────────────────────────────────────────────────────────
-
+			// ── Shared helpers ────────────────────────────────────────────────────────────
 			const MAX_SAMPLES = 1_000;
 
-			// Partition config
-			const cfgTableName = signal("demo");
-			const cfgRootTreesN = signal(3);
-			const cfgHashSplitN = signal(4);
-			const cfgHashMaxMb = signal(5);
-			const cfgRangeSplitN = signal(4);
-			const cfgRangeMaxMb = signal(5);
-
-			// Load config
-			const loadParallelN = signal(10);
-			const loadKbPerItem = signal(50);
-			const loadHashMode = signal("random"); // "random" | "same" | "custom"
-			const loadHashValue = signal("fokos-hash-key");
-			const loadSortMode = signal("random");
-			const loadSortValue = signal("fokos-sort-key");
-			const loadRunning = signal(false);
-			const destroying = signal(false);
-
-			// Stats
-			const sActorHits = signal({});
-			const sBrowserLats = signal([]);
-			const sWorkerLats = signal([]);
-			const sForwardCounts = signal([]);
-			const sCount = signal(0);
-			const sErrors = signal(0);
-			const sRunStart = signal(null);
-			const sReqPerSec = signal(0);
-
-			const sAvgBrowser = computed(() => avg(sBrowserLats.value));
-			const sP99Browser = computed(() => p99(sBrowserLats.value));
-			const sAvgWorker = computed(() => avg(sWorkerLats.value));
-			const sP99Worker = computed(() => p99(sWorkerLats.value));
-			const sAvgForward = computed(() => avg(sForwardCounts.value));
-			const sP99Forward = computed(() => p99(sForwardCounts.value));
-
-			// ── Stats helpers ─────────────────────────────────────────────────────────────
 			function avg(arr) {
 				return arr.length ? arr.reduce((s, v) => s + v, 0) / arr.length : null;
 			}
@@ -216,63 +228,153 @@
 			function appendCapped(arr, val) {
 				return arr.length >= MAX_SAMPLES ? [...arr.slice(1), val] : [...arr, val];
 			}
-
-			function resetStats() {
-				batch(() => {
-					sActorHits.value = {};
-					sBrowserLats.value = [];
-					sWorkerLats.value = [];
-					sForwardCounts.value = [];
-					sCount.value = 0;
-					sErrors.value = 0;
-					sRunStart.value = loadRunning.value ? Date.now() : null;
-					sReqPerSec.value = 0;
-				});
+			function pickRandom(arr, k) {
+				const copy = [...arr];
+				for (let i = copy.length - 1; i > 0; i--) {
+					const j = Math.floor(Math.random() * (i + 1));
+					[copy[i], copy[j]] = [copy[j], copy[i]];
+				}
+				return copy.slice(0, k);
+			}
+			function decodeData(item) {
+				return item.dataEncoding === "base64" ? atob(item.data) : item.data;
 			}
 
-			function recordResponse(browserMs, workerMs, actorValue, dbSize, forwardCount) {
-				batch(() => {
-					const count = sCount.value + 1;
-					sCount.value = count;
-					sBrowserLats.value = appendCapped(sBrowserLats.value, browserMs);
-					if (workerMs !== null) sWorkerLats.value = appendCapped(sWorkerLats.value, workerMs);
-					if (forwardCount !== null) sForwardCounts.value = appendCapped(sForwardCounts.value, forwardCount);
-					if (actorValue != null) {
-						const key = typeof actorValue === "string" ? actorValue : JSON.stringify(actorValue);
-						const hits = { ...sActorHits.value };
-						const prev = hits[key] ?? { count: 0, dbSize: null };
-						hits[key] = { count: prev.count + 1, dbSize: dbSize ?? prev.dbSize };
-						sActorHits.value = hits;
-					}
-					const elapsed = (Date.now() - (sRunStart.value ?? Date.now())) / 1000;
-					sReqPerSec.value = elapsed > 0.1 ? count / elapsed : 0;
-				});
+			// ── Shared components ─────────────────────────────────────────────────────────
+			function Spinner() {
+				return html`<span class="spinner"></span>`;
 			}
 
-			// ── Load runner ───────────────────────────────────────────────────────────────
+			function NumInput({ label, sig, min = 1, step = 1, max }) {
+				return html`
+					<label>
+						${label}
+						<input
+							type="number"
+							min=${min}
+							max=${max}
+							step=${step}
+							value=${sig.value}
+							onInput=${(e) => (sig.value = Number(e.target.value))}
+						/>
+					</label>
+				`;
+			}
+
+			// ── Shared: Partition Context ─────────────────────────────────────────────────
+			const destroying = signal(false);
+
 			async function destroyDB() {
 				if (destroying.value) return;
 				destroying.value = true;
 				try {
-					await apiFetch(`/databases/${cfgTableName.value}`, {
+					await apiFetch(`/databases/${cfg.tableName.value}`, {
 						method: "DELETE",
-						body: JSON.stringify({
-							partitionOptions: {
-								rootTreesN: cfgRootTreesN.value,
-								hashSplitN: cfgHashSplitN.value,
-								rangeSplitN: cfgRangeSplitN.value,
-								hashSplitConditions: { maxSizeMb: cfgHashMaxMb.value },
-								rangeSplitConditions: { maxSizeMb: cfgRangeMaxMb.value },
-							},
-						}),
+						body: JSON.stringify({ partitionOptions: getPartitionOptions() }),
 					});
-					resetStats();
 				} finally {
 					destroying.value = false;
 				}
 			}
 
-			let splitAbort = null;
+			function PartitionContext() {
+				const anyRunning = split.running.value || tx.running.value;
+				return html`
+					<article>
+						<details open>
+							<summary style="display:flex;align-items:center;justify-content:space-between">
+								<strong>Partition Context</strong>
+								<button
+									class="secondary outline"
+									style="margin:0;padding:0.2rem 0.6rem;font-size:0.8rem"
+									disabled=${destroying.value || anyRunning}
+									onClick=${(e) => {
+										e.preventDefault();
+										destroyDB();
+									}}
+								>
+									${destroying.value ? html`<${Spinner} />Destroying…` : "Destroy DB"}
+								</button>
+							</summary>
+							<div class="grid" style="margin-top:0.75rem">
+								<label
+									>Table name
+									<input type="text" value=${cfg.tableName.value} onInput=${(e) => (cfg.tableName.value = e.target.value)} />
+								</label>
+								<${NumInput} label="Root trees (N)" sig=${cfg.rootTreesN} />
+							</div>
+							<div class="grid">
+								<${NumInput} label="Hash partitions (N)" sig=${cfg.hashSplitN} />
+								<${NumInput} label="Hash max size (MB)" sig=${cfg.hashMaxMb} />
+							</div>
+							<div class="grid">
+								<${NumInput} label="Range partitions (N)" sig=${cfg.rangeSplitN} />
+								<${NumInput} label="Range max size (MB)" sig=${cfg.rangeMaxMb} />
+							</div>
+						</details>
+					</article>
+				`;
+			}
+
+			// ── Split Demo — state ────────────────────────────────────────────────────────
+			const split = {
+				// load config
+				parallelN: signal(10),
+				kbPerItem: signal(50),
+				hashMode: signal("random"),
+				hashValue: signal("fokos-hash-key"),
+				sortMode: signal("random"),
+				sortValue: signal("fokos-sort-key"),
+				// run state
+				running: signal(false),
+				// stats
+				actorHits: signal({}),
+				browserLats: signal([]),
+				workerLats: signal([]),
+				forwardCounts: signal([]),
+				count: signal(0),
+				errors: signal(0),
+				runStart: signal(null),
+				reqPerSec: signal(0),
+			};
+			const splitAvgBrowser = computed(() => avg(split.browserLats.value));
+			const splitP99Browser = computed(() => p99(split.browserLats.value));
+			const splitAvgWorker = computed(() => avg(split.workerLats.value));
+			const splitP99Worker = computed(() => p99(split.workerLats.value));
+			const splitAvgForward = computed(() => avg(split.forwardCounts.value));
+			const splitP99Forward = computed(() => p99(split.forwardCounts.value));
+
+			function splitResetStats() {
+				batch(() => {
+					split.actorHits.value = {};
+					split.browserLats.value = [];
+					split.workerLats.value = [];
+					split.forwardCounts.value = [];
+					split.count.value = 0;
+					split.errors.value = 0;
+					split.runStart.value = split.running.value ? Date.now() : null;
+					split.reqPerSec.value = 0;
+				});
+			}
+
+			function splitRecordResponse(browserMs, workerMs, actorValue, dbSize, forwardCount) {
+				batch(() => {
+					const count = split.count.value + 1;
+					split.count.value = count;
+					split.browserLats.value = appendCapped(split.browserLats.value, browserMs);
+					if (workerMs !== null) split.workerLats.value = appendCapped(split.workerLats.value, workerMs);
+					if (forwardCount !== null) split.forwardCounts.value = appendCapped(split.forwardCounts.value, forwardCount);
+					if (actorValue != null) {
+						const key = typeof actorValue === "string" ? actorValue : JSON.stringify(actorValue);
+						const hits = { ...split.actorHits.value };
+						const prev = hits[key] ?? { count: 0, dbSize: null };
+						hits[key] = { count: prev.count + 1, dbSize: dbSize ?? prev.dbSize };
+						split.actorHits.value = hits;
+					}
+					const elapsed = (Date.now() - (split.runStart.value ?? Date.now())) / 1000;
+					split.reqPerSec.value = elapsed > 0.1 ? count / elapsed : 0;
+				});
+			}
 
 			function resolveKey(mode, custom, same) {
 				if (mode === "random") return crypto.randomUUID();
@@ -280,29 +382,25 @@
 				return custom;
 			}
 
+			let splitAbort = null;
+
 			async function splitWorker(abortSignal, sameHash, sameSort, data) {
 				while (!abortSignal.aborted) {
-					const hashKey = resolveKey(loadHashMode.value, loadHashValue.value, sameHash);
-					const sortKey = resolveKey(loadSortMode.value, loadSortValue.value, sameSort);
+					const hashKey = resolveKey(split.hashMode.value, split.hashValue.value, sameHash);
+					const sortKey = resolveKey(split.sortMode.value, split.sortValue.value, sameSort);
 					const t0 = performance.now();
 					try {
-						const { body, workerDurMs } = await apiFetch(`/rpc/${cfgTableName.value}/putItem`, {
+						const { body, workerDurMs } = await apiFetch(`/rpc/${cfg.tableName.value}/putItem`, {
 							method: "POST",
 							body: JSON.stringify({
 								hashKey,
 								sortKey,
 								data,
-								partitionOptions: {
-									rootTreesN: cfgRootTreesN.value,
-									hashSplitN: cfgHashSplitN.value,
-									rangeSplitN: cfgRangeSplitN.value,
-									hashSplitConditions: { maxSizeMb: cfgHashMaxMb.value },
-									rangeSplitConditions: { maxSizeMb: cfgRangeMaxMb.value },
-								},
+								partitionOptions: getPartitionOptions(),
 							}),
 							signal: abortSignal,
 						});
-						recordResponse(
+						splitRecordResponse(
 							performance.now() - t0,
 							workerDurMs,
 							body?.meta?.servedByActorName ?? null,
@@ -311,39 +409,30 @@
 						);
 					} catch (e) {
 						if (abortSignal.aborted) break;
-						sErrors.value += 1;
+						split.errors.value += 1;
 					}
 				}
 			}
 
-			async function startSplit() {
-				if (loadRunning.value) return;
+			async function splitStart() {
+				if (split.running.value) return;
 				splitAbort = new AbortController();
 				const sameHash = crypto.randomUUID();
 				const sameSort = crypto.randomUUID();
-				const data = "x".repeat(Math.max(1, Math.floor(loadKbPerItem.value * 1024)));
-				sRunStart.value = Date.now();
-				loadRunning.value = true;
+				const data = "x".repeat(Math.max(1, Math.floor(split.kbPerItem.value * 1024)));
+				split.runStart.value = Date.now();
+				split.running.value = true;
 				await Promise.allSettled(
-					Array.from({ length: loadParallelN.value }, () => splitWorker(splitAbort.signal, sameHash, sameSort, data)),
+					Array.from({ length: split.parallelN.value }, () => splitWorker(splitAbort.signal, sameHash, sameSort, data)),
 				);
-				loadRunning.value = false;
+				split.running.value = false;
 			}
 
-			function stopSplit() {
+			function splitStop() {
 				splitAbort?.abort();
 			}
 
-			// ── Split Demo components ─────────────────────────────────────────────────────
-			function NumInput({ label, sig, min = 1, step = 1 }) {
-				return html`
-					<label>
-						${label}
-						<input type="number" min=${min} step=${step} value=${sig.value} onInput=${(e) => (sig.value = Number(e.target.value))} />
-					</label>
-				`;
-			}
-
+			// ── Split Demo — components ───────────────────────────────────────────────────
 			function KeyConfig({ label, modeSignal, valueSignal }) {
 				const mode = modeSignal.value;
 				return html`
@@ -375,87 +464,52 @@
 			}
 
 			function SplitDemo() {
-				const actors = sActorHits.value;
+				const actors = split.actorHits.value;
 				const actorList = Object.entries(actors).sort((a, b) => a[1].count - b[1].count);
-				const total = sCount.value;
+				const total = split.count.value;
 				const maxHits = actorList.at(-1)?.[1].count ?? 1;
 
 				return html`
 					<article>
-						<details open>
-							<summary style="display:flex;align-items:center;justify-content:space-between">
-								<strong>Partition Context</strong>
-								<button
-									class="secondary outline"
-									style="margin:0;padding:0.2rem 0.6rem;font-size:0.8rem"
-									disabled=${destroying.value || loadRunning.value}
-									onClick=${(e) => {
-										e.preventDefault();
-										destroyDB();
-									}}
-								>
-									${destroying.value ? html`<${Spinner} />Destroying…` : "Destroy DB"}
-								</button>
-							</summary>
-							<div class="grid" style="margin-top:0.75rem">
-								<label
-									>Table name
-									<input type="text" value=${cfgTableName.value} onInput=${(e) => (cfgTableName.value = e.target.value)} />
-								</label>
-								<${NumInput} label="Root trees (N)" sig=${cfgRootTreesN} />
-							</div>
-							<div class="grid">
-								<${NumInput} label="Hash partitions (N)" sig=${cfgHashSplitN} />
-								<${NumInput} label="Hash max size (MB)" sig=${cfgHashMaxMb} />
-							</div>
-							<div class="grid">
-								<${NumInput} label="Range partitions (N)" sig=${cfgRangeSplitN} />
-								<${NumInput} label="Range max size (MB)" sig=${cfgRangeMaxMb} />
-							</div>
-						</details>
-					</article>
-
-					<article>
 						<header><strong>Load Generator</strong></header>
 						<div class="grid">
-							<${NumInput} label="Parallel requests" sig=${loadParallelN} />
-							<${NumInput} label="KB per item" sig=${loadKbPerItem} min=${0.1} step=${0.1} />
+							<${NumInput} label="Parallel requests" sig=${split.parallelN} />
+							<${NumInput} label="KB per item" sig=${split.kbPerItem} min=${0.1} step=${0.1} />
 						</div>
 						<details>
 							<summary>Key options</summary>
 							<div class="grid" style="margin-top:0.75rem">
-								<${KeyConfig} label="Hash key" modeSignal=${loadHashMode} valueSignal=${loadHashValue} />
-								<${KeyConfig} label="Sort key" modeSignal=${loadSortMode} valueSignal=${loadSortValue} />
+								<${KeyConfig} label="Hash key" modeSignal=${split.hashMode} valueSignal=${split.hashValue} />
+								<${KeyConfig} label="Sort key" modeSignal=${split.sortMode} valueSignal=${split.sortValue} />
 							</div>
 						</details>
 						<div style="display:flex;gap:0.5rem;margin-top:1rem">
-							<button onClick=${startSplit} disabled=${loadRunning.value}>
-								${loadRunning.value ? html`<${Spinner} />Running…` : "Start"}
+							<button class=${split.running.value ? "secondary" : ""} onClick=${split.running.value ? splitStop : splitStart}>
+								${split.running.value ? html`<${Spinner} />Stop` : "Start"}
 							</button>
-							<button class="secondary" onClick=${stopSplit} disabled=${!loadRunning.value}>Stop</button>
 						</div>
 					</article>
 
 					<article>
 						<header>
 							<strong>Results</strong>
-							<button class="secondary outline" onClick=${resetStats}>Reset</button>
+							<button class="secondary outline" onClick=${splitResetStats}>Reset</button>
 						</header>
 
 						<div class="stat-grid">
 							<div class="stat-box"><small>Requests</small><strong>${total.toLocaleString()}</strong></div>
-							<div class="stat-box"><small>Errors</small><strong>${sErrors.value.toLocaleString()}</strong></div>
-							<div class="stat-box"><small>Req / s</small><strong>${sReqPerSec.value.toFixed(1)}</strong></div>
+							<div class="stat-box"><small>Errors</small><strong>${split.errors.value.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Req / s</small><strong>${split.reqPerSec.value.toFixed(1)}</strong></div>
 							<div class="stat-box"><small>Unique actors</small><strong>${actorList.length}</strong></div>
 							<div class="stat-box">
-								<small>Browser avg / p99</small><strong>${fmtMs(sAvgBrowser.value)} / ${fmtMs(sP99Browser.value)}</strong>
+								<small>Browser avg / p99</small><strong>${fmtMs(splitAvgBrowser.value)} / ${fmtMs(splitP99Browser.value)}</strong>
 							</div>
 							<div class="stat-box">
-								<small>Worker avg / p99</small><strong>${fmtMs(sAvgWorker.value)} / ${fmtMs(sP99Worker.value)}</strong>
+								<small>Worker avg / p99</small><strong>${fmtMs(splitAvgWorker.value)} / ${fmtMs(splitP99Worker.value)}</strong>
 							</div>
 							<div class="stat-box">
 								<small>Forwards avg / p99</small
-								><strong>${sAvgForward.value?.toFixed(1) ?? "—"} / ${sP99Forward.value?.toFixed(1) ?? "—"}</strong>
+								><strong>${splitAvgForward.value?.toFixed(1) ?? "—"} / ${splitP99Forward.value?.toFixed(1) ?? "—"}</strong>
 							</div>
 						</div>
 						<small style="color:var(--pico-muted-color)">Latency based on last ${MAX_SAMPLES.toLocaleString()} samples.</small>
@@ -487,8 +541,319 @@
 				`;
 			}
 
+			// ── Transactions Demo — state ─────────────────────────────────────────────────
+			const NUM_ACCOUNTS = 10;
+			const INITIAL_BALANCE = 1000;
+			const ACCOUNT_IDS = Array.from({ length: NUM_ACCOUNTS }, (_, i) => `acct-${i}`);
+			const TX_LOG_MAX = 100;
+
+			const tx = {
+				// load config
+				parallelN: signal(1),
+				k: signal(2),
+				// run state
+				running: signal(false),
+				initializing: signal(false),
+				refreshing: signal(false),
+				// account cache: { id, balance, version } — balance null means unknown
+				accounts: signal(ACCOUNT_IDS.map((id) => ({ id, balance: null, version: null }))),
+				// stats
+				committed: signal(0),
+				cancelled: signal(0),
+				errors: signal(0),
+				browserLats: signal([]),
+				runStart: signal(null),
+				reqPerSec: signal(0),
+				// log: newest-first array of { accounts: [{id, delta}], n, outcome }
+				log: signal([]),
+			};
+			const txAvgBrowser = computed(() => avg(tx.browserLats.value));
+			const txP99Browser = computed(() => p99(tx.browserLats.value));
+
+			function txResetStats() {
+				batch(() => {
+					tx.committed.value = 0;
+					tx.cancelled.value = 0;
+					tx.errors.value = 0;
+					tx.browserLats.value = [];
+					tx.runStart.value = tx.running.value ? Date.now() : null;
+					tx.reqPerSec.value = 0;
+					tx.log.value = [];
+				});
+			}
+
+			async function txInitAccounts() {
+				if (tx.initializing.value) return;
+				tx.initializing.value = true;
+				try {
+					await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
+						method: "POST",
+						body: JSON.stringify({
+							operations: ACCOUNT_IDS.map((id) => ({
+								hashKey: id,
+								operation: "put",
+								data: JSON.stringify({ balance: INITIAL_BALANCE }),
+							})),
+							partitionOptions: getPartitionOptions(),
+						}),
+					});
+					tx.accounts.value = ACCOUNT_IDS.map((id) => ({ id, balance: INITIAL_BALANCE, version: null }));
+					txResetStats();
+				} finally {
+					tx.initializing.value = false;
+				}
+			}
+
+			async function txRefreshAccounts() {
+				if (tx.refreshing.value) return;
+				tx.refreshing.value = true;
+				try {
+					const results = await Promise.all(
+						ACCOUNT_IDS.map((id) =>
+							apiFetch(`/rpc/${cfg.tableName.value}/getItem`, {
+								method: "POST",
+								body: JSON.stringify({ hashKey: id, partitionOptions: getPartitionOptions() }),
+							}),
+						),
+					);
+					tx.accounts.value = ACCOUNT_IDS.map((id, i) => {
+						const r = results[i].body;
+						if (!r.found) return { id, balance: null, version: null };
+						const data = JSON.parse(decodeData(r.item));
+						return { id, balance: data.balance, version: r.item.version };
+					});
+				} finally {
+					tx.refreshing.value = false;
+				}
+			}
+
+			let txAbort = null;
+
+			async function txWorker(abortSignal) {
+				while (!abortSignal.aborted) {
+					const selected = pickRandom(ACCOUNT_IDS, tx.k.value);
+					const t0 = performance.now();
+					try {
+						// Read current state of selected accounts
+						const reads = await Promise.all(
+							selected.map((id) =>
+								apiFetch(`/rpc/${cfg.tableName.value}/getItem`, {
+									method: "POST",
+									body: JSON.stringify({ hashKey: id, partitionOptions: getPartitionOptions() }),
+								}),
+							),
+						);
+
+						if (abortSignal.aborted) break;
+
+						const items = reads.map((r, i) => {
+							const b = r.body;
+							if (!b.found) return null;
+							return {
+								id: selected[i],
+								balance: JSON.parse(decodeData(b.item)).balance,
+								version: b.item.version,
+							};
+						});
+
+						// Skip if any account not yet initialized
+						if (items.some((x) => x === null)) continue;
+
+						// items[0] is the winner; each of the other K-1 accounts transfers N to it
+						const n = Math.floor(Math.random() * 10) + 1;
+						const deltas = items.map((_, i) => (i === 0 ? (items.length - 1) * n : -n));
+						const newBalances = items.map((item, i) => item.balance + deltas[i]);
+
+						const { body } = await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
+							method: "POST",
+							body: JSON.stringify({
+								operations: items.map((item, i) => ({
+									hashKey: item.id,
+									operation: "put",
+									data: JSON.stringify({ balance: newBalances[i] }),
+									conditions: [{ type: "attribute_equals", attribute: "v", value: item.version }],
+								})),
+								partitionOptions: getPartitionOptions(),
+							}),
+							signal: abortSignal,
+						});
+
+						if (abortSignal.aborted) break;
+
+						const browserMs = performance.now() - t0;
+
+						batch(() => {
+							const logEntry = {
+								accounts: items.map((item, i) => ({ id: item.id, delta: deltas[i] })),
+								n,
+								outcome: body.outcome,
+								reason: body.outcome !== "committed" ? (body.reason ?? null) : null,
+							};
+							tx.log.value = [logEntry, ...tx.log.value.slice(0, TX_LOG_MAX - 1)];
+							if (body.outcome === "committed") {
+								tx.committed.value += 1;
+								tx.browserLats.value = appendCapped(tx.browserLats.value, browserMs);
+								// Update local account cache with new balances
+								const accounts = [...tx.accounts.value];
+								items.forEach((item, i) => {
+									const idx = ACCOUNT_IDS.indexOf(item.id);
+									if (idx >= 0) accounts[idx] = { ...accounts[idx], balance: newBalances[i] };
+								});
+								tx.accounts.value = accounts;
+							} else {
+								tx.cancelled.value += 1;
+							}
+							const total = tx.committed.value + tx.cancelled.value;
+							const elapsed = (Date.now() - (tx.runStart.value ?? Date.now())) / 1000;
+							tx.reqPerSec.value = elapsed > 0.1 ? total / elapsed : 0;
+						});
+					} catch (e) {
+						if (abortSignal.aborted) break;
+						tx.errors.value += 1;
+					} finally {
+						await new Promise((resolve) => setTimeout(resolve, 5)); // avoid transaction timestamp conflicts locally with wrangler dev.
+					}
+				}
+			}
+
+			async function txStart() {
+				if (tx.running.value) return;
+				txAbort = new AbortController();
+				tx.runStart.value = Date.now();
+				tx.running.value = true;
+				await Promise.allSettled(Array.from({ length: tx.parallelN.value }, () => txWorker(txAbort.signal)));
+				tx.running.value = false;
+			}
+
+			function txStop() {
+				txAbort?.abort();
+			}
+
+			// ── Transactions Demo — component ─────────────────────────────────────────────
+			function TransactionsDemo() {
+				const accounts = tx.accounts.value;
+				const knownBalances = accounts.filter((a) => a.balance !== null);
+				const totalBalance = knownBalances.reduce((s, a) => s + a.balance, 0);
+				const allKnown = knownBalances.length === NUM_ACCOUNTS;
+				const expectedTotal = NUM_ACCOUNTS * INITIAL_BALANCE;
+
+				return html`
+					<article>
+						<header><strong>Load Generator</strong></header>
+						<div class="grid">
+							<${NumInput} label="Parallel workers" sig=${tx.parallelN} />
+							<${NumInput} label="Accounts per transaction (K)" sig=${tx.k} min=${2} max=${NUM_ACCOUNTS} />
+						</div>
+						<div style="display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap">
+							<button onClick=${txInitAccounts} disabled=${tx.initializing.value || tx.running.value}>
+								${tx.initializing.value ? html`<${Spinner} />Initializing…` : "Initialize Accounts"}
+							</button>
+							<button
+								class=${tx.running.value ? "secondary" : ""}
+								onClick=${tx.running.value ? txStop : txStart}
+								disabled=${tx.initializing.value}
+							>
+								${tx.running.value ? html`<${Spinner} />Stop` : "Start"}
+							</button>
+							<button class="secondary outline" onClick=${txRefreshAccounts} disabled=${tx.refreshing.value || tx.running.value}>
+								${tx.refreshing.value ? html`<${Spinner} />Refreshing…` : "Refresh Accounts"}
+							</button>
+						</div>
+					</article>
+
+					<article>
+						<header>
+							<strong>Accounts</strong>
+							<span style="font-size:0.85rem;color:var(--pico-muted-color)">
+								Total:${" "}
+								<strong style="font-size:inherit;color:${allKnown && totalBalance !== expectedTotal ? "var(--pico-del-color)" : "inherit"}">
+									${allKnown ? totalBalance.toLocaleString() : "—"}
+								</strong>
+								${allKnown ? html`<small> / ${expectedTotal.toLocaleString()} expected</small>` : ""}
+							</span>
+						</header>
+						<div class="account-grid" style="margin-top:0.75rem">
+							${accounts.map(
+								({ id, balance }) => html`
+									<div class="account-box" key=${id}>
+										<small>${id}</small>
+										<span>${balance !== null ? balance.toLocaleString() : "—"}</span>
+									</div>
+								`,
+							)}
+						</div>
+					</article>
+
+					<article>
+						<header>
+							<strong>Results</strong>
+							<button class="secondary outline" onClick=${txResetStats}>Reset</button>
+						</header>
+						<div class="stat-grid">
+							<div class="stat-box"><small>Committed</small><strong>${tx.committed.value.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Cancelled (conflict)</small><strong>${tx.cancelled.value.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Errors</small><strong>${tx.errors.value.toLocaleString()}</strong></div>
+							<div class="stat-box"><small>Tx / s</small><strong>${tx.reqPerSec.value.toFixed(1)}</strong></div>
+							<div class="stat-box">
+								<small>Browser avg / p99</small>
+								<strong>${fmtMs(txAvgBrowser.value)} / ${fmtMs(txP99Browser.value)}</strong>
+							</div>
+						</div>
+						<small style="color:var(--pico-muted-color)"
+							>Latency based on last ${MAX_SAMPLES.toLocaleString()} samples. Cancelled transactions are retried automatically on the next
+							worker loop.</small
+						>
+					</article>
+
+					<article>
+						<header><strong>Transaction Log</strong></header>
+						${tx.log.value.length === 0
+							? html`<p class="empty">No transactions yet.</p>`
+							: html`
+									<div style="max-height:320px;overflow-y:auto">
+										${tx.log.value.map(
+											(entry, i) => html`
+												<div class="actor-row" key=${i} style="flex-direction:column;align-items:flex-start">
+													<div style="display:flex;align-items:center;gap:0.5rem;width:100%">
+														<span
+															style="font-size:0.7rem;padding:0.1rem 0.35rem;border-radius:3px;flex-shrink:0;font-weight:600;background:${entry.outcome ===
+															"committed"
+																? "#2a7a2a"
+																: "#7a2a2a"};color:#fff"
+														>
+															${entry.outcome === "committed" ? "ok" : "x"}
+														</span>
+														<span style="display:flex;flex-wrap:wrap;gap:0.5rem;font-size:0.75rem">
+															${entry.accounts.map(
+																({ id, delta }) => html`
+																	<span>
+																		<code>${id}</code>${" "}
+																		<strong
+																			style="color:${delta > 0 ? "var(--pico-ins-color, #2a7a2a)" : "var(--pico-del-color, #c0392b)"}"
+																		>
+																			${delta > 0 ? "+" : ""}${delta}
+																		</strong>
+																	</span>
+																`,
+															)}
+														</span>
+													</div>
+													${entry.reason
+														? html`<span style="font-size:0.7rem;color:var(--pico-muted-color);padding-left:0.1rem">
+																${entry.reason.type}${entry.reason.hashKey ? html` · <code>${entry.reason.hashKey}</code>` : ""}
+															</span>`
+														: null}
+												</div>
+											`,
+										)}
+									</div>
+								`}
+					</article>
+				`;
+			}
+
 			// ── Demo registry ─────────────────────────────────────────────────────────────
-			const DEMO_COMPONENTS = { split: SplitDemo };
+			const DEMO_COMPONENTS = { split: SplitDemo, transactions: TransactionsDemo };
 
 			// ── Admin tools ───────────────────────────────────────────────────────────────
 			function AdminTools() {
@@ -526,6 +891,7 @@
 							</ul>
 						</nav>
 						<main class="container">
+							<${PartitionContext} />
 							<${DemoComp} />
 						</main>
 						<footer class="container">
