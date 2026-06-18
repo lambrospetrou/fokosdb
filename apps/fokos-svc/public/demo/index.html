@@ -542,33 +542,42 @@
 			}
 
 			// ── Transactions Demo — state ─────────────────────────────────────────────────
-			const NUM_ACCOUNTS = 10;
 			const INITIAL_BALANCE = 1000;
-			const ACCOUNT_IDS = Array.from({ length: NUM_ACCOUNTS }, (_, i) => `acct-${i}`);
 			const TX_LOG_MAX = 100;
 
 			const tx = {
 				// load config
 				parallelN: signal(1),
 				k: signal(2),
+				numAccounts: signal(10),
 				// run state
 				running: signal(false),
 				initializing: signal(false),
 				refreshing: signal(false),
 				// account cache: { id, balance, version } — balance null means unknown
-				accounts: signal(ACCOUNT_IDS.map((id) => ({ id, balance: null, version: null }))),
+				accounts: signal([]),
 				// stats
 				committed: signal(0),
 				cancelled: signal(0),
 				errors: signal(0),
 				browserLats: signal([]),
+				workerLats: signal([]),
 				runStart: signal(null),
 				reqPerSec: signal(0),
 				// log: newest-first array of { accounts: [{id, delta}], n, outcome }
 				log: signal([]),
 			};
+			const txAccountIds = computed(() => Array.from({ length: tx.numAccounts.value }, (_, i) => `acct-${i}`));
+			// Reset account display and log whenever the account count changes
+			effect(() => {
+				tx.accounts.value = txAccountIds.value.map((id) => ({ id, balance: null, version: null }));
+				tx.log.value = [];
+			});
+
 			const txAvgBrowser = computed(() => avg(tx.browserLats.value));
 			const txP99Browser = computed(() => p99(tx.browserLats.value));
+			const txAvgWorker = computed(() => avg(tx.workerLats.value));
+			const txP99Worker = computed(() => p99(tx.workerLats.value));
 
 			function txResetStats() {
 				batch(() => {
@@ -576,6 +585,7 @@
 					tx.cancelled.value = 0;
 					tx.errors.value = 0;
 					tx.browserLats.value = [];
+					tx.workerLats.value = [];
 					tx.runStart.value = tx.running.value ? Date.now() : null;
 					tx.reqPerSec.value = 0;
 					tx.log.value = [];
@@ -589,7 +599,7 @@
 					await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
 						method: "POST",
 						body: JSON.stringify({
-							operations: ACCOUNT_IDS.map((id) => ({
+							operations: txAccountIds.value.map((id) => ({
 								hashKey: id,
 								operation: "put",
 								data: JSON.stringify({ balance: INITIAL_BALANCE }),
@@ -597,7 +607,7 @@
 							partitionOptions: getPartitionOptions(),
 						}),
 					});
-					tx.accounts.value = ACCOUNT_IDS.map((id) => ({ id, balance: INITIAL_BALANCE, version: null }));
+					tx.accounts.value = txAccountIds.value.map((id) => ({ id, balance: INITIAL_BALANCE, version: null }));
 					txResetStats();
 				} finally {
 					tx.initializing.value = false;
@@ -608,15 +618,16 @@
 				if (tx.refreshing.value) return;
 				tx.refreshing.value = true;
 				try {
+					const ids = txAccountIds.value;
 					const results = await Promise.all(
-						ACCOUNT_IDS.map((id) =>
+						ids.map((id) =>
 							apiFetch(`/rpc/${cfg.tableName.value}/getItem`, {
 								method: "POST",
 								body: JSON.stringify({ hashKey: id, partitionOptions: getPartitionOptions() }),
 							}),
 						),
 					);
-					tx.accounts.value = ACCOUNT_IDS.map((id, i) => {
+					tx.accounts.value = ids.map((id, i) => {
 						const r = results[i].body;
 						if (!r.found) return { id, balance: null, version: null };
 						const data = JSON.parse(decodeData(r.item));
@@ -631,7 +642,8 @@
 
 			async function txWorker(abortSignal) {
 				while (!abortSignal.aborted) {
-					const selected = pickRandom(ACCOUNT_IDS, tx.k.value);
+					const accountIds = txAccountIds.value;
+					const selected = pickRandom(accountIds, Math.min(tx.k.value, accountIds.length));
 					const t0 = performance.now();
 					try {
 						// Read current state of selected accounts
@@ -664,7 +676,7 @@
 						const deltas = items.map((_, i) => (i === 0 ? (items.length - 1) * n : -n));
 						const newBalances = items.map((item, i) => item.balance + deltas[i]);
 
-						const { body } = await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
+						const { body, workerDurMs } = await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
 							method: "POST",
 							body: JSON.stringify({
 								operations: items.map((item, i) => ({
@@ -693,10 +705,11 @@
 							if (body.outcome === "committed") {
 								tx.committed.value += 1;
 								tx.browserLats.value = appendCapped(tx.browserLats.value, browserMs);
+								if (workerDurMs !== null) tx.workerLats.value = appendCapped(tx.workerLats.value, workerDurMs);
 								// Update local account cache with new balances
 								const accounts = [...tx.accounts.value];
 								items.forEach((item, i) => {
-									const idx = ACCOUNT_IDS.indexOf(item.id);
+									const idx = accountIds.indexOf(item.id);
 									if (idx >= 0) accounts[idx] = { ...accounts[idx], balance: newBalances[i] };
 								});
 								tx.accounts.value = accounts;
@@ -734,15 +747,16 @@
 				const accounts = tx.accounts.value;
 				const knownBalances = accounts.filter((a) => a.balance !== null);
 				const totalBalance = knownBalances.reduce((s, a) => s + a.balance, 0);
-				const allKnown = knownBalances.length === NUM_ACCOUNTS;
-				const expectedTotal = NUM_ACCOUNTS * INITIAL_BALANCE;
+				const allKnown = knownBalances.length === tx.numAccounts.value;
+				const expectedTotal = tx.numAccounts.value * INITIAL_BALANCE;
 
 				return html`
 					<article>
 						<header><strong>Load Generator</strong></header>
 						<div class="grid">
 							<${NumInput} label="Parallel workers" sig=${tx.parallelN} />
-							<${NumInput} label="Accounts per transaction (K)" sig=${tx.k} min=${2} max=${NUM_ACCOUNTS} />
+							<${NumInput} label="Number of accounts" sig=${tx.numAccounts} min=${2} max=${100} />
+							<${NumInput} label="Per transaction (K)" sig=${tx.k} min=${2} max=${tx.numAccounts.value} />
 						</div>
 						<div style="display:flex;gap:0.5rem;margin-top:1rem;flex-wrap:wrap">
 							<button onClick=${txInitAccounts} disabled=${tx.initializing.value || tx.running.value}>
@@ -797,6 +811,10 @@
 							<div class="stat-box">
 								<small>Browser avg / p99</small>
 								<strong>${fmtMs(txAvgBrowser.value)} / ${fmtMs(txP99Browser.value)}</strong>
+							</div>
+							<div class="stat-box">
+								<small>Worker avg / p99</small>
+								<strong>${fmtMs(txAvgWorker.value)} / ${fmtMs(txP99Worker.value)}</strong>
 							</div>
 						</div>
 						<small style="color:var(--pico-muted-color)"
