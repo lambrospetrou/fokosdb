@@ -302,7 +302,13 @@
 							}),
 							signal: abortSignal,
 						});
-						recordResponse(performance.now() - t0, workerDurMs, body?.meta?.servedByActorName ?? null, body?.meta?.databaseSize ?? null, body?.meta?.forwardCount ?? null);
+						recordResponse(
+							performance.now() - t0,
+							workerDurMs,
+							body?.meta?.servedByActorName ?? null,
+							body?.meta?.databaseSize ?? null,
+							body?.meta?.forwardCount ?? null,
+						);
 					} catch (e) {
 						if (abortSignal.aborted) break;
 						sErrors.value += 1;
@@ -448,7 +454,8 @@
 								<small>Worker avg / p99</small><strong>${fmtMs(sAvgWorker.value)} / ${fmtMs(sP99Worker.value)}</strong>
 							</div>
 							<div class="stat-box">
-								<small>Forwards avg / p99</small><strong>${sAvgForward.value?.toFixed(1) ?? "—"} / ${sP99Forward.value?.toFixed(1) ?? "—"}</strong>
+								<small>Forwards avg / p99</small
+								><strong>${sAvgForward.value?.toFixed(1) ?? "—"} / ${sP99Forward.value?.toFixed(1) ?? "—"}</strong>
 							</div>
 						</div>
 						<small style="color:var(--pico-muted-color)">Latency based on last ${MAX_SAMPLES.toLocaleString()} samples.</small>
