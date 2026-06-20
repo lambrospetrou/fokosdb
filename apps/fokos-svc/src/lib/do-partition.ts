@@ -452,13 +452,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	// Direct read bypassing split forwarding — used by migrating children to avoid forwarding loops
-	// (same rationale as getItemDirect).
+	// (same rationale as getItemDirect). Must always read local rows only: a range router that fans
+	// out to children via queryItemsAsRangeNode would route back to the calling migrating child,
+	// causing an infinite loop (child → queryItemsDirect → walkRangeChildren → child.queryItems → …).
 	async queryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult> {
-		const pCtx = this.pCtx();
-		if (isRangePartition(pCtx)) {
-			return await this.queryItemsAsRangeNode(pCtx, req);
-		}
-		return this.queryItemsLocal(pCtx, req);
+		return this.queryItemsLocal(this.pCtx(), req);
 	}
 
 	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResult {
