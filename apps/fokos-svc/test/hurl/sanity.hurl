@@ -147,6 +147,53 @@ Content-Type: application/json
 }
 HTTP 200
 
+# ── queryItems: two hash keys, different scanIndexForward ─────────────────────
+
+POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
+Content-Type: application/json
+{
+  "operations": [
+    { "hashKey": "qi#asc", "sortKey": "s1", "operation": "put", "data": "asc-1" },
+    { "hashKey": "qi#asc", "sortKey": "s2", "operation": "put", "data": "asc-2" },
+    { "hashKey": "qi#asc", "sortKey": "s3", "operation": "put", "data": "asc-3" },
+    { "hashKey": "qi#desc", "sortKey": "s1", "operation": "put", "data": "desc-1" },
+    { "hashKey": "qi#desc", "sortKey": "s2", "operation": "put", "data": "desc-2" },
+    { "hashKey": "qi#desc", "sortKey": "s3", "operation": "put", "data": "desc-3" }
+  ]
+}
+HTTP 200
+
+# query both hash keys: qi#asc ascending (default), qi#desc descending
+POST {{base_url}}/api/rpc/{{database_name}}/queryItems
+Content-Type: application/json
+{
+  "queries": [
+    { "hashKey": "qi#asc", "scanIndexForward": true },
+    { "hashKey": "qi#desc", "scanIndexForward": false }
+  ]
+}
+HTTP 200
+[Asserts]
+jsonpath "$.count" == 6
+jsonpath "$.items[0].hashKey" == "qi#asc"
+jsonpath "$.items[0].sortKey" == "s1"
+jsonpath "$.items[0].data" == "asc-1"
+jsonpath "$.items[1].hashKey" == "qi#asc"
+jsonpath "$.items[1].sortKey" == "s2"
+jsonpath "$.items[1].data" == "asc-2"
+jsonpath "$.items[2].hashKey" == "qi#asc"
+jsonpath "$.items[2].sortKey" == "s3"
+jsonpath "$.items[2].data" == "asc-3"
+jsonpath "$.items[3].hashKey" == "qi#desc"
+jsonpath "$.items[3].sortKey" == "s3"
+jsonpath "$.items[3].data" == "desc-3"
+jsonpath "$.items[4].hashKey" == "qi#desc"
+jsonpath "$.items[4].sortKey" == "s2"
+jsonpath "$.items[4].data" == "desc-2"
+jsonpath "$.items[5].hashKey" == "qi#desc"
+jsonpath "$.items[5].sortKey" == "s1"
+jsonpath "$.items[5].data" == "desc-1"
+
 # ── transactWriteItems ─────────────────────────────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
