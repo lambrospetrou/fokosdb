@@ -617,7 +617,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const hk = childPartitionContext.rangePartition.hashKey;
 			if (isHashPartition(pCtx)) {
 				// I am a hash DO; authorize via promoted_keys[hk] === 'promoting'.
-				const status = this.#store.getPromotedKeyStatus(hk);
+				const status = this.#promotion.statusFor(hk);
 				invariant(
 					status === "promoting",
 					() => `fokos/partition.getItemsBatch: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
@@ -721,7 +721,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				// Hash DO serving a promotion: lock-free cutover guarantees no pending_transactions for this key.
 				// Return only the deletion watermark so the range root can sync it.
-				const status = this.#store.getPromotedKeyStatus(hk);
+				const status = this.#promotion.statusFor(hk);
 				invariant(
 					status === "promoting",
 					() => `fokos/partition.getPartitionTransactionMetadata: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,

@@ -15,7 +15,6 @@ import { RANGE_PROMOTION_FRACTION } from "../partition-topology/split-policy.js"
 import type { SplitStatusKVItem } from "../partition-topology/split-state.js";
 import type { PartitionPeer } from "./partition-peer.js";
 import type { PartitionStore, PromotedKeyStatus } from "./partition-store.js";
-import invariant from "../invariant.js";
 
 /** The subset of the peer surface promotion needs from a range root (phase 3's gateway interface). */
 export type PromotionPeer = Pick<PartitionPeer, "initFromSplit" | "triggerMigration">;
@@ -41,9 +40,10 @@ export type PromotionManagerDeps = {
  * Hash DOs only: range DOs never have promoted_keys rows.
  */
 export class PromotionManager {
-	// TODO Implement LRU cache, or somehow use the BloomFilter implementation.
+	// TODO: Do we want the cache here or inside the PartitionStore, to avoid having to keep it in sync with the store?
 	//
-	// In-memory cache of promoted_keys (promoting or promoted), loaded at DO startup via loadFromStorage().
+	// In-memory cache of promoted_keys (promoted only). Filled on-demand on reads.
+	//
 	// Keyed by a stable identity of the hashKey (a Uint8Array can't be a Map key); the KeyBytes is kept in
 	// the value so callers get the real key back.
 	//
@@ -51,22 +51,21 @@ export class PromotionManager {
 	// We can use KeyCodec.mapKey(hashKey) to get a stable number identity for the key, which avoids the string allocation and is faster to compare.
 	//
 	// For full correctness we could simply just scrap the in-memory cache and only rely on the store but that would lead to extra rows read charges.
-	//
-	// #keys: Map<bigint, { key: KeyBytes; status: PromotedKeyStatus }> = new Map();
+	// #cachePromoted = new LRUCache<bigint, { hk: KeyBytes }>(1_000);
 
 	constructor(private readonly deps: PromotionManagerDeps) {}
 
 	/** Populates the cache from storage; called from the DO's blockConcurrencyWhile at startup. */
 	loadFromStorage(): void {
-		for (const row of this.deps.store.listPromotedKeys()) {
-			// TODO fill in-memory cache if we know which keys are often accessed.
-			// this.#keys.set(KeyCodec.mapKey(row.hash_key), { key: row.hash_key, status: row.status });
-		}
+		// for (const row of this.deps.store.listPromotedKeys("promoted")) {
+		// 	this.#cachePromoted.set(KeyCodec.mapKey(row.hash_key), { hk: row.hash_key });
+		// }
 	}
 
 	/** Hot-path read for routing decisions. */
 	statusFor(hashKey: KeyBytes): PromotedKeyStatus | undefined {
-		// TODO Read from cache!
+		// const cached = this.#cachePromoted.get(KeyCodec.mapKey(hashKey));
+		// if (cached && KeyCodec.compare(cached.hk, hashKey) === 0) return "promoted";
 		return this.deps.store.getPromotedKeyStatus(hashKey);
 	}
 
