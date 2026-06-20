@@ -22,14 +22,17 @@ Once there is a stable version ready, I will properly refactor the directory str
 
 No particular order.
 
+- Expose an RPC/API to trigger a manual split.
 - Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
-- Update partial range topology within each partition to maintain also range boundaries.
+- Update partial range topology within each partition to maintain also range boundaries to skip forwards in range partitions.
 - Proper structured errors thrown to differentiate user vs server errors.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Enforce the expiration ttl for items.
 - Batch item operations (non-transactions).
+- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow.
 - Allow check conditions and filter conditions on any attribute if the data is not bytes.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
+- Add global eventual indexes (DynamoDB GSIs).
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Think about backups and export in a consistent fashion.
@@ -39,10 +42,7 @@ No particular order.
 - Add optimization for single-partition transactions to not do 2PC.
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
-- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow.
 - Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
-- Implement Jump Consistent Hashing instead/in addition of xxhash32.
-- Add global eventual indexes.
 - Extend the split/migration flow to also allow writes while migration in-progress. Not needed once we use DO Snapshot API.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
 - Support large items through R2.
