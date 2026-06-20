@@ -2213,6 +2213,41 @@ describe("PartitionDO — range split", () => {
 			expect(got).toEqual([...sks].sort().reverse());
 			expect(new Set(got.map(String)).size).toBe(got.length);
 		});
+
+		it("queryItemsDirect reads from the router's own local rows, never fanning out to children (regression: infinite loop when children are migrating)", async () => {
+			// Scenario: a migrating range child calls parent.queryItemsDirect(). Before the fix,
+			// queryItemsDirect on a range router called queryItemsAsRangeNode → walkRangeChildren →
+			// child.queryItems() → child detects it's still migrating → parent.queryItemsDirect() → …
+			// (infinite loop until the subrequest depth limit is hit).
+			//
+			// The fix makes queryItemsDirect always call queryItemsLocal, bypassing child routing.
+			// We verify this by asserting forwardCount=0: the old code would produce forwardCount=N
+			// (from walkRangeChildren) whether or not children have migrated.
+			const N = 2;
+			const { rootStub, sks } = await makeQueuedRangeRoot(N);
+
+			// Run only the parent's alarm: split_queued → split_started (children initialized).
+			// Do NOT drain children so they remain in migration_initialized when the call below fires.
+			await waitForAlarm(rootStub);
+
+			const result = await rootStub.queryItemsDirect({
+				hashKey: kb("alice"),
+				interval: {},
+				direction: "asc",
+				budgetBytes: 64 * 1024 * 1024,
+				remainingLimit: null,
+				maxPartitionVisits: 1000,
+				cursor: null,
+			});
+
+			// The router's own DB still holds all items (parent rows are never deleted during split).
+			expect(result.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+			// Local read only: no forwarding to children.
+			expect(result.meta.forwardCount).toBe(0);
+
+			// Drain pending child migrations so their background work doesn't outlive the test.
+			await drainSplitTree(rootStub);
+		});
 	});
 
 	describe("PartialRangeTopology", () => {
