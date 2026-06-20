@@ -77,36 +77,54 @@ export function decodeCursor(s: string): DecodedCursor {
 export function computeCursorFingerprint(
 	queries: Array<{ hashKey: KeyBytes; interval: SkInterval | null; direction: "asc" | "desc" }>,
 ): bigint {
-	const parts: Uint8Array[] = [];
-	const u8 = (n: number) => new Uint8Array([n]);
-	const u32le = (n: number) => {
-		const b = new Uint8Array(4);
-		new DataView(b.buffer).setUint32(0, n, true);
-		return b;
+	const sizeOfBound = (b: { value: KeyBytes } | undefined) => (b ? 1 + 4 + b.value.byteLength : 0);
+	const sizeOfInterval = (q: (typeof queries)[number]) => {
+		if (q.interval === null) return 1;
+		return 1 + sizeOfBound(q.interval.lower) + 1 + sizeOfBound(q.interval.upper) + 1;
 	};
 
-	parts.push(u32le(queries.length));
+	let total = 4;
+	for (const q of queries) total += 4 + q.hashKey.byteLength + sizeOfInterval(q);
+
+	const buf = new Uint8Array(total);
+	const dv = new DataView(buf.buffer);
+	let o = 0;
+
+	const writeU8 = (n: number) => {
+		buf[o++] = n;
+	};
+	const writeU32le = (n: number) => {
+		dv.setUint32(o, n, true);
+		o += 4;
+	};
+	const writeBytes = (src: Uint8Array) => {
+		buf.set(src, o);
+		o += src.byteLength;
+	};
+
+	writeU32le(queries.length);
 	for (const q of queries) {
-		parts.push(u32le(q.hashKey.byteLength), q.hashKey);
+		writeU32le(q.hashKey.byteLength);
+		writeBytes(q.hashKey);
 		if (q.interval === null) {
-			parts.push(u8(2));
+			writeU8(2);
 			continue;
 		}
 		const lo = q.interval.lower;
 		const up = q.interval.upper;
-		parts.push(u8(lo ? 1 : 0));
-		if (lo) parts.push(u8(lo.inclusive ? 1 : 0), u32le(lo.value.byteLength), lo.value);
-		parts.push(u8(up ? 1 : 0));
-		if (up) parts.push(u8(up.inclusive ? 1 : 0), u32le(up.value.byteLength), up.value);
-		parts.push(u8(q.direction === "asc" ? 0 : 1));
-	}
-
-	const total = parts.reduce((s, p) => s + p.byteLength, 0);
-	const buf = new Uint8Array(total);
-	let o = 0;
-	for (const p of parts) {
-		buf.set(p, o);
-		o += p.byteLength;
+		writeU8(lo ? 1 : 0);
+		if (lo) {
+			writeU8(lo.inclusive ? 1 : 0);
+			writeU32le(lo.value.byteLength);
+			writeBytes(lo.value);
+		}
+		writeU8(up ? 1 : 0);
+		if (up) {
+			writeU8(up.inclusive ? 1 : 0);
+			writeU32le(up.value.byteLength);
+			writeBytes(up.value);
+		}
+		writeU8(q.direction === "asc" ? 0 : 1);
 	}
 	return hash64(buf);
 }
