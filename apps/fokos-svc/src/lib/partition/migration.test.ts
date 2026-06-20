@@ -11,7 +11,7 @@ import type {
 	GetPromotedKeysBatchResult,
 	PartitionPeer,
 } from "./partition-peer.js";
-import { PartitionStore, type MigratedItem, type MigrationCursor, type PromotedKeyStatus } from "./partition-store.js";
+import { PartitionStore, type MigratedItem, type ScanCursor, type PromotedKeyStatus } from "./partition-store.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -228,7 +228,7 @@ function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): Migrate
 // Serves `all` (already in (hk, sk) order) in pages of `batchSize`, honoring the resume cursor —
 // mirrors the parent's real batch-serving contract (nextCursor non-null only when more remains).
 function pagedItemBatches(all: MigratedItem[], batchSize: number) {
-	return (cursor: MigrationCursor | null): GetItemsBatchResult => {
+	return (cursor: ScanCursor | null): GetItemsBatchResult => {
 		const start =
 			cursor === null
 				? 0
@@ -244,7 +244,7 @@ function pagedItemBatches(all: MigratedItem[], batchSize: number) {
 }
 
 type FakePeerOptions = {
-	items?: (cursor: MigrationCursor | null) => GetItemsBatchResult;
+	items?: (cursor: ScanCursor | null) => GetItemsBatchResult;
 	txBatches?: GetPartitionTransactionMetadataResult[];
 	pkBatches?: GetPromotedKeysBatchResult[];
 	/** 1-based getItemsBatch call number that throws once (simulated crash mid-migration). */
@@ -253,7 +253,7 @@ type FakePeerOptions = {
 
 function makeFakePeer(opts: FakePeerOptions = {}) {
 	const calls = {
-		itemCursors: [] as (MigrationCursor | null)[],
+		itemCursors: [] as (ScanCursor | null)[],
 		txCalls: 0,
 		pkCalls: 0,
 		childAcks: [] as string[],
@@ -297,7 +297,7 @@ type MigrationEnv = {
 	inherited: [KeyBytes, PromotedKeyStatus][];
 	makeMigration: (peer: PartitionPeer) => SplitMigration;
 	status: () => PartitionSplitMigrationStatus | undefined;
-	cursor: () => MigrationCursor | null | undefined;
+	cursor: () => ScanCursor | null | undefined;
 };
 
 // Real DO storage (vitest-pool-workers); the peer is the only fake — exactly what the gateway
@@ -321,7 +321,7 @@ async function withMigrationEnv(fn: (menv: MigrationEnv) => Promise<void>): Prom
 					onPromotedKeyInherited: (hk, status) => inherited.push([hk, status]),
 				}),
 			status: () => state.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
-			cursor: () => state.storage.kv.get<MigrationCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR),
+			cursor: () => state.storage.kv.get<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR),
 		});
 	});
 }

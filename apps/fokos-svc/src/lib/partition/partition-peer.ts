@@ -2,7 +2,7 @@ import type { InitFromSplitOptions, PartitionContextResolved } from "../partitio
 import type { KeyBytes } from "../partition-topology/key-codec.js";
 import type {
 	MigratedItem,
-	MigrationCursor,
+	ScanCursor,
 	PendingTransactionCursor,
 	PendingTransactionRow,
 	PromotedKeyCursor,
@@ -11,7 +11,7 @@ import type {
 
 export type GetItemsBatchResult = {
 	items: MigratedItem[];
-	nextCursor: MigrationCursor | null;
+	nextCursor: ScanCursor | null;
 };
 
 export type GetPartitionTransactionMetadataResult = {
@@ -38,7 +38,7 @@ export type GetPromotedKeysBatchResult = {
  * TC must not be coupled to partition/ internals.
  */
 export interface PartitionPeer {
-	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: MigrationCursor | null }): Promise<GetItemsBatchResult>;
+	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: ScanCursor | null }): Promise<GetItemsBatchResult>;
 	getPartitionTransactionMetadata(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PendingTransactionCursor | null;

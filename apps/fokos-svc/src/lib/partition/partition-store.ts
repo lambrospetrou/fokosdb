@@ -46,7 +46,7 @@ export type PendingTransactionRow = {
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
-export type MigrationCursor = { hk: KeyBytes; sk: KeyBytes };
+export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
@@ -456,7 +456,7 @@ export class PartitionStore {
 	}
 
 	/** Pages the items table in (hk, sk) order, strictly after `cursor`. */
-	queryItemsPage(cursor: MigrationCursor | null, limit: number): MigratedItem[] {
+	queryItemsPage(cursor: ScanCursor | null, limit: number): MigratedItem[] {
 		type Row = {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
@@ -509,8 +509,7 @@ export class PartitionStore {
 		lowerInclusive: boolean;
 		upper: KeyBytes | null;
 		upperInclusive: boolean;
-		cursor: MigrationCursor | null;
-		cursorInclusive?: boolean;
+		cursor: ScanCursor | null;
 		limit: number;
 		direction: "asc" | "desc";
 	}): MigratedItem[] {
@@ -528,7 +527,7 @@ export class PartitionStore {
 		if (opts.direction === "asc") {
 			// Near-bound (start): cursor wins; else use lower bound.
 			if (opts.cursor) {
-				conds.push(opts.cursorInclusive ? "sk >= ?" : "sk > ?");
+				conds.push(opts.cursor.inclusive ? "sk >= ?" : "sk > ?");
 				params.push(opts.cursor.sk);
 			} else {
 				conds.push(opts.lowerInclusive ? "sk >= ?" : "sk > ?");
@@ -542,7 +541,7 @@ export class PartitionStore {
 		} else {
 			// Near-bound (start descending): cursor wins; else use upper bound.
 			if (opts.cursor) {
-				conds.push(opts.cursorInclusive ? "sk <= ?" : "sk < ?");
+				conds.push(opts.cursor.inclusive ? "sk <= ?" : "sk < ?");
 				params.push(opts.cursor.sk);
 			} else if (opts.upper !== null) {
 				conds.push(opts.upperInclusive ? "sk <= ?" : "sk < ?");
