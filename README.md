@@ -53,8 +53,24 @@ No particular order.
 
 _TODO_
 
+## Development
+
+```sh
+npm test
+```
+
+### Test with Hurl
+
+```sh
+# terminal 1
+rm -rf ./wrangler && npm run dev
+
+# terminal 2
+npm run test:hurl
+```
+
 ## Contributing
 
-This project is still in prototype and design mode, so I don't really want new features to be contributed by external folks, yet.
+This project is still work in progress and does breaking changes, so I don't really want new features to be contributed by external folks, yet.
 
 You can submit issues for bugs if you find something, or start a discussion if you have ideas, questions, or something else to say.
