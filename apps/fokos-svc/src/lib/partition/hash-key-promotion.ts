@@ -1,12 +1,3 @@
-// ============================================================================================
-// BIG FIXME (perf): The in-memory promoted-keys cache (#keys) is keyed by KeyCodec.mapKey(hashKey),
-// which hex-encodes the key bytes. statusFor()/has() run on EVERY request's hot routing path
-// (withSplitForwarding / groupItemsByRouting), so we pay a full hex encode of the hashKey per request.
-// This needs an optimization pass AFTER the bytes-key refactor lands — e.g. a cheaper stable key
-// (latin1/raw-byte string), caching the mapKey on the carried KeyBytes, or a byte-trie keyed cache.
-// Do NOT micro-optimize now; revisit once the refactor is complete and we can benchmark.
-// ============================================================================================
-
 import { tryWhile } from "durable-utils/retries";
 import { isHashPartition, type PartitionContextResolved } from "../partition-topology/partition-context.js";
 import { resolveRangePartitionContext } from "../partition-topology/partition-id.js";
