@@ -95,7 +95,7 @@ interface Layer {
 }
 
 interface LayerSnapshot {
-	bits: number[];
+	bits: Uint8Array;
 	capacity: number;
 	count: number;
 	k: number;
@@ -186,7 +186,7 @@ export class BloomFilter {
 			maxSizeBytes: this.maxSizeBytes,
 			initialCapacityN: this.initialCapacityN,
 			layers: this.layers.map((layer) => ({
-				bits: Array.from(layer.bits),
+				bits: layer.bits,
 				capacity: layer.capacity,
 				count: layer.count,
 				k: layer.k,

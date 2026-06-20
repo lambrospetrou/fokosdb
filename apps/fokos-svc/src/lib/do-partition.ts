@@ -1674,6 +1674,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			this.#_partialRangeTopology = PartialRangeTopology.create({
 				errorRate: 0.01,
 				// I want this to not be more than about 1MB, but we give 1.5MB for extra buffer.
+				// It has to be less than 2MB to fit into the SQLite row size limit (2MB) for the serialized bloom filter.
+				//
 				// Here's the growth until we cross 1 MB:
 				//    node ./tools/bloom-filter-sizing.js 300000 2MB
 				//
