@@ -59,11 +59,20 @@ export class SplitMigration {
 
 		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
+		let nextBatchPromise = parent.getItemsBatch({
+			childPartitionContext: pCtx,
+			cursor,
+		});
+
 		while (true) {
-			const { items, nextCursor } = await parent.getItemsBatch({
-				childPartitionContext: pCtx,
-				cursor,
-			});
+			const { items, nextCursor } = await nextBatchPromise;
+			if (nextCursor) {
+				// Pre-fetch the next batch while we process this one.
+				nextBatchPromise = parent.getItemsBatch({
+					childPartitionContext: pCtx,
+					cursor: nextCursor,
+				});
+			}
 
 			if (items.length > 0) {
 				for (const item of items) {
@@ -143,11 +152,20 @@ export class SplitMigration {
 		// for a range-split child the parent is a range DO (filter by hk and sk range).
 		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
+		let nextBatchPromise = parent.getItemsBatch({
+			childPartitionContext: pCtx,
+			cursor,
+		});
+
 		while (true) {
-			const { items, nextCursor } = await parent.getItemsBatch({
-				childPartitionContext: pCtx,
-				cursor,
-			});
+			const { items, nextCursor } = await nextBatchPromise;
+			if (nextCursor) {
+				// Pre-fetch the next batch while we process this one.
+				nextBatchPromise = parent.getItemsBatch({
+					childPartitionContext: pCtx,
+					cursor: nextCursor,
+				});
+			}
 
 			if (items.length > 0) {
 				for (const item of items) {
