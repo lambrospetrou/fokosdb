@@ -732,9 +732,15 @@ export class PartitionStore {
 
 	// ─── promoted_keys ──────────────────────────────────────────────────────
 
-	listPromotedKeys(): PromotedKeyRow[] {
+	listPromotedKeys(status?: PromotedKeyStatus): PromotedKeyRow[] {
+		let sql = `SELECT hash_key, status FROM promoted_keys`;
+		const params: any[] = [];
+		if (status) {
+			sql += ` WHERE status = ?`;
+			params.push(status);
+		}
 		return this.#storage.sql
-			.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(`SELECT hash_key, status FROM promoted_keys`)
+			.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(sql, ...params)
 			.toArray()
 			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
 	}

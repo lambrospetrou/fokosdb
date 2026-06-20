@@ -664,7 +664,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			// Filter: only items for the requesting hash child, excluding promoted keys
 			// (their data lives in range structures — hash children must not inherit local copies).
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk) && !this.#promotion.has(row.hk),
+			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk) && !this.#promotion.hasStatus(row.hk),
 			estimateBytes: estimateItemBytes,
 			budgetBytes: BATCH_LIMIT_BYTES,
 			pageSize: PAGE_SIZE,
@@ -1260,7 +1260,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		} = opts;
 
 		if (isHashPartition(ctx)) {
-			// Step 1: Authoritative promotion check.
+			// Step 1: Authoritative promotion check for keys we promoted or inherited.
 			const promotedStatus = this.#promotion.statusFor(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 				return await this.forwardToRangeRootPartition(ctx, hashKey, forward);
@@ -1417,7 +1417,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			storage: this.ctx.storage,
 			parent,
 			logParams: () => this.logParams(),
-			onPromotedKeyInherited: (hashKey, status) => this.#promotion.inheritKey(hashKey, status),
+			onPromotedKeyInherited: (_hashKey, _status) => {},
 			beforeComplete: async () => {
 				await this.__testing__beforeMigrationComplete?.();
 			},
@@ -1586,26 +1586,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// GC: delete local items and pending_transactions for fully-promoted keys.
 				this.#promotion.runGC();
 			}
-
-			///////////////////////////////////////////////////////////////////////////
-			// ── Sync promoted keys into the partial range topology bloom filter.
-			// Only update an existing bloom filter (created via per-request learning from forwarded
-			// responses). The owning partition routes promoted keys authoritatively via
-			// PromotionManager.statusFor(); creating a bloom filter eagerly would bloat databaseSize.
-			//
-			// TODO: Do we need this here??? Why not let it learn from responses only?
-			//
-			if (isHashPartition(this.pCtx()) && this.#_partialRangeTopology) {
-				const promotedHashKeys = this.#promotion
-					.snapshot()
-					.filter(({ status }) => status === "promoting" || status === "promoted")
-					.map(({ hashKey }) => hashKey);
-				if (promotedHashKeys.length > 0) {
-					if (this.#_partialRangeTopology.learnPromotedKeys(promotedHashKeys)) {
-						this.persistPartialRangeTopology();
-					}
-				}
-			}
 		} catch (error) {
 			console.error({
 				...this.logParams(),
@@ -1695,7 +1675,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				errorRate: 0.01,
 				// I want this to not be more than about 1MB, but we give 1.5MB for extra buffer.
 				// Here's the growth until we cross 1 MB:
-				//    node ./tools/bloom-filter-sizing.js 300000 1MB
+				//    node ./tools/bloom-filter-sizing.js 300000 2MB
 				//
 				// Initial capacity: 300,000 items | Max size: 1.00 MB | Error rate: 0.01
 				//
@@ -1703,6 +1683,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// -------------------------------------------------------------------
 				// 0           300,000         0.5000%    403.8 KB        403.8 KB   8
 				// 1           600,000         0.2500%    913.4 KB         1.29 MB   9
+				// 2         1,200,000         0.1250%     1.99 MB         3.28 MB  10
 				//
 				maxSizeBytes: 1.5 * 1024 * 1024,
 				// WARNING: This cannot change after the first addition of something in the bloom filter!

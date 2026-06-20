@@ -15,6 +15,7 @@ import { RANGE_PROMOTION_FRACTION } from "../partition-topology/split-policy.js"
 import type { SplitStatusKVItem } from "../partition-topology/split-state.js";
 import type { PartitionPeer } from "./partition-peer.js";
 import type { PartitionStore, PromotedKeyStatus } from "./partition-store.js";
+import invariant from "../invariant.js";
 
 /** The subset of the peer surface promotion needs from a range root (phase 3's gateway interface). */
 export type PromotionPeer = Pick<PartitionPeer, "initFromSplit" | "triggerMigration">;
@@ -35,14 +36,14 @@ export type PromotionManagerDeps = {
 };
 
 /**
- * The promotion lifecycle (queued → promoting → promoted) together with the in-memory
- * promoted_keys cache it keeps consistent — one consistency domain, one owner. The cache is read
- * by hot-path routing (withSplitForwarding / groupItemsByRouting) via statusFor()/has().
+ * The promotion lifecycle (queued → promoting → promoted) owner.
  *
- * Hash DOs only: range DOs never have promoted_keys rows, so every method is a no-op there.
+ * Hash DOs only: range DOs never have promoted_keys rows.
  */
 export class PromotionManager {
-	// In-memory cache of promoted_keys, loaded at DO startup via loadFromStorage().
+	// TODO Implement LRU cache, or somehow use the BloomFilter implementation.
+	//
+	// In-memory cache of promoted_keys (promoting or promoted), loaded at DO startup via loadFromStorage().
 	// Keyed by a stable identity of the hashKey (a Uint8Array can't be a Map key); the KeyBytes is kept in
 	// the value so callers get the real key back.
 	//
@@ -50,26 +51,29 @@ export class PromotionManager {
 	// We can use KeyCodec.mapKey(hashKey) to get a stable number identity for the key, which avoids the string allocation and is faster to compare.
 	//
 	// For full correctness we could simply just scrap the in-memory cache and only rely on the store but that would lead to extra rows read charges.
-	// We might decide that it's fine in the end, but for now we will keep the in-memory cache.
-	#keys: Map<bigint, { key: KeyBytes; status: PromotedKeyStatus }> = new Map();
+	//
+	// #keys: Map<bigint, { key: KeyBytes; status: PromotedKeyStatus }> = new Map();
 
 	constructor(private readonly deps: PromotionManagerDeps) {}
 
 	/** Populates the cache from storage; called from the DO's blockConcurrencyWhile at startup. */
 	loadFromStorage(): void {
 		for (const row of this.deps.store.listPromotedKeys()) {
-			this.#keys.set(KeyCodec.mapKey(row.hash_key), { key: row.hash_key, status: row.status });
+			// TODO fill in-memory cache if we know which keys are often accessed.
+			// this.#keys.set(KeyCodec.mapKey(row.hash_key), { key: row.hash_key, status: row.status });
 		}
 	}
 
 	/** Hot-path read for routing decisions. */
 	statusFor(hashKey: KeyBytes): PromotedKeyStatus | undefined {
-		return this.#keys.get(KeyCodec.mapKey(hashKey))?.status;
+		// TODO Read from cache!
+		return this.deps.store.getPromotedKeyStatus(hashKey);
 	}
 
 	/** Whether the key is tracked at any lifecycle stage (queued, promoting, or promoted). */
-	has(hashKey: KeyBytes): boolean {
-		return this.#keys.has(KeyCodec.mapKey(hashKey));
+	hasStatus(hashKey: KeyBytes): boolean {
+		// TODO Read from cache!
+		return this.statusFor(hashKey) !== undefined;
 	}
 
 	// Promotion⇄hash-split mutual exclusion input for the split policy.
@@ -83,58 +87,40 @@ export class PromotionManager {
 	 */
 	activeRangeRootHashKeys(): KeyBytes[] {
 		const keys: KeyBytes[] = [];
-		for (const { key, status } of this.#keys.values()) {
-			if (status === "promoting" || status === "promoted") keys.push(key);
+		for (const { hash_key, status } of this.deps.store.listPromotedKeys()) {
+			if (status === "promoting" || status === "promoted") keys.push(hash_key);
 		}
 		return keys;
 	}
 
-	/** Migration inheritance: a hash child receives a promoted-key entry pulled from its parent. */
-	inheritKey(hashKey: KeyBytes, status: PromotedKeyStatus): void {
-		this.#keys.set(KeyCodec.mapKey(hashKey), { key: hashKey, status });
-	}
-
 	snapshot(): { hashKey: KeyBytes; status: PromotedKeyStatus }[] {
-		return Array.from(this.#keys.values()).map(({ key, status }) => ({ hashKey: key, status }));
+		return this.deps.store.listPromotedKeys().map(({ hash_key, status }) => ({ hashKey: hash_key, status }));
 	}
 
 	async maybeQueuePromotion(pCtx: PartitionContextResolved, hk: KeyBytes, newKeyEst: number): Promise<void> {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
-		if (threshold <= 0 || newKeyEst < threshold || this.has(hk)) return;
+		if (threshold <= 0 || newKeyEst < threshold || this.hasStatus(hk)) return;
 		const { inserted } = this.deps.store.insertPromotedKey(hk, "queued", Date.now());
-		if (!inserted) {
-			// A row already existed (the in-memory cache was stale, e.g. after crash recovery) —
-			// resync the cache from storage instead of clobbering a possibly-advanced status
-			// (promoting/promoted) back to queued.
-			const stored = this.deps.store.getPromotedKeyStatus(hk);
-			if (stored) this.#keys.set(KeyCodec.mapKey(hk), { key: hk, status: stored });
-			return;
-		}
-		this.#keys.set(KeyCodec.mapKey(hk), { key: hk, status: "queued" });
 		await this.deps.scheduleWork({ delayMs: 10 });
 		console.log({
 			...this.deps.logParams(),
 			message: "fokos/partition: Key queued for promotion.",
 			hk: KeyCodec.keyForLog(hk),
 			newKeyEst,
-			totalPromotedKeys: this.#keys.size,
+			inserted,
 		});
 	}
 
 	async acknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
 		const { updated } = this.deps.store.updatePromotedKeyStatus(hashKey, "promoting", "promoted", Date.now());
-		if (updated) {
-			this.#keys.set(KeyCodec.mapKey(hashKey), { key: hashKey, status: "promoted" });
-		} else {
-			// No row transitioned (e.g. idempotent re-ack of an already-promoted key) — sync the
-			// cache from storage's truth rather than assuming the transition happened.
-			const stored = this.deps.store.getPromotedKeyStatus(hashKey);
-			if (stored) this.#keys.set(KeyCodec.mapKey(hashKey), { key: hashKey, status: stored });
-			else this.#keys.delete(KeyCodec.mapKey(hashKey));
-		}
 		await this.deps.scheduleWork({ delayMs: 1_000 });
-		console.log({ ...this.deps.logParams(), message: "fokos/partition: Promotion complete.", hashKey: KeyCodec.keyForLog(hashKey) });
+		console.log({
+			...this.deps.logParams(),
+			message: "fokos/partition: Promotion complete.",
+			hashKey: KeyCodec.keyForLog(hashKey),
+			updated,
+		});
 	}
 
 	/**
@@ -142,18 +128,16 @@ export class PromotionManager {
 	 * Per-key failures are logged and never block the remaining keys.
 	 */
 	async drive(pCtx: PartitionContextResolved, getSplitStatus: () => SplitStatusKVItem | undefined): Promise<void> {
-		for (const { key, status } of this.#keys.values()) {
-			if (status === "queued") {
-				try {
-					await this.startPromotion(pCtx, key, getSplitStatus);
-				} catch (error) {
-					console.error({
-						...this.deps.logParams(),
-						message: "fokos/partition: Promotion drive job failed.",
-						hashKey: KeyCodec.keyForLog(key),
-						error: String(error),
-					});
-				}
+		for (const { hash_key: key } of this.deps.store.listPromotedKeys("queued")) {
+			try {
+				await this.startPromotion(pCtx, key, getSplitStatus);
+			} catch (error) {
+				console.error({
+					...this.deps.logParams(),
+					message: "fokos/partition: Promotion drive job failed.",
+					hashKey: KeyCodec.keyForLog(key),
+					error: String(error),
+				});
 			}
 		}
 	}
@@ -192,20 +176,8 @@ export class PromotionManager {
 			const { updated } = this.deps.store.updatePromotedKeyStatus(hashKey, "queued", "promoting", Date.now());
 			return updated ? "cutover" : "stale";
 		});
-		if (cutover === "cutover") {
-			this.#keys.set(KeyCodec.mapKey(hashKey), { key: hashKey, status: "promoting" });
-		} else if (cutover === "stale") {
-			// Storage disagrees with the in-memory cache (the key is no longer 'queued') — sync the
-			// cache from storage's truth and skip; the background loop acts on the real status.
-			const stored = this.deps.store.getPromotedKeyStatus(hashKey);
-			if (stored) this.#keys.set(KeyCodec.mapKey(hashKey), { key: hashKey, status: stored });
-			else this.#keys.delete(KeyCodec.mapKey(hashKey));
-			console.log({
-				...this.deps.logParams(),
-				message: "fokos/partition: Promotion cutover skipped (key no longer queued in storage).",
-				hashKey: KeyCodec.keyForLog(hashKey),
-				storedStatus: stored ?? null,
-			});
+
+		if (cutover === "stale") {
 			return;
 		}
 

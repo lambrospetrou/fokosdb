@@ -220,7 +220,7 @@ describe("PromotionManager — GC", () => {
 });
 
 describe("PromotionManager — cache views", () => {
-	it("loadFromStorage + snapshot + inheritKey expose the storage truth", async () => {
+	it("loadFromStorage + snapshot expose the storage truth", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, store } = penv;
 			store.insertPromotedKey(kb("alice"), "promoted", 1);
@@ -231,12 +231,8 @@ describe("PromotionManager — cache views", () => {
 				{ hashKey: kb("alice"), status: "promoted" },
 				{ hashKey: kb("bob"), status: "queued" },
 			]);
-			expect(manager.has(kb("alice"))).toBe(true);
+			expect(manager.hasStatus(kb("alice"))).toBe(true);
 			expect(manager.statusFor(kb("bob"))).toBe("queued");
-
-			manager.inheritKey(kb("carol"), "promoting");
-			expect(manager.statusFor(kb("carol"))).toBe("promoting");
-			expect(manager.activeRangeRootHashKeys().sort()).toEqual([kb("alice"), kb("carol")].sort());
 		});
 	});
 });
