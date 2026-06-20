@@ -22,10 +22,9 @@ Once there is a stable version ready, I will properly refactor the directory str
 
 No particular order.
 
-- Proper structured errors thrown to differentiate user vs server errors.
 - Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
 - Update partial range topology within each partition to maintain also range boundaries.
-- Implement queryItems with pagination similar to the PartiQL execution though that allows multiple hash keys too.
+- Proper structured errors thrown to differentiate user vs server errors.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Enforce the expiration ttl for items.
 - Batch item operations (non-transactions).
