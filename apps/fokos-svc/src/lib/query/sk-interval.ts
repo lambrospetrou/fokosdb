@@ -1,4 +1,5 @@
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import type { ScanCursor } from "../partition/partition-store.js";
 import type { SortKeyCondition } from "../types.js";
 
 /** Byte-space sort-key interval. Both ends are optional (absent = unbounded). */
@@ -6,14 +7,6 @@ export type SkInterval = {
 	lower?: { value: KeyBytes; inclusive: boolean };
 	upper?: { value: KeyBytes; inclusive: boolean };
 };
-
-/**
- * Resume position for queryItems within a single sub-query's scan.
- * Row-derived cursors are exclusive (resume strictly past the row; `inclusive` absent/false).
- * Boundary cursors emitted by the range-walk's visit cap carry `inclusive: true` (asc) or
- * `inclusive: false` (desc) to control whether the boundary key itself is included on resume.
- */
-export type QueryCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
 /**
  * Check whether a child range [childStart, childEnd) intersects an SkInterval.
@@ -70,7 +63,7 @@ export function clipToChildRange(interval: SkInterval, childStart: KeyBytes | nu
 export function isChildFullyBeforeCursor(
 	childStart: KeyBytes,
 	childEnd: KeyBytes | null,
-	cursor: QueryCursor,
+	cursor: ScanCursor,
 	direction: "asc" | "desc",
 ): boolean {
 	if (direction === "asc") {
@@ -84,7 +77,7 @@ export function isChildFullyBeforeCursor(
  * If true, the child should receive the cursor for a resumed scan; otherwise the child
  * starts a fresh scan from the interval's bound.
  */
-export function cursorFallsInChild(childStart: KeyBytes, childEnd: KeyBytes | null, cursor: QueryCursor): boolean {
+export function cursorFallsInChild(childStart: KeyBytes, childEnd: KeyBytes | null, cursor: ScanCursor): boolean {
 	return KeyCodec.compare(cursor.sk, childStart) >= 0 && (childEnd === null || KeyCodec.compare(cursor.sk, childEnd) < 0);
 }
 
@@ -101,24 +94,11 @@ export function makeBoundaryCursor(
 	childStart: KeyBytes,
 	childEnd: KeyBytes | null,
 	direction: "asc" | "desc",
-): QueryCursor {
+): ScanCursor {
 	if (direction === "asc") {
 		return { hk: hashKey, sk: childEnd ?? KeyCodec.encodeOptional(undefined), inclusive: true };
 	}
 	return { hk: hashKey, sk: childStart, inclusive: false };
-}
-
-/**
- * Determine whether a page cursor (from collectBatch's fetchPage) is the original inclusive
- * boundary cursor. Uses value equality (KeyCodec.compare) rather than reference identity
- * so it is safe across structured-clone / RPC boundaries.
- *
- * Returns true only when both cursors are non-null, the original was marked inclusive, and
- * the page cursor's hk/sk match the original by value.
- */
-export function isOriginalInclusiveCursor(pageCursor: { hk: KeyBytes; sk: KeyBytes } | null, originalCursor: QueryCursor | null): boolean {
-	if (pageCursor === null || originalCursor === null || originalCursor.inclusive !== true) return false;
-	return KeyCodec.compare(pageCursor.hk, originalCursor.hk) === 0 && KeyCodec.compare(pageCursor.sk, originalCursor.sk) === 0;
 }
 
 /**

@@ -1,6 +1,6 @@
 import { isHashPartition, type PartitionContextResolved } from "../partition-topology/partition-context.js";
 import type { KeyBytes } from "../partition-topology/key-codec.js";
-import type { PartitionStore, MigrationCursor, PendingTransactionCursor, PromotedKeyCursor, PromotedKeyStatus } from "./partition-store.js";
+import type { PartitionStore, ScanCursor, PendingTransactionCursor, PromotedKeyCursor, PromotedKeyStatus } from "./partition-store.js";
 import type { PartitionPeer } from "./partition-peer.js";
 import invariant from "../invariant.js";
 
@@ -57,7 +57,7 @@ export class SplitMigration {
 	private async runHashChildMigration(pCtx: PartitionContextResolved): Promise<void> {
 		const { store, storage, parent } = this.deps;
 
-		let cursor = storage.kv.get<MigrationCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
 		while (true) {
 			const { items, nextCursor } = await parent.getItemsBatch({
@@ -77,7 +77,7 @@ export class SplitMigration {
 
 			// Checkpoint cursor after each batch so we can resume if interrupted.
 			cursor = nextCursor;
-			storage.kv.put<MigrationCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
+			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
 
 			if (!nextCursor) break;
 		}
@@ -141,7 +141,7 @@ export class SplitMigration {
 		// Migrate items for this range DO's owned slice.
 		// For a promotion root the parent is a hash DO (filter by hk only);
 		// for a range-split child the parent is a range DO (filter by hk and sk range).
-		let cursor = storage.kv.get<MigrationCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
 		while (true) {
 			const { items, nextCursor } = await parent.getItemsBatch({
@@ -156,7 +156,7 @@ export class SplitMigration {
 			}
 
 			cursor = nextCursor;
-			storage.kv.put<MigrationCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
+			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
 
 			if (!nextCursor) break;
 		}

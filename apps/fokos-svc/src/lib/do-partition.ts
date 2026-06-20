@@ -45,7 +45,7 @@ import {
 	PartitionStore,
 	type ItemSnapshot,
 	type MigratedItem,
-	type MigrationCursor,
+	type ScanCursor,
 	type PendingTransactionCursor,
 	type PendingTransactionRow,
 	type PromotedKeyCursor,
@@ -66,10 +66,8 @@ import {
 	clipToChildRange,
 	cursorFallsInChild,
 	isChildFullyBeforeCursor,
-	isOriginalInclusiveCursor,
 	makeBoundaryCursor,
 	rangeIntersects,
-	type QueryCursor,
 	type SkInterval,
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
@@ -96,7 +94,8 @@ export interface PartitionAPI {
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
-export type { SkInterval, QueryCursor } from "./query/sk-interval.js";
+export type { SkInterval } from "./query/sk-interval.js";
+export type { ScanCursor } from "./partition/partition-store.js";
 
 export type QueryItemsRpcRequest = {
 	hashKey: KeyBytes;
@@ -110,12 +109,12 @@ export type QueryItemsRpcRequest = {
 	 * heavily-split (or sparse) range subtree. Decremented as the walk descends.
 	 */
 	maxPartitionVisits: number;
-	cursor: QueryCursor | null;
+	cursor: ScanCursor | null;
 };
 
 export type QueryItemsRpcResult = {
 	items: MigratedItem[];
-	nextCursor: QueryCursor | null;
+	nextCursor: ScanCursor | null;
 	bytesConsumed: number;
 	/**
 	 * The serving DO's own bookkeeping record (servedBy*, hashDepth) — NOT part of the public
@@ -475,9 +474,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			rows,
 			nextCursor,
 			totalBytes: bytesConsumed,
-		} = collectBatch<MigratedItem, MigrationCursor>({
+		} = collectBatch<MigratedItem, ScanCursor>({
 			fetchPage: (pageCursor, pageSize) => {
-				const cursorInclusive = isOriginalInclusiveCursor(pageCursor, cursor);
 				const page = this.#store.queryRangeItemsPage({
 					hk,
 					lower,
@@ -485,7 +483,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					upper,
 					upperInclusive,
 					cursor: pageCursor,
-					cursorInclusive,
 					limit: pageSize,
 					direction: req.direction,
 				});
@@ -540,7 +537,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
 		// contribute nothing of their own; they're captured numerically via `forwardCount`.
 		const leafMetas: Array<OperationMetrics & PartitionInfo> = [];
-		let nextCursor: QueryCursor | null = null;
+		let nextCursor: ScanCursor | null = null;
 		let totalBytesConsumed = 0;
 		let childrenCalled = 0;
 		// Sum of forwards performed by descendant routers, so this node's `forwardCount` is cumulative.
@@ -611,10 +608,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { items: allItems, nextCursor, bytesConsumed: totalBytesConsumed, meta, partitionMetas: leafMetas };
 	}
 
-	async getItemsBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: MigrationCursor | null;
-	}): Promise<GetItemsBatchResult> {
+	async getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: ScanCursor | null }): Promise<GetItemsBatchResult> {
 		const pCtx = this.pCtx();
 
 		// Range-child migration (promotion or range-split).
@@ -665,7 +659,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
 
-		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
+		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
 			fetchPage: (cursor, pageSize) => this.#store.queryItemsPage(cursor, pageSize),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			// Filter: only items for the requesting hash child, excluding promoted keys
@@ -685,13 +679,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		hashKey: KeyBytes,
 		start: KeyBytes | null,
 		end: KeyBytes | null,
-		cursor: MigrationCursor | null,
+		cursor: ScanCursor | null,
 	): GetItemsBatchResult {
 		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 		const lower = start ?? KeyCodec.encodeOptional(undefined);
 
-		const { rows, nextCursor } = collectBatch<MigratedItem, MigrationCursor>({
+		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
 			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
 			fetchPage: (pageCursor, pageSize) =>
 				this.#store.queryRangeItemsPage({

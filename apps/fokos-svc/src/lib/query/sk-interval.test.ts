@@ -4,12 +4,11 @@ import {
 	clipToChildRange,
 	cursorFallsInChild,
 	isChildFullyBeforeCursor,
-	isOriginalInclusiveCursor,
 	makeBoundaryCursor,
 	rangeIntersects,
-	type QueryCursor,
 	type SkInterval,
 } from "./sk-interval.js";
+import type { ScanCursor } from "../partition/partition-store.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const sentinel = () => KeyCodec.encodeOptional(undefined);
@@ -243,58 +242,5 @@ describe("makeBoundaryCursor", () => {
 	it("carries the provided hashKey", () => {
 		const c = makeBoundaryCursor(kb("mykey"), kb("b"), kb("d"), "asc");
 		expect(KeyCodec.compare(c.hk, kb("mykey"))).toBe(0);
-	});
-});
-
-// ─── isOriginalInclusiveCursor ────────────────────────────────────────────────
-
-describe("isOriginalInclusiveCursor", () => {
-	it("returns true when positions match and original is inclusive", () => {
-		const original: QueryCursor = { hk: kb("h"), sk: kb("x"), inclusive: true };
-		const page = { hk: kb("h"), sk: kb("x") };
-		expect(isOriginalInclusiveCursor(page, original)).toBe(true);
-	});
-
-	it("returns false when original is not inclusive", () => {
-		const original: QueryCursor = { hk: kb("h"), sk: kb("x"), inclusive: false };
-		const page = { hk: kb("h"), sk: kb("x") };
-		expect(isOriginalInclusiveCursor(page, original)).toBe(false);
-	});
-
-	it("returns false when original has no inclusive field", () => {
-		const original: QueryCursor = { hk: kb("h"), sk: kb("x") };
-		const page = { hk: kb("h"), sk: kb("x") };
-		expect(isOriginalInclusiveCursor(page, original)).toBe(false);
-	});
-
-	it("returns false when sk differs", () => {
-		const original: QueryCursor = { hk: kb("h"), sk: kb("x"), inclusive: true };
-		const page = { hk: kb("h"), sk: kb("y") };
-		expect(isOriginalInclusiveCursor(page, original)).toBe(false);
-	});
-
-	it("returns false when hk differs", () => {
-		const original: QueryCursor = { hk: kb("h1"), sk: kb("x"), inclusive: true };
-		const page = { hk: kb("h2"), sk: kb("x") };
-		expect(isOriginalInclusiveCursor(page, original)).toBe(false);
-	});
-
-	it("returns false when pageCursor is null", () => {
-		expect(isOriginalInclusiveCursor(null, { hk: kb("h"), sk: kb("x"), inclusive: true })).toBe(false);
-	});
-
-	it("returns false when originalCursor is null", () => {
-		expect(isOriginalInclusiveCursor({ hk: kb("h"), sk: kb("x") }, null)).toBe(false);
-	});
-
-	it("uses value equality, not reference identity", () => {
-		const hk1 = kb("h");
-		const hk2 = kb("h");
-		const sk1 = kb("x");
-		const sk2 = kb("x");
-		const original: QueryCursor = { hk: hk1, sk: sk1, inclusive: true };
-		const page = { hk: hk2, sk: sk2 };
-		expect(hk1 === hk2).toBe(false); // different references
-		expect(isOriginalInclusiveCursor(page, original)).toBe(true); // still matches by value
 	});
 });

@@ -19,7 +19,8 @@ import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { isErrorRetryable } from "durable-utils/do-utils";
-import { normalizeSkInterval, QueryCursor } from "./query/sk-interval.js";
+import { normalizeSkInterval } from "./query/sk-interval.js";
+import type { ScanCursor } from "./partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
 import { PageBudget } from "./query/page-budget.js";
 
@@ -214,7 +215,7 @@ export class FokosDB {
 			const query = normalizedQueries[qi];
 			if (query.interval === null) continue;
 
-			const rpcCursor: QueryCursor | null =
+			const rpcCursor: ScanCursor | null =
 				qi === startQueryIdx && startInner !== null
 					? { hk: startInner.hashKey, sk: startInner.sortKey, inclusive: startInner.inclusive }
 					: null;
