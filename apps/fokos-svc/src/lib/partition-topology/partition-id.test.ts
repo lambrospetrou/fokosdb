@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { PartitionContextCreator, type PartitionContext } from "./partition-context.js";
 import { KeyCodec } from "./key-codec.js";
-import { PartitionIdHelper, rangePartitionDoName } from "./partition-id.js";
+import { PartitionIdHelper } from "./partition-id.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -115,8 +115,8 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 
 	it("doName formats range IDs via rangePartitionDoName", () => {
 		const base = makeBase();
-		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), null).encode(false);
-		expect(PartitionIdHelper.doName(base, bytes)).toBe(rangePartitionDoName("iddb", kb("alice"), kb("b1"), null));
+		const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), null).encode(true);
+		expect(doName).toBe("iddb.r.alice.b1.~max");
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.alice.b1.~max");
 	});
 
@@ -126,5 +126,167 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(/expected hash schema/);
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow(/expected hash schema/);
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow(/expected hash schema/);
+	});
+});
+
+describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
+	it("fromRangePartition root: encode then decode round-trips (both boundaries null)", () => {
+		const base = makeBase();
+		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), null, null);
+		const { bytes, opaque, doName } = helper.encode(true);
+
+		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_RANGE_V1);
+		expect(doName).toBe("iddb.r.alice.~min.~max");
+
+		const decoded = PartitionIdHelper.decode(bytes);
+		expect(decoded.schema).toBe(1);
+		if (decoded.schema === 1) {
+			expect(decoded.hashKey).toEqual(kb("alice"));
+			expect(decoded.startBoundary).toBeNull();
+			expect(decoded.endBoundary).toBeNull();
+		}
+
+		// Opaque round-trip.
+		const decoded2 = PartitionIdHelper.decode(Uint8Array.fromHex(opaque));
+		expect(decoded2).toEqual(decoded);
+	});
+
+	it("fromRangePartition child: encode then decode round-trips with both boundaries", () => {
+		const base = makeBase();
+		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), kb("b2"));
+		const { bytes, doName } = helper.encode(true);
+
+		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_RANGE_V1);
+		expect(doName).toBe("iddb.r.alice.b1.b2");
+
+		const decoded = PartitionIdHelper.decode(bytes);
+		expect(decoded.schema).toBe(1);
+		if (decoded.schema === 1) {
+			expect(decoded.hashKey).toEqual(kb("alice"));
+			expect(decoded.startBoundary).toEqual(kb("b1"));
+			expect(decoded.endBoundary).toEqual(kb("b2"));
+		}
+	});
+
+	it("round-trips half-bounded edges (leftmost: null start; rightmost: null end)", () => {
+		const base = makeBase();
+		for (const [start, end, name] of [
+			[null, kb("m"), "iddb.r.x.~min.m"],
+			[kb("m"), null, "iddb.r.x.m.~max"],
+		] as const) {
+			const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, kb("x"), start, end).encode(true);
+			expect(doName).toBe(name);
+			const decoded = PartitionIdHelper.decode(bytes);
+			expect(decoded.schema).toBe(1);
+			if (decoded.schema === 1) {
+				expect(decoded.startBoundary).toEqual(start);
+				expect(decoded.endBoundary).toEqual(end);
+			}
+		}
+	});
+
+	it("handles unicode in hashKey and boundaries", () => {
+		const base = makeBase();
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("café☕"), kb("töst"), kb("zünd")).encode(false);
+		const decoded = PartitionIdHelper.decode(bytes);
+		expect(decoded.schema).toBe(1);
+		if (decoded.schema === 1) {
+			expect(decoded.hashKey).toEqual(kb("café☕"));
+			expect(decoded.startBoundary).toEqual(kb("töst"));
+			expect(decoded.endBoundary).toEqual(kb("zünd"));
+		}
+	});
+
+	it("doName dispatches correctly for range ID loaded from opaque hex", () => {
+		const base = makeBase();
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("mykey"), kb("start1"), kb("end1")).encode(false);
+		const bytes = Uint8Array.fromHex(opaque);
+		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.mykey.start1.end1");
+	});
+});
+
+describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
+	it("fromHashIdxs root: encode then decode", () => {
+		const base = makeBase();
+		const { bytes, opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [0]).encode(true);
+
+		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_HASH_V1);
+		expect(doName).toBe("iddb.h.0");
+
+		const decoded = PartitionIdHelper.decode(bytes);
+		expect(decoded.schema).toBe(0);
+		if (decoded.schema === 0) {
+			expect(decoded.rootIdx).toBe(0);
+			expect(decoded.depth).toBe(0);
+		}
+
+		const decoded2 = PartitionIdHelper.decode(Uint8Array.fromHex(opaque));
+		expect(decoded2).toEqual(decoded);
+	});
+
+	it("fromHashIdxs child: appendHashIdx extends depth", () => {
+		const base = makeBase();
+		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [2]).appendHashIdx(1).encode(true);
+
+		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_HASH_V1);
+		expect(doName).toBe("iddb.h.2.1");
+		expect(PartitionIdHelper.depth(bytes)).toBe(1);
+		expect(PartitionIdHelper.lastChildIdx(bytes)).toBe(1);
+	});
+
+	it("rootIdx, depth, lastChildIdx assert SCHEMA_HASH_V1", () => {
+		const base = makeBase();
+		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
+		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow();
+		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
+		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow();
+	});
+});
+
+describe("rangePartitionDoName", () => {
+	function makeName(hashKey: string, start: string | null, end: string | null) {
+		return PartitionIdHelper.fromRangePartition(
+			makeBase(),
+			kb(hashKey),
+			start === null ? null : kb(start),
+			end === null ? null : kb(end),
+		).encode(true).doName!;
+	}
+
+	it("produces root name (null start/end → ~min/~max sentinels)", () => {
+		expect(makeName("alice", null, null)).toBe("iddb.r.alice.~min.~max");
+	});
+
+	it("produces child name with explicit start and end boundaries", () => {
+		expect(makeName("alice", "b1", "b2")).toBe("iddb.r.alice.b1.b2");
+	});
+
+	it("renders half-bounded edges with one sentinel (leftmost / rightmost child)", () => {
+		expect(makeName("alice", null, "m")).toBe("iddb.r.alice.~min.m");
+		expect(makeName("alice", "m", null)).toBe("iddb.r.alice.m.~max");
+	});
+
+	it("escapes a real boundary that looks like a sentinel (collision-proofness)", () => {
+		// A literal "~min" boundary value is escaped (~ → %7E), so it can never collide with the sentinel.
+		expect(makeName("k", "~min", null)).toBe("iddb.r.k.%7Emin.~max");
+	});
+
+	it("percent-encodes dots in hashKey and boundaries", () => {
+		expect(makeName("a.b", "c.d", "e.f")).toBe("iddb.r.a%2Eb.c%2Ed.e%2Ef");
+	});
+
+	it("leaves slashes literal (0x2F is a safe name byte, not reserved)", () => {
+		expect(makeName("a/b", "c/d", "e/f")).toBe("iddb.r.a/b.c/d.e/f");
+	});
+
+	it("leaves [A-Za-z0-9_-] unchanged", () => {
+		expect(makeName("Hello_World-123", "sk_value-99", "sk_value-zz")).toBe("iddb.r.Hello_World-123.sk_value-99.sk_value-zz");
+	});
+
+	it("keeps range names disjoint from hash names (.r. vs .h.)", () => {
+		const rangeName = makeName("0", null, null);
+		expect(rangeName).toBe("iddb.r.0.~min.~max");
+		// Hash root 0 is "iddb.h.0" — no collision.
+		expect(rangeName).not.toBe("iddb.h.0");
 	});
 });

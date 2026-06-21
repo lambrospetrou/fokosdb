@@ -44,12 +44,7 @@ function encodeRangeComponent(bytes: KeyBytes): string {
 // Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
 // three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
 // The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
-export function rangePartitionDoName(
-	tableName: string,
-	hashKey: KeyBytes,
-	startBoundary: KeyBytes | null,
-	endBoundary: KeyBytes | null,
-): string {
+function rangePartitionDoName(tableName: string, hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
 	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);

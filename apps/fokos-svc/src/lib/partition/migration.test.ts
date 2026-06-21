@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../do-partition.js";
 import { PartitionContextCreator, type PartitionContext, type PartitionContextResolved } from "../partition-topology/partition-context.js";
-import { PartitionIdHelper, rangePartitionDoName } from "../partition-topology/partition-id.js";
+import { PartitionIdHelper } from "../partition-topology/partition-id.js";
 import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./migration.js";
 import type {
 	GetItemsBatchResult,
@@ -202,15 +202,15 @@ function hashCtx(base: PartitionContext, idxs: number[]): PartitionContextResolv
 function rangeCtx(base: PartitionContext, hashKey: string, start: string | null, end: string | null): PartitionContextResolved {
 	const startKey = start === null ? undefined : start;
 	const endKey = end === null ? undefined : end;
-	const { opaque } = PartitionIdHelper.fromRangePartition(
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(
 		base,
 		kb(hashKey),
 		KeyCodec.encodeOptional(startKey),
 		KeyCodec.encodeOptional(endKey),
-	).encode(false);
+	).encode(true);
 	return {
 		...base,
-		doName: rangePartitionDoName(base.tableName, kb(hashKey), KeyCodec.encodeOptional(startKey), KeyCodec.encodeOptional(endKey)),
+		doName: doName!,
 		primaryDoIdStr: "",
 		partitionId: opaque,
 		rangePartition: {
