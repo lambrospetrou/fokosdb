@@ -281,4 +281,195 @@ Average per delta entry: **~23 bytes**
 | **Bounded size** | No | No | Yes (~382 B) |
 | **Cache convergence** | Instant (one response) | Instant (one response) | Gradual (multiple responses) |
 
-Option 3 is recommended. The bounded size (~382 bytes) makes it safe for any tree depth, the exponential spacing gives strong skip potential, and the incremental cache-building model aligns with real access patterns: hot paths get learned fast, cold paths degrade gracefully to root-first routing with a few extra hops.
+---
+
+## Option 4: Response-level ancestor propagation (recommended)
+
+Leave the partition ID unchanged (own boundaries only — no hierarchy encoding). Instead, propagate ancestor boundaries through two mechanisms:
+
+1. **Split initialization:** When a parent splits, it passes ancestor context to children during `initFromSplit`. Each child stores a bounded set of ancestor boundaries in its local DO state.
+2. **Response enrichment:** Each response includes ancestor boundaries in a `rangeAncestors` field on `PartitionInfo`. The caller uses these to populate its routing cache.
+
+The key insight: the partition ID is identity (used for DO name resolution). The routing cache is operational metadata (used for skipping levels). These are separate concerns and belong in separate data paths.
+
+### Which ancestors to include
+
+The ancestor set is configurable with two parameters:
+
+- **`fromRoot` (default: 2):** Number of shallowest ancestor depths to include, counting from depth 1. These provide broad coverage for cold-start and far-miss scenarios.
+- **`fromLeaf` (default: 2):** Number of leaf-adjacent ancestor depths to include, counting upward from depth Leaf-1. These provide narrow coverage for the common near-miss pattern (sibling/cousin ranges).
+
+Total ancestors per response: `min(fromRoot + fromLeaf, own_depth)`. For shallow trees where the sets overlap, they collapse naturally (no duplicates).
+
+Examples with `fromRoot=2, fromLeaf=2`:
+
+| Leaf depth | Ancestors included | Notes |
+|------------|-------------------|-------|
+| 1 | (none) | Leaf IS root's child, no ancestors needed |
+| 2 | [depth 1] | fromRoot and fromLeaf overlap completely |
+| 3 | [depth 1, depth 2] | Still fully overlapping |
+| 4 | [depth 1, depth 2, depth 3] | fromRoot=[1,2], fromLeaf=[3], one overlap at depth 2 |
+| 5 | [depth 1, depth 2, depth 3, depth 4] | fromRoot=[1,2], fromLeaf=[3,4], no overlap |
+| 10 | [depth 1, depth 2, depth 8, depth 9] | fromRoot=[1,2], fromLeaf=[8,9], clear separation |
+| 20 | [depth 1, depth 2, depth 18, depth 19] | fromRoot=[1,2], fromLeaf=[18,19] |
+
+### Why this selection works
+
+**Shallow ancestors (fromRoot)** cover broad ranges. They're learned quickly (after `splitN^fromRoot` responses, all are cached — e.g., 16 responses for 4-way splits with fromRoot=2). After warmup, they're redundant in responses but cost little space and provide a safety net for:
+- Cold-start routing (first requests after restart)
+- Far-miss routing (sort key in a completely different sub-tree from any cached leaf)
+
+**Leaf-adjacent ancestors (fromLeaf)** cover the narrow ranges close to where requests actually land. These are the high-value entries in steady state because:
+- When a cached leaf splits, its siblings fall in Leaf-1's range — one hop instead of traversing from depth 1.
+- When a request hits a cousin (nearby but different leaf), Leaf-2 catches it — two hops instead of traversing from depth 1.
+- Deeper trees have more partitions at each level, so leaf-adjacent entries are less likely to already be cached.
+
+**The gap in the middle (depths 3 through Leaf-3)** is filled naturally by traversal. When a cache miss falls to a depth-1 or depth-2 partition, the traversal from there to the leaf passes through intermediate levels. Each intermediate can add itself to the response on the way back (the forwarding chain sees the response). Alternatively, the miss traversal itself teaches the caller about the intermediates it passes through.
+
+### Data flow
+
+**At split time (parent → child initialization):**
+
+```
+parent splits into N children:
+  for each child:
+    child.initFromSplit({
+      ...existingInitPayload,
+      rangeAncestors: selectAncestors(parent.rangeAncestors, parent.boundaries, parent.depth)
+    })
+```
+
+The `selectAncestors` function:
+1. Takes the parent's stored ancestors (which the parent received at its own init).
+2. Adds the parent itself to the list.
+3. Selects the final set: shallowest `fromRoot` entries + deepest `fromLeaf` entries (relative to the child's depth = parent.depth + 1).
+4. If total exceeds `fromRoot + fromLeaf`, deduplicate overlapping entries.
+
+**At response time (leaf → caller via forwarding chain):**
+
+```typescript
+// In PartitionInfo response type:
+interface PartitionInfo {
+  // ... existing fields ...
+  rangeAncestors?: Array<{
+    depth: number;
+    startBoundary: KeyBytes | null;
+    endBoundary: KeyBytes | null;
+  }>;
+}
+```
+
+The leaf populates `rangeAncestors` from its local DO state. No intermediate router needs to modify the response — the ancestors are pre-selected at init time and carried by the leaf.
+
+Optionally, intermediate routers CAN append themselves to `rangeAncestors` as the response flows back (enriching the set beyond the pre-selected entries). This is additive — more entries means faster cache convergence — but not required for correctness.
+
+### Routing cache behavior
+
+The caller maintains a local routing table for each hashKey (or range structure):
+
+```
+routingCache[hashKey] = sorted list of { depth, start, end, doName, doId }
+```
+
+**On response:** extract `rangeAncestors` + leaf boundaries. Insert/update entries in the routing cache.
+
+**On new request for sort key `sk`:**
+1. Find the deepest entry in `routingCache[hashKey]` where `start <= sk < end`.
+2. If found: route directly to that partition's DO (skip everything above it).
+3. If not found: route to range root (implicit [null, null) at depth 0).
+
+**Correctness guarantee:** Any partition whose boundaries contain the sort key is a valid routing target. It either serves (leaf) or forwards (router). The worst case is extra forwarding hops, never misrouting. This holds because:
+- Range partitions only split (never merge). Split parents become permanent routers.
+- Boundaries are immutable once assigned.
+- A stale entry (partition has split since cached) simply forwards — correct, just slower.
+
+### Size estimate
+
+**Partition ID: unchanged.** Same as current SCHEMA_RANGE_V1:
+
+`1 schema + 1 flags + 4 hkLen + 4 startLen + hashKey + start + end`
+
+| Depth | Partition ID size |
+|-------|------------------|
+| Any | 10 + 50 + 100 + 100 = **~260 bytes** (max, both boundaries set) |
+| Root | 10 + 50 = **~60 bytes** (both boundaries null) |
+
+**Response `rangeAncestors` field** (with fromRoot=2, fromLeaf=2):
+
+Each ancestor entry: `1 depth(u8) + 1 flags + [4 + boundary_bytes] × (0, 1, or 2)`
+
+Per entry with both boundaries set (~100 bytes each): `1 + 1 + 4 + 100 + 4 + 100 = 210 bytes`
+Per entry with one null boundary: `1 + 1 + 4 + 100 = 106 bytes`
+Average (mix of edge/middle children): **~160 bytes**
+
+| Leaf depth | Entries | Response overhead |
+|------------|---------|------------------|
+| 1 | 0 | **0 bytes** |
+| 2 | 1 | **~160 bytes** |
+| 3 | 2 | **~320 bytes** |
+| 5 | 4 | **~640 bytes** |
+| 10 | 4 | **~640 bytes** |
+| 20 | 4 | **~640 bytes** |
+| 50 | 4 | **~640 bytes** |
+
+Note: response overhead is bounded at `(fromRoot + fromLeaf) × ~160 = 640 bytes` regardless of depth. This is per-response wire cost, not stored in the partition ID.
+
+**Local DO state for ancestors:**
+
+Same `~640 bytes` stored once per range partition DO. Negligible relative to the data the partition holds.
+
+**With optional prefix-sharing in the response encoding** (delta-encode ancestor boundaries against each other, shallowest first): the shallowest entry stores full boundaries (~210 bytes), subsequent entries share prefixes with their predecessor. At ~90% prefix sharing:
+
+| Leaf depth | Entries | Response overhead (with prefix sharing) |
+|------------|---------|----------------------------------------|
+| 5 | 4 | 210 + 3 × 30 = **~300 bytes** |
+| 10 | 4 | 210 + 3 × 30 = **~300 bytes** |
+| 20 | 4 | 210 + 3 × 30 = **~300 bytes** |
+
+Prefix sharing is optional — it adds decoder complexity but roughly halves the wire cost.
+
+### Pros
+
+- **Partition ID stays small and simple.** No wire format changes. Identity and routing metadata are cleanly separated.
+- **Bounded response overhead.** At most `(fromRoot + fromLeaf) × ~160` bytes regardless of tree depth. With defaults (2+2), ~640 bytes uncompressed, ~300 bytes with prefix sharing.
+- **Configurable trade-off.** Increase `fromRoot` for better cold-start coverage. Increase `fromLeaf` for better steady-state near-miss routing. Tune per workload.
+- **Optimal for warm caches.** Leaf-adjacent ancestors address the actual miss pattern: siblings and cousins of cached leaves. These are the entries the caller is least likely to already have.
+- **Natural cache lifecycle.** Shallow entries are learned fast (few partitions at top levels). Deep entries grow organically from responses. The gap fills through traversal when misses occur.
+- **No partition ID migration.** Existing range partition IDs continue to work as-is. The `rangeAncestors` field is additive.
+- **Intermediate enrichment is additive.** Routers in the forwarding chain CAN append themselves to the response for bonus cache entries — strictly optional, doesn't affect correctness.
+
+### Cons
+
+- **Cannot resolve ancestors from partition ID alone.** Need a response (I/O) to learn ancestors. Tooling/debugging that wants to inspect the tree from an ID alone must fall back to tree traversal.
+- **Init payload grows.** `initFromSplit` must pass the ancestor set to children. With 4 entries at ~160 bytes each, this adds ~640 bytes to the init RPC. Negligible in practice.
+- **Local DO storage.** Each range partition stores ~640 bytes of ancestor data. Trivial relative to data stored.
+- **Cache convergence is gradual.** One response gives ~4 entries. Full tree knowledge requires many responses (or cache misses that traverse and learn). For hot paths this is fast; for cold/rare paths it takes longer.
+- **Shallow ancestors become redundant.** After `splitN^fromRoot` responses (~16 for defaults), the fromRoot entries repeat known information. They cost 2 entries per response but provide zero new information. This is the price of cold-start safety.
+
+### Configuration guidance
+
+| Workload | fromRoot | fromLeaf | Rationale |
+|----------|----------|----------|-----------|
+| Default | 2 | 2 | Balanced — good cold start, good steady state |
+| Hot-key heavy (few deep paths) | 1 | 3 | Shallow levels learned instantly; invest in deep coverage |
+| Uniform distribution (many shallow paths) | 2 | 1 | Many top-level branches; shallow entries high value |
+| Very deep trees (depth 15+) | 2 | 3 | Extra leaf-adjacent entry bridges the wider gap |
+
+---
+
+## Summary comparison
+
+| | Option 1: Full stack | Option 2: Full + prefix | Option 3: Capped N in ID | Option 4: Response propagation |
+|---|---|---|---|---|
+| **Partition ID size** | ~1,656 B (depth 10) | ~445 B (depth 10) | ~382 B (any depth) | **~260 B (unchanged)** |
+| **Response overhead** | 0 (in ID) | 0 (in ID) | 0 (in ID) | ~640 B (or ~300 w/ prefix sharing) |
+| **Ancestry coverage** | Complete | Complete | N=5 (exponential) | fromRoot + fromLeaf (configurable) |
+| **Skip potential** | O(1) any level | O(1) any level | O(log D) worst | O(1) cached, O(D) cold gap |
+| **Decoder complexity** | Simple | Medium | Medium | Simple (just boundary list) |
+| **Partition ID changes** | Yes (new schema) | Yes (new schema) | Yes (new schema) | **None** |
+| **Bounded size** | No | No | Yes | **Yes (both ID and response)** |
+| **Cache convergence** | Instant | Instant | Gradual | Gradual |
+| **Steady-state value** | Redundant | Redundant | Partially redundant | **Optimized (leaf-adjacent)** |
+| **Configurable** | No | No | N only | **Yes (fromRoot, fromLeaf)** |
+
+Option 4 is recommended. It keeps the partition ID simple and unchanged, puts routing metadata in the response where it belongs, and optimizes for the actual steady-state miss pattern (leaf-adjacent entries). The configurable `fromRoot`/`fromLeaf` parameters let the strategy adapt to different workload shapes without wire format changes.
