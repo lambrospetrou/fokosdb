@@ -23,16 +23,18 @@ Once there is a stable version ready, I will properly refactor the directory str
 No particular order.
 
 - Expose an RPC/API to trigger a manual split.
+- Define the data type (JSON serializable object, raw bytes). JSON serializable can provide property filtering and other SQLite JSON functions support.
 - Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
 - Update partial range topology within each partition to maintain also range boundaries to skip forwards in range partitions.
 - Proper structured errors thrown to differentiate user vs server errors.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Enforce the expiration ttl for items.
 - Batch item operations (non-transactions).
-- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow.
-- Allow check conditions and filter conditions on any attribute if the data is not bytes.
+- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
+- Allow check conditions and filter conditions on any attribute if the data is JSON.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
 - Add global eventual indexes (DynamoDB GSIs).
+- Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Think about backups and export in a consistent fashion.
