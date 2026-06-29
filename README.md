@@ -27,9 +27,8 @@ No particular order.
 - Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
 - Update partial range topology within each partition to maintain also range boundaries to skip forwards in range partitions.
 - Proper structured errors thrown to differentiate user vs server errors.
-- Add FokosStd class with helper methods (e.g. paginator for queryItems).
+- Add more FokosStd helper methods (e.g. paginator for queryItems).
 - Enforce the expiration ttl for items.
-- Batch item operations (non-transactions).
 - Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Allow check conditions and filter conditions on any attribute if the data is JSON.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.

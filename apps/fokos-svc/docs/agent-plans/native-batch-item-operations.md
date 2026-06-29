@@ -1,12 +1,13 @@
 # Native Batch Item Operations
 
-Status: **proposal / not implemented**. This document captures the GitHub issue draft and the
-implementation contract for native, non-transactional `BatchGet` / `BatchWrite` style operations in
-FokosDB.
+Status: **implemented on `feat/batch-item-ops`**. This document captures the GitHub issue draft and
+the implementation contract for native, non-transactional `BatchGet` / `BatchWrite` style operations
+in FokosDB.
 
 The scope is intentionally narrower than DynamoDB parity and broader than a client-side helper loop.
-The core operations should be native FokosDB RPCs that preserve the existing partition routing,
-migration, split, lock, promotion, and retry behavior.
+The core operations are native FokosDB RPCs that preserve the existing partition routing, migration,
+split, lock, promotion, and retry behavior. `FokosStd` adds optional client-side chunking and bounded
+retry helpers on top of those native operations.
 
 ## Source hierarchy and quality bar
 
@@ -122,14 +123,21 @@ Use the same public key shape as the existing single-item and transaction APIs:
 
 ```ts
 type BatchGetItemsOptions = {
-  items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
+	items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
 };
 
 type BatchWriteItemsOptions = {
-  operations: Array<
-    | { operation: "put"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; data: string | Uint8Array; ttlSeconds?: number; ttlEpochUTCSeconds?: number }
-    | { operation: "delete"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
-  >;
+	operations: Array<
+		| {
+				operation: "put";
+				hashKey: string | Uint8Array;
+				sortKey?: string | Uint8Array;
+				data: string | Uint8Array;
+				ttlSeconds?: number;
+				ttlEpochUTCSeconds?: number;
+		  }
+		| { operation: "delete"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	>;
 };
 ```
 
