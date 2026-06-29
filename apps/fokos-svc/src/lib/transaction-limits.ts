@@ -54,7 +54,7 @@ function isEmptyKey(k: string | Uint8Array): boolean {
 	return typeof k === "string" ? k.length === 0 : k.byteLength === 0;
 }
 
-function payloadBytes(data: Uint8Array | string | undefined): number {
+export function payloadBytes(data: Uint8Array | string | undefined): number {
 	if (data === undefined) return 0;
 	return typeof data === "string" ? data.length * 2 : data.byteLength;
 }
@@ -75,7 +75,7 @@ function encodedKeyParts(item: ItemKeyLike) {
 	return { hashKey, sortKey };
 }
 
-function encodedPairIdentity(item: ItemKeyLike): string {
+export function encodedPairIdentity(item: ItemKeyLike): string {
 	const { hashKey, sortKey } = encodedKeyParts(item);
 	return `${hashKey.byteLength}:${hashKey.toBase64({ alphabet: "base64url" })}|${sortKey.byteLength}:${sortKey.toBase64({ alphabet: "base64url" })}`;
 }
@@ -91,14 +91,14 @@ function validateNoDuplicateKeys(items: readonly ItemKeyLike[], duplicateMessage
 	}
 }
 
-function keyForError(item: ItemKeyLike): { hashKey: string; sortKey: string } {
+export function keyForError(item: ItemKeyLike): { hashKey: string; sortKey: string } {
 	return {
 		hashKey: KeyCodec.keyForLog(KeyCodec.encode(item.hashKey)),
 		sortKey: item.sortKey ? KeyCodec.keyForLog(KeyCodec.encode(item.sortKey)) : "",
 	};
 }
 
-function estimateEncodedKeyPayloadBytes(item: ItemKeyLike): number {
+export function estimateEncodedKeyPayloadBytes(item: ItemKeyLike): number {
 	const { hashKey, sortKey } = encodedKeyParts(item);
 	return hashKey.byteLength + sortKey.byteLength;
 }
