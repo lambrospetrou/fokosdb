@@ -4,11 +4,21 @@ import {
 	DeleteItemResult,
 	GetItemOptions,
 	GetItemResult,
+	ItemKey,
 	OperationMetrics,
 	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
 } from "./types.js";
+import type {
+	BatchGetItemsRpcRequest,
+	BatchGetItemsRpcResult,
+	BatchGetRpcItem,
+	BatchRetryableFailure,
+	BatchWriteItemsRpcRequest,
+	BatchWriteItemsRpcResult,
+	BatchWriteRpcOperation,
+} from "./batch-types.js";
 import type {
 	CancelRequest,
 	CancelResponse,
@@ -71,6 +81,7 @@ import {
 	type SkInterval,
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
+import { estimateEncodedBatchWriteForwardedOperationBytes, MAX_BATCH_FORWARDED_SUB_BATCH_BYTES } from "./transaction-limits.js";
 
 function isPhantomBounceError(e: unknown): boolean {
 	return e instanceof Error && e.message.includes("phantom-bounce");
@@ -89,6 +100,8 @@ function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResult>;
+	batchGetItems(ctx: PartitionContext, req: BatchGetItemsRpcRequest): Promise<BatchGetItemsRpcResult>;
+	batchWriteItems(ctx: PartitionContext, req: BatchWriteItemsRpcRequest): Promise<BatchWriteItemsRpcResult>;
 	deleteItem(ctx: PartitionContext, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 }
 
@@ -133,6 +146,9 @@ export type QueryItemsRpcResult = {
 type PartitionDOStub = {
 	putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult>;
 	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult>;
+	batchGetItems(ctx: PartitionContextResolved, req: BatchGetItemsRpcRequest): Promise<BatchGetItemsRpcResult>;
+	batchGetItemsDirect(req: BatchGetItemsRpcRequest): Promise<BatchGetItemsRpcResult>;
+	batchWriteItems(ctx: PartitionContextResolved, req: BatchWriteItemsRpcRequest): Promise<BatchWriteItemsRpcResult>;
 	deleteItem(ctx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 	prepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
 	commit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
@@ -411,6 +427,162 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// Called by child partitions during migration to avoid a forwarding loop back into the child.
 	async getItemDirect(opts: GetItemOptions): Promise<GetItemResult> {
 		return await this.readItemLocally(this.pCtx(), opts);
+	}
+
+	async batchGetItems(pCtx: PartitionContextResolved, req: BatchGetItemsRpcRequest): Promise<BatchGetItemsRpcResult> {
+		this.ensurePartitionContext(pCtx);
+
+		if (await this.ensureMigration("batchGetItems", false)) {
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			invariant(parentCtx, "fokos/partition.batchGetItems: no parent partition context stored during migration");
+			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
+			const parentStub = this.env[parentCtx.ns].get(parentId) as PartitionDOStub;
+			const result = await parentStub.batchGetItemsDirect(req);
+			if (isHashPartition(pCtx)) {
+				const myDepth = PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!);
+				return { ...result, meta: { ...result.meta, hashDepth: myDepth } };
+			}
+			return result;
+		}
+
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(req.items);
+
+		const items: BatchGetItemsRpcResult["items"] = [];
+		const unprocessedKeys: BatchGetItemsRpcResult["unprocessedKeys"] = unplaceable.map((item) =>
+			this.batchGetUnprocessedKey(item, { type: "partition_over_limit" }),
+		);
+		const partitionMetas: BatchGetItemsRpcResult["partitionMetas"] = [];
+		let descendantForwards = 0;
+		let forwardedCalls = 0;
+		let localRowsRead = 0;
+
+		if (local.length > 0) {
+			const localResult = this.batchGetItemsLocal(pCtx, { items: local });
+			items.push(...localResult.items);
+			unprocessedKeys.push(...localResult.unprocessedKeys);
+			partitionMetas.push(...localResult.partitionMetas);
+			localRowsRead += localResult.meta.rowsRead;
+		}
+
+		const forwardedEntries = [...forwarded.values()];
+		if (forwardedEntries.length > 0) {
+			const childResults = await Promise.allSettled(
+				forwardedEntries.map(async ({ pCtx: childPCtx, items }) => ({
+					childPCtx,
+					items,
+					result: await this.getChildStub(childPCtx).batchGetItems(childPCtx, { items }),
+				})),
+			);
+			for (let i = 0; i < childResults.length; i++) {
+				const childResult = childResults[i];
+				const childItems = forwardedEntries[i].items;
+				forwardedCalls++;
+				if (childResult.status === "fulfilled") {
+					items.push(...childResult.value.result.items);
+					unprocessedKeys.push(...childResult.value.result.unprocessedKeys);
+					partitionMetas.push(...childResult.value.result.partitionMetas);
+					descendantForwards += childResult.value.result.meta.forwardCount;
+					continue;
+				}
+				for (const item of childItems) {
+					unprocessedKeys.push(
+						this.batchGetUnprocessedKey(item, {
+							type: "transient_error",
+							message: childResult.reason instanceof Error ? childResult.reason.message : String(childResult.reason),
+						}),
+					);
+				}
+			}
+		}
+
+		return {
+			items,
+			unprocessedKeys,
+			meta: this.partitionMeta(pCtx, {
+				rowsRead: localRowsRead,
+				rowsWritten: 0,
+				forwardCount: forwardedCalls + descendantForwards,
+			}),
+			partitionMetas,
+		};
+	}
+
+	// Direct read bypassing split forwarding — used by migrating children to read parent-local rows.
+	async batchGetItemsDirect(req: BatchGetItemsRpcRequest): Promise<BatchGetItemsRpcResult> {
+		return this.batchGetItemsLocal(this.pCtx(), req);
+	}
+
+	async batchWriteItems(pCtx: PartitionContextResolved, req: BatchWriteItemsRpcRequest): Promise<BatchWriteItemsRpcResult> {
+		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration("batchWriteItems");
+
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(req.operations);
+
+		const processedItems: BatchWriteItemsRpcResult["processedItems"] = [];
+		const unprocessedItems: BatchWriteItemsRpcResult["unprocessedItems"] = unplaceable.map((op) =>
+			this.batchWriteUnprocessedItem(op, { type: "partition_over_limit" }),
+		);
+		const partitionMetas: BatchWriteItemsRpcResult["partitionMetas"] = [];
+		let localRowsRead = 0;
+		let localRowsWritten = 0;
+		let descendantForwards = 0;
+		let forwardedCalls = 0;
+
+		if (local.length > 0) {
+			const localResult = await this.batchWriteItemsLocal(pCtx, { operations: local });
+			processedItems.push(...localResult.processedItems);
+			unprocessedItems.push(...localResult.unprocessedItems);
+			partitionMetas.push(...localResult.partitionMetas);
+			localRowsRead += localResult.meta.rowsRead;
+			localRowsWritten += localResult.meta.rowsWritten;
+		}
+
+		const { chunks: forwardedChunks, overLimitItems } = this.batchWriteForwardedChunks(forwarded);
+		unprocessedItems.push(...overLimitItems);
+
+		if (forwardedChunks.length > 0) {
+			const childResults = await Promise.allSettled(
+				forwardedChunks.map(async ({ pCtx: childPCtx, operations }) => ({
+					childPCtx,
+					operations,
+					result: await this.getChildStub(childPCtx).batchWriteItems(childPCtx, { operations }),
+				})),
+			);
+			for (let i = 0; i < childResults.length; i++) {
+				const childResult = childResults[i];
+				const childOperations = forwardedChunks[i].operations;
+				forwardedCalls++;
+				if (childResult.status === "fulfilled") {
+					processedItems.push(...childResult.value.result.processedItems);
+					unprocessedItems.push(...childResult.value.result.unprocessedItems);
+					partitionMetas.push(...childResult.value.result.partitionMetas);
+					descendantForwards += childResult.value.result.meta.forwardCount;
+					continue;
+				}
+				for (const op of childOperations) {
+					unprocessedItems.push(
+						this.batchWriteUnprocessedItem(op, {
+							type: "transient_error",
+							message: childResult.reason instanceof Error ? childResult.reason.message : String(childResult.reason),
+						}),
+					);
+				}
+			}
+		}
+
+		processedItems.sort((a, b) => a.inputIndex - b.inputIndex);
+		unprocessedItems.sort((a, b) => a.inputIndex - b.inputIndex);
+
+		return {
+			processedItems,
+			unprocessedItems,
+			meta: this.partitionMeta(pCtx, {
+				rowsRead: localRowsRead,
+				rowsWritten: localRowsWritten,
+				forwardCount: forwardedCalls + descendantForwards,
+			}),
+			partitionMetas,
+		};
 	}
 
 	async queryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResult> {
@@ -1372,20 +1544,193 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.env[this.pCtx().ns].get(childId);
 	}
 
-	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
-		const res = this.#store.getItem(PartitionDO.keyIn(opts.hashKey), PartitionDO.optKeyIn(opts.sortKey));
-		const { rowsRead, rowsWritten } = res;
-		const result = res.row;
-		const actorMeta = {
-			rowsRead,
-			rowsWritten,
+	private batchGetItemsLocal(pCtx: PartitionContextResolved, req: BatchGetItemsRpcRequest): BatchGetItemsRpcResult {
+		const items: BatchGetItemsRpcResult["items"] = [];
+		let rowsRead = 0;
+		for (const item of req.items) {
+			const res = this.#store.getItem(PartitionDO.keyIn(item.hashKey), PartitionDO.keyIn(item.sortKey));
+			rowsRead += res.rowsRead;
+			const itemKey = this.publicItemKey(item);
+			if (!res.row) {
+				items.push({ inputIndex: item.inputIndex, found: false, item: itemKey });
+				continue;
+			}
+			items.push({
+				inputIndex: item.inputIndex,
+				found: true,
+				item: {
+					...itemKey,
+					data: res.row.data,
+					ttlEpochUTCSeconds: res.row.ttl_epoch_utc_seconds ? Number(res.row.ttl_epoch_utc_seconds) : undefined,
+					version: res.row.v,
+				},
+			});
+		}
+
+		const meta = this.partitionMeta(pCtx, { rowsRead, rowsWritten: 0, forwardCount: 0 });
+		return {
+			items,
+			unprocessedKeys: [],
+			meta,
+			partitionMetas: req.items.length > 0 ? [meta] : [],
+		};
+	}
+
+	private batchGetUnprocessedKey(item: BatchGetRpcItem, reason: BatchRetryableFailure): BatchGetItemsRpcResult["unprocessedKeys"][number] {
+		return { inputIndex: item.inputIndex, item: this.publicItemKey(item), reason };
+	}
+
+	private batchWriteForwardedChunks(forwarded: Map<string, { pCtx: PartitionContextResolved; items: BatchWriteRpcOperation[] }>): {
+		chunks: Array<{ pCtx: PartitionContextResolved; operations: BatchWriteRpcOperation[] }>;
+		overLimitItems: BatchWriteItemsRpcResult["unprocessedItems"];
+	} {
+		const chunks: Array<{ pCtx: PartitionContextResolved; operations: BatchWriteRpcOperation[] }> = [];
+		const overLimitItems: BatchWriteItemsRpcResult["unprocessedItems"] = [];
+
+		for (const { pCtx, items } of forwarded.values()) {
+			let current: BatchWriteRpcOperation[] = [];
+			let currentBytes = 0;
+			const flush = () => {
+				if (current.length === 0) return;
+				chunks.push({ pCtx, operations: current });
+				current = [];
+				currentBytes = 0;
+			};
+
+			for (const op of items) {
+				const opBytes = estimateEncodedBatchWriteForwardedOperationBytes(op);
+				if (opBytes > MAX_BATCH_FORWARDED_SUB_BATCH_BYTES) {
+					flush();
+					overLimitItems.push(this.batchWriteUnprocessedItem(op, { type: "partition_over_limit" }));
+					continue;
+				}
+				if (current.length > 0 && currentBytes + opBytes > MAX_BATCH_FORWARDED_SUB_BATCH_BYTES) {
+					flush();
+				}
+				current.push(op);
+				currentBytes += opBytes;
+			}
+			flush();
+		}
+
+		return { chunks, overLimitItems };
+	}
+
+	private async batchWriteItemsLocal(pCtx: PartitionContextResolved, req: BatchWriteItemsRpcRequest): Promise<BatchWriteItemsRpcResult> {
+		const processedItems: BatchWriteItemsRpcResult["processedItems"] = [];
+		const unprocessedItems: BatchWriteItemsRpcResult["unprocessedItems"] = [];
+		let rowsRead = 0;
+		let rowsWritten = 0;
+
+		for (const op of req.operations) {
+			// A previous item can queue split/promotion work. Re-check before every local apply
+			// so this DO never writes locally after ownership has moved to a child/range router.
+			const ownership = this.groupItemsByRouting([op]);
+			if (ownership.unplaceable.length > 0) {
+				unprocessedItems.push(this.batchWriteUnprocessedItem(op, { type: "partition_over_limit" }));
+				continue;
+			}
+			if (ownership.forwarded.size > 0) {
+				unprocessedItems.push(
+					this.batchWriteUnprocessedItem(op, {
+						type: "transient_error",
+						message: "fokos/partition.batchWriteItems: ownership changed during local batch; retry item",
+					}),
+				);
+				continue;
+			}
+
+			const hashKey = PartitionDO.keyIn(op.hashKey);
+			const sortKey = PartitionDO.keyIn(op.sortKey);
+			const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
+			if (pendingRow) {
+				unprocessedItems.push(
+					this.batchWriteUnprocessedItem(op, {
+						type: "pending_lock",
+						conflictingTransactionId: pendingRow.transaction_id,
+					}),
+				);
+				continue;
+			}
+
+			try {
+				if (op.operation === "put") {
+					const writeRes = this.#store.upsertItem({
+						hk: hashKey,
+						sk: sortKey,
+						data: op.data,
+						ttlEpochUtcSeconds: op.ttlEpochUTCSeconds ?? null,
+						lastTransactionTs: Date.now(),
+					});
+					rowsRead += writeRes.rowsRead;
+					rowsWritten += writeRes.rowsWritten;
+					this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
+					await this.checkSplits(pCtx, hashKey, sortKey);
+				} else {
+					const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
+					rowsRead += writeRes.rowsRead;
+					rowsWritten += writeRes.rowsWritten;
+				}
+
+				processedItems.push({
+					inputIndex: op.inputIndex,
+					operation: op.operation,
+					item: this.publicItemKey(op),
+				});
+			} catch (err) {
+				unprocessedItems.push(
+					this.batchWriteUnprocessedItem(op, {
+						type: "transient_error",
+						message: err instanceof Error ? err.message : String(err),
+					}),
+				);
+			}
+		}
+
+		const meta = this.partitionMeta(pCtx, { rowsRead, rowsWritten, forwardCount: 0 });
+		return {
+			processedItems,
+			unprocessedItems,
+			meta,
+			partitionMetas: req.operations.length > 0 ? [meta] : [],
+		};
+	}
+
+	private batchWriteUnprocessedItem(
+		op: BatchWriteRpcOperation,
+		reason: BatchRetryableFailure,
+	): BatchWriteItemsRpcResult["unprocessedItems"][number] {
+		return { inputIndex: op.inputIndex, operation: op.operation, item: this.publicItemKey(op), reason };
+	}
+
+	private publicItemKey(item: { hashKey: KeyBytes; sortKey: KeyBytes }): ItemKey {
+		return {
+			hashKey: KeyCodec.decode(item.hashKey),
+			sortKey: item.sortKey.byteLength === 0 ? undefined : KeyCodec.decode(item.sortKey),
+		};
+	}
+
+	private partitionMeta(
+		pCtx: PartitionContextResolved,
+		opts: { rowsRead: number; rowsWritten: number; forwardCount: number },
+	): OperationMetrics & PartitionInfo {
+		return {
+			rowsRead: opts.rowsRead,
+			rowsWritten: opts.rowsWritten,
 			databaseSize: this.#store.databaseSize,
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
-			forwardCount: 0,
+			forwardCount: opts.forwardCount,
 			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
 		};
+	}
+
+	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
+		const res = this.#store.getItem(PartitionDO.keyIn(opts.hashKey), PartitionDO.optKeyIn(opts.sortKey));
+		const { rowsRead, rowsWritten } = res;
+		const result = res.row;
+		const actorMeta = this.partitionMeta(pCtx, { rowsRead, rowsWritten, forwardCount: 0 });
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {
 			return { found: false, item: itemKey, meta: actorMeta };

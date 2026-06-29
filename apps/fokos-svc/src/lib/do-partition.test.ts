@@ -10,6 +10,7 @@ import { HashPartitionTopologyImpl, RANGE_PROMOTION_FRACTION } from "./partition
 import type { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import { KeyBytes, KeyCodec } from "./partition-topology/key-codec.js";
 import invariant from "./invariant.js";
+import { MAX_BATCH_FORWARDED_SUB_BATCH_BYTES } from "./transaction-limits.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -984,6 +985,122 @@ describe("PartitionDO - splitting", () => {
 			expect(result.meta.forwardCount).toBe(1);
 			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
 		});
+
+		it("batchWriteItems forwards through a completed hash split and reports the child leaf meta", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+
+			const result = await stub.batchWriteItems(ctx, {
+				operations: [{ inputIndex: 0, operation: "put", hashKey: kb("batch-forwarded-key"), sortKey: kb("sk"), data: "via-child" }],
+			});
+
+			expect(result.unprocessedItems).toEqual([]);
+			expect(result.processedItems).toEqual([{ inputIndex: 0, operation: "put", item: { hashKey: "batch-forwarded-key", sortKey: "sk" } }]);
+			expect(result.meta.forwardCount).toBe(1);
+			expect(result.meta.rowsWritten).toBe(0);
+			expect(result.partitionMetas).toHaveLength(1);
+			expect(result.partitionMetas[0].servedByActorName).not.toBe(ctx.doName);
+			expect(result.partitionMetas[0].rowsWritten).toBeGreaterThan(0);
+
+			const read = await stub.getItem(ctx, { hashKey: "batch-forwarded-key", sortKey: "sk" });
+			expect(read).toMatchObject({ found: true, item: { data: "via-child" }, meta: { forwardCount: 1 } });
+		});
+
+		it("batchWriteItems forwards a single-key item through a completed hash split", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+
+			const result = await stub.batchWriteItems(ctx, {
+				operations: [
+					{
+						inputIndex: 0,
+						operation: "put",
+						hashKey: kb("batch-forwarded-single-key"),
+						sortKey: KeyCodec.encodeOptional(undefined),
+						data: "via-child",
+					},
+				],
+			});
+
+			expect(result.unprocessedItems).toEqual([]);
+			expect(result.processedItems).toEqual([
+				{ inputIndex: 0, operation: "put", item: { hashKey: "batch-forwarded-single-key", sortKey: undefined } },
+			]);
+			expect(result.meta.forwardCount).toBe(1);
+			expect(result.partitionMetas).toHaveLength(1);
+			expect(result.partitionMetas[0].servedByActorName).not.toBe(ctx.doName);
+
+			const read = await stub.getItem(ctx, { hashKey: "batch-forwarded-single-key" });
+			expect(read).toMatchObject({ found: true, item: { data: "via-child" }, meta: { forwardCount: 1 } });
+		});
+
+		it("batchWriteItems keeps local ownership while a split is only queued", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+
+			await runInDurableObject(stub, async (instance: PartitionDO) => {
+				const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * 1024 * 1024 * 0.65);
+				const tData = "x".repeat(chunkBytes);
+				for (let i = 0; ; i++) {
+					await instance.putItem(ctx, { hashKey: `queued-split-${i}`, sortKey: "sk", data: tData });
+					if ((await instance.status()).splitStatus?.status === "split_queued") break;
+				}
+
+				const result = await instance.batchWriteItems(ctx, {
+					operations: [
+						{ inputIndex: 0, operation: "put", hashKey: kb("queued-local-a"), sortKey: kb("sk"), data: "a" },
+						{ inputIndex: 1, operation: "put", hashKey: kb("queued-local-b"), sortKey: kb("sk"), data: "b" },
+					],
+				});
+
+				expect((await instance.status()).splitStatus?.status).toBe("split_queued");
+				expect(result.unprocessedItems).toEqual([]);
+				expect(result.processedItems.map((item) => item.inputIndex)).toEqual([0, 1]);
+				expect(result.meta.forwardCount).toBe(0);
+				expect(result.partitionMetas).toHaveLength(1);
+				expect(result.partitionMetas[0].servedByActorName).toBe(ctx.doName);
+			});
+
+			await expect(stub.getItem(ctx, { hashKey: "queued-local-a", sortKey: "sk" })).resolves.toMatchObject({
+				found: true,
+				item: { data: "a" },
+			});
+		});
+
+		it("batchWriteItems rejects an oversized forwarded operation without calling the child", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+
+			const result = await stub.batchWriteItems(ctx, {
+				operations: [
+					{
+						inputIndex: 0,
+						operation: "put",
+						hashKey: kb("too-large-forward"),
+						sortKey: kb("sk"),
+						data: "x".repeat(MAX_BATCH_FORWARDED_SUB_BATCH_BYTES + 1),
+					},
+				],
+			});
+
+			expect(result.processedItems).toEqual([]);
+			expect(result.unprocessedItems).toEqual([
+				{
+					inputIndex: 0,
+					operation: "put",
+					item: { hashKey: "too-large-forward", sortKey: "sk" },
+					reason: { type: "partition_over_limit" },
+				},
+			]);
+			expect(result.meta.forwardCount).toBe(0);
+			expect(result.partitionMetas).toEqual([]);
+			await expect(stub.getItem(ctx, { hashKey: "too-large-forward", sortKey: "sk" })).resolves.toMatchObject({ found: false });
+		});
 	});
 
 	describe("multi-level splits", async () => {
@@ -1273,6 +1390,64 @@ describe("PartitionDO - splitting", () => {
 			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
 		});
 
+		it("batchWriteItems maps a migrating child failure to unprocessed and keeps another child success", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+
+			await triggerHashSplitThreshold(stub, ctx, 1);
+
+			let releaseMigration!: () => void;
+			const migrationGate = new Promise<void>((resolve) => {
+				releaseMigration = resolve;
+			});
+			const plannedChildren = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
+			const blockedChildName = plannedChildren[0].doName;
+			await runInDurableObject(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(blockedChildName)), async (instance: PartitionDO) => {
+				instance.__testing__beforeMigrationComplete = () => migrationGate;
+			});
+
+			await waitForAlarm(stub);
+
+			const parentState = await stub.status();
+			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const blockedCtx = childContexts.find((childCtx) => childCtx.doName === blockedChildName)!;
+			const readyCtx = childContexts.find((childCtx) => childCtx.doName !== blockedChildName)!;
+			const readyStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(readyCtx.doName));
+			await waitForAlarm(readyStub);
+			expect((await readyStub.status()).migrationStatus).toBe("migration_completed");
+			expect((await env.PARTITION_DO.get(env.PARTITION_DO.idFromName(blockedCtx.doName)).status()).migrationStatus).toBe(
+				"migration_migrating",
+			);
+
+			const blockedKey = await keyForHashChild(stub, ctx, blockedCtx, "batch-blocked-child");
+			const readyKey = await keyForHashChild(stub, ctx, readyCtx, "batch-ready-child");
+			const result = await stub.batchWriteItems(ctx, {
+				operations: [
+					{ inputIndex: 0, operation: "put", hashKey: kb(blockedKey), sortKey: kb("sk"), data: "blocked" },
+					{ inputIndex: 1, operation: "put", hashKey: kb(readyKey), sortKey: kb("sk"), data: "ready" },
+				],
+			});
+
+			expect(result.processedItems).toEqual([{ inputIndex: 1, operation: "put", item: { hashKey: readyKey, sortKey: "sk" } }]);
+			expect(result.unprocessedItems).toEqual([
+				{
+					inputIndex: 0,
+					operation: "put",
+					item: { hashKey: blockedKey, sortKey: "sk" },
+					reason: { type: "transient_error", message: expect.stringContaining("split in progress") },
+				},
+			]);
+			expect(result.meta.forwardCount).toBe(2);
+			expect(result.partitionMetas).toHaveLength(1);
+			expect(result.partitionMetas[0].servedByActorName).toBe(readyCtx.doName);
+			await expect(stub.getItem(ctx, { hashKey: readyKey, sortKey: "sk" })).resolves.toMatchObject({
+				found: true,
+				item: { data: "ready" },
+			});
+
+			releaseMigration();
+			await drainSplitTree(stub);
+		});
+
 		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
@@ -1531,6 +1706,41 @@ describe("PartitionDO - partitionId encoding", () => {
 	});
 });
 
+async function keyForHashChild(
+	parentStub: DurableObjectStub<PartitionDO>,
+	parentCtx: PartitionContextResolved,
+	childCtx: PartitionContextResolved,
+	prefix: string,
+): Promise<string> {
+	let match: string | undefined;
+	await runInDurableObject(parentStub, async (_instance: PartitionDO, doCtx: DurableObjectState) => {
+		const topology = new HashPartitionTopologyImpl(parentCtx, doCtx);
+		const isCorrectChild = topology.makeIsCorrectChildHashPartition(parentCtx, childCtx);
+		for (let i = 0; i < 10_000; i++) {
+			const candidate = `${prefix}-${i}`;
+			if (isCorrectChild(kb(candidate))) {
+				match = candidate;
+				return;
+			}
+		}
+	});
+	invariant(match, `could not find key for child ${childCtx.doName}`);
+	return match;
+}
+
+function rangeOwnerForSortKey(children: PartitionContextResolved[], sortKey: string): PartitionContextResolved {
+	const sk = kb(sortKey);
+	const owner = children.find((childCtx) => {
+		const rp = childCtx.rangePartition;
+		invariant(rp, "range child missing rangePartition");
+		const start = rp.startBoundary ?? KeyCodec.encodeOptional(undefined);
+		const end = rp.endBoundary;
+		return KeyCodec.compare(sk, start) >= 0 && (end === null || KeyCodec.compare(sk, end) < 0);
+	});
+	invariant(owner, `could not find range owner for sort key ${sortKey}`);
+	return owner;
+}
+
 async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	// runDurableObjectAlarm drains any pending alarm. The auto-fired alarm (from Miniflare
 	// detecting an immediate schedule) may still be in progress when putItem returns.
@@ -1698,9 +1908,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 
 describe("PartitionDO — promotion cutover deferral and routing", () => {
 	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
-		const { ctx, stub } = makeStub({
-			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
-		});
+		const { ctx, stub } = makeStub();
 		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
@@ -1708,13 +1916,24 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
 		const lockResult = await stub.prepare(ctx, {
 			transactionId: txId,
-			transactionTimestamp: Date.now(),
+			transactionTimestamp: Date.now() + 1_000,
 			coordinatorDoId: coordId,
 			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending" }],
 		});
 		expect(lockResult.outcome).toBe("accepted");
 
-		// Detection queued alice but cutover was deferred — key must still be 'queued'.
+		await runInDurableObject(stub, async (_instance: PartitionDO, doCtx: DurableObjectState) => {
+			const now = Date.now();
+			doCtx.storage.sql.exec(
+				`INSERT INTO promoted_keys (hash_key, status, gc_done, created_at, updated_at) VALUES (?, 'queued', 0, ?, ?)`,
+				kb("alice"),
+				now,
+				now,
+			);
+			await doCtx.storage.setAlarm(Date.now());
+		});
+
+		// The queued key was driven, but cutover was deferred because the pending lock exists.
 		await vi.waitFor(
 			async () => {
 				await waitForAlarm(stub);
@@ -1780,6 +1999,48 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		// Item is in the range root.
 		const g = await rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" });
 		expect(g).toMatchObject({ found: true, item: { data: "in-range" } });
+	});
+
+	it("batchWriteItems mixes promoted-key forwarding with local siblings in input order", async () => {
+		const { ctx, stub } = makeStub({
+			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
+		});
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
+		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
+		await vi.waitFor(
+			async () => {
+				await waitForAlarm(stub);
+				await waitForAlarm(rangeRootStub);
+				if ((await stub.status()).promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb("alice")) === 0)?.status !== "promoted")
+					throw new Error("not yet promoted");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
+
+		const result = await stub.batchWriteItems(ctx, {
+			operations: [
+				{ inputIndex: 0, operation: "put", hashKey: kb("alice"), sortKey: kb("sk2"), data: "range-data" },
+				{ inputIndex: 1, operation: "put", hashKey: kb("bob"), sortKey: kb("sk1"), data: "local-data" },
+			],
+		});
+
+		expect(result.unprocessedItems).toEqual([]);
+		expect(result.processedItems).toEqual([
+			{ inputIndex: 0, operation: "put", item: { hashKey: "alice", sortKey: "sk2" } },
+			{ inputIndex: 1, operation: "put", item: { hashKey: "bob", sortKey: "sk1" } },
+		]);
+		expect(result.meta.forwardCount).toBe(1);
+		expect(result.partitionMetas.map((meta) => meta.servedByActorName).sort()).toEqual([ctx.doName, rangeRootCtx.doName].sort());
+
+		await expect(rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" })).resolves.toMatchObject({
+			found: true,
+			item: { data: "range-data" },
+		});
+		await expect(stub.getItem(ctx, { hashKey: "bob", sortKey: "sk1" })).resolves.toMatchObject({
+			found: true,
+			item: { data: "local-data" },
+		});
 	});
 });
 
@@ -2071,6 +2332,38 @@ describe("PartitionDO — range split", () => {
 			expect(g.found).toBe(true);
 			expect(g.meta.servedByActorName, `sk ${sk} should be served by its owning child`).toBe(owners[0].doName);
 		}
+	});
+
+	it("batchWriteItems on a split range root forwards to the range child by sort key", async () => {
+		const N = 4;
+		const { rootCtx, rootStub } = await makeQueuedRangeRoot(N);
+		await vi.waitFor(
+			async () => {
+				await drainSplitTree(rootStub);
+				const s = await rootStub.status();
+				if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+			},
+			{ timeout: 5000, interval: 100 },
+		);
+		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+		const sortKey = "sk999-batch-write";
+		const owner = rangeOwnerForSortKey(status.childPartitionContexts, sortKey);
+
+		const result = await rootStub.batchWriteItems(rootCtx, {
+			operations: [{ inputIndex: 0, operation: "put", hashKey: kb("alice"), sortKey: kb(sortKey), data: "range-child-write" }],
+		});
+
+		expect(result.unprocessedItems).toEqual([]);
+		expect(result.processedItems).toEqual([{ inputIndex: 0, operation: "put", item: { hashKey: "alice", sortKey } }]);
+		expect(result.meta.forwardCount).toBe(1);
+		expect(result.meta.rowsWritten).toBe(0);
+		expect(result.partitionMetas).toHaveLength(1);
+		expect(result.partitionMetas[0].servedByActorName).toBe(owner.doName);
+		await expect(rootStub.getItem(rootCtx, { hashKey: "alice", sortKey })).resolves.toMatchObject({
+			found: true,
+			item: { data: "range-child-write" },
+			meta: { servedByActorName: owner.doName },
+		});
 	});
 
 	it("creates a brand-new leftmost child distinct from the router (no retain-leftmost)", async () => {
