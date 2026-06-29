@@ -1,7 +1,6 @@
 import type {
 	BatchGetProcessedItem,
 	BatchGetUnprocessedKey,
-	BatchRetryableFailureReason,
 	BatchWriteProcessedItem,
 	BatchWriteUnprocessedItem,
 	OperationMetrics,
@@ -53,5 +52,3 @@ export type BatchWriteItemsRpcResult = {
 	meta: OperationMetrics & PartitionInfo;
 	partitionMetas: Array<OperationMetrics & PartitionInfo>;
 };
-
-export type BatchRetryableFailure = BatchRetryableFailureReason;

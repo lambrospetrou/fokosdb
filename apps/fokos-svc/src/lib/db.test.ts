@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { FokosDB } from "./db.js";
+import { FokosDB, type FokosDBOptions } from "./db.js";
+import type { BatchGetItemsRpcResult } from "./batch-types.js";
 import { MAX_BATCH_FORWARDED_SUB_BATCH_BYTES, MAX_BATCH_GET_ITEMS, MAX_BATCH_WRITE_ITEMS } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
@@ -46,6 +47,32 @@ describe("FokosDB batch item operations", () => {
 		expect(result.meta.rowsRead).toBe(2);
 		expect(result.partitionMetas).toHaveLength(1);
 		expect(result.partitionMetas[0]).toMatchObject({ rowsRead: 2, rowsWritten: 0, forwardCount: 0 });
+	});
+
+	it("batchGetItems fails loudly when an RPC returns an unknown processed inputIndex", async () => {
+		const db = makeDBReturningBatchGet({
+			items: [{ inputIndex: 1, found: false, item: { hashKey: "corrupt" } }],
+			unprocessedKeys: [],
+			meta: batchRpcMeta(),
+			partitionMetas: [],
+		});
+
+		await expect(db.batchGetItems({ items: [{ hashKey: "only" }] })).rejects.toThrow(
+			/fokos\/batchGetItems: missing original item for inputIndex 1/,
+		);
+	});
+
+	it("batchGetItems fails loudly when an RPC returns an unknown unprocessed inputIndex", async () => {
+		const db = makeDBReturningBatchGet({
+			items: [],
+			unprocessedKeys: [{ inputIndex: 1, item: { hashKey: "corrupt" }, reason: { type: "transient_error" } }],
+			meta: batchRpcMeta(),
+			partitionMetas: [],
+		});
+
+		await expect(db.batchGetItems({ items: [{ hashKey: "only" }] })).rejects.toThrow(
+			/fokos\/batchGetItems: missing original item for inputIndex 1/,
+		);
 	});
 
 	it("rejects invalid batchWriteItems input before the native routing boundary", async () => {
@@ -513,6 +540,56 @@ function makeDBHarness(rootTreesN = 1) {
 
 function makeDB(rootTreesN = 1) {
 	return makeDBHarness(rootTreesN).db;
+}
+
+function makeDBReturningBatchGet(result: BatchGetItemsRpcResult) {
+	const tableName = `test.${crypto.randomUUID()}`;
+	const base = PartitionContextCreator.create({
+		ns: "PARTITION_DO",
+		tableName,
+		rootTreesN: 1,
+		hashSplitN: 2,
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 500 },
+		rangeSplitConditions: { maxSizeMb: 500 },
+	});
+	const doName = `${tableName}.fake`;
+	const doId = env.PARTITION_DO.idFromName(doName);
+	const partitionContext = {
+		...base,
+		doName,
+		primaryDoIdStr: doId.toString(),
+		partitionId: "00",
+	};
+	const topology: FokosDBOptions["topology"] = {
+		partitionContext: () => base,
+		pickPartition: () => ({ doId, partitionContext }),
+		rootPartitionContexts: () => [partitionContext],
+		traverseForDestroy: async () => {},
+	};
+	const ns = {
+		get: () => ({
+			batchGetItems: async () => result,
+		}),
+	} as unknown as FokosDBOptions["ns"];
+	return new FokosDB({
+		ns,
+		topology,
+		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
+	});
+}
+
+function batchRpcMeta(): BatchGetItemsRpcResult["meta"] {
+	return {
+		rowsRead: 0,
+		rowsWritten: 0,
+		databaseSize: 0,
+		servedByActorId: "actor-id",
+		servedByActorName: "actor-name",
+		servedByPartitionId: "partition-id",
+		forwardCount: 0,
+		hashDepth: 0,
+	};
 }
 
 function sksOf(res: { items: Array<{ sortKey?: string | Uint8Array }> }) {

@@ -127,6 +127,10 @@ export class FokosStd {
 		};
 	}
 
+	/**
+	 * Retries only writes returned as unprocessed. This is safe for partial failure recovery,
+	 * but not version-idempotent: a retried put/delete can bump item versions.
+	 */
 	async batchWriteAll(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {
 		validateBatchWriteAllInput(opts.operations);
 		let pending: BatchWritePending[] = opts.operations.map((operation, inputIndex) => ({ inputIndex, operation }));
@@ -146,8 +150,6 @@ export class FokosStd {
 						const entry = chunk[item.inputIndex];
 						processedItems.push(remapBatchWriteProcessedItem(item, entry));
 					}
-					// Retry only entries the core reported unprocessed. Retrying writes is safe
-					// but not version-idempotent: a re-applied put/delete can bump versions again.
 					for (const item of result.unprocessedItems) {
 						const entry = chunk[item.inputIndex];
 						nextPending.push({ inputIndex: entry.inputIndex, operation: entry.operation, reason: item.reason });

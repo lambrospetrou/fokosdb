@@ -226,7 +226,9 @@ export class FokosDB {
 
 	private echoBatchGetOriginalKey(item: BatchGetProcessedItem, originalItems: Map<number, ItemKey>): BatchGetProcessedItem {
 		const originalItem = originalItems.get(item.inputIndex);
-		if (!originalItem) return item;
+		if (!originalItem) {
+			throw new Error(`fokos/batchGetItems: missing original item for inputIndex ${item.inputIndex}`);
+		}
 		if (!item.found) {
 			return { ...item, item: originalItem };
 		}
@@ -234,7 +236,11 @@ export class FokosDB {
 	}
 
 	private echoBatchGetOriginalUnprocessedKey(item: BatchGetUnprocessedKey, originalItems: Map<number, ItemKey>): BatchGetUnprocessedKey {
-		return { ...item, item: originalItems.get(item.inputIndex) ?? item.item };
+		const originalItem = originalItems.get(item.inputIndex);
+		if (!originalItem) {
+			throw new Error(`fokos/batchGetItems: missing original item for inputIndex ${item.inputIndex}`);
+		}
+		return { ...item, item: originalItem };
 	}
 
 	async batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {

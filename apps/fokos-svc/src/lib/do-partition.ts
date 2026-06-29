@@ -9,12 +9,12 @@ import {
 	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
+	BatchRetryableFailureReason,
 } from "./types.js";
 import type {
 	BatchGetItemsRpcRequest,
 	BatchGetItemsRpcResult,
 	BatchGetRpcItem,
-	BatchRetryableFailure,
 	BatchWriteItemsRpcRequest,
 	BatchWriteItemsRpcResult,
 	BatchWriteRpcOperation,
@@ -1576,7 +1576,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
-	private batchGetUnprocessedKey(item: BatchGetRpcItem, reason: BatchRetryableFailure): BatchGetItemsRpcResult["unprocessedKeys"][number] {
+	private batchGetUnprocessedKey(
+		item: BatchGetRpcItem,
+		reason: BatchRetryableFailureReason,
+	): BatchGetItemsRpcResult["unprocessedKeys"][number] {
 		return { inputIndex: item.inputIndex, item: this.publicItemKey(item), reason };
 	}
 
@@ -1698,7 +1701,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private batchWriteUnprocessedItem(
 		op: BatchWriteRpcOperation,
-		reason: BatchRetryableFailure,
+		reason: BatchRetryableFailureReason,
 	): BatchWriteItemsRpcResult["unprocessedItems"][number] {
 		return { inputIndex: op.inputIndex, operation: op.operation, item: this.publicItemKey(op), reason };
 	}

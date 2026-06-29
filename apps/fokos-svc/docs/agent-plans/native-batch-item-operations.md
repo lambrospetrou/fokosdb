@@ -231,7 +231,6 @@ diagnostics.
 Use a discriminated union for per-item retryable failures. At minimum:
 
 - `pending_lock`;
-- `migration_in_progress`;
 - `partition_over_limit`;
 - `transient_error`.
 

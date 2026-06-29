@@ -108,7 +108,6 @@ export type BatchWriteItemsOptions = {
 
 export type BatchRetryableFailureReason =
 	| { type: "pending_lock"; conflictingTransactionId?: string }
-	| { type: "migration_in_progress" }
 	| { type: "partition_over_limit" }
 	| { type: "transient_error"; message?: string };
 
