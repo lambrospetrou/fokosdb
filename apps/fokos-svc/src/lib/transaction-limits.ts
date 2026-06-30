@@ -107,6 +107,9 @@ function batchWriteDataBytes(data: Uint8Array | string): number {
 	return typeof data === "string" ? batchWriteTextEncoder.encode(data).byteLength : data.byteLength;
 }
 
+// Public validation receives raw keys, while DO forwarded chunking receives already-encoded KeyBytes.
+// Keep the raw path defined through the encoded estimator so both call sites measure identical bytes;
+// never re-encode KeyBytes, or binary keys double-tag and the [] absent-sort-key sentinel is rejected.
 export function estimateBatchWriteForwardedOperationBytes(op: BatchWriteOperationLike): number {
 	const { hashKey, sortKey } = encodedKeyParts(op);
 	return estimateEncodedBatchWriteForwardedOperationBytes({ ...op, hashKey, sortKey });
