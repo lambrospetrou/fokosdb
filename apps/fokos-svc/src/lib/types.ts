@@ -1,4 +1,4 @@
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, BatchItemGetter, BatchItemWriter {}
 
 export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
@@ -74,6 +74,103 @@ export type GetItemResult =
 			item: ItemKey;
 			meta: OperationMetrics & PartitionInfo & {};
 	  };
+
+export interface BatchItemGetter {
+	batchGetItems(opts: BatchGetItemsOptions): Promise<BatchGetItemsResult>;
+}
+
+export interface BatchItemWriter {
+	batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult>;
+}
+
+export type BatchGetItemsOptions = {
+	items: ItemKey[];
+};
+
+export type BatchWriteItemOperation =
+	| {
+			operation: "put";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			ttlSeconds?: number;
+			ttlEpochUTCSeconds?: number;
+			data: Uint8Array | string;
+	  }
+	| {
+			operation: "delete";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+	  };
+
+export type BatchWriteItemsOptions = {
+	operations: BatchWriteItemOperation[];
+};
+
+export type BatchRetryableFailureReason =
+	| { type: "pending_lock"; conflictingTransactionId?: string }
+	| { type: "partition_over_limit" }
+	| { type: "transient_error"; message?: string };
+
+export type BatchItemsMeta = {
+	requestedCount: number;
+	processedCount: number;
+	unprocessedCount: number;
+	rowsRead: number;
+	rowsWritten: number;
+	forwardCount: number;
+	partitionsVisited: number;
+};
+
+export type BatchGetProcessedItem =
+	| {
+			inputIndex: number;
+			found: true;
+			item: {
+				hashKey: string | Uint8Array;
+				sortKey?: string | Uint8Array;
+				data: Uint8Array | string;
+				ttlEpochUTCSeconds?: number;
+				version: number;
+			};
+	  }
+	| {
+			inputIndex: number;
+			found: false;
+			item: ItemKey;
+	  };
+
+export type BatchGetUnprocessedKey = {
+	inputIndex: number;
+	item: ItemKey;
+	reason: BatchRetryableFailureReason;
+};
+
+export type BatchGetItemsResult = {
+	items: BatchGetProcessedItem[];
+	unprocessedKeys: BatchGetUnprocessedKey[];
+	meta: BatchItemsMeta;
+	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+};
+
+export type BatchWriteProcessedItem = {
+	inputIndex: number;
+	operation: BatchWriteItemOperation["operation"];
+	item: ItemKey;
+};
+
+export type BatchWriteUnprocessedItem = {
+	inputIndex: number;
+	operation: BatchWriteItemOperation["operation"];
+	item: ItemKey;
+	reason: BatchRetryableFailureReason;
+};
+
+export type BatchWriteItemsResult = {
+	processedItems: BatchWriteProcessedItem[];
+	unprocessedItems: BatchWriteUnprocessedItem[];
+	meta: BatchItemsMeta;
+	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+};
 
 export type PartitionInfo = {
 	/**

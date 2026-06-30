@@ -1,4 +1,13 @@
 import {
+	BatchGetItemsOptions,
+	BatchGetItemsResult,
+	BatchGetProcessedItem,
+	BatchGetUnprocessedKey,
+	BatchWriteItemOperation,
+	BatchWriteItemsOptions,
+	BatchWriteItemsResult,
+	BatchWriteProcessedItem,
+	BatchWriteUnprocessedItem,
 	DeleteItemOptions,
 	GetItemOptions,
 	GetItemResult,
@@ -8,12 +17,19 @@ import {
 	QueryItemsMeta,
 	QueryItemsOptions,
 	QueryItemsResult,
+	ItemKey,
 } from "./types.js";
 import { PartitionDO, type QueryItemsRpcRequest } from "./do-partition.js";
+import type { BatchGetRpcItem, BatchWriteRpcOperation } from "./batch-types.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
-import { validateItemKeys, validateTransactWriteOperations } from "./transaction-limits.js";
+import {
+	validateBatchGetItems,
+	validateBatchWriteOperations,
+	validateItemKeys,
+	validateTransactWriteOperations,
+} from "./transaction-limits.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import type { ItemCondition } from "./types.js";
 import { StaticShardedDO } from "durable-utils/do-sharding";
@@ -58,6 +74,14 @@ export type FokosDBOptions = {
 	// This is safe to increase if needed except for retrying the same transaction with the same idempotency token.
 	// Data partitions record the actual DO name they should reach out for recovering the transaction.
 	numTransactionCoordinators?: number;
+};
+
+type EncodedBatchGetWorkItem = BatchGetRpcItem & {
+	originalItem: ItemKey;
+};
+
+type EncodedBatchWriteWorkItem = BatchWriteRpcOperation & {
+	originalOperation: BatchWriteItemOperation;
 };
 
 export class FokosDB {
@@ -116,6 +140,237 @@ export class FokosDB {
 		const res = await stub.deleteItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
+	}
+
+	async batchGetItems(opts: BatchGetItemsOptions): Promise<BatchGetItemsResult> {
+		validateBatchGetItems(opts.items);
+		const originalItems = new Map<number, ItemKey>();
+		const groups = new Map<
+			string,
+			{
+				doId: DurableObjectId;
+				partitionContext: ReturnType<PartitionTopologyRouter["pickPartition"]>["partitionContext"];
+				items: EncodedBatchGetWorkItem[];
+			}
+		>();
+
+		for (let inputIndex = 0; inputIndex < opts.items.length; inputIndex++) {
+			const item = opts.items[inputIndex];
+			const hashKey = encodeHashKey(item.hashKey);
+			const sortKey = encodeSortKey(item.sortKey);
+			const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			const originalItem = { hashKey: item.hashKey, sortKey: item.sortKey };
+			originalItems.set(inputIndex, originalItem);
+			let group = groups.get(partitionContext.doName);
+			if (!group) {
+				group = { doId, partitionContext, items: [] };
+				groups.set(partitionContext.doName, group);
+			}
+			group.items.push({ inputIndex, hashKey, sortKey, originalItem });
+		}
+
+		const items: BatchGetProcessedItem[] = [];
+		const unprocessedKeys: BatchGetUnprocessedKey[] = [];
+		const partitionMetas: BatchGetItemsResult["partitionMetas"] = [];
+		let forwardCount = 0;
+		const groupList = [...groups.values()];
+
+		const groupResults = await Promise.allSettled(
+			groupList.map(async (group) => ({
+				group,
+				result: await this.#options.ns.get(group.doId).batchGetItems(group.partitionContext, { items: group.items }),
+			})),
+		);
+
+		for (let i = 0; i < groupResults.length; i++) {
+			const groupResult = groupResults[i];
+			const group = groupList[i];
+			if (groupResult.status === "fulfilled") {
+				const result = groupResult.value.result;
+				items.push(...result.items.map((item) => this.echoBatchGetOriginalKey(item, originalItems)));
+				unprocessedKeys.push(...result.unprocessedKeys.map((item) => this.echoBatchGetOriginalUnprocessedKey(item, originalItems)));
+				partitionMetas.push(...result.partitionMetas);
+				forwardCount += result.meta.forwardCount;
+				continue;
+			}
+			for (const item of group.items) {
+				unprocessedKeys.push({
+					inputIndex: item.inputIndex,
+					item: item.originalItem,
+					reason: {
+						type: "transient_error",
+						message: groupResult.reason instanceof Error ? groupResult.reason.message : String(groupResult.reason),
+					},
+				});
+			}
+		}
+
+		items.sort((a, b) => a.inputIndex - b.inputIndex);
+		unprocessedKeys.sort((a, b) => a.inputIndex - b.inputIndex);
+
+		return {
+			items,
+			unprocessedKeys,
+			meta: {
+				requestedCount: opts.items.length,
+				processedCount: items.length,
+				unprocessedCount: unprocessedKeys.length,
+				rowsRead: partitionMetas.reduce((sum, meta) => sum + meta.rowsRead, 0),
+				rowsWritten: partitionMetas.reduce((sum, meta) => sum + meta.rowsWritten, 0),
+				forwardCount,
+				partitionsVisited: partitionMetas.length,
+			},
+			partitionMetas,
+		};
+	}
+
+	private echoBatchGetOriginalKey(item: BatchGetProcessedItem, originalItems: Map<number, ItemKey>): BatchGetProcessedItem {
+		const originalItem = originalItems.get(item.inputIndex);
+		if (!originalItem) {
+			throw new Error(`fokos/batchGetItems: missing original item for inputIndex ${item.inputIndex}`);
+		}
+		if (!item.found) {
+			return { ...item, item: originalItem };
+		}
+		return { ...item, item: { ...item.item, hashKey: originalItem.hashKey, sortKey: originalItem.sortKey } };
+	}
+
+	private echoBatchGetOriginalUnprocessedKey(item: BatchGetUnprocessedKey, originalItems: Map<number, ItemKey>): BatchGetUnprocessedKey {
+		const originalItem = originalItems.get(item.inputIndex);
+		if (!originalItem) {
+			throw new Error(`fokos/batchGetItems: missing original item for inputIndex ${item.inputIndex}`);
+		}
+		return { ...item, item: originalItem };
+	}
+
+	async batchWriteItems(opts: BatchWriteItemsOptions): Promise<BatchWriteItemsResult> {
+		validateBatchWriteOperations(opts.operations);
+
+		const originalOperations = new Map<number, BatchWriteItemOperation>();
+		const groups = new Map<
+			string,
+			{
+				doId: DurableObjectId;
+				partitionContext: ReturnType<PartitionTopologyRouter["pickPartition"]>["partitionContext"];
+				operations: EncodedBatchWriteWorkItem[];
+			}
+		>();
+
+		for (let inputIndex = 0; inputIndex < opts.operations.length; inputIndex++) {
+			const op = opts.operations[inputIndex];
+			const hashKey = encodeHashKey(op.hashKey);
+			const sortKey = encodeSortKey(op.sortKey);
+			const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			const originalOperation = { ...op, hashKey: op.hashKey, sortKey: op.sortKey };
+			originalOperations.set(inputIndex, originalOperation);
+
+			let group = groups.get(partitionContext.doName);
+			if (!group) {
+				group = { doId, partitionContext, operations: [] };
+				groups.set(partitionContext.doName, group);
+			}
+
+			if (op.operation === "put") {
+				group.operations.push({
+					inputIndex,
+					operation: "put",
+					hashKey,
+					sortKey,
+					data: op.data,
+					ttlSeconds: op.ttlSeconds,
+					ttlEpochUTCSeconds: op.ttlEpochUTCSeconds,
+					originalOperation,
+				});
+			} else {
+				group.operations.push({
+					inputIndex,
+					operation: "delete",
+					hashKey,
+					sortKey,
+					originalOperation,
+				});
+			}
+		}
+
+		const processedItems: BatchWriteProcessedItem[] = [];
+		const unprocessedItems: BatchWriteUnprocessedItem[] = [];
+		const partitionMetas: BatchWriteItemsResult["partitionMetas"] = [];
+		let forwardCount = 0;
+		const groupList = [...groups.values()];
+
+		const groupResults = await Promise.allSettled(
+			groupList.map(async (group) => ({
+				group,
+				result: await this.#options.ns.get(group.doId).batchWriteItems(group.partitionContext, { operations: group.operations }),
+			})),
+		);
+
+		for (let i = 0; i < groupResults.length; i++) {
+			const groupResult = groupResults[i];
+			const group = groupList[i];
+			if (groupResult.status === "fulfilled") {
+				const result = groupResult.value.result;
+				processedItems.push(...result.processedItems.map((item) => this.echoBatchWriteOriginalItem(item, originalOperations)));
+				unprocessedItems.push(
+					...result.unprocessedItems.map((item) => this.echoBatchWriteOriginalUnprocessedItem(item, originalOperations)),
+				);
+				partitionMetas.push(...result.partitionMetas);
+				forwardCount += result.meta.forwardCount;
+				continue;
+			}
+
+			for (const op of group.operations) {
+				unprocessedItems.push({
+					inputIndex: op.inputIndex,
+					operation: op.operation,
+					item: this.batchWriteOriginalItem(op.inputIndex, originalOperations),
+					reason: {
+						type: "transient_error",
+						message: groupResult.reason instanceof Error ? groupResult.reason.message : String(groupResult.reason),
+					},
+				});
+			}
+		}
+
+		processedItems.sort((a, b) => a.inputIndex - b.inputIndex);
+		unprocessedItems.sort((a, b) => a.inputIndex - b.inputIndex);
+
+		return {
+			processedItems,
+			unprocessedItems,
+			meta: {
+				requestedCount: opts.operations.length,
+				processedCount: processedItems.length,
+				unprocessedCount: unprocessedItems.length,
+				rowsRead: partitionMetas.reduce((sum, meta) => sum + meta.rowsRead, 0),
+				rowsWritten: partitionMetas.reduce((sum, meta) => sum + meta.rowsWritten, 0),
+				forwardCount,
+				partitionsVisited: partitionMetas.length,
+			},
+			partitionMetas,
+		};
+	}
+
+	private echoBatchWriteOriginalItem(
+		item: BatchWriteProcessedItem,
+		originalOperations: Map<number, BatchWriteItemOperation>,
+	): BatchWriteProcessedItem {
+		return { ...item, item: this.batchWriteOriginalItem(item.inputIndex, originalOperations) };
+	}
+
+	private echoBatchWriteOriginalUnprocessedItem(
+		item: BatchWriteUnprocessedItem,
+		originalOperations: Map<number, BatchWriteItemOperation>,
+	): BatchWriteUnprocessedItem {
+		return { ...item, item: this.batchWriteOriginalItem(item.inputIndex, originalOperations) };
+	}
+
+	private batchWriteOriginalItem(inputIndex: number, originalOperations: Map<number, BatchWriteItemOperation>): ItemKey {
+		const originalOperation = originalOperations.get(inputIndex);
+		if (!originalOperation) {
+			throw new Error(`fokos/batchWriteItems: missing original operation for inputIndex ${inputIndex}`);
+		}
+		return { hashKey: originalOperation.hashKey, sortKey: originalOperation.sortKey };
 	}
 
 	async transactWriteItems(opts: {

@@ -1,8 +1,251 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { FokosDB } from "./db.js";
+import { FokosDB, type FokosDBOptions } from "./db.js";
+import type { BatchGetItemsRpcResult } from "./batch-types.js";
+import { MAX_BATCH_FORWARDED_SUB_BATCH_BYTES, MAX_BATCH_GET_ITEMS, MAX_BATCH_WRITE_ITEMS } from "./transaction-limits.js";
+import { KeyCodec } from "./partition-topology/key-codec.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
+import { hashRootIndex } from "./partition-topology/partition-id.js";
 import { PartitionTopologyRouterImpl } from "./partition-topology/router.js";
+
+describe("FokosDB batch item operations", () => {
+	it("rejects invalid batchGetItems input before the native routing boundary", async () => {
+		const db = makeDB();
+		await expect(db.batchGetItems({ items: [] })).rejects.toThrow(/batchGetItems requires at least 1 item/);
+		await expect(
+			db.batchGetItems({ items: Array.from({ length: MAX_BATCH_GET_ITEMS + 1 }, (_, i) => ({ hashKey: `hk-${i}` })) }),
+		).rejects.toThrow(/batchGetItems supports at most 100 items/);
+		await expect(db.batchGetItems({ items: [{ hashKey: "a" }, { hashKey: "a" }] })).rejects.toThrow(/batchGetItems duplicate key/);
+	});
+
+	it("batchGetItems returns found and missing items in request order with inputIndex correlation", async () => {
+		const db = makeDB();
+		await db.putItem({ hashKey: "a", sortKey: "1", data: "a1" });
+		await db.putItem({ hashKey: "b", data: "b0" });
+
+		const result = await db.batchGetItems({
+			items: [{ hashKey: "missing" }, { hashKey: "a", sortKey: "1" }, { hashKey: "b" }],
+		});
+
+		expect(result.unprocessedKeys).toEqual([]);
+		expect(result.items.map((item) => item.inputIndex)).toEqual([0, 1, 2]);
+		expect(result.items[0]).toMatchObject({ inputIndex: 0, found: false, item: { hashKey: "missing", sortKey: undefined } });
+		expect(result.items[1]).toMatchObject({ inputIndex: 1, found: true, item: { hashKey: "a", sortKey: "1", data: "a1", version: 1 } });
+		expect(result.items[2]).toMatchObject({
+			inputIndex: 2,
+			found: true,
+			item: { hashKey: "b", sortKey: undefined, data: "b0", version: 1 },
+		});
+		expect(result.meta).toMatchObject({
+			requestedCount: 3,
+			processedCount: 3,
+			unprocessedCount: 0,
+			rowsWritten: 0,
+			forwardCount: 0,
+			partitionsVisited: 1,
+		});
+		expect(result.meta.rowsRead).toBe(2);
+		expect(result.partitionMetas).toHaveLength(1);
+		expect(result.partitionMetas[0]).toMatchObject({ rowsRead: 2, rowsWritten: 0, forwardCount: 0 });
+	});
+
+	it("batchGetItems fails loudly when an RPC returns an unknown processed inputIndex", async () => {
+		const db = makeDBReturningBatchGet({
+			items: [{ inputIndex: 1, found: false, item: { hashKey: "corrupt" } }],
+			unprocessedKeys: [],
+			meta: batchRpcMeta(),
+			partitionMetas: [],
+		});
+
+		await expect(db.batchGetItems({ items: [{ hashKey: "only" }] })).rejects.toThrow(
+			/fokos\/batchGetItems: missing original item for inputIndex 1/,
+		);
+	});
+
+	it("batchGetItems fails loudly when an RPC returns an unknown unprocessed inputIndex", async () => {
+		const db = makeDBReturningBatchGet({
+			items: [],
+			unprocessedKeys: [{ inputIndex: 1, item: { hashKey: "corrupt" }, reason: { type: "transient_error" } }],
+			meta: batchRpcMeta(),
+			partitionMetas: [],
+		});
+
+		await expect(db.batchGetItems({ items: [{ hashKey: "only" }] })).rejects.toThrow(
+			/fokos\/batchGetItems: missing original item for inputIndex 1/,
+		);
+	});
+
+	it("rejects invalid batchWriteItems input before the native routing boundary", async () => {
+		const db = makeDB();
+		await expect(db.batchWriteItems({ operations: [] })).rejects.toThrow(/batchWriteItems requires at least 1 item/);
+		await expect(
+			db.batchWriteItems({
+				operations: Array.from({ length: MAX_BATCH_WRITE_ITEMS + 1 }, (_, i) => ({ operation: "put", hashKey: `hk-${i}`, data: "x" })),
+			}),
+		).rejects.toThrow(/batchWriteItems supports at most 25 items/);
+		await expect(
+			db.batchWriteItems({
+				operations: [
+					{ operation: "put", hashKey: "a", data: "x" },
+					{ operation: "delete", hashKey: "a" },
+				],
+			}),
+		).rejects.toThrow(/batchWriteItems duplicate key/);
+		await expect(db.batchWriteItems({ operations: [{ operation: "check", hashKey: "a" }] as never })).rejects.toThrow(
+			/operation must be "put" or "delete"/,
+		);
+		await expect(
+			db.batchWriteItems({ operations: [{ operation: "put", hashKey: "a", data: "x", conditions: [{ type: "item_exists" }] }] as never }),
+		).rejects.toThrow(/does not support conditions/);
+		await expect(
+			db.batchWriteItems({
+				operations: Array.from({ length: 5 }, (_, i) => ({
+					operation: "put",
+					hashKey: `payload-too-large-${i}`,
+					data: new Uint8Array(MAX_BATCH_FORWARDED_SUB_BATCH_BYTES - 128),
+				})),
+			}),
+		).rejects.toThrow(/batchWriteItems total payload exceeds 4 MB/);
+		await expect(
+			db.batchWriteItems({
+				operations: [{ operation: "put", hashKey: "forwarded-too-large", data: new Uint8Array(MAX_BATCH_FORWARDED_SUB_BATCH_BYTES + 1) }],
+			}),
+		).rejects.toThrow(/batchWriteItems operation payload exceeds 1 MB forwarded sub-batch limit/);
+	});
+
+	it("batchWriteItems applies mixed put/delete on a single root and omits per-item versions", async () => {
+		const db = makeDB();
+		await db.putItem({ hashKey: "existing", data: "old" });
+
+		const result = await db.batchWriteItems({
+			operations: [
+				{ operation: "put", hashKey: "created", data: "new" },
+				{ operation: "delete", hashKey: "existing" },
+			],
+		});
+
+		expect(result.unprocessedItems).toEqual([]);
+		expect(result.processedItems).toEqual([
+			{ inputIndex: 0, operation: "put", item: { hashKey: "created", sortKey: undefined } },
+			{ inputIndex: 1, operation: "delete", item: { hashKey: "existing", sortKey: undefined } },
+		]);
+		expect("version" in result.processedItems[0]).toBe(false);
+		await expect(db.getItem({ hashKey: "created" })).resolves.toMatchObject({ found: true, item: { data: "new" } });
+		await expect(db.getItem({ hashKey: "existing" })).resolves.toMatchObject({ found: false });
+		expect(result.meta).toMatchObject({
+			requestedCount: 2,
+			processedCount: 2,
+			unprocessedCount: 0,
+			forwardCount: 0,
+			partitionsVisited: 1,
+		});
+		expect(result.meta.rowsWritten).toBeGreaterThan(0);
+		expect(result.partitionMetas).toHaveLength(1);
+		expect(result.partitionMetas[0]).toMatchObject({ forwardCount: 0 });
+		expect(result.partitionMetas[0].rowsWritten).toBeGreaterThan(0);
+	});
+
+	it("batchWriteItems preserves sibling successes when one local item has a pending transaction lock", async () => {
+		const { db, topology } = makeDBHarness();
+		const lockedHashKey = KeyCodec.encode("locked");
+		const lockedSortKey = KeyCodec.encodeOptional(undefined);
+		const { doId, partitionContext } = topology.pickPartition(lockedHashKey, lockedSortKey);
+		const stub = env.PARTITION_DO.get(doId);
+		const txId = crypto.randomUUID();
+		const prepareResult = await stub.prepare(partitionContext, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: [{ hashKey: lockedHashKey, sortKey: lockedSortKey, operation: "put", data: "pending" }],
+		});
+		expect(prepareResult).toEqual({ outcome: "accepted" });
+
+		const result = await db.batchWriteItems({
+			operations: [
+				{ operation: "put", hashKey: "locked", data: "blocked" },
+				{ operation: "put", hashKey: "unlocked", data: "visible" },
+			],
+		});
+
+		expect(result.processedItems).toEqual([{ inputIndex: 1, operation: "put", item: { hashKey: "unlocked", sortKey: undefined } }]);
+		expect(result.unprocessedItems).toEqual([
+			{
+				inputIndex: 0,
+				operation: "put",
+				item: { hashKey: "locked", sortKey: undefined },
+				reason: { type: "pending_lock", conflictingTransactionId: txId },
+			},
+		]);
+		await expect(db.getItem({ hashKey: "unlocked" })).resolves.toMatchObject({ found: true, item: { data: "visible" } });
+		await expect(db.getItem({ hashKey: "locked" })).resolves.toMatchObject({ found: false });
+		expect(result.meta).toMatchObject({
+			requestedCount: 2,
+			processedCount: 1,
+			unprocessedCount: 1,
+			forwardCount: 0,
+			partitionsVisited: 1,
+		});
+		expect(result.meta.rowsWritten).toBeGreaterThan(0);
+		expect(result.partitionMetas).toHaveLength(1);
+		expect(result.partitionMetas[0].rowsWritten).toBeGreaterThan(0);
+
+		await stub.cancel(partitionContext, { transactionId: txId });
+		const retryResult = await db.batchWriteItems({ operations: [{ operation: "put", hashKey: "locked", data: "blocked" }] });
+		expect(retryResult.unprocessedItems).toEqual([]);
+		expect(retryResult.processedItems).toEqual([{ inputIndex: 0, operation: "put", item: { hashKey: "locked", sortKey: undefined } }]);
+		await expect(db.getItem({ hashKey: "locked" })).resolves.toMatchObject({ found: true, item: { data: "blocked" } });
+	});
+
+	it("batchGetItems succeeds across more than ten initial roots and aggregates partition metadata", async () => {
+		const rootTreesN = 64;
+		const db = makeDB(rootTreesN);
+		const hashKeys = keysForDistinctRootPartitions(11, rootTreesN);
+		for (const hashKey of hashKeys) {
+			await db.putItem({ hashKey, data: `data-${hashKey}` });
+		}
+
+		const result = await db.batchGetItems({ items: hashKeys.map((hashKey) => ({ hashKey })) });
+
+		expect(result.unprocessedKeys).toEqual([]);
+		expect(result.items.map((item) => item.inputIndex)).toEqual(hashKeys.map((_, index) => index));
+		expect(result.items).toHaveLength(hashKeys.length);
+		expect(result.meta).toMatchObject({
+			requestedCount: hashKeys.length,
+			processedCount: hashKeys.length,
+			unprocessedCount: 0,
+			rowsRead: hashKeys.length,
+			rowsWritten: 0,
+			forwardCount: 0,
+			partitionsVisited: hashKeys.length,
+		});
+		expect(result.partitionMetas).toHaveLength(hashKeys.length);
+		expect(result.partitionMetas.reduce((sum, meta) => sum + meta.rowsRead, 0)).toBe(hashKeys.length);
+	});
+
+	it("batchWriteItems succeeds across more than ten initial roots without a client fan-out cap", async () => {
+		const rootTreesN = 64;
+		const db = makeDB(rootTreesN);
+		const operations = keysForDistinctRootPartitions(11, rootTreesN).map((hashKey) => ({
+			operation: "put" as const,
+			hashKey,
+			data: "x",
+		}));
+
+		const result = await db.batchWriteItems({ operations });
+
+		expect(result.unprocessedItems).toEqual([]);
+		expect(result.processedItems.map((item) => item.inputIndex)).toEqual(operations.map((_, index) => index));
+		expect(result.meta).toMatchObject({
+			requestedCount: operations.length,
+			processedCount: operations.length,
+			unprocessedCount: 0,
+			forwardCount: 0,
+			partitionsVisited: operations.length,
+		});
+		expect(result.meta.rowsWritten).toBeGreaterThanOrEqual(operations.length);
+		expect(result.partitionMetas).toHaveLength(operations.length);
+	});
+});
 
 describe("FokosDB.queryItems — multi sub-query fan-out", () => {
 	it("groups results per sub-query in request order, sk-ordered within each group", async () => {
@@ -275,7 +518,31 @@ describe("FokosDB.queryItems — sort-key condition operators", () => {
 // Builds a FokosDB over a fresh, isolated table. Generous split thresholds keep every key on a
 // single root partition so these tests exercise FokosDB.queryItems' cross-sub-query fan-out and
 // pagination, not the DO-level range-tree walk (covered in do-partition.test.ts).
-function makeDB() {
+function makeDBHarness(rootTreesN = 1) {
+	const tableName = `test.${crypto.randomUUID()}`;
+	const base = PartitionContextCreator.create({
+		ns: "PARTITION_DO",
+		tableName,
+		rootTreesN,
+		hashSplitN: 2,
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 500 },
+		rangeSplitConditions: { maxSizeMb: 500 },
+	});
+	const topology = new PartitionTopologyRouterImpl(base);
+	const db = new FokosDB({
+		ns: env.PARTITION_DO,
+		topology,
+		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
+	});
+	return { db, topology };
+}
+
+function makeDB(rootTreesN = 1) {
+	return makeDBHarness(rootTreesN).db;
+}
+
+function makeDBReturningBatchGet(result: BatchGetItemsRpcResult) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
@@ -286,13 +553,58 @@ function makeDB() {
 		hashSplitConditions: { maxSizeMb: 500 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
+	const doName = `${tableName}.fake`;
+	const doId = env.PARTITION_DO.idFromName(doName);
+	const partitionContext = {
+		...base,
+		doName,
+		primaryDoIdStr: doId.toString(),
+		partitionId: "00",
+	};
+	const topology: FokosDBOptions["topology"] = {
+		partitionContext: () => base,
+		pickPartition: () => ({ doId, partitionContext }),
+		rootPartitionContexts: () => [partitionContext],
+		traverseForDestroy: async () => {},
+	};
+	const ns = {
+		get: () => ({
+			batchGetItems: async () => result,
+		}),
+	} as unknown as FokosDBOptions["ns"];
 	return new FokosDB({
-		ns: env.PARTITION_DO,
-		topology: new PartitionTopologyRouterImpl(base),
+		ns,
+		topology,
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});
 }
 
+function batchRpcMeta(): BatchGetItemsRpcResult["meta"] {
+	return {
+		rowsRead: 0,
+		rowsWritten: 0,
+		databaseSize: 0,
+		servedByActorId: "actor-id",
+		servedByActorName: "actor-name",
+		servedByPartitionId: "partition-id",
+		forwardCount: 0,
+		hashDepth: 0,
+	};
+}
+
 function sksOf(res: { items: Array<{ sortKey?: string | Uint8Array }> }) {
 	return res.items.map((i) => i.sortKey);
+}
+
+function keysForDistinctRootPartitions(count: number, rootTreesN: number): string[] {
+	const keysByRoot = new Map<number, string>();
+	for (let i = 0; keysByRoot.size < count && i < 10_000; i++) {
+		const hashKey = `batch-fanout-${i}`;
+		const rootIdx = hashRootIndex(KeyCodec.encode(hashKey), rootTreesN);
+		if (!keysByRoot.has(rootIdx)) {
+			keysByRoot.set(rootIdx, hashKey);
+		}
+	}
+	expect(keysByRoot.size).toBe(count);
+	return [...keysByRoot.values()];
 }

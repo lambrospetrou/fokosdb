@@ -5,7 +5,8 @@ import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
 import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
-import type { GetItemResult, InitiateReadResponse, QueryItemsResult } from "./lib/types.js";
+import { MAX_BATCH_GET_ITEMS, MAX_BATCH_WRITE_ITEMS } from "./lib/transaction-limits.js";
+import type { BatchGetItemsResult, BatchWriteItemsResult, GetItemResult, InitiateReadResponse, QueryItemsResult } from "./lib/types.js";
 
 export { PartitionDO } from "./lib/do-partition.js";
 export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
@@ -78,6 +79,46 @@ const TransactWriteItemsBodySchema = v.object({
 
 const TransactGetItemsBodySchema = v.object({
 	items: v.array(v.object({ hashKey: v.string(), sortKey: v.optional(v.string()) })),
+	partitionOptions: PartitionOptionsSchema,
+});
+
+const BatchGetItemsBodySchema = v.strictObject({
+	items: v.pipe(
+		v.array(v.strictObject({ hashKey: v.string(), sortKey: v.optional(v.string()) })),
+		v.minLength(1, "fokos: batchGetItems requires at least 1 item"),
+		v.maxLength(MAX_BATCH_GET_ITEMS, `fokos: batchGetItems supports at most ${MAX_BATCH_GET_ITEMS} items`),
+	),
+	partitionOptions: PartitionOptionsSchema,
+});
+
+const BatchWriteItemsBodySchema = v.strictObject({
+	operations: v.pipe(
+		v.array(
+			v.variant("operation", [
+				v.pipe(
+					v.strictObject({
+						operation: v.literal("put"),
+						hashKey: v.string(),
+						sortKey: v.optional(v.string()),
+						ttlSeconds: v.optional(v.number()),
+						ttlEpochUTCSeconds: v.optional(v.number()),
+						data: v.string(),
+					}),
+					v.check(
+						(input) => !(input.ttlSeconds !== undefined && input.ttlEpochUTCSeconds !== undefined),
+						"Only one of ttlSeconds or ttlEpochUTCSeconds may be provided, not both",
+					),
+				),
+				v.strictObject({
+					operation: v.literal("delete"),
+					hashKey: v.string(),
+					sortKey: v.optional(v.string()),
+				}),
+			]),
+		),
+		v.minLength(1, "fokos: batchWriteItems requires at least 1 item"),
+		v.maxLength(MAX_BATCH_WRITE_ITEMS, `fokos: batchWriteItems supports at most ${MAX_BATCH_WRITE_ITEMS} items`),
+	),
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -164,6 +205,57 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 			return { ...rest, hashKey, sortKey, ...encodeData(data) };
 		}),
 	};
+}
+
+function assertStringKeysForHttp(
+	rpcAction: "batchGetItems" | "batchWriteItems",
+	item: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+) {
+	if (item.hashKey instanceof Uint8Array || item.sortKey instanceof Uint8Array) {
+		throw new HTTPException(500, { message: `fokos/${rpcAction}: binary keys are not supported over the HTTP API` });
+	}
+}
+
+function serializeBatchGetItemsResult(result: BatchGetItemsResult) {
+	return {
+		...result,
+		items: result.items.map((item) => {
+			assertStringKeysForHttp("batchGetItems", item.item);
+			if (!item.found) return item;
+			const { data, ...itemRest } = item.item;
+			return { ...item, item: { ...itemRest, ...encodeData(data) } };
+		}),
+		unprocessedKeys: result.unprocessedKeys.map((item) => {
+			assertStringKeysForHttp("batchGetItems", item.item);
+			return item;
+		}),
+	};
+}
+
+function serializeBatchWriteItemsResult(result: BatchWriteItemsResult) {
+	return {
+		...result,
+		processedItems: result.processedItems.map((item) => {
+			assertStringKeysForHttp("batchWriteItems", item.item);
+			return item;
+		}),
+		unprocessedItems: result.unprocessedItems.map((item) => {
+			assertStringKeysForHttp("batchWriteItems", item.item);
+			return item;
+		}),
+	};
+}
+
+async function runBatchRpc<T>(fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (error) {
+		const message = error instanceof Error ? error.message : String(error);
+		if (message.startsWith("fokos:")) {
+			throw new HTTPException(400, { message });
+		}
+		throw error;
+	}
 }
 
 function serializeTransactGetItemsResult(result: InitiateReadResponse) {
@@ -289,6 +381,18 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeGetItemResult(result));
+		}
+		case "batchGetItems": {
+			const { partitionOptions, ...opts } = parseBody(BatchGetItemsBodySchema);
+			const result = await runBatchRpc(() => makeFokosDB(c.env, tableName, partitionOptions).batchGetItems(opts));
+			c.set("dbItemMeta", result.meta);
+			return c.json(serializeBatchGetItemsResult(result));
+		}
+		case "batchWriteItems": {
+			const { partitionOptions, ...opts } = parseBody(BatchWriteItemsBodySchema);
+			const result = await runBatchRpc(() => makeFokosDB(c.env, tableName, partitionOptions).batchWriteItems(opts));
+			c.set("dbItemMeta", result.meta);
+			return c.json(serializeBatchWriteItemsResult(result));
 		}
 		case "deleteItem": {
 			const { partitionOptions, ...opts } = parseBody(DeleteItemBodySchema);
