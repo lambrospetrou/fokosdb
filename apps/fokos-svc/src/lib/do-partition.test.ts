@@ -204,6 +204,21 @@ describe("PartitionDO - putItem / getItem", () => {
 			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
 			if (result.found) expect(result.item.ttlEpochUTCSeconds).toBeUndefined();
 		});
+
+		it("converts a relative ttlSeconds to an absolute ttlEpochUTCSeconds on put", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+			const before = Math.floor(Date.now() / 1000);
+
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val", ttlSeconds: 3600 });
+			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
+
+			expect(result.found).toBe(true);
+			if (result.found) {
+				const ttl = result.item.ttlEpochUTCSeconds;
+				expect(ttl).toBeGreaterThanOrEqual(before + 3600);
+				expect(ttl).toBeLessThanOrEqual(Math.floor(Date.now() / 1000) + 3600);
+			}
+		});
 	});
 
 	it("stores and retrieves an item with no sortKey", async ({ expect }) => {

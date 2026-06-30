@@ -318,7 +318,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					hk: hashKey,
 					sk: sortKey,
 					data: opts.data,
-					ttlEpochUtcSeconds: opts.ttlEpochUTCSeconds ?? null,
+					ttlEpochUtcSeconds: PartitionDO.resolveTtlEpochSeconds(opts),
 					lastTransactionTs: Date.now(),
 				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
@@ -1304,6 +1304,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return k === undefined ? KeyCodec.encodeOptional(undefined) : PartitionDO.keyIn(k);
 	}
 
+	// Resolve a write's TTL to an absolute epoch (seconds). An explicit `ttlEpochUTCSeconds` wins;
+	// otherwise a relative `ttlSeconds` is anchored to write time. Returns null when neither is set.
+	// The HTTP layer already rejects setting both. Shared by putItem and batchWriteItems so a
+	// caller-supplied `ttlSeconds` is honored rather than silently dropped.
+	private static resolveTtlEpochSeconds(opts: { ttlSeconds?: number; ttlEpochUTCSeconds?: number }): number | null {
+		if (opts.ttlEpochUTCSeconds != null) return opts.ttlEpochUTCSeconds;
+		if (opts.ttlSeconds != null) return Math.floor(Date.now() / 1000) + opts.ttlSeconds;
+		return null;
+	}
+
 	private pCtx(): PartitionContextResolved {
 		invariant(
 			this.#_partitionContext,
@@ -1662,7 +1672,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						hk: hashKey,
 						sk: sortKey,
 						data: op.data,
-						ttlEpochUtcSeconds: op.ttlEpochUTCSeconds ?? null,
+						ttlEpochUtcSeconds: PartitionDO.resolveTtlEpochSeconds(op),
 						lastTransactionTs: Date.now(),
 					});
 					rowsRead += writeRes.rowsRead;
