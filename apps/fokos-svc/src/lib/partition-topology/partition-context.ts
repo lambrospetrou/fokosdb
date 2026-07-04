@@ -1,4 +1,5 @@
 import type { PartitionNodeId, SplitType } from "./types.js";
+import type { RangeAncestorInfo } from "../types.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 // Type-only import: erased at emit, so it creates NO runtime module cycle with do-partition.ts
 // (the value-level cycle is what the layering refactor eliminated). It exists solely so the
@@ -32,6 +33,13 @@ export type PartitionContext = {
 
 	hashSplitConditions: SplitConditions;
 	rangeSplitConditions?: SplitConditions;
+
+	/**
+	 * Bounded ancestor-set selection for range splits: shallowest `fromRoot` + deepest `fromLeaf`
+	 * ancestors, deduped. Table-level (not per-request) because splits are driven by background
+	 * jobs, not a user request.
+	 */
+	rangeAncestorsConfig: { fromRoot: number; fromLeaf: number };
 };
 export type PartitionContextResolved = PartitionContext & {
 	doName: string;
@@ -46,9 +54,6 @@ export type PartitionContextResolved = PartitionContext & {
 	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
 	partitionId: PartitionNodeId;
 
-	// Cached parsed bytes of partitionId. Populated inside the DO for fast routing; survives structured clone.
-	_partitionIdBytes?: Uint8Array;
-
 	// Present only on range-structure DOs. Immutable identity.
 	// Redundant with the decoded partitionId, but kept denormalized for cheap routing/filters.
 	// Both boundaries are immutable: a range DO owns [startBoundary, endBoundary) for life; on split it
@@ -62,6 +67,11 @@ export type PartitionContextResolved = PartitionContext & {
 	};
 };
 
+export type PartitionContextLivePartition = PartitionContextResolved & {
+	// Cached parsed bytes of partitionId. Populated inside the DO for fast routing; survives structured clone.
+	_partitionIdBytes?: Uint8Array;
+};
+
 export type SplitConditions = {
 	/**
 	 * The maximum size of the partition in megabytes before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.
@@ -69,6 +79,7 @@ export type SplitConditions = {
 	maxSizeMb?: number;
 	/**
 	 * The maximum number of items in the partition before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.
+	 * FIXME: Not fully implemented, either remove or implement.
 	 */
 	maxItems?: number;
 };
@@ -79,16 +90,31 @@ export type SplitConditions = {
  * own new identity.
  */
 export type InitFromSplitOptions = {
-	parentPartitionContext: PartitionContextResolved;
-	newPartitionContext: PartitionContextResolved;
 	splitType: SplitType;
+	parentPartitionContext: PartitionContextLivePartition;
+
+	newPartitionContext: PartitionContextResolved;
+	newPartitionRangeDepth?: number; // undefined for hash partitions, 0 for range-root, 1 for first-level child, etc.
+
+	/**
+	 * Range splits (and range-root promotion) only. One-time init payload — NOT persisted as part
+	 * of routing context. The child writes this to its local `range_hierarchy` table in
+	 * `initFromSplit`.
+	 */
+	rangeAncestors?: RangeAncestorInfo[];
 };
 
-export function isHashPartition(ctx: PartitionContextResolved): ctx is PartitionContextResolved & { rangePartition: null | undefined } {
+export function isHashPartition(
+	ctx: PartitionContextResolved | PartitionContextLivePartition,
+): ctx is (PartitionContextResolved | PartitionContextLivePartition) & { rangePartition: null | undefined } {
 	return !ctx.rangePartition;
 }
 
-export function isRangePartition(ctx: PartitionContextResolved): ctx is PartitionContextResolved & {
+// TODO: Can I make this a type guard that narrows to PartitionContextLivePartition?
+export function isRangePartition(ctx: PartitionContextResolved | PartitionContextLivePartition): ctx is (
+	| PartitionContextResolved
+	| PartitionContextLivePartition
+) & {
 	rangePartition: NonNullable<PartitionContextResolved["rangePartition"]>;
 } {
 	return Boolean(ctx.rangePartition);
@@ -128,7 +154,9 @@ export function areMutableOptionsEqual(opts1: PartitionContext, opts2: Partition
 		opts1.hashSplitConditions.maxItems === opts2.hashSplitConditions.maxItems &&
 		opts1.rangeSplitN === opts2.rangeSplitN &&
 		opts1.rangeSplitConditions?.maxSizeMb === opts2.rangeSplitConditions?.maxSizeMb &&
-		opts1.rangeSplitConditions?.maxItems === opts2.rangeSplitConditions?.maxItems
+		opts1.rangeSplitConditions?.maxItems === opts2.rangeSplitConditions?.maxItems &&
+		opts1.rangeAncestorsConfig?.fromRoot === opts2.rangeAncestorsConfig?.fromRoot &&
+		opts1.rangeAncestorsConfig?.fromLeaf === opts2.rangeAncestorsConfig?.fromLeaf
 	);
 }
 
@@ -141,6 +169,7 @@ export class PartitionContextCreator {
 		hashSplitConditions: SplitConditions;
 		rangeSplitN?: number;
 		rangeSplitConditions?: SplitConditions;
+		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
 	}): PartitionContext {
 		// Assert the input options and default to reasonable values if not provided.
 		if (!opts.rangeSplitConditions) {
@@ -150,6 +179,9 @@ export class PartitionContextCreator {
 		if (!opts.hashSplitConditions) {
 			opts.hashSplitN = 4;
 			opts.hashSplitConditions = { maxSizeMb: 100 };
+		}
+		if (!opts.rangeAncestorsConfig) {
+			opts.rangeAncestorsConfig = { fromRoot: 2, fromLeaf: 2 };
 		}
 		if (opts.rootTreesN < 1 || opts.rootTreesN > 65000) {
 			throw new Error("fokos: rootTreesN must be between 1 and 65000");
@@ -177,6 +209,13 @@ export class PartitionContextCreator {
 			throw new Error("fokos: rangeSplitConditions.maxItems must be at least 1");
 		}
 
+		if (opts.rangeAncestorsConfig.fromRoot < 0 || opts.rangeAncestorsConfig.fromRoot > 10) {
+			throw new Error("fokos: rangeAncestorsConfig.fromRoot must be between 0 and 10");
+		}
+		if (opts.rangeAncestorsConfig.fromLeaf < 0 || opts.rangeAncestorsConfig.fromLeaf > 10) {
+			throw new Error("fokos: rangeAncestorsConfig.fromLeaf must be between 0 and 10");
+		}
+
 		const context: PartitionContext = {
 			schema: 1,
 			ns: opts.ns,
@@ -186,6 +225,7 @@ export class PartitionContextCreator {
 			rangeSplitN: opts.rangeSplitN,
 			hashSplitConditions: opts.hashSplitConditions,
 			rangeSplitConditions: opts.rangeSplitConditions,
+			rangeAncestorsConfig: opts.rangeAncestorsConfig,
 		};
 		return context;
 	}

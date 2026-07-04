@@ -1,5 +1,5 @@
 import { tryWhile } from "durable-utils/retries";
-import { isHashPartition, type PartitionContextResolved } from "../partition-topology/partition-context.js";
+import { isHashPartition, type PartitionContextLivePartition } from "../partition-topology/partition-context.js";
 import { resolveRangePartitionContext } from "../partition-topology/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { RANGE_PROMOTION_FRACTION } from "../partition-topology/split-policy.js";
@@ -16,7 +16,7 @@ export type PromotionManagerDeps = {
 	 * Resolves the peer for a range-root context. Boundary rule: only DO classes (and FokosDB)
 	 * acquire stubs — the DO passes this factory in; the manager never touches `env`/`.get()`.
 	 */
-	getRangeRootPeer: (ctx: PartitionContextResolved) => PromotionPeer;
+	getRangeRootPeer: (ctx: PartitionContextLivePartition) => PromotionPeer;
 	/** Requests a background-work run via the DO's scheduling machinery. */
 	scheduleWork: (opts: { delayMs: number }) => Promise<void>;
 	/** Structured-log context (the DO's logParams), so extracted logs keep their shape. */
@@ -47,11 +47,11 @@ export class PromotionManager {
 	constructor(private readonly deps: PromotionManagerDeps) {}
 
 	/** Populates the cache from storage; called from the DO's blockConcurrencyWhile at startup. */
-	loadFromStorage(): void {
-		// for (const row of this.deps.store.listPromotedKeys("promoted")) {
-		// 	this.#cachePromoted.set(KeyCodec.mapKey(row.hash_key), { hk: row.hash_key });
-		// }
-	}
+	// loadFromStorage(): void {
+	// 	// for (const row of this.deps.store.listPromotedKeys("promoted")) {
+	// 	// 	this.#cachePromoted.set(KeyCodec.mapKey(row.hash_key), { hk: row.hash_key });
+	// 	// }
+	// }
 
 	/** Hot-path read for routing decisions. */
 	statusFor(hashKey: KeyBytes): PromotedKeyStatus | undefined {
@@ -87,7 +87,7 @@ export class PromotionManager {
 		return this.deps.store.listPromotedKeys().map(({ hash_key, status }) => ({ hashKey: hash_key, status }));
 	}
 
-	async maybeQueuePromotion(pCtx: PartitionContextResolved, hk: KeyBytes, newKeyEst: number): Promise<void> {
+	async maybeQueuePromotion(pCtx: PartitionContextLivePartition, hk: KeyBytes, newKeyEst: number): Promise<void> {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || newKeyEst < threshold || this.hasStatus(hk)) return;
@@ -117,7 +117,7 @@ export class PromotionManager {
 	 * Background job: advance each queued key through init → cutover → migrate.
 	 * Per-key failures are logged and never block the remaining keys.
 	 */
-	async drive(pCtx: PartitionContextResolved, getSplitStatus: () => SplitStatusKVItem | undefined): Promise<void> {
+	async drive(pCtx: PartitionContextLivePartition, getSplitStatus: () => SplitStatusKVItem | undefined): Promise<void> {
 		for (const { hash_key: key } of this.deps.store.listPromotedKeys("queued")) {
 			try {
 				await this.startPromotion(pCtx, key, getSplitStatus);
@@ -135,7 +135,7 @@ export class PromotionManager {
 	// Drives the queued→promoting→migrated lifecycle for a single hash key.
 	// Idempotent — safe to call repeatedly across background cycles.
 	async startPromotion(
-		pCtx: PartitionContextResolved,
+		pCtx: PartitionContextLivePartition,
 		hashKey: KeyBytes,
 		getSplitStatus: () => SplitStatusKVItem | undefined,
 	): Promise<void> {
@@ -154,7 +154,10 @@ export class PromotionManager {
 				rangeRootPeer.initFromSplit({
 					parentPartitionContext: pCtx,
 					newPartitionContext: rangeRootCtx,
+					newPartitionRangeDepth: 0,
 					splitType: "range",
+					// Spelled out for clarity, even though it's the same as the "no rows" default.
+					rangeAncestors: [],
 				}),
 			(_err, attempt) => attempt <= 5,
 		);

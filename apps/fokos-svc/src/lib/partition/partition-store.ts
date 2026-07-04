@@ -1,5 +1,5 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import type { ItemCondition } from "../types.js";
+import type { ItemCondition, RangeAncestorInfo } from "../types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 
@@ -201,6 +201,20 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 hk        BLOB    NOT NULL PRIMARY KEY,
                 est_bytes INTEGER NOT NULL DEFAULT 0
             ) WITHOUT ROWID, STRICT;`,
+	},
+	{
+		idMonotonicInc: 5,
+		description: "Add range_hierarchy table for this range partition's ancestor and descendant boundaries",
+		sql: `
+            CREATE TABLE IF NOT EXISTS range_hierarchy (
+				hk			      BLOB    NOT NULL DEFAULT x'',
+                sk_start_boundary BLOB    NOT NULL DEFAULT x'',
+                sk_end_boundary   BLOB    NOT NULL DEFAULT x'',
+                depth             INTEGER NOT NULL,
+				PRIMARY KEY (hk, sk_start_boundary, sk_end_boundary)
+            ) WITHOUT ROWID, STRICT;
+
+			CREATE INDEX IF NOT EXISTS idx_range_hierarchy_depth ON range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary);`,
 	},
 ];
 
@@ -834,5 +848,39 @@ export class PartitionStore {
 		)
 			.toArray()
 			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
+	}
+
+	// ─── range_hierarchy ────────────────────────────────────────────────────
+
+	/**
+	 * Called exactly once, from initFromSplit, before any concurrent request can reach this DO.
+	 * Boundaries are already decoded to the public wire representation (see `RangeAncestorInfo`).
+	 */
+	setRangeAncestors(ancestors: RangeAncestorInfo[]): void {
+		for (const a of ancestors) {
+			this.#storage.sql.exec(
+				`INSERT INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
+				// For range partitions the hash key is always the empty sentinel (the partition's data keyspace is a range of a single hash key).
+				KeyCodec.encodeOptional(undefined),
+				a.depth,
+				a.startBoundary,
+				a.endBoundary,
+			);
+		}
+	}
+
+	/**
+	 * Only rows with depth strictly less than `ltDepth` are ancestors — filtering here (rather than
+	 * relying on callers) keeps this method correct once `range_hierarchy` also holds descendant-side
+	 * cache entries (depth > ltDepth), which this table is named generically to support later.
+	 */
+	getRangeAncestors(ltDepth: number): RangeAncestorInfo[] {
+		return this.#storage.sql
+			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
+				`SELECT depth, sk_start_boundary, sk_end_boundary FROM range_hierarchy WHERE depth < ? ORDER BY depth ASC`,
+				ltDepth,
+			)
+			.toArray()
+			.map((r) => ({ depth: r.depth, startBoundary: fromSqlKey(r.sk_start_boundary), endBoundary: fromSqlKey(r.sk_end_boundary) }));
 	}
 }

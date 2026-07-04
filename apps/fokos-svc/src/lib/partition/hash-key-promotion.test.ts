@@ -202,7 +202,6 @@ describe("PromotionManager — GC", () => {
 			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
 			insertLock(store, kb("alice"), "tx1");
 			store.insertPromotedKey(kb("alice"), "promoted", 1);
-			manager.loadFromStorage();
 
 			// Cycle 1: bounded batch (2 of 3 rows) — residual work remains.
 			manager.runGC();
@@ -225,7 +224,6 @@ describe("PromotionManager — cache views", () => {
 			const { manager, store } = penv;
 			store.insertPromotedKey(kb("alice"), "promoted", 1);
 			store.insertPromotedKey(kb("bob"), "queued", 1);
-			manager.loadFromStorage();
 
 			expect(manager.snapshot().sort((a, b) => KeyCodec.compare(a.hashKey, b.hashKey))).toEqual([
 				{ hashKey: kb("alice"), status: "promoted" },

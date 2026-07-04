@@ -1,3 +1,5 @@
+import { KeyBytes } from "./partition-topology/key-codec.js";
+
 export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
 
 export interface ItemPutter {
@@ -82,9 +84,12 @@ export type PartitionInfo = {
 	 * and to debug the underlying Durable Objects.
 	 */
 	servedByActorId: string;
-	/** The human-readable name of the partition that served the request, if available. */
+	/**
+	 * The human-readable name of the partition that served the request, if available.
+	 */
 	servedByActorName: string;
-	/** Opaque identifier for the partition that served the request.
+	/**
+	 * Opaque identifier for the partition that served the request.
 	 * Useful for correlating with partition topology information in logs, but not meaningful to clients.
 	 */
 	servedByPartitionId: string;
@@ -98,6 +103,33 @@ export type PartitionInfo = {
 	 * but can be useful for debugging and monitoring the partition topology.
 	 */
 	hashDepth: number;
+	/**
+	 * This range partition's own depth (root = 0). Always 0 for hash partitions (mirrors hashDepth's 0-for-range convention).
+	 */
+	rangeDepth: number;
+
+	////////////////////////////////////////////////////////////
+	// INTERNAL_ONLY: Not to be exposed to the final responses.
+	////////////////////////////////////////////////////////////
+
+	_internal: {
+		/**
+		 * Bounded set of this range partition's ancestor boundaries (excludes root and self). Always empty for hash partitions.
+		 */
+		rangeAncestors: RangeAncestorInfo[];
+	};
+};
+
+/**
+ * INTERNAL ONLY - Not to be exposed to the final responses.
+ * Used to track the boundaries of ancestor range partitions for a given partition in the partition topology tree.
+ * This information is useful for routing and debugging purposes, but should not be exposed to clients.
+ * The boundaries are stored in their encoded form (KeyBytes) for efficient comparisons and storage.
+ */
+export type RangeAncestorInfo = {
+	depth: number;
+	startBoundary: KeyBytes;
+	endBoundary: KeyBytes;
 };
 
 export type OperationMetrics = {

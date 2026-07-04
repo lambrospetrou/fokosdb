@@ -8,6 +8,7 @@ import {
 	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
+	RangeAncestorInfo,
 } from "./types.js";
 import type {
 	CancelRequest,
@@ -29,6 +30,7 @@ import {
 	PartitionContext,
 	PartitionContextResolved,
 	type InitFromSplitOptions,
+	PartitionContextLivePartition,
 } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
@@ -149,8 +151,13 @@ export type { InitFromSplitOptions };
 export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly KV_KEYS = {
 		PARTITION_CONTEXT: "__partition_context",
+
+		// Updated on splits and key promotions.
+		PARTITION_DEPTH: "__partition_depth",
+
 		PARENT_PARTITION_CONTEXT: "__parent_partition_context",
 		PARENT_SPLIT_TYPE: "__parent_split_type",
+
 		PARTIAL_RANGE_TOPOLOGY: "__partial_range_topology",
 	};
 
@@ -161,10 +168,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#promotion: PromotionManager;
-	#_partitionContext?: PartitionContextResolved;
+	#_partitionContext?: PartitionContextLivePartition;
 	#_topology?: PartitionTopologySplitter;
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
+	// Local-only, per-DO state (never sent as ordinary routing context): applies uniformly to hash
+	// DOs too — they simply keep [] forever, since nothing ever writes this for a hash partition.
+	#_rangeAncestors: RangeAncestorInfo[] = [];
 
 	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
 	__testing__alarm_running = false;
@@ -194,19 +204,20 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			await this.#store.runMigrations();
 
 			// Load partition context from storage.
-			const pCtx = ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
+			const pCtx = ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
 			if (pCtx) {
 				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 				this.#_partitionContext = pCtx;
-			}
 
-			const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
-			if (prtSnap) {
-				this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
-			}
+				if (isRangePartition(pCtx)) {
+					this.#_rangeAncestors = this.#store.getRangeAncestors(this.depth());
+				}
 
-			// Load promoted keys into in-memory cache (hash DOs only; range DOs never have rows).
-			this.#promotion.loadFromStorage();
+				const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
+				if (prtSnap) {
+					this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
+				}
+			}
 		});
 	}
 
@@ -220,7 +231,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { parentPartitionContext, newPartitionContext, splitType } = opts;
 
 		if (this.#_partitionContext) {
-			const storedParent = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			const storedParent = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			const storedSplitType = this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE);
 			if (
 				this.#_partitionContext.primaryDoIdStr !== newPartitionContext.primaryDoIdStr ||
@@ -238,26 +249,41 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return;
 		}
 
-		this.ensurePartitionContext(newPartitionContext, /* isInit */ true);
-		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
-		this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
-		this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+		this.ctx.storage.transactionSync(() => {
+			const pCtx = this.ensurePartitionContext(opts.newPartitionContext, /* isInit */ true);
+			if (opts.rangeAncestors) {
+				this.#store.setRangeAncestors(opts.rangeAncestors);
+				this.#_rangeAncestors = opts.rangeAncestors;
+			}
+			this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
+			this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
+			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 
-		// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
-		// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
-		//          This is OK but if any other flow runs the background job in the child partition, the migration job will also run.
-		// Fallback: alarm fires if the DO is evicted before setTimeout runs.
-		// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
-		// Fast path: begin migration in this request's event loop turn.
-		// this.scheduleBackgroundWork(0);
+			if (isRangePartition(pCtx)) {
+				invariant(
+					opts.newPartitionRangeDepth !== undefined,
+					"fokos/partition: newPartitionRangeDepth must be provided for range partitions",
+				);
+				this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, opts.newPartitionRangeDepth);
+			}
+			this.depth(); // populate #_depth
 
-		// FIXME Remove this shit and test properly through the public API.
-		if (__testing__completeMigration) {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-		}
-		if (__testing__splitStatus) {
-			this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
-		}
+			// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
+			// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
+			//          This is OK but if any other flow runs the background job in the child partition, the migration job will also run.
+			// Fallback: alarm fires if the DO is evicted before setTimeout runs.
+			// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
+			// Fast path: begin migration in this request's event loop turn.
+			// this.scheduleBackgroundWork(0);
+
+			// FIXME Remove this shit and test properly through the public API.
+			if (__testing__completeMigration) {
+				this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+			}
+			if (__testing__splitStatus) {
+				this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
+			}
+		});
 	}
 
 	async triggerMigration(): Promise<void> {
@@ -320,7 +346,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
+						hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+						rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+						_internal: {
+							rangeAncestors: this.#_rangeAncestors,
+						},
 					},
 				};
 			},
@@ -370,7 +400,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						servedByActorName: pCtx.doName,
 						servedByPartitionId: pCtx.partitionId,
 						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
+						hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+						rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+						_internal: {
+							rangeAncestors: this.#_rangeAncestors,
+						},
 					},
 				};
 			},
@@ -382,7 +416,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		if (await this.ensureMigration("getItem", false)) {
 			// Read directly from parent while this child is still migrating its share of the data.
-			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
 			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 			const parentStub = this.env[parentCtx.ns].get(parentId);
@@ -418,7 +452,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// If still migrating, read directly from the parent (mirrors getItem / getItemDirect).
 		if (await this.ensureMigration("queryItems", false)) {
-			const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.queryItems: no parent partition context stored during migration");
 			const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);
 			const parentStub = this.env[parentCtx.ns].get(parentId) as PartitionDOStub;
@@ -508,7 +542,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
+			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+			_internal: {
+				rangeAncestors: this.#_rangeAncestors,
+			},
 		};
 
 		return { items: rows, nextCursor, bytesConsumed, meta, partitionMetas: [meta] };
@@ -602,7 +640,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: childrenCalled + descendantForwards,
-			hashDepth: 0,
+			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+			_internal: {
+				rangeAncestors: this.#_rangeAncestors,
+			},
 		};
 
 		return { items: allItems, nextCursor, bytesConsumed: totalBytesConsumed, meta, partitionMetas: leafMetas };
@@ -845,15 +887,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	/**
 	 * INTERNAL ONLY FOR TESTING.
 	 */
-	async status(pCtx?: PartitionContextResolved) {
+	async status(pCtx?: PartitionContextLivePartition) {
 		// The pCtx is only provided during tests, since any other use-case in production should initialize the DO already as part of the public API.
 		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
 		return {
+			depth: this.depth(),
 			partitionContext: pCtx,
-			partitionContextStored: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
+			partitionContextStored: this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
 			splitStatus: pCtx ? this.ensureTopology(pCtx).splitStatus() : undefined,
 			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
-			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
+			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
 			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
 			promotedKeys: this.#promotion.snapshot(),
 		};
@@ -1032,18 +1075,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 		}
 
-		const childInits = topology.prepareSplit({ boundaries });
+		const childInits = topology.prepareSplit({
+			parentDepth: this.depth(),
+			boundaries,
+			parentRangeAncestors: splitStatus.splitType === "range" ? this.#_rangeAncestors : undefined,
+		});
 		if (!childInits) return;
 
 		// Call the new DOs at `initFromSplit()` to initialize them with the right context and their
 		// parent partition info that they will use to get data during migration (retry ≤5 each).
-		const promises = childInits.map(async (childContext) => {
-			const doId = this.env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
+		const promises = childInits.map(async (childInitOptions) => {
+			const doId = this.env[childInitOptions.newPartitionContext.ns].idFromName(childInitOptions.newPartitionContext.doName);
 			try {
 				return await tryWhile(
 					async () => {
-						const childDo = this.env[childContext.newPartitionContext.ns].get(doId);
-						return await childDo.initFromSplit(childContext);
+						const childDo = this.env[childInitOptions.newPartitionContext.ns].get(doId);
+						return await childDo.initFromSplit(childInitOptions);
 					},
 					(_error, nextAttempt) => {
 						return nextAttempt <= 5; // Retry up to 5 times
@@ -1057,9 +1104,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					errorProps: error,
 					doId: doId.toString(),
 					childContext: {
-						parentPartitionContext: pCtxForLog(childContext.parentPartitionContext),
-						newPartitionContext: pCtxForLog(childContext.newPartitionContext),
-						splitType: childContext.splitType,
+						parentPartitionContext: pCtxForLog(childInitOptions.parentPartitionContext),
+						newPartitionContext: pCtxForLog(childInitOptions.newPartitionContext),
+						splitType: childInitOptions.splitType,
 					},
 				});
 				throw error; // Rethrow to be caught by the outer try-catch and trigger a retry of the split process.
@@ -1094,17 +1141,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// start migrating on its first incoming request if this doesn't reach it.
 		// We do not use this.ctx.waitUntil(...) since it causes vitest errors with tangling log messages.
 		await Promise.allSettled(
-			childInits.map(async (childContext) => {
+			childInits.map(async (childInitOptions) => {
 				try {
-					const doId = this.env[childContext.newPartitionContext.ns].idFromName(childContext.newPartitionContext.doName);
-					const childDo = this.env[childContext.newPartitionContext.ns].get(doId);
+					const doId = this.env[childInitOptions.newPartitionContext.ns].idFromName(childInitOptions.newPartitionContext.doName);
+					const childDo = this.env[childInitOptions.newPartitionContext.ns].get(doId);
 					await childDo.triggerMigration();
 				} catch (error) {
 					console.error({
 						message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
 						error: String(error),
 						errorProps: error,
-						childDoName: childContext.newPartitionContext.doName,
+						childDoName: childInitOptions.newPartitionContext.doName,
 					});
 				}
 			}),
@@ -1132,7 +1179,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return k === undefined ? KeyCodec.encodeOptional(undefined) : PartitionDO.keyIn(k);
 	}
 
-	private pCtx(): PartitionContextResolved {
+	private pCtx(): PartitionContextLivePartition {
 		invariant(
 			this.#_partitionContext,
 			// FIXME Optimize this to be statically generated once only since we call pCtx() often.
@@ -1141,7 +1188,36 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.#_partitionContext;
 	}
 
-	private ensurePartitionContext(pCtx: PartitionContextResolved, isInit = false): PartitionContextResolved {
+	// The depth of this partition in the topology tree.
+	// 0 = root, 1 = first-level child, etc.
+	// For range partitions, 0 is the root range partition, 1 is the first-level child, etc.
+	#_depth: number | undefined = undefined;
+
+	private depth(): number {
+		if (this.#_depth !== undefined) return this.#_depth;
+
+		const pCtx = this.pCtx();
+		if (isHashPartition(pCtx)) {
+			this.#_depth = PartitionIdHelper.depth(pCtx._partitionIdBytes!);
+		} else {
+			const rangeDepth = this.kvDepth();
+			invariant(
+				rangeDepth !== undefined,
+				"fokos/partition: rangeDepth must be set on a range partition (key promotion or range split did not initialize it)",
+			);
+			this.#_depth = rangeDepth;
+		}
+		return this.#_depth;
+	}
+
+	private kvDepth(): number | undefined {
+		return this.ctx.storage.kv.get<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH);
+	}
+
+	private ensurePartitionContext(
+		pCtx: PartitionContextResolved | PartitionContextLivePartition,
+		isInit = false,
+	): PartitionContextLivePartition {
 		// Phantom-bounce guard: a range DO is born ONLY through initFromSplit (promotion creates the root,
 		// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
 		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
@@ -1173,7 +1249,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
 		this.#_partitionContext = { ...pCtx };
 		this.#_partitionContext._partitionIdBytes = undefined;
-		this.ctx.storage.kv.put<PartitionContextResolved>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
+		this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
 		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
 		return this.#_partitionContext;
 	}
@@ -1384,7 +1460,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx) ? PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) : 0,
+			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+			_internal: {
+				rangeAncestors: this.#_rangeAncestors,
+			},
 		};
 		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {
@@ -1406,7 +1486,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// parent stub (boundary rule: only DO classes and FokosDB acquire stubs) and wires the deps.
 	private async runMigration(): Promise<void> {
 		const pCtx = this.pCtx();
-		const parentCtx = this.ctx.storage.kv.get<PartitionContextResolved>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+		const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
 
 		const parentId = this.env[parentCtx.ns].idFromName(parentCtx.doName);

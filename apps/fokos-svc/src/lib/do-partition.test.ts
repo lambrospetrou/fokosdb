@@ -32,6 +32,8 @@ describe("PartitionDO - putItem / getItem", () => {
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
+				rangeDepth: 0,
+				_internal: { rangeAncestors: [] },
 			},
 		});
 	});
@@ -460,6 +462,10 @@ describe("PartitionDO - deleteItem", () => {
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
+				rangeDepth: 0,
+				_internal: {
+					rangeAncestors: [],
+				},
 			},
 		});
 	});
@@ -1776,10 +1782,16 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		// Writes via the hash partition are forwarded to the range root.
 		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range" });
 		expect(w.meta.forwardCount).toBe(1);
+		// The response must surface the serving range root's own rangeDepth/rangeAncestors (0/[] for a
+		// fresh root), not an empty/zero value from the forwarding hash partition's own context.
+		expect(w.meta.rangeDepth).toBe(0);
+		expect(w.meta._internal.rangeAncestors).toEqual([]);
 
 		// Item is in the range root.
 		const g = await rangeRootStub.getItem(rangeRootCtx, { hashKey: "alice", sortKey: "sk2" });
 		expect(g).toMatchObject({ found: true, item: { data: "in-range" } });
+		expect(g.meta.rangeDepth).toBe(0);
+		expect(g.meta._internal.rangeAncestors).toEqual([]);
 	});
 });
 
@@ -1970,7 +1982,10 @@ const RANGE_ITEM_DATA = "x".repeat(50 * 1024); // ~50 KB/item → ~21 items cros
 // Builds a range-structure leaf owning [−∞, +∞) (parent = a hash DO), migration-complete so it serves
 // locally, then writes distinct-sk items until a range split is queued. No retain-leftmost: on split it
 // becomes a pure router over N fresh children.
-async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
+async function makeQueuedRangeRoot(
+	rangeSplitN: number,
+	overrides?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>,
+): Promise<{
 	rootCtx: PartitionContextResolved;
 	rootStub: DurableObjectStub<PartitionDO>;
 	sks: string[];
@@ -1983,6 +1998,7 @@ async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
 		rangeSplitN,
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: RANGE_SPLIT_MAX_SIZE_MB },
+		...overrides,
 	});
 	const hashParentCtx = new PartitionTopologyRouterImpl(base).pickPartition(kb("alice")).partitionContext;
 	const { partitionContext: rootCtx } = resolveRangePartitionContext(hashParentCtx, kb("alice"), null, null);
@@ -1990,7 +2006,13 @@ async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
 
 	// Initialize as a ready leaf (migration complete → serves locally rather than 503).
 	await rootStub.initFromSplit(
-		{ parentPartitionContext: hashParentCtx, newPartitionContext: rootCtx, splitType: "range" },
+		{
+			parentPartitionContext: hashParentCtx,
+			newPartitionContext: rootCtx,
+			newPartitionRangeDepth: 0,
+			splitType: "range",
+			rangeAncestors: [],
+		},
 		true, // __testing__completeMigration
 	);
 
@@ -2003,6 +2025,29 @@ async function makeQueuedRangeRoot(rangeSplitN: number): Promise<{
 		if ((await rootStub.status()).splitStatus?.status === "split_queued") break;
 	}
 	return { rootCtx, rootStub, sks };
+}
+
+// Waits for a range partition's own split to finish, driving the whole subtree's migration each poll.
+async function waitForSplitCompleted(stub: DurableObjectStub<PartitionDO>): Promise<void> {
+	await vi.waitFor(
+		async () => {
+			await drainSplitTree(stub);
+			const s = await stub.status();
+			if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
+		},
+		{ timeout: 5000, interval: 100 },
+	);
+}
+
+// Writes distinct-sk items (keyed by `keyPrefix` so they land in the target's own range) into a range
+// partition until it queues a split, then drives that split to completion.
+async function splitRangePartition(stub: DurableObjectStub<PartitionDO>, ctx: PartitionContextResolved, keyPrefix: string): Promise<void> {
+	for (let i = 0; ; i++) {
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: `${keyPrefix}${String(i).padStart(4, "0")}`, data: RANGE_ITEM_DATA });
+		if ((await stub.status()).splitStatus?.status === "split_queued") break;
+		invariant(i < 200, `partition (${keyPrefix}) did not reach split_queued in time`);
+	}
+	await waitForSplitCompleted(stub);
 }
 
 describe("PartitionDO — range split", () => {
@@ -2089,6 +2134,76 @@ describe("PartitionDO — range split", () => {
 		expect(leftmost, "a leftmost child [−∞, B1) must exist").toBeDefined();
 		// The router keeps no slice: the leftmost child is a different DO than the splitting node.
 		expect(leftmost!.doName).not.toBe(rootCtx.doName);
+	});
+
+	describe("rangeAncestors / rangeDepth propagation", () => {
+		it("propagates rangeDepth and the ancestor set across two levels of splits", async () => {
+			const N = 2;
+			const { rootCtx, rootStub } = await makeQueuedRangeRoot(N);
+			await waitForSplitCompleted(rootStub);
+			const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+
+			// Every depth-1 child: rangeDepth=1, rangeAncestors=[] (matches the M1 table: depth 1 → []).
+			for (const childCtx of status.childPartitionContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				const childRead = await childStub.getItem(childCtx, {
+					hashKey: "alice",
+					sortKey: childCtx.rangePartition!.startBoundary ?? undefined,
+				});
+				expect(childRead.meta.rangeDepth).toBe(1);
+				expect(childRead.meta._internal.rangeAncestors).toEqual([]);
+			}
+
+			// A depth-2 grandchild's expected ancestor is its depth-1 parent's own boundaries, decoded to
+			// wire form. Split both the leftmost child (start=null) and a non-leftmost one (start=KeyBytes)
+			// so both the null and the decode-from-KeyBytes startBoundary paths are exercised.
+			const expectAncestor = (childCtx: PartitionContextResolved) => {
+				return {
+					depth: 1,
+					startBoundary: childCtx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined),
+					endBoundary: childCtx.rangePartition!.endBoundary ?? KeyCodec.encodeOptional(undefined),
+				};
+			};
+
+			for (const childCtx of status.childPartitionContexts) {
+				const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
+				const start = childCtx.rangePartition!.startBoundary;
+				// Keys keyed to the child's own start land inside it; '~' (0x7E) sorts after alnum so they
+				// stay >= a non-null start. The leftmost child (start=null) takes plain "aa…" keys.
+				const keyPrefix = start === null ? "aa" : `${KeyCodec.decode(start) as string}~`;
+				await splitRangePartition(childStub, childCtx, keyPrefix);
+
+				const childSplit = (await childStub.status()).splitStatus as SplitStartedOrCompleted;
+				for (const grandchildCtx of childSplit.childPartitionContexts) {
+					const grandchildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(grandchildCtx.doName));
+					expect((await grandchildStub.status()).depth).toBe(2);
+				}
+
+				// Reading through the root router surfaces the serving grandchild's own rangeDepth/rangeAncestors.
+				const g = await rootStub.getItem(rootCtx, { hashKey: "alice", sortKey: `${keyPrefix}0000` });
+				expect(g.found).toBe(true);
+				expect(g.meta.rangeDepth).toBe(2);
+				expect(g.meta._internal.rangeAncestors).toEqual([expectAncestor(childCtx)]);
+			}
+		});
+
+		it("is fully inert when rangeAncestorsConfig={fromRoot:0,fromLeaf:0}: every response has rangeAncestors:[]", async () => {
+			const N = 2;
+			const { rootCtx, rootStub } = await makeQueuedRangeRoot(N, { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 0 } });
+			await waitForSplitCompleted(rootStub);
+			const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+
+			const leftChildCtx = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null)!;
+			const leftChildStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(leftChildCtx.doName));
+			await splitRangePartition(leftChildStub, leftChildCtx, "aa");
+
+			// Depth-2 grandchild reached through the root: rangeDepth is still tracked, but rangeAncestors
+			// stays [] regardless of depth — the feature is fully inert when the config is zeroed out.
+			const g = await rootStub.getItem(rootCtx, { hashKey: "alice", sortKey: "aa0000" });
+			expect(g.found).toBe(true);
+			expect(g.meta.rangeDepth).toBe(2);
+			expect(g.meta._internal.rangeAncestors).toEqual([]);
+		});
 	});
 
 	describe("queryItems across the split range tree", () => {

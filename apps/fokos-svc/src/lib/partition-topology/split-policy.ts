@@ -2,7 +2,13 @@ import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { hashChildIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
-import { isHashPartition, type InitFromSplitOptions, type PartitionContextResolved } from "./partition-context.js";
+import {
+	isHashPartition,
+	isRangePartition,
+	PartitionContextLivePartition,
+	type InitFromSplitOptions,
+	type PartitionContextResolved,
+} from "./partition-context.js";
 import {
 	PartitionIdHelper,
 	resolveDescendantHashPartitionContext,
@@ -12,6 +18,7 @@ import {
 } from "./partition-id.js";
 import { SplitStateMachine, type SplitStatusKVItem } from "./split-state.js";
 import invariant from "../invariant.js";
+import type { RangeAncestorInfo } from "../types.js";
 
 // Re-exported here as well: the plan files SplitStatusKVItem under split-policy; it is defined
 // with the state machine that owns it in split-state.ts.
@@ -29,7 +36,15 @@ export type SplitDecisionInputs = {
 	hasInFlightPromotions: boolean;
 };
 
-export type PrepareSplitInputs = {
+export type PrepareSplitParams = {
+	/**
+	 * The depth of the partition that is preparing to split.
+	 * This is used to determine the depth of the child partitions that will be created as a result of the split.
+	 * 0 = root partition, 1 = first-level child, etc.
+	 * 0 can refer to the root range partition and the root hash partition.
+	 */
+	parentDepth: number;
+
 	/**
 	 * Range splits only: precomputed split boundaries from
 	 * PartitionStore.computeRangeSplitBoundaries (a data query, so it lives with the store).
@@ -37,6 +52,14 @@ export type PrepareSplitInputs = {
 	 * retries on a later cycle.
 	 */
 	boundaries?: KeyBytes[] | null;
+	/**
+	 * Range splits only: the SPLITTING PARENT's own currently-stored ancestor list — i.e. the
+	 * partition calling prepareSplit, not the children being created (local-state read, so it lives
+	 * with the DO — same boundary rule as `boundaries`). Combined with the parent's own depth and
+	 * boundaries, this is the input selectRangeAncestors uses to compute the children's ancestor
+	 * list. Root: [].
+	 */
+	parentRangeAncestors?: RangeAncestorInfo[];
 };
 
 /**
@@ -78,7 +101,7 @@ export interface PartitionTopologySplitter {
 	 * split, or a range split without enough items yet). The DO then performs the initFromSplit
 	 * fan-out and, on success, calls commitSplitStarted.
 	 */
-	prepareSplit(inputs: PrepareSplitInputs): InitFromSplitOptions[] | null;
+	prepareSplit(inputs: PrepareSplitParams): InitFromSplitOptions[] | null;
 
 	/**
 	 * Transitions split_queued → split_started after ALL children initialized successfully.
@@ -129,7 +152,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	#_hashTopology: HashTopology | null = null;
 
 	constructor(
-		private readonly partitionContext: PartitionContextResolved,
+		private readonly partitionContext: PartitionContextLivePartition,
 		private readonly doCtx: DurableObjectState,
 	) {
 		this.#storage = doCtx.storage;
@@ -204,7 +227,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		return null;
 	}
 
-	prepareSplit(_inputs: PrepareSplitInputs): InitFromSplitOptions[] | null {
+	prepareSplit(_inputs: PrepareSplitParams): InitFromSplitOptions[] | null {
 		const splitStatus = this.splitStatus();
 		if (!splitStatus || splitStatus.status !== "split_queued") {
 			// Already started or completed — idempotent no-op.
@@ -252,7 +275,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	 * Used by the topology cache to skip known intermediate router hops.
 	 */
 	pickDescendantHashPartition(
-		partitionContext: PartitionContextResolved,
+		partitionContext: PartitionContextLivePartition,
 		hashKey: KeyBytes,
 		relativeDepthToLeaf: number,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
@@ -268,7 +291,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	pickChildPartition(
-		partitionContext: PartitionContextResolved,
+		partitionContext: PartitionContextLivePartition,
 		hashKey: KeyBytes,
 		_sortKey?: KeyBytes,
 	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
@@ -285,8 +308,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	makeIsCorrectChildHashPartition(
-		_parentContext: PartitionContextResolved,
-		childContext: PartitionContextResolved,
+		_parentContext: PartitionContextLivePartition,
+		childContext: PartitionContextLivePartition,
 	): (hashKey: KeyBytes, sortKey?: KeyBytes) => boolean {
 		const childPartitionIdBytes = childContext._partitionIdBytes ?? Uint8Array.fromHex(childContext.partitionId);
 		const childLevel = PartitionIdHelper.depth(childPartitionIdBytes);
@@ -304,8 +327,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	recordForwardResult(
 		hashKey: KeyBytes,
-		fromCtx: PartitionContextResolved,
-		toCtx: PartitionContextResolved,
+		fromCtx: PartitionContextLivePartition,
+		toCtx: PartitionContextLivePartition,
 		responseHashDepth: number,
 	): void {
 		// This logic only makes sense for both being hash partitions.
@@ -355,7 +378,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	#splitState: SplitStateMachine;
 
 	constructor(
-		private readonly partitionContext: PartitionContextResolved,
+		private readonly partitionContext: PartitionContextLivePartition,
 		private readonly ctx: DurableObjectState,
 	) {
 		this.#storage = ctx.storage;
@@ -422,13 +445,16 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		return null;
 	}
 
-	prepareSplit(inputs: PrepareSplitInputs): InitFromSplitOptions[] | null {
+	prepareSplit(params: PrepareSplitParams): InitFromSplitOptions[] | null {
 		const splitStatus = this.splitStatus();
 		if (!splitStatus || splitStatus.status !== "split_queued") {
 			// Already started or completed — idempotent no-op.
 			return null;
 		}
 
+		if (!isRangePartition(this.partitionContext)) {
+			throw new Error("fokos/range.prepareSplit: called on a non-range partition");
+		}
 		const rp = this.partitionContext.rangePartition;
 		invariant(rp, "fokos/range.prepareSplit: missing rangePartition identity");
 		const N = this.partitionContext.rangeSplitN;
@@ -436,7 +462,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// Boundaries are a data query (PartitionStore.computeRangeSplitBoundaries); the DO passes
 		// them in. null = not enough distinct items to split into N non-empty children yet.
-		const boundaries = inputs.boundaries;
+		const boundaries = params.boundaries;
 		if (!boundaries) return null;
 		invariant(boundaries.length === N - 1, `fokos/range.prepareSplit: expected ${N - 1} boundaries, got ${boundaries.length}`);
 
@@ -444,13 +470,28 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		// (start, B1) is a brand-new DO — this node retains no slice and becomes a pure router.
 		const starts: (KeyBytes | null)[] = [rp.startBoundary, ...boundaries];
 		const ends: (KeyBytes | null)[] = [...boundaries, rp.endBoundary];
+
+		// Ancestor selection: computed once, identical for every child produced by
+		// this split, depends only on the splitting parent's own depth/ancestors/boundaries.
+		const parentAncestors = params.parentRangeAncestors ?? [];
+		const parentAsAncestor: RangeAncestorInfo = {
+			depth: params.parentDepth,
+			startBoundary: rp.startBoundary ?? KeyCodec.encodeOptional(undefined),
+			endBoundary: rp.endBoundary ?? KeyCodec.encodeOptional(undefined),
+		};
+		const config = this.partitionContext.rangeAncestorsConfig;
+		const childAncestors = selectRangeAncestors(params.parentDepth, parentAncestors, parentAsAncestor, config);
+		const childDepth = params.parentDepth + 1;
+
 		const childInits: InitFromSplitOptions[] = [];
 		for (let i = 0; i < N; i++) {
 			const { partitionContext: childCtx } = resolveRangePartitionContext(this.partitionContext, rp.hashKey, starts[i], ends[i]);
 			childInits.push({
-				parentPartitionContext: this.partitionContext,
-				newPartitionContext: childCtx,
 				splitType: "range",
+				parentPartitionContext: this.partitionContext,
+				newPartitionContext: { ...childCtx },
+				newPartitionRangeDepth: childDepth,
+				rangeAncestors: childAncestors,
 			});
 		}
 		const uniqueNames = new Set(childInits.map((c) => c.newPartitionContext.doName));
@@ -510,4 +551,32 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	): void {
 		return;
 	}
+}
+
+/**
+ * Selects the bounded ancestor set a splitting range partition passes to its children.
+ * shallowest `fromRoot` + deepest `fromLeaf` of the parent's own candidate list
+ * (parent's stored ancestors plus the parent itself), deduped by depth.
+ * Called once per split — identical for every child produced by that split.
+ */
+export function selectRangeAncestors(
+	parentDepth: number,
+	parentAncestors: RangeAncestorInfo[],
+	parentAsAncestor: RangeAncestorInfo,
+	config: { fromRoot: number; fromLeaf: number },
+): RangeAncestorInfo[] {
+	const candidates = parentDepth === 0 ? [] : [...parentAncestors, parentAsAncestor];
+
+	// Candidates are already sorted by depth ascending (parentAncestors is stored sorted, and
+	// parentAsAncestor.depth === parentDepth is strictly greater than every stored ancestor's depth).
+	const shallowest = candidates.slice(0, config.fromRoot);
+	// Must NOT use candidates.slice(-fromLeaf): slice(-0) === slice(0), which would return the
+	// entire array instead of [] when fromLeaf === 0.
+	const deepest = candidates.slice(Math.max(0, candidates.length - config.fromLeaf));
+
+	const byDepth = new Map<number, RangeAncestorInfo>();
+	for (const c of [...shallowest, ...deepest]) {
+		byDepth.set(c.depth, c);
+	}
+	return [...byDepth.values()].sort((a, b) => a.depth - b.depth);
 }

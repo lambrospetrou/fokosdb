@@ -340,3 +340,54 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 		});
 	});
 });
+
+describe("PartitionStore - range_hierarchy", () => {
+	it("returns [] when no rows are stored", async () => {
+		await withStore((store) => {
+			expect(store.getRangeAncestors(10)).toEqual([]);
+		});
+	});
+
+	it("setRangeAncestors([]) is a no-op (does not throw on a zero-tuple INSERT)", async () => {
+		await withStore((store) => {
+			expect(() => store.setRangeAncestors([])).not.toThrow();
+			expect(store.getRangeAncestors(10)).toEqual([]);
+		});
+	});
+
+	it("round-trips a populated set, ordered by depth ascending", async () => {
+		await withStore((store) => {
+			store.setRangeAncestors([
+				{ depth: 2, startBoundary: kb("b2"), endBoundary: kb("e2") },
+				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
+			]);
+			expect(store.getRangeAncestors(10)).toEqual([
+				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
+				{ depth: 2, startBoundary: kb("b2"), endBoundary: kb("e2") },
+			]);
+		});
+	});
+
+	it("round-trips Uint8Array boundaries", async () => {
+		await withStore((store) => {
+			const bin = new Uint8Array([1, 2, 3]);
+			store.setRangeAncestors([{ depth: 1, startBoundary: kb(bin), endBoundary: KeyCodec.encodeOptional(undefined) }]);
+			const got = store.getRangeAncestors(10);
+			const decodedBin = KeyCodec.decode(got[0].startBoundary);
+			expect(got).toHaveLength(1);
+			expect(decodedBin).toBeInstanceOf(Uint8Array);
+			expect(decodedBin).toEqual(bin);
+			expect(got[0].endBoundary).toEqual(KeyCodec.encodeOptional(undefined));
+		});
+	});
+
+	it("excludes rows at or beyond ownDepth (future-proofing for descendant-side entries)", async () => {
+		await withStore((store) => {
+			store.setRangeAncestors([
+				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
+				{ depth: 5, startBoundary: kb("b5"), endBoundary: kb("e5") },
+			]);
+			expect(store.getRangeAncestors(5)).toEqual([{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) }]);
+		});
+	});
+});

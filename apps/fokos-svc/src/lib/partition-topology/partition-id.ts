@@ -68,7 +68,6 @@ export function resolveRangePartitionContext(
 			doName: doName!,
 			primaryDoIdStr: doId.toString(),
 			partitionId: opaque,
-			_partitionIdBytes: undefined,
 			rangePartition: { hashKey, startBoundary, endBoundary },
 		},
 	};
