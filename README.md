@@ -22,30 +22,40 @@ Once there is a stable version ready, I will properly refactor the directory str
 
 No particular order.
 
-- Expose an RPC/API to trigger a manual split.
-- Define the data type (JSON serializable object, raw bytes). JSON serializable can provide property filtering and other SQLite JSON functions support.
-- Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
+### Performance and Reliability
+
 - Update partial range topology within each partition to maintain also range boundaries to skip forwards in range partitions.
+- Optimize the range partition splitting (25% of total space instead of 50%, and see if there is a way to go straight to N partitions vs copying to root range).
+- Create RpcTargets for the partition DOs and LRU cache them in the Worker to skip the getActor calls and go directly to the partition DOs.
+- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
+- Add topology keeper and encoding. Schema and versioning per change (split).
+- Add optimization for single-partition transactions to not do 2PC.
+- Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
+- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
+- Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
+- Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
+- Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
+
+### Features
+
+- Expose an RPC/API to trigger a manual split.
+- Add partition DO location info in the response (`colo` and country `loc` from <https://www.cloudflare.com/cdn-cgi/trace>, `loc` is the 2-letter country code: https://www.iso.org/obp/ui/#search).
+- Define the data type (JSON serializable object, raw bytes). JSON serializable can provide property filtering and other SQLite JSON functions support.
+- Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root, but it could impact availability).
+- Add jurisdictions support.
 - Proper structured errors thrown to differentiate user vs server errors.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Enforce the expiration ttl for items.
 - Batch item operations (non-transactions).
-- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Allow check conditions and filter conditions on any attribute if the data is JSON.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
 - Add global eventual indexes (DynamoDB GSIs).
 - Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
-- Add topology keeper and encoding. Schema and versioning per change (split).
 - Think about backups and export in a consistent fashion.
 - User provided code running inside the DO for N+1 operations. ONLY for library or self-hosted mode where the user controls the Durable Object class used, otherwise we would need Dynamic Workers and the `pipe()` operator.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
-- Add optimization for single-partition transactions to not do 2PC.
-- Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
-- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
-- Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
-- Extend the split/migration flow to also allow writes while migration in-progress. Not needed once we use DO Snapshot API.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
 - Support large items through R2.
 - Support CASPaxosDO for the data partitions for multi-region availability. Use Paxos Commit and CAS Paxos for the topology keeper for higher availability (speed is no issue).
