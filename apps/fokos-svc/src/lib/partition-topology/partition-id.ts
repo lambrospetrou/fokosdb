@@ -54,7 +54,7 @@ function rangePartitionDoName(tableName: string, hashKey: KeyBytes, startBoundar
 // Resolves a PartitionContextResolved for a range-structure DO (root or child).
 // Same return shape as pickPartition / pickChildPartition so callers can use the result uniformly.
 export function resolveRangePartitionContext(
-	base: PartitionContextResolved,
+	base: PartitionContext,
 	hashKey: KeyBytes,
 	startBoundary: KeyBytes | null,
 	endBoundary: KeyBytes | null,
