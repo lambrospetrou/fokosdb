@@ -18,7 +18,7 @@ import {
 } from "./partition-id.js";
 import { SplitStateMachine, type SplitStatusKVItem } from "./split-state.js";
 import invariant from "../invariant.js";
-import type { RangeAncestorInfo } from "../types.js";
+import type { PartitionInfo, RangeAncestorInfo } from "../types.js";
 
 // Re-exported here as well: the plan files SplitStatusKVItem under split-policy; it is defined
 // with the state machine that owns it in split-state.ts.
@@ -126,7 +126,7 @@ export interface PartitionTopologySplitter {
 		hashKey: KeyBytes,
 		fromCtx: PartitionContextResolved,
 		toCtx: PartitionContextResolved,
-		responseHashDepth: number,
+		responsePartitionInfo: PartitionInfo,
 	): void;
 
 	/**
@@ -329,7 +329,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		hashKey: KeyBytes,
 		fromCtx: PartitionContextLivePartition,
 		toCtx: PartitionContextLivePartition,
-		responseHashDepth: number,
+		responsePartitionInfo: PartitionInfo,
 	): void {
 		// This logic only makes sense for both being hash partitions.
 		// FIXME Support learning during when a hash partition forwards to a range partition,
@@ -349,6 +349,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		// if the target partition is itself a router that forwarded further.
 		// It could also be the case that the target hash partition forwarded to a range partition,
 		// and in that case the responseHashDepth would be equal to the target partition depth.
+		const responseHashDepth = responsePartitionInfo.hashDepth;
 		invariant(
 			responseHashDepth >= toAbsDepth,
 			`fokos/topology.recordForwardResult: responseHashDepth must be >= toAbsDepth, got responseHashDepth ${responseHashDepth} and toAbsDepth ${toAbsDepth}`,
@@ -547,7 +548,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		_hashKey: KeyBytes,
 		_fromCtx: PartitionContextResolved,
 		_toCtx: PartitionContextResolved,
-		_responseHashDepth: number,
+		_responsePartitionInfo: PartitionInfo,
 	): void {
 		return;
 	}

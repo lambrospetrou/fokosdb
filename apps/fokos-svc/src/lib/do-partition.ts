@@ -1359,7 +1359,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[ctx.ns].get(doId);
 				const result = await forward(stub, partitionContext);
-				topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta.hashDepth);
+				topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta);
 
 				if (isHashPartition(ctx) && PartitionIdHelper.isRangePartition(result.meta.servedByPartitionId)) {
 					const prt = this.getOrCreatePartialRangeTopology();
