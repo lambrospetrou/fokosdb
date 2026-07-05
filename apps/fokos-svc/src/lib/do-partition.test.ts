@@ -10,6 +10,7 @@ import { HashPartitionTopologyImpl, RANGE_PROMOTION_FRACTION } from "./partition
 import type { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import { KeyBytes, KeyCodec } from "./partition-topology/key-codec.js";
 import invariant from "./invariant.js";
+import { PartitionStore } from "./partition/partition-store.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -1070,7 +1071,7 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
 			});
 			invariant(topology!, "topology should be initialized in the DO instance");
 
@@ -1099,7 +1100,7 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
 			});
 			invariant(topology!, "topology should be initialized in the DO instance");
 
@@ -1125,7 +1126,7 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
 			});
 			invariant(topology!, "topology should be initialized in the DO instance");
 
@@ -1476,7 +1477,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		});
 		let topology: HashPartitionTopologyImpl;
 		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			topology = new HashPartitionTopologyImpl(pCtx, ctx);
+			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage));
 		});
 		invariant(topology!, "topology should be initialized in the DO instance");
 		const hashKey = "routing-consistency-key";
@@ -1512,7 +1513,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		let topology: HashPartitionTopologyImpl;
 		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			topology = new HashPartitionTopologyImpl(pCtx, ctx);
+			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage));
 		});
 		invariant(topology!, "topology should be initialized in the DO instance");
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
@@ -2183,7 +2184,9 @@ describe("PartitionDO — range split", () => {
 				const g = await rootStub.getItem(rootCtx, { hashKey: "alice", sortKey: `${keyPrefix}0000` });
 				expect(g.found).toBe(true);
 				expect(g.meta.rangeDepth).toBe(2);
-				expect(g.meta._internal.rangeAncestors).toEqual([expectAncestor(childCtx)]);
+				expect(g.meta._internal.rangeAncestors[0]).toEqual(expectAncestor(childCtx));
+				// The last ancestor is the grandchild itself.
+				expect(g.meta._internal.rangeAncestors).toHaveLength(2);
 			}
 		});
 
@@ -2374,7 +2377,7 @@ describe("PartitionDO — range split", () => {
 			});
 			let topology: HashPartitionTopologyImpl;
 			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx);
+				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
 			});
 			invariant(topology!, "topology should be initialized in the DO instance");
 

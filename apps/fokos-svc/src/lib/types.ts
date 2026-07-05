@@ -97,14 +97,19 @@ export type PartitionInfo = {
 	 * The number of times the request was forwarded between partitions before reaching the final partition that served it.
 	 */
 	forwardCount: number;
+
 	/**
 	 * The depth of the hash partition in the partition topology tree. Root partitions have depth 0, their children have depth 1, and so on.
 	 * Will be zero for range partitions since they don't have a depth in the hash partition tree,
 	 * but can be useful for debugging and monitoring the partition topology.
+	 *
+	 * ONLY FOR DEBUGGING PURPOSES: This is not a stable API and may change in future versions. Clients should not rely on this value for any logic.
 	 */
 	hashDepth: number;
 	/**
 	 * This range partition's own depth (root = 0). Always 0 for hash partitions (mirrors hashDepth's 0-for-range convention).
+	 *
+	 * ONLY FOR DEBUGGING PURPOSES: This is not a stable API and may change in future versions. Clients should not rely on this value for any logic.
 	 */
 	rangeDepth: number;
 
@@ -114,7 +119,8 @@ export type PartitionInfo = {
 
 	_internal: {
 		/**
-		 * Bounded set of this range partition's ancestor boundaries (excludes root and self). Always empty for hash partitions.
+		 * Bounded set of this range partition's ancestor boundaries (excludes root) including self (last).
+		 * Always empty for hash partitions.
 		 */
 		rangeAncestors: RangeAncestorInfo[];
 	};

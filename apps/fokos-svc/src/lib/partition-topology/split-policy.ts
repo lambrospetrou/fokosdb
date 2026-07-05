@@ -3,6 +3,7 @@ import { hashChildIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
 import {
+	assertCtxHasIdBytes,
 	isHashPartition,
 	isRangePartition,
 	PartitionContextLivePartition,
@@ -19,6 +20,7 @@ import {
 import { SplitStateMachine, type SplitStatusKVItem } from "./split-state.js";
 import invariant from "../invariant.js";
 import type { PartitionInfo, RangeAncestorInfo } from "../types.js";
+import { PartitionStore } from "../partition/partition-store.js";
 
 // Re-exported here as well: the plan files SplitStatusKVItem under split-policy; it is defined
 // with the state machine that owns it in split-state.ts.
@@ -147,14 +149,16 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		SPLIT_STATUS: "__split_status",
 	};
 
+	private partitionContext: PartitionContextLivePartition;
+
 	#storage: DurableObjectStorage;
 	#splitState: SplitStateMachine;
+	#partitionStore: PartitionStore;
 	#_hashTopology: HashTopology | null = null;
 
-	constructor(
-		private readonly partitionContext: PartitionContextLivePartition,
-		private readonly doCtx: DurableObjectState,
-	) {
+	constructor(partitionContext: PartitionContextLivePartition, doCtx: DurableObjectState, partitionStore: PartitionStore) {
+		this.partitionContext = partitionContext;
+		this.#partitionStore = partitionStore;
 		this.#storage = doCtx.storage;
 		this.#splitState = new SplitStateMachine(doCtx.storage, HashPartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
@@ -331,6 +335,13 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		toCtx: PartitionContextLivePartition,
 		responsePartitionInfo: PartitionInfo,
 	): void {
+		if (responsePartitionInfo._internal.rangeAncestors.length > 0) {
+			// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
+			for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
+				this.#partitionStore.insertRangePartitionBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
+			}
+		}
+
 		// This logic only makes sense for both being hash partitions.
 		// FIXME Support learning during when a hash partition forwards to a range partition,
 		// which can happen with promoted hash keys.
@@ -377,13 +388,17 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 	#storage: DurableObjectStorage;
 	#splitState: SplitStateMachine;
+	#partitionStore: PartitionStore;
 
-	private partitionContext: PartitionContextLivePartition & { rangePartition: Required<PartitionContextLivePartition["rangePartition"]> };
+	private partitionContext: PartitionContextLivePartition & {
+		rangePartition: NonNullable<PartitionContextLivePartition["rangePartition"]>;
+	};
 
-	constructor(pCtx: PartitionContextLivePartition, ctx: DurableObjectState) {
+	constructor(pCtx: PartitionContextLivePartition, ctx: DurableObjectState, partitionStore: PartitionStore) {
 		invariant(isRangePartition(pCtx), "fokos/topology: RangePartitionTopologyImpl must be initialized with a range partition context");
 		this.partitionContext = pCtx;
 		this.#storage = ctx.storage;
+		this.#partitionStore = partitionStore;
 		this.#splitState = new SplitStateMachine(ctx.storage, RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 	}
 
@@ -546,11 +561,28 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	recordForwardResult(
-		_hashKey: KeyBytes,
+		hashKey: KeyBytes,
 		_fromCtx: PartitionContextResolved,
 		_toCtx: PartitionContextResolved,
-		_responsePartitionInfo: PartitionInfo,
+		responsePartitionInfo: PartitionInfo,
 	): void {
+		// TODO(perf) Remove for optimization.
+		invariant(
+			KeyCodec.compare(hashKey, this.partitionContext.rangePartition.hashKey) === 0,
+			"fokos/range.recordForwardResult: hashKey mismatch",
+		);
+
+		// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
+		for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
+			this.#partitionStore.insertRangePartitionBoundary(
+				// TODO: We can optimize this by inserting an empty hash key since this range partition tree is about a single hash key.
+				this.partitionContext.rangePartition.hashKey,
+				ancestor.startBoundary,
+				ancestor.endBoundary,
+				ancestor.depth,
+			);
+		}
+
 		return;
 	}
 }

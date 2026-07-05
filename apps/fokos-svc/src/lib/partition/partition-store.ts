@@ -883,4 +883,14 @@ export class PartitionStore {
 			.toArray()
 			.map((r) => ({ depth: r.depth, startBoundary: fromSqlKey(r.sk_start_boundary), endBoundary: fromSqlKey(r.sk_end_boundary) }));
 	}
+
+	insertRangePartitionBoundary(hk: KeyBytes, startBoundary: KeyBytes, endBoundary: KeyBytes, depth: number): void {
+		this.#storage.sql.exec(
+			`INSERT OR IGNORE INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
+			hk,
+			depth,
+			startBoundary,
+			endBoundary,
+		);
+	}
 }

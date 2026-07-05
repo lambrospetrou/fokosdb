@@ -198,8 +198,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
 				this.#_partitionContext = pCtx;
 
-				if (isRangePartition(pCtx)) {
-					this.#_rangeAncestors = this.#store.getRangeAncestors(this.depth());
+				if (isRangePartition(pCtx) && this.depth() > 0) {
+					// Append non-root "self".
+					this.#_rangeAncestors = this.#store.getRangeAncestors(this.depth()).concat({
+						depth: this.depth(),
+						startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
+						endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
+					});
 				}
 
 				const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
@@ -217,7 +222,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * This is not meant to be called directly by clients.
 	 */
 	async initFromSplit(opts: InitFromSplitOptions, __testing__completeMigration?: boolean, __testing__splitStatus?: SplitStatusKVItem) {
-		const { parentPartitionContext, newPartitionContext, splitType } = opts;
+		const { parentPartitionContext, newPartitionContext, newPartitionRangeDepth, splitType } = opts;
 
 		if (this.#_partitionContext) {
 			const storedParent = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
@@ -240,20 +245,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		this.ctx.storage.transactionSync(() => {
 			const pCtx = this.ensurePartitionContext(opts.newPartitionContext, /* isInit */ true);
-			if (opts.rangeAncestors) {
-				this.#store.setRangeAncestors(opts.rangeAncestors);
-				this.#_rangeAncestors = opts.rangeAncestors;
-			}
 			this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 			this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
 
 			if (isRangePartition(pCtx)) {
-				invariant(
-					opts.newPartitionRangeDepth !== undefined,
-					"fokos/partition: newPartitionRangeDepth must be provided for range partitions",
-				);
-				this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, opts.newPartitionRangeDepth);
+				invariant(newPartitionRangeDepth !== undefined, "fokos/partition: newPartitionRangeDepth must be provided for range partitions");
+				this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, newPartitionRangeDepth);
+
+				if (opts.rangeAncestors && opts.rangeAncestors.length > 0) {
+					invariant(newPartitionRangeDepth > 0, "fokos/partition: rangeAncestors should only be set for non-root range partitions");
+					this.#store.setRangeAncestors(opts.rangeAncestors);
+					// Append non-root "self".
+					this.#_rangeAncestors = opts.rangeAncestors.concat({
+						depth: newPartitionRangeDepth,
+						startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
+						endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
+					});
+				}
 			}
 			this.depth(); // populate #_depth
 
@@ -1250,8 +1259,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
-				? new RangePartitionTopologyImpl(pCtx, this.ctx)
-				: new HashPartitionTopologyImpl(pCtx, this.ctx);
+				? new RangePartitionTopologyImpl(pCtx, this.ctx, this.#store)
+				: new HashPartitionTopologyImpl(pCtx, this.ctx, this.#store);
 		}
 		return this.#_topology;
 	}
