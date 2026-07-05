@@ -378,10 +378,11 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	#storage: DurableObjectStorage;
 	#splitState: SplitStateMachine;
 
-	constructor(
-		private readonly partitionContext: PartitionContextLivePartition,
-		private readonly ctx: DurableObjectState,
-	) {
+	private partitionContext: PartitionContextLivePartition & { rangePartition: Required<PartitionContextLivePartition["rangePartition"]> };
+
+	constructor(pCtx: PartitionContextLivePartition, ctx: DurableObjectState) {
+		invariant(isRangePartition(pCtx), "fokos/topology: RangePartitionTopologyImpl must be initialized with a range partition context");
+		this.partitionContext = pCtx;
 		this.#storage = ctx.storage;
 		this.#splitState = new SplitStateMachine(ctx.storage, RangePartitionTopologyImpl.KV_KEYS.SPLIT_STATUS);
 	}

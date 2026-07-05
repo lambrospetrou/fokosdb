@@ -72,6 +72,12 @@ export type PartitionContextLivePartition = PartitionContextResolved & {
 	_partitionIdBytes?: Uint8Array;
 };
 
+export function assertCtxHasIdBytes(
+	pCtx: PartitionContextLivePartition,
+): asserts pCtx is PartitionContextLivePartition & { _partitionIdBytes: Uint8Array } {
+	invariant(pCtx._partitionIdBytes != null, `fokos: partition context _partitionIdBytes not initialized`);
+}
+
 export type SplitConditions = {
 	/**
 	 * The maximum size of the partition in megabytes before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.

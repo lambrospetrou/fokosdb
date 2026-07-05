@@ -24,6 +24,7 @@ import type {
 import {
 	areImmutableOptionsEqual,
 	areMutableOptionsEqual,
+	assertCtxHasIdBytes,
 	isHashPartition,
 	isRangePartition,
 	pCtxForLog,
@@ -73,20 +74,6 @@ import {
 	type SkInterval,
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
-
-function isPhantomBounceError(e: unknown): boolean {
-	return e instanceof Error && e.message.includes("phantom-bounce");
-}
-
-function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
-	let rowsRead = 0;
-	let rowsWritten = 0;
-	for (const r of results) {
-		rowsRead += r.rowsRead;
-		rowsWritten += r.rowsWritten;
-	}
-	return { rowsRead, rowsWritten };
-}
 
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
@@ -164,6 +151,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private static readonly STALE_TX_MS = 5_000;
 	private static readonly MIGRATION_FALLBACK_ALARM_MS = 10_000;
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
+
+	private readonly STRING_PCTX_INIT_ERROR = `fokos/partition: partition context not initialized for ${this.ctx.id.toString()}[${this.ctx.id.name}]`;
 
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
@@ -426,7 +415,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			if (isHashPartition(pCtx)) {
 				return {
 					...result,
-					meta: { ...result.meta, hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) },
+					meta: { ...result.meta, hashDepth: this.depth() },
 				};
 			}
 			return result;
@@ -458,7 +447,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const parentStub = this.env[parentCtx.ns].get(parentId) as PartitionDOStub;
 			const result = await parentStub.queryItemsDirect(req);
 			if (isHashPartition(pCtx)) {
-				const myDepth = PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!);
+				const myDepth = this.depth();
 				return { ...result, meta: { ...result.meta, hashDepth: myDepth } };
 			}
 			return result;
@@ -1179,13 +1168,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return k === undefined ? KeyCodec.encodeOptional(undefined) : PartitionDO.keyIn(k);
 	}
 
-	private pCtx(): PartitionContextLivePartition {
-		invariant(
-			this.#_partitionContext,
-			// FIXME Optimize this to be statically generated once only since we call pCtx() often.
-			`fokos/partition: partition context not initialized for ${this.ctx.id.toString()}[${this.ctx.id.name}]`,
-		);
-		return this.#_partitionContext;
+	private pCtx(): PartitionContextLivePartition & { _partitionIdBytes: Uint8Array } {
+		const pCtx = this.#_partitionContext;
+		invariant(pCtx, this.STRING_PCTX_INIT_ERROR);
+		assertCtxHasIdBytes(pCtx);
+		return pCtx;
 	}
 
 	// The depth of this partition in the topology tree.
@@ -1198,7 +1185,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		const pCtx = this.pCtx();
 		if (isHashPartition(pCtx)) {
-			this.#_depth = PartitionIdHelper.depth(pCtx._partitionIdBytes!);
+			this.#_depth = PartitionIdHelper.depth(pCtx._partitionIdBytes);
 		} else {
 			const rangeDepth = this.kvDepth();
 			invariant(
@@ -1300,7 +1287,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			meta: {
 				...result.meta,
 				forwardCount: result.meta.forwardCount + 1,
-				...(isHashPartition(ctx) ? { hashDepth: PartitionIdHelper.depth(this.pCtx()._partitionIdBytes!) } : {}),
+				...(isHashPartition(ctx) ? { hashDepth: this.depth() } : {}),
 			},
 		} as T;
 	}
@@ -1794,4 +1781,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			partitionContext: pCtxForLog(this.#_partitionContext),
 		};
 	}
+}
+
+function isPhantomBounceError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes("phantom-bounce");
+}
+
+function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {
+	let rowsRead = 0;
+	let rowsWritten = 0;
+	for (const r of results) {
+		rowsRead += r.rowsRead;
+		rowsWritten += r.rowsWritten;
+	}
+	return { rowsRead, rowsWritten };
 }
