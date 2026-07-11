@@ -407,53 +407,113 @@ export class PartitionStore {
 		return this.#storage.sql.exec(`SELECT 1 FROM items WHERE hk = ? LIMIT 1`, hk).toArray().length > 0;
 	}
 
-	// Computes N-1 strictly-increasing split boundaries (count-quantiles) within [start, end) in one
-	// transactionSync snapshot. Returns null if there are fewer than N items (so every child stays non-empty).
-	// Each boundary is shortened to the minimum prefix that still separates adjacent data keys (the
-	// "shortest separator" of the predecessor and boundary key), keeping doNames and topology encoding compact.
-	// A data query on the items table — it lives with the store; the DO passes the result into the
-	// range split policy's prepareSplit.
+	/**
+	 * Computes N-1 strictly-increasing split boundaries (byte-quantiles) within [start, end) in one
+	 * transactionSync snapshot. Returns null if the slice cannot yield N non-empty children.
+	 *
+	 * Each boundary is shortened to the minimum prefix that still separates adjacent data keys (the
+	 * "shortest separator" of the predecessor and crossing key), keeping doNames and topology encoding
+	 * compact. A data query on the items table — it lives with the store; the DO passes the result into
+	 * the range split policy's prepareSplit.
+	 *
+	 * Assumes the caller (do-partition startSplit) passes this partition's own [start, end) ownership,
+	 * so the slice being split == all items this DO holds for `hashKey`. That is why the O(1) whole-key
+	 * est_bytes total is a valid byte basis: a splitting parent owns its entire slice and its children
+	 * pull sub-slices during migration, so est_bytes[hk] equals the slice's bytes. The start/end SQL
+	 * filter is retained as a defensive bound on the scan.
+	 */
 	computeRangeSplitBoundaries(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): KeyBytes[] | null {
+		// Rather than a COUNT(*) pass plus N-1 OFFSET re-walks (~2.5·cnt row touches, all count-balanced),
+		// this reads the O(1) est_bytes total and does a single early-stopping streaming scan that emits a
+		// boundary each time the running est_row_bytes total crosses the next byte threshold, breaking after
+		// the (N-1)th boundary (~0.75·cnt at N=4). Byte-balance — not count-balance — is the right metric
+		// because the split is triggered by size; it also isolates a heavy row into its own child.
 		return this.#storage.transactionSync(() => {
 			const lower = start ?? KeyCodec.encodeOptional(undefined); // −∞ ⇒ sk >= x'' (the empty sentinel)
-			const cntRow =
+
+			// Total bytes in O(1) from the maintained per-hk estimate. Nothing to split ⇒ null.
+			const B =
+				this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey).toArray()[0]
+					?.est_bytes ?? 0;
+			if (B <= 0) return null;
+
+			// Cheap "≥ N items" guard, O(N) not O(cnt): each child needs ≥ 1 item, so probe with a bounded
+			// count rather than a full pass. Fewer than N items ⇒ cannot split into N non-empty children.
+			const guardRow =
 				end === null
-					? this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ?`, hashKey, lower).toArray()[0]
+					? this.#storage.sql
+							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? LIMIT ?)`, hashKey, lower, N)
+							.toArray()[0]
 					: this.#storage.sql
-							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ? AND sk >= ? AND sk < ?`, hashKey, lower, end)
+							.exec<{
+								n: number;
+							}>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? AND sk < ? LIMIT ?)`, hashKey, lower, end, N)
 							.toArray()[0];
-			const cnt = cntRow?.n ?? 0;
-			if (cnt < N) return null; // need ≥ N items so each of the N children gets ≥ 1
+			if ((guardRow?.n ?? 0) < N) {
+				console.warn({
+					message: "fokos/partition-store.computeRangeSplitBoundaries: cannot split, fewer than N items",
+					hashKey: KeyCodec.keyForLog(hashKey),
+					start: start ? KeyCodec.keyForLog(start) : null,
+					end: end ? KeyCodec.keyForLog(end) : null,
+					N,
+					itemCount: guardRow?.n ?? 0,
+				});
+				return null;
+			}
+
+			// Single streaming scan, accumulating est_row_bytes and emitting a boundary at each byte threshold.
+			const step = B / N;
+			const cursor =
+				end === null
+					? this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
+							`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? ORDER BY sk`,
+							hashKey,
+							lower,
+						)
+					: this.#storage.sql.exec<{ sk: ArrayBuffer; est_row_bytes: number }>(
+							`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk`,
+							hashKey,
+							lower,
+							end,
+						);
 
 			const boundaries: KeyBytes[] = [];
-			for (let i = 1; i < N; i++) {
-				const offset = Math.floor((cnt * i) / N);
-				// Fetch the predecessor (offset - 1) and the boundary key (offset) in one scan.
-				// offset >= 1 always because cnt >= N guarantees floor(cnt * 1 / N) >= 1.
-				const rows = (
-					end === null
-						? this.#storage.sql
-								.exec<{
-									sk: ArrayBuffer;
-								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, offset - 1)
-								.toArray()
-						: this.#storage.sql
-								.exec<{
-									sk: ArrayBuffer;
-								}>(`SELECT sk FROM items WHERE hk = ? AND sk >= ? AND sk < ? ORDER BY sk LIMIT 2 OFFSET ?`, hashKey, lower, end, offset - 1)
-								.toArray()
-				).map((r) => fromSqlKey(r.sk));
-				invariant(
-					rows.length === 2,
-					"fokos/range.computeRangeSplitBoundaries: expected predecessor + boundary rows at the computed offset",
-				);
-				// Byte-space separator: the boundary's UTF-8 position now matches the SQL scans that migrate the data.
-				boundaries.push(KeyCodec.shortestSeparator(rows[0], rows[1]));
+			let acc = 0;
+			let threshold = step;
+			let prev: KeyBytes | null = null;
+			for (const row of cursor) {
+				const sk = fromSqlKey(row.sk);
+				acc += row.est_row_bytes;
+				// prev !== null: the first row can never be a boundary, so child 0 always owns ≥ 1 row.
+				if (prev !== null && acc >= threshold && boundaries.length < N - 1) {
+					// Byte-space separator: the boundary's UTF-8 position matches the SQL scans that migrate the data.
+					// The crossing row (sk) falls into the upper child; prev is its predecessor.
+					boundaries.push(KeyCodec.shortestSeparator(prev, sk));
+					// Relative bump (acc + step, not threshold += step): if one oversized row pushes acc past
+					// several thresholds at once, we still emit only one boundary and re-anchor here, so no two
+					// boundaries land on the same adjacent-key pair. Also guarantees ≥ 1 row per child.
+					threshold = acc + step;
+					if (boundaries.length === N - 1) break;
+				}
+				prev = sk;
 			}
-			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty children).
+
+			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty
+			// children). On skewed data the scan may yield fewer than N-1 boundaries; treat any shortfall or
+			// validation failure as "cannot split yet" and return null (the split retries later). This
+			// is the safety net that makes estimate inaccuracy harmless.
+			if (boundaries.length !== N - 1) return null;
 			for (let i = 0; i < boundaries.length; i++) {
-				if (KeyCodec.compare(boundaries[i], lower) <= 0) return null;
-				if (i > 0 && KeyCodec.compare(boundaries[i], boundaries[i - 1]) <= 0) return null;
+				invariant(
+					KeyCodec.compare(boundaries[i], lower) > 0,
+					`fokos/partition-store.computeRangeSplitBoundaries: boundary is not above lower bound`,
+				);
+				if (i > 0) {
+					invariant(
+						KeyCodec.compare(boundaries[i], boundaries[i - 1]) > 0,
+						`fokos/partition-store.computeRangeSplitBoundaries: boundaries are not strictly increasing`,
+					);
+				}
 			}
 			return boundaries;
 		});

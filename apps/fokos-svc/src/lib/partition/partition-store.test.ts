@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../do-partition.js";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import { estimateRowBytes, PartitionStore } from "./partition-store.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
@@ -245,12 +245,14 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 		});
 	});
 
-	it("N=2: returns the shortest separator between the two halves", async () => {
+	it("N=2: emits a boundary at the byte midpoint (crossing row goes to the upper child)", async () => {
 		await withStore((store) => {
-			// 4 items; boundary at offset floor(4/2)=2 → predecessor="cherry", boundary="mango"
-			// shortestSeparator("cherry","mango"): 'c'!='m' at i=0 → "m"
+			// 4 equal-size items; total bytes B, step = B/2. Accumulating est_row_bytes: after "apple"
+			// acc ≈ B/4 (< step); "cherry" tips acc over B/2, so the boundary lands between "apple" and
+			// "cherry" (the crossing row "cherry" falls into the upper child).
+			// shortestSeparator("apple","cherry"): 'a'!='c' at i=0 → "c".
 			put(store, "hk", "apple", "cherry", "mango", "peach");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("m")]);
+			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 2)).toEqual([kb("c")]);
 		});
 	});
 
@@ -280,23 +282,22 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 		});
 	});
 
-	it("N=3: produces two strictly-increasing shortened boundaries", async () => {
+	it("N=3: produces two strictly-increasing shortened byte-quantile boundaries", async () => {
 		await withStore((store) => {
-			// 6 items; boundary1 at offset 2, boundary2 at offset 4
-			// sorted: "aardvark","cherry","mango","strawberry","vanilla","zebra"
-			// b1: predecessor="cherry", boundary="mango" → shortestSeparator → "m"
-			// b2: predecessor="strawberry", boundary="vanilla" → shortestSeparator → "v"
+			// 6 roughly-equal items; step = B/3. sorted: "aardvark","cherry","mango","strawberry","vanilla","zebra"
+			// b1: "cherry" tips acc over B/3 → shortestSeparator("aardvark","cherry") → "c"
+			// b2: "strawberry" tips acc over 2·B/3 → shortestSeparator("mango","strawberry") → "s"
 			put(store, "hk", "aardvark", "cherry", "mango", "strawberry", "vanilla", "zebra");
-			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toEqual([kb("m"), kb("v")]);
+			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toEqual([kb("c"), kb("s")]);
 		});
 	});
 
-	it("respects start/end range bounds and excludes out-of-range items", async () => {
+	it("honors explicit start/end range bounds on the scan", async () => {
 		await withStore((store) => {
-			// All items: "apple","banana","cherry","mango","peach","strawberry"
-			// Range [banana, peach) → in-range items: "banana","cherry","mango" (3 items)
-			// N=2: boundary at offset 1 → predecessor="banana", boundary="cherry" → "c"
-			put(store, "hk", "apple", "banana", "cherry", "mango", "peach", "strawberry");
+			// A splitting range parent owns exactly its [start, end) slice, so its items == the slice and
+			// est_bytes[hk] is the slice's byte total. Here the DO holds "banana","cherry","mango" and splits
+			// [banana, peach). N=2: "cherry" tips acc over B/2 → shortestSeparator("banana","cherry") → "c".
+			put(store, "hk", "banana", "cherry", "mango");
 			expect(store.computeRangeSplitBoundaries(kb("hk"), kb("banana"), kb("peach"), 2)).toEqual([kb("c")]);
 		});
 	});
@@ -337,6 +338,78 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// Boundary must satisfy: encode(uFFFF) < boundary <= encode(emoji)
 			expect(KeyCodec.compare(kb(uFFFF), boundaries![0])).toBeLessThan(0);
 			expect(KeyCodec.compare(boundaries![0], kb(emoji))).toBeLessThanOrEqual(0);
+		});
+	});
+
+	// Buckets known sorted keys into the N children defined by `boundaries` and returns the count per child.
+	// Child i owns [b_{i-1}, b_i); mirrors the byte-space [start, end) routing the migration scans use.
+	function bucketCounts(sortedKeys: string[], boundaries: KeyBytes[]): number[] {
+		const counts = new Array(boundaries.length + 1).fill(0);
+		for (const key of sortedKeys) {
+			let child = boundaries.length; // last child unless an earlier boundary claims it
+			for (let i = 0; i < boundaries.length; i++) {
+				if (KeyCodec.compare(kb(key), boundaries[i]) < 0) {
+					child = i;
+					break;
+				}
+			}
+			counts[child]++;
+		}
+		return counts;
+	}
+
+	it("uniform rows: byte-balanced children are non-empty and roughly equal, boundaries strictly increasing", async () => {
+		await withStore((store) => {
+			// 40 equal-size rows → with N=4 each child should get ~10; byte-balance ≈ count-balance here.
+			const keys = Array.from({ length: 40 }, (_, i) => `k${String(i).padStart(3, "0")}`);
+			for (const sk of keys) {
+				store.upsertItem({ hk: kb("hk"), sk: kb(sk), data: "payload", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			}
+			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 4);
+			expect(boundaries).not.toBeNull();
+			expect(boundaries!.length).toBe(3);
+			// Strictly increasing.
+			for (let i = 1; i < boundaries!.length; i++) {
+				expect(KeyCodec.compare(boundaries![i - 1], boundaries![i])).toBeLessThan(0);
+			}
+			// Every child non-empty and within a loose band of the ideal 10.
+			const counts = bucketCounts(keys, boundaries!);
+			expect(counts.length).toBe(4);
+			for (const c of counts) {
+				expect(c).toBeGreaterThanOrEqual(5);
+				expect(c).toBeLessThanOrEqual(15);
+			}
+			expect(counts.reduce((a, b) => a + b, 0)).toBe(40);
+		});
+	});
+
+	it("one heavy row: the heavy row is isolated into its own child", async () => {
+		await withStore((store) => {
+			// 10 light rows plus one heavy row (data far larger than the light rows' combined bytes),
+			// keyed to sort last. With N=2, step = B/2 < heavy weight, so the light rows all fall below
+			// the threshold and the heavy row alone tips it over → boundary lands between them.
+			for (let i = 0; i < 10; i++) {
+				store.upsertItem({ hk: kb("hk"), sk: kb(`k${i}`), data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			}
+			store.upsertItem({ hk: kb("hk"), sk: kb("zheavy"), data: "H".repeat(5000), ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 2);
+			expect(boundaries).not.toBeNull();
+			expect(boundaries!.length).toBe(1);
+			// Boundary sits above the last light key and at/below the heavy key: lights in child 0, heavy alone in child 1.
+			expect(KeyCodec.compare(kb("k9"), boundaries![0])).toBeLessThan(0);
+			expect(KeyCodec.compare(boundaries![0], kb("zheavy"))).toBeLessThanOrEqual(0);
+		});
+	});
+
+	it("skewed data that cannot form N-1 boundaries returns null (retry contract)", async () => {
+		await withStore((store) => {
+			// A single dominant row between two light rows. With N=3 the heavy row crosses the first
+			// threshold and the relative bump pushes the next threshold past the remaining bytes, so only
+			// one boundary is emitted (< N-1) → null, and the split retries on a later cycle.
+			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toBeNull();
 		});
 	});
 });
