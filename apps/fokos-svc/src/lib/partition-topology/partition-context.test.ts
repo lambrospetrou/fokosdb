@@ -14,9 +14,9 @@ function makeOpts(overrides?: Partial<Parameters<typeof PartitionContextCreator.
 }
 
 describe("PartitionContextCreator.create — rangeAncestorsConfig", () => {
-	it("defaults to { fromRoot: 2, fromLeaf: 2 } when omitted", () => {
+	it("defaults to { fromRoot: 0, fromLeaf: 3 } when omitted", () => {
 		const ctx = PartitionContextCreator.create(makeOpts());
-		expect(ctx.rangeAncestorsConfig).toEqual({ fromRoot: 2, fromLeaf: 2 });
+		expect(ctx.rangeAncestorsConfig).toEqual({ fromRoot: 0, fromLeaf: 3 });
 	});
 
 	it("keeps an explicit rangeAncestorsConfig", () => {

@@ -391,3 +391,90 @@ describe("PartitionStore - range_hierarchy", () => {
 		});
 	});
 });
+
+describe("PartitionStore - findDeepestKnownRangeSlice", () => {
+	const UNBOUNDED = KeyCodec.encodeOptional(undefined);
+
+	// A single hash key's learned range tree:
+	//   depth 1: [-∞,"m") , ["m",+∞)
+	//   depth 2 (within ["m",+∞)): ["m","t") , ["t",+∞)
+	function seedTree(store: PartitionStore, hk = kb("h")) {
+		store.insertRangePartitionBoundary(hk, UNBOUNDED, kb("m"), 1);
+		store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
+		store.insertRangePartitionBoundary(hk, kb("m"), kb("t"), 2);
+		store.insertRangePartitionBoundary(hk, kb("t"), UNBOUNDED, 2);
+	}
+
+	it("returns null when nothing is stored", async () => {
+		await withStore((store) => {
+			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toBeNull();
+		});
+	});
+
+	it("returns the deepest slice containing the key", async () => {
+		await withStore((store) => {
+			seedTree(store);
+			// "p" is in ["m","t") at depth 2, a strict sub-slice of ["m",+∞) at depth 1.
+			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toEqual({
+				depth: 2,
+				startBoundary: kb("m"),
+				endBoundary: kb("t"),
+			});
+		});
+	});
+
+	it("selects an unbounded-end slice via the empty sentinel (decoded to null)", async () => {
+		await withStore((store) => {
+			seedTree(store);
+			// "z" is in ["t",+∞) at depth 2 — only matched because the end sentinel is treated as +∞.
+			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("z"))).toEqual({
+				depth: 2,
+				startBoundary: kb("t"),
+				endBoundary: null,
+			});
+		});
+	});
+
+	it("selects an unbounded-start slice (decoded to null)", async () => {
+		await withStore((store) => {
+			seedTree(store);
+			// "a" only falls in [-∞,"m") at depth 1.
+			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("a"))).toEqual({
+				depth: 1,
+				startBoundary: null,
+				endBoundary: kb("m"),
+			});
+		});
+	});
+
+	it("falls back to a shallower covering slice when the deeper slice lies to the side of the key", async () => {
+		await withStore((store) => {
+			const hk = kb("h");
+			// Only a depth-1 ["m",+∞) and a depth-2 ["t",+∞) are known; nothing at depth 2 covers ["m","t").
+			store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
+			store.insertRangePartitionBoundary(hk, kb("t"), UNBOUNDED, 2);
+			// "p" is left of "t", so the depth-2 slice does not contain it — fall back to depth 1.
+			expect(store.findDeepestKnownRangeSlice(hk, kb("p"))).toEqual({
+				depth: 1,
+				startBoundary: kb("m"),
+				endBoundary: null,
+			});
+		});
+	});
+
+	it("returns null when no stored slice covers the key", async () => {
+		await withStore((store) => {
+			const hk = kb("h");
+			// Only the right half is known; "a" is left of every stored start.
+			store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
+			expect(store.findDeepestKnownRangeSlice(hk, kb("a"))).toBeNull();
+		});
+	});
+
+	it("isolates by hash key", async () => {
+		await withStore((store) => {
+			seedTree(store, kb("h"));
+			expect(store.findDeepestKnownRangeSlice(kb("other"), kb("p"))).toBeNull();
+		});
+	});
+});

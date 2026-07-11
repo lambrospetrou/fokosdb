@@ -557,6 +557,16 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			throw new Error(`fokos/range: no child found for sortKey ${KeyCodec.keyForLog(sk)}`);
 		}
 
+		// Skip intermediate router hops: if we have learned (from prior forward results) a deeper slice
+		// that is a strict sub-slice of the immediate child and still contains sk, jump straight to it.
+		// Boundaries are immutable identity, so a stale hint at worst lands on a router that forwards on;
+		// the target's shouldAllow validates range membership, so a bad hint can never corrupt data.
+		const hashKey = this.partitionContext.rangePartition.hashKey;
+		const learned = this.#partitionStore.findDeepestKnownRangeSlice(hashKey, sk);
+		if (learned && isStrictSubSlice(learned, best.rangePartition!.startBoundary ?? null, best.rangePartition!.endBoundary ?? null)) {
+			return resolveRangePartitionContext(partitionContext, hashKey, learned.startBoundary, learned.endBoundary);
+		}
+
 		return { doId: resolveDoId(partitionContext.ns, best.doName), partitionContext: best };
 	}
 
@@ -593,6 +603,38 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
  * (parent's stored ancestors plus the parent itself), deduped by depth.
  * Called once per split — identical for every child produced by that split.
  */
+// Compares range start boundaries where null = -∞ (unbounded lower edge).
+function startCmp(a: KeyBytes | null, b: KeyBytes | null): number {
+	if (a === null && b === null) return 0;
+	if (a === null) return -1;
+	if (b === null) return 1;
+	return KeyCodec.compare(a, b);
+}
+
+// Compares range end boundaries where null = +∞ (unbounded upper edge).
+function endCmp(a: KeyBytes | null, b: KeyBytes | null): number {
+	if (a === null && b === null) return 0;
+	if (a === null) return 1;
+	if (b === null) return -1;
+	return KeyCodec.compare(a, b);
+}
+
+/**
+ * True when [slice.start, slice.end) is strictly contained within [childStart, childEnd) — i.e. a
+ * deeper, narrower descendant. In a range tree any two slices containing the same key are nested, so
+ * a strict sub-slice of the immediate child is always a valid deeper skip target. An equal or wider
+ * slice (an ancestor) fails this check and the caller falls back to the immediate child.
+ */
+function isStrictSubSlice(
+	slice: { startBoundary: KeyBytes | null; endBoundary: KeyBytes | null },
+	childStart: KeyBytes | null,
+	childEnd: KeyBytes | null,
+): boolean {
+	const startRel = startCmp(slice.startBoundary, childStart);
+	const endRel = endCmp(slice.endBoundary, childEnd);
+	return startRel >= 0 && endRel <= 0 && (startRel > 0 || endRel < 0);
+}
+
 export function selectRangeAncestors(
 	parentDepth: number,
 	parentAncestors: RangeAncestorInfo[],

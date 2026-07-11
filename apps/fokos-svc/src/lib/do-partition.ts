@@ -1287,10 +1287,29 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		ctx: PartitionContextResolved,
 		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+		sortKey?: KeyBytes,
 	): Promise<T> {
-		const { doId, partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
-		const rangeRootStub = this.env[ctx.ns].get(doId);
-		const result = await forward(rangeRootStub, rangeRootCtx);
+		// Default entry is the range root (null, null). If this DO has already learned deeper range
+		// boundaries for this hash key (from prior forward results), jump straight to the deepest known
+		// slice that contains sortKey, skipping the root router chain. Immutable boundary identity makes
+		// a stale hint safe: the target validates range membership and re-forwards if it has split
+		// further. Multi-item paths that lack a single sortKey pass undefined and stay on the root.
+		let entry = resolveRangePartitionContext(ctx, hashKey, null, null);
+		if (sortKey !== undefined) {
+			const learned = this.#store.findDeepestKnownRangeSlice(hashKey, sortKey);
+			if (learned && (learned.startBoundary !== null || learned.endBoundary !== null)) {
+				entry = resolveRangePartitionContext(ctx, hashKey, learned.startBoundary, learned.endBoundary);
+			}
+		}
+		const rangeRootStub = this.env[ctx.ns].get(entry.doId);
+		const result = await forward(rangeRootStub, entry.partitionContext);
+		// Learn the range subtree boundaries from the response so future entries can skip the root chain.
+		// The response meta carries the serving leaf's rangeAncestors (propagated up through each range
+		// router), so this feeds the same range_hierarchy cache that the skip above reads — without this,
+		// the steady-state promoted-key path (which always enters here) would never populate that cache.
+		// On a hash `fromCtx` → range `toCtx`, recordForwardResult inserts the ancestors and no-ops the
+		// hash-topology update.
+		this.ensureTopology(ctx).recordForwardResult(hashKey, ctx, entry.partitionContext, result.meta);
 		return {
 			...result,
 			meta: {
@@ -1305,9 +1324,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		ctx: PartitionContextResolved,
 		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+		sortKey?: KeyBytes,
 	): Promise<T | null> {
 		try {
-			return await this.forwardToRangeRootPartition(ctx, hashKey, forward);
+			return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 		} catch (e) {
 			if (isPhantomBounceError(e)) {
 				return null;
@@ -1335,13 +1355,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// Step 1: Authoritative promotion check for keys we promoted or inherited.
 			const promotedStatus = this.#promotion.statusFor(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-				return await this.forwardToRangeRootPartition(ctx, hashKey, forward);
+				return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 			}
 
 			// Step 2: Speculative bloom filter check — learned promotions from descendants.
 			const prt = this.#_partialRangeTopology;
 			if (prt?.maybePromoted(hashKey)) {
-				const result = await this.maybeForwardToRangeRootPartition(ctx, hashKey, forward);
+				const result = await this.maybeForwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 				if (result) return result;
 			}
 		}

@@ -187,7 +187,7 @@ export class PartitionContextCreator {
 			opts.hashSplitConditions = { maxSizeMb: 100 };
 		}
 		if (!opts.rangeAncestorsConfig) {
-			opts.rangeAncestorsConfig = { fromRoot: 2, fromLeaf: 2 };
+			opts.rangeAncestorsConfig = { fromRoot: 0, fromLeaf: 3 };
 		}
 		if (opts.rootTreesN < 1 || opts.rootTreesN > 65000) {
 			throw new Error("fokos: rootTreesN must be between 1 and 65000");

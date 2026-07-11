@@ -885,6 +885,11 @@ export class PartitionStore {
 	}
 
 	insertRangePartitionBoundary(hk: KeyBytes, startBoundary: KeyBytes, endBoundary: KeyBytes, depth: number): void {
+		// FIXME: Add a limit on the storage we use for this table, or a TTL, or a cleanup policy.
+		// The range router can learn many boundaries over time, and we don't want to keep them or grow forever.
+		//
+		// We use INSERT OR IGNORE here to avoid causing writes for the same boundaries.
+		// This is called on every forwarded request so we need to avoid unnecessary writes.
 		this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
 			hk,
@@ -892,5 +897,48 @@ export class PartitionStore {
 			startBoundary,
 			endBoundary,
 		);
+	}
+
+	/**
+	 * Returns the deepest learned range slice (from `range_hierarchy`) that contains `sortKey` for the
+	 * given hash key, or `null` when nothing is known that covers it. Used to skip intermediate range
+	 * router hops: the returned `[startBoundary, endBoundary)` slice resolves deterministically to a DO.
+	 */
+	findDeepestKnownRangeSlice(
+		hk: KeyBytes,
+		sortKey: KeyBytes,
+	): { depth: number; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null } | null {
+		// Boundaries are stored with the empty sentinel `[]` for unbounded edges (consistent with the start
+		// side and `getRangeAncestors`). `[]` is the byte minimum, which is correct for an unbounded start
+		// (`start <= sortKey` always holds) but NOT for an unbounded end — hence the explicit sentinel check
+		// in the WHERE clause. Real keys are never empty (KeyCodec rejects empty input), so `[]` is an
+		// unambiguous "unbounded" tag. The sentinel semantics stay encapsulated here: the result decodes
+		// `[]` back to `null` for both edges, so callers can feed `resolveRangePartitionContext` directly.
+		const unbounded = KeyCodec.encodeOptional(undefined);
+		const row = this.#storage.sql
+			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
+				`SELECT depth, sk_start_boundary, sk_end_boundary
+				 FROM range_hierarchy
+				 WHERE hk = ?
+				   AND sk_start_boundary <= ?
+				   AND (sk_end_boundary > ? OR sk_end_boundary = ?)
+				 ORDER BY depth DESC
+				 LIMIT 1`,
+				hk,
+				sortKey,
+				sortKey,
+				unbounded,
+			)
+			.toArray()[0];
+		if (!row) return null;
+
+		const start = fromSqlKey(row.sk_start_boundary);
+		const end = fromSqlKey(row.sk_end_boundary);
+		return {
+			depth: row.depth,
+			// Decode the empty sentinel back to null (unbounded) so callers feed resolveRangePartitionContext directly.
+			startBoundary: start.length === 0 ? null : start,
+			endBoundary: end.length === 0 ? null : end,
+		};
 	}
 }
