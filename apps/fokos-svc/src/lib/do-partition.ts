@@ -1294,12 +1294,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// slice that contains sortKey, skipping the root router chain. Immutable boundary identity makes
 		// a stale hint safe: the target validates range membership and re-forwards if it has split
 		// further. Multi-item paths that lack a single sortKey pass undefined and stay on the root.
-		let entry = resolveRangePartitionContext(ctx, hashKey, null, null);
+		let entry: ReturnType<typeof resolveRangePartitionContext> | null = null;
 		if (sortKey !== undefined) {
 			const learned = this.#store.findDeepestKnownRangeSlice(hashKey, sortKey);
 			if (learned && (learned.startBoundary !== null || learned.endBoundary !== null)) {
 				entry = resolveRangePartitionContext(ctx, hashKey, learned.startBoundary, learned.endBoundary);
 			}
+		}
+		if (!entry) {
+			entry = resolveRangePartitionContext(ctx, hashKey, null, null);
 		}
 		const rangeRootStub = this.env[ctx.ns].get(entry.doId);
 		const result = await forward(rangeRootStub, entry.partitionContext);
