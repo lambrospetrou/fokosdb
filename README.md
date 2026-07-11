@@ -30,6 +30,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Use the partial range topology within each partition to speed up transactions as well.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
+- Garbage collect the items table after splits and hash key promotions.
 - Create RpcTargets for the partition DOs and LRU cache them in the Worker to skip the getActor calls and go directly to the partition DOs.
 - Add optimization for single-partition transactions to not do 2PC.
 - Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
