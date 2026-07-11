@@ -1811,6 +1811,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			actorId: this.ctx.id.toString(),
 			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
+			databaseSize: this.#store.databaseSize,
 			// Always put the partition context in the logs for better debugging, even if it's undefined.
 			// KeyBytes fields are rendered via keyForLog so they never appear as bare Uint8Array.
 			partitionContext: pCtxForLog(this.#_partitionContext),
