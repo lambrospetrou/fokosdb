@@ -74,6 +74,7 @@ import {
 	type SkInterval,
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
+import { getColoInfo, type ColoInfo } from "./cf-utils.js";
 
 export interface PartitionAPI {
 	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
@@ -164,6 +165,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
 
+	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
+	// non-blocking from the constructor, so it may be undefined for the first few
+	// requests after the DO wakes. Never gate correctness on it.
+	#_coloInfo?: ColoInfo;
+
 	// Local-only, per-DO state (never sent as ordinary routing context): applies uniformly to hash
 	// DOs too — they simply keep [] forever, since nothing ever writes this for a hash partition.
 	#_rangeAncestors: RangeAncestorInfo[] = [];
@@ -221,6 +227,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 			}
 		});
+
+		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
+		// We swallow errors — this must never affect the DO's lifecycle. Note: no
+		// waitUntil here — a constructor has no invocation of its own to extend, and the
+		// DO stays alive by serving requests regardless.
+		void this.fokosGetColoInfo()
+			.then((info) => {
+				this.#_coloInfo = info;
+			})
+			.catch(() => {});
 	}
 
 	/**
@@ -292,6 +308,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
 			}
 		});
+	}
+
+	/**
+	 * Overrideable method to get the location info.
+	 */
+	async fokosGetColoInfo(): Promise<ColoInfo> {
+		return await getColoInfo();
 	}
 
 	async triggerMigration(): Promise<void> {
@@ -1818,6 +1841,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private logParams() {
 		const info = {
+			...this.#_coloInfo,
 			actorId: this.ctx.id.toString(),
 			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
