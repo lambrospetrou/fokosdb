@@ -157,10 +157,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#promotion: PromotionManager;
+
+	#_parentPartitionContext?: PartitionContextLivePartition;
 	#_partitionContext?: PartitionContextLivePartition;
 	#_topology?: PartitionTopologySplitter;
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
+
 	// Local-only, per-DO state (never sent as ordinary routing context): applies uniformly to hash
 	// DOs too — they simply keep [] forever, since nothing ever writes this for a hash partition.
 	#_rangeAncestors: RangeAncestorInfo[] = [];
@@ -211,6 +214,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				if (prtSnap) {
 					this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
 				}
+
+				const parentPctx = ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
+				if (parentPctx) {
+					this.#_parentPartitionContext = parentPctx;
+				}
 			}
 		});
 	}
@@ -248,6 +256,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
 			this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
 			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
+
+			this.#_parentPartitionContext = parentPartitionContext;
 
 			if (isRangePartition(pCtx)) {
 				invariant(newPartitionRangeDepth !== undefined, "fokos/partition: newPartitionRangeDepth must be provided for range partitions");
@@ -1807,15 +1817,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private logParams() {
-		return {
+		const info = {
 			actorId: this.ctx.id.toString(),
 			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
 			actorName: this.ctx.id.name,
 			databaseSize: this.#store.databaseSize,
+			depth: this.#_depth,
 			// Always put the partition context in the logs for better debugging, even if it's undefined.
 			// KeyBytes fields are rendered via keyForLog so they never appear as bare Uint8Array.
 			partitionContext: pCtxForLog(this.#_partitionContext),
 		};
+		if (this.#_parentPartitionContext) {
+			Object.assign(info, {
+				parentPartition: {
+					actorName: this.#_parentPartitionContext.doName,
+					actorId: this.#_parentPartitionContext.primaryDoIdStr,
+				},
+			});
+		}
+		return info;
 	}
 }
 
