@@ -1674,6 +1674,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 			///////////////////////////////////////////////////////////////////////////
 			// ── Jobs: Promotion drive and GC (hash partitions only, not routers)
+			//
+			// FIXME: We have to interleave the key promotion and transactions above, or some form of cooperative scheduling, to avoid starvation.
+			//
 			const pCtx = this.pCtx();
 			if (isHashPartition(pCtx)) {
 				// Drive: advance each queued key through init → cutover → migrate.
