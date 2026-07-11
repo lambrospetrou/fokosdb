@@ -130,9 +130,11 @@ export function isRangePartition(ctx: PartitionContextResolved | PartitionContex
  * Log-safe rendering of a PartitionContextResolved. Converts KeyBytes fields in rangePartition to
  * human-readable strings via keyForLog so they never appear as bare Uint8Array in operational logs.
  */
-export function pCtxForLog(ctx: PartitionContextResolved | null | undefined): Record<string, unknown> {
+export function pCtxForLog(ctx: PartitionContextResolved | PartitionContextLivePartition | null | undefined): Record<string, unknown> {
 	if (!ctx) return { partitionContext: null };
 	const { rangePartition, ...rest } = ctx;
+	if ("_partitionIdBytes" in rest) delete (rest as any)._partitionIdBytes;
+
 	return {
 		...rest,
 		rangePartition: rangePartition

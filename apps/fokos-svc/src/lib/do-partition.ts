@@ -1763,7 +1763,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			console.warn({ ...this.logParams(), message: "fokos/partition: Partition destroyed." });
 		});
 
-		// Evict the DO instance so the next caller gets a fresh one with re-run migrations.
+		// Evict the DO instance so the next caller gets a fresh one with re-ran migrations.
 		// This throws on the caller side with the sentinel message, which FokosDB.destroy() catches and ignores.
 		this.ctx.abort("__special_destroy_sentinel");
 		// await this.ctx.blockConcurrencyWhile(async () => {
