@@ -44,7 +44,8 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
 - Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root and make the forwarding and migrations faster).
 - Proper structured errors thrown to differentiate user vs server errors.
-- Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status).
+- Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
+- Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
 - Expose an RPC/API to trigger a manual split.
 - Enforce the expiration ttl for items.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).

@@ -8,7 +8,7 @@ import type { PartitionPeer } from "./partition-peer.js";
 import type { PartitionStore, PromotedKeyStatus } from "./partition-store.js";
 
 /** The subset of the peer surface promotion needs from a range root (phase 3's gateway interface). */
-export type PromotionPeer = Pick<PartitionPeer, "initFromSplit" | "triggerMigration">;
+export type PromotionPeer = Pick<PartitionPeer, "internalInitFromSplit" | "internalTriggerMigration">;
 
 export type PromotionManagerDeps = {
 	store: PartitionStore;
@@ -151,7 +151,7 @@ export class PromotionManager {
 		// B. Initialize the range root (idempotent, retry ≤5). No forwarding yet — status is still 'queued'.
 		await tryWhile(
 			() =>
-				rangeRootPeer.initFromSplit({
+				rangeRootPeer.internalInitFromSplit({
 					parentPartitionContext: pCtx,
 					newPartitionContext: rangeRootCtx,
 					newPartitionRangeDepth: 0,
@@ -185,7 +185,7 @@ export class PromotionManager {
 
 		// D. Trigger migration on the range root (fire-and-forget).
 		try {
-			await rangeRootPeer.triggerMigration();
+			await rangeRootPeer.internalTriggerMigration();
 		} catch (e) {
 			console.error({
 				...this.deps.logParams(),

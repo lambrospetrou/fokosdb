@@ -287,12 +287,12 @@ type PeerCalls = {
 
 function makePeer(calls: PeerCalls): PromotionPeer {
 	return {
-		async initFromSplit(opts) {
+		async internalInitFromSplit(opts) {
 			const hk = KeyCodec.mapKey(opts.newPartitionContext.rangePartition?.hashKey ?? KeyCodec.encodeOptional(undefined));
 			if (calls.failInitFor.has(hk)) throw new Error("simulated range-root init failure");
 			calls.inits.push(opts);
 		},
-		async triggerMigration() {
+		async internalTriggerMigration() {
 			calls.triggers++;
 		},
 	};
@@ -310,7 +310,7 @@ type PromotionEnv = {
 // Real DO storage (vitest-pool-workers); the range-root peer is the only fake — the gateway
 // pattern makes the lifecycle testable without spinning up a real range root.
 async function withPromotionEnv(fn: (penv: PromotionEnv) => Promise<void>): Promise<void> {
-	const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(`promotion-test.${crypto.randomUUID()}`));
+	const stub = PartitionDO.getByName(env.PARTITION_DO, `promotion-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const base = makeBase();
 		const pCtx = hashCtx(base, [0]);

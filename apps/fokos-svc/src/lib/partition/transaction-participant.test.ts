@@ -22,8 +22,7 @@ type Harness = {
 // The PartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promise<void> {
-	const id = env.PARTITION_DO.idFromName(`participant-test.${crypto.randomUUID()}`);
-	const stub = env.PARTITION_DO.get(id);
+	const stub = PartitionDO.getByName(env.PARTITION_DO, `participant-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const clock = { now: BASE_NOW };

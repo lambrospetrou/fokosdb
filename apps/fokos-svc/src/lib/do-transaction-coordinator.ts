@@ -5,31 +5,17 @@ import type { PartitionContextResolved } from "./partition-topology/partition-co
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import { DATA_KINDS, type DataKind } from "./types.js";
 import type {
-	CancelRequest,
-	CancelResponse,
-	CommitRequest,
-	CommitResponse,
 	InitiateReadRequest,
 	InitiateReadResponseEncoded,
 	InitiateWriteRequest,
 	InitiateWriteResponse,
-	PrepareRequest,
-	PrepareResponse,
 	ReadForTransactionItemResultEncoded,
-	ReadForTransactionRequest,
-	ReadForTransactionResponse,
 	RecoverTransactionResult,
 	RejectionReason,
 	TCState,
 	TransactionItem,
 } from "./transaction-types.js";
-
-type PartitionDOStub = {
-	prepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
-	commit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
-	cancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
-	readForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
-};
+import { PartitionDO } from "./do-partition.js";
 
 type TcStateRow = {
 	idempotency_token: string;
@@ -266,7 +252,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				const result = await tryWhile(
 					async () => {
-						const r = await this.getPartitionStub(p.partition_do_name).prepare(pCtx, {
+						const r = await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txPrepare(pCtx, {
 							transactionId,
 							coordinatorDoId,
 							transactionTimestamp: stateRow.transaction_ts,
@@ -346,7 +332,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				await tryWhile(
 					async () => {
-						await this.getPartitionStub(p.partition_do_name).commit(pCtx, {
+						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCommit(pCtx, {
 							transactionId,
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItems(partitionItems),
@@ -394,7 +380,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				await tryWhile(
 					async () => {
-						await this.getPartitionStub(p.partition_do_name).cancel(pCtx, { transactionId });
+						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCancel(pCtx, { transactionId });
 						this.ctx.storage.sql.exec(
 							`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE transaction_id = ? AND partition_do_name = ?`,
 							transactionId,
@@ -450,7 +436,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				const result = await tryWhile(
 					async () => {
-						const r = await this.getPartitionStub(p.partition_do_name).prepare(pCtx, {
+						const r = await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txPrepare(pCtx, {
 							transactionId,
 							coordinatorDoId,
 							transactionTimestamp: stateRow.transaction_ts,
@@ -520,7 +506,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			partitionEntries.map(({ pCtx, items }) =>
 				tryWhile(
 					async () =>
-						await this.getPartitionStub(pCtx.doName).readForTransaction(pCtx, {
+						await PartitionDO.getByName(this.env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
 							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
 						}),
@@ -545,7 +531,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			partitionEntries.map(({ pCtx, items }) =>
 				tryWhile(
 					async () =>
-						await this.getPartitionStub(pCtx.doName).readForTransaction(pCtx, {
+						await PartitionDO.getByName(this.env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
 							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
 						}),
@@ -700,10 +686,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				transactionId,
 			)
 			.toArray();
-	}
-
-	private getPartitionStub(partitionDoName: string): PartitionDOStub {
-		return this.env.PARTITION_DO.get(this.env.PARTITION_DO.idFromName(partitionDoName)) as unknown as PartitionDOStub;
 	}
 }
 

@@ -5,7 +5,7 @@ import { FokosDB } from "../src/lib/db.js";
 import { PartitionContextCreator } from "../src/lib/partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "../src/lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
-import type { PartitionDO } from "../src/lib/do-partition.js";
+import { PartitionDO } from "../src/lib/do-partition.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.1 = 102 400 bytes; 2 × 50 KB items per partition → split triggers.
@@ -70,7 +70,7 @@ describe.skip("DELETE /api/databases/:tableName", () => {
 
 		// Drain the split alarm on every partition.
 		for (const doName of doNamesSet) {
-			await waitForAlarm(env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName)));
+			await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
 		}
 
 		// Call the HTTP DELETE endpoint, passing the same partition options so the server
@@ -90,7 +90,7 @@ describe.skip("DELETE /api/databases/:tableName", () => {
 		});
 
 		for (const doName of doNamesSet) {
-			const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName));
+			const stub = PartitionDO.getByName(env.PARTITION_DO, doName);
 			const { partitionContextStored } = await stub.status();
 			expect(partitionContextStored).toBeFalsy();
 		}

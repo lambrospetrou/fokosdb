@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../do-partition.js";
+import { PartitionDO } from "../do-partition.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { SplitStateMachine } from "./split-state.js";
@@ -18,7 +18,7 @@ async function withSplitState(fn: (machine: SplitStateMachine, pCtx: PartitionCo
 	const { opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [0]).encode(true);
 	const pCtx: PartitionContextResolved = { ...base, doName: doName!, primaryDoIdStr: "", partitionId: opaque };
 
-	const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(doName!));
+	const stub = PartitionDO.getByName(env.PARTITION_DO, `splitstate-${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		await fn(new SplitStateMachine(state.storage, "__split_status"), pCtx);
 	});

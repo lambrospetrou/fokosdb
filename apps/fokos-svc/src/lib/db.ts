@@ -130,7 +130,7 @@ export class FokosDB {
 		const stub = this.#options.ns.get(doId);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const { data, ...rest } = opts;
-		const res = await stub.putItem(partitionContext, { ...rest, hashKey, sortKey, ...encodeItemData(data) });
+		const res = await stub.apiPutItem(partitionContext, { ...rest, hashKey, sortKey, ...encodeItemData(data) });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
 	}
@@ -141,7 +141,7 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
-		const res = await stub.getItem(partitionContext, { ...opts, hashKey, sortKey });
+		const res = await stub.apiGetItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed); preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
@@ -160,7 +160,7 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
-		const res = await stub.deleteItem(partitionContext, { ...opts, hashKey, sortKey });
+		const res = await stub.apiDeleteItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
 	}
@@ -280,7 +280,7 @@ export class FokosDB {
 			const { doId, partitionContext } = this.#options.topology.pickPartition(query.hashKey, KeyCodec.encodeOptional(undefined));
 			const stub = this.#options.ns.get(doId);
 
-			const rpcResult = await stub.queryItems(partitionContext, {
+			const rpcResult = await stub.apiQueryItems(partitionContext, {
 				hashKey: query.hashKey,
 				interval: query.interval,
 				direction: query.direction,

@@ -6,6 +6,7 @@ import { FokosDB } from "./lib/db.js";
 import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
 import type { GetItemResult, InitiateReadResponse, JsonValue, QueryItemsResult } from "./lib/types.js";
+import { PartitionDO } from "./lib/do-partition.js";
 
 export { PartitionDO } from "./lib/do-partition.js";
 export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
@@ -119,7 +120,7 @@ type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
 
 function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
 	const partitionContext = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
+		ns: "CUSTOM_PARTITION_DO",
 		tableName,
 		rootTreesN: partitionOptions?.rootTreesN ?? DEFAULT_PARTITION_OPTIONS.rootTreesN,
 		hashSplitN: partitionOptions?.hashSplitN ?? DEFAULT_PARTITION_OPTIONS.hashSplitN,
@@ -129,7 +130,7 @@ function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOp
 	});
 	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({
-		ns: env.PARTITION_DO,
+		ns: env.CUSTOM_PARTITION_DO,
 		topology,
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});
@@ -326,3 +327,7 @@ export default {
 		return api.fetch(request, env, ctx);
 	},
 } satisfies ExportedHandler<Env>;
+
+// TESTING THE PartitionDO override capabilities.
+
+export class CustomPartitionDO extends PartitionDO {}

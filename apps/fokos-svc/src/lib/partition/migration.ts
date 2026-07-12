@@ -59,7 +59,7 @@ export class SplitMigration {
 
 		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
-		let nextBatchPromise = parent.getItemsBatch({
+		let nextBatchPromise = parent.migrationGetItemsBatch({
 			childPartitionContext: pCtx,
 			cursor,
 		});
@@ -68,7 +68,7 @@ export class SplitMigration {
 			const { items, nextCursor } = await nextBatchPromise;
 			if (nextCursor) {
 				// Pre-fetch the next batch while we process this one.
-				nextBatchPromise = parent.getItemsBatch({
+				nextBatchPromise = parent.migrationGetItemsBatch({
 					childPartitionContext: pCtx,
 					cursor: nextCursor,
 				});
@@ -95,7 +95,7 @@ export class SplitMigration {
 		// Migrate transaction metadata: pending locks and deletion high-water mark.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.getPartitionTransactionMetadata({
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata({
 				childPartitionContext: pCtx,
 				cursor: txCursor,
 			});
@@ -116,7 +116,7 @@ export class SplitMigration {
 		// promoted keys. Mutual exclusion guarantees every such key is 'promoted' at hash-split time.
 		let pkCursor: PromotedKeyCursor | null = null;
 		while (true) {
-			const { rows, nextCursor } = await parent.getPromotedKeysBatch({
+			const { rows, nextCursor } = await parent.migrationGetPromotedKeysBatch({
 				childPartitionContext: pCtx,
 				cursor: pkCursor,
 			});
@@ -136,7 +136,7 @@ export class SplitMigration {
 		store.rebuildKeySizeEstimates();
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
-		await parent.acknowledgeChildMigrationComplete(pCtx.doName);
+		await parent.migrationAcknowledgeChildComplete(pCtx.doName);
 
 		console.log({
 			...this.deps.logParams(),
@@ -152,7 +152,7 @@ export class SplitMigration {
 		// for a range-split child the parent is a range DO (filter by hk and sk range).
 		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 
-		let nextBatchPromise = parent.getItemsBatch({
+		let nextBatchPromise = parent.migrationGetItemsBatch({
 			childPartitionContext: pCtx,
 			cursor,
 		});
@@ -161,7 +161,7 @@ export class SplitMigration {
 			const { items, nextCursor } = await nextBatchPromise;
 			if (nextCursor) {
 				// Pre-fetch the next batch while we process this one.
-				nextBatchPromise = parent.getItemsBatch({
+				nextBatchPromise = parent.migrationGetItemsBatch({
 					childPartitionContext: pCtx,
 					cursor: nextCursor,
 				});
@@ -185,7 +185,7 @@ export class SplitMigration {
 		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.getPartitionTransactionMetadata({
+			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata({
 				childPartitionContext: pCtx,
 				cursor: txCursor,
 			});
@@ -206,11 +206,11 @@ export class SplitMigration {
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
 
-		// Notify the parent: a promotion root calls acknowledgePromotionComplete; a range-split child calls acknowledgeChildMigrationComplete.
+		// Notify the parent: a promotion root calls migrationAcknowledgePromotionComplete; a range-split child calls migrationAcknowledgeChildComplete.
 		if (isHashPartition(parentCtx)) {
-			await parent.acknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
+			await parent.migrationAcknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
 		} else {
-			await parent.acknowledgeChildMigrationComplete(pCtx.doName);
+			await parent.migrationAcknowledgeChildComplete(pCtx.doName);
 		}
 
 		console.log({

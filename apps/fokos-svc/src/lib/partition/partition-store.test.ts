@@ -20,8 +20,7 @@ function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes)
 // The PartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withStore(fn: (store: PartitionStore, state: DurableObjectState) => void | Promise<void>): Promise<void> {
-	const id = env.PARTITION_DO.idFromName(`store-test.${crypto.randomUUID()}`);
-	const stub = env.PARTITION_DO.get(id);
+	const stub = PartitionDO.getByName(env.PARTITION_DO, `store-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		await fn(new PartitionStore(state.storage), state);
 	});

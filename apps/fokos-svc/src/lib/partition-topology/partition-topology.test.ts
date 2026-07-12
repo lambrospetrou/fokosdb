@@ -6,7 +6,7 @@ import type { PartitionContext, PartitionContextLivePartition, PartitionContextR
 import { PartitionIdHelper } from "./partition-id.js";
 import { PartitionTopologyRouterImpl } from "./router.js";
 import type { SplitStatusKVItem } from "./split-state.js";
-import type { PartitionDO } from "../do-partition.js";
+import { PartitionDO } from "../do-partition.js";
 import { KeyCodec } from "./key-codec.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -58,7 +58,7 @@ async function setupRootRangeDO(
 	pCtx: PartitionContextResolved,
 	parentCtx: PartitionContextResolved,
 ): Promise<void> {
-	await stub.initFromSplit(
+	await stub.internalInitFromSplit(
 		{ parentPartitionContext: parentCtx, newPartitionContext: pCtx, newPartitionRangeDepth: 0, splitType: "range", rangeAncestors: [] },
 		true, // __testing__completeMigration
 	);
@@ -70,27 +70,27 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 	it("serves sort keys within [start, end) — putItem succeeds locally (forwardCount=0)", async () => {
 		const base = makeUniqueBase();
 		const rootCtx = makeRangeCtx(base, "alice", null, "m"); // owns [∅, "m")
-		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		const r = await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1", kind: "text" });
+		const r = await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1", kind: "text" });
 		expect(r.meta.forwardCount).toBe(0);
 
-		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "a" });
+		const g = await stub.apiGetItem(rootCtx, { hashKey: "alice", sortKey: "a" });
 		expect(g).toMatchObject({ found: true, item: { data: "v1" }, meta: { forwardCount: 0 } });
 	});
 
 	it("rejects sort keys outside [start, end) when not split", async () => {
 		const base = makeUniqueBase();
 		const rootCtx = makeRangeCtx(base, "alice", null, "m"); // owns [∅, "m")
-		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
-			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x", kind: "text" })).rejects.toThrow(
+			await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x", kind: "text" })).rejects.toThrow(
 				/exceeded its limits/,
 			);
-			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x", kind: "text" })).rejects.toThrow(
+			await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x", kind: "text" })).rejects.toThrow(
 				/exceeded its limits/,
 			);
 		});
@@ -99,26 +99,26 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 	it("unbounded range (endBoundary=null) accepts any sort key", async () => {
 		const base = makeUniqueBase();
 		const rootCtx = makeRangeCtx(base, "alice", null, null); // owns [∅, +∞)
-		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk", kind: "text" });
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last", kind: "text" });
 
-		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });
+		const g = await stub.apiGetItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });
 		expect(g).toMatchObject({ found: true });
 	});
 
 	it("once split, the node is a pure router — forwards EVERY sort key to the owning child", async () => {
 		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
 		const rootCtx = makeRangeCtx(base, "alice", null, null);
-		const rootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const rootStub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(rootStub, rootCtx, makeHashCtx(base));
 
 		// Write ~50 KB items until a range split is queued (0.1 MB threshold → ~3 items).
 		const bigData = "x".repeat(50 * 1024);
 		for (let i = 0; i < 10; i++) {
-			await rootStub.putItem(rootCtx, {
+			await rootStub.apiPutItem(rootCtx, {
 				hashKey: "alice",
 				sortKey: `sk${String(i).padStart(3, "0")}`,
 				data: bigData,
@@ -134,8 +134,8 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 				const s = await rootStub.status(rootCtx);
 				if (s.splitStatus?.status === "split_started") {
 					for (const childCtx of (s.splitStatus as SplitStartedOrCompleted).childPartitionContexts) {
-						const childStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(childCtx.doName));
-						await childStub.triggerMigration();
+						const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
+						await childStub.internalTriggerMigration();
 						await runDurableObjectAlarm(childStub);
 					}
 				}
@@ -152,7 +152,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const boundary = children[0].rangePartition!.endBoundary!;
 
 		// sk below boundary — forwarded to left child (forwardCount=1, not served locally by the router).
-		const left = await rootStub.putItem(rootCtx, {
+		const left = await rootStub.apiPutItem(rootCtx, {
 			hashKey: "alice",
 			sortKey: "sk000",
 			data: "left",
@@ -161,7 +161,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		expect(left.meta.forwardCount).toBe(1);
 
 		// sk at boundary — forwarded to right child.
-		const right = await rootStub.putItem(rootCtx, {
+		const right = await rootStub.apiPutItem(rootCtx, {
 			hashKey: "alice",
 			sortKey: boundary,
 			data: "right",
@@ -170,13 +170,13 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		expect(right.meta.forwardCount).toBe(1);
 
 		// Items landed in their owning children, not on the router.
-		const leftStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[0].doName));
-		const rightStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(children[1].doName));
-		expect(await leftStub.getItem(children[0], { hashKey: "alice", sortKey: "sk000" })).toMatchObject({
+		const leftStub = PartitionDO.getByName(env.PARTITION_DO, children[0].doName);
+		const rightStub = PartitionDO.getByName(env.PARTITION_DO, children[1].doName);
+		expect(await leftStub.apiGetItem(children[0], { hashKey: "alice", sortKey: "sk000" })).toMatchObject({
 			found: true,
 			item: { data: "left" },
 		});
-		expect(await rightStub.getItem(children[1], { hashKey: "alice", sortKey: boundary })).toMatchObject({
+		expect(await rightStub.apiGetItem(children[1], { hashKey: "alice", sortKey: boundary })).toMatchObject({
 			found: true,
 			item: { data: "right" },
 		});
@@ -187,12 +187,12 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 	it("queues a range split when db exceeds rangeSplitConditions.maxSizeMb", async () => {
 		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
 		const rootCtx = makeRangeCtx(base, "alice", null, null);
-		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		const bigData = "x".repeat(50 * 1024);
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData, kind: "text" });
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData, kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData, kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData, kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus?.status).toBe("split_queued");
@@ -210,10 +210,10 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 	it("does not queue a split when db is within limits", async () => {
 		const base = makeUniqueBase(); // rangeSplitConditions.maxSizeMb=500 by default
 		const rootCtx = makeRangeCtx(base, "alice", null, null);
-		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
+		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x", kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus).toBeUndefined();

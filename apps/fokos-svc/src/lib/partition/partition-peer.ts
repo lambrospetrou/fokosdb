@@ -38,17 +38,21 @@ export type GetPromotedKeysBatchResult = {
  * TC must not be coupled to partition/ internals.
  */
 export interface PartitionPeer {
-	getItemsBatch(opts: { childPartitionContext: PartitionContextResolved; cursor: ScanCursor | null }): Promise<GetItemsBatchResult>;
-	getPartitionTransactionMetadata(opts: {
+	migrationGetItemsBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: ScanCursor | null;
+	}): Promise<GetItemsBatchResult>;
+	migrationGetPartitionTransactionMetadata(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PendingTransactionCursor | null;
 	}): Promise<GetPartitionTransactionMetadataResult>;
-	getPromotedKeysBatch(opts: {
+	migrationGetPromotedKeysBatch(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PromotedKeyCursor | null;
 	}): Promise<GetPromotedKeysBatchResult>;
-	acknowledgeChildMigrationComplete(childDoName: string): Promise<void>;
-	acknowledgePromotionComplete(hashKey: KeyBytes): Promise<void>;
-	initFromSplit(opts: InitFromSplitOptions): Promise<void>;
-	triggerMigration(): Promise<void>;
+	migrationAcknowledgeChildComplete(childDoName: string): Promise<void>;
+	migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void>;
+
+	internalInitFromSplit(opts: InitFromSplitOptions): Promise<void>;
+	internalTriggerMigration(): Promise<void>;
 }

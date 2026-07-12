@@ -264,7 +264,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 	let pkIdx = 0;
 	let failItemsCall = opts.failItemsCall ?? 0;
 	const peer: PartitionPeer = {
-		async getItemsBatch({ cursor }) {
+		async migrationGetItemsBatch({ cursor }) {
 			calls.itemCursors.push(cursor);
 			if (failItemsCall > 0 && calls.itemCursors.length === failItemsCall) {
 				failItemsCall = 0; // fail once, then recover
@@ -272,22 +272,22 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 			}
 			return opts.items?.(cursor) ?? { items: [], nextCursor: null };
 		},
-		async getPartitionTransactionMetadata() {
+		async migrationGetPartitionTransactionMetadata() {
 			calls.txCalls++;
 			return opts.txBatches?.[txIdx++] ?? { maxDeletedTs: 0, pendingTransactions: [], nextCursor: null };
 		},
-		async getPromotedKeysBatch() {
+		async migrationGetPromotedKeysBatch() {
 			calls.pkCalls++;
 			return opts.pkBatches?.[pkIdx++] ?? { rows: [], nextCursor: null };
 		},
-		async acknowledgeChildMigrationComplete(childDoName) {
+		async migrationAcknowledgeChildComplete(childDoName) {
 			calls.childAcks.push(childDoName);
 		},
-		async acknowledgePromotionComplete(hashKey) {
+		async migrationAcknowledgePromotionComplete(hashKey) {
 			calls.promotionAcks.push(hashKey);
 		},
-		async initFromSplit() {},
-		async triggerMigration() {},
+		async internalInitFromSplit() {},
+		async internalTriggerMigration() {},
 	};
 	return { peer, calls };
 }
@@ -304,7 +304,7 @@ type MigrationEnv = {
 // Real DO storage (vitest-pool-workers); the peer is the only fake — exactly what the gateway
 // pattern buys: migration is testable without spinning up two real DOs.
 async function withMigrationEnv(fn: (menv: MigrationEnv) => Promise<void>): Promise<void> {
-	const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(`migration-test.${crypto.randomUUID()}`));
+	const stub = PartitionDO.getByName(env.PARTITION_DO, `migration-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const inherited: [KeyBytes, PromotedKeyStatus][] = [];
