@@ -73,7 +73,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		const r = await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1" });
+		const r = await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1", kind: "text" });
 		expect(r.meta.forwardCount).toBe(0);
 
 		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "a" });
@@ -87,8 +87,12 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
-			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x" })).rejects.toThrow(/exceeded its limits/);
-			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x" })).rejects.toThrow(/exceeded its limits/);
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x", kind: "text" })).rejects.toThrow(
+				/exceeded its limits/,
+			);
+			await expect(doInstance.putItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x", kind: "text" })).rejects.toThrow(
+				/exceeded its limits/,
+			);
 		});
 	});
 
@@ -98,8 +102,8 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk" });
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk", kind: "text" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last", kind: "text" });
 
 		const g = await stub.getItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });
 		expect(g).toMatchObject({ found: true });
@@ -118,6 +122,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 				hashKey: "alice",
 				sortKey: `sk${String(i).padStart(3, "0")}`,
 				data: bigData,
+				kind: "text",
 			});
 			if ((await rootStub.status(rootCtx)).splitStatus) break;
 		}
@@ -151,6 +156,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 			hashKey: "alice",
 			sortKey: "sk000",
 			data: "left",
+			kind: "text",
 		});
 		expect(left.meta.forwardCount).toBe(1);
 
@@ -159,6 +165,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 			hashKey: "alice",
 			sortKey: boundary,
 			data: "right",
+			kind: "text",
 		});
 		expect(right.meta.forwardCount).toBe(1);
 
@@ -184,8 +191,8 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		const bigData = "x".repeat(50 * 1024);
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData });
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData, kind: "text" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData, kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus?.status).toBe("split_queued");
@@ -206,7 +213,7 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		const stub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rootCtx.doName));
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x" });
+		await stub.putItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x", kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus).toBeUndefined();

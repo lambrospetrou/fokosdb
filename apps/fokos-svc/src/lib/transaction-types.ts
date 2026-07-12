@@ -1,5 +1,6 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
+import type { DataKind, JsonValue } from "./types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -21,8 +22,10 @@ export type TransactionItem = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
 	operation: TransactionOperationType;
-	/** Required for "put". */
+	/** Required for "put". Already encoded (JSON stringified at the db.ts boundary), so string | Uint8Array. */
 	data?: Uint8Array | string;
+	/** Data kind discriminant; present for "put" (json ⇒ data is JSON text). */
+	kind?: DataKind;
 	/** Optional for all operation types. */
 	conditions?: import("./types.js").ItemCondition[];
 };
@@ -79,12 +82,13 @@ export type ReadForTransactionRequest = {
 };
 
 // Result/OUT type: keys decoded to the public form by the producing participant.
-export type ReadForTransactionItemResult =
+type ReadForTransactionItemResultOf<D> =
 	| {
 			found: true;
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
-			data: Uint8Array | string;
+			data: D;
+			kind: DataKind;
 			lastCommittedTs: TransactionTimestamp;
 			hasPendingWrite: boolean;
 	  }
@@ -96,8 +100,15 @@ export type ReadForTransactionItemResult =
 			hasPendingWrite: boolean;
 	  };
 
+// RPC result (participant→TC→db.ts): json is JSON text. Free of the recursive JsonValue so the
+// Workers-RPC type machinery does not instantiate infinitely deep.
+export type ReadForTransactionItemResultEncoded = ReadForTransactionItemResultOf<string | Uint8Array>;
+
+// Public variant surfaced by FokosDB.transactGetItems: db.ts has parsed json text into a JsonValue.
+export type ReadForTransactionItemResult = ReadForTransactionItemResultOf<string | Uint8Array | JsonValue>;
+
 export type ReadForTransactionResponse = {
-	items: ReadForTransactionItemResult[];
+	items: ReadForTransactionItemResultEncoded[];
 };
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
@@ -122,7 +133,9 @@ export type TCWriteOperation = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
 	operation: TransactionOperationType;
+	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
 	data?: Uint8Array | string;
+	kind?: DataKind;
 	conditions?: import("./types.js").ItemCondition[];
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
@@ -161,6 +174,11 @@ export type InitiateReadRequest = {
 	items: TCReadItem[];
 };
 
+export type InitiateReadResponseEncoded =
+	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
+	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
+
+// Public variant surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts boundary.
 export type InitiateReadResponse =
 	| { outcome: "committed"; items: ReadForTransactionItemResult[] }
 	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };

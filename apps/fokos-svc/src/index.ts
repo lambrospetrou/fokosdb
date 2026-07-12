@@ -5,7 +5,7 @@ import * as v from "valibot";
 import { FokosDB } from "./lib/db.js";
 import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
-import type { GetItemResult, InitiateReadResponse, QueryItemsResult } from "./lib/types.js";
+import type { GetItemResult, InitiateReadResponse, JsonValue, QueryItemsResult } from "./lib/types.js";
 
 export { PartitionDO } from "./lib/do-partition.js";
 export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
@@ -82,7 +82,7 @@ const TransactGetItemsBodySchema = v.object({
 });
 
 // FIXME: the HTTP API only accepts string keys; support Uint8Array (binary) keys via a
-// keyEncoding discriminator or base64-encoded binary form (see queryItems design §2).
+// keyEncoding discriminator or base64-encoded binary form.
 const SortKeyConditionSchema = v.union([
 	v.object({ op: v.literal("eq"), value: v.string() }),
 	v.object({ op: v.union([v.literal("lt"), v.literal("lte"), v.literal("gt"), v.literal("gte")]), value: v.string() }),
@@ -135,11 +135,17 @@ function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOp
 	});
 }
 
-function encodeData(data: Uint8Array | string): { data: string; dataEncoding: "utf8" | "base64" } {
+// The HTTP write surface only accepts string `data` (PutItemBodySchema), so over HTTP items are always
+// text; but a json/bytes row created via the programmatic API can still be read back here, so all three
+// kinds are serialized. json values are re-stringified with a distinct `dataEncoding` discriminant.
+function encodeData(data: string | Uint8Array | JsonValue): { data: string; dataEncoding: "utf8" | "base64" | "json" } {
 	if (data instanceof Uint8Array) {
 		return { data: Buffer.from(data).toString("base64"), dataEncoding: "base64" };
 	}
-	return { data, dataEncoding: "utf8" };
+	if (typeof data === "string") {
+		return { data, dataEncoding: "utf8" };
+	}
+	return { data: JSON.stringify(data), dataEncoding: "json" };
 }
 
 function serializeGetItemResult(result: GetItemResult) {
@@ -157,7 +163,7 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 			// only produce UTF-8 keys and a scan can only decode strings back. A Uint8Array key here
 			// means a binary key reached the store via the programmatic/RPC API — it would serialize to
 			// `{"0":..}` over c.json. Fail loudly rather than emit broken JSON; binary keys over HTTP
-			// would need a keyEncoding discriminator (see queryItems design §2), not yet wired.
+			// would need a keyEncoding discriminator, not yet wired.
 			if (hashKey instanceof Uint8Array || sortKey instanceof Uint8Array) {
 				throw new HTTPException(500, { message: "fokos/queryItems: binary keys are not supported over the HTTP API" });
 			}

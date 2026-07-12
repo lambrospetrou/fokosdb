@@ -42,12 +42,12 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("stores and retrieves a string value", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello", kind: "text" as const });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result).toMatchObject({
 			found: true,
-			item: { hashKey: "hk", sortKey: "sk", data: "hello" },
+			item: { hashKey: "hk", sortKey: "sk", data: "hello", kind: "text" as const },
 		});
 	});
 
@@ -55,7 +55,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		const { ctx, stub } = makeStub();
 		const data = new Uint8Array([1, 2, 3, 4, 5]);
 
-		await stub.putItem(ctx, { hashKey: "hk-bin", sortKey: "sk-bin", data });
+		await stub.putItem(ctx, { hashKey: "hk-bin", sortKey: "sk-bin", data, kind: "bytes" });
 		const result = await stub.getItem(ctx, { hashKey: "hk-bin", sortKey: "sk-bin" });
 
 		expect(result).toMatchObject({ found: true, item: { data } });
@@ -64,8 +64,8 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("overwrites an existing item on repeated put", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "second" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "second", kind: "text" as const });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result).toMatchObject({ found: true, item: { data: "second" } });
@@ -74,9 +74,9 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("isolates items by (hashKey, sortKey) composite key", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk1", sortKey: "sk1", data: "a" });
-		await stub.putItem(ctx, { hashKey: "hk1", sortKey: "sk2", data: "b" });
-		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk1", data: "c" });
+		await stub.putItem(ctx, { hashKey: "hk1", sortKey: "sk1", data: "a", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk1", sortKey: "sk2", data: "b", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk1", data: "c", kind: "text" as const });
 
 		const r1 = await stub.getItem(ctx, { hashKey: "hk1", sortKey: "sk1" });
 		const r2 = await stub.getItem(ctx, { hashKey: "hk1", sortKey: "sk2" });
@@ -90,7 +90,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("returns version 1 on first write", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello", kind: "text" as const });
 
 		expect(result.version).toBe(1);
 	});
@@ -98,9 +98,9 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("increments version on each subsequent write to the same key", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-		const r2 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
-		const r3 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v3" });
+		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+		const r2 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const });
+		const r3 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v3", kind: "text" as const });
 
 		expect(r1.version).toBe(1);
 		expect(r2.version).toBe(2);
@@ -110,8 +110,8 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("getItem returns the current version", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result).toMatchObject({ found: true, item: { version: 2 } });
@@ -120,9 +120,9 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("versions are independent per (hashKey, sortKey) key", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a2" });
-		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a2", kind: "text" as const });
+		const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b", kind: "text" as const });
 
 		const get1 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk1" });
 		const get2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk2" });
@@ -135,7 +135,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("includes operation metrics in putItem result", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data" });
+		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data", kind: "text" as const });
 
 		expect(result.meta).toMatchObject({
 			rowsRead: expect.any(Number),
@@ -149,7 +149,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("includes operation metrics in getItem result", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data", kind: "text" as const });
 		const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result).toMatchObject({
@@ -174,6 +174,7 @@ describe("PartitionDO - putItem / getItem", () => {
 				sortKey: "sk",
 				data: "val",
 				ttlEpochUTCSeconds: ttl,
+				kind: "text",
 			});
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
@@ -183,7 +184,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		it("ttlEpochUTCSeconds is absent when not set on put", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "val", kind: "text" as const });
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 			expect(result).toMatchObject({ found: true });
@@ -199,8 +200,9 @@ describe("PartitionDO - putItem / getItem", () => {
 				sortKey: "sk",
 				data: "v1",
 				ttlEpochUTCSeconds: ttl,
+				kind: "text",
 			});
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const });
 			const result = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
@@ -211,7 +213,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("stores and retrieves an item with no sortKey", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort", kind: "text" as const });
 		const result = await stub.getItem(ctx, { hashKey: "hk" });
 
 		expect(result).toMatchObject({ found: true, item: { hashKey: "hk", data: "no-sort" } });
@@ -221,8 +223,8 @@ describe("PartitionDO - putItem / getItem", () => {
 	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort" });
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort", kind: "text" as const });
 
 		const r1 = await stub.getItem(ctx, { hashKey: "hk" });
 		const r2 = await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" });
@@ -244,6 +246,7 @@ describe("PartitionDO - conditional putItem", () => {
 				sortKey: "sk",
 				data: "value",
 				conditions: [{ type: "item_not_exists" }],
+				kind: "text",
 			});
 
 			expect(result.version).toBe(1);
@@ -255,7 +258,7 @@ describe("PartitionDO - conditional putItem", () => {
 			const { ctx, stub } = makeStub();
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
+				await instance.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original", kind: "text" as const });
 
 				await expect(
 					instance.putItem(ctx, {
@@ -263,6 +266,7 @@ describe("PartitionDO - conditional putItem", () => {
 						sortKey: "sk",
 						data: "overwrite",
 						conditions: [{ type: "item_not_exists" }],
+						kind: "text",
 					}),
 				).rejects.toThrow(/item_not_exists.*v=1.*hk=\"hk\".*sk=\"sk\"/);
 			});
@@ -274,7 +278,7 @@ describe("PartitionDO - conditional putItem", () => {
 		it("works when sortKey is absent", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", data: "original" });
+			await stub.putItem(ctx, { hashKey: "hk", data: "original", kind: "text" as const });
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				await expect(
@@ -282,6 +286,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: "hk",
 						data: "overwrite",
 						conditions: [{ type: "item_not_exists" }],
+						kind: "text",
 					}),
 				).rejects.toThrow("item_not_exists");
 			});
@@ -295,12 +300,13 @@ describe("PartitionDO - conditional putItem", () => {
 		it("succeeds when v matches the expected value", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first", kind: "text" as const });
 			const result = await stub.putItem(ctx, {
 				hashKey: "hk",
 				sortKey: "sk",
 				data: "second",
 				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+				kind: "text",
 			});
 
 			expect(result.version).toBe(2);
@@ -309,8 +315,8 @@ describe("PartitionDO - conditional putItem", () => {
 		it("throws when v does not match, leaving the item unchanged", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const }); // v is now 2
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				await expect(
@@ -319,6 +325,7 @@ describe("PartitionDO - conditional putItem", () => {
 						sortKey: "sk",
 						data: "stale",
 						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						kind: "text",
 					}),
 				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
 			});
@@ -337,6 +344,7 @@ describe("PartitionDO - conditional putItem", () => {
 						sortKey: "sk",
 						data: "value",
 						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						kind: "text",
 					}),
 				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found null/);
 			});
@@ -345,7 +353,7 @@ describe("PartitionDO - conditional putItem", () => {
 		it("allows sequential optimistic-concurrency updates at the correct version", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
+			const r1 = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
 			expect(r1.version).toBe(1);
 
 			const r2 = await stub.putItem(ctx, {
@@ -353,6 +361,7 @@ describe("PartitionDO - conditional putItem", () => {
 				sortKey: "sk",
 				data: "v2",
 				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+				kind: "text",
 			});
 			expect(r2.version).toBe(2);
 
@@ -361,6 +370,7 @@ describe("PartitionDO - conditional putItem", () => {
 				sortKey: "sk",
 				data: "v3",
 				conditions: [{ type: "attribute_equals", attribute: "v", value: 2 }],
+				kind: "text",
 			});
 			expect(r3.version).toBe(3);
 		});
@@ -370,7 +380,7 @@ describe("PartitionDO - conditional putItem", () => {
 		it("succeeds when all conditions pass", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "first", kind: "text" as const });
 			const result = await stub.putItem(ctx, {
 				hashKey: "hk",
 				sortKey: "sk",
@@ -379,6 +389,7 @@ describe("PartitionDO - conditional putItem", () => {
 					{ type: "attribute_equals", attribute: "v", value: 1 },
 					{ type: "attribute_equals", attribute: "v", value: 1 },
 				],
+				kind: "text",
 			});
 
 			expect(result.version).toBe(2);
@@ -389,7 +400,7 @@ describe("PartitionDO - conditional putItem", () => {
 
 			// item_not_exists is listed first and will fail since the item exists.
 			// attribute_equals with value=1 would pass — but we never reach it.
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "original", kind: "text" as const });
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				await expect(
@@ -398,6 +409,7 @@ describe("PartitionDO - conditional putItem", () => {
 						sortKey: "sk",
 						data: "overwrite",
 						conditions: [{ type: "item_not_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+						kind: "text",
 					}),
 				).rejects.toThrow("item_not_exists");
 			});
@@ -409,8 +421,8 @@ describe("PartitionDO - conditional putItem", () => {
 		it("fails on the second condition when the first passes", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const }); // v is now 2
 
 			// attribute_equals v=2 passes, then attribute_equals v=1 fails.
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
@@ -423,6 +435,7 @@ describe("PartitionDO - conditional putItem", () => {
 							{ type: "attribute_equals", attribute: "v", value: 2 },
 							{ type: "attribute_equals", attribute: "v", value: 1 },
 						],
+						kind: "text",
 					}),
 				).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
 			});
@@ -439,6 +452,7 @@ describe("PartitionDO - conditional putItem", () => {
 				sortKey: "sk",
 				data: "value",
 				conditions: [],
+				kind: "text",
 			});
 
 			expect(result.version).toBe(1);
@@ -474,7 +488,7 @@ describe("PartitionDO - deleteItem", () => {
 	it("returns deleted:true and removes the item when it exists", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello", kind: "text" as const });
 		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result.deleted).toBe(true);
@@ -485,7 +499,7 @@ describe("PartitionDO - deleteItem", () => {
 	it("is idempotent — second delete returns deleted:false", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "hello", kind: "text" as const });
 		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
 		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
@@ -495,9 +509,9 @@ describe("PartitionDO - deleteItem", () => {
 	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b" });
-		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk1", data: "c" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk1", data: "a", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk2", data: "b", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk2", sortKey: "sk1", data: "c", kind: "text" as const });
 
 		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk1" });
 
@@ -515,8 +529,8 @@ describe("PartitionDO - deleteItem", () => {
 	it("works when sortKey is absent — deletes only the no-sortKey row", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort" });
+		await stub.putItem(ctx, { hashKey: "hk", data: "no-sort", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "with-sort", kind: "text" as const });
 
 		const result = await stub.deleteItem(ctx, { hashKey: "hk" });
 		expect(result.deleted).toBe(true);
@@ -531,10 +545,10 @@ describe("PartitionDO - deleteItem", () => {
 	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const });
 		await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
-		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "fresh" });
+		const result = await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "fresh", kind: "text" as const });
 
 		expect(result.version).toBe(1);
 		expect(await stub.getItem(ctx, { hashKey: "hk", sortKey: "sk" })).toMatchObject({
@@ -546,7 +560,7 @@ describe("PartitionDO - deleteItem", () => {
 	it("includes operation metrics in deleteItem result", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "data", kind: "text" as const });
 		const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk" });
 
 		expect(result.meta).toMatchObject({
@@ -564,7 +578,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("succeeds and deletes the item when it exists", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", kind: "text" as const });
 				const result = await stub.deleteItem(ctx, {
 					hashKey: "hk",
 					sortKey: "sk",
@@ -605,7 +619,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("succeeds when v matches the expected value", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", kind: "text" as const });
 				const result = await stub.deleteItem(ctx, {
 					hashKey: "hk",
 					sortKey: "sk",
@@ -618,8 +632,8 @@ describe("PartitionDO - deleteItem", () => {
 			it("throws when v does not match, leaving the item untouched", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const }); // v is now 2
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
 					await expect(
@@ -656,7 +670,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("succeeds when all conditions pass", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", kind: "text" as const });
 				const result = await stub.deleteItem(ctx, {
 					hashKey: "hk",
 					sortKey: "sk",
@@ -685,8 +699,8 @@ describe("PartitionDO - deleteItem", () => {
 			it("fails on the second condition when the first passes", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1" });
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2" }); // v is now 2
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v1", kind: "text" as const });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "v2", kind: "text" as const }); // v is now 2
 
 				// item_exists passes, then attribute_equals v=1 fails.
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
@@ -708,7 +722,7 @@ describe("PartitionDO - deleteItem", () => {
 			it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
-				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value" });
+				await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "value", kind: "text" as const });
 				const result = await stub.deleteItem(ctx, { hashKey: "hk", sortKey: "sk", conditions: [] });
 
 				expect(result.deleted).toBe(true);
@@ -721,7 +735,7 @@ describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small", kind: "text" as const });
 
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeUndefined();
@@ -750,7 +764,7 @@ describe("PartitionDO - splitting", () => {
 			const tData = "x".repeat(chunkBytes);
 			for (let i = 0; ; i++) {
 				try {
-					await instance.putItem(ctx, { hashKey: `split-trig-${i}`, sortKey: "sk", data: tData });
+					await instance.putItem(ctx, { hashKey: `split-trig-${i}`, sortKey: "sk", data: tData, kind: "text" as const });
 				} catch (e) {
 					if (!String(e).includes("partition exceeded")) throw e;
 					break;
@@ -762,7 +776,7 @@ describe("PartitionDO - splitting", () => {
 			const { splitStatus: after1 } = await instance.status();
 			expect(after1?.status).toBe("split_queued");
 
-			await instance.putItem(ctx, { hashKey: "extra", sortKey: "sk2", data: "small" });
+			await instance.putItem(ctx, { hashKey: "extra", sortKey: "sk2", data: "small", kind: "text" as const });
 
 			const { splitStatus: after2 } = await instance.status();
 			expect(after2?.status).toBe("split_queued");
@@ -937,7 +951,7 @@ describe("PartitionDO - splitting", () => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
 		// Write something small — well below the split threshold — to initialize the partition context.
-		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small" });
+		await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "small", kind: "text" as const });
 
 		// No split should have been queued.
 		const { splitStatus: before } = await stub.status();
@@ -968,7 +982,7 @@ describe("PartitionDO - splitting", () => {
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
 			const hashKey = "forwarded-key";
-			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val" });
+			const putResult = await stub.putItem(ctx, { hashKey, sortKey: "sk", data: "val", kind: "text" as const });
 			expect(putResult.meta.forwardCount).toBe(1);
 			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
 			expect(childNames).toContain(putResult.meta.servedByActorName);
@@ -1016,7 +1030,7 @@ describe("PartitionDO - splitting", () => {
 				// Drain the full split tree and retry until the write lands.
 				for (let attempt = 0; attempt < 20; attempt++) {
 					try {
-						await stub.putItem(ctx, { hashKey, sortKey, data: dummyData });
+						await stub.putItem(ctx, { hashKey, sortKey, data: dummyData, kind: "text" as const });
 						break;
 					} catch (e: unknown) {
 						expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
@@ -1168,12 +1182,12 @@ describe("PartitionDO - splitting", () => {
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
-				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1" },
-				{ hashKey: "alpha", sortKey: "s2", data: "data-alpha-2" },
-				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
-				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1" },
-				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1" },
-				{ hashKey: "echo", sortKey: "s1", data: "data-echo-1" },
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1", kind: "text" as const },
+				{ hashKey: "alpha", sortKey: "s2", data: "data-alpha-2", kind: "text" as const },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1", kind: "text" as const },
+				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1", kind: "text" as const },
+				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1", kind: "text" as const },
+				{ hashKey: "echo", sortKey: "s1", data: "data-echo-1", kind: "text" as const },
 			];
 			for (const item of seedItems) {
 				await stub.putItem(ctx, item);
@@ -1240,7 +1254,7 @@ describe("PartitionDO - splitting", () => {
 		it("putItem is rejected while migration is in progress", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1" });
+			await stub.putItem(ctx, { hashKey: "key1", sortKey: "sk", data: "value1", kind: "text" as const });
 			await triggerHashSplitThreshold(stub, ctx, 1);
 
 			// Pre-install the gate on all child partitions before the parent alarm fires.
@@ -1269,7 +1283,7 @@ describe("PartitionDO - splitting", () => {
 			// exception, which Vitest surfaces as an unhandled rejection even though we catch it.
 			await expect(
 				runInDurableObject(childStub, (instance: PartitionDO) =>
-					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value" }),
+					instance.putItem(childCtx, { hashKey: "key1", sortKey: "sk", data: "new-value", kind: "text" as const }),
 				),
 			).rejects.toThrow("split in progress");
 
@@ -1284,8 +1298,8 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
 			const seedItems = [
-				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1" },
-				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-1", kind: "text" as const },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1", kind: "text" as const },
 			];
 			for (const item of seedItems) {
 				await stub.putItem(ctx, item);
@@ -1335,11 +1349,11 @@ describe("PartitionDO - splitting", () => {
 
 			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
 			const seedItems = [
-				{ hashKey: "alpha", sortKey: undefined, data: "data-alpha-nosort" },
-				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-s1" },
-				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1" },
-				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1" },
-				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1" },
+				{ hashKey: "alpha", sortKey: undefined, data: "data-alpha-nosort", kind: "text" as const },
+				{ hashKey: "alpha", sortKey: "s1", data: "data-alpha-s1", kind: "text" as const },
+				{ hashKey: "banana", sortKey: "s1", data: "data-banana-1", kind: "text" as const },
+				{ hashKey: "cherry", sortKey: "s1", data: "data-cherry-1", kind: "text" as const },
+				{ hashKey: "delta", sortKey: "s1", data: "data-delta-1", kind: "text" as const },
 			];
 			for (const item of seedItems) {
 				await stub.putItem(ctx, item);
@@ -1383,12 +1397,12 @@ describe("PartitionDO - splitting", () => {
 		it("getItemDirect bypasses split forwarding and reads from local storage", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
-			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "direct-value" });
+			await stub.putItem(ctx, { hashKey: "hk", sortKey: "sk", data: "direct-value", kind: "text" as const });
 
 			const result = await stub.getItemDirect({ hashKey: "hk", sortKey: "sk" });
 			expect(result).toMatchObject({
 				found: true,
-				item: { hashKey: "hk", sortKey: "sk", data: "direct-value" },
+				item: { hashKey: "hk", sortKey: "sk", data: "direct-value", kind: "text" as const },
 			});
 
 			const miss = await stub.getItemDirect({ hashKey: "missing", sortKey: "sk" });
@@ -1517,7 +1531,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		});
 		invariant(topology!, "topology should be initialized in the DO instance");
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
-		await stub.putItem(pCtx, { hashKey: "hk", sortKey: "sk", data: "v" });
+		await stub.putItem(pCtx, { hashKey: "hk", sortKey: "sk", data: "v", kind: "text" as const });
 		const rootState = await stub.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
 		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(pCtx.partitionId));
@@ -1568,7 +1582,7 @@ async function triggerHashSplitThreshold(
 	const data = "x".repeat(chunkBytes);
 	for (let i = 0; ; i++) {
 		try {
-			await stub.putItem(ctx, { hashKey: `_split_trig_${i}`, sortKey: "sk", data });
+			await stub.putItem(ctx, { hashKey: `_split_trig_${i}`, sortKey: "sk", data, kind: "bytes" });
 		} catch (e) {
 			// "partition exceeded" means we crossed the reject band — split was queued by a prior write.
 			if (!String(e).includes("partition exceeded")) throw e;
@@ -1651,7 +1665,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 		await vi.waitFor(
 			async () => {
@@ -1667,7 +1681,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 
 	it("does not detect any key when the DB is well below the promotion threshold", async () => {
 		const { ctx, stub } = makeStub(); // default hashSplitConditions.maxSizeMb=100 → threshold 50 MB
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: "tiny" });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: "tiny", kind: "text" as const });
 
 		await waitForAlarm(stub); // alarm may not be set at all; waitForAlarm is a no-op if so
 		const s = await stub.status();
@@ -1680,7 +1694,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 		// Wait for alice to reach 'promoting' or 'promoted' (the fire-and-forget range-root migration
 		// may race to completion within the same background cycle).
@@ -1696,7 +1710,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		// Write more data, then assert no hash split was queued. This holds in both cases:
 		//  - 'promoting': mutual exclusion blocks the split even though DB exceeds maxSizeMb.
 		//  - 'promoted':  alice's data is GC'd, so the DB is back under maxSizeMb and no split is warranted.
-		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: "small-data" });
+		await stub.putItem(ctx, { hashKey: "bob", sortKey: "sk1", data: "small-data", kind: "text" as const });
 
 		const s = await stub.status();
 		expect(s.splitStatus).toBeUndefined();
@@ -1708,7 +1722,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
 		const txId = crypto.randomUUID();
@@ -1717,7 +1731,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
-			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending" }],
+			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }],
 		});
 		expect(lockResult.outcome).toBe("accepted");
 
@@ -1733,7 +1747,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		);
 
 		// A write to alice while 'queued' is still served locally.
-		const r = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "still-local" });
+		const r = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "still-local", kind: "text" as const });
 		expect(r.meta.forwardCount).toBe(0);
 
 		// Release the lock; next background cycle should complete the cutover.
@@ -1753,7 +1767,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 		// Wait for detection + cutover to 'promoting'.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
@@ -1781,7 +1795,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		);
 
 		// Writes via the hash partition are forwarded to the range root.
-		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range" });
+		const w = await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk2", data: "in-range", kind: "text" as const });
 		expect(w.meta.forwardCount).toBe(1);
 		// The response must surface the serving range root's own rangeDepth/rangeAncestors (0/[] for a
 		// fresh root), not an empty/zero value from the forwarding hash partition's own context.
@@ -1802,7 +1816,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await vi.waitFor(
@@ -1823,8 +1837,8 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
 			items: [
-				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn" },
-				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data" },
+				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
+				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
 			],
 		});
 		expect(prepareResp.outcome).toBe("accepted");
@@ -1833,8 +1847,8 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			items: [
-				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn" },
-				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data" },
+				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
+				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
 			],
 		});
 
@@ -1853,7 +1867,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.putItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA });
+		await stub.putItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
 		const rangeRootStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(rangeRootCtx.doName));
 		await vi.waitFor(
@@ -1873,8 +1887,8 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
 			items: [
-				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "alice-data" },
-				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data" },
+				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "alice-data", kind: "text" },
+				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
 			],
 		});
 		expect(prepareResp.outcome).toBe("accepted");
@@ -1889,8 +1903,8 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionTimestamp: Date.now() + 1,
 			coordinatorDoId: coordId,
 			items: [
-				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "retried" },
-				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "retried" },
+				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "retried", kind: "text" },
+				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "retried", kind: "text" },
 			],
 		});
 		expect(prepareResp2.outcome).toBe("accepted");
@@ -1906,7 +1920,7 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 
 		// Alice data exceeds the 512KB promotion threshold for maxSizeMb=1.
 		const aliceData = "x".repeat(600 * 1024);
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: aliceData });
+		await stub.putItem(ctx, { hashKey: "alice", sortKey: "sk1", data: aliceData, kind: "text" as const });
 
 		// Wait for: detect → 'promoting' → range-root migration → 'promoted' → GC clears local alice items.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
@@ -2021,7 +2035,7 @@ async function makeQueuedRangeRoot(
 	for (let i = 0; i < 100; i++) {
 		// The random part at the end is to check the short boundaries computation if we want.
 		const sk = `sk${String(i).padStart(3, "0")}-${crypto.randomUUID()}`;
-		await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: sk, data: RANGE_ITEM_DATA });
+		await rootStub.putItem(rootCtx, { hashKey: "alice", sortKey: sk, data: RANGE_ITEM_DATA, kind: "text" as const });
 		sks.push(sk);
 		if ((await rootStub.status()).splitStatus?.status === "split_queued") break;
 	}
@@ -2044,7 +2058,12 @@ async function waitForSplitCompleted(stub: DurableObjectStub<PartitionDO>): Prom
 // partition until it queues a split, then drives that split to completion.
 async function splitRangePartition(stub: DurableObjectStub<PartitionDO>, ctx: PartitionContextResolved, keyPrefix: string): Promise<void> {
 	for (let i = 0; ; i++) {
-		await stub.putItem(ctx, { hashKey: "alice", sortKey: `${keyPrefix}${String(i).padStart(4, "0")}`, data: RANGE_ITEM_DATA });
+		await stub.putItem(ctx, {
+			hashKey: "alice",
+			sortKey: `${keyPrefix}${String(i).padStart(4, "0")}`,
+			data: RANGE_ITEM_DATA,
+			kind: "text" as const,
+		});
 		if ((await stub.status()).splitStatus?.status === "split_queued") break;
 		invariant(i < 200, `partition (${keyPrefix}) did not reach split_queued in time`);
 	}
@@ -2399,7 +2418,7 @@ describe("PartitionDO — range split", () => {
 			// Promote hashKey on the leaf (depth=2) that owns it.
 			const { partitionContext: leafCtx } = topology.pickDescendantHashPartition(ctx, kb(hashKey), 2);
 			const leafStub = env.PARTITION_DO.get(env.PARTITION_DO.idFromName(leafCtx.doName));
-			await leafStub.putItem(leafCtx, { hashKey, sortKey: "sk1", data: PROMOTION_BIG_DATA });
+			await leafStub.putItem(leafCtx, { hashKey, sortKey: "sk1", data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 			// Wait for promotion to complete: leaf detects heavy key → cutover ("promoting") →
 			// range root migrates data → leaf acknowledges ("promoted").

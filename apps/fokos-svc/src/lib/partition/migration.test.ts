@@ -97,6 +97,7 @@ describe("SplitMigration — hash child", () => {
 			transaction_ts: 123,
 			operation: "put",
 			data: "d",
+			kind: "text" as const,
 			conditions_json: null,
 			coordinator_do_id: "tc-1",
 			created_at: 1000,
@@ -222,7 +223,7 @@ function rangeCtx(base: PartitionContext, hashKey: string, start: string | null,
 }
 
 function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): MigratedItem {
-	return { hk: kb(hk), sk: kb(sk), data, ttl_epoch_utc_seconds: null, v, last_transaction_ts: 0 };
+	return { hk: kb(hk), sk: kb(sk), data, kind: "text", ttl_epoch_utc_seconds: null, v, last_transaction_ts: 0 };
 }
 
 // Serves `all` (already in (hk, sk) order) in pages of `batchSize`, honoring the resume cursor —

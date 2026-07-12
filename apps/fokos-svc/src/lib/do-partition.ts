@@ -2,11 +2,11 @@ import { DurableObject } from "cloudflare:workers";
 import {
 	DeleteItemOptions,
 	DeleteItemResult,
+	EncodedPutItemOptions as PutItemEncodedOptions,
 	GetItemOptions,
-	GetItemResult,
+	GetItemResultEncoded,
 	OperationMetrics,
 	PartitionInfo,
-	PutItemOptions,
 	PutItemResult,
 	RangeAncestorInfo,
 } from "./types.js";
@@ -77,8 +77,8 @@ import { PageBudget } from "./query/page-budget.js";
 import { getColoInfo, type ColoInfo } from "./cf-utils.js";
 
 export interface PartitionAPI {
-	putItem(ctx: PartitionContext, opts: PutItemOptions): Promise<PutItemResult>;
-	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResult>;
+	putItem(ctx: PartitionContext, opts: PutItemEncodedOptions): Promise<PutItemResult>;
+	getItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResultEncoded>;
 	deleteItem(ctx: PartitionContext, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 }
 
@@ -121,8 +121,8 @@ export type QueryItemsRpcResult = {
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
 // DurableObjectStub<PartitionDO> → PartitionDO → withSplitForwarding → DurableObjectStub<PartitionDO>.
 type PartitionDOStub = {
-	putItem(ctx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult>;
-	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult>;
+	putItem(ctx: PartitionContextResolved, opts: PutItemEncodedOptions): Promise<PutItemResult>;
+	getItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResultEncoded>;
 	deleteItem(ctx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult>;
 	prepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
 	commit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
@@ -229,14 +229,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
-		// We swallow errors — this must never affect the DO's lifecycle. Note: no
-		// waitUntil here — a constructor has no invocation of its own to extend, and the
-		// DO stays alive by serving requests regardless.
-		void this.fokosGetColoInfo()
-			.then((info) => {
-				this.#_coloInfo = info;
-			})
-			.catch(() => {});
+		// We swallow errors — this must never affect the DO's lifecycle.
+		setTimeout(() => {
+			void this.fokosGetColoInfo()
+				.then((info) => {
+					this.#_coloInfo = info;
+				})
+				.catch(() => {});
+		}, 0);
 	}
 
 	/**
@@ -314,7 +314,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * Overrideable method to get the location info.
 	 */
 	async fokosGetColoInfo(): Promise<ColoInfo> {
-		return await getColoInfo();
+		if (this.env.FOKOS_SHOULD_FETCH_COLO_INFO) {
+			return await getColoInfo();
+		}
+		return { cfColo: "", cfLoc: "", cfFl: "" };
 	}
 
 	async triggerMigration(): Promise<void> {
@@ -325,7 +328,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	async putItem(pCtx: PartitionContextResolved, opts: PutItemOptions): Promise<PutItemResult> {
+	async putItem(pCtx: PartitionContextResolved, opts: PutItemEncodedOptions): Promise<PutItemResult> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("putItem");
 		const hashKey = PartitionDO.keyIn(opts.hashKey);
@@ -359,6 +362,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					hk: hashKey,
 					sk: sortKey,
 					data: opts.data,
+					kind: opts.kind,
 					ttlEpochUtcSeconds: opts.ttlEpochUTCSeconds ?? null,
 					lastTransactionTs: Date.now(),
 				});
@@ -442,7 +446,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	async getItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResult> {
+	async getItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResultEncoded> {
 		this.ensurePartitionContext(pCtx);
 
 		if (await this.ensureMigration("getItem", false)) {
@@ -463,7 +467,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return result;
 		}
 
-		return await this.withSplitForwarding<GetItemResult>({
+		return await this.withSplitForwarding<GetItemResultEncoded>({
 			ctx: pCtx,
 			keys: { hashKey: PartitionDO.keyIn(opts.hashKey), sortKey: PartitionDO.optKeyIn(opts.sortKey) },
 			operationName: "getItem",
@@ -474,7 +478,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	// Internal RPC: reads directly from local storage, bypassing split forwarding.
 	// Called by child partitions during migration to avoid a forwarding loop back into the child.
-	async getItemDirect(opts: GetItemOptions): Promise<GetItemResult> {
+	async getItemDirect(opts: GetItemOptions): Promise<GetItemResultEncoded> {
 		return await this.readItemLocally(this.pCtx(), opts);
 	}
 
@@ -550,6 +554,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					cursor: pageCursor,
 					limit: pageSize,
 					direction: req.direction,
+					decodeJson: true, // public read: json rows decode to JSON text; db.ts parses at the boundary.
 				});
 				rowsScanned += page.length;
 				return page;
@@ -770,6 +775,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					cursor: pageCursor,
 					limit: pageSize,
 					direction: "asc",
+					decodeJson: false, // migration read: copy the raw JSONB blob verbatim.
 				}),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			estimateBytes: estimateItemBytes,
@@ -1500,7 +1506,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.env[this.pCtx().ns].get(childId);
 	}
 
-	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResult {
+	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResultEncoded {
 		const res = this.#store.getItem(PartitionDO.keyIn(opts.hashKey), PartitionDO.optKeyIn(opts.sortKey));
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
@@ -1526,7 +1532,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			found: true,
 			item: {
 				...itemKey,
+				// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 				data: result.data,
+				kind: result.kind,
 				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
 				version: result.v,
 			},
@@ -1680,6 +1688,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 									sortKey: r.sk,
 									operation: r.operation as TransactionItem["operation"],
 									data: r.data ?? undefined,
+									kind: r.kind ?? undefined,
 								}));
 								await this.commit(this.pCtx(), {
 									transactionId: row.transaction_id,

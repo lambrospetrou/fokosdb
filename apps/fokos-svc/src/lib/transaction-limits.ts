@@ -18,6 +18,7 @@ export type TransactWriteOperationLike = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
 	operation: TransactionOperationType;
+	// Already-encoded data (json stringified upstream), so payload accounting is a plain byte/char count.
 	data?: Uint8Array | string;
 };
 
