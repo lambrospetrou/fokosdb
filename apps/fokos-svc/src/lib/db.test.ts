@@ -272,6 +272,72 @@ describe("FokosDB.queryItems — sort-key condition operators", () => {
 	});
 });
 
+describe("FokosDB — item data kinds (bytes / text / json)", () => {
+	it("round-trips each kind through put→get, exposing the reconstructed value and its kind", async () => {
+		const db = makeDB();
+		const bytes = new Uint8Array([0, 1, 2, 255]);
+		const obj = { a: 1, nested: { b: [true, "x", null] }, list: [1, 2, 3] };
+
+		await db.putItem({ hashKey: "k", sortKey: "bytes", data: bytes });
+		await db.putItem({ hashKey: "k", sortKey: "text", data: "hello" });
+		await db.putItem({ hashKey: "k", sortKey: "json", data: obj });
+
+		const gotBytes = await db.getItem({ hashKey: "k", sortKey: "bytes" });
+		const gotText = await db.getItem({ hashKey: "k", sortKey: "text" });
+		const gotJson = await db.getItem({ hashKey: "k", sortKey: "json" });
+
+		expect(gotBytes).toMatchObject({ found: true, item: { kind: "bytes", data: bytes } });
+		expect(gotText).toMatchObject({ found: true, item: { kind: "text", data: "hello" } });
+		expect(gotJson).toMatchObject({ found: true, item: { kind: "json" } });
+		if (gotJson.found) expect(gotJson.item.data).toEqual(obj); // deep structural equality after JSONB round-trip
+	});
+
+	it("keeps a bare string as opaque text (not JSON-wrapped), byte-identical on read", async () => {
+		const db = makeDB();
+		const jsonText = '{"a":1}'; // legitimate JSON *text* stored as a string stays a string
+		await db.putItem({ hashKey: "k", sortKey: "s", data: jsonText });
+		const got = await db.getItem({ hashKey: "k", sortKey: "s" });
+		expect(got).toMatchObject({ found: true, item: { kind: "text", data: jsonText } });
+	});
+
+	it("exposes kind on queryItems results and parses json rows", async () => {
+		const db = makeDB();
+		await db.putItem({ hashKey: "q", sortKey: "1", data: "plain" });
+		await db.putItem({ hashKey: "q", sortKey: "2", data: { n: 42 } });
+
+		const res = await db.queryItems({ queries: [{ hashKey: "q" }] });
+		expect(res.items).toMatchObject([
+			{ sortKey: "1", kind: "text", data: "plain" },
+			{ sortKey: "2", kind: "json", data: { n: 42 } },
+		]);
+	});
+
+	it("round-trips a json value written and read through a transaction", async () => {
+		const db = makeDB();
+		const obj = { status: "active", tags: ["a", "b"] };
+		const write = await db.transactWriteItems({
+			operations: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
+		});
+		expect(write.outcome).toBe("committed");
+
+		const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
+		expect(read.outcome).toBe("committed");
+		if (read.outcome === "committed") {
+			expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
+			const item = read.items[0];
+			if (item.found) expect(item.data).toEqual(obj);
+		}
+	});
+
+	it("rejects data that is not JSON-serializable", async () => {
+		const db = makeDB();
+		const circular: Record<string, unknown> = {};
+		circular.self = circular;
+		// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
+		await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(/not JSON-serializable/);
+	});
+});
+
 // Builds a FokosDB over a fresh, isolated table. Generous split thresholds keep every key on a
 // single root partition so these tests exercise FokosDB.queryItems' cross-sub-query fan-out and
 // pagination, not the DO-level range-tree walk (covered in do-partition.test.ts).

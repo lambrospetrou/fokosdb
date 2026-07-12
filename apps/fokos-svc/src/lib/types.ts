@@ -1,5 +1,27 @@
 import { KeyBytes } from "./partition-topology/key-codec.js";
 
+// ─── Item data kinds ────────────────────────────────────────────────────────────
+
+export type JsonPrimitive = string | number | boolean | null;
+export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
+// Top-level accepted composites only (start restricted; top-level primitives excluded initially).
+export type JsonComposite = JsonValue[] | { [key: string]: JsonValue };
+
+// ONE source of truth: the array. The on-disk `data_kind` column stores the compact integer code =
+// the array index; the TS/public discriminant is the readable string literal. Both lookups are index
+// math (`DATA_KINDS.indexOf(kind)` / `DATA_KINDS[code]`), so nothing can drift.
+//
+// ATTENTION: NEVER change the order of this array. The index is the on-disk code, so reordering would break existing data.
+export const DATA_KINDS = ["bytes", "text", "json"] as const; // index = on-disk code
+export type DataKind = (typeof DATA_KINDS)[number]; // "bytes" | "text" | "json"
+
+// Encoded for the wire / store WRITE — JSON already stringified at the db.ts boundary, so the DO
+// only ever sees `string | Uint8Array`. JSON text → store as jsonb(data)
+export type EncodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: string };
+
+// Decoded for public READ — json rebuilt at the db.ts boundary.
+export type DecodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: JsonValue };
+
 export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
 
 export interface ItemPutter {
@@ -18,12 +40,20 @@ export type ItemCondition =
 export type PutItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
+
 	ttlSeconds?: number;
 	ttlEpochUTCSeconds?: number;
 
-	data: Uint8Array | string;
+	data: string | Uint8Array | JsonComposite;
 
 	conditions?: ItemCondition[];
+};
+
+// Wire-IN type (db.ts → PartitionDO): the public `data` has been encoded to `string | Uint8Array`
+// plus a `kind` discriminant, so the DO never sees a JS object.
+export type EncodedPutItemOptions = Omit<PutItemOptions, "data"> & {
+	data: string | Uint8Array;
+	kind: DataKind;
 };
 
 export type DeleteItemOptions = {
@@ -59,13 +89,14 @@ export type GetItemOptions = {
 	sortKey?: string | Uint8Array;
 };
 
-export type GetItemResult =
+type GetItemResultOf<D> =
 	| {
 			found: true;
 			item: {
 				hashKey: string | Uint8Array;
 				sortKey?: string | Uint8Array;
-				data: Uint8Array | string;
+				data: D;
+				kind: DataKind;
 				ttlEpochUTCSeconds?: number;
 				version: number;
 			};
@@ -76,6 +107,13 @@ export type GetItemResult =
 			item: ItemKey;
 			meta: OperationMetrics & PartitionInfo & {};
 	  };
+
+// DO→db.ts RPC result: json arrives as JSON text, so data is `string | Uint8Array`. Deliberately free
+// of the recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
+export type GetItemResultEncoded = GetItemResultOf<string | Uint8Array>;
+
+// Public result surfaced by FokosDB.getItem: db.ts has parsed json text into a JsonValue.
+export type GetItemResult = GetItemResultOf<string | Uint8Array | JsonValue>;
 
 export type PartitionInfo = {
 	/**
@@ -149,6 +187,7 @@ export type {
 	InitiateWriteRequest,
 	InitiateWriteResponse,
 	InitiateReadRequest,
+	InitiateReadResponseEncoded,
 	InitiateReadResponse,
 	TCWriteOperation,
 	TCReadItem,
@@ -188,7 +227,8 @@ export type QueryItemsResult = {
 	items: Array<{
 		hashKey: string | Uint8Array;
 		sortKey?: string | Uint8Array;
-		data: string | Uint8Array;
+		data: string | Uint8Array | JsonValue;
+		kind: DataKind;
 		ttlEpochUTCSeconds?: number;
 		version: number;
 	}>;

@@ -51,6 +51,7 @@
 	"vars": {
 		// https://hono.dev/docs/middleware/builtin/logger#logging-details
 		"NO_COLOR": true,
+		"FOKOS_SHOULD_FETCH_COLO_INFO": true,
 	},
 	"secrets": {
 		"required": ["FOKOS_API_TOKENS"],

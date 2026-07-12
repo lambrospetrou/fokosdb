@@ -197,9 +197,9 @@ describe("PromotionManager — GC", () => {
 				gcBatchLimit: 2,
 			});
 			for (const sk of ["1", "2", "3"]) {
-				store.upsertItem({ hk: kb("alice"), sk: kb(sk), data: "x", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
+				store.upsertItem({ hk: kb("alice"), sk: kb(sk), data: "x", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
 			}
-			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
+			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 0 });
 			insertLock(store, kb("alice"), "tx1");
 			store.insertPromotedKey(kb("alice"), "promoted", 1);
 
@@ -271,6 +271,7 @@ function insertLock(store: PartitionStore, hk: KeyBytes, transactionId: string):
 		transaction_ts: 123,
 		operation: "put",
 		data: "d",
+		kind: "text",
 		conditions_json: null,
 		coordinator_do_id: "tc-1",
 		created_at: 1000,

@@ -3,7 +3,7 @@ import type {
 	CommitResponse,
 	PrepareRequest,
 	PrepareResponse,
-	ReadForTransactionItemResult,
+	ReadForTransactionItemResultEncoded,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
 	TransactionItem,
@@ -127,6 +127,8 @@ export class TransactionParticipant {
 					transaction_ts: request.transactionTimestamp,
 					operation: item.operation,
 					data: item.data ?? null,
+					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
+					kind: item.kind ?? null,
 					conditions_json: item.conditions ? JSON.stringify(item.conditions) : null,
 					coordinator_do_id: request.coordinatorDoId,
 					created_at: this.#now(),
@@ -176,15 +178,18 @@ export class TransactionParticipant {
 			if (!pendingRow) continue;
 
 			if (pendingRow.operation === "put") {
+				// A put always persisted both data and kind; assert together so upsertItem gets a real kind.
 				invariant(
-					pendingRow.data !== null,
+					pendingRow.data !== null && pendingRow.kind !== null,
 					() =>
-						`fokos/partition.commit: pending "put" row has no data (hk=${KeyCodec.keyForLog(item.hashKey)}, sk=${KeyCodec.keyForLog(sk)})`,
+						`fokos/partition.commit: pending "put" row has no data/kind (hk=${KeyCodec.keyForLog(item.hashKey)}, sk=${KeyCodec.keyForLog(sk)})`,
 				);
 				const res = this.#store.upsertItem({
 					hk: item.hashKey,
 					sk,
 					data: pendingRow.data,
+					// For kind=json -> pendingRow.data is raw JSON text; upsertItem re-encodes it to JSONB.
+					kind: pendingRow.kind,
 					ttlEpochUtcSeconds: null,
 					lastTransactionTs: transactionTimestamp,
 				});
@@ -202,7 +207,7 @@ export class TransactionParticipant {
 	}
 
 	readForTransactionLocal(request: ReadForTransactionRequest): ReadForTransactionResponse {
-		const results: ReadForTransactionItemResult[] = [];
+		const results: ReadForTransactionItemResultEncoded[] = [];
 
 		for (const item of request.items) {
 			const sk = item.sortKey;
@@ -221,7 +226,9 @@ export class TransactionParticipant {
 					found: true,
 					hashKey,
 					sortKey,
+					// json arrives as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 					data: itemRow.data,
+					kind: itemRow.kind,
 					lastCommittedTs,
 					hasPendingWrite,
 				});

@@ -1,9 +1,13 @@
 import {
+	DataKind,
 	DeleteItemOptions,
+	EncodedItemData,
 	GetItemOptions,
 	GetItemResult,
 	InitiateReadResponse,
 	InitiateWriteResponse,
+	JsonComposite,
+	JsonValue,
 	PutItemOptions,
 	QueryItemsMeta,
 	QueryItemsOptions,
@@ -49,6 +53,39 @@ function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
 	return bytes;
 }
 
+// The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
+// a string is opaque text, and an object/array is JSON — stringified exactly once here
+// so the DO only ever receives `string | Uint8Array` plus a kind discriminant.
+function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemData {
+	if (data instanceof Uint8Array) return { kind: "bytes", data };
+	if (typeof data === "string") return { kind: "text", data };
+	let text: string;
+	try {
+		text = JSON.stringify(data);
+	} catch {
+		throw new Error("fokos: data is not JSON-serializable");
+	}
+	if (text === undefined) throw new Error("fokos: data serialized to undefined");
+	return { kind: "json", data: text };
+}
+
+// The matching decode boundary: json rows arrive from the DO as JSON text, parsed once back to a
+// JsonValue; bytes/text pass through untouched. A parse failure means the stored JSONB → json() text
+// is malformed (a store/encoding bug, not user input), so surface it loudly rather than returning junk.
+function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): string | Uint8Array | JsonValue {
+	if (kind !== "json") return data;
+	try {
+		return JSON.parse(data as string);
+	} catch (err) {
+		console.error({
+			message: "fokos: failed to parse json item data returned by the store",
+			error: String(err),
+			errorProps: err,
+		});
+		throw new Error("fokos: failed to parse json item data returned by the store", { cause: err });
+	}
+}
+
 export type FokosDBOptions = {
 	ns: DurableObjectNamespace<PartitionDO>;
 	topology: PartitionTopologyRouter;
@@ -83,12 +120,17 @@ export class FokosDB {
 	}
 
 	async putItem(opts: PutItemOptions) {
+		if (opts.ttlEpochUTCSeconds !== undefined && opts.ttlSeconds !== undefined) {
+			throw new Error("fokosdb: TTL expiration not yet implemented");
+		}
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = this.#options.ns.get(doId);
-		const res = await stub.putItem(partitionContext, { ...opts, hashKey, sortKey });
+		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
+		const { data, ...rest } = opts;
+		const res = await stub.putItem(partitionContext, { ...rest, hashKey, sortKey, ...encodeItemData(data) });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
 	}
@@ -101,8 +143,13 @@ export class FokosDB {
 		const stub = this.#options.ns.get(doId);
 		const res = await stub.getItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed); preserve the found/not-found discriminant.
+		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
-			return { found: true, item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
+			return {
+				found: true,
+				item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey, data: decodeItemData(res.item.kind, res.item.data) },
+				meta: res.meta,
+			};
 		}
 		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
 	}
@@ -123,18 +170,21 @@ export class FokosDB {
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
 			operation: "put" | "delete" | "check";
-			data?: Uint8Array | string;
+			data?: string | Uint8Array | JsonComposite;
 			conditions?: ItemCondition[];
 		}>;
 		clientRequestToken?: string;
 	}): Promise<InitiateWriteResponse> {
-		// Validate raw keys at the single boundary, then encode once and route on the encoded keys.
-		validateTransactWriteOperations(opts.operations);
-		const operations: TCWriteOperation[] = opts.operations.map((op) => {
+		// Encode data once at this boundary (only puts carry data); the TC/DO see string | Uint8Array + kind.
+		// Validation then runs on the already-encoded data so json payload accounting reuses this single
+		// serialization rather than JSON.stringify-ing a second time.
+		const encoded = opts.operations.map((op) => (op.data !== undefined ? encodeItemData(op.data) : undefined));
+		validateTransactWriteOperations(opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })));
+		const operations: TCWriteOperation[] = opts.operations.map((op, i) => {
 			const hashKey = encodeHashKey(op.hashKey);
 			const sortKey = encodeSortKey(op.sortKey);
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-			return { ...op, hashKey, sortKey, partitionContext };
+			return { ...op, hashKey, sortKey, partitionContext, data: encoded[i]?.data, kind: encoded[i]?.kind };
 		});
 
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
@@ -156,7 +206,7 @@ export class FokosDB {
 			return { ...item, hashKey, sortKey, partitionContext };
 		});
 
-		return await tryWhile(
+		const response = await tryWhile(
 			async () => {
 				// Read-only TCs are ephemeral — random UUID, no client idempotency token needed.
 				// Even better using a different shard key each time to maximize chances of hitting different TCs if there is an overloaded one.
@@ -166,6 +216,13 @@ export class FokosDB {
 			},
 			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
 		);
+
+		// json data arrives as JSON text — parse it once here to the public JsonValue.
+		if (response.outcome !== "committed") return response;
+		return {
+			...response,
+			items: response.items.map((item) => (item.found ? { ...item, data: decodeItemData(item.kind, item.data) } : item)),
+		};
 	}
 
 	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
@@ -237,7 +294,9 @@ export class FokosDB {
 				items.push({
 					hashKey: KeyCodec.decode(item.hk),
 					sortKey: item.sk.byteLength === 0 ? undefined : KeyCodec.decode(item.sk),
-					data: item.data,
+					// json data arrives as JSON text — parse it once here to the public JsonValue.
+					data: decodeItemData(item.kind, item.data),
+					kind: item.kind,
 					ttlEpochUTCSeconds: item.ttl_epoch_utc_seconds ?? undefined,
 					version: item.v,
 				});

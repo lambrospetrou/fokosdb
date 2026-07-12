@@ -3,18 +3,19 @@ import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migra
 import { tryWhile } from "durable-utils/retries";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
+import { DATA_KINDS, type DataKind } from "./types.js";
 import type {
 	CancelRequest,
 	CancelResponse,
 	CommitRequest,
 	CommitResponse,
 	InitiateReadRequest,
-	InitiateReadResponse,
+	InitiateReadResponseEncoded,
 	InitiateWriteRequest,
 	InitiateWriteResponse,
 	PrepareRequest,
 	PrepareResponse,
-	ReadForTransactionItemResult,
+	ReadForTransactionItemResultEncoded,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
 	RecoverTransactionResult,
@@ -54,6 +55,9 @@ type TcItemRow = {
 	sk: ArrayBuffer;
 	operation: string;
 	data: string | ArrayBuffer | null;
+	// Persisted so the reconstructed TransactionItem carries the kind through prepare/commit; for json,
+	// `data` is the JSON text (the DO re-encodes to JSONB on commit). NULL for delete/check (no data).
+	data_kind: number | null;
 	conditions_json: string | null;
 	partition_do_name: string;
 };
@@ -109,6 +113,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 sk                  BLOB    NOT NULL DEFAULT x'',
                 operation           TEXT    NOT NULL,
                 data                ANY,
+                data_kind           INTEGER,
                 conditions_json     TEXT,
                 partition_do_name   TEXT    NOT NULL,
                 PRIMARY KEY (transaction_id, hk, sk)
@@ -164,13 +169,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			);
 			for (const op of request.operations) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, conditions_json, partition_do_name)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
 					op.operation,
 					op.data ?? null,
+					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
+					op.kind === undefined ? null : DATA_KINDS.indexOf(op.kind),
 					op.conditions ? JSON.stringify(op.conditions) : null,
 					op.partitionContext.doName,
 				);
@@ -492,7 +499,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		// If some participants still NULL, leave in PREPARING; alarm will retry
 	}
 
-	async initiateRead(request: InitiateReadRequest): Promise<InitiateReadResponse> {
+	async initiateRead(request: InitiateReadRequest): Promise<InitiateReadResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 
 		// Group items by partition, keeping the context alongside.
@@ -523,7 +530,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			),
 		);
 
-		const phase1Flat: ReadForTransactionItemResult[] = [];
+		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase1Settled) {
 			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
 			phase1Flat.push(...r.value.items);
@@ -548,7 +555,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			),
 		);
 
-		const phase2Flat: ReadForTransactionItemResult[] = [];
+		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase2Settled) {
 			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
 			phase2Flat.push(...r.value.items);
@@ -560,7 +567,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		// Key-based comparison guards against any future reordering in PartitionDO. Re-encode the
 		// decoded result keys to a collision-proof composite identity for arbitrary key bytes.
-		const resultKey = (r: ReadForTransactionItemResult): string => `${r.hashKey.length}:${r.hashKey}:${r.sortKey ?? ""}`;
+		const resultKey = (r: ReadForTransactionItemResultEncoded): string => `${r.hashKey.length}:${r.hashKey}:${r.sortKey ?? ""}`;
 		const phase2ByKey = new Map(phase2Flat.map((r) => [resultKey(r), r]));
 		for (const p1 of phase1Flat) {
 			const p2 = phase2ByKey.get(resultKey(p1));
@@ -678,7 +685,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadItems(transactionId: string): TcItemRow[] {
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, operation, data, conditions_json, partition_do_name
+				`SELECT transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name
                  FROM tc_items WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -723,6 +730,7 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		sortKey: keyFromBlob(row.sk), // empty KeyBytes ([]) is the absent sentinel
 		operation: row.operation as TransactionItem["operation"],
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
+		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
 		conditions: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
 	}));
 }

@@ -1,7 +1,15 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import type { ItemCondition, RangeAncestorInfo } from "../types.js";
+import { DATA_KINDS, type DataKind, type ItemCondition, type RangeAncestorInfo } from "../types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
+
+// The on-disk `data_kind` code for json rows. json is stored as JSONB (a BLOB); a public read must
+// decode it to JSON text in SQL (`json(data)`) so JS never touches raw JSONB, while a migration read
+// copies the JSONB blob verbatim. This fixed integer is safe to interpolate into SQL.
+const JSON_KIND_CODE = DATA_KINDS.indexOf("json");
+
+// Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
+const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data`;
 
 /**
  * PartitionStore owns ALL SQL on the partition's tables: items, pending_transactions,
@@ -26,7 +34,9 @@ import invariant from "../invariant.js";
 export type MigratedItem = {
 	hk: KeyBytes;
 	sk: KeyBytes;
+	// Public reads decode json to JSON text; migration reads carry the raw JSONB blob (Uint8Array).
 	data: string | Uint8Array;
+	kind: DataKind;
 	ttl_epoch_utc_seconds: number | null;
 	v: number;
 	last_transaction_ts: number;
@@ -38,7 +48,9 @@ export type PendingTransactionRow = {
 	transaction_id: string;
 	transaction_ts: number;
 	operation: string;
+	// data and its kind are absent together: null for delete/check ops, present for put.
 	data: string | Uint8Array | null;
+	kind: DataKind | null;
 	conditions_json: string | null;
 	coordinator_do_id: string;
 	created_at: number;
@@ -101,14 +113,24 @@ export function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCon
 	}
 }
 
-export function estimateRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes): number {
-	const dataBytes = typeof data === "string" ? data.length : data.byteLength;
-	// hk and sk are variable-length and physically stored in every row (WITHOUT ROWID PK),
-	// so a long hk with many sort keys contributes significant storage that must be counted per-row.
-	// Keys are canonical bytes now, so byteLength is the exact stored size.
-	// 40 = fixed overhead: integer columns (v, ttl_epoch_utc_seconds, last_transaction_ts, est_row_bytes ≈ 4×8 = 32 bytes)
-	//      + SQLite B-tree record metadata (header varints, null bitmap ≈ 8 bytes).
-	return dataBytes + hk.byteLength + sk.byteLength + 40;
+// Maps the on-disk integer `data_kind` code back to its string discriminant. The SELECTs cast the
+// column to number; index math (never a lookup table) keeps it drift-proof with DATA_KINDS.
+function kindFromCode(code: number): DataKind {
+	const kind = DATA_KINDS[code];
+	invariant(kind !== undefined, `fokos/partition-store: unknown data_kind code`);
+	return kind;
+}
+
+// pending_transactions/tc_items rows for delete/check ops carry no data, so their data_kind is NULL —
+// kind and data are absent together. `null` code ⇒ `null` kind; a real code maps through kindFromCode.
+function kindFromNullableCode(code: number | null): DataKind | null {
+	return code === null ? null : kindFromCode(code);
+}
+function codeFromNullableKind(kind: DataKind | null): number | null {
+	if (kind === null) return null;
+	const code = DATA_KINDS.indexOf(kind);
+	invariant(code !== -1, `fokos/partition-store: unknown data kind`);
+	return code;
 }
 
 export function estimateItemBytes(item: MigratedItem): number {
@@ -140,17 +162,28 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
 		description: "Create items table",
-		// The type of `data` is ANY to allow SQLite to retain the input type (e.g. BLOB vs TEXT) and avoid unnecessary conversions.
-		// The Durable Object API only accepts strings and Uint8Arrays, so we can safely store them as-is and retrieve them with the correct type.
+		// `data` is ANY so SQLite retains the physical storage class: TEXT for text, BLOB for bytes, and
+		// BLOB for json (SQLite's JSONB binary form). `data_kind` is the discriminant that tells the three
+		// apart (JSONB and bytes are both blobs).
+		// `est_row_bytes` is a STORED generated column measuring the true encoded byte size via octet_length
+		// (UTF-8 bytes for TEXT, blob bytes for BLOB/JSONB) so it can never drift from a JS-side estimate.
+		//
+		// octet_length measures the exact variable part (data + keys); the +44 constant (K) covers the
+		// fixed per-row remainder that no cheap per-row function exposes: ~8 bytes each for the four wide
+		// integer columns (ttl_epoch_utc_seconds, v, last_transaction_ts, the materialized est_row_bytes)
+		// ≈ 32, ~4 for the small data_kind enum, plus SQLite's B-tree record header/null-bitmap ≈ 8 = 44.
+		// K is a rough size-accounting knob (feeds promotion/split), not a precise figure.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 data                  ANY     NOT NULL,
+                data_kind             INTEGER NOT NULL DEFAULT 0,
                 ttl_epoch_utc_seconds INTEGER,
                 v                     INTEGER NOT NULL,
                 last_transaction_ts   INTEGER NOT NULL DEFAULT 0,
-                est_row_bytes         INTEGER NOT NULL DEFAULT 0,
+                est_row_bytes         INTEGER NOT NULL
+                    GENERATED ALWAYS AS (octet_length(data) + octet_length(hk) + octet_length(sk) + 44) STORED,
                 PRIMARY KEY (hk, sk)
             ) WITHOUT ROWID, STRICT;`,
 	},
@@ -165,8 +198,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_ts        INTEGER NOT NULL,
                 operation             TEXT    NOT NULL,
                 data                  ANY,
+                data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
-                coordinator_do_id   TEXT    NOT NULL DEFAULT '',
+                coordinator_do_id     TEXT    NOT NULL DEFAULT '',
                 created_at            INTEGER NOT NULL,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) WITHOUT ROWID, STRICT;
@@ -196,6 +230,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 4,
 		description: "Add per-row size estimate and key-level size summary for efficient promotion detection",
+		// FIXME: Add also number of items per hash key.
 		sql: `
             CREATE TABLE IF NOT EXISTS key_size_estimates (
                 hk        BLOB    NOT NULL PRIMARY KEY,
@@ -257,19 +292,26 @@ export class PartitionStore {
 		hk: KeyBytes,
 		sk: KeyBytes,
 	): {
-		row?: { data: string | Uint8Array; ttl_epoch_utc_seconds: number | null; v: number; last_transaction_ts: number };
+		row?: { data: string | Uint8Array; kind: DataKind; ttl_epoch_utc_seconds: number | null; v: number; last_transaction_ts: number };
 		rowsRead: number;
 		rowsWritten: number;
 	} {
 		const res = this.#storage.sql.exec<{
 			data: string | ArrayBuffer;
+			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
 			last_transaction_ts: number;
-		}>(`SELECT data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk);
+		}>(
+			`SELECT ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+			hk,
+			sk,
+		);
 		const row = res.toArray()[0];
+		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		const { data_kind, ...rest } = row; // data_kind → the readable `kind`; don't leak the raw code
 		return {
-			row: row ? { ...row, data: fromSqlData(row.data) } : undefined,
+			row: { ...rest, data: fromSqlData(row.data), kind: kindFromCode(data_kind) },
 			rowsRead: res.rowsRead,
 			rowsWritten: res.rowsWritten,
 		};
@@ -299,7 +341,9 @@ export class PartitionStore {
 	upsertItem(opts: {
 		hk: KeyBytes;
 		sk: KeyBytes;
+		/** json ⇒ `data` is JSON text, wrapped with jsonb() into the binary form on write. */
 		data: string | Uint8Array;
+		kind: DataKind;
 		ttlEpochUtcSeconds: number | null;
 		lastTransactionTs: number;
 	}): {
@@ -312,24 +356,27 @@ export class PartitionStore {
 			.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hk, opts.sk)
 			.toArray()[0];
 		const oldEst = oldEstRow?.est_row_bytes ?? 0;
-		const newEst = estimateRowBytes(opts.data, opts.hk, opts.sk);
 
-		const writeRes = this.#storage.sql.exec<{ v: number }>(
-			`INSERT INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes)
-			 VALUES (?, ?, ?, ?, 1, ?, ?)
+		// json text is encoded to JSONB inside the DO; bytes/text bind verbatim. This is a fixed SQL
+		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
+		const dataExpr = opts.kind === "json" ? "jsonb(?)" : "?";
+
+		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
+			`INSERT INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts)
+			 VALUES (?, ?, ${dataExpr}, ?, ?, 1, ?)
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
+			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   v = v + 1,
-			   last_transaction_ts = excluded.last_transaction_ts,
-			   est_row_bytes = excluded.est_row_bytes
-			 RETURNING v`,
+			   last_transaction_ts = excluded.last_transaction_ts
+			 RETURNING v, est_row_bytes`,
 			opts.hk,
 			opts.sk,
 			opts.data,
+			DATA_KINDS.indexOf(opts.kind),
 			opts.ttlEpochUtcSeconds,
 			opts.lastTransactionTs,
-			newEst,
 		);
 		const rows = writeRes.toArray();
 		invariant(rows.length === 1, `fokos/partition-store.upsertItem: RETURNING expected 1 row, got ${rows.length}`);
@@ -338,6 +385,8 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.upsertItem: unexpected version value: ${version}`,
 		);
+		// Exact stored size from the generated column (drives the key_size_estimates rollup delta).
+		const newEst = rows[0].est_row_bytes;
 
 		const kseRow = this.#storage.sql
 			.exec<{ est_bytes: number }>(
@@ -391,15 +440,18 @@ export class PartitionStore {
 	 * skip re-inserting those items rather than overwriting them unnecessarily.
 	 */
 	insertItemIfAbsent(item: MigratedItem): void {
+		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
+		// JSONB blob, bound directly (no jsonb() re-encode). est_row_bytes is a generated column, so it is
+		// recomputed by SQLite and never appears in the INSERT list.
 		this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO items (hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT OR IGNORE INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			item.hk,
 			item.sk,
 			item.data,
+			DATA_KINDS.indexOf(item.kind),
 			item.ttl_epoch_utc_seconds ?? null,
 			item.v,
 			item.last_transaction_ts,
-			estimateRowBytes(item.data, item.hk, item.sk),
 		);
 	}
 
@@ -529,12 +581,16 @@ export class PartitionStore {
 		);
 	}
 
-	/** Pages the items table in (hk, sk) order, strictly after `cursor`. */
+	/**
+	 * Pages the items table in (hk, sk) order, strictly after `cursor`. This is a migration read: json
+	 * rows return the raw JSONB blob verbatim (no `json()` decode) so the child re-inserts it unchanged.
+	 */
 	queryItemsPage(cursor: ScanCursor | null, limit: number): MigratedItem[] {
 		type Row = {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
+			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
 			last_transaction_ts: number;
@@ -543,12 +599,12 @@ export class PartitionStore {
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items ORDER BY hk, sk LIMIT ?`,
 				limit,
 			);
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.hk,
 				cursor.sk,
@@ -557,8 +613,14 @@ export class PartitionStore {
 		}
 
 		const items: MigratedItem[] = [];
-		for (const row of sqlCursor) {
-			items.push({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) });
+		for (const { data_kind, ...row } of sqlCursor) {
+			items.push({
+				...row,
+				hk: fromSqlKey(row.hk),
+				sk: fromSqlKey(row.sk),
+				data: fromSqlData(row.data),
+				kind: kindFromCode(data_kind),
+			});
 		}
 		return items;
 	}
@@ -576,6 +638,9 @@ export class PartitionStore {
 	 *
 	 * Callers that always want lower-inclusive / upper-exclusive (e.g. migration) pass
 	 * `lowerInclusive: true, upperInclusive: false`.
+	 *
+	 * `decodeJson` selects the data projection: public reads (queryItems) pass `true` to decode json
+	 * rows to JSON text in SQL; migration reads pass `false` to copy the raw JSONB blob verbatim.
 	 */
 	queryRangeItemsPage(opts: {
 		hk: KeyBytes;
@@ -586,15 +651,18 @@ export class PartitionStore {
 		cursor: ScanCursor | null;
 		limit: number;
 		direction: "asc" | "desc";
+		decodeJson: boolean;
 	}): MigratedItem[] {
 		type Row = {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
+			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
 			last_transaction_ts: number;
 		};
+		const dataProjection = opts.decodeJson ? DATA_SELECT_DECODED : "data";
 		const conds: string[] = ["hk = ?"];
 		const params: unknown[] = [opts.hk];
 
@@ -631,12 +699,18 @@ export class PartitionStore {
 
 		const page = this.#storage.sql
 			.exec<Row>(
-				`SELECT hk, sk, data, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
+				`SELECT hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
 				...params,
 				opts.limit,
 			)
 			.toArray();
-		return page.map((row) => ({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) }));
+		return page.map(({ data_kind, ...row }) => ({
+			...row,
+			hk: fromSqlKey(row.hk),
+			sk: fromSqlKey(row.sk),
+			data: fromSqlData(row.data),
+			kind: kindFromCode(data_kind),
+		}));
 	}
 
 	// ─── pending_transactions ───────────────────────────────────────────────
@@ -650,15 +724,18 @@ export class PartitionStore {
 	/** Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. */
 	insertPendingLock(row: PendingTransactionRow): void {
 		this.#storage.sql.exec(
+			// pending_transactions is never queried by JSON path, so json data is stored raw (as text),
+			// not JSONB, the data_kind tag lets commit reconstruct the kind for upsertItem.
 			`INSERT OR IGNORE INTO pending_transactions
-			   (hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, coordinator_do_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
 			row.transaction_id,
 			row.transaction_ts,
 			row.operation,
 			row.data,
+			codeFromNullableKind(row.kind),
 			row.conditions_json,
 			row.coordinator_do_id,
 			row.created_at,
@@ -688,27 +765,47 @@ export class PartitionStore {
 			.map((r) => ({ hk: fromSqlKey(r.hk), sk: fromSqlKey(r.sk) }));
 	}
 
-	getPendingTxOp(hk: KeyBytes, sk: KeyBytes, transactionId: string): { operation: string; data: string | Uint8Array | null } | undefined {
+	getPendingTxOp(
+		hk: KeyBytes,
+		sk: KeyBytes,
+		transactionId: string,
+	): { operation: string; data: string | Uint8Array | null; kind: DataKind | null } | undefined {
 		const row = this.#storage.sql
 			.exec<{
 				operation: string;
 				data: string | ArrayBuffer | null;
-			}>(`SELECT operation, data FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`, hk, sk, transactionId)
+				data_kind: number | null;
+			}>(
+				`SELECT operation, data, data_kind FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
+				hk,
+				sk,
+				transactionId,
+			)
 			.toArray()[0];
-		return row ? { operation: row.operation, data: fromSqlData(row.data) } : undefined;
+		return row ? { operation: row.operation, data: fromSqlData(row.data), kind: kindFromNullableCode(row.data_kind) } : undefined;
 	}
 
 	/** Stale-transaction recovery: the locked items of one transaction, data converted. */
 	listPendingTxItems(
 		transactionId: string,
-	): { hk: KeyBytes; sk: KeyBytes; transaction_ts: number; operation: string; data: string | Uint8Array | null }[] {
+	): { hk: KeyBytes; sk: KeyBytes; transaction_ts: number; operation: string; data: string | Uint8Array | null; kind: DataKind | null }[] {
 		return this.#storage.sql
-			.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; transaction_ts: number; operation: string; data: string | ArrayBuffer | null }>(
-				`SELECT hk, sk, transaction_ts, operation, data FROM pending_transactions WHERE transaction_id = ?`,
-				transactionId,
-			)
+			.exec<{
+				hk: ArrayBuffer;
+				sk: ArrayBuffer;
+				transaction_ts: number;
+				operation: string;
+				data: string | ArrayBuffer | null;
+				data_kind: number | null;
+			}>(`SELECT hk, sk, transaction_ts, operation, data, data_kind FROM pending_transactions WHERE transaction_id = ?`, transactionId)
 			.toArray()
-			.map((row) => ({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) }));
+			.map(({ data_kind, ...row }) => ({
+				...row,
+				hk: fromSqlKey(row.hk),
+				sk: fromSqlKey(row.sk),
+				data: fromSqlData(row.data),
+				kind: kindFromNullableCode(data_kind),
+			}));
 	}
 
 	listStalePendingTx(staleBeforeTs: number, limit: number): { transaction_id: string; coordinator_do_id: string }[] {
@@ -745,12 +842,13 @@ export class PartitionStore {
 			transaction_ts: number;
 			operation: string;
 			data: string | ArrayBuffer | null;
+			data_kind: number | null;
 			conditions_json: string | null;
 			coordinator_do_id: string;
 			created_at: number;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, conditions_json, coordinator_do_id, created_at`;
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, coordinator_do_id, created_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
@@ -769,8 +867,14 @@ export class PartitionStore {
 		}
 
 		const rows: PendingTransactionRow[] = [];
-		for (const row of sqlCursor) {
-			rows.push({ ...row, hk: fromSqlKey(row.hk), sk: fromSqlKey(row.sk), data: fromSqlData(row.data) });
+		for (const { data_kind, ...row } of sqlCursor) {
+			rows.push({
+				...row,
+				hk: fromSqlKey(row.hk),
+				sk: fromSqlKey(row.sk),
+				data: fromSqlData(row.data),
+				kind: kindFromNullableCode(data_kind),
+			});
 		}
 		return rows;
 	}

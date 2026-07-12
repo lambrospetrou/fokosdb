@@ -486,6 +486,9 @@ Comparison with the DynamoDB API (`AttributeValue`, `PutItem`) and the follow-on
 storage model now enables. None of these are in scope for this plan; they are recorded here because
 the `data_kind` discriminator and JSONB storage are their prerequisite.
 
+- https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_PutItem.html
+- https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_AttributeValue.html
+
 ### A.1 Type model: untyped document, not per-field tags (decided)
 
 DynamoDB tags every value with a one-letter type (`S`, `N`, `B`, `BOOL`, `NULL`, `M`, `L`, and the
