@@ -41,13 +41,14 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Define the data type (JSON serializable object, raw bytes). JSON serializable can provide property filtering and other SQLite JSON functions support.
 - Proper structured errors thrown to differentiate user vs server errors.
+- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
+- Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root and make the forwarding and migrations faster).
+- Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status).
 - Expose an RPC/API to trigger a manual split.
 - Enforce the expiration ttl for items.
-- Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root, but it could impact availability).
-- Add jurisdictions support.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
+- Add jurisdictions support.
 - Batch item operations (non-transactions).
 - Allow check conditions and filter conditions on any attribute if the data is JSON.
 - Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
