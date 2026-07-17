@@ -188,6 +188,7 @@ describe("SplitMigration — status gate", () => {
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `migration-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,

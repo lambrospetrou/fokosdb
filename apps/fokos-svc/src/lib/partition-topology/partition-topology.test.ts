@@ -19,6 +19,7 @@ type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_start
 function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `testdb-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 4,

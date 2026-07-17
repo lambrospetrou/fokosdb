@@ -75,6 +75,7 @@ import {
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
 import { getColoInfo, type ColoInfo } from "./cf-utils.js";
+import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 
 export interface PartitionAPI {
 	apiPutItem(ctx: PartitionContext, opts: PutItemEncodedOptions): Promise<PutItemResult>;
@@ -1743,8 +1744,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				for (const row of staleTxRows) {
 					if (!row.coordinator_do_id) continue;
 					try {
-						const tcId = this.env.TRANSACTION_COORDINATOR_DO.idFromString(row.coordinator_do_id);
-						const result = await this.env.TRANSACTION_COORDINATOR_DO.get(tcId).recoverTransaction(row.transaction_id);
+						const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
+						const result = await tcStub.recoverTransaction(row.transaction_id);
 
 						if (result.state === "COMMITTED") {
 							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);

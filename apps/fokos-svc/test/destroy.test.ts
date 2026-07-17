@@ -22,13 +22,13 @@ const ITEM_DATA = "x".repeat(50 * 1024); // 50 KB
 function makeDB(tableName: string) {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName,
 		...PARTITION_OPTIONS,
 	});
 	return new FokosDB({
-		ns: env.PARTITION_DO,
-		topology: new PartitionTopologyRouterImpl(base),
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
+		topology: new PartitionTopologyRouterImpl(base),
 	});
 }
 

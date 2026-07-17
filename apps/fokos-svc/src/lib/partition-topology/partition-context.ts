@@ -6,10 +6,15 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 // namespace-key filter below can match by class identity — structural alternatives collapse to
 // `any` when TypeScript resolves them mid-cycle from do-partition.ts itself.
 import type { PartitionDO } from "../do-partition.js";
+import type { TransactionCoordinatorDO } from "../do-transaction-coordinator.js";
 import invariant from "../invariant.js";
 
 export type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
+}[keyof Env];
+
+export type TransactionCoordinatorNamespaceKey = {
+	[K in keyof Env]: Env[K] extends DurableObjectNamespace<TransactionCoordinatorDO> ? K : never;
 }[keyof Env];
 
 /**
@@ -21,8 +26,14 @@ export type PartitionNamespaceKey = {
 export type PartitionContext = {
 	schema: 1; // For future compatibility, in case we need to change the structure of the context.
 
-	ns: PartitionNamespaceKey;
 	tableName: string;
+
+	// TODO: Think where to put these since they are needed by the PartitionDO and the client as well.
+	// Wrangler ENV vars work too, but I prefer it in the code somewhere.
+	// Having them in the PartitionContext makes it easier to pass them around and use them in the PartitionDO and the client,
+	// but it's adding extra bytes to every single request.
+	ns: PartitionNamespaceKey;
+	nsTx: TransactionCoordinatorNamespaceKey;
 
 	/**
 	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
@@ -171,6 +182,7 @@ export function areMutableOptionsEqual(opts1: PartitionContext, opts2: Partition
 export class PartitionContextCreator {
 	static create(opts: {
 		ns: PartitionNamespaceKey;
+		nsTx: TransactionCoordinatorNamespaceKey;
 		tableName: string;
 		rootTreesN: number;
 		hashSplitN: number;
@@ -227,6 +239,7 @@ export class PartitionContextCreator {
 		const context: PartitionContext = {
 			schema: 1,
 			ns: opts.ns,
+			nsTx: opts.nsTx,
 			tableName: opts.tableName,
 			rootTreesN: opts.rootTreesN,
 			hashSplitN: opts.hashSplitN,

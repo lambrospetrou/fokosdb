@@ -1433,6 +1433,7 @@ describe("PartitionDO - partitionId encoding", () => {
 	describe("PartitionIdHelper static readers", () => {
 		const baseCtx = PartitionContextCreator.create({
 			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
 			tableName: "test.readers",
 			rootTreesN: 1,
 			hashSplitN: 2,
@@ -1641,6 +1642,7 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 	const prefix = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: prefix,
 		// For testing determinism only one root partition.
 		rootTreesN: 1,
@@ -2009,6 +2011,7 @@ async function makeQueuedRangeRoot(
 }> {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `rangesplit.${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,

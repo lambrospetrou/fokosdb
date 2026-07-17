@@ -121,6 +121,7 @@ type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
 function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
 	const partitionContext = PartitionContextCreator.create({
 		ns: "CUSTOM_PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName,
 		rootTreesN: partitionOptions?.rootTreesN ?? DEFAULT_PARTITION_OPTIONS.rootTreesN,
 		hashSplitN: partitionOptions?.hashSplitN ?? DEFAULT_PARTITION_OPTIONS.hashSplitN,
@@ -130,7 +131,6 @@ function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOp
 	});
 	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({
-		ns: env.CUSTOM_PARTITION_DO,
 		topology,
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});

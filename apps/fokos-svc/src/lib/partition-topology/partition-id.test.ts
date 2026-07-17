@@ -8,6 +8,7 @@ const kb = (s: string) => KeyCodec.encode(s);
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: "iddb",
 		rootTreesN: 4,
 		hashSplitN: 4,

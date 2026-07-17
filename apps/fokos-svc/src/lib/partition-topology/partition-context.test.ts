@@ -5,6 +5,7 @@ import type { PartitionContext } from "./partition-context.js";
 function makeOpts(overrides?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
 	return {
 		ns: "PARTITION_DO" as const,
+		nsTx: "TRANSACTION_COORDINATOR_DO" as const,
 		tableName: "testdb",
 		rootTreesN: 1,
 		hashSplitN: 4,

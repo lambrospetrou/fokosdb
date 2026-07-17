@@ -352,6 +352,7 @@ function makeDBFor(ns: PartitionNamespaceKey) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns,
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName,
 		rootTreesN: 1,
 		hashSplitN: 2,
@@ -360,7 +361,6 @@ function makeDBFor(ns: PartitionNamespaceKey) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	return new FokosDB({
-		ns: env[ns],
 		topology: new PartitionTopologyRouterImpl(base),
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});

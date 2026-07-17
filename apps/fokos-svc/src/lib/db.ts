@@ -1,3 +1,7 @@
+import { env } from "cloudflare:workers";
+import { StaticShardedDO } from "durable-utils/do-sharding";
+import { tryWhile } from "durable-utils/retries";
+import { isErrorRetryable } from "durable-utils/do-utils";
 import {
 	DataKind,
 	DeleteItemOptions,
@@ -13,16 +17,13 @@ import {
 	QueryItemsOptions,
 	QueryItemsResult,
 } from "./types.js";
-import { PartitionDO, type QueryItemsRpcRequest } from "./do-partition.js";
+import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
 import { validateItemKeys, validateTransactWriteOperations } from "./transaction-limits.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import type { ItemCondition } from "./types.js";
-import { StaticShardedDO } from "durable-utils/do-sharding";
-import { tryWhile } from "durable-utils/retries";
-import { isErrorRetryable } from "durable-utils/do-utils";
 import { normalizeSkInterval } from "./query/sk-interval.js";
 import type { ScanCursor } from "./partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
@@ -87,7 +88,6 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 }
 
 export type FokosDBOptions = {
-	ns: DurableObjectNamespace<PartitionDO>;
 	topology: PartitionTopologyRouter;
 	transactionCoordinatorNs: DurableObjectNamespace<TransactionCoordinatorDO>;
 
@@ -127,7 +127,7 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = this.#options.ns.get(doId);
+		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const { data, ...rest } = opts;
 		const res = await stub.apiPutItem(partitionContext, { ...rest, hashKey, sortKey, ...encodeItemData(data) });
@@ -140,7 +140,7 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = this.#options.ns.get(doId);
+		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiGetItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed); preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
@@ -159,7 +159,7 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = this.#options.ns.get(doId);
+		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiDeleteItem(partitionContext, { ...opts, hashKey, sortKey });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
@@ -278,7 +278,7 @@ export class FokosDB {
 					: null;
 
 			const { doId, partitionContext } = this.#options.topology.pickPartition(query.hashKey, KeyCodec.encodeOptional(undefined));
-			const stub = this.#options.ns.get(doId);
+			const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 
 			const rpcResult = await stub.apiQueryItems(partitionContext, {
 				hashKey: query.hashKey,
@@ -355,19 +355,19 @@ export class FokosDB {
 	}
 
 	async destroy(): Promise<{ ok: true }> {
-		const ns = this.#options.ns;
+		const ns = this.#options.topology.partitionContext().ns;
 
 		// The router owns the traversal (child-discovery order, range-root resolution, dedup);
 		// FokosDB supplies the two callbacks that perform the RPCs.
 		await this.#options.topology.traverseForDestroy(
 			async (ctx) => {
-				const stub = ns.get(ns.idFromName(ctx.doName));
+				const stub = PartitionDO.getByName(env[ns], ctx.doName);
 				console.warn(`Destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 				const { splitStatus, promotedKeys } = await stub.status(ctx);
 				return { splitStatus, promotedKeys };
 			},
 			async (ctx) => {
-				const stub = ns.get(ns.idFromName(ctx.doName));
+				const stub = PartitionDO.getByName(env[ns], ctx.doName);
 				try {
 					await stub.destroyPartition();
 				} catch (e) {

@@ -7,6 +7,7 @@ import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/route
 describe("fokosdb", async () => {
 	const testSplitOptions = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: "fokos",
 		rootTreesN: 10,
 		hashSplitN: 2,
@@ -17,7 +18,6 @@ describe("fokosdb", async () => {
 
 	it("should route to the right partition DO", async ({ expect }) => {
 		const db = new FokosDB({
-			ns: env.PARTITION_DO,
 			topology: new PartitionTopologyRouterImpl({
 				...testSplitOptions,
 			}),

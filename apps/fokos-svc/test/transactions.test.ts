@@ -11,6 +11,7 @@ function makeDB() {
 	const prefix = `txtest.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: prefix,
 		rootTreesN: 100,
 		hashSplitN: 2,
@@ -20,9 +21,8 @@ function makeDB() {
 	});
 	const topology = new PartitionTopologyRouterImpl(base);
 	return new FokosDB({
-		ns: env.PARTITION_DO,
-		topology,
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
+		topology,
 	});
 }
 
@@ -515,6 +515,7 @@ describe("transactions - end-to-end", () => {
 		const dbName = `tcdist.${crypto.randomUUID()}`;
 		const base = PartitionContextCreator.create({
 			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
 			tableName: dbName,
 			rootTreesN: 100,
 			hashSplitN: 2,
@@ -524,7 +525,6 @@ describe("transactions - end-to-end", () => {
 		});
 		const topology = new PartitionTopologyRouterImpl(base);
 		const db = new FokosDB({
-			ns: env.PARTITION_DO,
 			topology,
 			transactionCoordinatorNs: spyTCNs,
 			numTransactionCoordinators: 3,

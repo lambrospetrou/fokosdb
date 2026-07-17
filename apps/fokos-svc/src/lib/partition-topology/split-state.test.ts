@@ -10,6 +10,7 @@ import { SplitStateMachine } from "./split-state.js";
 async function withSplitState(fn: (machine: SplitStateMachine, pCtx: PartitionContextResolved) => void | Promise<void>): Promise<void> {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `splitstate-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,

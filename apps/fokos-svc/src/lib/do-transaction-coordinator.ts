@@ -111,6 +111,19 @@ const sqlMigrations: SQLSchemaMigration[] = [
 export class TransactionCoordinatorDO extends DurableObject<Env> {
 	#migrations: SQLSchemaMigrations;
 
+	static get(
+		ns: DurableObjectNamespace<TransactionCoordinatorDO>,
+		id: DurableObjectId | string,
+	): DurableObjectStub<TransactionCoordinatorDO> {
+		if (typeof id === "string") {
+			id = ns.idFromString(id);
+		}
+		return ns.get(id);
+	}
+	static getByName(ns: DurableObjectNamespace<TransactionCoordinatorDO>, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
+		return ns.getByName(doName);
+	}
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#migrations = new SQLSchemaMigrations({

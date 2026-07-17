@@ -240,6 +240,7 @@ describe("PromotionManager — cache views", () => {
 function makeBase(): PartitionContext {
 	return PartitionContextCreator.create({
 		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `promotion-${crypto.randomUUID()}`,
 		rootTreesN: 1,
 		hashSplitN: 2,
