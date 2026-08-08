@@ -1,17 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
-	MAX_ITEMS_PER_TRANSACTION,
-	MAX_PAYLOAD_BYTES,
+	MAX_ITEM_BYTES,
+	MAX_ITEMS_PER_TX,
+	MAX_PAYLOAD_BYTES_PER_TX,
 	validateItemKeys,
+	validateTransactGetItemCount,
 	validateTransactWriteOperations,
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 
-// The byte-size caps live in db.ts; the validator only needs canonical encoding for its duplicate
-// detection and error messages, so these plain KeyCodec encoders are enough here.
-const ENCODERS = { encodeHashKey: KeyCodec.encode, encodeSortKey: KeyCodec.encodeOptional };
-const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops, ENCODERS);
+const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops);
 
 function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x"): TransactWriteOperationLike {
 	return { hashKey, sortKey, operation: "put", data };
@@ -54,7 +53,7 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("accepts exactly the max item count and rejects one more", () => {
-		const ops = Array.from({ length: MAX_ITEMS_PER_TRANSACTION }, (_, i) => putOp(`hk-${i}`));
+		const ops = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => putOp(`hk-${i}`));
 		expect(() => validate(ops)).not.toThrow();
 		expect(() => validate([...ops, putOp("one-too-many")])).toThrow(/at most 100 items/);
 	});
@@ -105,18 +104,41 @@ describe("validateTransactWriteOperations", () => {
 		).not.toThrow();
 	});
 
-	it("accepts a payload at the byte limit and rejects one over it", () => {
-		// Uint8Array data counts byteLength; string data counts length * 2.
-		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_PAYLOAD_BYTES))])).not.toThrow();
-		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_PAYLOAD_BYTES + 1))])).toThrow(/total payload exceeds 4 MB/);
-		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_PAYLOAD_BYTES / 2 + 1))])).toThrow(/total payload exceeds 4 MB/);
+	it("accepts an item at the per-item byte limit and rejects one over it", () => {
+		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_ITEM_BYTES))])).not.toThrow();
+		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_ITEM_BYTES + 1))])).toThrow(/item data exceeds 400 KB/);
 	});
 
+	// A string counts its UTF-16 length, a lower bound on the UTF-8 bytes it stores. So the check only
+	// fires once the string is over the limit in code units — it never rejects text that would fit, and
+	// text above U+07FF slips through until the exact accounting in itemDataBytes' FIXME lands.
+	it("counts a string by its length, so it rejects only what is certainly over", () => {
+		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_ITEM_BYTES))])).not.toThrow();
+		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_ITEM_BYTES + 1))])).toThrow(/item data exceeds 400 KB/);
+		// Three UTF-8 bytes per code unit, but only `length` is counted, so this is currently accepted.
+		expect(() => validate([putOp("a", undefined, "日".repeat(MAX_ITEM_BYTES))])).not.toThrow();
+	});
+
+	// The per-item cap alone does not bound a transaction: MAX_ITEMS_PER_TRANSACTION items at the item
+	// limit would be far over the transaction budget, so the total is still checked separately.
 	it("sums payload bytes across operations", () => {
-		const half = new Uint8Array(MAX_PAYLOAD_BYTES / 2);
-		expect(() => validate([putOp("a", undefined, half), putOp("b", undefined, half)])).not.toThrow();
-		expect(() => validate([putOp("a", undefined, half), putOp("b", undefined, half), putOp("c", undefined, "x")])).toThrow(
-			/total payload exceeds 4 MB/,
-		);
+		const maxItem = new Uint8Array(MAX_ITEM_BYTES);
+		const atLimit = Math.floor(MAX_PAYLOAD_BYTES_PER_TX / MAX_ITEM_BYTES); // 10 items → 4000 KB, under 4 MB
+		const ops = Array.from({ length: atLimit }, (_, i) => putOp(`hk-${i}`, undefined, maxItem));
+		expect(() => validate(ops)).not.toThrow();
+		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(/total payload exceeds 4 MB/);
+	});
+});
+
+describe("validateTransactGetItemCount", () => {
+	it("rejects an empty item set", () => {
+		expect(() => validateTransactGetItemCount(0)).toThrow(/at least 1 item/);
+	});
+
+	// The read fans out to every partition holding a key, twice (two-phase read), so it carries the
+	// same cap as the write path.
+	it("accepts exactly the max item count and rejects one more", () => {
+		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX)).not.toThrow();
+		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX + 1)).toThrow(/at most 100 items/);
 	});
 });

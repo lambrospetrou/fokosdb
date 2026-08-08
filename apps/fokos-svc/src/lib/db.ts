@@ -21,8 +21,16 @@ import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
-import { validateItemKeys, validateTransactWriteOperations } from "./transaction-limits.js";
-import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
+import {
+	encodeHashKey,
+	encodeSortBound,
+	encodeSortKey,
+	validateItemDataSize,
+	validateItemKeys,
+	validateTransactGetItemCount,
+	validateTransactWriteOperations,
+} from "./transaction-limits.js";
+import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { ItemCondition } from "./types.js";
 import { normalizeSkInterval } from "./query/sk-interval.js";
 import type { ScanCursor } from "./partition/partition-store.js";
@@ -30,29 +38,6 @@ import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, t
 import { PageBudget } from "./query/page-budget.js";
 
 export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
-
-// DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
-// DynamoDB uses 2KB for hashKey and 1KB for sortKey.
-// We start stricter and we can raise later.
-const MAX_HASH_KEY_BYTES = 1024;
-const MAX_SORT_KEY_BYTES = 512;
-
-function encodeHashKey(k: string | Uint8Array): KeyBytes {
-	const bytes = KeyCodec.encode(k);
-	if (bytes.byteLength > MAX_HASH_KEY_BYTES) {
-		throw new Error(`fokos: hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
-	}
-	return bytes;
-}
-
-function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
-	if (k === undefined) return KeyCodec.encodeOptional(undefined);
-	const bytes = KeyCodec.encode(k);
-	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
-		throw new Error(`fokos: sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
-	}
-	return bytes;
-}
 
 // The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
@@ -130,7 +115,11 @@ export class FokosDB {
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const { data, ...rest } = opts;
-		const res = await stub.apiPutItem(partitionContext, { ...rest, hashKey, sortKey, ...encodeItemData(data) });
+		const encoded = encodeItemData(data);
+		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
+		// the same item is accepted or rejected identically here and in transactWriteItems.
+		validateItemDataSize(encoded.data, "putItem");
+		const res = await stub.apiPutItem(partitionContext, { ...rest, hashKey, sortKey, ...encoded });
 		// Echo the caller's original keys (no decode needed).
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
 	}
@@ -181,10 +170,7 @@ export class FokosDB {
 		const encoded = opts.operations.map((op) => (op.data !== undefined ? encodeItemData(op.data) : undefined));
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
 		// Build the operations from those bytes — encoding a key again here would be redundant work.
-		const keys = validateTransactWriteOperations(
-			opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })),
-			{ encodeHashKey, encodeSortKey },
-		);
+		const keys = validateTransactWriteOperations(opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })));
 		const operations: TCWriteOperation[] = opts.operations.map((op, i) => {
 			const { hashKey, sortKey } = keys[i];
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
@@ -214,6 +200,7 @@ export class FokosDB {
 	async transactGetItems(opts: {
 		items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
 	}): Promise<InitiateReadResponse> {
+		validateTransactGetItemCount(opts.items.length);
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
 			const hashKey = encodeHashKey(item.hashKey);
@@ -264,9 +251,13 @@ export class FokosDB {
 
 		const normalizedQueries = opts.queries.map((q) => {
 			const direction = (q.scanIndexForward ?? true) ? ("asc" as const) : ("desc" as const);
+			// A query hash key is a whole item key and gets the full rules, so a key that cannot be
+			// written cannot be queried either. Sort-key BOUNDS get only the content rules: they are not
+			// item keys, and `begins_with: ""` is a legitimate "everything" query.
+			validateItemKeys(q.hashKey);
 			return {
 				hashKey: encodeHashKey(q.hashKey),
-				interval: normalizeSkInterval(q.sort, encodeSortKey),
+				interval: normalizeSkInterval(q.sort, encodeSortBound),
 				direction,
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};

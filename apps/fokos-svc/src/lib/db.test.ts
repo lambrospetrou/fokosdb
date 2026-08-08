@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import { FokosDB } from "./db.js";
 import { PartitionContextCreator, type PartitionNamespaceKey } from "./partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./partition-topology/router.js";
+import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "./transaction-limits.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -341,6 +342,66 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			circular.self = circular;
 			// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
 			await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(/not JSON-serializable/);
+		});
+	});
+
+	// Every write path caps one item's data at the same value, and every key-taking path runs the same
+	// key rules. A limit or a rule that applies through one API and not another is a bug in itself:
+	// the caller cannot know which of two equivalent calls will be accepted.
+	describe("FokosDB — limits and key validation are uniform across the APIs", () => {
+		it("caps putItem data at the same per-item limit as a transactional put", async () => {
+			const db = makeDB();
+			const tooBig = new Uint8Array(MAX_ITEM_BYTES + 1);
+
+			await expect(db.putItem({ hashKey: "big", data: tooBig })).rejects.toThrow(/item data exceeds 400 KB/);
+			await expect(db.transactWriteItems({ operations: [{ hashKey: "big", operation: "put", data: tooBig }] })).rejects.toThrow(
+				/item data exceeds 400 KB/,
+			);
+
+			// Exactly at the limit is accepted by both.
+			const atLimit = new Uint8Array(MAX_ITEM_BYTES);
+			await expect(db.putItem({ hashKey: "at-limit", data: atLimit })).resolves.toMatchObject({ version: 1 });
+			await expect(
+				db.transactWriteItems({ operations: [{ hashKey: "at-limit-tx", operation: "put", data: atLimit }] }),
+			).resolves.toMatchObject({ outcome: "committed" });
+		});
+
+		it("caps the transactGetItems item count like the write path", async () => {
+			const db = makeDB();
+			const items = Array.from({ length: MAX_ITEMS_PER_TX + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
+			await expect(db.transactGetItems({ items })).rejects.toThrow(/at most 100 items/);
+			await expect(db.transactGetItems({ items: [] })).rejects.toThrow(/at least 1 item/);
+		});
+
+		it("rejects in queryItems the hash keys that putItem rejects", async () => {
+			const db = makeDB();
+			for (const hashKey of ["", "h\0k"]) {
+				await expect(db.putItem({ hashKey, data: "v" })).rejects.toThrow();
+				await expect(db.queryItems({ queries: [{ hashKey }] })).rejects.toThrow();
+			}
+		});
+
+		it("rejects a NUL in every sort-key bound a query can carry", async () => {
+			const db = makeDB();
+			const bad = "s\0k";
+			for (const sort of [
+				{ op: "eq", value: bad },
+				{ op: "gt", value: bad },
+				{ op: "begins_with", prefix: bad },
+				{ op: "between", lower: "a", upper: bad },
+				{ op: "range", lower: { value: bad, inclusive: true } },
+			] as const) {
+				await expect(db.queryItems({ queries: [{ hashKey: "hk", sort }] })).rejects.toThrow(/sortKey must not contain the NUL/);
+			}
+		});
+
+		// An empty prefix is not an empty key — it means "every sort key" — so the emptiness rule that
+		// applies to item keys must not reach query bounds.
+		it("still accepts begins_with with an empty prefix", async () => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "prefix-hk", sortKey: "s1", data: "v" });
+			const res = await db.queryItems({ queries: [{ hashKey: "prefix-hk", sort: { op: "begins_with", prefix: "" } }] });
+			expect(res.items.map((i) => i.sortKey)).toEqual(["s1"]);
 		});
 	});
 });

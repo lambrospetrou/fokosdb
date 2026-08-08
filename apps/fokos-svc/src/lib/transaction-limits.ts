@@ -1,14 +1,58 @@
 /**
- * Shared transaction limits and validation for transact-write operations.
- * Single source of truth used by both the FokosDB client (db.ts) and the
- * TransactionCoordinatorDO — keep client-side and coordinator-side validation in lockstep.
+ * The single home for item validation: key rules, key size caps, data size caps, and the
+ * transaction count/payload caps. Every public path goes through these — putItem, getItem,
+ * deleteItem, queryItems, transactWriteItems, transactGetItems — so a rule cannot apply through one
+ * API and not another. Used by both the FokosDB client (db.ts) and the TransactionCoordinatorDO,
+ * which keeps client-side and coordinator-side validation in lockstep.
+ *
+ * Encoding lives here too: a key's size cap is measured on the ENCODED bytes, so capping and
+ * encoding are one step and cannot drift apart.
  */
 
 import type { TransactionOperationType } from "./transaction-types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
-export const MAX_ITEMS_PER_TRANSACTION = 100;
-export const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MB
+// DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
+// DynamoDB uses 2KB for hashKey and 1KB for sortKey.
+// We start stricter and we can raise later.
+export const MAX_HASH_KEY_BYTES = 1024;
+export const MAX_SORT_KEY_BYTES = 512;
+
+/**
+ * Per-item data ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation
+ * in a transaction — so one item cannot be larger through one API than the other. Without it a
+ * single transactional put could carry the whole 4 MB transaction budget while `putItem` had no
+ * ceiling at all.
+ */
+export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
+
+export const MAX_ITEMS_PER_TX = 100;
+export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
+
+/**
+ * Lower bound on the stored size of one item's data: exact for binary, UTF-16 code units for text.
+ *
+ * A string's UTF-8 size is at least its `length` (every code unit is one or more bytes) and at most
+ * `length * 3`, so this NEVER over-counts and the limits built on it never reject a string that
+ * would have fit. The cost is the other direction: text above U+07FF is 3 UTF-8 bytes per code unit,
+ * so a 400 KB check can admit 1.2 MB of CJK. The store measures the truth with `octet_length` in the
+ * `est_row_bytes` generated column (`partition/partition-store.ts`).
+ *
+ * FIXME: implement the real size accounting — exact UTF-8 length for values, and the KEYS counted
+ * into the item's budget rather than capped separately, per
+ * https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html#limits-data-types
+ */
+export function itemDataBytes(data: Uint8Array | string): number {
+	return typeof data === "string" ? data.length : data.byteLength;
+}
+
+/** Throws when a single item's data exceeds MAX_ITEM_BYTES. `where` names the calling API. */
+export function validateItemDataSize(data: Uint8Array | string, where: string): void {
+	const bytes = itemDataBytes(data);
+	if (bytes > MAX_ITEM_BYTES) {
+		throw new Error(`fokos: ${where} item data exceeds ${MAX_ITEM_BYTES / 1024} KB (got ${bytes})`);
+	}
+}
 
 /**
  * The minimal shape validation needs. Both TCWriteOperation (client/TC wire type) and the
@@ -27,10 +71,28 @@ function isEmptyKey(k: string | Uint8Array): boolean {
 }
 
 /**
- * The single key-validation boundary, run on public keys before encoding. Rejects:
- * - empty hashKey / empty sortKey (key attributes cannot be empty); an absent sortKey is allowed,
+ * The content rules for one key, independent of whether it may be empty. Rejects:
  * - lone-surrogate strings (invalid UTF-16),
  * - the NUL character in STRING keys. Binary (Uint8Array) keys may contain any byte, including 0x00.
+ *
+ * Separate from `validateItemKeys` because a query's sort-key BOUND is not an item key: `begins_with`
+ * accepts an empty prefix (it means "everything"), so the emptiness rule must not apply to it — but
+ * the content rules must, or a key rejected on write would be accepted as a query bound.
+ */
+export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint8Array): void {
+	if (typeof k !== "string") return;
+	if (k.includes("\0")) {
+		throw new Error(`fokos: ${name} must not contain the NUL (\\0) character`);
+	}
+	if (k.isWellFormed?.() === false) {
+		throw new Error(`fokos: ${name} string contains a lone surrogate (not well-formed UTF-16)`);
+	}
+}
+
+/**
+ * The single key-validation boundary, run on public keys before encoding. Adds to the content rules:
+ * empty hashKey / empty sortKey are rejected (key attributes cannot be empty); an absent sortKey is
+ * allowed.
  */
 export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string | Uint8Array): void {
 	if (isEmptyKey(hashKey)) {
@@ -39,29 +101,40 @@ export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string 
 	if (sortKey !== undefined && isEmptyKey(sortKey)) {
 		throw new Error("fokos: sortKey must not be empty (omit it for a single-key item)");
 	}
-	for (const [name, k] of [
-		["hashKey", hashKey],
-		["sortKey", sortKey],
-	] as const) {
-		if (typeof k !== "string") continue;
-		if (k.includes("\0")) {
-			throw new Error(`fokos: ${name} must not contain the NUL (\\0) character`);
-		}
-		if (k.isWellFormed?.() === false) {
-			throw new Error(`fokos: ${name} string contains a lone surrogate (not well-formed UTF-16)`);
-		}
+	validateKeyContent("hashKey", hashKey);
+	if (sortKey !== undefined) {
+		validateKeyContent("sortKey", sortKey);
 	}
 }
 
+/** Encodes a hash key to canonical bytes, enforcing the size cap on the encoded form. */
+export function encodeHashKey(k: string | Uint8Array): KeyBytes {
+	const bytes = KeyCodec.encode(k);
+	if (bytes.byteLength > MAX_HASH_KEY_BYTES) {
+		throw new Error(`fokos: hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+	}
+	return bytes;
+}
+
+/** Encodes a sort key to canonical bytes (absent ⇒ the empty sentinel), enforcing the size cap. */
+export function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
+	if (k === undefined) return KeyCodec.encodeOptional(undefined);
+	const bytes = KeyCodec.encode(k);
+	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
+		throw new Error(`fokos: sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+	}
+	return bytes;
+}
+
 /**
- * The caller's key encoders. Injected so the byte-size caps stay owned by the public boundary in
- * db.ts and this module stays agnostic to key-length policy — the same pattern
- * `normalizeSkInterval(sort, encodeSortKey)` uses.
+ * Encodes one sort-key BOUND of a query. Bounds get the content rules but not the emptiness rule,
+ * and passing this to `normalizeSkInterval` checks every bound exactly once wherever that function
+ * uses it (`between` and `range` each carry two).
  */
-export type KeyEncoders = {
-	encodeHashKey: (k: string | Uint8Array) => KeyBytes;
-	encodeSortKey: (k: string | Uint8Array | undefined) => KeyBytes;
-};
+export function encodeSortBound(k: string | Uint8Array): KeyBytes {
+	validateKeyContent("sortKey", k);
+	return encodeSortKey(k);
+}
 
 /**
  * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
@@ -73,21 +146,20 @@ export type KeyEncoders = {
  */
 export function validateTransactWriteOperations(
 	ops: readonly TransactWriteOperationLike[],
-	encoders: KeyEncoders,
 ): Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> {
 	if (ops.length === 0) {
 		throw new Error("fokos: transactWriteItems requires at least 1 item");
 	}
-	if (ops.length > MAX_ITEMS_PER_TRANSACTION) {
-		throw new Error(`fokos: transactWriteItems supports at most ${MAX_ITEMS_PER_TRANSACTION} items`);
+	if (ops.length > MAX_ITEMS_PER_TX) {
+		throw new Error(`fokos: transactWriteItems supports at most ${MAX_ITEMS_PER_TX} items`);
 	}
 	const seen = new Set<bigint>();
 	const encodedKeys: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> = [];
 	let totalBytes = 0;
 	for (const op of ops) {
 		validateItemKeys(op.hashKey, op.sortKey);
-		const hashKey = encoders.encodeHashKey(op.hashKey);
-		const sortKey = encoders.encodeSortKey(op.sortKey);
+		const hashKey = encodeHashKey(op.hashKey);
+		const sortKey = encodeSortKey(op.sortKey);
 		if (op.operation === "put" && op.data == null) {
 			throw new Error(
 				`fokos: transactWriteItems "put" operation requires data (${KeyCodec.keyForLog(hashKey)}${sortKey.byteLength > 0 ? `, ${KeyCodec.keyForLog(sortKey)}` : ""})`,
@@ -106,12 +178,30 @@ export function validateTransactWriteOperations(
 		}
 		seen.add(identity);
 		if (op.data) {
-			totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
+			validateItemDataSize(op.data, "transactWriteItems");
+			totalBytes += itemDataBytes(op.data);
 		}
 		encodedKeys.push({ hashKey, sortKey });
 	}
-	if (totalBytes > MAX_PAYLOAD_BYTES) {
-		throw new Error(`fokos: transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES / (1024 * 1024)} MB`);
+	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {
+		throw new Error(`fokos: transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB`);
 	}
 	return encodedKeys;
+}
+
+/**
+ * The read-side counterpart of the count checks above. `transactGetItems` fans out to every partition
+ * holding a requested key and does it TWICE (the two-phase read), so an unbounded item list is an
+ * unbounded fan-out — the same reason the write path is capped.
+ *
+ * Keys are validated per item by the caller as it encodes them; this runs first so an oversized
+ * request fails before any of that work.
+ */
+export function validateTransactGetItemCount(itemCount: number): void {
+	if (itemCount === 0) {
+		throw new Error("fokos: transactGetItems requires at least 1 item");
+	}
+	if (itemCount > MAX_ITEMS_PER_TX) {
+		throw new Error(`fokos: transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`);
+	}
 }
