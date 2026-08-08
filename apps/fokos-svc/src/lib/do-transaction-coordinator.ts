@@ -16,6 +16,7 @@ import type {
 	TransactionItem,
 } from "./transaction-types.js";
 import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
+import { hashTransactionOperations } from "./transaction-idempotency.js";
 
 type TcStateRow = {
 	idempotency_token: string;
@@ -24,6 +25,7 @@ type TcStateRow = {
 	transaction_ts: number;
 	created_at: number;
 	rejection_reason_json: string | null;
+	operations_hash: string;
 };
 
 type TcParticipantRow = {
@@ -78,7 +80,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 state                   TEXT    NOT NULL,
                 transaction_ts          INTEGER NOT NULL,
                 created_at              INTEGER NOT NULL,
-                rejection_reason_json   TEXT
+                rejection_reason_json   TEXT,
+                -- Fingerprint of the operation set this token was first used for. A replay whose
+                -- operations hash differently is a different request wearing the same token, and is
+                -- rejected instead of being answered with this transaction's outcome.
+                -- TEXT because DO SQL cannot bind a JS bigint.
+                operations_hash         TEXT    NOT NULL
 			) WITHOUT ROWID, STRICT;
 
 			CREATE INDEX IF NOT EXISTS tc_state_transaction_id ON tc_state (transaction_id);
@@ -140,8 +147,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const idempotencyToken = request.clientRequestToken ?? transactionId;
 		const coordinatorDoId = this.ctx.id.toString();
 
+		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
+		const operationsHash = hashTransactionOperations(request.operations);
+
 		const existingRow = this.loadStateRow(idempotencyToken);
 		if (existingRow) {
+			if (existingRow.operations_hash !== operationsHash) {
+				// Answering with the stored outcome here would report "committed" for operations that
+				// were never executed, so this must fail loudly. DynamoDB calls it
+				// IdempotentParameterMismatch.
+				throw new Error(
+					`fokos: transactWriteItems clientRequestToken was already used for a different set of operations [${idempotencyToken}]`,
+				);
+			}
 			return await this.resumeTransaction(existingRow, idempotencyToken);
 		}
 
@@ -159,12 +177,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		this.ctx.storage.transactionSync(() => {
 			this.ctx.storage.sql.exec(
-				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at)
-                 VALUES (?, ?, 'CREATED', ?, ?)`,
+				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, operations_hash)
+                 VALUES (?, ?, 'CREATED', ?, ?, ?)`,
 				idempotencyToken,
 				transactionId,
 				transactionTs,
 				Date.now(),
+				operationsHash,
 			);
 			for (const op of request.operations) {
 				this.ctx.storage.sql.exec(
@@ -720,7 +739,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRow(idempotencyToken: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json
+				`SELECT idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
 			)

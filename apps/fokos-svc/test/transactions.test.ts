@@ -434,6 +434,44 @@ describe("transactions - end-to-end", () => {
 		expect(item.item.version).toBe(1);
 	});
 
+	// A token identifies one request, not one caller. Answering a different request with the stored
+	// outcome would acknowledge writes that never execute, so the coordinator compares an
+	// operation-set fingerprint and refuses.
+	it("idempotency: reusing a clientRequestToken for different operations is rejected", async () => {
+		const db = makeDB();
+
+		const token = `idemp-mismatch-${crypto.randomUUID()}`;
+		const operations = [{ hashKey: "mismatch-1", operation: "put" as const, data: "original" }];
+		const first = await db.transactWriteItems({ operations, clientRequestToken: token });
+		expect(first.outcome).toBe("committed");
+
+		// Same key, different payload — the case that silently lost the write.
+		await expect(
+			db.transactWriteItems({
+				operations: [{ hashKey: "mismatch-1", operation: "put" as const, data: "different" }],
+				clientRequestToken: token,
+			}),
+		).rejects.toThrow(/was already used for a different set of operations/);
+
+		// A different operation SET is rejected too, not just a different payload.
+		await expect(
+			db.transactWriteItems({
+				operations: [...operations, { hashKey: "mismatch-2", operation: "put" as const, data: "original" }],
+				clientRequestToken: token,
+			}),
+		).rejects.toThrow(/was already used for a different set of operations/);
+
+		// The stored transaction is untouched: still the original value, still version 1.
+		const item = await db.getItem({ hashKey: "mismatch-1" });
+		invariant(item.found);
+		expect(item.item.data).toBe("original");
+		expect(item.item.version).toBe(1);
+
+		// The legitimate replay still works — the guard rejects different work, not retries.
+		const replay = await db.transactWriteItems({ operations, clientRequestToken: token });
+		expect(replay.outcome).toBe("committed");
+	});
+
 	it("delete operations in a transaction remove items atomically", async () => {
 		const db = makeDB();
 

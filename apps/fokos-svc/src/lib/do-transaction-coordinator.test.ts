@@ -24,14 +24,16 @@ function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionRea
 	state.storage.sql.exec(`DELETE FROM tc_state`);
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json)
-		 VALUES (?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json, operations_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		TOKEN,
 		TX_ID,
 		tcState,
 		1_000,
 		1_000,
 		reason === undefined ? null : JSON.stringify(reason),
+		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
+		"0000000000000000",
 	);
 	// Two items, one with a sort key and one without, so the decode of the absent sentinel is covered.
 	state.storage.sql.exec(
