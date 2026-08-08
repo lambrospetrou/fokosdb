@@ -8,7 +8,7 @@ import type {
 	InitiateReadRequest,
 	InitiateReadResponseEncoded,
 	InitiateWriteRequest,
-	InitiateWriteResponse,
+	InitiateWriteResponseEncoded,
 	ReadForTransactionItemResultEncoded,
 	RecoverTransactionResult,
 	RejectionReason,
@@ -135,7 +135,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		});
 	}
 
-	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse> {
+	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const idempotencyToken = request.clientRequestToken ?? transactionId;
 		const coordinatorDoId = this.ctx.id.toString();
@@ -198,7 +198,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId);
 	}
 
-	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
+	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponseEncoded> {
 		const { transaction_id: transactionId } = existingRow;
 		switch (existingRow.state) {
 			case "COMMITTED":
@@ -233,25 +233,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 * - PREPARED is the point of no return. Every participant voted to accept and holds its locks, and
 	 *   nothing transitions PREPARED → CANCELLING (both writers of CANCELLING guard on state =
 	 *   'PREPARING'), so the transaction WILL commit. Reporting anything else would be false.
-	 * - CANCELLING is decided too, and is the easy half: a cancelled transaction applied nothing
-	 *   anywhere, so outstanding cleanup cannot change what the caller observes.
+	 * - CANCELLING is decided too: a cancelled transaction applied nothing anywhere, so outstanding
+	 *   cleanup cannot change what the caller observes.
 	 * - CREATED / PREPARING are genuinely undecided — those, and only those, ask the caller to retry.
 	 *
 	 * Returning early with cleanup outstanding is safe because `alarm()` reschedules itself while any
 	 * non-terminal row remains, so it drives the stragglers to completion.
 	 */
-	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
+	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		switch (row.state) {
 			case "PREPARED":
 			case "COMMITTING":
 			case "COMMITTED": {
-				// Decode keys to the public form; the empty sentinel ([]) maps back to an absent sortKey.
-				const items = this.loadItems(transactionId).map((i) => {
-					const hk = keyFromBlob(i.hk);
-					const sk = keyFromBlob(i.sk);
-					return sk.length === 0 ? { hashKey: KeyCodec.decode(hk) } : { hashKey: KeyCodec.decode(hk), sortKey: KeyCodec.decode(sk) };
-				});
+				// Keys stay canonical KeyBytes (sortKey [] = absent); db.ts decodes at the public exit.
+				const items = this.loadItems(transactionId).map((i) => ({ hashKey: keyFromBlob(i.hk), sortKey: keyFromBlob(i.sk) }));
 				return { outcome: "committed", transactionId, idempotencyToken, items };
 			}
 			case "CANCELLING":
@@ -275,7 +271,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async drivePrepare(transactionId: string, idempotencyToken: string, coordinatorDoId: string): Promise<InitiateWriteResponse> {
+	private async drivePrepare(
+		transactionId: string,
+		idempotencyToken: string,
+		coordinatorDoId: string,
+	): Promise<InitiateWriteResponseEncoded> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'PREPARING' WHERE idempotency_token = ? AND state = 'CREATED'`,
 			idempotencyToken,
@@ -591,13 +591,28 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return { outcome: "aborted", reason: "pending_write" };
 		}
 
-		// Key-based comparison guards against any future reordering in PartitionDO. Re-encode the
-		// decoded result keys to a collision-proof composite identity for arbitrary key bytes.
-		const resultKey = (r: ReadForTransactionItemResultEncoded): string => `${r.hashKey.length}:${r.hashKey}:${r.sortKey ?? ""}`;
-		const phase2ByKey = new Map(phase2Flat.map((r) => [resultKey(r), r]));
+		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
+		// flattens the replies, so result order is not request order. KeyCodec.pairKey is the ONE identity
+		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
+		// returns a bigint, a primitive, so Map lookup compares by value.
+		const itemIdentity = (r: ReadForTransactionItemResultEncoded): bigint => KeyCodec.pairKey(r.hashKey, r.sortKey);
+
+		// Did both phases observe the same committed state? `version` (the item's `v`) is the primary
+		// datum: a monotonic per-item counter, so unlike a wall-clock timestamp it cannot miss two writes
+		// landing inside the same millisecond. This mirrors the LSN comparison the DynamoDB paper uses
+		// for its read transactions. `lastCommittedTs` is a second signal that catches a delete+recreate
+		// landing back on the same version, whenever the timestamps differ. An item absent in both phases
+		// compares equal and is not a conflict.
+		const sameCommittedState = (a: ReadForTransactionItemResultEncoded, b: ReadForTransactionItemResultEncoded): boolean => {
+			if (a.found !== b.found) return false;
+			if (a.found && b.found && a.version !== b.version) return false;
+			return a.lastCommittedTs === b.lastCommittedTs;
+		};
+
+		const phase2ByKey = new Map(phase2Flat.map((r) => [itemIdentity(r), r]));
 		for (const p1 of phase1Flat) {
-			const p2 = phase2ByKey.get(resultKey(p1));
-			if (!p2 || p1.lastCommittedTs !== p2.lastCommittedTs) {
+			const p2 = phase2ByKey.get(itemIdentity(p1));
+			if (!p2 || !sameCommittedState(p1, p2)) {
 				return { outcome: "aborted", reason: "read_conflict" };
 			}
 		}

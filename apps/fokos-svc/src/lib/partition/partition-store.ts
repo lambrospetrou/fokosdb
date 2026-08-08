@@ -361,14 +361,20 @@ export class PartitionStore {
 		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
 		const dataExpr = opts.kind === "json" ? "jsonb(?)" : "?";
 
-		// last_transaction_ts is MONOTONIC: it never moves backwards. `prepare` accepts a transaction only
-		// when its timestamp is above this value (transaction-participant.ts), so lowering it would let an
-		// already-superseded transaction commit over newer data. A non-transactional put stamps
-		// `Date.now()` on the partition's clock, while a committed transaction may have stamped a
-		// coordinator clock up to MAX_CLOCK_SKEW_MS ahead — so a plain assignment here really can go
-		// backwards. MAX cannot drift ahead of the wall clock: it only ever keeps the larger of the two
-		// values that already exist (that would need an increment, which this deliberately is not).
-		// Mirrors bumpItemLastTransactionTs, which has always used MAX for the transactional "check" op.
+		// INVARIANT: last_transaction_ts is monotonic per item — it must never move backwards.
+		//
+		// `prepare` accepts a transaction only when its timestamp is above this value
+		// (transaction-participant.ts), so a lower value here would let an already-superseded
+		// transaction commit over newer data. The two writers disagree on whose clock they read: a
+		// non-transactional put stamps `Date.now()` on this partition's clock, while a committed
+		// transaction stamps its coordinator's, which prepare accepts up to MAX_CLOCK_SKEW_MS ahead.
+		// MAX is what reconciles them.
+		//
+		// MAX also cannot drift ahead of the wall clock: it only ever keeps the larger of two values
+		// that already exist. Do NOT turn it into an increment (`MAX(last_transaction_ts + 1, ?)`) —
+		// that would run the timestamp forward under sustained writes.
+		//
+		// bumpItemLastTransactionTs applies the same rule for the transactional "check" operation.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
 			`INSERT INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts)
 			 VALUES (?, ?, ${dataExpr}, ?, ?, 1, ?)

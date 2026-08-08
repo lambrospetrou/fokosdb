@@ -81,31 +81,43 @@ export type ReadForTransactionRequest = {
 	items: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }>;
 };
 
-// Result/OUT type: keys decoded to the public form by the producing participant.
-type ReadForTransactionItemResultOf<D> =
-	| {
-			found: true;
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
-			data: D;
-			kind: DataKind;
-			lastCommittedTs: TransactionTimestamp;
-			hasPendingWrite: boolean;
-	  }
-	| {
-			found: false;
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
-			lastCommittedTs: TransactionTimestamp;
-			hasPendingWrite: boolean;
-	  };
+// The value half of a read result, shared by the RPC and public variants. Only `data` differs
+// between them (JSON text on the wire, parsed JsonValue in public), so it is the one type parameter.
+type ReadForTransactionItemValueOf<D> =
+	| { found: true; data: D; kind: DataKind; version: number; ttlEpochUTCSeconds?: number }
+	| { found: false };
 
-// RPC result (participant→TC→db.ts): json is JSON text. Free of the recursive JsonValue so the
-// Workers-RPC type machinery does not instantiate infinitely deep.
-export type ReadForTransactionItemResultEncoded = ReadForTransactionItemResultOf<string | Uint8Array>;
+/**
+ * RPC result (participant→TC). Keys are canonical KeyBytes and sortKey is always present (the empty
+ * KeyBytes [] is the absent sentinel), matching the request side: the TC is an INTERNAL hop, and per
+ * the KeyCodec contract ("encode at entry, decode at exit, compare bytes in between") it compares
+ * bytes and never decodes. `db.ts` decodes at the public exit.
+ *
+ * `lastCommittedTs` / `hasPendingWrite` are TC-only 2PC bookkeeping and are stripped by `db.ts`.
+ * `lastCommittedTs` is NOT the conflict datum on its own — it is wall-clock milliseconds, so two
+ * writes inside one millisecond are indistinguishable. The item's `version` (`v`) is the monotonic
+ * per-item counter that decides a conflict; the timestamp is a second signal that catches a
+ * delete+recreate landing back on the same version.
+ *
+ * json data is JSON text here, and the type is free of the recursive JsonValue so the Workers-RPC type
+ * machinery does not instantiate infinitely deep.
+ */
+export type ReadForTransactionItemResultEncoded = ReadForTransactionItemValueOf<string | Uint8Array> & {
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
+	lastCommittedTs: TransactionTimestamp;
+	hasPendingWrite: boolean;
+};
 
-// Public variant surfaced by FokosDB.transactGetItems: db.ts has parsed json text into a JsonValue.
-export type ReadForTransactionItemResult = ReadForTransactionItemResultOf<string | Uint8Array | JsonValue>;
+/**
+ * Public variant surfaced by FokosDB.transactGetItems: `db.ts` has decoded the keys (the empty
+ * sentinel maps back to an absent sortKey), parsed json text into a JsonValue, and dropped the
+ * 2PC internals.
+ */
+export type ReadForTransactionItemResult = ReadForTransactionItemValueOf<string | Uint8Array | JsonValue> & {
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
+};
 
 export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResultEncoded[];
@@ -147,12 +159,35 @@ export type InitiateWriteRequest = {
 	operations: TCWriteOperation[];
 };
 
+/**
+ * RPC result (TC→db.ts). Item keys stay canonical KeyBytes (sortKey [] = absent), matching the read
+ * path and the `tc_items` BLOB columns they are read from: the TC is an INTERNAL hop, so it never
+ * decodes. `db.ts` decodes at the public exit.
+ *
+ * `RejectionReason` is the deliberate exception — its keys are already in public form because the
+ * reason is PERSISTED in `tc_state.rejection_reason_json` and replayed verbatim on an idempotent
+ * retry. Storing bytes there would need the same `$u8` JSON tagging plus a decode on every replay.
+ */
+export type InitiateWriteResponseEncoded =
+	| {
+			outcome: "committed";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			items: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }>;
+	  }
+	| {
+			outcome: "cancelled";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			reason: RejectionReason;
+	  };
+
+/** Public variant surfaced by FokosDB.transactWriteItems: db.ts has decoded the item keys. */
 export type InitiateWriteResponse =
 	| {
 			outcome: "committed";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
-			// Decoded to the public form by the TC when assembling the final response.
 			items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
 	  }
 	| {

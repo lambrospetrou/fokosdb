@@ -179,10 +179,14 @@ export class FokosDB {
 		// Validation then runs on the already-encoded data so json payload accounting reuses this single
 		// serialization rather than JSON.stringify-ing a second time.
 		const encoded = opts.operations.map((op) => (op.data !== undefined ? encodeItemData(op.data) : undefined));
-		validateTransactWriteOperations(opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })));
+		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
+		// Build the operations from those bytes — encoding a key again here would be redundant work.
+		const keys = validateTransactWriteOperations(
+			opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })),
+			{ encodeHashKey, encodeSortKey },
+		);
 		const operations: TCWriteOperation[] = opts.operations.map((op, i) => {
-			const hashKey = encodeHashKey(op.hashKey);
-			const sortKey = encodeSortKey(op.sortKey);
+			const { hashKey, sortKey } = keys[i];
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 			return { ...op, hashKey, sortKey, partitionContext, data: encoded[i]?.data, kind: encoded[i]?.kind };
 		});
@@ -190,9 +194,21 @@ export class FokosDB {
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
 		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
-		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+		const response = await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, operations });
 		});
+
+		// The public exit. The TC speaks canonical KeyBytes throughout, so the echoed item keys are
+		// decoded here (the empty sentinel maps back to an absent sortKey), as in transactGetItems.
+		if (response.outcome !== "committed") return response;
+		return {
+			...response,
+			items: response.items.map(({ hashKey, sortKey }) =>
+				sortKey.byteLength === 0
+					? { hashKey: KeyCodec.decode(hashKey) }
+					: { hashKey: KeyCodec.decode(hashKey), sortKey: KeyCodec.decode(sortKey) },
+			),
+		};
 	}
 
 	async transactGetItems(opts: {
@@ -217,11 +233,21 @@ export class FokosDB {
 			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
 		);
 
-		// json data arrives as JSON text — parse it once here to the public JsonValue.
+		// The public boundary — the single exit where the internal representation becomes the public one:
+		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
+		// queryItems), parse json text once into a JsonValue, and drop the TC-only 2PC bookkeeping
+		// (lastCommittedTs / hasPendingWrite) so callers never depend on it. Those two are meaningless in
+		// a "committed" outcome regardless — the TC aborts when any item has a pending write.
 		if (response.outcome !== "committed") return response;
 		return {
 			...response,
-			items: response.items.map((item) => (item.found ? { ...item, data: decodeItemData(item.kind, item.data) } : item)),
+			items: response.items.map(({ lastCommittedTs: _lastCommittedTs, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item }) => {
+				const keys = {
+					hashKey: KeyCodec.decode(hashKey),
+					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
+				};
+				return item.found ? { ...item, ...keys, data: decodeItemData(item.kind, item.data) } : { ...item, ...keys };
+			}),
 		};
 	}
 

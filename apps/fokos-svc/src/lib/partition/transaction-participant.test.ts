@@ -6,6 +6,7 @@ import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest } from "../transaction-types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import invariant from "../invariant.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -363,7 +364,28 @@ describe("TransactionParticipant - cancel", () => {
 });
 
 describe("TransactionParticipant - readForTransaction", () => {
-	it("returns data, lastCommittedTs, and hasPendingWrite per item", async () => {
+	it("returns version and ttl per found item, so the TC can compare `v` and the caller gets the version", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			// Two writes inside the SAME millisecond: last_transaction_ts is identical, only `v` moves.
+			// This is the pair the two-phase read must be able to tell apart.
+			store.upsertItem({ hk: kb("k"), sk, data: "first", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
+			const before = participant.readForTransactionLocal({ transactionId: "r1", items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
+
+			store.upsertItem({ hk: kb("k"), sk, data: "second", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
+			const after = participant.readForTransactionLocal({ transactionId: "r2", items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
+
+			invariant(before.found && after.found);
+			expect(before.ttlEpochUTCSeconds).toBe(777);
+			// The timestamps are identical, so a timestamp-only comparison cannot see the write at all.
+			expect(before.lastCommittedTs).toBe(after.lastCommittedTs);
+			// `v` does, which is why it is the primary conflict datum.
+			expect(before.version).toBe(1);
+			expect(after.version).toBe(2);
+		});
+	});
+
+	it("echoes canonical KeyBytes and returns data, lastCommittedTs, and hasPendingWrite per item", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
 				hk: kb("existing"),
@@ -386,24 +408,29 @@ describe("TransactionParticipant - readForTransaction", () => {
 					{ hashKey: kb("missing"), sortKey: KeyCodec.encodeOptional(undefined) },
 				],
 			});
+			// Keys come back as canonical KeyBytes (sortKey [] = absent), not decoded: the TC pairs the
+			// two read phases by bytes, and db.ts decodes once at the public exit.
+			const ABSENT = KeyCodec.encodeOptional(undefined);
 			expect(response.items).toEqual([
 				{
 					found: true,
-					hashKey: "existing",
-					sortKey: undefined,
+					hashKey: kb("existing"),
+					sortKey: ABSENT,
 					data: "value",
 					kind: "text",
+					version: 1,
+					ttlEpochUTCSeconds: undefined,
 					lastCommittedTs: 42,
 					hasPendingWrite: false,
 				},
 				{
 					found: false,
-					hashKey: "locked-absent",
-					sortKey: undefined,
+					hashKey: kb("locked-absent"),
+					sortKey: ABSENT,
 					lastCommittedTs: 0,
 					hasPendingWrite: true,
 				},
-				{ found: false, hashKey: "missing", sortKey: undefined, lastCommittedTs: 0, hasPendingWrite: false },
+				{ found: false, hashKey: kb("missing"), sortKey: ABSENT, lastCommittedTs: 0, hasPendingWrite: false },
 			]);
 		});
 	});

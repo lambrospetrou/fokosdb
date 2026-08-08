@@ -400,7 +400,12 @@ describe("transactions - end-to-end", () => {
 			expect(item.found).toBe(true);
 			invariant(item.found);
 			expect(item.data).toBe(`data-${item.hashKey}`);
-			expect(item.hasPendingWrite).toBe(false);
+			// Each key was written exactly once above, so v=1 — the same version getItem reports, and
+			// the value a caller feeds back into an attribute_equals condition.
+			expect(item.version).toBe(1);
+			// The 2PC bookkeeping is stripped at the public boundary.
+			expect(item).not.toHaveProperty("lastCommittedTs");
+			expect(item).not.toHaveProperty("hasPendingWrite");
 		}
 	});
 

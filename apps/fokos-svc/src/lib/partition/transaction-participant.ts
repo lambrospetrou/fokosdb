@@ -217,9 +217,10 @@ export class TransactionParticipant {
 
 			const hasPendingWrite = pendingRow != null;
 			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
-			// Decode the requested keys back to the public form for the result echo.
-			const hashKey = KeyCodec.decode(item.hashKey);
-			const sortKey = decodeSortKey(sk);
+			// Echo the requested keys as canonical KeyBytes: the TC pairs phase 1 with phase 2 by bytes,
+			// and db.ts decodes once at the public exit.
+			const hashKey = item.hashKey;
+			const sortKey = sk;
 
 			if (itemRow) {
 				results.push({
@@ -229,6 +230,10 @@ export class TransactionParticipant {
 					// json arrives as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 					data: itemRow.data,
 					kind: itemRow.kind,
+					// `v` is the conflict datum for the TC's two-phase read AND the public version, so the
+					// caller can feed it straight back into an attribute_equals condition.
+					version: itemRow.v,
+					ttlEpochUTCSeconds: itemRow.ttl_epoch_utc_seconds ?? undefined,
 					lastCommittedTs,
 					hasPendingWrite,
 				});

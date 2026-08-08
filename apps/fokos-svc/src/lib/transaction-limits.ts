@@ -5,7 +5,7 @@
  */
 
 import type { TransactionOperationType } from "./transaction-types.js";
-import { KeyCodec } from "./partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 export const MAX_ITEMS_PER_TRANSACTION = 100;
 export const MAX_PAYLOAD_BYTES = 4 * 1024 * 1024; // 4 MB
@@ -54,38 +54,64 @@ export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string 
 }
 
 /**
- * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
- * bytes, and that every "put" carries data. Throws on the first violation. Runs on RAW public keys.
+ * The caller's key encoders. Injected so the byte-size caps stay owned by the public boundary in
+ * db.ts and this module stays agnostic to key-length policy — the same pattern
+ * `normalizeSkInterval(sort, encodeSortKey)` uses.
  */
-export function validateTransactWriteOperations(ops: readonly TransactWriteOperationLike[]): void {
+export type KeyEncoders = {
+	encodeHashKey: (k: string | Uint8Array) => KeyBytes;
+	encodeSortKey: (k: string | Uint8Array | undefined) => KeyBytes;
+};
+
+/**
+ * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
+ * bytes, and that every "put" carries data. Throws on the first violation.
+ *
+ * Key policy checks run on the RAW public keys (NUL, lone surrogates). Each key is then encoded
+ * EXACTLY ONCE, and the canonical bytes are returned in input order for the caller to reuse — so
+ * `transactWriteItems` must build its operations from the returned bytes, never re-encode.
+ */
+export function validateTransactWriteOperations(
+	ops: readonly TransactWriteOperationLike[],
+	encoders: KeyEncoders,
+): Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> {
 	if (ops.length === 0) {
 		throw new Error("fokos: transactWriteItems requires at least 1 item");
 	}
 	if (ops.length > MAX_ITEMS_PER_TRANSACTION) {
 		throw new Error(`fokos: transactWriteItems supports at most ${MAX_ITEMS_PER_TRANSACTION} items`);
 	}
-	const seen = new Set<string>();
+	const seen = new Set<bigint>();
+	const encodedKeys: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> = [];
 	let totalBytes = 0;
 	for (const op of ops) {
 		validateItemKeys(op.hashKey, op.sortKey);
+		const hashKey = encoders.encodeHashKey(op.hashKey);
+		const sortKey = encoders.encodeSortKey(op.sortKey);
 		if (op.operation === "put" && op.data == null) {
 			throw new Error(
-				`fokos: transactWriteItems "put" operation requires data (${KeyCodec.keyForLog(KeyCodec.encode(op.hashKey))}${op.sortKey ? `, ${KeyCodec.keyForLog(KeyCodec.encode(op.sortKey))}` : ""})`,
+				`fokos: transactWriteItems "put" operation requires data (${KeyCodec.keyForLog(hashKey)}${sortKey.byteLength > 0 ? `, ${KeyCodec.keyForLog(sortKey)}` : ""})`,
 			);
 		}
-		// Collision-proof composite identity for arbitrary key bytes.
-		const key = `${op.hashKey.length}:${op.hashKey}:${op.sortKey ?? ""}`;
-		if (seen.has(key)) {
-			throw new Error(
-				`fokos: transactWriteItems duplicate key (${KeyCodec.keyForLog(KeyCodec.encode(op.hashKey))}, ${op.sortKey ? KeyCodec.keyForLog(KeyCodec.encode(op.sortKey)) : ""})`,
-			);
+		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
+		// commitLocal's keyset check and the TC's two-phase read pairing use.
+		//
+		// Do NOT substitute a template string built from the public keys: `${Uint8Array}` renders as a
+		// comma-joined decimal list, so the string sortKey "9,9" and the binary sortKey [9,9] produce the
+		// same text, and two distinct items (KeyCodec 0xFF-tags binary keys) would be rejected as a
+		// duplicate. Identity must be taken over the canonical bytes.
+		const identity = KeyCodec.pairKey(hashKey, sortKey);
+		if (seen.has(identity)) {
+			throw new Error(`fokos: transactWriteItems duplicate key (${KeyCodec.keyForLog(hashKey)}, ${KeyCodec.keyForLog(sortKey)})`);
 		}
-		seen.add(key);
+		seen.add(identity);
 		if (op.data) {
 			totalBytes += typeof op.data === "string" ? op.data.length * 2 : op.data.byteLength;
 		}
+		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES) {
 		throw new Error(`fokos: transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES / (1024 * 1024)} MB`);
 	}
+	return encodedKeys;
 }

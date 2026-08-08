@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
-import type { InitiateWriteResponse, RejectionReason, TCState } from "./transaction-types.js";
+import type { InitiateWriteResponseEncoded, RejectionReason, TCState } from "./transaction-types.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -14,9 +14,10 @@ const TOKEN = "tok-1";
 // loadFinalResponse is private: TypeScript's `private` is compile-time only, so the running instance
 // exposes it. We reach it directly because the states under test (PREPARED / COMMITTING / CANCELLING)
 // are only reachable end-to-end by exhausting the participant retry budget — 10 attempts with backoff
-// up to 2 s, far too slow for a unit test. The state→outcome mapping IS the behaviour being fixed.
+// up to 2 s, far too slow for a unit test. The state→outcome mapping is the whole contract here, so
+// testing it directly is both faster and more precise than driving it end-to-end.
 type WithLoadFinalResponse = {
-	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponse;
+	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 };
 
 function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionReason): void {
@@ -67,7 +68,11 @@ describe("TransactionCoordinatorDO - loadFinalResponse answers from the decision
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
-				items: [{ hashKey: "hk1", sortKey: "sk1" }, { hashKey: "hk2" }],
+				// Keys stay canonical KeyBytes here (sortKey [] = absent); db.ts decodes at the public exit.
+				items: [
+					{ hashKey: kb("hk1"), sortKey: kb("sk1") },
+					{ hashKey: kb("hk2"), sortKey: ABSENT_SK },
+				],
 			});
 		});
 	});
