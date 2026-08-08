@@ -65,6 +65,11 @@ export type PrepareSplitParams = {
 };
 
 /**
+ * Whether the operation asking to be routed can grow the partition. Reads never can.
+ */
+export type OperationIntent = "read" | "write";
+
+/**
  * The split policy of a partition: pure decisions (shouldAllow / shouldSplit / prepareSplit /
  * pickChildPartition) plus delegation to its KV-backed SplitStateMachine.
  *
@@ -81,9 +86,13 @@ export interface PartitionTopologySplitter {
 	 * Called before every operation to check if the partition can accept the request based on the provided context, storage, and keys.
 	 * This can be used to implement backpressure or to prevent writes to certain partitions based on custom logic.
 	 *
+	 * `intent` gates size backpressure: only a write can grow a partition, so an over-size partition
+	 * still serves reads. Routing decisions ("forward", and the range out-of-range "reject") do not
+	 * depend on it — they are about correctness, not load.
+	 *
 	 * This should be extremely fast since it's called in every request!
 	 */
-	shouldAllow(hashKey: KeyBytes, sortKey?: KeyBytes): "forward" | "reject" | "ok";
+	shouldAllow(hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok";
 
 	/**
 	 * Determines whether a partition should be split based on the provided context, storage, and keys.
@@ -175,7 +184,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 	}
 
-	shouldAllow(_hashKey: KeyBytes, _sortKey?: KeyBytes): "forward" | "reject" | "ok" {
+	shouldAllow(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok" {
 		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// TODO - Keep this in memory to avoid reading it all the time from storage.
 		const splitStatus = this.#splitState.splitStatus();
@@ -186,7 +195,9 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const dbSize = this.#storage.sql.databaseSize;
 		// We allow up to 10% over the max size before we start rejecting requests to avoid flapping around the threshold,
 		// and to allow the requests to complete and trigger the split.
+		// Writes only: a read cannot grow the partition, so refusing it costs availability and buys nothing.
 		if (
+			intent === "write" &&
 			this.partitionContext.hashSplitConditions.maxSizeMb &&
 			dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
@@ -410,7 +421,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		return this.#splitState.childPartitionContexts();
 	}
 
-	shouldAllow(_hashKey: KeyBytes, sortKey?: KeyBytes): "forward" | "reject" | "ok" {
+	shouldAllow(_hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok" {
 		const sk = sortKey ?? KeyCodec.encodeOptional(undefined);
 
 		const splitStatus = this.splitStatus();
@@ -428,8 +439,9 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			return "reject";
 		}
 
-		// Size-based backpressure (10% overage allowed, consistent with hash partition).
+		// Size-based backpressure (10% overage allowed, writes only — consistent with hash partition).
 		if (
+			intent === "write" &&
 			this.partitionContext.rangeSplitConditions?.maxSizeMb &&
 			this.#storage.sql.databaseSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {

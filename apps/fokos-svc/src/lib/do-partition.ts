@@ -35,7 +35,12 @@ import {
 } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
-import { HashPartitionTopologyImpl, PartitionTopologySplitter, RangePartitionTopologyImpl } from "./partition-topology/split-policy.js";
+import {
+	HashPartitionTopologyImpl,
+	PartitionTopologySplitter,
+	RangePartitionTopologyImpl,
+	type OperationIntent,
+} from "./partition-topology/split-policy.js";
 import { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import type { SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
@@ -379,6 +384,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx: pCtx,
 			keys: { hashKey, sortKey },
 			operationName: "putItem",
+			intent: "write",
 			forward: async (stub, pCtx) => await stub.apiPutItem(pCtx, opts),
 			local: async () => {
 				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
@@ -443,6 +449,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx: pCtx,
 			keys: { hashKey, sortKey },
 			operationName: "deleteItem",
+			intent: "write",
 			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, opts),
 			local: async () => {
 				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
@@ -512,6 +519,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx: pCtx,
 			keys: { hashKey: PartitionDO.keyIn(opts.hashKey), sortKey: PartitionDO.optKeyIn(opts.sortKey) },
 			operationName: "getItem",
+			intent: "read",
 			forward: async (stub, pCtx) => await stub.apiGetItem(pCtx, opts),
 			local: async () => await this.readItemLocally(pCtx, opts),
 		});
@@ -554,6 +562,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx: pCtx,
 			keys: { hashKey: PartitionDO.keyIn(req.hashKey), sortKey: KeyCodec.encodeOptional(undefined) },
 			operationName: "queryItems",
+			intent: "read",
 			forward: async (stub, childPCtx) => await stub.apiQueryItems(childPCtx, req),
 			local: async () => await this.queryItemsLocal(this.pCtx(), req),
 		});
@@ -1155,7 +1164,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("prepare");
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "write");
 		invariant(unplaceable.length === 0, "fokos/partition.prepare: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<PrepareResponse>[] = [];
@@ -1184,7 +1193,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("commit"); // reject while this partition is migrating
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "write");
 		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<CommitResponse>[] = [];
@@ -1242,7 +1251,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items);
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "read");
 		invariant(unplaceable.length === 0, "fokos/partition.readForTransaction: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<ReadForTransactionResponse>[] = [];
@@ -1452,6 +1461,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: KeyBytes; sortKey: KeyBytes };
 		operationName: string;
+		intent: OperationIntent;
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>;
 		local: () => Promise<T>;
 	}): Promise<T> {
@@ -1459,6 +1469,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx,
 			keys: { hashKey, sortKey },
 			operationName,
+			intent,
 			forward,
 			local,
 		} = opts;
@@ -1479,7 +1490,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		const topology = this.ensureTopology(ctx);
-		const decision = topology.shouldAllow(hashKey, sortKey);
+		const decision = topology.shouldAllow(hashKey, sortKey, intent);
 		switch (decision) {
 			case "ok":
 				return await local();
@@ -1526,6 +1537,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// false positives need careful handling in multi-item transaction flows.
 	private groupItemsByRouting<T extends { hashKey: KeyBytes; sortKey?: KeyBytes }>(
 		items: T[],
+		intent: OperationIntent,
 	): {
 		local: T[];
 		forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }>;
@@ -1557,7 +1569,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 			}
 
-			const decision = topology.shouldAllow(item.hashKey, item.sortKey);
+			const decision = topology.shouldAllow(item.hashKey, item.sortKey, intent);
 			if (decision === "ok") {
 				local.push(item);
 			} else if (decision === "forward") {
