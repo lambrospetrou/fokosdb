@@ -6,7 +6,7 @@ import { PartitionStore } from "../partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
-import { HashPartitionTopologyImpl, RangePartitionTopologyImpl } from "./split-policy.js";
+import { HashPartitionTopologyImpl, RangePartitionTopologyImpl, type OperationIntent } from "./split-policy.js";
 
 // An empty SQLite database already occupies several KB, so any partition built with this cap is
 // over its 10% backpressure threshold from the first request — no data has to be written.
@@ -14,43 +14,51 @@ const OVER_SIZE_MB = 0.000_001;
 const HK = KeyCodec.encode("hk");
 const SK = KeyCodec.encode("sk");
 
+// Listed explicitly rather than derived, so adding a value to OperationIntent forces a decision here
+// about which side of the backpressure gate it belongs on.
+const NON_GROWING = ["read", "delete", "ignore_size_reject"] as const satisfies readonly OperationIntent[];
+const ALL_INTENTS = ["write", ...NON_GROWING] as const satisfies readonly OperationIntent[];
+
 describe("shouldAllow size backpressure applies to growing writes only", () => {
-	// Neither a read nor a delete can grow a partition. Refusing reads removes availability with no
-	// benefit, and refusing deletes is worse than useless: a delete is the only way a client brings
-	// an over-size partition back under its cap, so refusing it leaves the partition stuck.
-	it("hash partition over its size cap rejects a write but still serves reads and deletes", async () => {
+	// Only "write" can grow a partition. Refusing a read removes availability with no benefit;
+	// refusing a delete is worse than useless, because a delete is how a client brings an over-size
+	// partition back under its cap; and refusing a commit wedges a transaction the coordinator has
+	// already decided, for bytes that prepare has already written.
+	it("hash partition over its size cap rejects a write but serves every non-growing intent", async () => {
 		await withHashTopology(hashContext(OVER_SIZE_MB), (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
-			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
-			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
+			for (const intent of NON_GROWING) {
+				expect(topology.shouldAllow(HK, SK, intent), intent).toBe("ok");
+			}
 		});
 	});
 
-	it("range partition over its size cap rejects a write but still serves reads and deletes", async () => {
+	it("range partition over its size cap rejects a write but serves every non-growing intent", async () => {
 		await withRangeTopology(rangeContext(OVER_SIZE_MB), (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
-			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
-			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
+			for (const intent of NON_GROWING) {
+				expect(topology.shouldAllow(HK, SK, intent), intent).toBe("ok");
+			}
 		});
 	});
 
 	// The range partition rejects for two unrelated reasons. Only the size one is backpressure; an
-	// out-of-range sort key is a routing bug, and serving it would return or destroy data this DO
-	// does not own — so it must keep rejecting every intent.
+	// out-of-range sort key is a routing bug, and serving it would touch data this DO does not own.
+	// "ignore_size_reject" names the SIZE reject only — it must not buy its way past this one.
 	it("range partition rejects an out-of-range sort key whatever the intent", async () => {
 		await withRangeTopology(rangeContext(100, KeyCodec.encode("m"), null), (topology) => {
-			for (const intent of ["read", "write", "delete"] as const) {
-				expect(topology.shouldAllow(HK, KeyCodec.encode("a"), intent)).toBe("reject");
-				expect(topology.shouldAllow(HK, KeyCodec.encode("z"), intent)).toBe("ok");
+			for (const intent of ALL_INTENTS) {
+				expect(topology.shouldAllow(HK, KeyCodec.encode("a"), intent), intent).toBe("reject");
+				expect(topology.shouldAllow(HK, KeyCodec.encode("z"), intent), intent).toBe("ok");
 			}
 		});
 	});
 
 	it("a partition under its size cap allows every intent", async () => {
 		await withHashTopology(hashContext(100), (topology) => {
-			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
-			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
-			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
+			for (const intent of ALL_INTENTS) {
+				expect(topology.shouldAllow(HK, SK, intent), intent).toBe("ok");
+			}
 		});
 	});
 });

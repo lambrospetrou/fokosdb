@@ -67,14 +67,22 @@ export type PrepareSplitParams = {
 /**
  * What the operation asking to be routed does to the partition's size. Size backpressure gates on
  * "write" alone, because only a write can grow a partition:
- * - a read cannot, so refusing it costs availability and buys nothing;
- * - a delete cannot either, and it is exactly how a client brings an over-size partition back under
- *   its cap — refusing deletes would leave the partition with no way to recover.
+ * - "read" cannot, so refusing it costs availability and buys nothing;
+ * - "delete" cannot either, and it is exactly how a client brings an over-size partition back under
+ *   its cap — refusing deletes would leave the partition with no way to recover;
+ * - "ignore_size_reject" is a transaction commit. `prepare` already persisted the payload into
+ *   pending_transactions, so commit only moves those bytes into `items` and drops the pending row.
+ *   The size high-water mark is at prepare, never at commit, and refusing it would wedge a
+ *   transaction whose outcome the coordinator has already decided.
  *
- * "read" and "delete" therefore take the same branch today. They stay separate values because the
- * call site should say what it is doing, not pre-compute the policy's answer.
+ * Only "write" takes the backpressure branch. The other three stay distinct so a call site states
+ * what it is doing rather than pre-computing the policy's answer.
+ *
+ * NONE of them bypass routing. "forward" and the range partition's out-of-range "reject" apply to
+ * every intent, "ignore_size_reject" included — an out-of-range item is a routing bug, not load, and
+ * serving it would touch data this partition does not own.
  */
-export type OperationIntent = "read" | "write" | "delete";
+export type OperationIntent = "read" | "write" | "delete" | "ignore_size_reject";
 
 /**
  * The split policy of a partition: pure decisions (shouldAllow / shouldSplit / prepareSplit /
@@ -93,9 +101,9 @@ export interface PartitionTopologySplitter {
 	 * Called before every operation to check if the partition can accept the request based on the provided context, storage, and keys.
 	 * This can be used to implement backpressure or to prevent writes to certain partitions based on custom logic.
 	 *
-	 * `intent` gates size backpressure only: an over-size partition still serves reads and deletes.
-	 * Routing decisions ("forward", and the range out-of-range "reject") do not depend on it — they
-	 * are about correctness, not load.
+	 * `intent` gates size backpressure only: an over-size partition still serves every non-growing
+	 * intent. Routing decisions ("forward", and the range out-of-range "reject") do not depend on it
+	 * — they are about correctness, not load.
 	 *
 	 * This should be extremely fast since it's called in every request!
 	 */
@@ -202,7 +210,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const dbSize = this.#storage.sql.databaseSize;
 		// We allow up to 10% over the max size before we start rejecting requests to avoid flapping around the threshold,
 		// and to allow the requests to complete and trigger the split.
-		// Writes only — see OperationIntent: reads and deletes cannot grow the partition.
+		// Writes only — see OperationIntent for why no other intent can grow the partition.
 		if (
 			intent === "write" &&
 			this.partitionContext.hashSplitConditions.maxSizeMb &&

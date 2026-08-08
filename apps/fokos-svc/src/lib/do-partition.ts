@@ -1193,7 +1193,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("commit"); // reject while this partition is migrating
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "write");
+		// The coordinator has already decided this transaction, and commit cannot grow the partition:
+		// prepare persisted the payload into pending_transactions, so commit moves those bytes into
+		// `items` and drops the pending row. Size backpressure here would wedge a decided transaction.
+		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "ignore_size_reject");
 		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
 
 		const tasks: Promise<CommitResponse>[] = [];
