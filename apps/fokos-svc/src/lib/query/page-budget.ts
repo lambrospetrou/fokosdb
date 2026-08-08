@@ -21,9 +21,15 @@ export class PageBudget {
 		this.remainingVisits -= partitionsVisited;
 	}
 
-	/** Byte budget or item-count cap is exhausted. */
+	/**
+	 * Byte budget or item-count cap is exhausted.
+	 *
+	 * The null check is intentional, NOT redundant: `null <= 0` is `true` in JS (relational
+	 * comparison coerces null to 0), so a bare `this.remainingLimit <= 0` would report an unlimited
+	 * query as exhausted before it read a single item.
+	 */
 	get budgetExhausted(): boolean {
-		return this.remainingBytes <= 0 || this.remainingLimit === 0;
+		return this.remainingBytes <= 0 || (this.remainingLimit !== null && this.remainingLimit <= 0);
 	}
 
 	/** Leaf-partition visit cap is exhausted. */
