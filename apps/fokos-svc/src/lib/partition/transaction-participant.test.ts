@@ -122,6 +122,42 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
+	it("still rejects a superseded transaction after a non-transactional write with a lower timestamp", async () => {
+		await withParticipant(({ participant, store }) => {
+			// 1. A transaction committed with a coordinator clock running ahead of this partition's.
+			store.upsertItem({
+				hk: kb("hk"),
+				sk: kb("sk"),
+				data: "from-tx",
+				kind: "text",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: BASE_NOW + 4_000,
+			});
+
+			// 2. A non-transactional put lands next, stamped with the partition's own (lower) clock.
+			store.upsertItem({
+				hk: kb("hk"),
+				sk: kb("sk"),
+				data: "from-put",
+				kind: "text",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: BASE_NOW,
+			});
+
+			// 3. A transaction stamped between the two must NOT be able to overwrite the newer put.
+			//    It could, if step 2 had lowered the item's watermark.
+			const superseded = prepareReq({
+				transactionTimestamp: BASE_NOW + 2_000,
+				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "stale", kind: "text" }],
+			});
+			expect(participant.prepareLocal(superseded)).toEqual({
+				outcome: "rejected",
+				reason: { type: "timestamp_conflict", hashKey: "hk", sortKey: "sk" },
+			});
+			expect(store.getItem(kb("hk"), kb("sk")).row?.data).toBe("from-put");
+		});
+	});
+
 	it("rejects with timestamp_conflict for an ABSENT item via the deletion watermark", async () => {
 		await withParticipant(({ participant, store }) => {
 			// A transactional delete bumps the watermark even though the row never existed.

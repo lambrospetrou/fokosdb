@@ -361,6 +361,14 @@ export class PartitionStore {
 		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
 		const dataExpr = opts.kind === "json" ? "jsonb(?)" : "?";
 
+		// last_transaction_ts is MONOTONIC: it never moves backwards. `prepare` accepts a transaction only
+		// when its timestamp is above this value (transaction-participant.ts), so lowering it would let an
+		// already-superseded transaction commit over newer data. A non-transactional put stamps
+		// `Date.now()` on the partition's clock, while a committed transaction may have stamped a
+		// coordinator clock up to MAX_CLOCK_SKEW_MS ahead — so a plain assignment here really can go
+		// backwards. MAX cannot drift ahead of the wall clock: it only ever keeps the larger of the two
+		// values that already exist (that would need an increment, which this deliberately is not).
+		// Mirrors bumpItemLastTransactionTs, which has always used MAX for the transactional "check" op.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
 			`INSERT INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts)
 			 VALUES (?, ?, ${dataExpr}, ?, ?, 1, ?)
@@ -369,7 +377,7 @@ export class PartitionStore {
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   v = v + 1,
-			   last_transaction_ts = excluded.last_transaction_ts
+			   last_transaction_ts = MAX(last_transaction_ts, excluded.last_transaction_ts)
 			 RETURNING v, est_row_bytes`,
 			opts.hk,
 			opts.sk,

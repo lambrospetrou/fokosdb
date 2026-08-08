@@ -64,6 +64,31 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("upsertItem never lowers last_transaction_ts, but still applies the write", async () => {
+		await withStore((store) => {
+			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "from-tx", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 5_000 });
+
+			// A non-transactional put stamps the partition's own (lower) clock.
+			const second = store.upsertItem({
+				hk: kb("hk"),
+				sk: kb("sk"),
+				data: "from-put",
+				kind: "text",
+				ttlEpochUtcSeconds: null,
+				lastTransactionTs: 1_000,
+			});
+
+			// The write lands in full — only the timestamp is held at the high-water mark.
+			expect(second.version).toBe(2);
+			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ data: "from-put", last_transaction_ts: 5_000 });
+
+			// A later timestamp still moves it forward.
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "newer", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 9_000 });
+			expect(store.getItem(kb("hk"), kb("sk")).row?.last_transaction_ts).toBe(9_000);
+		});
+	});
+
 	it("getItem returns converted data, ttl, version, and last_transaction_ts", async () => {
 		await withStore((store) => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "hello", kind: "text", ttlEpochUtcSeconds: 1234, lastTransactionTs: 42 });
