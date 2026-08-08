@@ -225,27 +225,54 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
+	/**
+	 * Maps the state machine to the client's answer. The answer follows the DECISION, never the
+	 * cleanup: a state is terminal for the caller as soon as the outcome can no longer change, even
+	 * though participants may still be catching up.
+	 *
+	 * - PREPARED is the point of no return. Every participant voted to accept and holds its locks, and
+	 *   nothing transitions PREPARED → CANCELLING (both writers of CANCELLING guard on state =
+	 *   'PREPARING'), so the transaction WILL commit. Reporting anything else would be false.
+	 * - CANCELLING is decided too, and is the easy half: a cancelled transaction applied nothing
+	 *   anywhere, so outstanding cleanup cannot change what the caller observes.
+	 * - CREATED / PREPARING are genuinely undecided — those, and only those, ask the caller to retry.
+	 *
+	 * Returning early with cleanup outstanding is safe because `alarm()` reschedules itself while any
+	 * non-terminal row remains, so it drives the stragglers to completion.
+	 */
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
-		if (row.state === "COMMITTED") {
-			// Decode keys to the public form; the empty sentinel ([]) maps back to an absent sortKey.
-			const items = this.loadItems(transactionId).map((i) => {
-				const hk = keyFromBlob(i.hk);
-				const sk = keyFromBlob(i.sk);
-				return sk.length === 0 ? { hashKey: KeyCodec.decode(hk) } : { hashKey: KeyCodec.decode(hk), sortKey: KeyCodec.decode(sk) };
-			});
-			return { outcome: "committed", transactionId, idempotencyToken, items };
+		switch (row.state) {
+			case "PREPARED":
+			case "COMMITTING":
+			case "COMMITTED": {
+				// Decode keys to the public form; the empty sentinel ([]) maps back to an absent sortKey.
+				const items = this.loadItems(transactionId).map((i) => {
+					const hk = keyFromBlob(i.hk);
+					const sk = keyFromBlob(i.sk);
+					return sk.length === 0 ? { hashKey: KeyCodec.decode(hk) } : { hashKey: KeyCodec.decode(hk), sortKey: KeyCodec.decode(sk) };
+				});
+				return { outcome: "committed", transactionId, idempotencyToken, items };
+			}
+			case "CANCELLING":
+			case "CANCELLED":
+				return {
+					outcome: "cancelled",
+					transactionId,
+					idempotencyToken,
+					// Both writers of CANCELLING set the reason in the same UPDATE, so this is always
+					// present; fall back rather than assert, so a torn row degrades instead of throwing.
+					reason: row.rejection_reason_json ? parseReason(row.rejection_reason_json) : { type: "transient_error" },
+				};
+			case "CREATED":
+			case "PREPARING":
+				// No decision yet — the alarm will drive it. This is the only retryable answer.
+				throw new Error(`fokos/tc: transaction ${transactionId} outcome is not yet decided (state=${row.state}), retry later`);
+			default: {
+				const _exhaustive: never = row.state;
+				throw new Error(`fokos/tc: unexpected transaction state ${_exhaustive}`);
+			}
 		}
-		if (row.state === "CANCELLED" && row.rejection_reason_json) {
-			return {
-				outcome: "cancelled",
-				transactionId,
-				idempotencyToken,
-				reason: parseReason(row.rejection_reason_json),
-			};
-		}
-		// Some participants didn't respond during recovery; alarm will retry.
-		throw new Error(`fokos/tc: transaction ${transactionId} still in progress (state=${row.state}), retry later`);
 	}
 
 	private async drivePrepare(transactionId: string, idempotencyToken: string, coordinatorDoId: string): Promise<InitiateWriteResponse> {
