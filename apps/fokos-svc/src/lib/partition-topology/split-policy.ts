@@ -85,6 +85,19 @@ export type PrepareSplitParams = {
 export type OperationIntent = "read" | "write" | "delete" | "ignore_size_reject";
 
 /**
+ * Where one item should be handled. The two rejects are unrelated failures and callers MUST keep
+ * them apart:
+ * - "reject_over_size" is load. The partition is healthy, just past its cap; the caller retries
+ *   later, and a split will bring it back under.
+ * - "reject_out_of_range" is a bug. The item reached a range partition that does not own its sort
+ *   key, so serving it would touch data belonging to another partition. Retrying cannot fix it.
+ *
+ * A single "reject" would make an overloaded partition indistinguishable from a broken router in
+ * logs, and would make the caller retry a request that can never succeed.
+ */
+export type RoutingDecision = "ok" | "forward" | "reject_over_size" | "reject_out_of_range";
+
+/**
  * The split policy of a partition: pure decisions (shouldAllow / shouldSplit / prepareSplit /
  * pickChildPartition) plus delegation to its KV-backed SplitStateMachine.
  *
@@ -101,13 +114,13 @@ export interface PartitionTopologySplitter {
 	 * Called before every operation to check if the partition can accept the request based on the provided context, storage, and keys.
 	 * This can be used to implement backpressure or to prevent writes to certain partitions based on custom logic.
 	 *
-	 * `intent` gates size backpressure only: an over-size partition still serves every non-growing
-	 * intent. Routing decisions ("forward", and the range out-of-range "reject") do not depend on it
-	 * — they are about correctness, not load.
+	 * `intent` gates "reject_over_size" only: an over-size partition still serves every non-growing
+	 * intent. "forward" and "reject_out_of_range" do not depend on it — they are about correctness,
+	 * not load.
 	 *
 	 * This should be extremely fast since it's called in every request!
 	 */
-	shouldAllow(hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok";
+	shouldAllow(hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision;
 
 	/**
 	 * Determines whether a partition should be split based on the provided context, storage, and keys.
@@ -199,7 +212,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 	}
 
-	shouldAllow(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok" {
+	shouldAllow(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision {
 		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
 		// TODO - Keep this in memory to avoid reading it all the time from storage.
 		const splitStatus = this.#splitState.splitStatus();
@@ -216,7 +229,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 			this.partitionContext.hashSplitConditions.maxSizeMb &&
 			dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
-			return "reject";
+			return "reject_over_size";
 		}
 
 		// All good!
@@ -436,7 +449,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		return this.#splitState.childPartitionContexts();
 	}
 
-	shouldAllow(_hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): "forward" | "reject" | "ok" {
+	shouldAllow(_hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision {
 		const sk = sortKey ?? KeyCodec.encodeOptional(undefined);
 
 		const splitStatus = this.splitStatus();
@@ -451,7 +464,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		const inRange = KeyCodec.compare(sk, start) >= 0 && (end === null || KeyCodec.compare(sk, end) < 0);
 		if (!inRange) {
 			// Out of owned range — routing bug; should not happen via correct routing.
-			return "reject";
+			return "reject_out_of_range";
 		}
 
 		// Size-based backpressure (10% overage allowed, writes only — consistent with the hash partition).
@@ -460,7 +473,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			this.partitionContext.rangeSplitConditions?.maxSizeMb &&
 			this.#storage.sql.databaseSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
-			return "reject";
+			return "reject_over_size";
 		}
 
 		return "ok";

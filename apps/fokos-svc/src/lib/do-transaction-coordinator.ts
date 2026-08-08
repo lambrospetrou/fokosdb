@@ -15,7 +15,7 @@ import type {
 	TCState,
 	TransactionItem,
 } from "./transaction-types.js";
-import { PartitionDO } from "./do-partition.js";
+import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
 
 type TcStateRow = {
 	idempotency_token: string;
@@ -306,7 +306,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						);
 						return r;
 					},
-					(_err, nextAttempt) => nextAttempt <= 3,
+					// Backpressure is deterministic for the life of this transaction: the partition is over
+					// its cap, and a split will not land inside a retry budget of a few seconds. Retrying
+					// only adds latency before the same cancellation.
+					(err, nextAttempt) => !isPartitionExceededDatabaseSizeError(err) && nextAttempt <= 3,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 				return { partitionDoName: p.partition_do_name, result };
@@ -490,7 +493,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						);
 						return r;
 					},
-					(_err, nextAttempt) => nextAttempt <= 5,
+					// Same as the first prepare pass: an over-size partition will not clear by retrying.
+					(err, nextAttempt) => !isPartitionExceededDatabaseSizeError(err) && nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 				if (result.outcome === "rejected") {

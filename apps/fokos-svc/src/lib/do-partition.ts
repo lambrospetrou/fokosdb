@@ -1164,8 +1164,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("prepare");
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "write");
-		invariant(unplaceable.length === 0, "fokos/partition.prepare: mis-routed item this node can neither own nor route");
+		const { local, forwarded } = this.groupItemsByRouting(request.items, "write", "prepare");
 
 		const tasks: Promise<PrepareResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -1196,8 +1195,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// The coordinator has already decided this transaction, and commit cannot grow the partition:
 		// prepare persisted the payload into pending_transactions, so commit moves those bytes into
 		// `items` and drops the pending row. Size backpressure here would wedge a decided transaction.
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "ignore_size_reject");
-		invariant(unplaceable.length === 0, "fokos/partition.commit: mis-routed item this node can neither own nor route");
+		const { local, forwarded } = this.groupItemsByRouting(request.items, "ignore_size_reject", "commit");
 
 		const tasks: Promise<CommitResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -1254,8 +1252,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
-		const { local, forwarded, unplaceable } = this.groupItemsByRouting(request.items, "read");
-		invariant(unplaceable.length === 0, "fokos/partition.readForTransaction: mis-routed item this node can neither own nor route");
+		const { local, forwarded } = this.groupItemsByRouting(request.items, "read", "readForTransaction");
 
 		const tasks: Promise<ReadForTransactionResponse>[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
@@ -1525,8 +1522,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					},
 				} as T;
 			}
-			case "reject":
-				throw new Error(`fokos/partition: partition exceeded its limits, please retry later (${operationName}).`);
+			case "reject_over_size":
+				throw errExceededDatabaseSize(operationName);
+			case "reject_out_of_range":
+				throw errInvalidPartitionRouting(operationName);
 			default: {
 				const _exhaustive: never = decision;
 				invariant(false, `fokos/partition.withSplitForwarding: unexpected decision value: ${_exhaustive}`);
@@ -1538,19 +1537,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// (prepare/commit/readForTransaction). Currently only the authoritative PromotionManager is
 	// checked. The bloom filter would save hops for keys promoted by descendant partitions, but
 	// false positives need careful handling in multi-item transaction flows.
+	/**
+	 * Routes a transaction's items. Throws on either reject, and the two are NOT interchangeable:
+	 * "reject_over_size" is retryable backpressure from a healthy partition, so it raises the same
+	 * error the non-transactional path raises; "reject_out_of_range" means the item reached a
+	 * partition that cannot own it, which is a bug, so it keeps the invariant.
+	 */
 	private groupItemsByRouting<T extends { hashKey: KeyBytes; sortKey?: KeyBytes }>(
 		items: T[],
 		intent: OperationIntent,
+		operationName: string,
 	): {
 		local: T[];
 		forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }>;
-		unplaceable: T[];
 	} {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 		const local: T[] = [];
 		const forwarded = new Map<string, { pCtx: PartitionContextResolved; items: T[] }>();
-		const unplaceable: T[] = [];
 
 		const addForwarded = (destPCtx: PartitionContextResolved, item: T) => {
 			let entry = forwarded.get(destPCtx.doName);
@@ -1578,12 +1582,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			} else if (decision === "forward") {
 				const { partitionContext } = topology.pickChildPartition(pCtx, item.hashKey, item.sortKey);
 				addForwarded(partitionContext, item);
+			} else if (decision === "reject_over_size") {
+				throw errExceededDatabaseSize(operationName);
 			} else {
-				unplaceable.push(item);
+				throw errInvalidPartitionRouting(operationName);
 			}
 		}
 
-		return { local, forwarded, unplaceable };
+		return { local, forwarded };
 	}
 
 	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
@@ -1928,6 +1934,34 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 function isPhantomBounceError(e: unknown): boolean {
 	return e instanceof Error && e.message.includes("phantom-bounce");
+}
+
+// Durable Object RPC carries only an error's message across the boundary — not its class, not any
+// custom property — so the transaction coordinator recognises backpressure by this substring.
+// It must stay in the message overSizeError builds.
+const OVER_SIZE_SENTINEL = "partition exceeded its limits";
+
+/** Transient: the partition is healthy but past its cap, and a split will bring it back under. */
+function errExceededDatabaseSize(operationName: string): Error {
+	return new Error(`fokos/partition: ${OVER_SIZE_SENTINEL}, please retry later (${operationName}).`);
+}
+
+/**
+ * Never transient: the item reached a partition that can neither own nor route it. Serving it would
+ * touch data another partition owns, and no amount of retrying changes the answer. Raised through
+ * invariant(), so it needs no sentinel — nothing matches on it, it just has to be unmistakable in a log.
+ */
+function errInvalidPartitionRouting(operationName: string): Error {
+	return new Error(`fokos/partition.${operationName}: mis-routed item this node can neither own nor route`);
+}
+
+/**
+ * True for overSizeError, including after it has crossed a DO RPC boundary. Callers use it to skip
+ * retries: the partition is over its cap, and that will not change inside a retry budget measured
+ * in seconds.
+ */
+export function isPartitionExceededDatabaseSizeError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes(OVER_SIZE_SENTINEL);
 }
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {

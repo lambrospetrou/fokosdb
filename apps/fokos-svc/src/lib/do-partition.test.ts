@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { InitFromSplitOptions, PartitionDO } from "./do-partition.js";
+import { InitFromSplitOptions, isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
@@ -1913,6 +1913,56 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		});
 		expect(prepareResp2.outcome).toBe("accepted");
 		await stub.txCancel(ctx, { transactionId: txId2 });
+	});
+});
+
+describe("PartitionDO — transaction routing separates backpressure from mis-routing", () => {
+	// An empty SQLite database is already several KB, so this cap is exceeded before anything is
+	// written and every "write" is refused for size.
+	const OVER_SIZE = { hashSplitConditions: { maxSizeMb: 0.000_001 } };
+
+	const txItems = [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put" as const, data: "d", kind: "text" as const }];
+
+	// An over-size partition is healthy, just full.
+	// The isPartitionOverSizeError assertion is the load-bearing one: the coordinator uses it to skip
+	// retries, and it sees this error only AFTER a Durable Object RPC hop, which keeps the message but
+	// drops the class. Asserting it here, on a genuinely remote error, is what proves the skip fires.
+	it("prepare on an over-size partition reports backpressure", async () => {
+		const { ctx, stub } = makeStub(OVER_SIZE);
+		const error = await stub
+			.txPrepare(ctx, {
+				transactionId: crypto.randomUUID(),
+				transactionTimestamp: Date.now(),
+				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+				items: txItems,
+			})
+			.then(
+				() => null,
+				(e: unknown) => e,
+			);
+		expect(String(error)).toMatch(/partition exceeded its limits/);
+		expect(String(error)).not.toMatch(/mis-routed/);
+		expect(isPartitionExceededDatabaseSizeError(error)).toBe(true);
+	});
+
+	// Commit is non-growing (prepare already persisted the payload) and its outcome is already
+	// decided, so an over-size partition must not refuse it — that would wedge the transaction.
+	it("commit is not refused by an over-size partition", async () => {
+		const { ctx, stub } = makeStub(OVER_SIZE);
+		// No prepare ran, so commit finds no pending rows and is a no-op — enough to prove it routed.
+		await expect(
+			stub.txCommit(ctx, { transactionId: crypto.randomUUID(), transactionTimestamp: Date.now(), items: txItems }),
+		).resolves.toEqual({ outcome: "committed" });
+	});
+
+	// Reads cannot grow a partition either, so they stay available.
+	it("readForTransaction is not refused by an over-size partition", async () => {
+		const { ctx, stub } = makeStub(OVER_SIZE);
+		const res = await stub.txReadForTransaction(ctx, {
+			transactionId: crypto.randomUUID(),
+			items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
+		});
+		expect(res.items).toHaveLength(1);
 	});
 });
 

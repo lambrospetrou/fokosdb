@@ -26,7 +26,7 @@ describe("shouldAllow size backpressure applies to growing writes only", () => {
 	// already decided, for bytes that prepare has already written.
 	it("hash partition over its size cap rejects a write but serves every non-growing intent", async () => {
 		await withHashTopology(hashContext(OVER_SIZE_MB), (topology) => {
-			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
 			for (const intent of NON_GROWING) {
 				expect(topology.shouldAllow(HK, SK, intent), intent).toBe("ok");
 			}
@@ -35,7 +35,7 @@ describe("shouldAllow size backpressure applies to growing writes only", () => {
 
 	it("range partition over its size cap rejects a write but serves every non-growing intent", async () => {
 		await withRangeTopology(rangeContext(OVER_SIZE_MB), (topology) => {
-			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
 			for (const intent of NON_GROWING) {
 				expect(topology.shouldAllow(HK, SK, intent), intent).toBe("ok");
 			}
@@ -48,7 +48,7 @@ describe("shouldAllow size backpressure applies to growing writes only", () => {
 	it("range partition rejects an out-of-range sort key whatever the intent", async () => {
 		await withRangeTopology(rangeContext(100, KeyCodec.encode("m"), null), (topology) => {
 			for (const intent of ALL_INTENTS) {
-				expect(topology.shouldAllow(HK, KeyCodec.encode("a"), intent), intent).toBe("reject");
+				expect(topology.shouldAllow(HK, KeyCodec.encode("a"), intent), intent).toBe("reject_out_of_range");
 				expect(topology.shouldAllow(HK, KeyCodec.encode("z"), intent), intent).toBe("ok");
 			}
 		});

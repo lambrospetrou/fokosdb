@@ -87,13 +87,15 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
+		// A sort key this partition does not own is a routing bug, never load, so it must report
+		// mis-routing and NOT the size-backpressure message — the two are not interchangeable: one is
+		// retryable, the other can never succeed. "m" is the exclusive upper bound, so it is outside.
 		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
-			await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "m", data: "x", kind: "text" })).rejects.toThrow(
-				/exceeded its limits/,
-			);
-			await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "z", data: "x", kind: "text" })).rejects.toThrow(
-				/exceeded its limits/,
-			);
+			for (const sortKey of ["m", "z"]) {
+				await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey, data: "x", kind: "text" })).rejects.toThrow(
+					/mis-routed item this node can neither own nor route/,
+				);
+			}
 		});
 	});
 
