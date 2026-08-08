@@ -449,7 +449,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			ctx: pCtx,
 			keys: { hashKey, sortKey },
 			operationName: "deleteItem",
-			intent: "write",
+			intent: "delete",
 			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, opts),
 			local: async () => {
 				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);

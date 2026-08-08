@@ -14,37 +14,43 @@ const OVER_SIZE_MB = 0.000_001;
 const HK = KeyCodec.encode("hk");
 const SK = KeyCodec.encode("sk");
 
-describe("shouldAllow size backpressure applies to writes only", () => {
-	// A read cannot grow a partition, so refusing reads on an over-size partition removes
-	// availability with no benefit — and it takes away the one operation (a query) a client needs
-	// to find what to delete.
-	it("hash partition over its size cap rejects a write and still serves a read", async () => {
+describe("shouldAllow size backpressure applies to growing writes only", () => {
+	// Neither a read nor a delete can grow a partition. Refusing reads removes availability with no
+	// benefit, and refusing deletes is worse than useless: a delete is the only way a client brings
+	// an over-size partition back under its cap, so refusing it leaves the partition stuck.
+	it("hash partition over its size cap rejects a write but still serves reads and deletes", async () => {
 		await withHashTopology(hashContext(OVER_SIZE_MB), (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
 			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
+			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
 		});
 	});
 
-	it("range partition over its size cap rejects a write and still serves a read", async () => {
+	it("range partition over its size cap rejects a write but still serves reads and deletes", async () => {
 		await withRangeTopology(rangeContext(OVER_SIZE_MB), (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject");
 			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
+			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
 		});
 	});
 
 	// The range partition rejects for two unrelated reasons. Only the size one is backpressure; an
-	// out-of-range sort key is a routing bug, and serving it would return data this DO does not own.
-	it("range partition rejects an out-of-range sort key for reads too", async () => {
+	// out-of-range sort key is a routing bug, and serving it would return or destroy data this DO
+	// does not own — so it must keep rejecting every intent.
+	it("range partition rejects an out-of-range sort key whatever the intent", async () => {
 		await withRangeTopology(rangeContext(100, KeyCodec.encode("m"), null), (topology) => {
-			expect(topology.shouldAllow(HK, KeyCodec.encode("a"), "read")).toBe("reject");
-			expect(topology.shouldAllow(HK, KeyCodec.encode("z"), "read")).toBe("ok");
+			for (const intent of ["read", "write", "delete"] as const) {
+				expect(topology.shouldAllow(HK, KeyCodec.encode("a"), intent)).toBe("reject");
+				expect(topology.shouldAllow(HK, KeyCodec.encode("z"), intent)).toBe("ok");
+			}
 		});
 	});
 
-	it("a partition under its size cap allows both", async () => {
+	it("a partition under its size cap allows every intent", async () => {
 		await withHashTopology(hashContext(100), (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
 			expect(topology.shouldAllow(HK, SK, "read")).toBe("ok");
+			expect(topology.shouldAllow(HK, SK, "delete")).toBe("ok");
 		});
 	});
 });
