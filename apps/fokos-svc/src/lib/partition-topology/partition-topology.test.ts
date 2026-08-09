@@ -9,7 +9,7 @@ import type { SplitStatusKVItem } from "./split-state.js";
 import { PartitionDO } from "../do-partition.js";
 import { KeyCodec } from "./key-codec.js";
 
-const kb = (s: string) => KeyCodec.encode(s);
+const kb = (s?: string) => KeyCodec.encodeOptional(s);
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
@@ -74,10 +74,10 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		const r = await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "a", data: "v1", kind: "text" });
+		const r = await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("a"), data: "v1", kind: "text" });
 		expect(r.meta.forwardCount).toBe(0);
 
-		const g = await stub.apiGetItem(rootCtx, { hashKey: "alice", sortKey: "a" });
+		const g = await stub.apiGetItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("a") });
 		expect(g).toMatchObject({ found: true, item: { data: "v1" }, meta: { forwardCount: 0 } });
 	});
 
@@ -92,9 +92,9 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		// retryable, the other can never succeed. "m" is the exclusive upper bound, so it is outside.
 		await runInDurableObject(stub, async (doInstance: PartitionDO) => {
 			for (const sortKey of ["m", "z"]) {
-				await expect(doInstance.apiPutItem(rootCtx, { hashKey: "alice", sortKey, data: "x", kind: "text" })).rejects.toThrow(
-					/mis-routed item this node can neither own nor route/,
-				);
+				await expect(
+					doInstance.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb(sortKey), data: "x", kind: "text" }),
+				).rejects.toThrow(/mis-routed item this node can neither own nor route/);
 			}
 		});
 	});
@@ -105,10 +105,10 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: undefined, data: "empty-sk", kind: "text" });
-		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz", data: "last", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb(), data: "empty-sk", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("zzzzz"), data: "last", kind: "text" });
 
-		const g = await stub.apiGetItem(rootCtx, { hashKey: "alice", sortKey: "zzzzz" });
+		const g = await stub.apiGetItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("zzzzz") });
 		expect(g).toMatchObject({ found: true });
 	});
 
@@ -122,8 +122,8 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const bigData = "x".repeat(50 * 1024);
 		for (let i = 0; i < 10; i++) {
 			await rootStub.apiPutItem(rootCtx, {
-				hashKey: "alice",
-				sortKey: `sk${String(i).padStart(3, "0")}`,
+				hashKey: kb("alice"),
+				sortKey: kb(`sk${String(i).padStart(3, "0")}`),
 				data: bigData,
 				kind: "text",
 			});
@@ -156,8 +156,8 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 
 		// sk below boundary — forwarded to left child (forwardCount=1, not served locally by the router).
 		const left = await rootStub.apiPutItem(rootCtx, {
-			hashKey: "alice",
-			sortKey: "sk000",
+			hashKey: kb("alice"),
+			sortKey: kb("sk000"),
 			data: "left",
 			kind: "text",
 		});
@@ -165,7 +165,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 
 		// sk at boundary — forwarded to right child.
 		const right = await rootStub.apiPutItem(rootCtx, {
-			hashKey: "alice",
+			hashKey: kb("alice"),
 			sortKey: boundary,
 			data: "right",
 			kind: "text",
@@ -175,11 +175,11 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		// Items landed in their owning children, not on the router.
 		const leftStub = PartitionDO.getByName(env.PARTITION_DO, children[0].doName);
 		const rightStub = PartitionDO.getByName(env.PARTITION_DO, children[1].doName);
-		expect(await leftStub.apiGetItem(children[0], { hashKey: "alice", sortKey: "sk000" })).toMatchObject({
+		expect(await leftStub.apiGetItem(children[0], { hashKey: kb("alice"), sortKey: kb("sk000") })).toMatchObject({
 			found: true,
 			item: { data: "left" },
 		});
-		expect(await rightStub.apiGetItem(children[1], { hashKey: "alice", sortKey: boundary })).toMatchObject({
+		expect(await rightStub.apiGetItem(children[1], { hashKey: kb("alice"), sortKey: boundary })).toMatchObject({
 			found: true,
 			item: { data: "right" },
 		});
@@ -194,8 +194,8 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
 		const bigData = "x".repeat(50 * 1024);
-		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk1", data: bigData, kind: "text" });
-		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk2", data: bigData, kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: bigData, kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: bigData, kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus?.status).toBe("split_queued");
@@ -216,7 +216,7 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		await stub.apiPutItem(rootCtx, { hashKey: "alice", sortKey: "sk", data: "x", kind: "text" });
+		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("sk"), data: "x", kind: "text" });
 
 		const s = await stub.status(rootCtx);
 		expect(s.splitStatus).toBeUndefined();

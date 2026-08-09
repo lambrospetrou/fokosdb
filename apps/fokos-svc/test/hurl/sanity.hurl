@@ -73,17 +73,6 @@ jsonpath "$.found" == true
 jsonpath "$.item.data" == "profile-data"
 jsonpath "$.item.dataEncoding" == "utf8"
 
-# ── putItem with ttlSeconds ────────────────────────────────────────────────────
-
-POST {{base_url}}/api/rpc/{{database_name}}/putItem
-Content-Type: application/json
-{
-  "hashKey": "ttl#item",
-  "data": "expires-soon",
-  "ttlSeconds": 3600
-}
-HTTP 200
-
 # ── putItem with conditions ────────────────────────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/putItem

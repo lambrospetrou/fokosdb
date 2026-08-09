@@ -1,15 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import {
-	DeleteItemOptions,
-	DeleteItemResult,
-	EncodedPutItemOptions as PutItemEncodedOptions,
-	GetItemOptions,
-	GetItemResultEncoded,
-	OperationMetrics,
-	PartitionInfo,
-	PutItemResult,
-	RangeAncestorInfo,
-} from "./types.js";
+import { DataKind, ItemCondition, OperationMetrics, PartitionInfo, RangeAncestorInfo } from "./types.js";
 import type {
 	CancelRequest,
 	CancelResponse,
@@ -83,11 +73,49 @@ import { getColoInfo, type ColoInfo } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 
 export interface PartitionAPI {
-	apiPutItem(ctx: PartitionContext, opts: PutItemEncodedOptions): Promise<PutItemResult>;
-	apiGetItem(ctx: PartitionContext, opts: GetItemOptions): Promise<GetItemResultEncoded>;
-	apiDeleteItem(ctx: PartitionContext, opts: DeleteItemOptions): Promise<DeleteItemResult>;
+	apiPutItem(ctx: PartitionContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
+	apiGetItem(ctx: PartitionContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
+	apiDeleteItem(ctx: PartitionContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
 	apiQueryItems(ctx: PartitionContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 }
+
+// ─── item RPC types ───────────────────────────────────────────────────────────
+
+/**
+ * Wire types for the item RPCs (db.ts → PartitionDO). Keys are canonical KeyBytes, encoded at the
+ * db.ts entry, and `sortKey` is always present — the empty KeyBytes ([]) is the absent sentinel.
+ * This matches the transaction and query RPCs, so every key crossing into a DO has one form.
+ *
+ * No response carries a key: `db.ts` answers with the caller's own keys, which are the only ones the
+ * caller can recognise.
+ */
+export type ItemRpcKeys = { hashKey: KeyBytes; sortKey: KeyBytes };
+
+export type PutItemRpcRequest = ItemRpcKeys & {
+	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
+	data: string | Uint8Array;
+	kind: DataKind;
+	ttlEpochUTCSeconds?: number;
+	conditions?: ItemCondition[];
+};
+
+export type PutItemRpcResponse = { version: number; meta: OperationMetrics & PartitionInfo };
+
+export type DeleteItemRpcRequest = ItemRpcKeys & { conditions?: ItemCondition[] };
+
+export type DeleteItemRpcResponse = { deleted: boolean; meta: OperationMetrics & PartitionInfo };
+
+export type GetItemRpcRequest = ItemRpcKeys;
+
+// json data is JSON text here; db.ts parses it once at the public boundary. The type is free of the
+// recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
+export type GetItemRpcResponse =
+	| {
+			found: true;
+			item: { data: string | Uint8Array; kind: DataKind; ttlEpochUTCSeconds?: number; version: number };
+			meta: OperationMetrics & PartitionInfo;
+	  }
+	| { found: false; meta: OperationMetrics & PartitionInfo };
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
@@ -128,9 +156,9 @@ export type QueryItemsRpcResponse = {
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
 // DurableObjectStub<PartitionDO> → PartitionDO → withSplitForwarding → DurableObjectStub<PartitionDO>.
 export type PartitionDOStub = {
-	apiPutItem(ctx: PartitionContextResolved, opts: PutItemEncodedOptions): Promise<PutItemResult>;
-	apiGetItem(ctx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResultEncoded>;
-	apiDeleteItem(ctx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult>;
+	apiPutItem(ctx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
+	apiGetItem(ctx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
+	apiDeleteItem(ctx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
 	apiQueryItems(ctx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 
 	internalQueryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
@@ -375,17 +403,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	async apiPutItem(pCtx: PartitionContextResolved, opts: PutItemEncodedOptions): Promise<PutItemResult> {
+	async apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("putItem");
-		const hashKey = PartitionDO.keyIn(opts.hashKey);
-		const sortKey = PartitionDO.optKeyIn(opts.sortKey);
-		return await this.withSplitForwarding<PutItemResult>({
+		const { hashKey, sortKey } = req;
+		return await this.withSplitForwarding<PutItemRpcResponse>({
 			ctx: pCtx,
 			keys: { hashKey, sortKey },
 			operationName: "putItem",
 			intent: "write",
-			forward: async (stub, pCtx) => await stub.apiPutItem(pCtx, opts),
+			forward: async (stub, pCtx) => await stub.apiPutItem(pCtx, req),
 			local: async () => {
 				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 				if (pendingRow) {
@@ -397,21 +424,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
-				if (opts.conditions && opts.conditions.length > 0) {
+				if (req.conditions && req.conditions.length > 0) {
 					const stamp = this.#store.getItemStamp(hashKey, sortKey);
 					conditionRes = stamp;
 					const item: ItemSnapshot = stamp.row
 						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
 						: { found: false, hk: hashKey, sk: sortKey };
-					evaluateConditionsOnItem(item, opts.conditions, "putItem");
+					evaluateConditionsOnItem(item, req.conditions, "putItem");
 				}
 
 				const writeRes = this.#store.upsertItem({
 					hk: hashKey,
 					sk: sortKey,
-					data: opts.data,
-					kind: opts.kind,
-					ttlEpochUtcSeconds: opts.ttlEpochUTCSeconds ?? null,
+					data: req.data,
+					kind: req.kind,
+					ttlEpochUtcSeconds: req.ttlEpochUTCSeconds ?? null,
 					lastTransactionTs: Date.now(),
 				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
@@ -419,7 +446,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				await this.checkSplits(pCtx, hashKey, sortKey);
 				return {
-					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					version: writeRes.version,
 					meta: {
 						rowsRead,
@@ -440,17 +466,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	async apiDeleteItem(pCtx: PartitionContextResolved, opts: DeleteItemOptions): Promise<DeleteItemResult> {
+	async apiDeleteItem(pCtx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("deleteItem");
-		const hashKey = PartitionDO.keyIn(opts.hashKey);
-		const sortKey = PartitionDO.optKeyIn(opts.sortKey);
-		return await this.withSplitForwarding<DeleteItemResult>({
+		const { hashKey, sortKey } = req;
+		return await this.withSplitForwarding<DeleteItemRpcResponse>({
 			ctx: pCtx,
 			keys: { hashKey, sortKey },
 			operationName: "deleteItem",
 			intent: "delete",
-			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, opts),
+			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, req),
 			local: async () => {
 				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 				if (pendingRow) {
@@ -461,20 +486,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
-				if (opts.conditions && opts.conditions.length > 0) {
+				if (req.conditions && req.conditions.length > 0) {
 					const stamp = this.#store.getItemStamp(hashKey, sortKey);
 					conditionRes = stamp;
 					const item: ItemSnapshot = stamp.row
 						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
 						: { found: false, hk: hashKey, sk: sortKey };
-					evaluateConditionsOnItem(item, opts.conditions, "deleteItem");
+					evaluateConditionsOnItem(item, req.conditions, "deleteItem");
 				}
 
 				// Keep deletion watermark consistent with transactional deletes.
 				const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
-					item: { hashKey: opts.hashKey, sortKey: opts.sortKey },
 					deleted: writeRes.deleted,
 					meta: {
 						rowsRead,
@@ -495,7 +519,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	async apiGetItem(pCtx: PartitionContextResolved, opts: GetItemOptions): Promise<GetItemResultEncoded> {
+	async apiGetItem(pCtx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 
 		if (await this.ensureMigration("getItem", false)) {
@@ -503,7 +527,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
 			const parentStub = PartitionDO.getByName(this.env[parentCtx.ns], parentCtx.doName);
-			const result = await parentStub.internalGetItemDirect(opts);
+			const result = await parentStub.internalGetItemDirect(req);
 			// The parent returns its own hashDepth, but the caller forwarded to this child partition.
 			// recordForwardResult on the caller requires responseHashDepth >= toAbsDepth (this child's depth).
 			if (isHashPartition(pCtx)) {
@@ -515,20 +539,20 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return result;
 		}
 
-		return await this.withSplitForwarding<GetItemResultEncoded>({
+		return await this.withSplitForwarding<GetItemRpcResponse>({
 			ctx: pCtx,
-			keys: { hashKey: PartitionDO.keyIn(opts.hashKey), sortKey: PartitionDO.optKeyIn(opts.sortKey) },
+			keys: { hashKey: req.hashKey, sortKey: req.sortKey },
 			operationName: "getItem",
 			intent: "read",
-			forward: async (stub, pCtx) => await stub.apiGetItem(pCtx, opts),
-			local: async () => await this.readItemLocally(pCtx, opts),
+			forward: async (stub, pCtx) => await stub.apiGetItem(pCtx, req),
+			local: async () => await this.readItemLocally(pCtx, req),
 		});
 	}
 
 	// Internal RPC: reads directly from local storage, bypassing split forwarding.
 	// Called by child partitions during migration to avoid a forwarding loop back into the child.
-	async internalGetItemDirect(opts: GetItemOptions): Promise<GetItemResultEncoded> {
-		return await this.readItemLocally(this.pCtx(), opts);
+	async internalGetItemDirect(req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
+		return await this.readItemLocally(this.pCtx(), req);
 	}
 
 	async apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
@@ -560,7 +584,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// hash key only — all sks of a non-promoted key live on one leaf, so `local` is a leaf scan.
 		return await this.withSplitForwarding<QueryItemsRpcResponse>({
 			ctx: pCtx,
-			keys: { hashKey: PartitionDO.keyIn(req.hashKey), sortKey: KeyCodec.encodeOptional(undefined) },
+			keys: { hashKey: req.hashKey, sortKey: KeyCodec.encodeOptional(undefined) },
 			operationName: "queryItems",
 			intent: "read",
 			forward: async (stub, childPCtx) => await stub.apiQueryItems(childPCtx, req),
@@ -577,7 +601,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
-		const hk = PartitionDO.keyIn(req.hashKey);
+		const hk = req.hashKey;
 		const { interval, cursor, budgetBytes, remainingLimit } = req;
 
 		const lower = interval.lower?.value ?? KeyCodec.encodeOptional(undefined);
@@ -974,8 +998,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.migrationAcknowledgePromotionComplete: only hash partitions can have promoted keys");
-		// RPC erases the brand; re-brand the incoming bytes before passing inward.
-		await this.#promotion.acknowledgePromotionComplete(PartitionDO.keyIn(hashKey));
+		await this.#promotion.acknowledgePromotionComplete(hashKey);
 	}
 
 	private async checkSplits(pCtx: PartitionContextResolved, hashKey: KeyBytes, sortKey?: KeyBytes): Promise<SplitStatusKVItem | undefined> {
@@ -1286,15 +1309,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// RPC erases the KeyBytes brand: keys reach the DO already-encoded as Uint8Array (db.ts encodes at
 	// the public entry). Re-brand on this trust boundary without re-encoding. A raw string (e.g. a direct
 	// in-process test call) is encoded so the DO always works on canonical KeyBytes.
-	private static keyIn(k: string | Uint8Array): KeyBytes {
-		return typeof k === "string" ? KeyCodec.encode(k) : KeyCodec.asKeyBytes(k);
-	}
-
-	// As keyIn, but an absent key maps to the empty KeyBytes sentinel ([]).
-	private static optKeyIn(k: string | Uint8Array | undefined): KeyBytes {
-		return k === undefined ? KeyCodec.encodeOptional(undefined) : PartitionDO.keyIn(k);
-	}
-
 	private pCtx(): PartitionContextLivePartition & { _partitionIdBytes: Uint8Array } {
 		const pCtx = this.#_partitionContext;
 		invariant(pCtx, this.STRING_PCTX_INIT_ERROR);
@@ -1596,8 +1610,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return this.env[this.pCtx().ns].getByName(childPCtx.doName);
 	}
 
-	private readItemLocally(pCtx: PartitionContextResolved, opts: GetItemOptions): GetItemResultEncoded {
-		const res = this.#store.getItem(PartitionDO.keyIn(opts.hashKey), PartitionDO.optKeyIn(opts.sortKey));
+	private readItemLocally(pCtx: PartitionContextResolved, req: GetItemRpcRequest): GetItemRpcResponse {
+		const res = this.#store.getItem(req.hashKey, req.sortKey);
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
 		const actorMeta = {
@@ -1614,14 +1628,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				rangeAncestors: this.#_rangeAncestors,
 			},
 		};
-		const itemKey = { hashKey: opts.hashKey, sortKey: opts.sortKey };
 		if (!result) {
-			return { found: false, item: itemKey, meta: actorMeta };
+			return { found: false, meta: actorMeta };
 		}
 		return {
 			found: true,
 			item: {
-				...itemKey,
 				// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 				data: result.data,
 				kind: result.kind,

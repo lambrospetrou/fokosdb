@@ -55,13 +55,6 @@ export type PutItemOptions = {
 	conditions?: ItemCondition[];
 };
 
-// Wire-IN type (db.ts → PartitionDO): the public `data` has been encoded to `string | Uint8Array`
-// plus a `kind` discriminant, so the DO never sees a JS object.
-export type EncodedPutItemOptions = Omit<PutItemOptions, "data"> & {
-	data: string | Uint8Array;
-	kind: DataKind;
-};
-
 export type DeleteItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
@@ -95,13 +88,15 @@ export type GetItemOptions = {
 	sortKey?: string | Uint8Array;
 };
 
-type GetItemResultOf<D> =
+// Public result surfaced by FokosDB.getItem. The keys are the caller's own, and db.ts has parsed json
+// text into a JsonValue. The DO's counterpart is GetItemRpcResponse, which carries no keys at all.
+export type GetItemResult =
 	| {
 			found: true;
 			item: {
 				hashKey: string | Uint8Array;
 				sortKey?: string | Uint8Array;
-				data: D;
+				data: string | Uint8Array | JsonValue;
 				kind: DataKind;
 				ttlEpochUTCSeconds?: number;
 				version: number;
@@ -113,13 +108,6 @@ type GetItemResultOf<D> =
 			item: ItemKey;
 			meta: OperationMetrics & PartitionInfo & {};
 	  };
-
-// DO→db.ts RPC result: json arrives as JSON text, so data is `string | Uint8Array`. Deliberately free
-// of the recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
-export type GetItemResultEncoded = GetItemResultOf<string | Uint8Array>;
-
-// Public result surfaced by FokosDB.getItem: db.ts has parsed json text into a JsonValue.
-export type GetItemResult = GetItemResultOf<string | Uint8Array | JsonValue>;
 
 export type PartitionInfo = {
 	/**

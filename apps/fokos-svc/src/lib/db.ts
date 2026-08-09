@@ -5,6 +5,7 @@ import { isErrorRetryable } from "durable-utils/do-utils";
 import {
 	DataKind,
 	DeleteItemOptions,
+	DeleteItemResult,
 	EncodedItemData,
 	GetItemOptions,
 	GetItemResult,
@@ -13,6 +14,7 @@ import {
 	JsonComposite,
 	JsonValue,
 	PutItemOptions,
+	PutItemResult,
 	QueryItemsMeta,
 	QueryItemsOptions,
 	QueryItemsResult,
@@ -103,8 +105,8 @@ export class FokosDB {
 		return { ...this.#options };
 	}
 
-	async putItem(opts: PutItemOptions) {
-		if (opts.ttlEpochUTCSeconds !== undefined && opts.ttlSeconds !== undefined) {
+	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
+		if (opts.ttlEpochUTCSeconds !== undefined || opts.ttlSeconds !== undefined) {
 			throw new Error("fokosdb: TTL expiration not yet implemented");
 		}
 		validateItemKeys(opts.hashKey, opts.sortKey);
@@ -113,13 +115,20 @@ export class FokosDB {
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
-		const { data, ...rest } = opts;
-		const encoded = encodeItemData(data);
+		const encoded = encodeItemData(opts.data);
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
-		const res = await stub.apiPutItem(partitionContext, { ...rest, hashKey, sortKey, ...encoded });
-		// Echo the caller's original keys (no decode needed).
+		// ttlSeconds is deliberately not forwarded: no layer honours it yet.
+		const res = await stub.apiPutItem(partitionContext, {
+			hashKey,
+			sortKey,
+			data: encoded.data,
+			kind: encoded.kind,
+			ttlEpochUTCSeconds: opts.ttlEpochUTCSeconds,
+			conditions: opts.conditions,
+		});
+		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
 	}
 
@@ -129,8 +138,8 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
-		const res = await stub.apiGetItem(partitionContext, { ...opts, hashKey, sortKey });
-		// Echo the caller's original keys (no decode needed); preserve the found/not-found discriminant.
+		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey });
+		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
 			return {
@@ -142,14 +151,14 @@ export class FokosDB {
 		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
 	}
 
-	async deleteItem(opts: DeleteItemOptions) {
+	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
-		const res = await stub.apiDeleteItem(partitionContext, { ...opts, hashKey, sortKey });
-		// Echo the caller's original keys (no decode needed).
+		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, conditions: opts.conditions });
+		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
 	}
 

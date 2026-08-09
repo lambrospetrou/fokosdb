@@ -345,6 +345,37 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		});
 	});
 
+	// The DO returns no keys — db.ts answers with the caller's own. These pin that mapping, which no
+	// DO-level test can cover.
+	describe("FokosDB — results carry the caller's own keys", () => {
+		it("reports an absent sortKey as undefined on put, get and delete", async () => {
+			const db = makeDB();
+
+			expect((await db.putItem({ hashKey: "no-sk", data: "v" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+
+			const got = await db.getItem({ hashKey: "no-sk" });
+			expect(got.found).toBe(true);
+			expect(got.item.hashKey).toBe("no-sk");
+			expect(got.item.sortKey).toBeUndefined();
+
+			expect((await db.deleteItem({ hashKey: "no-sk" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+		});
+
+		it("returns a binary key as the bytes the caller passed, not the encoded form", async () => {
+			const db = makeDB();
+			// KeyCodec 0xFF-tags a binary key, so the stored form differs from this one.
+			const hashKey = new Uint8Array([1, 2, 3]);
+			const sortKey = new Uint8Array([9]);
+
+			expect((await db.putItem({ hashKey, sortKey, data: "v" })).item).toEqual({ hashKey, sortKey });
+
+			const got = await db.getItem({ hashKey, sortKey });
+			expect(got.found).toBe(true);
+			expect(got.item.hashKey).toEqual(hashKey);
+			expect(got.item.sortKey).toEqual(sortKey);
+		});
+	});
+
 	// Every write path caps one item's data at the same value, and every key-taking path runs the same
 	// key rules. A limit or a rule that applies through one API and not another is a bug in itself:
 	// the caller cannot know which of two equivalent calls will be accepted.
