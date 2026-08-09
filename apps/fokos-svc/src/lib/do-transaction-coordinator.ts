@@ -632,15 +632,25 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return a.lastCommittedTs === b.lastCommittedTs;
 		};
 
+		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so
+		// the caller reads result[i] as the answer to items[i] instead of re-matching on keys. Neither
+		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
+		// request order is restored here, once, from the same pairKey identity.
+		const phase1ByKey = new Map(phase1Flat.map((r) => [itemIdentity(r), r]));
 		const phase2ByKey = new Map(phase2Flat.map((r) => [itemIdentity(r), r]));
-		for (const p1 of phase1Flat) {
-			const p2 = phase2ByKey.get(itemIdentity(p1));
-			if (!p2 || !sameCommittedState(p1, p2)) {
-				return { outcome: "aborted", reason: "read_conflict" };
-			}
+		const items: ReadForTransactionItemResultEncoded[] = [];
+		for (const requested of request.items) {
+			const key = KeyCodec.pairKey(requested.hashKey, requested.sortKey);
+			const p1 = phase1ByKey.get(key);
+			const p2 = phase2ByKey.get(key);
+			// A requested key with no reply means a participant dropped it — never expected, and not
+			// something to answer with a short array, so it fails the read like any other read failure.
+			if (!p1 || !p2) return { outcome: "aborted", reason: "transient_error" };
+			if (!sameCommittedState(p1, p2)) return { outcome: "aborted", reason: "read_conflict" };
+			items.push(p1);
 		}
 
-		return { outcome: "committed", items: phase1Flat };
+		return { outcome: "committed", items };
 	}
 
 	async alarm(): Promise<void> {

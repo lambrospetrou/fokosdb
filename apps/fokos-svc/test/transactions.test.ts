@@ -26,11 +26,15 @@ function makeDB() {
 	});
 }
 
+function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
+	const topology = db.options().topology as PartitionTopologyRouterImpl;
+	return topology.pickPartition(KeyCodec.encode(key.hashKey), KeyCodec.encodeOptional(key.sortKey)).partitionContext.doName;
+}
+
 function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sortKey?: string }>): number {
 	const names = new Set<string>();
-	const topology = db.options().topology as PartitionTopologyRouterImpl;
 	for (const k of keys) {
-		names.add(topology.pickPartition(KeyCodec.encode(k.hashKey), KeyCodec.encodeOptional(k.sortKey)).partitionContext.doName);
+		names.add(partitionNameOf(db, k));
 	}
 	return names.size;
 }
@@ -407,6 +411,76 @@ describe("transactions - end-to-end", () => {
 			expect(item).not.toHaveProperty("lastCommittedTs");
 			expect(item).not.toHaveProperty("hasPendingWrite");
 		}
+	});
+
+	it("transactGetItems returns items positionally matched to the request", async () => {
+		/**
+		 * Keys from `partitions` distinct partitions, `perPartition` each, ordered so that consecutive keys
+		 * sit in DIFFERENT partitions (round-robin over the buckets). The TC groups items by partition, so a
+		 * response returned in group order cannot come back in this order — which is what makes it a test of
+		 * the positional guarantee rather than of luck. Both counts must be >= 2 for that to hold.
+		 */
+		function interleavedKeysAcrossPartitions(
+			db: FokosDB,
+			partitions: number,
+			perPartition: number,
+		): Array<{ hashKey: string; sortKey: string }> {
+			type Key = { hashKey: string; sortKey: string };
+			// Candidate keys are routed one at a time until `partitions` buckets have filled — routing is a
+			// pure hash, so how many that takes is deterministic, not a source of flakiness. The cap only
+			// stops a misconfigured topology (too few root trees to ever fill them) from looping forever.
+			const MAX_CANDIDATES = 2_000;
+			const buckets = new Map<string, Key[]>();
+			const filled: Key[][] = [];
+			for (let i = 0; filled.length < partitions; i++) {
+				expect(i, `no ${partitions} partitions held ${perPartition} keys within ${MAX_CANDIDATES} candidates`).toBeLessThan(MAX_CANDIDATES);
+				const key = { hashKey: `ord-${i}`, sortKey: `sk-${i}` };
+				const name = partitionNameOf(db, key);
+				let bucket = buckets.get(name);
+				if (!bucket) buckets.set(name, (bucket = []));
+				if (bucket.length === perPartition) continue; // already filled and taken
+				bucket.push(key);
+				if (bucket.length === perPartition) filled.push(bucket);
+			}
+			const out: Key[] = [];
+			for (let i = 0; i < perPartition; i++) {
+				for (const bucket of filled) out.push(bucket[i]);
+			}
+			return out;
+		}
+
+		const db = makeDB();
+
+		// 3 partitions x 4 keys, asked for in interleaved order: the answer can only come back in this
+		// order if the TC restores the request order after its per-partition grouping.
+		const keys = interleavedKeysAcrossPartitions(db, 3, 4);
+		expect(countDistinctPartitions(db, keys)).toBe(3);
+		// Only every other key is written. An ABSENT key still occupies its own position. The gaps are
+		// spread over all three partitions, so no partition returns a "clean" all-found reply.
+		const isWritten = (i: number) => i % 2 === 0;
+		for (const [i, k] of keys.entries()) {
+			if (isWritten(i)) await db.putItem({ ...k, data: `data-${k.hashKey}` });
+		}
+
+		const readResult = await db.transactGetItems({ items: keys });
+		invariant(readResult.outcome === "committed");
+		expect(readResult.items).toHaveLength(keys.length);
+		readResult.items.forEach((item, i) => {
+			expect(item).toMatchObject({
+				hashKey: keys[i].hashKey,
+				sortKey: keys[i].sortKey,
+				found: isWritten(i),
+			});
+		});
+		for (const [i, item] of readResult.items.entries()) {
+			if (item.found) expect(item.data).toBe(`data-${keys[i].hashKey}`);
+		}
+
+		// A key asked for twice is answered twice, at both positions — one entry per requested position.
+		const withDuplicate = [keys[0], keys[1], keys[0]];
+		const dupResult = await db.transactGetItems({ items: withDuplicate });
+		invariant(dupResult.outcome === "committed");
+		expect(dupResult.items.map((item) => item.hashKey)).toEqual(withDuplicate.map((k) => k.hashKey));
 	});
 
 	it("idempotency: retrying transactWriteItems with same clientRequestToken returns same result", async () => {

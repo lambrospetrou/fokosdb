@@ -209,11 +209,16 @@ export type InitiateReadRequest = {
 	items: TCReadItem[];
 };
 
+/**
+ * On "committed", `items` is positionally matched to the request: `items[i]` answers
+ * `request.items[i]`, one entry per requested key, duplicates included.
+ */
 export type InitiateReadResponseEncoded =
 	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
 	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
 
-// Public variant surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts boundary.
+// Public variant surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts
+// boundary. Same positional guarantee as InitiateReadResponseEncoded.
 export type InitiateReadResponse =
 	| { outcome: "committed"; items: ReadForTransactionItemResult[] }
 	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
