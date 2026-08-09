@@ -693,15 +693,27 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Children are stored in ascending boundary order; reverse for desc.
 		const orderedChildren = direction === "desc" ? [...children].reverse() : children;
 
-		for (let i = 0; i < orderedChildren.length; i++) {
-			const childCtx = orderedChildren[i];
+		// The children that can contribute to this page: they intersect the query interval, and they are
+		// not entirely behind the resume cursor. Selecting them up front — instead of skipping inside the
+		// scan loop — turns "could a later child still contribute?" into a plain index test, which is the
+		// question BOTH budget exits must answer before they emit a continuation cursor.
+		const candidates = orderedChildren.flatMap((childCtx) => {
 			const rp = childCtx.rangePartition;
 			invariant(rp, "fokos/partition.walkRangeChildren: child has no rangePartition context");
 			const childStart = rp.startBoundary ?? KeyCodec.encodeOptional(undefined);
 			const childEnd = rp.endBoundary;
+			if (!rangeIntersects(childStart, childEnd, interval)) return [];
+			if (cursor && isChildFullyBeforeCursor(childStart, childEnd, cursor, direction)) return [];
+			return [{ childCtx, rp, childStart, childEnd }];
+		});
 
-			if (!rangeIntersects(childStart, childEnd, interval)) continue;
-			if (cursor && isChildFullyBeforeCursor(childStart, childEnd, cursor, direction)) continue;
+		for (let i = 0; i < candidates.length; i++) {
+			const { childCtx, rp, childStart, childEnd } = candidates[i];
+			// A cursor is honest only if a later child still holds rows for this query. Without this, a
+			// budget exhausted by the LAST child — one that drained itself and reported no cursor of its
+			// own — would still hand the client a cursor, buying it one more round trip that returns zero
+			// items. `db.ts:queryItems` applies the same rule across sub-queries.
+			const hasLaterCandidate = i < candidates.length - 1;
 
 			const childCursor = cursor && cursorFallsInChild(childStart, childEnd, cursor) ? cursor : null;
 			const clippedInterval = clipToChildRange(interval, rp.startBoundary, childEnd);
@@ -728,10 +740,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 			if (budget.budgetExhausted) {
 				const lastItem = allItems[allItems.length - 1];
-				if (lastItem) nextCursor = { hk: lastItem.hk, sk: lastItem.sk };
+				if (hasLaterCandidate && lastItem) nextCursor = { hk: lastItem.hk, sk: lastItem.sk };
 				break;
 			}
-			if (budget.visitsExhausted && i < orderedChildren.length - 1) {
+			if (budget.visitsExhausted && hasLaterCandidate) {
 				console.warn(`fokos/partition.walkRangeChildren: maxPartitionVisits reached (${req.maxPartitionVisits}), emitting boundary cursor`);
 				nextCursor = makeBoundaryCursor(req.hashKey, childStart, childEnd, direction);
 				break;

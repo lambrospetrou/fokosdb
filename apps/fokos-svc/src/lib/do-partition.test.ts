@@ -2439,6 +2439,47 @@ describe("PartitionDO — range split", () => {
 			// Drain pending child migrations so their background work doesn't outlive the test.
 			await drainSplitTree(rootStub);
 		});
+
+		// A cursor promises more rows. Both budget exits used to emit one even when the walk had already
+		// covered every child that could contribute, costing the client a round trip that returns nothing.
+		// `db.ts:queryItems` never had this: it emits a cursor only when a later sub-query remains.
+		it("emits no cursor when the byte budget lands on zero at the last leaf", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+
+			// The exact bytes the whole scan consumes. Replayed as the budget, every leaf still drains
+			// itself (each reports no cursor of its own) and the router's remaining bytes reach zero as the
+			// LAST leaf finishes — the one case where "budget exhausted" does not mean "more rows exist".
+			const full = await queryPage(rootStub, rootCtx);
+			expect(full.nextCursor).toBeNull();
+			expect(full.bytesConsumed).toBeGreaterThan(0);
+
+			const res = await queryPage(rootStub, rootCtx, { budgetBytes: full.bytesConsumed });
+			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+			expect(res.nextCursor).toBeNull();
+		});
+
+		it("emits no cursor when the partition-visit cap is reached but every remaining child is outside the interval", async () => {
+			const N = 4;
+			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
+			const children = ((await rootStub.status()).splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			// Children are in ascending boundary order, so an exclusive upper bound at the third child's
+			// start boundary leaves exactly the first two intersecting the query.
+			const upper = children[2].rangePartition!.startBoundary!;
+
+			// The visit cap is spent by those two leaves. The two children beyond the bound are skipped by
+			// the interval, so there is nothing left to resume into — the old code counted them anyway and
+			// emitted a boundary cursor.
+			const res = await queryPage(rootStub, rootCtx, {
+				interval: { upper: { value: upper, inclusive: false } },
+				maxPartitionVisits: 2,
+			});
+			expect(res.partitionMetas).toHaveLength(2);
+			const expected = [...sks].sort().filter((sk) => KeyCodec.compare(KeyCodec.encode(sk), upper) < 0);
+			expect(expected.length).toBeGreaterThan(0);
+			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual(expected);
+			expect(res.nextCursor).toBeNull();
+		});
 	});
 
 	describe("PartialRangeTopology", () => {
