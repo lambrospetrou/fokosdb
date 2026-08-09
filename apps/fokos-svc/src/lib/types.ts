@@ -1,4 +1,10 @@
 import { KeyBytes } from "./partition-topology/key-codec.js";
+import type {
+	InitiateReadResponse,
+	InitiateWriteResponse,
+	TransactGetItemsOptions,
+	TransactWriteItemsOptions,
+} from "./transaction-types.js";
 
 // ─── Item data kinds ────────────────────────────────────────────────────────────
 
@@ -22,7 +28,7 @@ export type EncodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "tex
 // Decoded for public READ — json rebuilt at the db.ts boundary.
 export type DecodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: JsonValue };
 
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter {}
+export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor {}
 
 export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
@@ -183,6 +189,11 @@ export type OperationMetrics = {
 	timings?: {};
 };
 
+export interface ItemTransactor {
+	transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse>;
+	transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse>;
+}
+
 export type {
 	InitiateWriteRequest,
 	InitiateWriteResponse,
@@ -191,6 +202,9 @@ export type {
 	InitiateReadResponse,
 	TCWriteOperation,
 	TCReadItem,
+	TransactWriteItem,
+	TransactWriteItemsOptions,
+	TransactGetItemsOptions,
 } from "./transaction-types.js";
 
 // ─── queryItems public API ────────────────────────────────────────────────────
@@ -206,8 +220,13 @@ export type SortKeyCondition =
 			upper?: { value: string | Uint8Array; inclusive: boolean };
 	  };
 
+export interface ItemQuerier {
+	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
+}
+
+// The field names what the list contains: `queries` here, `items` on the two transaction methods.
 export type QueryItemsOptions = {
-	queries: Array<{ hashKey: string | Uint8Array; sort?: SortKeyCondition; scanIndexForward?: boolean }>;
+	queries: Array<{ hashKey: string | Uint8Array; sortKeyCondition?: SortKeyCondition; scanIndexForward?: boolean }>;
 	limit?: number;
 	maxPageBytes?: number;
 	cursor?: string;

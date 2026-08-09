@@ -44,7 +44,12 @@ describe("validateTransactWriteOperations", () => {
 
 	it("accepts a typical valid operation set", () => {
 		expect(() =>
-			validate([putOp("a"), putOp("a", "s1"), { hashKey: "b", operation: "delete" }, { hashKey: "c", sortKey: "s", operation: "check" }]),
+			validate([
+				putOp("a"),
+				putOp("a", "s1"),
+				{ hashKey: "b", operation: "delete" },
+				{ hashKey: "c", sortKey: "s", operation: "check", conditions: [{ type: "item_exists" }] },
+			]),
 		).not.toThrow();
 	});
 
@@ -99,9 +104,25 @@ describe("validateTransactWriteOperations", () => {
 		expect(() =>
 			validate([
 				{ hashKey: "a", operation: "delete" },
-				{ hashKey: "b", operation: "check" },
+				{ hashKey: "b", operation: "check", conditions: [{ type: "item_exists" }] },
 			]),
 		).not.toThrow();
+	});
+
+	it("rejects data on a delete or a check", () => {
+		expect(() => validate([{ hashKey: "a", operation: "delete", data: "x" }])).toThrow(/"delete" operation must not carry data/);
+		expect(() => validate([{ hashKey: "a", operation: "check", conditions: [{ type: "item_exists" }], data: "x" }])).toThrow(
+			/"check" operation must not carry data/,
+		);
+		// An empty string is still a data field.
+		expect(() => validate([{ hashKey: "a", operation: "delete", data: "" }])).toThrow(/"delete" operation must not carry data/);
+	});
+
+	it("rejects a check without conditions", () => {
+		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(/"check" operation requires at least one condition/);
+		expect(() => validate([{ hashKey: "a", operation: "check", conditions: [] }])).toThrow(
+			/"check" operation requires at least one condition/,
+		);
 	});
 
 	it("accepts an item at the per-item byte limit and rejects one over it", () => {

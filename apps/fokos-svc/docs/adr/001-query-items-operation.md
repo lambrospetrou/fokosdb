@@ -25,8 +25,8 @@ The caller provides a list of sub-queries rather than a single key condition:
 ```typescript
 queryItems({
 	queries: [
-		{ hashKey: "user-alice", sort: { op: "begins_with", prefix: "order#" } },
-		{ hashKey: "user-bob", sort: { op: "between", lower: "2024-01", upper: "2024-12" }, scanIndexForward: false },
+		{ hashKey: "user-alice", sortKeyCondition: { op: "begins_with", prefix: "order#" } },
+		{ hashKey: "user-bob", sortKeyCondition: { op: "between", lower: "2024-01", upper: "2024-12" }, scanIndexForward: false },
 	],
 	limit: 100, // optional item count cap
 	maxPageBytes: 1_000_000, // optional byte budget override

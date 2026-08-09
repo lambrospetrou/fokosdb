@@ -92,7 +92,7 @@ function fromSqlKey(value: ArrayBuffer | Uint8Array): KeyBytes {
  * both paths evaluate the same conditions against the same item snapshot shape.
  */
 export function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
-	const where = () => `hk=${KeyCodec.keyForLog(item.hk)}, sk=${KeyCodec.keyForLog(item.sk)}`;
+	const where = () => KeyCodec.pairForLog(item.hk, item.sk);
 	for (const condition of conditions) {
 		if (condition.type === "item_exists") {
 			if (!item.found) {

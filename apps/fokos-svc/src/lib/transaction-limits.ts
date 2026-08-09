@@ -10,6 +10,7 @@
  */
 
 import type { TransactionOperationType } from "./transaction-types.js";
+import type { ItemCondition } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -64,6 +65,7 @@ export type TransactWriteOperationLike = {
 	operation: TransactionOperationType;
 	// Already-encoded data (json stringified upstream), so payload accounting is a plain byte/char count.
 	data?: Uint8Array | string;
+	conditions?: ItemCondition[];
 };
 
 function isEmptyKey(k: string | Uint8Array): boolean {
@@ -138,7 +140,8 @@ export function encodeSortBound(k: string | Uint8Array): KeyBytes {
 
 /**
  * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
- * bytes, and that every "put" carries data. Throws on the first violation.
+ * bytes, and the per-operation rules of `TransactWriteItem` — "put" carries data, "delete" and
+ * "check" carry none, "check" carries at least one condition. Throws on the first violation.
  *
  * Key policy checks run on the RAW public keys (NUL, lone surrogates). Each key is then encoded
  * EXACTLY ONCE, and the canonical bytes are returned in input order for the caller to reuse — so
@@ -160,10 +163,16 @@ export function validateTransactWriteOperations(
 		validateItemKeys(op.hashKey, op.sortKey);
 		const hashKey = encodeHashKey(op.hashKey);
 		const sortKey = encodeSortKey(op.sortKey);
-		if (op.operation === "put" && op.data == null) {
-			throw new Error(
-				`fokos: transactWriteItems "put" operation requires data (${KeyCodec.keyForLog(hashKey)}${sortKey.byteLength > 0 ? `, ${KeyCodec.keyForLog(sortKey)}` : ""})`,
-			);
+		const at = KeyCodec.pairForLog(hashKey, sortKey);
+		if (op.operation === "put") {
+			if (op.data == null) {
+				throw new Error(`fokos: transactWriteItems "put" operation requires data (${at})`);
+			}
+		} else if (op.data != null) {
+			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry data (${at})`);
+		}
+		if (op.operation === "check" && !op.conditions?.length) {
+			throw new Error(`fokos: transactWriteItems "check" operation requires at least one condition (${at})`);
 		}
 		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
 		// commitLocal's keyset check and the TC's two-phase read pairing use.
@@ -174,7 +183,7 @@ export function validateTransactWriteOperations(
 		// duplicate. Identity must be taken over the canonical bytes.
 		const identity = KeyCodec.pairKey(hashKey, sortKey);
 		if (seen.has(identity)) {
-			throw new Error(`fokos: transactWriteItems duplicate key (${KeyCodec.keyForLog(hashKey)}, ${KeyCodec.keyForLog(sortKey)})`);
+			throw new Error(`fokos: transactWriteItems duplicate key (${at})`);
 		}
 		seen.add(identity);
 		if (op.data) {

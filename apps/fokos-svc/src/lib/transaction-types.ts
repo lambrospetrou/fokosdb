@@ -1,6 +1,6 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
-import type { DataKind, JsonValue } from "./types.js";
+import type { DataKind, ItemCondition, ItemKey, JsonComposite, JsonValue } from "./types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -27,7 +27,7 @@ export type TransactionItem = {
 	/** Data kind discriminant; present for "put" (json ⇒ data is JSON text). */
 	kind?: DataKind;
 	/** Optional for all operation types. */
-	conditions?: import("./types.js").ItemCondition[];
+	conditions?: ItemCondition[];
 };
 
 export type PrepareRequest = {
@@ -138,6 +138,44 @@ export type RecoverTransactionResult =
 	/** TC found a non-terminal state and has taken over recovery. */
 	| { state: "driving" };
 
+// ─── Public API (FokosDB entry shapes) ────────────────────────────────────────
+
+/**
+ * One operation of `FokosDB.transactWriteItems`, as the caller writes it: public keys, unencoded
+ * `data`. `validateTransactWriteOperations` enforces the same rules at runtime, for the HTTP surface.
+ */
+export type TransactWriteItem =
+	| {
+			operation: "put";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			data: string | Uint8Array | JsonComposite;
+			conditions?: ItemCondition[];
+	  }
+	| {
+			operation: "delete";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			conditions?: ItemCondition[];
+	  }
+	| {
+			operation: "check";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			/** Required and non-empty: a check with no conditions asserts nothing. */
+			conditions: ItemCondition[];
+	  };
+
+export type TransactWriteItemsOptions = {
+	items: TransactWriteItem[];
+	/** Idempotency key. Reusing one for a DIFFERENT item set is rejected. */
+	clientRequestToken?: string;
+};
+
+export type TransactGetItemsOptions = {
+	items: ItemKey[];
+};
+
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
 
 // Wire-IN type (db.ts → TC): keys are canonical KeyBytes (sortKey [] = absent).
@@ -148,7 +186,7 @@ export type TCWriteOperation = {
 	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
 	data?: Uint8Array | string;
 	kind?: DataKind;
-	conditions?: import("./types.js").ItemCondition[];
+	conditions?: ItemCondition[];
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };
@@ -156,7 +194,7 @@ export type TCWriteOperation = {
 export type InitiateWriteRequest = {
 	/** When provided, used as idempotencyToken and TC DO name for deduplication. */
 	clientRequestToken?: string;
-	operations: TCWriteOperation[];
+	items: TCWriteOperation[];
 };
 
 /**

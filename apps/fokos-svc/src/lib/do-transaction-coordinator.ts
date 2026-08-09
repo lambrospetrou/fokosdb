@@ -148,7 +148,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const coordinatorDoId = this.ctx.id.toString();
 
 		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
-		const operationsHash = hashTransactionOperations(request.operations);
+		const operationsHash = hashTransactionOperations(request.items);
 
 		const existingRow = this.loadStateRow(idempotencyToken);
 		if (existingRow) {
@@ -171,7 +171,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		// Collect one partitionContext per distinct partition (doName → context).
 		const partitionContextByDoName = new Map<string, PartitionContextResolved>();
-		for (const op of request.operations) {
+		for (const op of request.items) {
 			partitionContextByDoName.set(op.partitionContext.doName, op.partitionContext);
 		}
 
@@ -185,7 +185,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				Date.now(),
 				operationsHash,
 			);
-			for (const op of request.operations) {
+			for (const op of request.items) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,

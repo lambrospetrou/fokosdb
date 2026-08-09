@@ -119,7 +119,7 @@ repeat: 20
       "maxSizeMb": 2
     }
   },
-  "operations": [
+  "items": [
     { "hashKey": "batch#{{newUuid}}", "operation": "put", "data": "batch-value-0" },
     { "hashKey": "batch#{{newUuid}}", "operation": "put", "data": "batch-value-1" },
     { "hashKey": "batch#{{newUuid}}", "operation": "put", "data": "batch-value-2" },

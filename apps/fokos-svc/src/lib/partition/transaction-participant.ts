@@ -181,8 +181,7 @@ export class TransactionParticipant {
 				// A put always persisted both data and kind; assert together so upsertItem gets a real kind.
 				invariant(
 					pendingRow.data !== null && pendingRow.kind !== null,
-					() =>
-						`fokos/partition.commit: pending "put" row has no data/kind (hk=${KeyCodec.keyForLog(item.hashKey)}, sk=${KeyCodec.keyForLog(sk)})`,
+					() => `fokos/partition.commit: pending "put" row has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
 				);
 				const res = this.#store.upsertItem({
 					hk: item.hashKey,

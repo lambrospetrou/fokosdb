@@ -152,7 +152,7 @@ HTTP 200
 POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
 Content-Type: application/json
 {
-  "operations": [
+  "items": [
     { "hashKey": "qi#asc", "sortKey": "s1", "operation": "put", "data": "asc-1" },
     { "hashKey": "qi#asc", "sortKey": "s2", "operation": "put", "data": "asc-2" },
     { "hashKey": "qi#asc", "sortKey": "s3", "operation": "put", "data": "asc-3" },
@@ -199,7 +199,7 @@ jsonpath "$.items[5].data" == "desc-1"
 POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
 Content-Type: application/json
 {
-  "operations": [
+  "items": [
     { "hashKey": "tx#item1", "operation": "put", "data": "value1" },
     { "hashKey": "tx#item2", "operation": "put", "data": "value2" },
     { "hashKey": "tx#item3", "sortKey": "sk", "operation": "put", "data": "value3" }
@@ -249,7 +249,7 @@ jsonpath "$.items[1].found" == false
 POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
 Content-Type: application/json
 {
-  "operations": [
+  "items": [
     { "hashKey": "tx#item1", "operation": "check", "conditions": [{ "type": "item_exists" }] },
     { "hashKey": "tx#item2", "operation": "delete" }
   ]

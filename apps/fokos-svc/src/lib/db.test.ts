@@ -65,8 +65,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			const res = await db.queryItems({
 				queries: [
-					{ hashKey: "k", sort: { op: "lte", value: "s2" } },
-					{ hashKey: "k", sort: { op: "gte", value: "s3" } },
+					{ hashKey: "k", sortKeyCondition: { op: "lte", value: "s2" } },
+					{ hashKey: "k", sortKeyCondition: { op: "gte", value: "s3" } },
 				],
 			});
 
@@ -81,7 +81,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const res = await db.queryItems({
 				queries: [
 					{ hashKey: "alice" },
-					{ hashKey: "zzz", sort: { op: "between", lower: "z9", upper: "z1" } }, // lower > upper → empty
+					{ hashKey: "zzz", sortKeyCondition: { op: "between", lower: "z9", upper: "z1" } }, // lower > upper → empty
 					{ hashKey: "bob" },
 				],
 			});
@@ -179,10 +179,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	describe("FokosDB.queryItems — sort-key condition operators", () => {
 		const ALL_SKS = ["a", "ab", "abc", "b", "ba", "c", "d"];
 
-		async function populateAndQuery(sort: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sort"]) {
+		async function populateAndQuery(sortKeyCondition: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sortKeyCondition"]) {
 			const db = makeDB();
 			for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
-			return db.queryItems({ queries: [{ hashKey: "k", sort }] });
+			return db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
 		}
 
 		it("eq: returns only the exact match", async () => {
@@ -273,7 +273,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
 			const res = await db.queryItems({
-				queries: [{ hashKey: "k", sort: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
+				queries: [{ hashKey: "k", sortKeyCondition: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
 			});
 			expect(sksOf(res)).toEqual(["abc", "ab", "a"]);
 		});
@@ -323,7 +323,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			const obj = { status: "active", tags: ["a", "b"] };
 			const write = await db.transactWriteItems({
-				operations: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
+				items: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
 			});
 			expect(write.outcome).toBe("committed");
 
@@ -354,16 +354,16 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const tooBig = new Uint8Array(MAX_ITEM_BYTES + 1);
 
 			await expect(db.putItem({ hashKey: "big", data: tooBig })).rejects.toThrow(/item data exceeds 400 KB/);
-			await expect(db.transactWriteItems({ operations: [{ hashKey: "big", operation: "put", data: tooBig }] })).rejects.toThrow(
+			await expect(db.transactWriteItems({ items: [{ hashKey: "big", operation: "put", data: tooBig }] })).rejects.toThrow(
 				/item data exceeds 400 KB/,
 			);
 
 			// Exactly at the limit is accepted by both.
 			const atLimit = new Uint8Array(MAX_ITEM_BYTES);
 			await expect(db.putItem({ hashKey: "at-limit", data: atLimit })).resolves.toMatchObject({ version: 1 });
-			await expect(
-				db.transactWriteItems({ operations: [{ hashKey: "at-limit-tx", operation: "put", data: atLimit }] }),
-			).resolves.toMatchObject({ outcome: "committed" });
+			await expect(db.transactWriteItems({ items: [{ hashKey: "at-limit-tx", operation: "put", data: atLimit }] })).resolves.toMatchObject({
+				outcome: "committed",
+			});
 		});
 
 		it("caps the transactGetItems item count like the write path", async () => {
@@ -384,14 +384,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("rejects a NUL in every sort-key bound a query can carry", async () => {
 			const db = makeDB();
 			const bad = "s\0k";
-			for (const sort of [
+			for (const sortKeyCondition of [
 				{ op: "eq", value: bad },
 				{ op: "gt", value: bad },
 				{ op: "begins_with", prefix: bad },
 				{ op: "between", lower: "a", upper: bad },
 				{ op: "range", lower: { value: bad, inclusive: true } },
 			] as const) {
-				await expect(db.queryItems({ queries: [{ hashKey: "hk", sort }] })).rejects.toThrow(/sortKey must not contain the NUL/);
+				await expect(db.queryItems({ queries: [{ hashKey: "hk", sortKeyCondition }] })).rejects.toThrow(/sortKey must not contain the NUL/);
 			}
 		});
 
@@ -400,7 +400,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("still accepts begins_with with an empty prefix", async () => {
 			const db = makeDB();
 			await db.putItem({ hashKey: "prefix-hk", sortKey: "s1", data: "v" });
-			const res = await db.queryItems({ queries: [{ hashKey: "prefix-hk", sort: { op: "begins_with", prefix: "" } }] });
+			const res = await db.queryItems({ queries: [{ hashKey: "prefix-hk", sortKeyCondition: { op: "begins_with", prefix: "" } }] });
 			expect(res.items.map((i) => i.sortKey)).toEqual(["s1"]);
 		});
 	});

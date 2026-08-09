@@ -150,6 +150,11 @@ function keyForLog(k: KeyBytes): string {
 	}
 }
 
+/** Human-readable rendering of a (hashKey, sortKey) pair for logs and error messages. Display only. */
+function pairForLog(hk: KeyBytes, sk: KeyBytes): string {
+	return `hk=${keyForLog(hk)}, sk=${keyForLog(sk)}`;
+}
+
 /**
  * Stable, collision-free string identity for a single key, for use as a Map/Set key (a raw
  * `Uint8Array` can't be a Map key — it compares by reference).
@@ -180,6 +185,7 @@ export const KeyCodec = {
 	shortestSeparator,
 	asKeyBytes,
 	keyForLog,
+	pairForLog,
 	mapKey,
 	pairKey,
 } as const;

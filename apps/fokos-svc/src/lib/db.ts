@@ -20,7 +20,7 @@ import {
 import { PartitionDO } from "./do-partition.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
-import type { TCWriteOperation, TCReadItem } from "./transaction-types.js";
+import type { TCWriteOperation, TCReadItem, TransactGetItemsOptions, TransactWriteItemsOptions } from "./transaction-types.js";
 import {
 	encodeHashKey,
 	encodeSortBound,
@@ -31,7 +31,6 @@ import {
 	validateTransactWriteOperations,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
-import type { ItemCondition } from "./types.js";
 import { normalizeSkInterval } from "./query/sk-interval.js";
 import type { ScanCursor } from "./partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
@@ -154,27 +153,17 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
 	}
 
-	async transactWriteItems(opts: {
-		operations: Array<{
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
-			operation: "put" | "delete" | "check";
-			data?: string | Uint8Array | JsonComposite;
-			conditions?: ItemCondition[];
-		}>;
-		clientRequestToken?: string;
-	}): Promise<InitiateWriteResponse> {
-		// Encode data once at this boundary (only puts carry data); the TC/DO see string | Uint8Array + kind.
-		// Validation then runs on the already-encoded data so json payload accounting reuses this single
-		// serialization rather than JSON.stringify-ing a second time.
-		const encoded = opts.operations.map((op) => (op.data !== undefined ? encodeItemData(op.data) : undefined));
+	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+		// Encode a put's data once at this boundary; the TC/DO see string | Uint8Array + kind. Validation
+		// below then measures the encoded form. A non-put is passed through untouched, so a `data` field
+		// set by a non-TypeScript caller still reaches validation.
+		const prepared = opts.items.map((item) => (item.operation === "put" ? { ...item, ...encodeItemData(item.data) } : item));
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
-		// Build the operations from those bytes — encoding a key again here would be redundant work.
-		const keys = validateTransactWriteOperations(opts.operations.map((op, i) => ({ ...op, data: encoded[i]?.data })));
-		const operations: TCWriteOperation[] = opts.operations.map((op, i) => {
+		const keys = validateTransactWriteOperations(prepared);
+		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-			return { ...op, hashKey, sortKey, partitionContext, data: encoded[i]?.data, kind: encoded[i]?.kind };
+			return { ...item, hashKey, sortKey, partitionContext };
 		});
 
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
@@ -183,13 +172,11 @@ export class FokosDB {
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See InitiateWriteResponse.
 		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
-			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, operations });
+			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
 		});
 	}
 
-	async transactGetItems(opts: {
-		items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
-	}): Promise<InitiateReadResponse> {
+	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
 		validateTransactGetItemCount(opts.items.length);
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
@@ -247,7 +234,7 @@ export class FokosDB {
 			validateItemKeys(q.hashKey);
 			return {
 				hashKey: encodeHashKey(q.hashKey),
-				interval: normalizeSkInterval(q.sort, encodeSortBound),
+				interval: normalizeSkInterval(q.sortKeyCondition, encodeSortBound),
 				direction,
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};

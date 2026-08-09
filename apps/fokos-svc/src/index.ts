@@ -63,16 +63,32 @@ const DeleteItemBodySchema = v.object({
 	partitionOptions: PartitionOptionsSchema,
 });
 
+// Mirrors the `TransactWriteItem` union. `strictObject` turns a field belonging to another variant —
+// data on a delete — into a 400 that names it, instead of silently stripping it.
+const TransactWriteItemBodySchema = v.variant("operation", [
+	v.strictObject({
+		operation: v.literal("put"),
+		hashKey: v.string(),
+		sortKey: v.optional(v.string()),
+		data: v.string(),
+		conditions: v.optional(v.array(ItemConditionSchema)),
+	}),
+	v.strictObject({
+		operation: v.literal("delete"),
+		hashKey: v.string(),
+		sortKey: v.optional(v.string()),
+		conditions: v.optional(v.array(ItemConditionSchema)),
+	}),
+	v.strictObject({
+		operation: v.literal("check"),
+		hashKey: v.string(),
+		sortKey: v.optional(v.string()),
+		conditions: v.pipe(v.array(ItemConditionSchema), v.minLength(1)),
+	}),
+]);
+
 const TransactWriteItemsBodySchema = v.object({
-	operations: v.array(
-		v.object({
-			hashKey: v.string(),
-			sortKey: v.optional(v.string()),
-			operation: v.union([v.literal("put"), v.literal("delete"), v.literal("check")]),
-			data: v.optional(v.string()),
-			conditions: v.optional(v.array(ItemConditionSchema)),
-		}),
-	),
+	items: v.array(TransactWriteItemBodySchema),
 	clientRequestToken: v.optional(v.string()),
 	partitionOptions: PartitionOptionsSchema,
 });
@@ -99,7 +115,9 @@ const SortKeyConditionSchema = v.union([
 const PositiveIntSchema = v.pipe(v.number(), v.integer(), v.minValue(1));
 
 const QueryItemsBodySchema = v.object({
-	queries: v.array(v.object({ hashKey: v.string(), sort: v.optional(SortKeyConditionSchema), scanIndexForward: v.optional(v.boolean()) })),
+	queries: v.array(
+		v.object({ hashKey: v.string(), sortKeyCondition: v.optional(SortKeyConditionSchema), scanIndexForward: v.optional(v.boolean()) }),
+	),
 	limit: v.optional(PositiveIntSchema),
 	maxPageBytes: v.optional(PositiveIntSchema),
 	cursor: v.optional(v.string()),
