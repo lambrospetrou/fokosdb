@@ -69,7 +69,7 @@ import {
 	type SkInterval,
 } from "./query/sk-interval.js";
 import { PageBudget } from "./query/page-budget.js";
-import { getColoInfo, type ColoInfo } from "./cf-utils.js";
+import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 
 export interface PartitionAPI {
@@ -1173,7 +1173,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// Evict the DO instance so the next caller gets a fresh one with re-ran migrations.
 		// This throws on the caller side with the sentinel message, which FokosDB.destroy() catches and ignores.
-		this.ctx.abort("__special_destroy_sentinel");
+		this.ctx.abort(DESTROY_ABORT_SENTINEL);
 		// await this.ctx.blockConcurrencyWhile(async () => {
 		// 	throw new Error("__special_destroy_sentinel");
 		// });

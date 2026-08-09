@@ -20,6 +20,7 @@ import {
 	QueryItemsResult,
 } from "./types.js";
 import { PartitionDO } from "./do-partition.js";
+import { isDestroyAbortError } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type { TCWriteOperation, TCReadItem, TransactGetItemsOptions, TransactWriteItemsOptions } from "./transaction-types.js";
@@ -360,6 +361,22 @@ export class FokosDB {
 	async destroy(): Promise<{ ok: true }> {
 		const ns = this.#options.topology.partitionContext().ns;
 
+		// Coordinators first, partitions second. A transaction still in flight is driven BY a coordinator,
+		// so wiping the coordinators stops the drivers before the data goes; the reverse order lets a live
+		// coordinator commit into a partition that was just emptied and leave rows behind the traversal has
+		// already passed. Every shard is swept, not only the ones that hold rows: the shard for a given
+		// idempotency token is not knowable from here, and a shard with no rows costs one wipe of empty
+		// storage.
+		await this.#staticShardedTCs.all(async (tcStub: DurableObjectStub<TransactionCoordinatorDO>, shard: number) => {
+			try {
+				await tcStub.destroyCoordinator();
+			} catch (e) {
+				// destroyCoordinator ends in ctx.abort(), which always surfaces here as a throw.
+				if (!isDestroyAbortError(e)) throw e;
+			}
+			console.warn(`Destroyed transaction coordinator shard ${shard}`);
+		});
+
 		// The router owns the traversal (child-discovery order, range-root resolution, dedup);
 		// FokosDB supplies the two callbacks that perform the RPCs.
 		await this.#options.topology.traverseForDestroy(
@@ -375,7 +392,7 @@ export class FokosDB {
 					await stub.destroyPartition();
 				} catch (e) {
 					// console.error(`Error destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId}):`, e);
-					if (!String(e).includes("__special_destroy_sentinel")) throw e;
+					if (!isDestroyAbortError(e)) throw e;
 				}
 				console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 			},

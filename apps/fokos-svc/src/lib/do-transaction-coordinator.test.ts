@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { InitiateWriteResponse, RejectionReason, TCState } from "./transaction-types.js";
@@ -51,6 +51,19 @@ function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionRea
 		kb("hk2"),
 		ABSENT_SK,
 	);
+}
+
+function countRows(state: DurableObjectState, table: string): number {
+	return state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM ${table}`).toArray()[0].n;
+}
+
+// Every table this DO owns — the tc_* tables plus the migrations bookkeeping. The `_cf_*` tables are
+// the platform's own and are excluded.
+function tableNames(state: DurableObjectState): string[] {
+	return state.storage.sql
+		.exec<{ name: string }>(`SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE '\\_cf\\_%' ESCAPE '\\' ORDER BY name`)
+		.toArray()
+		.map((r) => r.name);
 }
 
 async function withCoordinator(fn: (tc: WithLoadFinalResponse, state: DurableObjectState) => void): Promise<void> {
@@ -106,6 +119,37 @@ describe("TransactionCoordinatorDO - loadFinalResponse answers from the decision
 		await withCoordinator((tc, state) => {
 			seed(state, tcState);
 			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrowError(/outcome is not yet decided/);
+		});
+	});
+});
+
+describe("TransactionCoordinatorDO - destroyCoordinator", () => {
+	// The idempotency window lives in tc_state. A coordinator that survives FokosDB.destroy() answers a
+	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was
+	// wiped with the partitions.
+	it("wipes the idempotency window and the alarm, then evicts the instance", async () => {
+		const stub = TransactionCoordinatorDO.getByName(env.TRANSACTION_COORDINATOR_DO, `tc-destroy.${crypto.randomUUID()}`);
+
+		await runInDurableObject(stub, async (tc: TransactionCoordinatorDO, state: DurableObjectState) => {
+			seed(state, "COMMITTED");
+			await state.storage.setAlarm(Date.now() + 60_000);
+			expect(countRows(state, "tc_state")).toBe(1);
+			expect(countRows(state, "tc_items")).toBe(2);
+			expect(tableNames(state)).toContain("tc_participants");
+
+			// ctx.abort() genuinely evicts the instance, which hangs the workers pool — the same reason
+			// test/destroy.test.ts is skipped. Stubbing it keeps the eviction assertable (it is what makes
+			// the next caller re-run the migrations) without killing the run.
+			const abort = vi.spyOn(state, "abort").mockImplementation(() => {});
+
+			await tc.destroyCoordinator();
+
+			expect(abort).toHaveBeenCalledWith("__special_destroy_sentinel");
+			// deleteAll() drops the tables themselves, migration bookkeeping included — which is exactly
+			// why the instance must be evicted: the next caller re-creates them from the migrations.
+			expect(tableNames(state)).toEqual([]);
+			// A surviving alarm would fire after the wipe and try to drive transactions whose rows are gone.
+			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});
 });

@@ -1,3 +1,17 @@
+/**
+ * The message passed to `ctx.abort()` when a DO wipes itself as part of `FokosDB.destroy()`.
+ *
+ * `abort()` is the only way to evict the instance so the next caller constructs a fresh one and
+ * re-runs the SQL migrations against the now-empty storage. It surfaces on the CALLING side as a
+ * thrown error carrying this message, which the destroy path recognises and ignores.
+ */
+export const DESTROY_ABORT_SENTINEL = "__special_destroy_sentinel";
+
+/** True for the error `ctx.abort(DESTROY_ABORT_SENTINEL)` raises on the caller side. */
+export function isDestroyAbortError(e: unknown): boolean {
+	return String(e).includes(DESTROY_ABORT_SENTINEL);
+}
+
 export type ColoInfo = {
 	cfColo: string;
 	cfLoc: string;

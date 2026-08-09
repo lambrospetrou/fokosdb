@@ -16,6 +16,7 @@ import type {
 	TransactionItem,
 } from "./transaction-types.js";
 import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
+import { DESTROY_ABORT_SENTINEL } from "./cf-utils.js";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
 
 type TcStateRow = {
@@ -698,6 +699,32 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		if (remaining > 0) {
 			await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
 		}
+	}
+
+	/**
+	 * Wipes this coordinator shard. Called by `FokosDB.destroy()` for every shard of the table.
+	 *
+	 * The idempotency window lives in `tc_state`, so a shard that survives a destroy answers a replayed
+	 * `clientRequestToken` with the OLD transaction's outcome — "committed" for data that no longer
+	 * exists. That is why destroy must reach the coordinators and not the partitions alone.
+	 *
+	 * Mirrors `PartitionDO.destroyPartition`, including the `abort()` eviction: the migration bookkeeping
+	 * lives in the storage being wiped, and the in-memory `#migrations` would otherwise still believe the
+	 * tables exist.
+	 */
+	async destroyCoordinator(): Promise<void> {
+		console.warn({ message: "fokos/tc: Destroying transaction coordinator — deleting all storage.", doId: this.ctx.id.toString() });
+
+		await this.ctx.blockConcurrencyWhile(async () => {
+			// Cancel the recovery alarm before wiping storage, so it cannot fire on the evicted instance
+			// and try to drive transactions whose rows are gone.
+			await this.ctx.storage.deleteAlarm();
+			await this.ctx.storage.deleteAll();
+		});
+
+		// Evict the instance so the next caller gets a fresh one with re-ran migrations. This throws on
+		// the caller side with the sentinel message, which FokosDB.destroy() catches and ignores.
+		this.ctx.abort(DESTROY_ABORT_SENTINEL);
 	}
 
 	async recoverTransaction(transactionId: string): Promise<RecoverTransactionResult> {
