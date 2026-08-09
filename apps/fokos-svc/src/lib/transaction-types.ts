@@ -160,35 +160,28 @@ export type InitiateWriteRequest = {
 };
 
 /**
- * RPC result (TC→db.ts). Item keys stay canonical KeyBytes (sortKey [] = absent), matching the read
- * path and the `tc_items` BLOB columns they are read from: the TC is an INTERNAL hop, so it never
- * decodes. `db.ts` decodes at the public exit.
+ * Result of TC.initiateWrite, and the public result of FokosDB.transactWriteItems — ONE type, because
+ * it carries no keys for `db.ts` to decode. There is deliberately no item array: a write transaction
+ * is all-or-nothing, so echoing the keys back tells the caller only what it already sent. DynamoDB's
+ * TransactWriteItems answers the same way, returning consumed capacity and nothing item-shaped.
  *
- * `RejectionReason` is the deliberate exception — its keys are already in public form because the
- * reason is PERSISTED in `tc_state.rejection_reason_json` and replayed verbatim on an idempotent
- * retry. Storing bytes there would need the same `$u8` JSON tagging plus a decode on every replay.
+ * `RejectionReason` keys are in public form, unlike every other TC→db.ts value, because the reason is
+ * PERSISTED in `tc_state.rejection_reason_json` and replayed verbatim on an idempotent retry. Storing
+ * bytes there would need the same `$u8` JSON tagging plus a decode on every replay.
+ *
+ * FIXME: `cancelled` reports ONE reason for the whole transaction, so a caller with 100 operations
+ * cannot tell which one failed unless the reason happens to carry a key (`transient_error` and
+ * `clock_skew` carry none). DynamoDB returns `CancellationReasons` — one entry per operation, in
+ * REQUEST ORDER, with `Code: "None"` for the operations that were fine — and raises it as a typed
+ * `TransactionCanceledException`. We should do both: a positional per-operation reason array, and
+ * typed errors that share the `RejectionReason` union with the non-transactional path. That also
+ * lets a size-rejected prepare say so instead of reporting `transient_error`.
  */
-export type InitiateWriteResponseEncoded =
-	| {
-			outcome: "committed";
-			transactionId: TransactionId;
-			idempotencyToken: IdempotencyToken;
-			items: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }>;
-	  }
-	| {
-			outcome: "cancelled";
-			transactionId: TransactionId;
-			idempotencyToken: IdempotencyToken;
-			reason: RejectionReason;
-	  };
-
-/** Public variant surfaced by FokosDB.transactWriteItems: db.ts has decoded the item keys. */
 export type InitiateWriteResponse =
 	| {
 			outcome: "committed";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
-			items: Array<{ hashKey: string | Uint8Array; sortKey?: string | Uint8Array }>;
 	  }
 	| {
 			outcome: "cancelled";

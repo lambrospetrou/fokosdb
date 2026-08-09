@@ -180,21 +180,11 @@ export class FokosDB {
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
 		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
-		const response = await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
+		// method here. See InitiateWriteResponse.
+		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, operations });
 		});
-
-		// The public exit. The TC speaks canonical KeyBytes throughout, so the echoed item keys are
-		// decoded here (the empty sentinel maps back to an absent sortKey), as in transactGetItems.
-		if (response.outcome !== "committed") return response;
-		return {
-			...response,
-			items: response.items.map(({ hashKey, sortKey }) =>
-				sortKey.byteLength === 0
-					? { hashKey: KeyCodec.decode(hashKey) }
-					: { hashKey: KeyCodec.decode(hashKey), sortKey: KeyCodec.decode(sortKey) },
-			),
-		};
 	}
 
 	async transactGetItems(opts: {

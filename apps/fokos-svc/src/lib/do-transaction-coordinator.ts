@@ -8,7 +8,7 @@ import type {
 	InitiateReadRequest,
 	InitiateReadResponseEncoded,
 	InitiateWriteRequest,
-	InitiateWriteResponseEncoded,
+	InitiateWriteResponse,
 	ReadForTransactionItemResultEncoded,
 	RecoverTransactionResult,
 	RejectionReason,
@@ -142,7 +142,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		});
 	}
 
-	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
+	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const idempotencyToken = request.clientRequestToken ?? transactionId;
 		const coordinatorDoId = this.ctx.id.toString();
@@ -217,7 +217,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId);
 	}
 
-	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponseEncoded> {
+	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
 		const { transaction_id: transactionId } = existingRow;
 		switch (existingRow.state) {
 			case "COMMITTED":
@@ -259,16 +259,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 * Returning early with cleanup outstanding is safe because `alarm()` reschedules itself while any
 	 * non-terminal row remains, so it drives the stragglers to completion.
 	 */
-	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
+	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		switch (row.state) {
 			case "PREPARED":
 			case "COMMITTING":
-			case "COMMITTED": {
-				// Keys stay canonical KeyBytes (sortKey [] = absent); db.ts decodes at the public exit.
-				const items = this.loadItems(transactionId).map((i) => ({ hashKey: keyFromBlob(i.hk), sortKey: keyFromBlob(i.sk) }));
-				return { outcome: "committed", transactionId, idempotencyToken, items };
-			}
+			case "COMMITTED":
+				// The transaction is all-or-nothing, so "committed" already says every operation applied.
+				// Nothing per-item to report, and so no tc_items read on this path.
+				return { outcome: "committed", transactionId, idempotencyToken };
 			case "CANCELLING":
 			case "CANCELLED":
 				return {
@@ -290,11 +289,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async drivePrepare(
-		transactionId: string,
-		idempotencyToken: string,
-		coordinatorDoId: string,
-	): Promise<InitiateWriteResponseEncoded> {
+	private async drivePrepare(transactionId: string, idempotencyToken: string, coordinatorDoId: string): Promise<InitiateWriteResponse> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'PREPARING' WHERE idempotency_token = ? AND state = 'CREATED'`,
 			idempotencyToken,

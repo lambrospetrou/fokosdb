@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
-import type { InitiateWriteResponseEncoded, RejectionReason, TCState } from "./transaction-types.js";
+import type { InitiateWriteResponse, RejectionReason, TCState } from "./transaction-types.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -17,7 +17,7 @@ const TOKEN = "tok-1";
 // up to 2 s, far too slow for a unit test. The state→outcome mapping is the whole contract here, so
 // testing it directly is both faster and more precise than driving it end-to-end.
 type WithLoadFinalResponse = {
-	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
+	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponse;
 };
 
 function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionReason): void {
@@ -35,7 +35,8 @@ function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionRea
 		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
 		"0000000000000000",
 	);
-	// Two items, one with a sort key and one without, so the decode of the absent sentinel is covered.
+	// A realistic item set, one row with a sort key and one without. The response must not depend on
+	// it: a committed transaction reports no items.
 	state.storage.sql.exec(
 		`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
 		 VALUES (?, ?, ?, 'put', 'v', 1, NULL, 'p1')`,
@@ -66,15 +67,11 @@ describe("TransactionCoordinatorDO - loadFinalResponse answers from the decision
 	it.each(["PREPARED", "COMMITTING", "COMMITTED"] as const)("reports committed in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
 			seed(state, tcState);
+			// toEqual, not toMatchObject: an item echo reappearing here is a failure, not an extra.
 			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
-				// Keys stay canonical KeyBytes here (sortKey [] = absent); db.ts decodes at the public exit.
-				items: [
-					{ hashKey: kb("hk1"), sortKey: kb("sk1") },
-					{ hashKey: kb("hk2"), sortKey: ABSENT_SK },
-				],
 			});
 		});
 	});
