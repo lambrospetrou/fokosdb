@@ -1245,7 +1245,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
-		await this.ensureMigration("cancel"); // reject while this partition is migrating
+		// reject while this partition is migrating - it will recover it on its own.
+		await this.ensureMigration("cancel");
 		this.#participant.cancelLocal(request.transactionId);
 
 		const childContexts: PartitionContextResolved[] = [];
