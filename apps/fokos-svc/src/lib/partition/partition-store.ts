@@ -1090,13 +1090,16 @@ export class PartitionStore {
 	/**
 	 * Called exactly once, from initFromSplit, before any concurrent request can reach this DO.
 	 * Boundaries are already decoded to the public wire representation (see `RangeAncestorInfo`).
+	 *
+	 * `hk` is the partition's own hash key. Every row in this table is written under the real hash key
+	 * it describes — ancestors here, learned router boundaries in `insertRangePartitionBoundary` — so
+	 * a single convention covers both.
 	 */
-	setRangeAncestors(ancestors: RangeAncestorInfo[]): void {
+	setRangeAncestors(hk: KeyBytes, ancestors: RangeAncestorInfo[]): void {
 		for (const a of ancestors) {
 			this.#storage.sql.exec(
-				`INSERT INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
-				// For range partitions the hash key is always the empty sentinel (the partition's data keyspace is a range of a single hash key).
-				KeyCodec.encodeOptional(undefined),
+				`INSERT OR IGNORE INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
+				hk,
 				a.depth,
 				a.startBoundary,
 				a.endBoundary,
@@ -1105,14 +1108,21 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Only rows with depth strictly less than `ltDepth` are ancestors — filtering here (rather than
-	 * relying on callers) keeps this method correct once `range_hierarchy` also holds descendant-side
-	 * cache entries (depth > ltDepth), which this table is named generically to support later.
+	 * Ancestor partitions that own `hk`:
+	 *
+	 * - `hk`: For hash partitions, this table also holds learned router boundaries for other hash keys
+	 * 	 (see `insertRangePartitionBoundary`), which are not ancestors of anything here.
+	 * - `depth < ltDepth`: For range partitions filtering here rather than relying on callers keeps this method correct
+	 *   now that the table also holds descendant-side cache entries (depth >= ltDepth).
+	 *
+	 * Together they match `idx_range_hierarchy_depth (hk, depth, ...)`, so the query is a covering
+	 * seek and needs no sort step. Dropping either one degrades it to a scan plus a temp B-tree.
 	 */
-	getRangeAncestors(ltDepth: number): RangeAncestorInfo[] {
+	getRangeAncestors(hk: KeyBytes, ltDepth: number): RangeAncestorInfo[] {
 		return this.#storage.sql
 			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
-				`SELECT depth, sk_start_boundary, sk_end_boundary FROM range_hierarchy WHERE depth < ? ORDER BY depth ASC`,
+				`SELECT depth, sk_start_boundary, sk_end_boundary FROM range_hierarchy WHERE hk = ? AND depth < ? ORDER BY depth ASC`,
+				hk,
 				ltDepth,
 			)
 			.toArray()

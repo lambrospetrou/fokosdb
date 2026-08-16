@@ -254,7 +254,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				if (isRangePartition(pCtx) && this.depth() > 0) {
 					// Append non-root "self".
-					this.#_rangeAncestors = this.#store.getRangeAncestors(this.depth()).concat({
+					this.#_rangeAncestors = this.#store.getRangeAncestors(pCtx.rangePartition.hashKey, this.depth()).concat({
 						depth: this.depth(),
 						startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
 						endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
@@ -330,7 +330,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				if (opts.rangeAncestors && opts.rangeAncestors.length > 0) {
 					invariant(newPartitionRangeDepth > 0, "fokos/partition: rangeAncestors should only be set for non-root range partitions");
-					this.#store.setRangeAncestors(opts.rangeAncestors);
+					this.#store.setRangeAncestors(pCtx.rangePartition.hashKey, opts.rangeAncestors);
 					// Append non-root "self".
 					this.#_rangeAncestors = opts.rangeAncestors.concat({
 						depth: newPartitionRangeDepth,

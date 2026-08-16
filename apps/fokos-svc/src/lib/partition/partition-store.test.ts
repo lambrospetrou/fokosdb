@@ -691,26 +691,28 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 });
 
 describe("PartitionStore - range_hierarchy", () => {
+	const OWN_HK = kb("own");
+
 	it("returns [] when no rows are stored", async () => {
 		await withStore((store) => {
-			expect(store.getRangeAncestors(10)).toEqual([]);
+			expect(store.getRangeAncestors(OWN_HK, 10)).toEqual([]);
 		});
 	});
 
 	it("setRangeAncestors([]) is a no-op (does not throw on a zero-tuple INSERT)", async () => {
 		await withStore((store) => {
-			expect(() => store.setRangeAncestors([])).not.toThrow();
-			expect(store.getRangeAncestors(10)).toEqual([]);
+			expect(() => store.setRangeAncestors(OWN_HK, [])).not.toThrow();
+			expect(store.getRangeAncestors(OWN_HK, 10)).toEqual([]);
 		});
 	});
 
 	it("round-trips a populated set, ordered by depth ascending", async () => {
 		await withStore((store) => {
-			store.setRangeAncestors([
+			store.setRangeAncestors(OWN_HK, [
 				{ depth: 2, startBoundary: kb("b2"), endBoundary: kb("e2") },
 				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
 			]);
-			expect(store.getRangeAncestors(10)).toEqual([
+			expect(store.getRangeAncestors(OWN_HK, 10)).toEqual([
 				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
 				{ depth: 2, startBoundary: kb("b2"), endBoundary: kb("e2") },
 			]);
@@ -720,8 +722,8 @@ describe("PartitionStore - range_hierarchy", () => {
 	it("round-trips Uint8Array boundaries", async () => {
 		await withStore((store) => {
 			const bin = new Uint8Array([1, 2, 3]);
-			store.setRangeAncestors([{ depth: 1, startBoundary: kb(bin), endBoundary: KeyCodec.encodeOptional(undefined) }]);
-			const got = store.getRangeAncestors(10);
+			store.setRangeAncestors(OWN_HK, [{ depth: 1, startBoundary: kb(bin), endBoundary: KeyCodec.encodeOptional(undefined) }]);
+			const got = store.getRangeAncestors(OWN_HK, 10);
 			const decodedBin = KeyCodec.decode(got[0].startBoundary);
 			expect(got).toHaveLength(1);
 			expect(decodedBin).toBeInstanceOf(Uint8Array);
@@ -732,11 +734,58 @@ describe("PartitionStore - range_hierarchy", () => {
 
 	it("excludes rows at or beyond ownDepth (future-proofing for descendant-side entries)", async () => {
 		await withStore((store) => {
-			store.setRangeAncestors([
+			store.setRangeAncestors(OWN_HK, [
 				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
 				{ depth: 5, startBoundary: kb("b5"), endBoundary: kb("e5") },
 			]);
-			expect(store.getRangeAncestors(5)).toEqual([{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) }]);
+			expect(store.getRangeAncestors(OWN_HK, 5)).toEqual([
+				{ depth: 1, startBoundary: kb("b1"), endBoundary: KeyCodec.encodeOptional(undefined) },
+			]);
+		});
+	});
+
+	// Regression: `range_hierarchy` holds ancestors AND learned router boundaries for other hash keys
+	// (a hash partition that forwards to a promoted key's range tree writes the latter on every
+	// forwarded request). Without the `hk` filter, getRangeAncestors returned those as ancestors.
+	it("ignores learned boundaries stored under a different hash key", async () => {
+		await withStore((store) => {
+			store.setRangeAncestors(OWN_HK, [{ depth: 1, startBoundary: kb("b1"), endBoundary: kb("e1") }]);
+			store.insertRangePartitionBoundary(kb("other"), kb("x"), kb("z"), 1);
+			store.insertRangePartitionBoundary(KeyCodec.encodeOptional(undefined), kb("p"), kb("q"), 1);
+
+			expect(store.getRangeAncestors(OWN_HK, 10)).toEqual([{ depth: 1, startBoundary: kb("b1"), endBoundary: kb("e1") }]);
+		});
+	});
+
+	// Both writers use the real hash key, so PRIMARY KEY (hk, sk_start_boundary, sk_end_boundary)
+	// collapses a re-learned ancestor onto the row setRangeAncestors already wrote.
+	it("does not duplicate an ancestor that is later re-learned for the same hash key", async () => {
+		await withStore((store) => {
+			store.setRangeAncestors(OWN_HK, [{ depth: 1, startBoundary: kb("b1"), endBoundary: kb("e1") }]);
+			store.insertRangePartitionBoundary(OWN_HK, kb("b1"), kb("e1"), 1);
+
+			expect(store.getRangeAncestors(OWN_HK, 10)).toEqual([{ depth: 1, startBoundary: kb("b1"), endBoundary: kb("e1") }]);
+		});
+	});
+
+	// This one regresses silently: the query stays correct while degrading to a scan plus a temp
+	// B-tree over a table that has no TTL. Both predicates are needed to hit the index.
+	it("getRangeAncestors seeks on idx_range_hierarchy_depth", async () => {
+		await withStore((store, state) => {
+			store.setRangeAncestors(OWN_HK, [{ depth: 1, startBoundary: kb("b1"), endBoundary: kb("e1") }]);
+			const plan = state.storage.sql
+				.exec<{ detail: string }>(
+					`EXPLAIN QUERY PLAN SELECT depth, sk_start_boundary, sk_end_boundary FROM range_hierarchy WHERE hk = ? AND depth < ? ORDER BY depth ASC`,
+					OWN_HK,
+					10,
+				)
+				.toArray()
+				.map((r) => r.detail)
+				.join(" | ");
+
+			expect(plan).toContain("SEARCH");
+			expect(plan).toContain("idx_range_hierarchy_depth (hk=? AND depth<?)");
+			expect(plan).not.toContain("TEMP B-TREE");
 		});
 	});
 });

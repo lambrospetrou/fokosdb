@@ -625,7 +625,11 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
 		for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
 			this.#partitionStore.insertRangePartitionBoundary(
-				// TODO: We can optimize this by inserting an empty hash key since this range partition tree is about a single hash key.
+				// Always the real hash key, never the empty sentinel — `setRangeAncestors` writes ancestors
+				// under the same key, so the two writers share one convention and the primary key dedupes
+				// a learned boundary against the identical ancestor row. Storing this tree under the empty
+				// key to save bytes would put one keyspace under two labels, and `getRangeAncestors` could
+				// no longer tell its own ancestors from learned rows.
 				this.partitionContext.rangePartition.hashKey,
 				ancestor.startBoundary,
 				ancestor.endBoundary,
