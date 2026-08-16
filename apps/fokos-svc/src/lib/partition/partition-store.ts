@@ -373,6 +373,35 @@ export class PartitionStore {
 	}
 
 	/**
+	 * The row's currently stored `est_row_bytes`, or 0 when the row is absent. `upsertItem` and
+	 * `deleteItem` both need it to compute the `key_size_estimates` delta, and it is the only read
+	 * either of them does, so it sits on both write paths.
+	 *
+	 * `INDEXED BY idx_items_scan` is a deliberate plan pin, not decoration. `idx_items_scan
+	 * (hk, sk, est_row_bytes)` covers this query exactly, but SQLite prefers
+	 * `sqlite_autoindex_items_1` — the primary-key index, which stops at `(hk, sk)` — and then
+	 * fetches the table row for `est_row_bytes`. Measured plans:
+	 *
+	 *   without the hint: SEARCH items USING INDEX sqlite_autoindex_items_1 (hk=? AND sk=?)
+	 *   with the hint:    SEARCH items USING COVERING INDEX idx_items_scan (hk=? AND sk=?)
+	 *
+	 * The hint removes that table-row fetch from every put and every delete. It saves page reads, not
+	 * billed rows — SQLite reports one row read either way. `INDEXED BY` makes the dependency on
+	 * `idx_items_scan` hard: dropping or renaming that index fails this query loudly rather than
+	 * silently regressing both write paths. A query-plan test asserts the pin still works AND that it
+	 * is still needed, so it can be removed if SQLite ever picks the covering index unaided.
+	 *
+	 * Folding into the DELETE with `DELETE ... RETURNING` measured that reports the returned row
+	 * as an extra read, so it costs the same on a hit and one more on a miss.
+	 */
+	#storedEstRowBytes(hk: KeyBytes, sk: KeyBytes): number {
+		const row = this.#storage.sql
+			.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
+			.toArray()[0];
+		return row?.est_row_bytes ?? 0;
+	}
+
+	/**
 	 * The items upsert with est_row_bytes / key_size_estimates bookkeeping — the single
 	 * definition used by BOTH the non-transactional putItem and the transactional commit apply.
 	 * Returns the new item version and the key's updated size estimate (feeds promotion checks).
@@ -393,10 +422,7 @@ export class PartitionStore {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		const oldEstRow = this.#storage.sql
-			.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hk, opts.sk)
-			.toArray()[0];
-		const oldEst = oldEstRow?.est_row_bytes ?? 0;
+		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
 
 		// json text is encoded to JSONB inside the DO; bytes/text bind verbatim. This is a fixed SQL
 		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
@@ -471,10 +497,7 @@ export class PartitionStore {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		const delEstRow = this.#storage.sql
-			.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`, opts.hk, opts.sk)
-			.toArray()[0];
-		const delEst = delEstRow?.est_row_bytes ?? 0;
+		const delEst = this.#storedEstRowBytes(opts.hk, opts.sk);
 
 		const writeRes = this.#storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hk, opts.sk);
 		const deleted = writeRes.rowsWritten > 0;

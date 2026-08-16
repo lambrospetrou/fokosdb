@@ -328,6 +328,26 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	// The old-estimate lookup that upsertItem and deleteItem share. Without INDEXED BY, SQLite picks
+	// sqlite_autoindex_items_1 and fetches the table row for est_row_bytes — correct, but one row
+	// fetch per put and per delete. Both halves are asserted: that the hint still works, and that it
+	// is still needed, so the pin can be dropped if SQLite ever starts choosing the covering index.
+	it("the old-estimate lookup stays index-only, and needs the INDEXED BY hint to do so", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, kb("hk"), kb("sk"))
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			expect(plan(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ? LIMIT 1`)).toContain(
+				"COVERING INDEX idx_items_scan (hk=? AND sk=?)",
+			);
+			expect(plan(`SELECT est_row_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`)).toContain("sqlite_autoindex_items_1");
+		});
+	});
+
 	it("migration reads json verbatim (raw JSONB) and re-inserts it queryable by jsonb_extract", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ status: "ok", count: 7 });
