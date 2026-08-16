@@ -47,6 +47,24 @@ function prepareReq(overrides: Partial<PrepareRequest> & Pick<PrepareRequest, "i
 }
 
 describe("TransactionParticipant - prepare", () => {
+	// A lock is released only by the outcome of its transaction, and the recovery job reaches that
+	// outcome through these two ids alone. A lock created without them can never be released, so
+	// prepare must refuse rather than store one.
+	it.each([
+		["transactionId", { transactionId: "" }],
+		["coordinatorDoId", { coordinatorDoId: "" }],
+	])("refuses to lock an item when %s is empty, so no unreleasable lock is created", async (_name, override) => {
+		await withParticipant(({ participant, store }) => {
+			const request = prepareReq({
+				...override,
+				items: [{ hashKey: kb("hk1"), sortKey: kb("sk1"), operation: "put", data: "v1", kind: "text" }],
+			});
+
+			expect(() => participant.prepareLocal(request)).toThrow(/is required/);
+			expect(store.pendingLockFor(kb("hk1"), kb("sk1"))).toBeUndefined();
+		});
+	});
+
 	it("accepts and locks every item, and re-prepare of the same transaction is idempotent", async () => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({

@@ -1243,42 +1243,42 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { outcome: "committed" };
 	}
 
+	/**
+	 * Releases this transaction's locks in this partition and descendants that own `request.items`.
+	 *
+	 * The release is by transaction id, not by key, so this node is fully cleared regardless of which
+	 * keys it owns — including a parent mid-split, which is also the routing entry point, so routing
+	 * the fan-out opens no split-window gap. The keys only decide WHERE ELSE the cancel goes, and
+	 * routing is exact: a lock follows its key through a split, and a promotion cutover cannot happen
+	 * while a key is locked. With no keys (see CancelRequest.items) the cancel is local-only and any
+	 * descendant lock waits for its own stale-tx recovery alarm.
+	 */
 	async txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		// reject while this partition is migrating - it will recover it on its own.
 		await this.ensureMigration("cancel");
+		// First, so the local lock is released even if a child cancel fails and we throw below.
 		this.#participant.cancelLocal(request.transactionId);
 
-		const childContexts: PartitionContextResolved[] = [];
-
-		// Split children (hash or range, via existing split_status).
-		const topology = this.ensureTopology(pCtx);
-		const splitStatus = topology.splitStatus();
-		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-			childContexts.push(...splitStatus.childPartitionContexts);
+		// Cancel only DELETEs pending rows, so size backpressure must not wedge it — same reasoning as
+		// txCommit, and cancel is the path that BRINGS an over-size partition back under its cap.
+		const { forwarded } = this.groupItemsByRouting(request.items, "ignore_size_reject", "cancel");
+		if (forwarded.size === 0) {
+			return { outcome: "cancelled" };
 		}
 
-		// Promoted-key range roots (hash DOs only).
-		// FIXME(perf): We should only forward to the range roots (hash keys) that actually have pending locks for this transaction.
-		if (isHashPartition(pCtx)) {
-			for (const hashKey of this.#promotion.activeRangeRootHashKeys()) {
-				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
-				childContexts.push(rangeRootCtx);
-			}
-		}
-
-		if (childContexts.length > 0) {
-			const results = await Promise.allSettled(childContexts.map((childPCtx) => this.getChildStub(childPCtx).txCancel(childPCtx, request)));
-			const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
-			if (failures.length > 0) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition.cancel: child cancel(s) failed",
-					transactionId: request.transactionId,
-					failureCount: failures.length,
-				});
-				throw new Error(`fokos/partition.cancel: ${failures.length} child cancel(s) failed for transaction ${request.transactionId}`);
-			}
+		const results = await Promise.allSettled(
+			[...forwarded.values()].map(({ pCtx: childPCtx, items }) => this.getChildStub(childPCtx).txCancel(childPCtx, { ...request, items })),
+		);
+		const failures = results.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+		if (failures.length > 0) {
+			console.error({
+				...this.logParams(),
+				message: "fokos/partition.cancel: some child txCancel failed",
+				transactionId: request.transactionId,
+				failureCount: failures.length,
+			});
+			throw new Error(`fokos/partition.cancel: ${failures.length} child txCancel failed for transaction ${request.transactionId}`);
 		}
 
 		return { outcome: "cancelled" };
@@ -1793,8 +1793,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
 						const result = await tcStub.recoverTransaction(row.transaction_id);
 
+						// Both branches route on the keys THIS node has locked. That covers the descendants
+						// this node forwarded to, and leaves any other holder to its own alarm — which is
+						// already the case today whenever prepare forwarded every item, since this node
+						// would then hold no row for the transaction and never wake for it.
+						const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
+
 						if (result.state === "COMMITTED") {
-							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 							if (pendingRows.length > 0) {
 								const transactionTimestamp = pendingRows[0].transaction_ts;
 								const items: TransactionItem[] = pendingRows.map((r) => ({
@@ -1811,7 +1816,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 								});
 							}
 						} else if (result.state === "CANCELLED" || result.state === "not_found") {
-							await this.txCancel(this.pCtx(), { transactionId: row.transaction_id });
+							// "not_found" means the TC has no record, which it may only reach after the
+							// transaction is terminal — so it can never have committed. See the TC's
+							// retention rules before making it delete non-terminal rows.
+							await this.txCancel(this.pCtx(), {
+								transactionId: row.transaction_id,
+								items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
+							});
 						}
 					} catch (e) {
 						console.error({

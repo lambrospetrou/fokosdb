@@ -14,6 +14,7 @@ import type {
 	RejectionReason,
 	TCState,
 	TransactionItem,
+	TransactionItemKey,
 } from "./transaction-types.js";
 import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
 import { DESTROY_ABORT_SENTINEL } from "./cf-utils.js";
@@ -421,6 +422,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	private async runCancel(transactionId: string, idempotencyToken: string): Promise<void> {
+		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
+		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
+		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
+		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
+
 		// Cancel any participant not yet committed and not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
 		// (e.g., response lost in transit). PartitionDO.cancel is a no-op DELETE, so sending it
@@ -438,7 +444,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				await tryWhile(
 					async () => {
-						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCancel(pCtx, { transactionId });
+						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCancel(pCtx, {
+							transactionId,
+							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
+						});
 						this.ctx.storage.sql.exec(
 							`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE transaction_id = ? AND partition_do_name = ?`,
 							transactionId,
@@ -788,6 +797,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			.toArray();
 	}
 
+	/** The routing half of loadItems: no data, no conditions — see runCancel. */
+	private loadItemKeys(transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
+		return this.ctx.storage.sql
+			.exec<
+				Pick<TcItemRow, "hk" | "sk" | "partition_do_name">
+			>(`SELECT hk, sk, partition_do_name FROM tc_items WHERE transaction_id = ?`, transactionId)
+			.toArray();
+	}
+
 	private loadParticipants(transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
@@ -803,8 +821,8 @@ function deserializePartitionContext(json: string): PartitionContextResolved {
 	return JSON.parse(json) as PartitionContextResolved;
 }
 
-function groupByPartition(items: TcItemRow[]): Map<string, TcItemRow[]> {
-	const map = new Map<string, TcItemRow[]>();
+function groupByPartition<T extends Pick<TcItemRow, "partition_do_name">>(items: T[]): Map<string, T[]> {
+	const map = new Map<string, T[]>();
 	for (const item of items) {
 		let arr = map.get(item.partition_do_name);
 		if (!arr) {
@@ -814,6 +832,13 @@ function groupByPartition(items: TcItemRow[]): Map<string, TcItemRow[]> {
 		arr.push(item);
 	}
 	return map;
+}
+
+function toTransactionItemKeys(rows: Pick<TcItemRow, "hk" | "sk">[]): TransactionItemKey[] {
+	return rows.map((row) => ({
+		hashKey: keyFromBlob(row.hk),
+		sortKey: keyFromBlob(row.sk), // empty KeyBytes ([]) is the absent sentinel
+	}));
 }
 
 function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {

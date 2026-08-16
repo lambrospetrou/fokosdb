@@ -1755,7 +1755,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		expect(r.meta.forwardCount).toBe(0);
 
 		// Release the lock; next background cycle should complete the cutover.
-		await stub.txCancel(ctx, { transactionId: txId });
+		await stub.txCancel(ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
 		await vi.waitFor(
 			async () => {
 				await waitForAlarm(stub);
@@ -1897,8 +1897,15 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		});
 		expect(prepareResp.outcome).toBe("accepted");
 
-		// Cancel via hash DO — must fan out to range root.
-		await stub.txCancel(ctx, { transactionId: txId });
+		// Cancel via the hash DO. alice is promoted, so its lock lives on the range root and only the
+		// routed fan-out can release it; bob's lock is local. Both must be gone below.
+		await stub.txCancel(ctx, {
+			transactionId: txId,
+			items: [
+				{ hashKey: kb("alice"), sortKey: kb("sk2") },
+				{ hashKey: kb("bob"), sortKey: kb("sk1") },
+			],
+		});
 
 		// Both locks must be gone — a new prepare for the same keys must succeed.
 		const txId2 = crypto.randomUUID();
@@ -1912,7 +1919,13 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			],
 		});
 		expect(prepareResp2.outcome).toBe("accepted");
-		await stub.txCancel(ctx, { transactionId: txId2 });
+		await stub.txCancel(ctx, {
+			transactionId: txId2,
+			items: [
+				{ hashKey: kb("alice"), sortKey: kb("sk2") },
+				{ hashKey: kb("bob"), sortKey: kb("sk1") },
+			],
+		});
 	});
 });
 

@@ -71,18 +71,6 @@ export class PromotionManager {
 		return this.deps.store.hasInFlightPromotedKeys();
 	}
 
-	/**
-	 * Hash keys whose data lives (fully or in cutover) in their range structure — the DO's cancel
-	 * fan-out resolves a range-root context for each of these.
-	 */
-	activeRangeRootHashKeys(): KeyBytes[] {
-		const keys: KeyBytes[] = [];
-		for (const { hash_key, status } of this.deps.store.listPromotedKeys()) {
-			if (status === "promoting" || status === "promoted") keys.push(hash_key);
-		}
-		return keys;
-	}
-
 	snapshot(): { hashKey: KeyBytes; status: PromotedKeyStatus }[] {
 		return this.deps.store.listPromotedKeys().map(({ hash_key, status }) => ({ hashKey: hash_key, status }));
 	}

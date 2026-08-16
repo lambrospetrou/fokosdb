@@ -78,7 +78,6 @@ describe("PromotionManager — drive and cutover", () => {
 			expect(calls.triggers).toBe(1);
 			expect(manager.statusFor(kb("alice"))).toBe("promoting");
 			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoting");
-			expect(manager.activeRangeRootHashKeys()).toEqual([kb("alice")]);
 		});
 	});
 
@@ -174,7 +173,6 @@ describe("PromotionManager — acknowledgePromotionComplete", () => {
 			expect(store.getPromotedKeyStatus(kb("alice"))).toBe("promoted");
 			expect(scheduled).toEqual([1_000]);
 			expect(manager.hasInFlightPromotions()).toBe(false);
-			expect(manager.activeRangeRootHashKeys()).toEqual([kb("alice")]);
 
 			await manager.acknowledgePromotionComplete(kb("alice"));
 			expect(manager.statusFor(kb("alice"))).toBe("promoted");

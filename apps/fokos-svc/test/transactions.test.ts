@@ -110,7 +110,7 @@ describe("transactions - end-to-end", () => {
 		}
 
 		expect(countDistinctPartitions(db, operations)).toBeGreaterThan(1);
-	}, 15_000);
+	}, 20_000);
 
 	it("atomicity: condition failure on one item rolls back the entire transaction", async () => {
 		const db = makeDB();

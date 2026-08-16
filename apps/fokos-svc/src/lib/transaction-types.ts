@@ -16,11 +16,19 @@ export type TransactionTimestamp = number; // Date.now() ms
 
 export type TransactionOperationType = "put" | "delete" | "check";
 
-// Wire-IN type (db.ts/TC → PartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
-// sortKey is always present — the empty KeyBytes ([]) is the absent sentinel.
-export type TransactionItem = {
+/**
+ * The key half of a wire-IN item (db.ts/TC → PartitionDO): canonical KeyBytes, with sortKey always
+ * present — the empty KeyBytes ([]) is the absent sentinel. This is all the routing needs, so the
+ * operations that only have to REACH the owning partition (cancel, read) carry this and nothing else.
+ */
+export type TransactionItemKey = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
+};
+
+// Wire-IN type (db.ts/TC → PartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
+// sortKey is always present — the empty KeyBytes ([]) is the absent sentinel.
+export type TransactionItem = TransactionItemKey & {
 	operation: TransactionOperationType;
 	/** Required for "put". Already encoded (JSON stringified at the db.ts boundary), so string | Uint8Array. */
 	data?: Uint8Array | string;
@@ -70,6 +78,17 @@ export type CommitResponse = { outcome: "committed" };
 
 export type CancelRequest = {
 	transactionId: TransactionId;
+	/**
+	 * The keys this transaction locked, used ONLY to route the cancel to the partitions that can hold
+	 * a lock — the release itself is by transaction id, so every node the cancel passes through is
+	 * cleared whether or not it owns one of these keys.
+	 *
+	 * An empty list is legal and means "release locally, do not fan out". Correctness does not depend
+	 * on this list: a lock is always released eventually by the node holding it, via the stale-tx
+	 * recovery alarm. The keys only make that happen in milliseconds instead of STALE_TX_MS, which
+	 * matters because a held lock makes non-transactional writes to that key throw.
+	 */
+	items: TransactionItemKey[];
 };
 
 export type CancelResponse = { outcome: "cancelled" };
@@ -78,7 +97,7 @@ export type CancelResponse = { outcome: "cancelled" };
 
 export type ReadForTransactionRequest = {
 	transactionId: TransactionId;
-	items: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }>;
+	items: TransactionItemKey[];
 };
 
 // The value half of a read result, shared by the RPC and public variants. Only `data` differs

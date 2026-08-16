@@ -49,6 +49,14 @@ export class TransactionParticipant {
 	}
 
 	prepareLocal(request: PrepareRequest): PrepareResponse {
+		// A lock is only ever released by the outcome of its transaction, and the two ids below are the
+		// whole thread back to that outcome: the recovery job selects locks by transaction_id and calls
+		// the TC named by coordinator_do_id (it skips a row whose id is empty, and nothing else in the
+		// system can supply one). A lock missing either is therefore unreleasable — it would block every
+		// non-transactional write to its key for the life of the partition. Refuse to create it.
+		invariant(request.transactionId.length > 0, "fokos/partition.prepare: transactionId is required");
+		invariant(request.coordinatorDoId.length > 0, "fokos/partition.prepare: coordinatorDoId is required");
+
 		const now = this.#now();
 
 		if (request.transactionTimestamp > now + TransactionParticipant.MAX_CLOCK_SKEW_MS) {
