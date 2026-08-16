@@ -174,17 +174,22 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// integer columns (ttl_epoch_utc_seconds, v, last_transaction_ts, the materialized est_row_bytes)
 		// ≈ 32, ~4 for the small data_kind enum, plus SQLite's B-tree record header/null-bitmap ≈ 8 = 44.
 		// K is a rough size-accounting knob (feeds promotion/split), not a precise figure.
+		//
+		// SQLite reads pages for each row until it satisfies the columns needed for the query.
+		// Moving the "data" column to the end of the table definition keeps the hot-path SELECTs
+		// from reading the potentially large data column (overflow pages) when they only need the small metadata columns.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
-                data                  ANY     NOT NULL,
                 data_kind             INTEGER NOT NULL DEFAULT 0,
-                ttl_epoch_utc_seconds INTEGER,
                 v                     INTEGER NOT NULL,
                 last_transaction_ts   INTEGER NOT NULL DEFAULT 0,
+				ttl_epoch_utc_seconds INTEGER,
                 est_row_bytes         INTEGER NOT NULL
                     GENERATED ALWAYS AS (octet_length(data) + octet_length(hk) + octet_length(sk) + 44) STORED,
+				data                  ANY     NOT NULL,
+
                 PRIMARY KEY (hk, sk)
             ) WITHOUT ROWID, STRICT;`,
 	},
@@ -198,16 +203,15 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_id        TEXT    NOT NULL,
                 transaction_ts        INTEGER NOT NULL,
                 operation             TEXT    NOT NULL,
-                data                  ANY,
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
                 coordinator_do_id     TEXT    NOT NULL DEFAULT '',
                 created_at            INTEGER NOT NULL,
+				data                  ANY,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) WITHOUT ROWID, STRICT;
 
-            CREATE INDEX IF NOT EXISTS pending_transactions_created_at
-                ON pending_transactions (created_at);
+            CREATE INDEX IF NOT EXISTS pending_transactions_created_at ON pending_transactions (created_at);
 
             CREATE TABLE IF NOT EXISTS deletion_metadata (
                 id              INTEGER PRIMARY KEY CHECK (id = 1),
@@ -230,7 +234,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 	{
 		idMonotonicInc: 4,
-		description: "Add per-row size estimate and key-level size summary for efficient promotion detection",
+		description: "Add per-hash key size estimate and key-level size summary for efficient promotion detection",
 		// FIXME: Add also number of items per hash key.
 		sql: `
             CREATE TABLE IF NOT EXISTS key_size_estimates (
