@@ -27,7 +27,8 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 ### Performance and Reliability
 
 - Garbage collect the items table after splits and hash key promotions.
-- Garbage collect the transactions data from the tx coordinators.
+- Garbage collect the transactions data from the tx coordinators. Only delete a transaction that is already COMMITTED or CANCELLED, since partitions read a missing transaction as cancelled.
+- Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
 - Use the partial range topology within each partition to speed up transactions as well.
 - Add topology keeper and encoding. Schema and versioning per change (split).
@@ -37,18 +38,21 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
+- Count item data sizes in UTF-8 bytes, to match the `octet_length` the store uses. The current UTF-16 count under-counts non-ASCII data by up to 3x, so the item and transaction size caps admit more than they intend.
 - Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
+- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
 
 ### Features
 
-- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
+- Proper structured errors thrown to differentiate user vs server errors. Pick ONE failure model: a failed condition throws in `putItem` but is a returned `cancelled` value in `transactWriteItems`. Report one cancellation reason per operation, in request order.
+- Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
+- Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root and make the forwarding and migrations faster).
-- Proper structured errors thrown to differentiate user vs server errors.
 - Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
 - Expose an RPC/API to trigger a manual split.
-- Enforce the expiration ttl for items.
+- Enforce the expiration ttl for items. `ttlSeconds` is currently dropped without error, and a transactional put clears an existing expiry because `TransactionItem` carries no ttl.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Add jurisdictions support.
 - Batch item operations (non-transactions).
