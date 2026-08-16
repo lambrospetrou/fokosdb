@@ -366,6 +366,34 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
 			await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(/not JSON-serializable/);
 		});
+
+		// `JsonComposite` accepts arrays and objects only. TypeScript says so; these pin that the
+		// runtime agrees, which is what a JS caller actually meets — a primitive used to be stored
+		// silently as json, making the declared type a lie.
+		it.each([
+			["a number", 5],
+			["a boolean", true],
+			["null", null],
+			["a function", () => {}],
+		])("rejects %s as top-level data, in putItem and transactWriteItems alike", async (_name, data) => {
+			const db = makeDB();
+			const expected = /data must be an object, array, string or Uint8Array/;
+
+			await expect(db.putItem({ hashKey: "k", sortKey: "prim", data: data as never })).rejects.toThrow(expected);
+			await expect(
+				db.transactWriteItems({ items: [{ hashKey: "k", sortKey: "prim", operation: "put", data: data as never }] }),
+			).rejects.toThrow(expected);
+		});
+
+		// The one value the guard above lets through that JSON.stringify still drops: a toJSON that
+		// returns undefined makes the WHOLE document undefined, not just that field.
+		it("rejects an object whose toJSON() returns undefined, and says so", async () => {
+			const db = makeDB();
+			const data = { toJSON: () => undefined };
+			await expect(db.putItem({ hashKey: "k", sortKey: "tojson", data: data as never })).rejects.toThrow(
+				/not JSON-serializable \(its toJSON\(\) returned undefined\)/,
+			);
+		});
 	});
 
 	// The DO returns no keys — db.ts answers with the caller's own. These pin that mapping, which no

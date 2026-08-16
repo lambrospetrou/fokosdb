@@ -48,13 +48,24 @@ export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
 function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemData {
 	if (data instanceof Uint8Array) return { kind: "bytes", data };
 	if (typeof data === "string") return { kind: "text", data };
+	// `JsonComposite` is arrays and objects only.
+	// Accepting a primitive silently would make the declared type a lie, and taking it back later would be
+	// breaking — whereas relaxing this check later is not.
+	if (data === null || typeof data !== "object") {
+		throw new Error(`fokos: data must be an object, array, string or Uint8Array (got ${data === null ? "null" : typeof data})`);
+	}
 	let text: string;
 	try {
 		text = JSON.stringify(data);
-	} catch {
-		throw new Error("fokos: data is not JSON-serializable");
+	} catch (err) {
+		// A circular reference or a BigInt. Only JSON.stringify knows which, so quote it.
+		throw new Error(`fokos: data is not JSON-serializable (${String(err)})`, { cause: err });
 	}
-	if (text === undefined) throw new Error("fokos: data serialized to undefined");
+	// The guard above rules out every value that JSON.stringify drops, with one exception: a `toJSON`
+	// that itself returns undefined (or a function, or a symbol) makes the WHOLE document undefined.
+	if (text === undefined) {
+		throw new Error("fokos: data is not JSON-serializable (its toJSON() returned undefined)");
+	}
 	return { kind: "json", data: text };
 }
 
