@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, ItemCondition, OperationMetrics, PartitionInfo, RangeAncestorInfo } from "./types.js";
+import { DataKind, ItemCondition, OperationMetrics } from "./types.js";
 import type {
 	CancelRequest,
 	CancelResponse,
@@ -32,7 +32,7 @@ import {
 	type OperationIntent,
 } from "./partition-topology/split-policy.js";
 import { SplitStatusKVItem } from "./partition-topology/split-state.js";
-import type { SplitType } from "./partition-topology/types.js";
+import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "./partition-topology/types.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "./invariant.js";
 import { collectBatch } from "./partition/batch-scan.js";
@@ -99,11 +99,11 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	conditions?: ItemCondition[];
 };
 
-export type PutItemRpcResponse = { version: number; meta: OperationMetrics & PartitionInfo };
+export type PutItemRpcResponse = { version: number; meta: OperationMetrics & PartitionInfoInternal };
 
 export type DeleteItemRpcRequest = ItemRpcKeys & { conditions?: ItemCondition[] };
 
-export type DeleteItemRpcResponse = { deleted: boolean; meta: OperationMetrics & PartitionInfo };
+export type DeleteItemRpcResponse = { deleted: boolean; meta: OperationMetrics & PartitionInfoInternal };
 
 export type GetItemRpcRequest = ItemRpcKeys;
 
@@ -113,9 +113,9 @@ export type GetItemRpcResponse =
 	| {
 			found: true;
 			item: { data: string | Uint8Array; kind: DataKind; ttlEpochUTCSeconds?: number; version: number };
-			meta: OperationMetrics & PartitionInfo;
+			meta: OperationMetrics & PartitionInfoInternal;
 	  }
-	| { found: false; meta: OperationMetrics & PartitionInfo };
+	| { found: false; meta: OperationMetrics & PartitionInfoInternal };
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
@@ -146,9 +146,9 @@ export type QueryItemsRpcResponse = {
 	 * partitionMetas. Its `forwardCount` is subtree-cumulative: withSplitForwarding adds 1 per hash hop,
 	 * and a range router adds its child fan-out plus every descendant router's forwards.
 	 */
-	meta: OperationMetrics & PartitionInfo;
+	meta: OperationMetrics & PartitionInfoInternal;
 	/** Leaf-only debugging trail: hash leaves and non-split range partitions that actually scanned rows. Routers (hash or range) are excluded. */
-	partitionMetas: Array<OperationMetrics & PartitionInfo>;
+	partitionMetas: Array<OperationMetrics & PartitionInfoInternal>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -643,7 +643,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// A leaf (hash leaf or non-split range partition) is the only kind of DO that scans rows, so it
 		// is the only kind that contributes a `partitionMetas` entry. Routers (hash or range) are
 		// excluded — they appear only numerically via `forwardCount`.
-		const meta: OperationMetrics & PartitionInfo = {
+		const meta: OperationMetrics & PartitionInfoInternal = {
 			rowsRead: rowsScanned,
 			rowsWritten: 0,
 			databaseSize: this.#store.databaseSize,
@@ -683,7 +683,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const allItems: MigratedItem[] = [];
 		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
 		// contribute nothing of their own; they're captured numerically via `forwardCount`.
-		const leafMetas: Array<OperationMetrics & PartitionInfo> = [];
+		const leafMetas: Array<OperationMetrics & PartitionInfoInternal> = [];
 		let nextCursor: ScanCursor | null = null;
 		let totalBytesConsumed = 0;
 		let childrenCalled = 0;
@@ -753,7 +753,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// This range router is a pure router: it reads no rows and is NOT listed in `partitionMetas`.
 		// Its `meta` exists only for routing bookkeeping (servedBy*, hashDepth) and to carry the
 		// subtree-cumulative `forwardCount` (its own child fan-out plus every descendant router's).
-		const meta: OperationMetrics & PartitionInfo = {
+		const meta: OperationMetrics & PartitionInfoInternal = {
 			rowsRead: 0,
 			rowsWritten: 0,
 			databaseSize: this.#store.databaseSize,
@@ -1428,7 +1428,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return true;
 	}
 
-	private async forwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
+	private async forwardToRangeRootPartition<T extends { meta: PartitionInfoInternal }>(
 		ctx: PartitionContextResolved,
 		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
@@ -1468,7 +1468,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		} as T;
 	}
 
-	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfo }>(
+	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfoInternal }>(
 		ctx: PartitionContextResolved,
 		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
@@ -1484,7 +1484,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 	}
 
-	private async withSplitForwarding<T extends { meta: PartitionInfo }>(opts: {
+	private async withSplitForwarding<T extends { meta: PartitionInfoInternal }>(opts: {
 		ctx: PartitionContextResolved;
 		keys: { hashKey: KeyBytes; sortKey: KeyBytes };
 		operationName: string;

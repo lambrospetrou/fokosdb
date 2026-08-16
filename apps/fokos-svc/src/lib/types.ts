@@ -1,4 +1,3 @@
-import { KeyBytes } from "./partition-topology/key-codec.js";
 import type {
 	InitiateReadResponse,
 	InitiateWriteResponse,
@@ -144,30 +143,6 @@ export type PartitionInfo = {
 	 * ONLY FOR DEBUGGING PURPOSES: This is not a stable API and may change in future versions. Clients should not rely on this value for any logic.
 	 */
 	rangeDepth: number;
-
-	////////////////////////////////////////////////////////////
-	// INTERNAL_ONLY: Not to be exposed to the final responses.
-	////////////////////////////////////////////////////////////
-
-	_internal: {
-		/**
-		 * Bounded set of this range partition's ancestor boundaries (excludes root) including self (last).
-		 * Always empty for hash partitions.
-		 */
-		rangeAncestors: RangeAncestorInfo[];
-	};
-};
-
-/**
- * INTERNAL ONLY - Not to be exposed to the final responses.
- * Used to track the boundaries of ancestor range partitions for a given partition in the partition topology tree.
- * This information is useful for routing and debugging purposes, but should not be exposed to clients.
- * The boundaries are stored in their encoded form (KeyBytes) for efficient comparisons and storage.
- */
-export type RangeAncestorInfo = {
-	depth: number;
-	startBoundary: KeyBytes;
-	endBoundary: KeyBytes;
 };
 
 export type OperationMetrics = {

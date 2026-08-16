@@ -1,5 +1,5 @@
 import type { PartitionNodeId, SplitType } from "./types.js";
-import type { RangeAncestorInfo } from "../types.js";
+import type { RangeAncestorInfo } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 // Type-only import: erased at emit, so it creates NO runtime module cycle with do-partition.ts
 // (the value-level cycle is what the layering refactor eliminated). It exists solely so the

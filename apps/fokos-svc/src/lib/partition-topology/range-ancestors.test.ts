@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { RangeAncestorInfo } from "../types.js";
+import type { RangeAncestorInfo } from "./types.js";
 import { KeyCodec } from "./key-codec.js";
 import { selectRangeAncestors } from "./split-policy.js";
 

@@ -19,7 +19,7 @@ import {
 } from "./partition-id.js";
 import { SplitStateMachine, type SplitStatusKVItem } from "./split-state.js";
 import invariant from "../invariant.js";
-import type { PartitionInfo, RangeAncestorInfo } from "../types.js";
+import type { PartitionInfoInternal, RangeAncestorInfo } from "./types.js";
 import { PartitionStore } from "../partition/partition-store.js";
 
 // Re-exported here as well: the plan files SplitStatusKVItem under split-policy; it is defined
@@ -165,7 +165,7 @@ export interface PartitionTopologySplitter {
 		hashKey: KeyBytes,
 		fromCtx: PartitionContextResolved,
 		toCtx: PartitionContextResolved,
-		responsePartitionInfo: PartitionInfo,
+		responsePartitionInfo: PartitionInfoInternal,
 	): void;
 
 	/**
@@ -372,7 +372,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		hashKey: KeyBytes,
 		fromCtx: PartitionContextLivePartition,
 		toCtx: PartitionContextLivePartition,
-		responsePartitionInfo: PartitionInfo,
+		responsePartitionInfo: PartitionInfoInternal,
 	): void {
 		if (responsePartitionInfo._internal.rangeAncestors.length > 0) {
 			// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
@@ -614,7 +614,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		hashKey: KeyBytes,
 		_fromCtx: PartitionContextResolved,
 		_toCtx: PartitionContextResolved,
-		responsePartitionInfo: PartitionInfo,
+		responsePartitionInfo: PartitionInfoInternal,
 	): void {
 		// TODO(perf) Remove for optimization.
 		invariant(

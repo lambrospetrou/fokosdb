@@ -11,6 +11,29 @@ import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "./transaction-limits.js";
 describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s", (ns) => {
 	const makeDB = () => makeDBFor(ns);
 
+	describe("FokosDB — public results carry no internal routing state", () => {
+		// `_internal.rangeAncestors` is partition-to-partition routing state whose boundaries are
+		// KeyBytes, so leaking it also serialized them as {"0":97,"1":98} over HTTP. db.ts is the
+		// boundary where it stops. Asserted on every method that returns a meta, and on the
+		// per-partition metas, since each is a separate exit that has to strip it.
+		it("strips _internal from every meta a public method returns", async () => {
+			const db = makeDB();
+
+			const put = await db.putItem({ hashKey: "alice", sortKey: "sk1", data: "x" });
+			const get = await db.getItem({ hashKey: "alice", sortKey: "sk1" });
+			const missing = await db.getItem({ hashKey: "alice", sortKey: "nope" });
+			const query = await db.queryItems({ queries: [{ hashKey: "alice" }] });
+			const del = await db.deleteItem({ hashKey: "alice", sortKey: "sk1" });
+
+			for (const meta of [put.meta, get.meta, missing.meta, del.meta, ...query.partitionMetas]) {
+				expect(meta).not.toHaveProperty("_internal");
+				// The rest of the meta must survive the strip.
+				expect(meta.servedByActorName).toBeTypeOf("string");
+			}
+			expect(query.partitionMetas).not.toHaveLength(0);
+		});
+	});
+
 	describe("FokosDB.queryItems — multi sub-query fan-out", () => {
 		it("groups results per sub-query in request order, sk-ordered within each group", async () => {
 			const db = makeDB();

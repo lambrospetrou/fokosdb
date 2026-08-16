@@ -1,5 +1,6 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { DATA_KINDS, type DataKind, type ItemCondition, type RangeAncestorInfo } from "../types.js";
+import { DATA_KINDS, type DataKind, type ItemCondition } from "../types.js";
+import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 

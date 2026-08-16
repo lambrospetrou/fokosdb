@@ -34,6 +34,7 @@ import {
 	validateTransactWriteOperations,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
+import type { PartitionInfoInternal } from "./partition-topology/types.js";
 import { normalizeSkInterval } from "./query/sk-interval.js";
 import type { ScanCursor } from "./partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
@@ -84,6 +85,18 @@ export type FokosDBOptions = {
 	numTransactionCoordinators?: number;
 };
 
+/**
+ * Drops `_internal` from a partition meta. This is where partition-to-partition routing state stops:
+ * every DO response carries the serving leaf's `rangeAncestors` so routers can cache them, and none of
+ * that is meaningful to a client.
+ * Public results are typed `PartitionInfo`, which has no such field, but structural typing accepts an
+ * object that carries extra properties, so the removal has to happen at runtime as well.
+ */
+function publicMeta<T extends PartitionInfoInternal>(meta: T): Omit<T, "_internal"> {
+	const { _internal: _dropped, ...rest } = meta;
+	return rest;
+}
+
 export class FokosDB {
 	#options: Required<FokosDBOptions>;
 	#staticShardedTCs: StaticShardedDO<TransactionCoordinatorDO>;
@@ -130,7 +143,7 @@ export class FokosDB {
 			conditions: opts.conditions,
 		});
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: res.meta };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
 
 	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
@@ -146,10 +159,10 @@ export class FokosDB {
 			return {
 				found: true,
 				item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey, data: decodeItemData(res.item.kind, res.item.data) },
-				meta: res.meta,
+				meta: publicMeta(res.meta),
 			};
 		}
-		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: res.meta };
+		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: publicMeta(res.meta) };
 	}
 
 	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
@@ -160,7 +173,7 @@ export class FokosDB {
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, conditions: opts.conditions });
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: res.meta };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}
 
 	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
@@ -305,7 +318,7 @@ export class FokosDB {
 					version: item.v,
 				});
 			}
-			partitionMetas.push(...rpcResult.partitionMetas);
+			partitionMetas.push(...rpcResult.partitionMetas.map(publicMeta));
 			forwardCount += rpcResult.meta.forwardCount;
 			budget.consume(rpcResult.bytesConsumed, rpcResult.items.length, rpcResult.partitionMetas.length);
 
