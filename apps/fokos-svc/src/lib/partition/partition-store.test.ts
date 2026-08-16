@@ -3,14 +3,13 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../do-partition.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
-import { PartitionStore } from "./partition-store.js";
+import { EST_ROW_BYTES_K, PartitionStore } from "./partition-store.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
-// Mirrors the items.est_row_bytes STORED generated column: octet_length(data)+octet_length(hk)+
-// octet_length(sk)+K. octet_length is UTF-8 bytes for text and byteLength for blobs; keys are already
-// canonical bytes. K must track the constant in the CREATE TABLE (partition-store.ts).
-const EST_ROW_BYTES_K = 44;
+// Mirrors items.est_row_bytes: octet_length(data)+octet_length(hk)+octet_length(sk)+K. octet_length is
+// UTF-8 bytes for text and byteLength for blobs; keys are already canonical bytes. est_row_bytes is a
+// plain column written by two statements, so these tests are what keeps the formula from drifting.
 function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes): number {
 	const dataBytes = typeof data === "string" ? new TextEncoder().encode(data).length : data.byteLength;
 	return dataBytes + hk.byteLength + sk.byteLength + EST_ROW_BYTES_K;
@@ -227,6 +226,53 @@ describe("PartitionStore - items", () => {
 				.exec<{ n: number }>(`SELECT octet_length(data) AS n FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j"))
 				.toArray()[0].n;
 			expect(readEst("j")).toBe(jsonBlobLen + kb("hk").byteLength + kb("j").byteLength + EST_ROW_BYTES_K);
+		});
+	});
+
+	it("insertItemIfAbsent writes the same est_row_bytes as upsertItem", async () => {
+		await withStore((store, state) => {
+			const readEst = (sk: string) =>
+				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb(sk)).toArray()[0]
+					?.e;
+
+			// The migration writer carries the formula independently of upsertItem — both must agree.
+			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			const migrated = store.queryItemsPage(null, 10)[0];
+			store.insertItemIfAbsent({ ...migrated, sk: kb("j2") });
+			// Same row under a longer sk: the only difference must be octet_length(sk).
+			expect(readEst("j2")).toBe(readEst("j")! - kb("j").byteLength + kb("j2").byteLength);
+
+			const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+			store.insertItemIfAbsent({
+				hk: kb("hk"),
+				sk: kb("b"),
+				data: bytes,
+				kind: "bytes",
+				ttl_epoch_utc_seconds: null,
+				v: 1,
+				last_transaction_ts: 1,
+			});
+			expect(readEst("b")).toBe(bytes.byteLength + kb("hk").byteLength + kb("b").byteLength + EST_ROW_BYTES_K);
+		});
+	});
+
+	// idx_items_scan is what keeps computeRangeSplitBoundaries and rebuildKeySizeEstimates off the wide
+	// item rows. A generated est_row_bytes column, or a narrower index, silently loses "COVERING" and
+	// costs ~20x more page reads without failing any other test.
+	it("the est_row_bytes scans stay index-only", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string, ...params: unknown[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			expect(plan(`SELECT sk, est_row_bytes FROM items WHERE hk = ? AND sk >= ? ORDER BY sk`, kb("hk"), kb("a"))).toContain(
+				"COVERING INDEX",
+			);
+			expect(plan(`SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk`)).toContain("COVERING INDEX");
 		});
 	});
 

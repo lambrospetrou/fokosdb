@@ -12,6 +12,17 @@ const JSON_KIND_CODE = DATA_KINDS.indexOf("json");
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
 const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data`;
 
+// Fixed per-row overhead added to est_row_bytes. See the "items" migration for what K covers.
+export const EST_ROW_BYTES_K = 100;
+
+/**
+ * The ONLY definition of the est_row_bytes formula. `dataExpr` must be the same SQL that produces the
+ * stored `data` value (e.g. `jsonb(?6)`), so the size is always measured on what SQLite writes.
+ */
+function estRowBytesExpr(dataExpr: string, hkParam: string, skParam: string): string {
+	return `octet_length(${dataExpr}) + octet_length(${hkParam}) + octet_length(${skParam}) + ${EST_ROW_BYTES_K}`;
+}
+
 /**
  * PartitionStore owns ALL SQL on the partition's tables: items, pending_transactions,
  * deletion_metadata, key_size_estimates, and promoted_keys — plus the schema migrations and the
@@ -166,18 +177,31 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// `data` is ANY so SQLite retains the physical storage class: TEXT for text, BLOB for bytes, and
 		// BLOB for json (SQLite's JSONB binary form). `data_kind` is the discriminant that tells the three
 		// apart (JSONB and bytes are both blobs).
-		// `est_row_bytes` is a STORED generated column measuring the true encoded byte size via octet_length
-		// (UTF-8 bytes for TEXT, blob bytes for BLOB/JSONB) so it can never drift from a JS-side estimate.
 		//
-		// octet_length measures the exact variable part (data + keys); the +44 constant (K) covers the
-		// fixed per-row remainder that no cheap per-row function exposes: ~8 bytes each for the four wide
-		// integer columns (ttl_epoch_utc_seconds, v, last_transaction_ts, the materialized est_row_bytes)
-		// ≈ 32, ~4 for the small data_kind enum, plus SQLite's B-tree record header/null-bitmap ≈ 8 = 44.
+		// This is a rowid table on purpose. Do NOT add WITHOUT ROWID back. WITHOUT ROWID stores rows in an
+		// index B-tree, whose inline payload limit is ~1002 bytes on a 4 KiB page. Every item above that
+		// limit then takes a private overflow page it cannot share. Measured on Durable Object storage:
+		// 1000-byte data costs 4683 physical bytes per row (4.7x), and 2000-byte data costs 2.3x.
+		// `PRIMARY KEY (hk, sk)` still enforces uniqueness through sqlite_autoindex_items_1. hk/sk keep
+		// their explicit NOT NULL because a rowid table does NOT imply it from the primary key.
+		//
+		// `est_row_bytes` is the true encoded byte size (octet_length: UTF-8 bytes for TEXT, blob bytes for
+		// BLOB/JSONB). It is a plain column, NOT a generated column: SQLite refuses to treat an index that
+		// holds a generated column as covering, which would send the est_row_bytes scans back to every wide
+		// item row. Both writers build it with estRowBytesExpr, so SQLite still measures the stored value
+		// and JS never estimates it.
+		//
+		// octet_length covers the variable part (data + keys); K covers the fixed per-row remainder: the
+		// four wide integer columns, the data_kind enum, the B-tree record header, the rowid, and the two
+		// index entries each row carries (the PK autoindex + idx_items_scan).
 		// K is a rough size-accounting knob (feeds promotion/split), not a precise figure.
 		//
 		// SQLite reads pages for each row until it satisfies the columns needed for the query.
 		// Moving the "data" column to the end of the table definition keeps the hot-path SELECTs
 		// from reading the potentially large data column (overflow pages) when they only need the small metadata columns.
+		//
+		// idx_items_scan makes the est_row_bytes scans (computeRangeSplitBoundaries, rebuildKeySizeEstimates)
+		// index-only, so they never touch the wide item rows.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
                 hk                    BLOB    NOT NULL,
@@ -186,12 +210,13 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 v                     INTEGER NOT NULL,
                 last_transaction_ts   INTEGER NOT NULL DEFAULT 0,
 				ttl_epoch_utc_seconds INTEGER,
-                est_row_bytes         INTEGER NOT NULL
-                    GENERATED ALWAYS AS (octet_length(data) + octet_length(hk) + octet_length(sk) + 44) STORED,
+                est_row_bytes         INTEGER NOT NULL,
 				data                  ANY     NOT NULL,
 
                 PRIMARY KEY (hk, sk)
-            ) WITHOUT ROWID, STRICT;`,
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hk, sk, est_row_bytes);`,
 	},
 	{
 		idMonotonicInc: 2,
@@ -202,11 +227,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 transaction_id        TEXT    NOT NULL,
                 transaction_ts        INTEGER NOT NULL,
+				created_at            INTEGER NOT NULL,
+				coordinator_do_id     TEXT    NOT NULL DEFAULT '',
                 operation             TEXT    NOT NULL,
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
-                coordinator_do_id     TEXT    NOT NULL DEFAULT '',
-                created_at            INTEGER NOT NULL,
 				data                  ANY,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) WITHOUT ROWID, STRICT;
@@ -364,7 +389,8 @@ export class PartitionStore {
 
 		// json text is encoded to JSONB inside the DO; bytes/text bind verbatim. This is a fixed SQL
 		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
-		const dataExpr = opts.kind === "json" ? "jsonb(?)" : "?";
+		// data binds last (?6) because est_row_bytes must measure this same expression.
+		const dataExpr = opts.kind === "json" ? "jsonb(?6)" : "?6";
 
 		// INVARIANT: last_transaction_ts is monotonic per item — it must never move backwards.
 		//
@@ -381,21 +407,22 @@ export class PartitionStore {
 		//
 		// bumpItemLastTransactionTs applies the same rule for the transactional "check" operation.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts)
-			 VALUES (?, ?, ${dataExpr}, ?, ?, 1, ?)
+			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
+			 VALUES (?1, ?2, ?3, ?4, 1, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr})
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+			   est_row_bytes = excluded.est_row_bytes,
 			   v = v + 1,
 			   last_transaction_ts = MAX(last_transaction_ts, excluded.last_transaction_ts)
 			 RETURNING v, est_row_bytes`,
 			opts.hk,
 			opts.sk,
-			opts.data,
 			DATA_KINDS.indexOf(opts.kind),
 			opts.ttlEpochUtcSeconds,
 			opts.lastTransactionTs,
+			opts.data,
 		);
 		const rows = writeRes.toArray();
 		invariant(rows.length === 1, `fokos/partition-store.upsertItem: RETURNING expected 1 row, got ${rows.length}`);
@@ -404,7 +431,7 @@ export class PartitionStore {
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
 			`fokos/partition-store.upsertItem: unexpected version value: ${version}`,
 		);
-		// Exact stored size from the generated column (drives the key_size_estimates rollup delta).
+		// Exact stored size, measured by SQLite in the statement above (drives the key_size_estimates delta).
 		const newEst = rows[0].est_row_bytes;
 
 		const kseRow = this.#storage.sql
@@ -460,17 +487,18 @@ export class PartitionStore {
 	 */
 	insertItemIfAbsent(item: MigratedItem): void {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
-		// JSONB blob, bound directly (no jsonb() re-encode). est_row_bytes is a generated column, so it is
-		// recomputed by SQLite and never appears in the INSERT list.
+		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?7) so est_row_bytes can
+		// measure the same parameter.
 		this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO items (hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT OR IGNORE INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ${estRowBytesExpr("?7", "?1", "?2")}, ?7)`,
 			item.hk,
 			item.sk,
-			item.data,
 			DATA_KINDS.indexOf(item.kind),
 			item.ttl_epoch_utc_seconds ?? null,
 			item.v,
 			item.last_transaction_ts,
+			item.data,
 		);
 	}
 

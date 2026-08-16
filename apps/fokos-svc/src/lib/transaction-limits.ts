@@ -36,8 +36,8 @@ export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a 
  * A string's UTF-8 size is at least its `length` (every code unit is one or more bytes) and at most
  * `length * 3`, so this NEVER over-counts and the limits built on it never reject a string that
  * would have fit. The cost is the other direction: text above U+07FF is 3 UTF-8 bytes per code unit,
- * so a 400 KB check can admit 1.2 MB of CJK. The store measures the truth with `octet_length` in the
- * `est_row_bytes` generated column (`partition/partition-store.ts`).
+ * so a 400 KB check can admit 1.2 MB of CJK. The store measures the truth with `octet_length` when it
+ * writes `est_row_bytes` (`partition/partition-store.ts`).
  *
  * FIXME: implement the real size accounting — exact UTF-8 length for values, and the KEYS counted
  * into the item's budget rather than capped separately, per
