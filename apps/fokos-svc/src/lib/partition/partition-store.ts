@@ -1012,12 +1012,31 @@ export class PartitionStore {
 		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hk);
 	}
 
-	/** Post-migration rebuild: recomputes every key's estimate from the ingested rows. */
+	/**
+	 * Post-migration rebuild: recomputes every key's estimate from the ingested rows, and drops the
+	 * estimate of every key that has no rows left.
+	 *
+	 * The refresh alone touches only keys that still have rows, so a key whose rows have all gone would
+	 * keep its old estimate forever. That number is a running total — `upsertItem` adds its delta to
+	 * whatever is already there — so a stale base makes every later value for that key too large, and
+	 * the key promotes too early. The prune is what makes the method match its name.
+	 *
+	 * Refresh first, then prune: neither statement needs a transaction, because each one on its own
+	 * leaves the table no worse than it found it. `DELETE` everything and re-`INSERT` would need one,
+	 * because a crash between the two would zero every estimate.
+	 *
+	 * The prune uses `NOT EXISTS`, not `hk NOT IN (SELECT hk FROM items)`: `NOT EXISTS` is one index
+	 * seek per estimate row, while `NOT IN` materialises every `hk` in items.
+	 */
 	rebuildKeySizeEstimates(): void {
 		this.#storage.sql.exec(
 			`INSERT INTO key_size_estimates (hk, est_bytes)
 			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
 			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
+		);
+		this.#storage.sql.exec(
+			`DELETE FROM key_size_estimates
+			 WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.hk = key_size_estimates.hk)`,
 		);
 	}
 

@@ -154,6 +154,40 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("rebuildKeySizeEstimates drops the estimate of a key that has no rows left", async () => {
+		await withStore((store, state) => {
+			store.upsertItem({ hk: kb("keeps"), sk: kb("s1"), data: "xx", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			// A key whose rows are all gone. The estimate survives the deletes (deleteItem only
+			// decrements it), so only the rebuild can remove the row.
+			store.upsertItem({ hk: kb("empties"), sk: kb("s1"), data: "yyyy", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 2 });
+			state.storage.sql.exec(`DELETE FROM items WHERE hk = ?`, kb("empties"));
+			expect(kseBytes(state, "empties")).toBeGreaterThan(0);
+
+			store.rebuildKeySizeEstimates();
+
+			expect(kseBytes(state, "empties")).toBeUndefined();
+			expect(kseBytes(state, "keeps")).toBe(expectedRowBytes("xx", kb("keeps"), kb("s1")));
+		});
+	});
+
+	// The prune must seek items per estimate row. `hk NOT IN (SELECT hk FROM items)` would instead
+	// materialise every hk in the table, doubling the work the refresh already did.
+	it("the rebuild prune seeks items rather than scanning it", async () => {
+		await withStore((store, state) => {
+			store.upsertItem({ hk: kb("hk"), sk: kb("s1"), data: "xx", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			const plan = state.storage.sql
+				.exec<{ detail: string }>(
+					`EXPLAIN QUERY PLAN DELETE FROM key_size_estimates
+					 WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.hk = key_size_estimates.hk)`,
+				)
+				.toArray()
+				.map((r) => r.detail)
+				.join(" | ");
+
+			expect(plan).toContain("SEARCH items");
+		});
+	});
+
 	it("queryItemsPage pages in (hk, sk) order and resumes strictly after the cursor", async () => {
 		await withStore((store) => {
 			for (const [hk, sk] of [
