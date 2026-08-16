@@ -1889,7 +1889,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				// Job: Stale transaction recovery.
-				if (this.#store.pendingTxTotalCount() > 0) {
+				if (this.#store.hasAnyPendingTx()) {
 					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
 				}
 			});

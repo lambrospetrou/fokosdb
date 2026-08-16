@@ -461,7 +461,18 @@ describe("PartitionStore - pending transactions", () => {
 
 			store.deletePendingTx("tx1");
 			expect(store.pendingLockFor(kb("hk"), kb("s"))).toBeUndefined();
-			expect(store.pendingTxTotalCount()).toBe(0);
+			expect(store.hasAnyPendingTx()).toBe(false);
+		});
+	});
+
+	it("hasAnyPendingTx answers from a single row", async () => {
+		await withStore((store, state) => {
+			expect(store.hasAnyPendingTx()).toBe(false);
+			for (const sk of ["1", "2", "3"]) store.insertPendingLock(lockRow("hk", sk, "tx1"));
+			expect(store.hasAnyPendingTx()).toBe(true);
+
+			store.deletePendingTxForHashKey(kb("hk"));
+			expect(store.hasAnyPendingTx()).toBe(false);
 		});
 	});
 
