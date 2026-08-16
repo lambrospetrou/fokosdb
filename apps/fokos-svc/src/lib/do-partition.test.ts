@@ -10,6 +10,7 @@ import { HashPartitionTopologyImpl, RANGE_PROMOTION_FRACTION } from "./partition
 import type { SplitStatusKVItem } from "./partition-topology/split-state.js";
 import { KeyBytes, KeyCodec } from "./partition-topology/key-codec.js";
 import invariant from "./invariant.js";
+import { MAX_ITEM_BYTES } from "./transaction-limits.js";
 import { PartitionStore } from "./partition/partition-store.js";
 
 const kb = (s?: string) => KeyCodec.encodeOptional(s);
@@ -1569,6 +1570,15 @@ async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 	});
 }
 
+// Chunk size for filler writes, as a fraction of the promotion threshold. The ONLY property this
+// factor must have is being below 1, so no filler key crosses the promotion threshold and promotes
+// itself instead of contributing to a split. 0.7 is margin, not a derived number.
+//
+// It is NOT small enough to keep a crossing write inside the 10% reject grace band. That would need
+// <= 0.4: the chunk is RANGE_PROMOTION_FRACTION (0.25) * this * maxSizeMb, against a band of
+// 0.1 * maxSizeMb. Both callers are fine with overshooting, for different reasons — see each.
+const FILLER_CHUNK_FRACTION = 0.7;
+
 /**
  * Writes enough data spread across multiple hash keys to push the DB over maxSizeMb
  * without any single hash key accumulating enough data to trigger range-key promotion
@@ -1579,9 +1589,9 @@ async function triggerHashSplitThreshold(
 	ctx: PartitionContextResolved,
 	maxSizeMb: number = 1,
 ): Promise<void> {
-	// Use 70% of promotion threshold per key so no single key triggers promotion,
-	// and the chunk fits within the 10% reject grace band for the first write past threshold.
-	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * 0.7);
+	// Overshooting the grace band is expected here: the loop below treats the over-size rejection as a
+	// normal exit, because it means a prior write already crossed the split threshold.
+	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * FILLER_CHUNK_FRACTION);
 	const data = "x".repeat(chunkBytes);
 	for (let i = 0; ; i++) {
 		try {
@@ -1659,35 +1669,50 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 
 // ─── Promotion lifecycle ──────────────────────────────────────────────────────
 
-// These two constants are coupled, and the coupling is tighter than it looks. After the big put the
-// database size must land in the band (maxSizeMb, maxSizeMb * 1.1]:
+// Promotion and the write-reject guard read two DIFFERENT numbers, and these tests stay stable by
+// keeping them far apart:
 //
-//   - ABOVE maxSizeMb, or "blocks hash split while a key is being promoted" becomes vacuous — it
-//     asserts that no split is queued *although* a split would otherwise be warranted on size.
-//   - AT OR BELOW maxSizeMb * 1.1, the reject grace band in HashTopology.shouldAllow, or every later
-//     write in these tests fails with "partition exceeded its limits" instead of testing anything.
+//   - promotion fires when ONE KEY's estimate passes maxSizeMb * RANGE_PROMOTION_FRACTION;
+//   - writes are rejected when the WHOLE DATABASE passes maxSizeMb * 1.1.
 //
-// The empty schema is charged against that band, so it is not a free baseline: it was 57,344 bytes,
-// and making pending_transactions a rowid table added the primary-key autoindex root page for
-// 61,440. At the previous maxSizeMb=0.1 (104,857 bytes) the band was only 10,486 bytes wide and the
-// schema filled 59% of the budget, so that single page broke two tests. maxSizeMb=0.4 gives a 41,943
-// byte band, and a 370 KB item (measured: 438,272 bytes of database) sits ~4.6 pages above the
-// bottom edge and ~5.6 pages below the top one.
+// One key holding ~30% of the budget therefore promotes while the database sits at ~35% of it, three
+// times under the reject edge. An earlier maxSizeMb=0.1 left a 10 KB margin, and one
+// index page broke two tests.
 //
-// Measure before changing either number, and prefer growing the band to shaving the margins:
-// assertPromotionSizeBand below fails loudly rather than leaving a confusing over-size error.
-// 370 KB also stays under MAX_ITEM_BYTES (400 KB), so the big put goes through one item.
-const PROMOTION_TEST_MAX_SIZE_MB = 0.4;
-const PROMOTION_BIG_DATA = "x".repeat(370 * 1024);
+// Only one test needs the database ABOVE maxSizeMb, and it gets there through growPastSplitThreshold,
+// which writes until the DO reports that size. Nothing here infers a size from an item count.
+const PROMOTION_TEST_MAX_SIZE_MB = 1;
+const PROMOTION_BIG_DATA = "x".repeat(300 * 1024); // > 25% of 1 MB, and under MAX_ITEM_BYTES (400 KB)
 
 /**
- * Asserts the invariant above on a real database size, so a schema change that moves the baseline
- * reports the actual cause here instead of surfacing as an unrelated over-size failure downstream.
+ * Grows the partition past its promotion size threshold with filler keys, and returns the database
+ * size reached. Splits are only ever evaluated on a write (`checkSplits`, called from the putItem
+ * path), so a test that wants "a split is warranted but must not happen" has to write its way there.
+ *
+ * Overshooting the reject grace band is harmless here, which is why no rejection is caught: this
+ * returns the moment the size passes `target` and never writes again. A rejection needs
+ * `dbSize > maxSizeMb * 1.1`, which implies `dbSize > maxSizeMb`, so the previous write would already
+ * have returned. `shouldAllow` also runs BEFORE the write, so the write that carries the database
+ * across `maxSizeMb` is itself still accepted.
  */
-function assertPromotionSizeBand(databaseSize: number): void {
-	const maxBytes = PROMOTION_TEST_MAX_SIZE_MB * 1024 * 1024;
-	expect(databaseSize, `db must exceed maxSizeMb so a split is warranted (see PROMOTION_BIG_DATA)`).toBeGreaterThan(maxBytes);
-	expect(databaseSize, `db must stay inside the 10% reject grace band so later writes are served`).toBeLessThanOrEqual(maxBytes * 1.1);
+async function growPastSplitThreshold(
+	stub: DurableObjectStub<PartitionDO>,
+	ctx: PartitionContextResolved,
+	maxSizeMb: number,
+): Promise<number> {
+	const target = maxSizeMb * 1024 * 1024;
+	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * target * FILLER_CHUNK_FRACTION);
+	// chunkBytes scales with maxSizeMb, and apiPutItem does NOT enforce the per-item ceiling — that
+	// lives in db.ts and the coordinator — so a larger maxSizeMb would silently write items no real
+	// client could send, and the test would stop resembling the system it stands in for.
+	expect(chunkBytes, "filler chunk exceeds MAX_ITEM_BYTES; lower maxSizeMb or FILLER_CHUNK_FRACTION").toBeLessThanOrEqual(MAX_ITEM_BYTES);
+
+	const chunk = "x".repeat(chunkBytes);
+	for (let i = 0; i < 50; i++) {
+		const r = await stub.apiPutItem(ctx, { hashKey: kb(`_filler_${i}`), sortKey: kb("sk"), data: chunk, kind: "bytes" });
+		if (r.meta.databaseSize > target) return r.meta.databaseSize;
+	}
+	throw new Error(`growPastSplitThreshold: database never passed ${target} bytes`);
 }
 
 describe("PartitionDO — promotion detection and queuing", () => {
@@ -1719,32 +1744,43 @@ describe("PartitionDO — promotion detection and queuing", () => {
 	});
 
 	it("blocks hash split while a key is being promoted (mutual exclusion, inverse direction)", async () => {
-		// After detection cuts alice over to 'promoting', shouldSplit must return null even
-		// if DB is above hashSplitConditions.maxSizeMb, because alice is in-flight.
+		// shouldSplit must return null while a key is in-flight, even though the database is over
+		// hashSplitConditions.maxSizeMb and a split would otherwise be warranted.
+		//
+		// Only 'queued' and 'promoting' block a split (hasInFlightPromotedKeys), so this pins alice at
+		// 'queued' with a transaction lock rather than waiting for a cutover that races the migration to
+		// 'promoted'. Landing on 'promoted' would leave nothing in flight and make the assertion pass for
+		// the wrong reason.
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		const big = await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
-		// The whole point of this test is that a split IS warranted on size and still does not queue.
-		assertPromotionSizeBand(big.meta.databaseSize);
+		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 
-		// Wait for alice to reach 'promoting' or 'promoted' (the fire-and-forget range-root migration
-		// may race to completion within the same background cycle).
+		// Lock alice/sk1 so startPromotion defers the cutover and alice stays 'queued' throughout.
+		const lockResult = await stub.txPrepare(ctx, {
+			transactionId: crypto.randomUUID(),
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }],
+		});
+		expect(lockResult.outcome).toBe("accepted");
+
 		await vi.waitFor(
 			async () => {
 				await waitForAlarm(stub);
 				const aliceStatus = (await stub.status()).promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb("alice")) === 0)?.status;
-				if (!["promoting", "promoted"].includes(aliceStatus ?? "")) throw new Error("not yet");
+				if (aliceStatus !== "queued") throw new Error("not yet queued");
 			},
 			{ timeout: 5000, interval: 100 },
 		);
 
-		// Write more data, then assert no hash split was queued. This holds in both cases:
-		//  - 'promoting': mutual exclusion blocks the split even though DB exceeds maxSizeMb.
-		//  - 'promoted':  alice's data is GC'd, so the DB is back under maxSizeMb and no split is warranted.
-		await stub.apiPutItem(ctx, { hashKey: kb("bob"), sortKey: kb("sk1"), data: "small-data", kind: "text" as const });
+		// Now make a split genuinely warranted. Every one of these writes runs checkSplits.
+		const databaseSize = await growPastSplitThreshold(stub, ctx, PROMOTION_TEST_MAX_SIZE_MB);
 
 		const s = await stub.status();
+		// Both halves matter: no split queued, AND the preconditions that make that meaningful.
+		expect(databaseSize).toBeGreaterThan(PROMOTION_TEST_MAX_SIZE_MB * 1024 * 1024);
+		expect(s.promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb("alice")) === 0)?.status).toBe("queued");
 		expect(s.splitStatus).toBeUndefined();
 	});
 });
@@ -1754,9 +1790,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		const big = await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
-		// This test writes again further down, so it needs the room the grace band leaves.
-		assertPromotionSizeBand(big.meta.databaseSize);
+		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
 		const txId = crypto.randomUUID();
