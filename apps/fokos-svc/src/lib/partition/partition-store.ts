@@ -406,6 +406,12 @@ export class PartitionStore {
 	 *
 	 * Folding into the DELETE with `DELETE ... RETURNING` measured that reports the returned row
 	 * as an extra read, so it costs the same on a hit and one more on a miss.
+	 *
+	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
+	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
+	 * size accounting in bulk: insertItemIfAbsent (migration ingest, followed by one
+	 * rebuildKeySizeEstimates) and deleteItemsBatchForHashKey (GC, 1000 rows per call, followed by one
+	 * deleteKeySizeEstimate). It would add one row WRITE per row on those paths to save one row READ here.
 	 */
 	#storedEstRowBytes(hk: KeyBytes, sk: KeyBytes): number {
 		const row = this.#storage.sql
