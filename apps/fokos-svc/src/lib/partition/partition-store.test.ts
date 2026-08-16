@@ -477,6 +477,41 @@ describe("PartitionStore - pending transactions", () => {
 			}
 		});
 	});
+
+	// The (hk, sk) tail of pending_transactions_transaction_id is what makes these two index-only now
+	// that the table is a rowid table. While it was WITHOUT ROWID the primary key rode along in every
+	// index entry and a narrow key covered them for free; narrowing the index back would silently put
+	// a table fetch per row on the commit-and-abort path.
+	it("the transaction_id key listing and count stay index-only", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, "tx1")
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			expect(plan(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`)).toContain("COVERING INDEX");
+			expect(plan(`SELECT COUNT(*) AS n FROM pending_transactions WHERE transaction_id = ?`)).toContain("COVERING INDEX");
+		});
+	});
+
+	// pending_transactions must stay a rowid table: WITHOUT ROWID gives every row whose `data` exceeds
+	// the ~1002-byte inline limit a private overflow page, measured at 3.1x physical against logical.
+	// sqlite_master is the only thing that states this, and no behavioural test would notice.
+	it("pending_transactions is a rowid table", async () => {
+		await withStore((_store, state) => {
+			const ddl =
+				state.storage.sql
+					.exec<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pending_transactions'`)
+					.toArray()[0]?.sql ?? "";
+			expect(ddl).not.toContain("WITHOUT ROWID");
+			// A rowid table does not imply NOT NULL from the primary key, so the key columns must say so.
+			expect(ddl).toContain("hk                    BLOB    NOT NULL");
+			expect(ddl).toContain("sk                    BLOB    NOT NULL");
+			expect(ddl).toContain("transaction_id        TEXT    NOT NULL");
+		});
+	});
 });
 
 describe("PartitionStore - promoted keys", () => {

@@ -221,6 +221,16 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 2,
 		description: "Add last_transaction_ts to items and create transaction support tables",
+		// pending_transactions is a rowid table on purpose. Do NOT add WITHOUT ROWID back — it was
+		// WITHOUT ROWID until 2026-08-16, for the same reason `items` was, and it has the same defect:
+		// WITHOUT ROWID stores rows in an index B-tree with a ~1002-byte inline payload limit on a 4 KiB
+		// page, so every row whose `data` exceeds that takes a private overflow page it cannot share.
+		// Measured on Durable Object storage, 2000 rows of 1500-byte data against 3.00 MB logical:
+		// 9.41 MB WITHOUT ROWID (3.1x) against 4.20 MB as a rowid table (1.4x). `PRIMARY KEY
+		// (hk, sk, transaction_id)` still enforces uniqueness through sqlite_autoindex_pending_transactions_1,
+		// and hk/sk/transaction_id keep their explicit NOT NULL because a rowid table does NOT imply it
+		// from the primary key.
+		//
 		// pending_transactions_transaction_id exists because `transaction_id` is the THIRD primary key
 		// column and so cannot be seeked on its own. Every whole-transaction operation filters by it —
 		// pendingTxCountFor, listPendingTxKeys, listPendingTxItems, deletePendingTx. Also, deletePendingTx
@@ -228,9 +238,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// committing ONE transaction is O(all pending rows in the partition). Measured over 20k pending
 		// rows: 147 page reads drop to 3, and listPendingTxItems drops from 2859 to 8.
 		//
-		// The index key is `transaction_id` alone. The table is WITHOUT ROWID, so SQLite appends the
-		// primary key (hk, sk) to every entry; that makes it a COVERING index for the count and
-		// key-listing queries at no extra width.
+		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid change. While the
+		// table was WITHOUT ROWID, SQLite appended the primary key to every index entry, so a key of
+		// `transaction_id` alone happened to cover listPendingTxKeys for free. A rowid table appends
+		// only the rowid, so the narrow key would have sent listPendingTxKeys — a commit-and-abort path —
+		// back to a table fetch per row, and SQLite also stopped choosing pending_transactions_created_at
+		// for listStalePendingTx, scanning this index instead. Spelling (hk, sk) out restores both plans.
 		sql: `
             CREATE TABLE IF NOT EXISTS pending_transactions (
                 hk                    BLOB    NOT NULL,
@@ -244,10 +257,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 conditions_json       TEXT,
 				data                  ANY,
                 PRIMARY KEY (hk, sk, transaction_id)
-            ) WITHOUT ROWID, STRICT;
+            ) STRICT;
 
             CREATE INDEX IF NOT EXISTS pending_transactions_created_at ON pending_transactions (created_at);
-            CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id ON pending_transactions (transaction_id);
+            CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id ON pending_transactions (transaction_id, hk, sk);
 
             CREATE TABLE IF NOT EXISTS deletion_metadata (
                 id              INTEGER PRIMARY KEY CHECK (id = 1),

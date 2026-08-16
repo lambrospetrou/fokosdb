@@ -1659,10 +1659,36 @@ function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.creat
 
 // ─── Promotion lifecycle ──────────────────────────────────────────────────────
 
-// hashSplitConditions.maxSizeMb=0.1 → promotion threshold = 0.05 MB ≈ 52 KB.
-// Writing 55 KB for a single key exceeds it.
-const PROMOTION_TEST_MAX_SIZE_MB = 0.1;
-const PROMOTION_BIG_DATA = "x".repeat(55 * 1024);
+// These two constants are coupled, and the coupling is tighter than it looks. After the big put the
+// database size must land in the band (maxSizeMb, maxSizeMb * 1.1]:
+//
+//   - ABOVE maxSizeMb, or "blocks hash split while a key is being promoted" becomes vacuous — it
+//     asserts that no split is queued *although* a split would otherwise be warranted on size.
+//   - AT OR BELOW maxSizeMb * 1.1, the reject grace band in HashTopology.shouldAllow, or every later
+//     write in these tests fails with "partition exceeded its limits" instead of testing anything.
+//
+// The empty schema is charged against that band, so it is not a free baseline: it was 57,344 bytes,
+// and making pending_transactions a rowid table added the primary-key autoindex root page for
+// 61,440. At the previous maxSizeMb=0.1 (104,857 bytes) the band was only 10,486 bytes wide and the
+// schema filled 59% of the budget, so that single page broke two tests. maxSizeMb=0.4 gives a 41,943
+// byte band, and a 370 KB item (measured: 438,272 bytes of database) sits ~4.6 pages above the
+// bottom edge and ~5.6 pages below the top one.
+//
+// Measure before changing either number, and prefer growing the band to shaving the margins:
+// assertPromotionSizeBand below fails loudly rather than leaving a confusing over-size error.
+// 370 KB also stays under MAX_ITEM_BYTES (400 KB), so the big put goes through one item.
+const PROMOTION_TEST_MAX_SIZE_MB = 0.4;
+const PROMOTION_BIG_DATA = "x".repeat(370 * 1024);
+
+/**
+ * Asserts the invariant above on a real database size, so a schema change that moves the baseline
+ * reports the actual cause here instead of surfacing as an unrelated over-size failure downstream.
+ */
+function assertPromotionSizeBand(databaseSize: number): void {
+	const maxBytes = PROMOTION_TEST_MAX_SIZE_MB * 1024 * 1024;
+	expect(databaseSize, `db must exceed maxSizeMb so a split is warranted (see PROMOTION_BIG_DATA)`).toBeGreaterThan(maxBytes);
+	expect(databaseSize, `db must stay inside the 10% reject grace band so later writes are served`).toBeLessThanOrEqual(maxBytes * 1.1);
+}
 
 describe("PartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and immediately cuts over to 'promoting' when no locks are held", async () => {
@@ -1698,7 +1724,9 @@ describe("PartitionDO — promotion detection and queuing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		const big = await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		// The whole point of this test is that a split IS warranted on size and still does not queue.
+		assertPromotionSizeBand(big.meta.databaseSize);
 
 		// Wait for alice to reach 'promoting' or 'promoted' (the fire-and-forget range-root migration
 		// may race to completion within the same background cycle).
@@ -1726,7 +1754,9 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		const { ctx, stub } = makeStub({
 			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
 		});
-		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		const big = await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		// This test writes again further down, so it needs the room the grace band leaves.
+		assertPromotionSizeBand(big.meta.databaseSize);
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
 		const txId = crypto.randomUUID();
