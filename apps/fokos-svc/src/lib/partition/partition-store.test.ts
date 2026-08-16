@@ -431,6 +431,32 @@ describe("PartitionStore - pending transactions", () => {
 			expect(page2.map((r) => r.transaction_id)).toEqual(["tx3"]);
 		});
 	});
+
+	// transaction_id is the third primary key column, so these four queries can only seek through
+	// pending_transactions_transaction_id. Without it they scan the whole table on every commit and
+	// abort. The results stay correct either way, so only the query plan catches the regression.
+	it("whole-transaction queries seek on transaction_id", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, "tx1")
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			for (const sql of [
+				`SELECT COUNT(*) AS n FROM pending_transactions WHERE transaction_id = ?`,
+				`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`,
+				`SELECT hk, sk, transaction_ts, operation, data, data_kind FROM pending_transactions WHERE transaction_id = ?`,
+				`DELETE FROM pending_transactions WHERE transaction_id = ?`,
+			]) {
+				// "SEARCH … (transaction_id=?)" is the seek. Asserting only the index name would also
+				// pass for a full SCAN that happens to walk the same index.
+				expect(plan(sql), sql).toContain("SEARCH");
+				expect(plan(sql), sql).toContain("pending_transactions_transaction_id (transaction_id=?)");
+			}
+		});
+	});
 });
 
 describe("PartitionStore - promoted keys", () => {

@@ -113,12 +113,17 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 	});
 
 	it("once split, the node is a pure router — forwards EVERY sort key to the owning child", async () => {
-		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
+		const RANGE_SPLIT_N = 2;
+		const base = makeUniqueBase({ rangeSplitN: RANGE_SPLIT_N, rangeSplitConditions: { maxSizeMb: 0.1 } });
 		const rootCtx = makeRangeCtx(base, "alice", null, null);
 		const rootStub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(rootStub, rootCtx, makeHashCtx(base));
 
-		// Write ~50 KB items until a range split is queued (0.1 MB threshold → ~3 items).
+		// Write ~50 KB items until a range split is queued AND at least RANGE_SPLIT_N items exist.
+		// Both conditions are needed: computeRangeSplitBoundaries refuses to split fewer than N items
+		// (it cannot make N non-empty children), so a split queued at 1 item stays queued forever.
+		// The empty schema already occupies ~57 KB of the 0.1 MB budget, so a single item can cross
+		// the size threshold on its own — do not rely on the size trigger to imply enough items.
 		const bigData = "x".repeat(50 * 1024);
 		for (let i = 0; i < 10; i++) {
 			await rootStub.apiPutItem(rootCtx, {
@@ -127,7 +132,7 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 				data: bigData,
 				kind: "text",
 			});
-			if ((await rootStub.status(rootCtx)).splitStatus) break;
+			if (i + 1 >= RANGE_SPLIT_N && (await rootStub.status(rootCtx)).splitStatus) break;
 		}
 
 		// Run alarms until split_completed: root splits, children migrate.
