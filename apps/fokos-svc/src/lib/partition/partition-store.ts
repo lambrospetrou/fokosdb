@@ -631,6 +631,16 @@ export class PartitionStore {
 	/**
 	 * Pages the items table in (hk, sk) order, strictly after `cursor`. This is a migration read: json
 	 * rows return the raw JSONB blob verbatim (no `json()` decode) so the child re-inserts it unchanged.
+	 *
+	 * The cursor MUST stay a row-value comparison `(hk, sk) > (?, ?)`. Do NOT rewrite it as
+	 * `hk > ? OR (hk = ? AND sk > ?)`: SQLite cannot seek on that form — it takes only `hk > ?` as the
+	 * index bound and re-checks every remaining row. A range partition holds one hash key, so each page
+	 * would restart at that key's first row and a full pass would be quadratic. Measured over 50k rows
+	 * under one hk: 337 page reads for a late page against 4 for the row-value form.
+	 *
+	 * Row values are only correct because hk/sk are NOT NULL (see the items migration). A NULL on either
+	 * side makes the comparison NULL instead of true, which drops rows silently. A key with no sort key
+	 * stores the empty blob, which is the byte minimum and compares like any other value.
 	 */
 	queryItemsPage(cursor: ScanCursor | null, limit: number): MigratedItem[] {
 		type Row = {
@@ -651,8 +661,7 @@ export class PartitionStore {
 			);
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk > ? OR (hk = ? AND sk > ?) ORDER BY hk, sk LIMIT ?`,
-				cursor.hk,
+				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.sk,
 				limit,
@@ -880,7 +889,13 @@ export class PartitionStore {
 		this.#storage.sql.exec(`DELETE FROM pending_transactions`);
 	}
 
-	/** Pages pending_transactions in (hk, sk, transaction_id) order, strictly after `cursor`. */
+	/**
+	 * Pages pending_transactions in (hk, sk, transaction_id) order, strictly after `cursor`.
+	 *
+	 * The cursor MUST stay a row-value comparison, for the reason spelled out on queryItemsPage: the
+	 * equivalent nested `hk > ? OR (hk = ? AND (...))` form cannot seek, so each page rescans from the
+	 * start of the hash key. All three key columns are NOT NULL, which is what makes row values correct.
+	 */
 	queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
 		type Row = {
 			hk: ArrayBuffer;
@@ -902,11 +917,9 @@ export class PartitionStore {
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
 				`SELECT ${cols} FROM pending_transactions
-				 WHERE hk > ? OR (hk = ? AND (sk > ? OR (sk = ? AND transaction_id > ?)))
+				 WHERE (hk, sk, transaction_id) > (?, ?, ?)
 				 ORDER BY hk, sk, transaction_id LIMIT ?`,
 				cursor.hk,
-				cursor.hk,
-				cursor.sk,
 				cursor.sk,
 				cursor.transaction_id,
 				limit,

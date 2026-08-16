@@ -173,6 +173,58 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	// Keys with no sort key store the empty blob. Paging must step across the empty/non-empty boundary
+	// without skipping or repeating a row — the failure mode of a mis-written keyset cursor.
+	it("queryItemsPage pages across keys that have no sort key", async () => {
+		await withStore((store) => {
+			const EMPTY = KeyCodec.encodeOptional(undefined);
+			const keys: [KeyBytes, KeyBytes][] = [
+				[kb("a"), EMPTY],
+				[kb("a"), kb("m")],
+				[kb("b"), EMPTY],
+				[kb("c"), kb("q")],
+			];
+			for (const [hk, sk] of keys) {
+				store.upsertItem({ hk, sk, data: "d", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			}
+			// Walk the whole table one row at a time, the way migration does.
+			const seen: string[] = [];
+			let cursor: { hk: KeyBytes; sk: KeyBytes } | null = null;
+			for (;;) {
+				const page = store.queryItemsPage(cursor, 1);
+				if (page.length === 0) break;
+				const row = page[0];
+				seen.push(`${KeyCodec.decode(row.hk)}/${row.sk.byteLength === 0 ? "" : KeyCodec.decode(row.sk)}`);
+				cursor = { hk: row.hk, sk: row.sk };
+			}
+			expect(seen).toEqual(["a/", "a/m", "b/", "c/q"]);
+		});
+	});
+
+	// The keyset cursors must SEEK on the full key tuple. An `hk > ? OR (hk = ? AND sk > ?)` rewrite
+	// still returns correct rows, so only the query plan catches the regression: SQLite would bind just
+	// `hk>?` and re-check the rest, making every page O(rows already passed).
+	it("keyset cursors seek on the whole key tuple", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string, ...params: unknown[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			expect(plan(`SELECT hk, sk FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT 1`, kb("a"), kb("1"))).toContain("(hk,sk)>(?,?)");
+			expect(
+				plan(
+					`SELECT hk, sk FROM pending_transactions WHERE (hk, sk, transaction_id) > (?, ?, ?) ORDER BY hk, sk, transaction_id LIMIT 1`,
+					kb("a"),
+					kb("1"),
+					"tx",
+				),
+			).toContain("(hk,sk,transaction_id)>(?,?,?)");
+		});
+	});
+
 	it("stores json as JSONB, persists data_kind, and decodes to JSON text on read", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ a: 1, b: ["x", true, null] });
