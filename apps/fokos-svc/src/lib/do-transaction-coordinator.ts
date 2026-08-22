@@ -140,7 +140,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			doStorage: ctx.storage,
 		});
 		void ctx.blockConcurrencyWhile(async () => {
-			await this.#migrations.runAll();
+			this.#migrations.runAllSync();
 		});
 	}
 

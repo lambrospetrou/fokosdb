@@ -244,7 +244,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			logParams: () => this.logParams(),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
-			await this.#store.runMigrations();
+			this.#store.runMigrations();
 
 			// Load partition context from storage.
 			const pCtx = ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);

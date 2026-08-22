@@ -323,8 +323,8 @@ export class PartitionStore {
 		});
 	}
 
-	async runMigrations(): Promise<void> {
-		await this.#migrations.runAll();
+	runMigrations(): void {
+		this.#migrations.runAllSync();
 	}
 
 	get databaseSize(): number {
