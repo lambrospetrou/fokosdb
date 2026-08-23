@@ -142,6 +142,30 @@ export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResultEncoded[];
 };
 
+// ─── PartitionDO — SingleShot (single-partition fast path) ───────────────────
+
+/**
+ * A whole `transactWriteItems` handed to ONE partition, which validates and applies it inside one
+ * storage transaction.
+ *
+ * It carries no transaction id and no timestamp. Nothing is locked and nothing outlives the call, so
+ * there is no outcome for a recovery job to resolve later; and with no coordinator in the protocol
+ * there is no second clock, so the partition stamps the write with its own — exactly as a
+ * non-transactional put does.
+ */
+export type SingleShotRequest = {
+	items: TransactionItem[];
+};
+
+/**
+ * Only two rejection reasons can reach a caller here: `condition_failed` and `pending_conflict`
+ * against a two-phase transaction that holds a lock. `timestamp_conflict` and `clock_skew` order a
+ * transaction against writes that interleave between its prepare and its commit, and this path has
+ * no such window — one DO validates and applies the whole set serially inside one storage
+ * transaction, so serializability comes from the execution order.
+ */
+export type SingleShotResponse = { outcome: "committed" } | { outcome: "rejected"; reason: RejectionReason };
+
 // ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
 
 /**

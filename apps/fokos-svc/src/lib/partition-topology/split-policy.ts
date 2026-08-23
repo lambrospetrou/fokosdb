@@ -133,6 +133,7 @@ export interface PartitionTopologySplitter {
 	 * Automatically queues a split if the conditions are met, so the caller doesn't need to worry about it.
 	 */
 	maybeQueueSplit(hashKey: KeyBytes, sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
+	maybeQueueSplitNoKey(inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
 
 	/**
 	 * Computes and validates the child partition contexts for the queued split. Pure decision —
@@ -255,7 +256,14 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 	}
 
-	shouldSplit(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): SplitType | null {
+	async maybeQueueSplitNoKey(inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined> {
+		const splitType = this.shouldSplit(undefined, undefined, inputs);
+		if (splitType) {
+			return this.#splitState.queueSplit(splitType, this.partitionContext);
+		}
+	}
+
+	shouldSplit(_hashKey: KeyBytes | undefined, _sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): SplitType | null {
 		const dbSize = this.#storage.sql.databaseSize;
 		if (this.partitionContext.hashSplitConditions.maxSizeMb && dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1024 * 1024) {
 			// Mutual exclusion: no hash split while any promoted key is queued or promoting.
@@ -484,6 +492,13 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		_sortKey: KeyBytes | undefined,
 		_inputs: SplitDecisionInputs,
 	): Promise<SplitStatusKVItem | undefined> {
+		const splitType = this.shouldSplit();
+		if (splitType) {
+			return this.#splitState.queueSplit(splitType, this.partitionContext);
+		}
+	}
+
+	async maybeQueueSplitNoKey(_inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined> {
 		const splitType = this.shouldSplit();
 		if (splitType) {
 			return this.#splitState.queueSplit(splitType, this.partitionContext);

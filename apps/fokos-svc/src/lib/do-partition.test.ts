@@ -2048,6 +2048,150 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	});
 });
 
+describe("PartitionDO — single-shot transaction", () => {
+	/** Counts the lock rows this partition holds, whatever transaction owns them. */
+	async function pendingLockCount(stub: DurableObjectStub<PartitionDO>): Promise<number> {
+		return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			return state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions`).one().n;
+		});
+	}
+
+	it("applies puts, deletes and checks in one shot, and takes no lock", async () => {
+		const { ctx, stub } = makeStub();
+		await stub.apiPutItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk"), data: "old", kind: "text" as const });
+		await stub.apiPutItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk"), data: "keep", kind: "text" as const });
+
+		const res = await stub.txExecuteSingleShot(ctx, {
+			items: [
+				{ hashKey: kb("shot-new"), sortKey: kb("sk"), operation: "put", data: "written", kind: "text" },
+				{ hashKey: kb("shot-gone"), sortKey: kb("sk"), operation: "delete" },
+				{ hashKey: kb("shot-checked"), sortKey: kb("sk"), operation: "check", conditions: [{ type: "item_exists" }] },
+			],
+		});
+
+		expect(res).toEqual({ outcome: "committed" });
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-new"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "written" },
+		});
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "keep" },
+		});
+		// Nothing to cancel, nothing to recover: this path holds no lock at any point.
+		expect(await pendingLockCount(stub)).toBe(0);
+	});
+
+	it("rejects on a failed condition, leaving no partial write and no lock", async () => {
+		const { ctx, stub } = makeStub();
+		await stub.apiPutItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
+
+		// The failing item is LAST, so a non-atomic implementation would already have written the first.
+		const res = await stub.txExecuteSingleShot(ctx, {
+			items: [
+				{ hashKey: kb("atomic-existing"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" },
+				{ hashKey: kb("atomic-other"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
+				{ hashKey: kb("atomic-absent"), sortKey: kb("sk"), operation: "check", conditions: [{ type: "item_exists" }] },
+			],
+		});
+
+		expect(res).toEqual({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" } });
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "v1", version: 1 },
+		});
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-other"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		expect(await pendingLockCount(stub)).toBe(0);
+	});
+
+	it("rejects with pending_conflict against a two-phase transaction that holds a lock", async () => {
+		const { ctx, stub } = makeStub();
+		const transactionId = crypto.randomUUID();
+		const prepared = await stub.txPrepare(ctx, {
+			transactionId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: [{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "two-phase", kind: "text" }],
+		});
+		expect(prepared.outcome).toBe("accepted");
+
+		const res = await stub.txExecuteSingleShot(ctx, {
+			items: [
+				{ hashKey: kb("shot-free"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
+				{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
+			],
+		});
+
+		// The two-phase transaction may still commit, so this one loses rather than overwriting it.
+		expect(res).toMatchObject({
+			outcome: "rejected",
+			reason: { type: "pending_conflict", hashKey: "shot-locked", conflictingTransactionId: transactionId },
+		});
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-free"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		// Only the two-phase lock, and this path added none of its own.
+		expect(await pendingLockCount(stub)).toBe(1);
+
+		await stub.txCancel(ctx, { transactionId, items: [{ hashKey: kb("shot-locked"), sortKey: kb("sk") }] });
+	});
+
+	it("reports backpressure from an over-size partition", async () => {
+		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
+		// written and every write is refused for size.
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
+		const error = await stub
+			.txExecuteSingleShot(ctx, { items: [{ hashKey: kb("over-size"), sortKey: kb("sk"), operation: "put", data: "d", kind: "text" }] })
+			.then(
+				() => null,
+				(e: unknown) => e,
+			);
+		expect(isPartitionExceededDatabaseSizeError(error)).toBe(true);
+	});
+
+	it("queues a split once its writes push the partition over the threshold", async () => {
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const data = "x".repeat(64 * 1024);
+
+		for (let i = 0; i < 40; i++) {
+			const res = await stub.txExecuteSingleShot(ctx, {
+				items: [{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }],
+			});
+			expect(res.outcome).toBe("committed");
+			if ((await stub.status()).splitStatus) break;
+		}
+
+		// Only the write paths that call checkSplits can queue a split — the background job runs one
+		// that is already queued, it never queues one itself.
+		const { splitStatus } = await stub.status();
+		expect(splitStatus).toBeDefined();
+		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
+		await drainSplitTree(stub);
+	});
+});
+
+describe("PartitionDO — two-phase commit queues splits", () => {
+	it("queues a split once committed transactions push the partition over the threshold", async () => {
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const data = "x".repeat(64 * 1024);
+		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+
+		for (let i = 0; i < 40; i++) {
+			const transactionId = crypto.randomUUID();
+			const items = [{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const }];
+			const transactionTimestamp = Date.now() + i;
+			expect(await stub.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
+			await stub.txCommit(ctx, { transactionId, transactionTimestamp, items });
+			if ((await stub.status()).splitStatus) break;
+		}
+
+		// The background job only RUNS a queued split, so a status here proves commit queued one.
+		const { splitStatus } = await stub.status();
+		expect(splitStatus).toBeDefined();
+		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
+		await drainSplitTree(stub);
+	});
+});
+
 describe("PartitionDO — single-partition read snapshot", () => {
 	it("answers every key from local storage, positionally matched to the request", async () => {
 		const { ctx, stub } = makeStub();

@@ -11,6 +11,8 @@ import type {
 	ReadForTransactionResponse,
 	ReadSnapshotRequest,
 	ReadSnapshotResponse,
+	SingleShotRequest,
+	SingleShotResponse,
 	TransactionItem,
 } from "./transaction-types.js";
 import {
@@ -171,6 +173,7 @@ export type PartitionDOStub = {
 	txCancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
 	txReadForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 	txReadSnapshot(ctx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse>;
+	txExecuteSingleShot(ctx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse>;
 };
 
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
@@ -1034,6 +1037,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return splitStatus;
 	}
 
+	private async checkSplitsNoKey(pCtx: PartitionContextResolved): Promise<SplitStatusKVItem | undefined> {
+		const topology = this.ensureTopology(pCtx);
+		const splitStatus = await topology.maybeQueueSplitNoKey({
+			hasInFlightPromotions: this.#promotion.hasInFlightPromotions(),
+		});
+		if (splitStatus) {
+			console.log({
+				...this.logParams(),
+				message: "fokos/partition: Split conditions met.",
+				splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
+			});
+			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+			this.scheduleBackgroundWork({ delayMs: 10 });
+		}
+
+		return splitStatus;
+	}
+
 	/**
 	 * Orchestrates the split fan-out: the policy decides (prepareSplit), the DO performs the RPCs
 	 * (boundary rule: only DO classes and FokosDB hold stubs). Failure ordering matches the old
@@ -1243,6 +1264,28 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			tasks.push(Promise.resolve(this.#participant.commitLocal({ ...request, items: local })));
 		}
 		await Promise.all(tasks);
+
+		if (local.length > 0) {
+			// Transactional writes grow a partition exactly as apiPutItem does, so they have to be able
+			// to queue a split too — the background job only RUNS a split that is already queued, it
+			// never queues one. Without this, a workload that writes only through transactions grows
+			// without ever splitting.
+			//
+			// Unlike apiPutItem, a throw here is absorbed: the coordinator has already decided this
+			// transaction and the items are already applied, so failing the commit would wedge a decided
+			// transaction over bookkeeping that the next write repeats anyway.
+			try {
+				await this.checkSplitsNoKey(pCtx);
+			} catch (error) {
+				console.error({
+					...this.logParams(),
+					message: "fokos/partition.commit: split check failed after the transaction applied.",
+					transactionId: request.transactionId,
+					error: String(error),
+					errorProps: error,
+				});
+			}
+		}
 		return { outcome: "committed" };
 	}
 
@@ -1328,6 +1371,37 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return { outcome: "aborted", reason: "pending_write" };
 		}
 		return { outcome: "committed", items };
+	}
+
+	/**
+	 * The single-partition fast path for `transactWriteItems`: one round trip, no coordinator, no
+	 * lock rows, no alarms and no state left behind. The partition validates and applies the whole
+	 * set inside one storage transaction, which is where its atomicity comes from.
+	 *
+	 * There is no `await` between the routing decision and the apply. A split can only advance at an
+	 * input-gate point, so an unbroken synchronous block closes the split and promotion races: the
+	 * items cannot start belonging to another DO between the check and the write.
+	 */
+	async txExecuteSingleShot(pCtx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse> {
+		this.ensurePartitionContext(pCtx);
+		invariant(request.items.length > 0, "fokos/partition.executeSingleShot: at least one item is required");
+		await this.ensureMigration("executeSingleShot");
+
+		const route = this.routeSingleDestination(request.items, "write", "executeSingleShot");
+		if (route.destination === "child") {
+			return await this.getChildStub(route.pCtx).txExecuteSingleShot(route.pCtx, request);
+		}
+		const response = this.#participant.executeSingleShot(request);
+		if (response.outcome === "rejected") {
+			return response;
+		}
+
+		// ONCE per transaction, not once per item.
+		// Called bare, as apiPutItem calls it: everything it touches is local to this DO, and the apply
+		// that just ran is proof that this storage works, so a throw here is a defect worth surfacing.
+		await this.checkSplitsNoKey(pCtx);
+
+		return response;
 	}
 
 	/**

@@ -19,12 +19,14 @@ import {
 	QueryItemsOptions,
 	QueryItemsResult,
 } from "./types.js";
-import { PartitionDO, isSinglePartitionFastPathFallbackError } from "./do-partition.js";
+import { PartitionDO, isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "./do-partition.js";
 import { isDestroyAbortError } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type {
+	IdempotencyToken,
 	InitiateReadResponseEncoded,
+	SingleShotResponse,
 	TCWriteOperation,
 	TCReadItem,
 	TransactGetItemsOptions,
@@ -206,6 +208,10 @@ export class FokosDB {
 	}
 
 	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+		if (opts.clientRequestToken !== undefined && opts.clientRequestToken.trim().length === 0) {
+			throw new Error("fokosdb: clientRequestToken must be a non-empty string when provided");
+		}
+
 		// Encode a put's data once at this boundary; the TC/DO see string | Uint8Array + kind. Validation
 		// below then measures the encoded form. A non-put is passed through untouched, so a `data` field
 		// set by a non-TypeScript caller still reaches validation.
@@ -218,14 +224,68 @@ export class FokosDB {
 			return { ...item, hashKey, sortKey, partitionContext };
 		});
 
+		if (!opts.clientRequestToken) {
+			// A transaction that carries a client request token does not use this path: an idempotent replay
+			// is answered from the coordinator's ledger, and a partition keeps no record of finished
+			// transactions.
+			//
+			// TODO: give the partition its own completed-transaction-token storage. Once a partition can
+			// recognise a token it has already executed and return that outcome, this restriction lifts and
+			// token-bearing single-partition transactions can take the same single round trip.
+			const fastPathResult = await this.#writeSingleShotFastPath(items);
+			if (fastPathResult) return fastPathResult;
+		}
+
 		// TODO: We need to catch DO errors and retry with a different idempotency token to route
 		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
+
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See InitiateWriteResponse.
 		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
 		});
+	}
+
+	/**
+	 * One round trip to the owning partition when it owns every item, which applies the whole set
+	 * atomically. Returns null when the fast path does not apply, so the caller runs the coordinator
+	 * path: the option is off, the transaction carries a token, the client hint says the items span
+	 * partitions, or the partition itself answered that they do.
+	 *
+	 * `transactionId` is generated here, as the coordinator would generate it: nothing on this path
+	 * stores it, and it exists only so the public response shape is the same on both paths.
+	 */
+	async #writeSingleShotFastPath(items: TCWriteOperation[]): Promise<InitiateWriteResponse | null> {
+		if (!this.#options.singlePartitionFastPath) return null;
+
+		const target = singlePartitionTarget(items);
+		if (!target) return null;
+
+		const transactionId = crypto.randomUUID().replaceAll("-", "");
+		const stub = PartitionDO.getByName(env[target.ns], target.doName);
+		const request = { items: items.map(({ partitionContext: _partitionContext, ...item }) => item) };
+
+		let response: SingleShotResponse;
+		try {
+			// No retry, matching the coordinator path, which does not retry a write either.
+			response = await stub.txExecuteSingleShot(target, request);
+		} catch (err) {
+			// The fallback is the ONE error that means "run the coordinator path instead". It carries no
+			// side effects, so nothing was written and nothing has to be undone.
+			if (isSinglePartitionFastPathFallbackError(err)) return null;
+			// A partition past its size cap is healthy, just full. The coordinator answers a prepare that
+			// throws this with a cancelled transaction, and this path must answer identically.
+			if (isPartitionExceededDatabaseSizeError(err)) {
+				return { outcome: "cancelled", transactionId, idempotencyToken: transactionId, reason: { type: "transient_error" } };
+			}
+			throw err;
+		}
+
+		if (response.outcome === "committed") {
+			return { outcome: "committed", transactionId, idempotencyToken: transactionId };
+		}
+		return { outcome: "cancelled", transactionId, idempotencyToken: transactionId, reason: response.reason };
 	}
 
 	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {

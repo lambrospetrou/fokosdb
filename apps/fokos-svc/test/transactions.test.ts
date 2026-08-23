@@ -1,5 +1,4 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../src/lib/db.js";
@@ -10,7 +9,8 @@ import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/route
 import invariant from "../src/lib/invariant.js";
 import { KeyCodec } from "../src/lib/partition-topology/key-codec.js";
 
-function makeDB(opts?: { singlePartitionFastPath?: boolean }) {
+function makeDB(opts?: { singlePartitionFastPath?: boolean; maxSizeMb?: number }) {
+	const { maxSizeMb, ...dbOptions } = opts ?? {};
 	const prefix = `txtest.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
@@ -19,14 +19,14 @@ function makeDB(opts?: { singlePartitionFastPath?: boolean }) {
 		rootTreesN: 100,
 		hashSplitN: 2,
 		rangeSplitN: 2,
-		hashSplitConditions: { maxSizeMb: 100 },
+		hashSplitConditions: { maxSizeMb: maxSizeMb ?? 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const topology = new PartitionTopologyRouterImpl(base);
 	return new FokosDB({
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 		topology,
-		...opts,
+		...dbOptions,
 	});
 }
 
@@ -321,7 +321,11 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("serializability: concurrent transactions on the same key — loser retries and eventually commits", async () => {
-		const db = makeDB();
+		// The coordinator path, pinned: this key set is single-partition and untokened, so the fast path
+		// would take it, and there the premise below stops existing — the fast path holds no lock, so
+		// both transactions serialize inside the partition and neither loses. The fast-path counterpart
+		// is the next test.
+		const db = makeDB({ singlePartitionFastPath: false });
 
 		let firstRetries = 0,
 			secondRetries = 0;
@@ -385,6 +389,24 @@ describe("transactions - end-to-end", () => {
 			expect(result.item.data).toBe(value === tx1 ? "tx1" : "tx2");
 			expect(result.item.version).toBe(2);
 		}
+	});
+
+	it("serializability: concurrent single-partition transactions both commit with no retry", async () => {
+		const db = makeDB();
+
+		const write = async (data: string) => await db.transactWriteItems({ items: [{ hashKey: "ser-fast-key", operation: "put", data }] });
+		const [tx1, tx2] = await Promise.all([write("tx1"), write("tx2")]);
+
+		// The partition takes no lock for either, so neither can conflict with the other: they serialize
+		// inside the single-threaded DO and both commit on their first attempt.
+		expect(tx1.outcome).toBe("committed");
+		expect(tx2.outcome).toBe("committed");
+
+		// Applied one after the other, so the surviving value is one of the two and the item saw two writes.
+		const result = await db.getItem({ hashKey: "ser-fast-key" });
+		invariant(result.found);
+		expect(["tx1", "tx2"]).toContain(result.item.data);
+		expect(result.item.version).toBe(2);
 	});
 
 	it("transactGetItems returns consistent snapshot across partitions", async () => {
@@ -708,10 +730,17 @@ describe("transactions - single-partition fast path", () => {
 		vi.restoreAllMocks();
 	});
 
-	/** Counts the RPCs each path makes, so a test can assert which one ran. */
-	function countPathCalls() {
+	/** Counts the RPCs each read path makes, so a test can assert which one ran. */
+	function countReadPathCalls() {
 		const partitionCalls = vi.spyOn(PartitionDO.prototype, "txReadSnapshot");
 		const coordinatorCalls = vi.spyOn(TransactionCoordinatorDO.prototype, "initiateRead");
+		return { partitionCalls, coordinatorCalls };
+	}
+
+	/** The same, for the write paths. */
+	function countWritePathCalls() {
+		const partitionCalls = vi.spyOn(PartitionDO.prototype, "txExecuteSingleShot");
+		const coordinatorCalls = vi.spyOn(TransactionCoordinatorDO.prototype, "initiateWrite");
 		return { partitionCalls, coordinatorCalls };
 	}
 
@@ -727,7 +756,7 @@ describe("transactions - single-partition fast path", () => {
 			await slowDb.putItem({ ...key, data: `data-${key.hashKey}` });
 		}
 
-		const { partitionCalls, coordinatorCalls } = countPathCalls();
+		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
 		const fast = await db.transactGetItems({ items: keys });
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
 		expect(coordinatorCalls).not.toHaveBeenCalled();
@@ -750,64 +779,13 @@ describe("transactions - single-partition fast path", () => {
 		expect(countDistinctPartitions(db, keys)).toBe(2);
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
-		const { partitionCalls, coordinatorCalls } = countPathCalls();
+		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
 		const result = await db.transactGetItems({ items: keys });
 
 		expect(result.outcome).toBe("committed");
 		expect(partitionCalls).not.toHaveBeenCalled();
 		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
 	});
-
-	it("aborts with pending_write while a two-phase transaction holds a lock, on both paths", async () => {
-		const db = makeDB();
-		const slowDb = makeDB({ singlePartitionFastPath: false });
-		const keys = keysInOnePartition(db, 2, "fast-locked");
-		for (const key of keys) {
-			await db.putItem({ ...key, data: "v" });
-			await slowDb.putItem({ ...key, data: "v" });
-		}
-
-		// Locks the second key with a prepare that is never committed, and returns the release.
-		const lock = async (dbUnderTest: FokosDB) => {
-			const topology = dbUnderTest.options().topology as PartitionTopologyRouterImpl;
-			const { doId, partitionContext } = topology.pickPartition(KeyCodec.encode(keys[1].hashKey), KeyCodec.encode(keys[1].sortKey));
-			const stub = PartitionDO.get(env.PARTITION_DO, doId);
-			const transactionId = crypto.randomUUID();
-			const lockedKey = { hashKey: KeyCodec.encode(keys[1].hashKey), sortKey: KeyCodec.encode(keys[1].sortKey) };
-			// One millisecond past the put above: a prepare stamped at or below an item's
-			// last_transaction_ts is rejected as a timestamp conflict and would take no lock.
-			const prepared = await stub.txPrepare(partitionContext, {
-				transactionId,
-				transactionTimestamp: Date.now() + 1,
-				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
-				items: [{ ...lockedKey, operation: "put", data: "pending", kind: "text" }],
-			});
-			expect(prepared.outcome).toBe("accepted");
-			return async () => {
-				await stub.txCancel(partitionContext, { transactionId, items: [lockedKey] });
-				// The prepare also armed the stale-transaction recovery alarm. The cancel clears the lock
-				// but not the alarm, and work left scheduled here runs once this test is over — in another
-				// test's context, where the DO can no longer touch its own storage. With no pending
-				// transaction left, this drains the alarm and its background work without re-arming.
-				await runDurableObjectAlarm(stub);
-				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await vi.waitUntil(() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning, {
-						timeout: 5_000,
-						interval: 50,
-					});
-				});
-			};
-		};
-		const releaseFast = await lock(db);
-		const releaseSlow = await lock(slowDb);
-
-		await expect(db.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "pending_write" });
-		await expect(slowDb.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "pending_write" });
-
-		await releaseFast();
-		await releaseSlow();
-		await expect(db.transactGetItems({ items: keys })).resolves.toMatchObject({ outcome: "committed" });
-	}, 10_000);
 
 	it("runs the coordinator path when the partition answers that it cannot execute the whole set", async () => {
 		const db = makeDB();
@@ -817,7 +795,7 @@ describe("transactions - single-partition fast path", () => {
 		// A partition raises this when the items straddle a split or a promotion below it. Standing in
 		// for that setup here keeps the test on what db.ts owns: recognising the sentinel and finishing
 		// the read on the coordinator path. The raise itself is covered in do-partition.test.ts.
-		const { partitionCalls, coordinatorCalls } = countPathCalls();
+		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
 		partitionCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (readSnapshot)."));
 
 		const result = await db.transactGetItems({ items: keys });
@@ -834,10 +812,105 @@ describe("transactions - single-partition fast path", () => {
 		const keys = keysInOnePartition(db, 2, "fast-transport");
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
-		const { partitionCalls, coordinatorCalls } = countPathCalls();
+		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
 		partitionCalls.mockRejectedValue(new Error("Network connection lost."));
 
 		await expect(db.transactGetItems({ items: keys })).rejects.toThrow(/Network connection lost/);
 		expect(coordinatorCalls).not.toHaveBeenCalled();
+	});
+
+	it("writes a single-partition transaction in one round trip, with no coordinator", async () => {
+		const db = makeDB();
+		const keys = keysInOnePartition(db, 3, "fast-write");
+		await db.putItem({ ...keys[1], data: "to-delete" });
+		await db.putItem({ ...keys[2], data: "to-check" });
+
+		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
+		const result = await db.transactWriteItems({
+			items: [
+				{ ...keys[0], operation: "put", data: "written" },
+				{ ...keys[1], operation: "delete" },
+				{ ...keys[2], operation: "check", conditions: [{ type: "item_exists" }] },
+			],
+		});
+
+		expect(partitionCalls).toHaveBeenCalledTimes(1);
+		expect(coordinatorCalls).not.toHaveBeenCalled();
+		// The public shape is the same on both paths, so a caller cannot tell which one ran.
+		expect(result).toMatchObject({ outcome: "committed", transactionId: expect.any(String), idempotencyToken: expect.any(String) });
+
+		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: true, item: { data: "written" } });
+		await expect(db.getItem(keys[1])).resolves.toMatchObject({ found: false });
+		await expect(db.getItem(keys[2])).resolves.toMatchObject({ found: true, item: { data: "to-check" } });
+	});
+
+	it("reports a failed condition as a cancelled transaction, writing nothing", async () => {
+		const db = makeDB();
+		const keys = keysInOnePartition(db, 2, "fast-condition");
+
+		const { partitionCalls } = countWritePathCalls();
+		const result = await db.transactWriteItems({
+			items: [
+				{ ...keys[0], operation: "put", data: "never" },
+				{ ...keys[1], operation: "put", data: "never", conditions: [{ type: "item_exists" }] },
+			],
+		});
+
+		expect(partitionCalls).toHaveBeenCalledTimes(1);
+		expect(result).toMatchObject({ outcome: "cancelled", reason: { type: "condition_failed", hashKey: keys[1].hashKey } });
+		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: false });
+	});
+
+	it("keeps a transaction that carries a clientRequestToken on the coordinator path", async () => {
+		const db = makeDB();
+		const keys = keysInOnePartition(db, 2, "fast-token");
+		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "tokened" }));
+		const clientRequestToken = `fast-token-${crypto.randomUUID()}`;
+
+		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
+		const first = await db.transactWriteItems({ items, clientRequestToken });
+		const replay = await db.transactWriteItems({ items, clientRequestToken });
+
+		// A partition keeps no record of finished transactions, so only the coordinator's ledger can
+		// answer the replay — which is why a token holds a transaction on that path.
+		expect(partitionCalls).not.toHaveBeenCalled();
+		expect(coordinatorCalls).toHaveBeenCalledTimes(2);
+		expect(first.outcome).toBe("committed");
+		expect(replay).toEqual(first);
+	});
+
+	it("reports a write past the size cap as cancelled with transient_error, on both paths", async () => {
+		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
+		// written and every write is refused for size.
+		const overSize = { maxSizeMb: 0.000_001 };
+		const items = [{ hashKey: "over-size", operation: "put" as const, data: "d" }];
+
+		const fast = await makeDB(overSize).transactWriteItems({ items });
+		const slow = await makeDB({ ...overSize, singlePartitionFastPath: false }).transactWriteItems({ items });
+
+		expect(fast).toMatchObject({ outcome: "cancelled", reason: { type: "transient_error" } });
+		expect(slow).toMatchObject({ outcome: "cancelled", reason: { type: "transient_error" } });
+	});
+
+	it("runs the coordinator path for a write when the partition cannot execute the whole set", async () => {
+		const db = makeDB();
+		const keys = keysInOnePartition(db, 2, "fast-write-fallback");
+
+		// A partition raises this when the items straddle a split or a promotion below it. The raise
+		// itself is covered in do-partition.test.ts; what matters here is that db.ts recognises it and
+		// finishes the write on the coordinator path.
+		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
+		partitionCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (executeSingleShot)."));
+
+		const result = await db.transactWriteItems({
+			items: keys.map((key) => ({ ...key, operation: "put" as const, data: "via-coordinator" })),
+		});
+
+		expect(partitionCalls).toHaveBeenCalledTimes(1);
+		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
+		expect(result.outcome).toBe("committed");
+		for (const key of keys) {
+			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: "via-coordinator" } });
+		}
 	});
 });

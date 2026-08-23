@@ -6,6 +6,8 @@ import type {
 	ReadForTransactionItemResultEncoded,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	SingleShotRequest,
+	SingleShotResponse,
 	TransactionItem,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
@@ -207,6 +209,87 @@ export class TransactionParticipant {
 				this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
 			}
 		}
+	}
+
+	/**
+	 * Validates and applies a whole transaction that this partition owns end to end, in one storage
+	 * transaction. It is the transactional equivalent of the non-transactional write path, not a
+	 * phase of the two-phase protocol: it takes no lock, so it needs no cancel, no stale-transaction
+	 * alarm and no recovery, and it can never be the cause of another transaction's pending conflict.
+	 *
+	 * A lock held by a two-phase transaction still wins: that transaction may yet commit, so this one
+	 * is rejected rather than allowed to overwrite the decision.
+	 *
+	 * The timestamp is this partition's own clock, as `apiPutItem` stamps it. `PartitionStore` keeps
+	 * per-item monotonicity in SQL, so a stamp from a lagging clock is absorbed, not applied.
+	 */
+	executeSingleShot(request: SingleShotRequest): SingleShotResponse {
+		const transactionTimestamp = this.#now();
+
+		return this.#store.transactionSync<SingleShotResponse>(() => {
+			for (const item of request.items) {
+				const sk = item.sortKey;
+				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
+
+				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
+				if (pendingRow) {
+					return {
+						outcome: "rejected",
+						reason: {
+							type: "pending_conflict",
+							...rejectionKeys,
+							conflictingTransactionId: pendingRow.transaction_id,
+						},
+					};
+				}
+
+				if (item.conditions && item.conditions.length > 0) {
+					const itemRow = this.#store.getItemStamp(item.hashKey, sk).row;
+					const snapshot: ItemSnapshot = itemRow
+						? { found: true, hk: item.hashKey, sk, v: itemRow.v }
+						: { found: false, hk: item.hashKey, sk };
+					try {
+						evaluateConditionsOnItem(snapshot, item.conditions, "singleShot");
+					} catch {
+						return {
+							outcome: "rejected",
+							reason: { type: "condition_failed", ...rejectionKeys },
+						};
+					}
+				}
+			}
+
+			// Every item passed, so the whole set applies. Reaching this point inside transactionSync is
+			// what makes the transaction atomic: a throw below rolls the statements above back with it.
+			for (const item of request.items) {
+				const sk = item.sortKey;
+				if (item.operation === "put") {
+					// A put always carries both data and kind; assert together so upsertItem gets a real kind.
+					invariant(
+						item.data != null && item.kind != null,
+						() => `fokos/partition.singleShot: "put" item has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
+					);
+					const res = this.#store.upsertItem({
+						hk: item.hashKey,
+						sk,
+						data: item.data,
+						// For kind=json -> data is raw JSON text; upsertItem re-encodes it to JSONB.
+						kind: item.kind,
+						ttlEpochUtcSeconds: null,
+						lastTransactionTs: transactionTimestamp,
+					});
+					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
+				} else if (item.operation === "delete") {
+					this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
+				} else {
+					// A check writes nothing, but it still orders this transaction against later ones:
+					// transactGetItems uses last_transaction_ts as its second conflict signal.
+					this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
+				}
+			}
+
+			return { outcome: "committed" };
+		});
 	}
 
 	cancelLocal(transactionId: string): void {
