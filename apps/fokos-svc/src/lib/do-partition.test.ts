@@ -1,7 +1,12 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { InitFromSplitOptions, isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
+import {
+	InitFromSplitOptions,
+	isPartitionExceededDatabaseSizeError,
+	isSinglePartitionFastPathFallbackError,
+	PartitionDO,
+} from "./do-partition.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
@@ -2040,6 +2045,100 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 			items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
 		});
 		expect(res.items).toHaveLength(1);
+	});
+});
+
+describe("PartitionDO — single-partition read snapshot", () => {
+	it("answers every key from local storage, positionally matched to the request", async () => {
+		const { ctx, stub } = makeStub();
+		await stub.apiPutItem(ctx, { hashKey: kb("snap-a"), sortKey: kb("sk"), data: "a", kind: "text" as const });
+		await stub.apiPutItem(ctx, { hashKey: kb("snap-b"), sortKey: kb("sk"), data: "b", kind: "text" as const });
+
+		// A missing key and a duplicate: each requested position gets its own answer.
+		const requested = [
+			{ hashKey: kb("snap-b"), sortKey: kb("sk") },
+			{ hashKey: kb("snap-missing"), sortKey: kb("sk") },
+			{ hashKey: kb("snap-a"), sortKey: kb("sk") },
+			{ hashKey: kb("snap-b"), sortKey: kb("sk") },
+		];
+		const res = await stub.txReadSnapshot(ctx, { items: requested });
+
+		invariant(res.outcome === "committed");
+		expect(res.items.map((i) => i.found)).toEqual([true, false, true, true]);
+		expect(res.items.map((i) => KeyCodec.decode(i.hashKey))).toEqual(["snap-b", "snap-missing", "snap-a", "snap-b"]);
+		expect(res.items.filter((i) => i.found).map((i) => (i.found ? i.data : null))).toEqual(["b", "a", "b"]);
+	});
+
+	it("aborts with pending_write when a two-phase transaction holds a lock on one of the keys", async () => {
+		const { ctx, stub } = makeStub();
+		await stub.apiPutItem(ctx, { hashKey: kb("snap-free"), sortKey: kb("sk"), data: "free", kind: "text" as const });
+
+		const prepared = await stub.txPrepare(ctx, {
+			transactionId: crypto.randomUUID(),
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: [{ hashKey: kb("snap-locked"), sortKey: kb("sk"), operation: "put", data: "pending", kind: "text" }],
+		});
+		expect(prepared.outcome).toBe("accepted");
+
+		const res = await stub.txReadSnapshot(ctx, {
+			items: [
+				{ hashKey: kb("snap-free"), sortKey: kb("sk") },
+				{ hashKey: kb("snap-locked"), sortKey: kb("sk") },
+			],
+		});
+		expect(res).toEqual({ outcome: "aborted", reason: "pending_write" });
+	});
+
+	describe("after a hash split", () => {
+		/** Groups probe keys by the child DO that serves them, asking the split root who answered. */
+		async function keysByServingChild(
+			stub: DurableObjectStub<PartitionDO>,
+			ctx: PartitionContextResolved,
+			count: number,
+		): Promise<Map<string, string[]>> {
+			const byChild = new Map<string, string[]>();
+			for (let i = 0; i < count; i++) {
+				const hashKey = `probe-${i}`;
+				const res = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+				const child = res.meta.servedByActorName;
+				expect(child).not.toBe(ctx.doName);
+				byChild.set(child, [...(byChild.get(child) ?? []), hashKey]);
+			}
+			return byChild;
+		}
+
+		it("hands the whole request to the one child that owns every key, and falls back when the keys span two", async () => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			await triggerHashSplitThreshold(stub, ctx, 1);
+			await drainSplitTree(stub);
+
+			// Routing is a pure hash of the key bytes, so this grouping is deterministic, not flaky.
+			const byChild = await keysByServingChild(stub, ctx, 10);
+			expect(byChild.size).toBe(2);
+			const [childA, childB] = [...byChild.values()];
+
+			// One destination: the split root owns nothing itself and forwards the whole set.
+			const oneChild = await stub.txReadSnapshot(ctx, { items: childA.slice(0, 2).map((hk) => ({ hashKey: kb(hk), sortKey: kb("sk") })) });
+			invariant(oneChild.outcome === "committed");
+			expect(oneChild.items.map((i) => KeyCodec.decode(i.hashKey))).toEqual(childA.slice(0, 2));
+
+			// Two destinations: no single DO can answer, so the fallback error comes back with nothing
+			// touched. It crosses a real RPC hop here, which keeps the message but drops the class —
+			// which is what makes the sentinel predicate the thing under test.
+			const error = await stub
+				.txReadSnapshot(ctx, {
+					items: [
+						{ hashKey: kb(childA[0]), sortKey: kb("sk") },
+						{ hashKey: kb(childB[0]), sortKey: kb("sk") },
+					],
+				})
+				.then(
+					() => null,
+					(e: unknown) => e,
+				);
+			expect(isSinglePartitionFastPathFallbackError(error)).toBe(true);
+		});
 	});
 });
 

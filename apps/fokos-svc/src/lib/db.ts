@@ -19,17 +19,24 @@ import {
 	QueryItemsOptions,
 	QueryItemsResult,
 } from "./types.js";
-import { PartitionDO } from "./do-partition.js";
+import { PartitionDO, isSinglePartitionFastPathFallbackError } from "./do-partition.js";
 import { isDestroyAbortError } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
-import type { TCWriteOperation, TCReadItem, TransactGetItemsOptions, TransactWriteItemsOptions } from "./transaction-types.js";
+import type {
+	InitiateReadResponseEncoded,
+	TCWriteOperation,
+	TCReadItem,
+	TransactGetItemsOptions,
+	TransactWriteItemsOptions,
+} from "./transaction-types.js";
 import {
 	encodeHashKey,
 	encodeSortBound,
 	encodeSortKey,
 	validateItemDataSize,
 	validateItemKeys,
+	singlePartitionTarget,
 	validateTransactGetItemCount,
 	validateTransactWriteOperations,
 } from "./transaction-limits.js";
@@ -94,6 +101,16 @@ export type FokosDBOptions = {
 	// This is safe to increase if needed except for retrying the same transaction with the same idempotency token.
 	// Data partitions record the actual DO name they should reach out for recovering the transaction.
 	numTransactionCoordinators?: number;
+
+	/**
+	 * Runs a transaction whose items are all owned by ONE partition against that partition directly,
+	 * in a single round trip, instead of through a transaction coordinator. Defaults to true.
+	 *
+	 * It is an execution strategy, not a semantic: both paths give the same answer, so it belongs
+	 * here and not on the per-call options. Set it to false to force every transaction through the
+	 * coordinator.
+	 */
+	singlePartitionFastPath?: boolean;
 };
 
 /**
@@ -116,6 +133,7 @@ export class FokosDB {
 		this.#options = {
 			...options,
 			numTransactionCoordinators: options.numTransactionCoordinators ?? DEFAULT_NUM_TRANSACTION_COORDINATORS,
+			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
 		if (!Number.isInteger(this.#options.numTransactionCoordinators) || this.#options.numTransactionCoordinators <= 0) {
 			throw new Error("fokosdb: numTransactionCoordinators must be an integer greater or equal to 1");
@@ -220,16 +238,7 @@ export class FokosDB {
 			return { ...item, hashKey, sortKey, partitionContext };
 		});
 
-		const response = await tryWhile(
-			async () => {
-				// Read-only TCs are ephemeral — random UUID, no client idempotency token needed.
-				// Even better using a different shard key each time to maximize chances of hitting different TCs if there is an overloaded one.
-				return await this.#staticShardedTCs.one(crypto.randomUUID(), async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
-					return await tcStub.initiateRead({ items });
-				});
-			},
-			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
-		);
+		const response = (await this.#readSnapshotFastPath(items)) ?? (await this.#readViaCoordinator(items));
 
 		// The public boundary — the single exit where the internal representation becomes the public one:
 		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
@@ -247,6 +256,45 @@ export class FokosDB {
 				return item.found ? { ...item, ...keys, data: decodeItemData(item.kind, item.data) } : { ...item, ...keys };
 			}),
 		};
+	}
+
+	/**
+	 * One round trip to the owning partition when every requested key resolves to it. Returns null
+	 * when the fast path does not apply, so the caller runs the coordinator path: either the client
+	 * hint says the keys span partitions, or the partition itself answered that they do.
+	 */
+	async #readSnapshotFastPath(items: TCReadItem[]): Promise<InitiateReadResponseEncoded | null> {
+		if (!this.#options.singlePartitionFastPath) return null;
+		const target = singlePartitionTarget(items);
+		if (!target) return null;
+
+		const stub = PartitionDO.getByName(env[target.ns], target.doName);
+		const request = { items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) };
+		try {
+			return await tryWhile(
+				async () => await stub.txReadSnapshot(target, request),
+				(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
+			);
+		} catch (err) {
+			// The fallback is the ONE error that means "run the coordinator path instead". It carries no
+			// side effects, so nothing was read and nothing has to be undone. Every other error — a
+			// transport failure included — is the caller's, exactly as on the coordinator path.
+			if (!isSinglePartitionFastPathFallbackError(err)) throw err;
+			return null;
+		}
+	}
+
+	async #readViaCoordinator(items: TCReadItem[]): Promise<InitiateReadResponseEncoded> {
+		return await tryWhile(
+			async () => {
+				// Read-only TCs are ephemeral — random UUID, no client idempotency token needed.
+				// Even better using a different shard key each time to maximize chances of hitting different TCs if there is an overloaded one.
+				return await this.#staticShardedTCs.one(crypto.randomUUID(), async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+					return await tcStub.initiateRead({ items });
+				});
+			},
+			(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
+		);
 	}
 
 	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {

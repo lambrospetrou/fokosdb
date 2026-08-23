@@ -388,10 +388,10 @@ describe("TransactionParticipant - readForTransaction", () => {
 			// Two writes inside the SAME millisecond: last_transaction_ts is identical, only `v` moves.
 			// This is the pair the two-phase read must be able to tell apart.
 			store.upsertItem({ hk: kb("k"), sk, data: "first", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
-			const before = participant.readForTransactionLocal({ transactionId: "r1", items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
+			const before = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
 			store.upsertItem({ hk: kb("k"), sk, data: "second", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
-			const after = participant.readForTransactionLocal({ transactionId: "r2", items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
+			const after = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
 			invariant(before.found && after.found);
 			expect(before.ttlEpochUTCSeconds).toBe(777);
@@ -419,7 +419,6 @@ describe("TransactionParticipant - readForTransaction", () => {
 			expect(participant.prepareLocal(lock)).toEqual({ outcome: "accepted" });
 
 			const response = participant.readForTransactionLocal({
-				transactionId: "read-tx",
 				items: [
 					{ hashKey: kb("existing"), sortKey: KeyCodec.encodeOptional(undefined) },
 					{ hashKey: kb("locked-absent"), sortKey: KeyCodec.encodeOptional(undefined) },

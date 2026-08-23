@@ -213,7 +213,11 @@ export class TransactionParticipant {
 		this.#store.deletePendingTx(transactionId);
 	}
 
-	readForTransactionLocal(request: ReadForTransactionRequest): ReadForTransactionResponse {
+	/**
+	 * Reads every requested key from local storage. Takes only the keys: it holds no lock and
+	 * writes nothing, so the single-shot read path can call it without inventing a transaction id.
+	 */
+	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionResponse {
 		const results: ReadForTransactionItemResultEncoded[] = [];
 
 		for (const item of request.items) {

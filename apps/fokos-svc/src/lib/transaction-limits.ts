@@ -9,6 +9,7 @@
  * encoding are one step and cannot drift apart.
  */
 
+import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { TransactionOperationType } from "./transaction-types.js";
 import type { ItemCondition } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
@@ -213,4 +214,24 @@ export function validateTransactGetItemCount(itemCount: number): void {
 	if (itemCount > MAX_ITEMS_PER_TX) {
 		throw new Error(`fokos: transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`);
 	}
+}
+
+/**
+ * The single-partition eligibility hint used by the transaction fast paths: returns the shared
+ * partition context when EVERY item resolves to the same PartitionDO, else null.
+ *
+ * This is a client-side hint only. It is necessary but not sufficient — the resolved context names
+ * the partition at the top of a forwarding chain, and a split or a promotion below that node can
+ * still spread the items over several DOs. The partition itself is the authority and raises a
+ * fallback error when it cannot execute the whole set alone.
+ */
+export function singlePartitionTarget<T extends { partitionContext: PartitionContextResolved }>(
+	items: readonly T[],
+): PartitionContextResolved | null {
+	if (items.length === 0) return null;
+	const target = items[0].partitionContext;
+	for (const item of items) {
+		if (item.partitionContext.doName !== target.doName) return null;
+	}
+	return target;
 }

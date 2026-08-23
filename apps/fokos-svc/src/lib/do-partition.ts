@@ -9,6 +9,8 @@ import type {
 	PrepareResponse,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	ReadSnapshotRequest,
+	ReadSnapshotResponse,
 	TransactionItem,
 } from "./transaction-types.js";
 import {
@@ -168,6 +170,7 @@ export type PartitionDOStub = {
 	txCommit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
 	txCancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
 	txReadForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
+	txReadSnapshot(ctx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse>;
 };
 
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
@@ -1301,6 +1304,61 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { items: results.flatMap((r) => r.items) };
 	}
 
+	/**
+	 * The single-partition fast path for `transactGetItems`: one round trip, no coordinator, no
+	 * locks, and nothing persisted.
+	 *
+	 * A partition DO is single-threaded and reads the whole set with no `await` in between, so the
+	 * result already IS a consistent snapshot — the second phase of the coordinator's read exists
+	 * only to detect interleaving ACROSS partitions, and here there is none to detect.
+	 */
+	async txReadSnapshot(pCtx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
+		this.ensurePartitionContext(pCtx);
+		await this.ensureMigration("readSnapshot");
+
+		const route = this.routeSingleDestination(request.items, "read", "readSnapshot");
+		if (route.destination === "child") {
+			return await this.getChildStub(route.pCtx).txReadSnapshot(route.pCtx, { items: route.items });
+		}
+
+		const { items } = this.#participant.readForTransactionLocal({ items: route.items });
+		// Parity with the coordinator path: an item locked by an in-progress two-phase transaction has
+		// a write that may or may not land, so the read cannot claim a committed snapshot.
+		if (items.some((item) => item.hasPendingWrite)) {
+			return { outcome: "aborted", reason: "pending_write" };
+		}
+		return { outcome: "committed", items };
+	}
+
+	/**
+	 * The server-side authority for the single-partition fast paths. One DO must execute every item:
+	 * either this one owns them all, or exactly one child does and the whole request is handed over.
+	 * Anything else raises the fallback error and touches nothing, so the caller can run the
+	 * coordinator path.
+	 *
+	 * Forwarding hops cost latency but not correctness — the nodes in between own nothing and do
+	 * nothing.
+	 *
+	 * SYNCHRONOUS BY CONTRACT: the caller must not `await` between this decision and the work it
+	 * authorises. A split can only advance at an input-gate point, so an unbroken synchronous block
+	 * closes the split and promotion races.
+	 */
+	private routeSingleDestination<T extends { hashKey: KeyBytes; sortKey?: KeyBytes }>(
+		items: T[],
+		intent: OperationIntent,
+		operationName: string,
+	): { destination: "local"; items: T[] } | { destination: "child"; pCtx: PartitionContextResolved; items: T[] } {
+		const { local, forwarded } = this.groupItemsByRouting(items, intent, operationName);
+		if (forwarded.size === 0) {
+			return { destination: "local", items: local };
+		}
+		if (forwarded.size === 1 && local.length === 0) {
+			const [entry] = [...forwarded.values()];
+			return { destination: "child", pCtx: entry.pCtx, items: entry.items };
+		}
+		throw errSinglePartitionFastPathFallback(operationName);
+	}
+
 	/////////////////////////////////////////
 	// ALARM / BACKGROUND WORK / INTERNALs
 	/////////////////////////////////////////
@@ -1998,6 +2056,30 @@ function errInvalidPartitionRouting(operationName: string): Error {
  */
 export function isPartitionExceededDatabaseSizeError(e: unknown): boolean {
 	return e instanceof Error && e.message.includes(OVER_SIZE_SENTINEL);
+}
+
+// Recognised by message substring for the same reason as OVER_SIZE_SENTINEL: DO RPC carries only an
+// error's message across the boundary, so a dedicated error class would not survive the hop.
+// It must stay in the message errSinglePartitionFastPathFallback builds.
+const FAST_PATH_FALLBACK_SENTINEL = "single-partition fast path not applicable";
+
+/**
+ * Raised when a single-shot transaction reaches a partition that cannot execute the whole item set
+ * alone — the items straddle a split or a promotion boundary below this node. It carries ZERO side
+ * effects, so it is safe to raise from any depth of a forwarding chain: it propagates up through the
+ * intermediate routers untouched, and the caller runs the coordinator path instead.
+ */
+function errSinglePartitionFastPathFallback(operationName: string): Error {
+	return new Error(`fokos/partition: ${FAST_PATH_FALLBACK_SENTINEL}, items span more than one partition (${operationName}).`);
+}
+
+/**
+ * True for errSinglePartitionFastPathFallback, including after it has crossed a DO RPC boundary.
+ * A transport failure carries no sentinel, so it is never mistaken for a fallback and never
+ * silently retried on the coordinator path.
+ */
+export function isSinglePartitionFastPathFallbackError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes(FAST_PATH_FALLBACK_SENTINEL);
 }
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {

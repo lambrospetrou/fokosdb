@@ -142,6 +142,28 @@ export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResultEncoded[];
 };
 
+// ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
+
+/**
+ * A whole `transactGetItems` handed to ONE partition. It carries no transaction id: nothing is
+ * locked, nothing is persisted, and there is no second phase to correlate with.
+ */
+export type ReadSnapshotRequest = {
+	items: TransactionItemKey[];
+};
+
+/**
+ * `items` is positionally matched to the request, one entry per requested key, duplicates included.
+ *
+ * There is no `read_conflict`: a partition DO is single-threaded and reads the whole set with no
+ * `await` in between, so the result already IS a consistent snapshot and no second phase can
+ * disagree with the first. `pending_write` stays, so a lock held by an in-progress two-phase
+ * transaction aborts the read exactly as it does on the coordinator path.
+ */
+export type ReadSnapshotResponse =
+	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
+	| { outcome: "aborted"; reason: "pending_write" };
+
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
 export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
