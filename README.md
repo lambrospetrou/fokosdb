@@ -26,7 +26,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Add optimization for single-partition transactions to not do 2PC.
 - Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Garbage collect the transactions data from the tx coordinators. Only delete a transaction that is already COMMITTED or CANCELLED, since partitions read a missing transaction as cancelled.
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
