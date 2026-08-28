@@ -1,0 +1,10 @@
+{
+	"extends": "../../../tsconfig.json",
+	"compilerOptions": {
+		// This worker is a separate wrangler project, so it has its own generated Env.
+		"types": ["./worker-configuration.d.ts", "node"]
+	},
+	// ../../uint8array-hex.d.ts is ambient and shared with the library sources this worker imports.
+	"include": ["./**/*.ts", "./worker-configuration.d.ts", "../../uint8array-hex.d.ts"],
+	"exclude": []
+}

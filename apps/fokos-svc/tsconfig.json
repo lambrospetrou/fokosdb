@@ -43,5 +43,7 @@
 		]
 	},
 	// output of `wrangler types`
-	"include": ["./**/*.ts", "./worker-configuration.d.ts"]
+	"include": ["./**/*.ts", "./worker-configuration.d.ts"],
+	// The example workers are separate wrangler projects with their own Env types.
+	"exclude": ["src/examples"]
 }

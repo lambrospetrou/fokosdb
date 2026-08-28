@@ -1,17 +1,17 @@
 /**
- * For more details on how to configure Wrangler, refer to:
- * https://developers.cloudflare.com/workers/wrangler/configuration/
+ * Wrangler configuration for library development and tests.
+ *
+ * This worker is never deployed. It exists so that `vitest` (via
+ * @cloudflare/vitest-pool-workers) and `wrangler types` have an entrypoint that
+ * exports the library Durable Objects. The deployable example worker has its own
+ * configuration in src/examples/http-api/wrangler.jsonc.
  */
 {
 	"$schema": "node_modules/wrangler/config-schema.json",
-	"name": "fokos-svc-alpha",
-	"main": "src/index.ts",
+	"name": "fokos-lib-dev",
+	"main": "test/worker-entry.ts",
 	"compatibility_date": "2026-05-23",
-	"assets": {
-		"directory": "./public/",
-		"binding": "ASSETS",
-		"run_worker_first": ["/api/*"],
-	},
+	"compatibility_flags": ["nodejs_compat"],
 	"migrations": [
 		{
 			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "CustomPartitionDO"],
@@ -34,35 +34,7 @@
 			},
 		],
 	},
-	"observability": {
-		"enabled": true,
-		"logs": {
-			"invocation_logs": false,
-		},
-		// TOO NOISY for now.
-		"traces": {
-			"enabled": false,
-		},
-	},
-	"upload_source_maps": false,
-	"compatibility_flags": ["nodejs_compat"],
-	/**
-	 * Environment Variables
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#environment-variables
-	 * Note: Use secrets to store sensitive data.
-	 * https://developers.cloudflare.com/workers/configuration/secrets/
-	 */
 	"vars": {
-		// https://hono.dev/docs/middleware/builtin/logger#logging-details
-		"NO_COLOR": true,
 		"FOKOS_SHOULD_FETCH_COLO_INFO": true,
 	},
-	"secrets": {
-		"required": ["FOKOS_API_TOKENS"],
-	},
-	/**
-	 * Service Bindings (communicate between multiple Workers)
-	 * https://developers.cloudflare.com/workers/wrangler/configuration/#service-bindings
-	 */
-	// "services": [  {   "binding": "MY_SERVICE",   "service": "my-service"  } ]
 }

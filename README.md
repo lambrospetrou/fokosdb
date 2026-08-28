@@ -84,7 +84,7 @@ npm test
 
 ```sh
 # terminal 1
-rm -rf ./wrangler && npm run dev
+rm -rf ./apps/fokos-svc/src/examples/http-api/.wrangler && npm run dev
 
 # terminal 2
 npm run test:hurl

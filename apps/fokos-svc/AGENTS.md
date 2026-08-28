@@ -9,13 +9,18 @@ FokosDB is a globally strongly-consistent key-value database built on Cloudflare
 
 ## Commands
 
-| Command               | Purpose                   |
-| --------------------- | ------------------------- |
-| `npx wrangler dev`    | Local development         |
-| `npx wrangler deploy` | Deploy to Cloudflare      |
-| `npx wrangler types`  | Generate TypeScript types |
+| Command              | Purpose                                     |
+| -------------------- | ------------------------------------------- |
+| `npm run dev`        | Run the example worker locally              |
+| `npm run deploy`     | Deploy the example worker to Cloudflare     |
+| `npm run cf-typegen` | Generate TypeScript types for both projects |
 
-Run `wrangler types` after changing bindings in wrangler.jsonc.
+There are two wrangler projects:
+
+- `wrangler.jsonc` — the library worker. It is never deployed. It gives `vitest` and `wrangler types` an entrypoint (`test/worker-entry.ts`) that exports the library Durable Objects.
+- `src/examples/http-api/wrangler.jsonc` — the deployable example HTTP API worker, with its own `public/` assets, secrets and generated types.
+
+Run `npm run cf-typegen` after changing bindings in either file. Each project has its own `worker-configuration.d.ts` and its own local state under `.wrangler/`.
 
 ## Architecture
 

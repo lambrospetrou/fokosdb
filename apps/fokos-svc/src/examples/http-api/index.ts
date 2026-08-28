@@ -1,15 +1,14 @@
-import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import * as v from "valibot";
-import { FokosDB } from "./lib/db.js";
-import { PartitionContextCreator, type SplitConditions } from "./lib/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "./lib/partition-topology/router.js";
-import type { GetItemResult, InitiateReadResponse, JsonValue, QueryItemsResult } from "./lib/types.js";
-import { PartitionDO } from "./lib/do-partition.js";
+import { FokosDB } from "../../lib/db.js";
+import { PartitionContextCreator, type SplitConditions } from "../../lib/partition-topology/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../../lib/partition-topology/router.js";
+import type { GetItemResult, InitiateReadResponse, JsonValue, QueryItemsResult } from "../../lib/types.js";
+import { PartitionDO } from "../../lib/do-partition.js";
 
-export { PartitionDO } from "./lib/do-partition.js";
-export { TransactionCoordinatorDO } from "./lib/do-transaction-coordinator.js";
+export { PartitionDO } from "../../lib/do-partition.js";
+export { TransactionCoordinatorDO } from "../../lib/do-transaction-coordinator.js";
 
 // ── Valibot schemas ────────────────────────────────────────────────────────────
 
