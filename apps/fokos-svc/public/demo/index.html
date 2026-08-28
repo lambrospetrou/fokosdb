@@ -599,7 +599,7 @@
 					await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
 						method: "POST",
 						body: JSON.stringify({
-							operations: txAccountIds.value.map((id) => ({
+							items: txAccountIds.value.map((id) => ({
 								hashKey: id,
 								operation: "put",
 								data: JSON.stringify({ balance: INITIAL_BALANCE }),
@@ -679,7 +679,7 @@
 						const { body, workerDurMs } = await apiFetch(`/rpc/${cfg.tableName.value}/transactWriteItems`, {
 							method: "POST",
 							body: JSON.stringify({
-								operations: items.map((item, i) => ({
+								items: items.map((item, i) => ({
 									hashKey: item.id,
 									operation: "put",
 									data: JSON.stringify({ balance: newBalances[i] }),
