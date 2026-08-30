@@ -616,7 +616,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const upperInclusive = interval.upper?.inclusive ?? false;
 
 		let rowsScanned = 0;
-		const PAGE_SIZE = 1000;
+		const PAGE_SIZE = 20;
 
 		const {
 			rows,

@@ -6,6 +6,7 @@ import {
 	isPartitionExceededDatabaseSizeError,
 	isSinglePartitionFastPathFallbackError,
 	PartitionDO,
+	QueryItemsRpcRequest,
 } from "./do-partition.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
@@ -2602,6 +2603,78 @@ describe("PartitionDO — range split", () => {
 		});
 	});
 
+	describe("queryItems leaf batching", () => {
+		const request = (direction: "asc" | "desc", overrides: Partial<QueryItemsRpcRequest> = {}) => ({
+			hashKey: kb("alice"),
+			interval: {},
+			direction,
+			budgetBytes: 64 * 1024 * 1024,
+			remainingLimit: null,
+			maxPartitionVisits: 100,
+			cursor: null,
+			...overrides,
+		});
+
+		it("fetches at most 20 rows from SQLite and continues until the result page is full", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				for (let i = 0; i < 45; i++) {
+					store.upsertItem({
+						hk: kb("alice"),
+						sk: kb(String(i).padStart(3, "0")),
+						data: "x",
+						kind: "text",
+						ttlEpochUtcSeconds: null,
+						lastTransactionTs: 0,
+					});
+				}
+				const fetchSpy = vi.spyOn(PartitionStore.prototype, "queryRangeItemsPage");
+				try {
+					const result = await instance.apiQueryItems(ctx, request("asc"));
+					expect(result.items.map((item) => KeyCodec.decode(item.sk))).toEqual(
+						Array.from({ length: 45 }, (_, i) => String(i).padStart(3, "0")),
+					);
+					expect(fetchSpy.mock.calls.map(([opts]) => opts.limit)).toEqual([20, 20, 20]);
+				} finally {
+					fetchSpy.mockRestore();
+				}
+			});
+		});
+
+		it.each(["asc", "desc"] as const)("pages 400 KiB items without gaps or duplicates in %s order", async (direction) => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				for (const sk of ["a", "b", "c"]) {
+					store.upsertItem({
+						hk: kb("alice"),
+						sk: kb(sk),
+						data: new Uint8Array(MAX_ITEM_BYTES),
+						kind: "bytes",
+						ttlEpochUtcSeconds: null,
+						lastTransactionTs: 0,
+					});
+				}
+
+				const seen: string[] = [];
+				let cursor: QueryItemsRpcRequest["cursor"] = null;
+				for (;;) {
+					const result = await instance.apiQueryItems(
+						ctx,
+						request(direction, { budgetBytes: MAX_ITEM_BYTES + 100, remainingLimit: 2, cursor }),
+					);
+					seen.push(...result.items.map((item) => KeyCodec.decode(item.sk) as string));
+					if (result.nextCursor === null) break;
+					cursor = result.nextCursor;
+				}
+				const expected = direction === "asc" ? ["a", "b", "c"] : ["c", "b", "a"];
+				expect(seen).toEqual(expected);
+				expect(new Set(seen).size).toBe(seen.length);
+			});
+		});
+	});
+
 	describe("queryItems across the split range tree", () => {
 		// Build a promoted range root, populate it, and complete its split into N leaf children.
 		const buildSplitTree = async (N: number) => {
@@ -2621,7 +2694,7 @@ describe("PartitionDO — range split", () => {
 		const queryPage = (
 			rootStub: DurableObjectStub<PartitionDO>,
 			rootCtx: PartitionContextResolved,
-			overrides: Partial<Parameters<PartitionDO["apiQueryItems"]>[1]> = {},
+			overrides: Partial<QueryItemsRpcRequest> = {},
 		) =>
 			rootStub.apiQueryItems(rootCtx, {
 				hashKey: kb("alice"),
@@ -2638,11 +2711,11 @@ describe("PartitionDO — range split", () => {
 		const collect = async (
 			rootStub: DurableObjectStub<PartitionDO>,
 			rootCtx: PartitionContextResolved,
-			overrides: Partial<Parameters<PartitionDO["apiQueryItems"]>[1]> = {},
+			overrides: Partial<QueryItemsRpcRequest> = {},
 		) => {
 			const out: Array<string | Uint8Array> = [];
 			const leaves = new Set<string>();
-			let cursor: Parameters<PartitionDO["apiQueryItems"]>[1]["cursor"] = null;
+			let cursor: QueryItemsRpcRequest["cursor"] = null;
 			let pages = 0;
 			for (;;) {
 				const res = await queryPage(rootStub, rootCtx, { ...overrides, cursor });
