@@ -4,6 +4,7 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
+		"bench:expression": "vitest bench --config vitest.benchmark.config.ts",
 		"check": "tsc --noEmit && tsc --noEmit -p src/examples/http-api && prettier --check .",
 		"check:keys": "bash tools/check-key-invariants.sh",
 		"fmt": "prettier --write .",
