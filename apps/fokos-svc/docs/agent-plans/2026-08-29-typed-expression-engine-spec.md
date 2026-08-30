@@ -32,8 +32,9 @@ Implementation order:
 2. Build the standalone AST, validation, and compiler library with scalar literal bindings.
 3. Add write conditions for put, delete, and transactions.
 4. Add canonical JSON bindings for array and object literals as an additive milestone.
-5. Add projections for point, transaction, and query reads.
-6. Add query filters with correct paging and metering.
+5. Add binary key and byte-data literals as an additive milestone.
+6. Add projections for point, transaction, and query reads.
+7. Add query filters with correct paging and metering.
 
 The first version does not include:
 
@@ -42,7 +43,7 @@ The first version does not include:
 - Update expressions or `updateItem`.
 - A public table scan.
 - Nested projection reconstruction.
-- Binary expression literals or tagged nested binary values.
+- Tagged binary values nested inside array and object literals.
 - Set values.
 - Direct array or object equality.
 - Expression indexes.
@@ -102,6 +103,7 @@ type ExpressionReference =
 
 type ExpressionValue =
   | { val: JsonValue }
+  | { bytes: string }
   | ExpressionReference
   | { fn: string; args: readonly ExpressionValue[] };
 ```
@@ -113,7 +115,11 @@ type ExpressionValue =
 ```
 
 Expression literals are JSON values: string, number, Boolean, null, array, or object. Reject direct
-`Uint8Array` literals. Binary expression literals need an explicit tagged format and are deferred.
+`Uint8Array` literals: a compiled plan must stay JSON-serializable. A byte literal uses an explicit
+tagged value, `{ bytes: string }`.
+
+`bytes` carries standard base64 text with padding. Its native type is `bytes`, never `text`. It ships
+in M7; semantic validation rejects it before that milestone.
 
 Scalar literals use SQLite-compatible scalar bindings. Array and object literals use canonical JSON
 text bindings. The compiler serializes each composite literal once while it traverses the caller AST.
@@ -314,10 +320,20 @@ binary-keyed row, and a byte-level `contains` search could match inside a binary
 compiler must add a logical-key-type guard (first canonical byte is not `0xFF`) to `gt`, `gte`, `ne`,
 and `contains` on key references. `eq`, `lt`, `lte`, `between`, `in`, and `begins_with` need no
 guard: UTF-8 never contains the byte `0xFF`, so a text literal cannot equal, prefix-match, or sort
-above a binary key. Apply the same rule mirrored when byte key literals ship later.
+above a binary key. A byte literal (M7) mirrors the rule: every text key sorts below every binary
+key, so `lt`, `lte`, and `ne` against a byte literal need the opposite guard. The compiler derives
+both directions from one logical-key-type comparison, so one guard serves every operation.
 
-Binary key literals are deferred. Direct binary-key comparison, prefix, or containment against a
-literal is not in version one. A safe function such as `sqlite.hex` can return text for comparison.
+Before M7, a byte literal cannot be written. An allowlisted function can still reach the content of a
+binary key, because a function argument compiles as a logical value and drops the `0xFF` tag:
+
+```ts
+{ op: "eq", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "6162" }] }] }
+{ op: "begins_with", args: [{ fn: "sqlite.hex", args: [{ ref: "sortKey" }] }, { val: "61" }] }
+```
+
+Both forms keep the logical key types apart: a text key reports `text` and cannot match a `bytes`
+value. `sqlite.hex` returns uppercase text, and a hex prefix must contain complete bytes.
 
 ---
 
@@ -358,8 +374,8 @@ condition: { op: "not_exists", args: [{ ref: "hashKey" }] }
 
 `begins_with` is case-sensitive. Do not compile it to `LIKE`. Use a fixed prefix operation such as
 `substr` or `instr`. It supports two compatible text values or two byte-valued expressions. A text
-prefix literal against a key reference binds as canonical key bytes (section 4.4). Direct
-byte-prefix literals are deferred.
+prefix literal against a key reference binds as canonical key bytes (section 4.4). A byte prefix
+literal against a key reference binds the same way and ships in M7.
 
 `contains` supports:
 
@@ -367,7 +383,8 @@ byte-prefix literals are deferred.
 - Byte subsequence search when both expressions produce bytes.
 - JSON array membership for scalar string, number, Boolean, or null values.
 
-Reject array/object search values. Direct byte search literals are deferred.
+Reject array/object search values. A byte search literal ships in M7. Key containment compares
+logical values on both sides, so the `0xFF` tag is never part of the searched content.
 Use compiler-owned `json_each` only for scalar array containment and object size.
 
 Byte-mode `begins_with` and `contains` on the whole `data` reference must include the `data_kind`
@@ -515,10 +532,11 @@ Every descriptor is one JSON-safe scalar, so a plan survives JSON persistence an
   `KeyCodec.encode(value)` as canonical key bytes.
 - `path` — one SQLite JSON path string.
 
-The kind names follow the native type vocabulary (section 4.2), so future binary literals extend the
-set unambiguously: `keyBytes` for a binary key literal and `bytes` for a binary data literal, each
-carried as base64 text. The kind tags are persisted inside plans, so a rename is a plan-version
-change — do not shorten them.
+M7 adds two kinds that follow the same native type vocabulary (section 4.2): `keyBytes` for a byte
+literal that a key reference uses, and `bytes` for a byte literal that byte data uses. Both carry
+base64 text. The partition binds `KeyCodec.encode(decoded)` for `keyBytes` and the decoded bytes for
+`bytes`. The kind tags are persisted inside plans, so a rename is a plan-version change — do not
+shorten them.
 
 The partition materializes descriptors in order, after statement composition and immediately before
 execution. `KeyCodec.encode` is pure and deterministic, so a retry, a recovery replay, and a
@@ -941,7 +959,45 @@ scalar children, cycles, unsupported runtime values, depth, and payload limits. 
 insertion orders with equal identities and equal bindings. Test `size`, `attribute_type`, `contains`,
 and condition expressions in Workers SQLite.
 
-### M7 — Projections
+### M7 — Binary key and data literals
+
+This milestone is additive. M1-M6 must reject the `bytes` literal during semantic validation. Plans
+compiled before this milestone must stay valid when it ships.
+
+Deliver:
+
+- The `{ bytes: string }` value in the public AST, with the native type `bytes`.
+- Validation that decodes the base64 text once, rejects text that does not decode, and enforces the
+  canonical expression payload limit. The plan descriptor stores the canonical re-encoded text.
+- Canonical identity from the decoded bytes, so two encodings of one value give one identity.
+- The `keyBytes` descriptor for a byte literal against `hashKey` or `sortKey`. The comparison uses
+  canonical tagged key bytes, so it keeps the primary-key lookup.
+- The `bytes` descriptor for a byte literal against byte `data`, bound as a BLOB.
+- `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `between`, `in`, and `begins_with` on key references.
+- `eq`, `ne`, `begins_with`, and `contains` on byte `data`, with the existing data-kind guard.
+
+Rules:
+
+- Reject an empty byte literal. `KeyCodec` rejects an empty key, and an empty prefix or search value
+  has no meaning.
+- Reject a byte literal as a `contains` search value on a JSON array. A JSON array cannot hold bytes.
+- Reject a byte literal mixed with another literal type in one `in` choice list.
+- A byte literal and a text literal with the same content must never match one key. The logical key
+  type keeps them apart.
+- Binary values nested inside array and object literals stay unsupported (section 12).
+
+Test in Workers SQLite:
+
+- Every listed operation against binary hash and sort keys.
+- The mirrored guard: `lt`, `lte`, `ne`, and `contains` with a byte literal do not match text-keyed
+  rows.
+- A text literal and a byte literal with equal content against both a text key and a binary key.
+- Prefix and containment on byte data, and no match against a JSONB row.
+- Empty, malformed, and oversized literal rejection.
+- Plan JSON round-trip equality for `keyBytes` and `bytes` descriptors.
+- Primary-key query plan for a byte key literal.
+
+### M8 — Projections
 
 Deliver in this order:
 
@@ -952,7 +1008,7 @@ Deliver in this order:
 Test default names, aliases, duplicates, missing/null, computed values, composite literals, reverse
 paths, all source kinds, absent projection compatibility, transaction ordering, and split reads.
 
-### M8 — Query filters
+### M9 — Query filters
 
 Deliver in this order:
 
@@ -964,7 +1020,7 @@ Test all condition operations as filters, mixed data kinds, zero/high selectivit
 cursors, ascending/descending scans, no duplicate/omitted rows, promoted/range-split keys, budget
 rules, cursor identity changes, and fixed candidate routing.
 
-### M9 — Hardening and documentation
+### M10 — Hardening and documentation
 
 Run the full cross-surface matrix. Verify every allowlisted function in Workers SQLite. Measure large
 expressions and 400 KiB JSON items. Add public examples and an ADR for shipped filter/projection
@@ -980,7 +1036,7 @@ behavior.
 | Data kind | JSON object/array, text, bytes |
 | JSON value | Missing, null, Boolean, integer, real, text, empty/non-empty array/object |
 | Path | Root, normal/special field, array index, reverse index, missing parent, wrong container |
-| Keys | String hash/sort, absent sort, binary key where no literal is needed |
+| Keys | String hash/sort, absent sort, binary hash/sort with and without a byte literal |
 | Operations | All conditions and semantic functions |
 | Writes | Put, delete, transaction put/delete/check, single-shot |
 | Reads | Get, transactional get, hash-leaf query, promoted/range query |
@@ -1002,7 +1058,7 @@ The feature is complete when all milestones pass and:
 
 ## 12. Future extensions
 
-These items are not part of M0-M9:
+These items are not part of M0-M10:
 
 - **Binding compaction:** If needed, evaluate a bound JSON/`json_each` argument pool, numbered binding
   reuse, or one shared filter/projection pool. Measure it before replacing one-descriptor-per-use
@@ -1010,7 +1066,8 @@ These items are not part of M0-M9:
 - **Untrusted partition callers:** Re-run validation/compilation in partitions or authenticate plans.
 - **Composite equality:** Define object order, array order, number normalization, missing/null rules,
   traversal limits, and cost. Do not use JSONB byte equality.
-- **Binary values:** Add an explicit base64/tagged literal and nested-value format.
+- **Nested binary values:** Add a tagged format for bytes inside array and object literals. M7
+  covers only complete key and data literals.
 - **Sets:** Add stored types, uniqueness, equality, containment, size, and update rules.
 - **Nested projections:** Define overlap, arrays, reverse indexes, aliases, missing values, and
   collisions.

@@ -137,23 +137,62 @@ describe("compiled condition runtime", () => {
 		}
 	});
 
-	it.each(["gt", "gte", "ne", "contains"] as const)("does not match a binary key with text %s", async (op) => {
-		const item: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
-		const condition =
-			op === "contains"
-				? ({ op, args: [{ ref: "sortKey" }, { val: "a" }] } as const)
-				: ({ op, args: [{ ref: "sortKey" }, { val: "a" }] } as const);
-		expect((await evaluate(item, condition)).conditionOk).toBe(false);
+	it("matches a text key and never matches a binary key with the same content", async () => {
+		const textItem: StoredFixture = { hashKey: "item", sortKey: "ab", kind: "text", data: "value" };
+		const binaryItem: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
+		// Every condition holds for the text sort key "ab". The binary sort key carries the same bytes but
+		// is 0xFF-tagged and reports the "bytes" type, so a text literal can never match it.
+		for (const condition of [
+			{ op: "eq", args: [{ ref: "sortKey" }, { val: "ab" }] },
+			{ op: "ne", args: [{ ref: "sortKey" }, { val: "a" }] },
+			{ op: "lt", args: [{ ref: "sortKey" }, { val: "z" }] },
+			{ op: "gt", args: [{ ref: "sortKey" }, { val: "a" }] },
+			{ op: "gte", args: [{ ref: "sortKey" }, { val: "ab" }] },
+			{ op: "between", args: [{ ref: "sortKey" }, { val: "a" }, { val: "z" }] },
+			{ op: "begins_with", args: [{ ref: "sortKey" }, { val: "a" }] },
+			{ op: "contains", args: [{ ref: "sortKey" }, { val: "b" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			const label = JSON.stringify(condition);
+			expect((await evaluate(textItem, condition)).conditionOk, label).toBe(true);
+			expect((await evaluate(binaryItem, condition)).conditionOk, label).toBe(false);
+		}
 	});
 
-	it.each([
-		{ op: "eq", args: [{ ref: "sortKey" }, { val: "a" }] },
-		{ op: "lt", args: [{ ref: "sortKey" }, { val: "z" }] },
-		{ op: "between", args: [{ ref: "sortKey" }, { val: "a" }, { val: "z" }] },
-		{ op: "begins_with", args: [{ ref: "sortKey" }, { val: "a" }] },
-	] as const satisfies readonly ConditionExpression[])("does not match an incompatible binary key for $op", async (condition) => {
-		const item: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
-		expect((await evaluate(item, condition)).conditionOk).toBe(false);
+	it("compares binary keys against each other on untagged content", async () => {
+		// The hash key is a prefix of the sort key once both lose the 0xFF tag.
+		const item: StoredFixture = { hashKey: new Uint8Array([0x61]), sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
+		for (const condition of [
+			{ op: "exists", args: [{ ref: "sortKey" }] },
+			{ op: "eq", args: [{ fn: "attribute_type", args: [{ ref: "sortKey" }] }, { val: "bytes" }] },
+			{ op: "eq", args: [{ fn: "size", args: [{ ref: "sortKey" }] }, { val: 2 }] },
+			{ op: "eq", args: [{ ref: "sortKey" }, { ref: "sortKey" }] },
+			{ op: "gt", args: [{ ref: "sortKey" }, { ref: "hashKey" }] },
+			{ op: "begins_with", args: [{ ref: "sortKey" }, { ref: "hashKey" }] },
+			{ op: "contains", args: [{ ref: "sortKey" }, { ref: "hashKey" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			expect((await evaluate(item, condition)).conditionOk, JSON.stringify(condition)).toBe(true);
+		}
+	});
+
+	it("matches binary key content through a blob literal", async () => {
+		const item: StoredFixture = { hashKey: new Uint8Array([0x61]), sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
+		for (const condition of [
+			{ op: "eq", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "6162" }] }] },
+			{ op: "eq", args: [{ ref: "hashKey" }, { fn: "sqlite.unhex", args: [{ val: "61" }] }] },
+			{ op: "begins_with", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "61" }] }] },
+			{ op: "contains", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "62" }] }] },
+			{ op: "eq", args: [{ fn: "sqlite.hex", args: [{ ref: "sortKey" }] }, { val: "6162" }] },
+			{ op: "begins_with", args: [{ fn: "sqlite.hex", args: [{ ref: "sortKey" }] }, { val: "61" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			expect((await evaluate(item, condition)).conditionOk, JSON.stringify(condition)).toBe(true);
+		}
+		for (const condition of [
+			{ op: "eq", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "6163" }] }] },
+			{ op: "begins_with", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "62" }] }] },
+			{ op: "eq", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "zz" }] }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			expect((await evaluate(item, condition)).conditionOk, JSON.stringify(condition)).toBe(false);
+		}
 	});
 
 	it("keeps the SQLite failure as the runtime error cause", async () => {
