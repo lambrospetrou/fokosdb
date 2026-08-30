@@ -1,7 +1,7 @@
 # Typed expression engine
 
 Date: 2026-08-29  
-Status: **accepted design; not implemented**
+Status: **accepted design; M0-M2 implemented**
 
 References:
 
@@ -830,7 +830,7 @@ The library must not import the router, partition, or transaction coordinator.
 
 Each milestone must keep tests and type checks green.
 
-### M0 — Memory-safe query batch fetches
+### M0 — DONE — Memory-safe query batch fetches
 
 This milestone is independent of the expression engine. It must not change the public `queryItems`
 contract or import expression code.
@@ -846,7 +846,7 @@ Test queries with 400 KiB items, small items, both directions, byte and item lim
 fan-out. Verify that each store fetch requests at most 20 rows. Verify that all pages contain no gaps
 or duplicate items.
 
-### M1 — AST and semantic fixtures
+### M1 — DONE — AST and semantic fixtures
 
 Deliver:
 
@@ -857,7 +857,7 @@ Deliver:
 
 Test valid/invalid shapes, argument arity, missing/null truth tables, and limit fixtures.
 
-### M2 — Canonical identity and paths
+### M2 — DONE — Canonical identity and paths
 
 Deliver:
 
