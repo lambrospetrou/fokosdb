@@ -28,10 +28,12 @@ Build one reusable expression library that:
 
 Implementation order:
 
-1. Standalone AST, validation, and compiler library.
-2. Write conditions for put, delete, and transactions.
-3. Projections for point, transaction, and query reads.
-4. Query filters with correct paging and metering.
+1. Make the existing query batch fetch memory-safe. This milestone is independent of the expression engine.
+2. Build the standalone AST, validation, and compiler library with scalar literal bindings.
+3. Add write conditions for put, delete, and transactions.
+4. Add canonical JSON bindings for array and object literals as an additive milestone.
+5. Add projections for point, transaction, and query reads.
+6. Add query filters with correct paging and metering.
 
 The first version does not include:
 
@@ -112,6 +114,20 @@ type ExpressionValue =
 
 Expression literals are JSON values: string, number, Boolean, null, array, or object. Reject direct
 `Uint8Array` literals. Binary expression literals need an explicit tagged format and are deferred.
+
+Scalar literals use SQLite-compatible scalar bindings. Array and object literals use canonical JSON
+text bindings. The compiler serializes each composite literal once while it traverses the caller AST.
+It uses the same canonical object-key order as the expression identity. The compiler then emits a
+fixed `jsonb(?)`, `json(?)`, or `json_each(?)` form for the operation that consumes the value.
+
+The serialized binding retains its logical `array` or `object` type. The compiler must not treat the
+JSON text as a native `text` expression value. The serializer must enforce the expression depth and
+payload limits. It must reject cycles and values outside `JsonValue`. It must not mutate the caller
+value or allocate a normalized object tree.
+
+Composite literal support is additive. Before its milestone ships, semantic validation must reject
+array and object literals. This lets the scalar condition milestone ship first. The later milestone
+can enable composite literals without a public AST change or a change to scalar compiled plans.
 
 ### 3.2 Conditions
 
@@ -461,10 +477,14 @@ limits again before implementation.
 
 ### 6.3 Direct bindings
 
-Version one binds each literal and path directly. It does not pack, encode, or deduplicate bindings.
+Version one binds each scalar literal and path directly. It does not pack or deduplicate bindings.
+The compiler binds each array or object literal as canonical JSON text after the composite-literal
+milestone ships. Compiler-owned JSON functions convert or iterate that binding in SQLite.
+
 Count expression bindings, fixed operation bindings, range/cursor bindings, and combined
-filter/projection bindings. Reject a request before routing if the complete statement can exceed 100
-bindings. The partition performs the same final count after statement composition.
+filter/projection bindings. One serialized composite literal counts as one binding each time the SQL
+uses it. Reject a request before routing if the complete statement can exceed 100 bindings. The
+partition performs the same final count after statement composition.
 
 An AST can contain 100 `in` choices but still fail the SQL binding limit.
 
@@ -474,8 +494,11 @@ Generate canonical identity bytes/text while traversing the original AST. Do not
 normalized tree.
 
 Canonical encoding uses fixed operator/function spelling, fixed field order, ordered arguments, and
-canonical object-literal key order. Use the identity for transaction idempotency and query cursor
-fingerprints. Do not hash generated SQL formatting.
+canonical object-literal key order. The composite-literal serializer emits the canonical JSON text
+once. The compiler reuses that text as the SQLite binding and as input to the identity encoder.
+
+Use the identity for transaction idempotency and query cursor fingerprints. Do not hash generated SQL
+formatting.
 
 A compiled plan contains:
 
@@ -759,7 +782,23 @@ The library must not import the router, partition, or transaction coordinator.
 
 Each milestone must keep tests and type checks green.
 
-### M0 — AST and semantic fixtures
+### M0 — Memory-safe query batch fetches
+
+This milestone is independent of the expression engine. It must not change the public `queryItems`
+contract or import expression code.
+
+Deliver:
+
+- Replace the current 1,000-row internal query fetch with a fixed batch size from 10 to 20 rows.
+- Run more synchronous SQLite queries until the collector fills the public page or reaches a budget.
+- Apply the byte, item, and partition-visit budgets with the existing cursor rules.
+- Keep at most one small fetched batch in memory at a time.
+
+Test queries with 400 KiB items, small items, both directions, byte and item limits, and range-tree
+fan-out. Verify that each store fetch requests at most 20 rows. Verify that all pages contain no gaps
+or duplicate items.
+
+### M1 — AST and semantic fixtures
 
 Deliver:
 
@@ -770,28 +809,28 @@ Deliver:
 
 Test valid/invalid shapes, argument arity, missing/null truth tables, and limit fixtures.
 
-### M1 — Canonical identity and paths
+### M2 — Canonical identity and paths
 
 Deliver:
 
 - Canonical identity generation without a second AST tree.
-- JSON-compatible literal validation.
+- JSON-compatible scalar literal validation.
 - Allocation-light SQLite path validation.
 - Non-negative and `[#-N]` indexes.
 - Read-context rejection of `[#]`.
 
-Test stable identity, field/argument order, object-literal key order, valid/special paths, malformed
-paths, path limits, and hostile bound path text.
+Test stable identity, field/argument order, valid/special paths, malformed paths, path limits, and
+hostile bound path text.
 
-### M2 — Function allowlist and semantic validation
+### M3 — Function allowlist and semantic validation
 
 Deliver explicit `size`/`attribute_type` compilation, the deterministic SQLite scalar allowlist,
-complete AST validation, and required-column analysis.
+complete scalar AST validation, explicit composite-literal rejection, and required-column analysis.
 
 Test every operator shape, arity, type rule, unknown field/function, deterministic write policy, and
 rejection of aggregate/window/table/connection/extension functions.
 
-### M3 — SQLite compiler
+### M4 — SQLite compiler
 
 Deliver:
 
@@ -806,9 +845,9 @@ Deliver:
 
 Test in Workers SQLite:
 
-- All semantic fixtures.
+- All scalar semantic fixtures.
 - Missing versus null and JSON guards.
-- Scalar comparisons and rejected composite comparisons.
+- Scalar comparisons, rejected composite comparisons, and rejected composite literals.
 - Text and scalar-array containment.
 - UTF-8 size and reverse paths.
 - Every allowlisted SQLite function.
@@ -820,7 +859,7 @@ Test in Workers SQLite:
 - Existing/missing row-read metrics.
 - Required-column behavior.
 
-### M4 — Write conditions
+### M5 — Write conditions
 
 Integrate all four write paths. Replace the old condition union/evaluator. Add public, RPC, HTTP, TC,
 and persistence changes listed in section 7.
@@ -828,7 +867,26 @@ and persistence changes listed in section 7.
 Test all operators on put/delete, JSON conditions, no-write on failure, lock/check order,
 two-phase/single-shot behavior, idempotency, plan persistence/size, migration, and split routing.
 
-### M5 — Projections
+### M6 — Composite JSON literal bindings
+
+This milestone is additive. M1-M5 must reject array and object literals during semantic validation.
+Scalar condition expressions and their compiled plans must remain compatible when this milestone
+ships.
+
+Deliver:
+
+- A canonical JSON serializer for array and object literals.
+- One traversal that validates, enforces limits, writes canonical JSON text, and feeds identity bytes.
+- Canonical JSON text bindings with explicit logical `array` or `object` metadata.
+- Compiler-owned `jsonb(?)`, `json(?)`, and `json_each(?)` forms where each operation needs them.
+- Persistence and structured-clone support for the serialized bindings in compiled plans.
+
+Test nested and empty composites, array order, canonical object-key order, escaped strings, all JSON
+scalar children, cycles, unsupported runtime values, depth, and payload limits. Test different object
+insertion orders with equal identities and equal bindings. Test `size`, `attribute_type`, `contains`,
+and condition expressions in Workers SQLite.
+
+### M7 — Projections
 
 Deliver in this order:
 
@@ -836,10 +894,10 @@ Deliver in this order:
 2. Per-item `transactGetItems` projection with conflict fields preserved.
 3. `queryItems` projection with cursor identity and full-source byte accounting.
 
-Test default names, aliases, duplicates, missing/null, computed values, reverse paths, all source
-kinds, absent projection compatibility, transaction ordering, and split reads.
+Test default names, aliases, duplicates, missing/null, computed values, composite literals, reverse
+paths, all source kinds, absent projection compatibility, transaction ordering, and split reads.
 
-### M6 — Query filters
+### M8 — Query filters
 
 Deliver in this order:
 
@@ -851,7 +909,7 @@ Test all condition operations as filters, mixed data kinds, zero/high selectivit
 cursors, ascending/descending scans, no duplicate/omitted rows, promoted/range-split keys, budget
 rules, cursor identity changes, and fixed candidate routing.
 
-### M7 — Hardening and documentation
+### M9 — Hardening and documentation
 
 Run the full cross-surface matrix. Verify every allowlisted function in Workers SQLite. Measure large
 expressions and 400 KiB JSON items. Add public examples and an ADR for shipped filter/projection
@@ -889,7 +947,7 @@ The feature is complete when all milestones pass and:
 
 ## 12. Future extensions
 
-These items are not part of M0-M7:
+These items are not part of M0-M9:
 
 - **Binding compaction:** If needed, evaluate a bound JSON/`json_each` argument pool, numbered binding
   reuse, or one shared filter/projection pool. Measure it before replacing direct bindings.
@@ -900,6 +958,10 @@ These items are not part of M0-M7:
 - **Sets:** Add stored types, uniqueness, equality, containment, size, and update rules.
 - **Nested projections:** Define overlap, arrays, reverse indexes, aliases, missing values, and
   collisions.
+- **Projection output limits:** TODO: Add limits for the projection count, SQL result columns,
+  projected bytes per item, and total response bytes. Account for internal result columns. Add a
+  policy for SQLite functions that can increase output size. Keep this response protection separate
+  from query source-byte metering.
 - **Filter limits/indexing:** Add an evaluated-item limit or indexes only with preserved paging.
   Expression indexes need one audited literal-path renderer because bound paths do not match index
   expression text.
@@ -972,7 +1034,6 @@ const SQLITE_CORE_FUNCTIONS = new Set([
   "round",
   "rtrim",
   "sign",
-  "soundex",
   "substr",
   "substring",
   "trim",
