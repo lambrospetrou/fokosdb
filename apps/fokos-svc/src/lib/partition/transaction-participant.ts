@@ -12,7 +12,7 @@ import type {
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
-import { evaluateConditionsOnItem, type ItemSnapshot, type PartitionStore } from "./partition-store.js";
+import type { PartitionStore } from "./partition-store.js";
 
 // Decode a sort key for a user-facing result: the empty sentinel ([]) maps back to an absent sortKey.
 function decodeSortKey(sk: KeyBytes): string | Uint8Array | undefined {
@@ -93,24 +93,21 @@ export class TransactionParticipant {
 					};
 				}
 
-				const itemRow = this.#store.getItemStamp(item.hashKey, sk).row;
-
-				if (item.conditions && item.conditions.length > 0) {
-					const snapshot: ItemSnapshot = itemRow
-						? { found: true, hk: item.hashKey, sk, v: itemRow.v }
-						: { found: false, hk: item.hashKey, sk };
-					try {
-						evaluateConditionsOnItem(snapshot, item.conditions, "prepare");
-					} catch {
-						return {
-							outcome: "rejected",
-							reason: { type: "condition_failed", ...rejectionKeys },
-						};
-					}
+				const conditionResult = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
+				if (conditionResult && !conditionResult.conditionOk) {
+					return {
+						outcome: "rejected",
+						reason: { type: "condition_failed", ...rejectionKeys },
+					};
 				}
+				const itemStamp = conditionResult
+					? conditionResult.itemPresent
+						? { last_transaction_ts: conditionResult.lastTransactionTs! }
+						: undefined
+					: this.#store.getItemStamp(item.hashKey, sk).row;
 
-				if (itemRow) {
-					if (request.transactionTimestamp <= itemRow.last_transaction_ts) {
+				if (itemStamp) {
+					if (request.transactionTimestamp <= itemStamp.last_transaction_ts) {
 						return {
 							outcome: "rejected",
 							reason: { type: "timestamp_conflict", ...rejectionKeys },
@@ -139,7 +136,7 @@ export class TransactionParticipant {
 					data: item.data ?? null,
 					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
 					kind: item.kind ?? null,
-					conditions_json: item.conditions ? JSON.stringify(item.conditions) : null,
+					conditions_json: item.condition ? JSON.stringify(item.condition) : null,
 					coordinator_do_id: request.coordinatorDoId,
 					created_at: this.#now(),
 				});
@@ -243,19 +240,11 @@ export class TransactionParticipant {
 					};
 				}
 
-				if (item.conditions && item.conditions.length > 0) {
-					const itemRow = this.#store.getItemStamp(item.hashKey, sk).row;
-					const snapshot: ItemSnapshot = itemRow
-						? { found: true, hk: item.hashKey, sk, v: itemRow.v }
-						: { found: false, hk: item.hashKey, sk };
-					try {
-						evaluateConditionsOnItem(snapshot, item.conditions, "singleShot");
-					} catch {
-						return {
-							outcome: "rejected",
-							reason: { type: "condition_failed", ...rejectionKeys },
-						};
-					}
+				if (item.condition && !this.#store.evaluateCondition(item.condition, item.hashKey, sk).conditionOk) {
+					return {
+						outcome: "rejected",
+						reason: { type: "condition_failed", ...rejectionKeys },
+					};
 				}
 			}
 

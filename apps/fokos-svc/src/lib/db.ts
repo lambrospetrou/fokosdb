@@ -48,6 +48,7 @@ import { normalizeSkInterval } from "./query/sk-interval.js";
 import type { ScanCursor } from "./partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "./query/cursor.js";
 import { PageBudget } from "./query/page-budget.js";
+import { compileConditionExpression } from "./expression/compiler.js";
 
 export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
 
@@ -157,13 +158,14 @@ export class FokosDB {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
-		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const encoded = encodeItemData(opts.data);
+		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
+		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
 		// ttlSeconds is deliberately not forwarded: no layer honours it yet.
 		const res = await stub.apiPutItem(partitionContext, {
 			hashKey,
@@ -171,7 +173,7 @@ export class FokosDB {
 			data: encoded.data,
 			kind: encoded.kind,
 			ttlEpochUTCSeconds: opts.ttlEpochUTCSeconds,
-			conditions: opts.conditions,
+			condition,
 		});
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
@@ -200,9 +202,10 @@ export class FokosDB {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
+		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
-		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, conditions: opts.conditions });
+		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, condition });
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}
@@ -212,10 +215,12 @@ export class FokosDB {
 			throw new Error("fokosdb: clientRequestToken must be a non-empty string when provided");
 		}
 
-		// Encode a put's data once at this boundary; the TC/DO see string | Uint8Array + kind. Validation
-		// below then measures the encoded form. A non-put is passed through untouched, so a `data` field
-		// set by a non-TypeScript caller still reaches validation.
-		const prepared = opts.items.map((item) => (item.operation === "put" ? { ...item, ...encodeItemData(item.data) } : item));
+		// Encode each put and compile each condition once at this boundary. A `data` field set on a non-put
+		// by a non-TypeScript caller stays present so validation rejects it.
+		const prepared = opts.items.map((item) => {
+			const condition = item.condition ? compileConditionExpression(item.condition) : undefined;
+			return item.operation === "put" ? { ...item, ...encodeItemData(item.data), condition } : { ...item, condition };
+		});
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
 		const keys = validateTransactWriteOperations(prepared);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {

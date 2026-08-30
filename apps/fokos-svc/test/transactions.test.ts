@@ -8,6 +8,7 @@ import { PartitionContextCreator } from "../src/lib/partition-topology/partition
 import { PartitionTopologyRouterImpl } from "../src/lib/partition-topology/router.js";
 import invariant from "../src/lib/invariant.js";
 import { KeyCodec } from "../src/lib/partition-topology/key-codec.js";
+import type { ConditionExpression } from "../src/lib/types.js";
 
 function makeDB(opts?: { singlePartitionFastPath?: boolean; maxSizeMb?: number }) {
 	const { maxSizeMb, ...dbOptions } = opts ?? {};
@@ -42,6 +43,62 @@ function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sor
 	}
 	return names.size;
 }
+
+const passingConditions: readonly ConditionExpression[] = [
+	{ op: "eq", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
+	{ op: "ne", args: [{ ref: "data", path: "$.score" }, { val: 6 }] },
+	{ op: "lt", args: [{ ref: "data", path: "$.score" }, { val: 6 }] },
+	{ op: "lte", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
+	{ op: "gt", args: [{ ref: "data", path: "$.score" }, { val: 4 }] },
+	{ op: "gte", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
+	{ op: "between", args: [{ ref: "data", path: "$.score" }, { val: 4 }, { val: 6 }] },
+	{ op: "in", args: [{ ref: "data", path: "$.score" }, { val: 4 }, { val: 5 }] },
+	{
+		op: "and",
+		args: [
+			{ op: "exists", args: [{ ref: "data", path: "$.status" }] },
+			{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "active" }] },
+		],
+	},
+	{
+		op: "or",
+		args: [
+			{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "missing" }] },
+			{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "active" }] },
+		],
+	},
+	{ op: "not", args: [{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "missing" }] }] },
+	{ op: "exists", args: [{ ref: "data", path: "$.status" }] },
+	{ op: "not_exists", args: [{ ref: "data", path: "$.missing" }] },
+	{ op: "begins_with", args: [{ ref: "data", path: "$.status" }, { val: "act" }] },
+	{ op: "contains", args: [{ ref: "data", path: "$.tags" }, { val: "blue" }] },
+];
+
+describe("write conditions", () => {
+	it.each(passingConditions)("applies $op conditions to putItem and deleteItem", async (condition) => {
+		const db = makeDB();
+		const key = { hashKey: `condition-${condition.op}-${crypto.randomUUID()}` };
+		const data = { status: "active", score: 5, tags: ["blue", "green"] };
+
+		await db.putItem({ ...key, data });
+		await expect(db.putItem({ ...key, data, condition })).resolves.toMatchObject({ version: 2 });
+		await expect(db.deleteItem({ ...key, condition })).resolves.toMatchObject({ deleted: true });
+	});
+
+	it("does not write when a JSON condition fails", async () => {
+		const db = makeDB();
+		const key = { hashKey: `condition-failure-${crypto.randomUUID()}` };
+		await db.putItem({ ...key, data: { status: "active" } });
+		const condition = {
+			op: "eq",
+			args: [{ ref: "data", path: "$.status" }, { val: "disabled" }],
+		} as const satisfies ConditionExpression;
+
+		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(/condition failed/);
+		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(/condition failed/);
+		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version: 1 } });
+	});
+});
 
 describe("transactions - end-to-end", () => {
 	beforeEach(async () => {
@@ -139,7 +196,7 @@ describe("transactions - end-to-end", () => {
 				{
 					hashKey: "atom-nonexistent",
 					operation: "check" as const,
-					conditions: [{ type: "item_exists" as const }],
+					condition: { op: "exists" as const, args: [{ ref: "hashKey" as const }] },
 				},
 			],
 		});
@@ -185,7 +242,7 @@ describe("transactions - end-to-end", () => {
 				...k,
 				operation: "put" as const,
 				data: `should-not-appear`,
-				conditions: i === 0 ? [{ type: "item_not_exists" as const }] : undefined,
+				condition: i === 0 ? ({ op: "not_exists", args: [{ ref: "hashKey" }] } as const) : undefined,
 			})),
 		});
 
@@ -534,6 +591,26 @@ describe("transactions - end-to-end", () => {
 		expect(item.item.version).toBe(1);
 	});
 
+	it("persists a JSON condition plan through two-phase commit and replays it idempotently", async () => {
+		const db = makeDB();
+		const key = { hashKey: `condition-plan-${crypto.randomUUID()}` };
+		const token = `condition-plan-token-${crypto.randomUUID()}`;
+		await db.putItem({ ...key, data: { status: "active" } });
+		vi.advanceTimersByTime(1);
+		const operation = {
+			...key,
+			operation: "put" as const,
+			data: { status: "updated" },
+			condition: { op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "active" }] } as const,
+		};
+
+		const first = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
+		const replay = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
+
+		expect(replay).toEqual(first);
+		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "updated" }, version: 2 } });
+	});
+
 	// A token identifies one request, not one caller. Answering a different request with the stored
 	// outcome would acknowledge writes that never execute, so the coordinator compares an
 	// operation-set fingerprint and refuses.
@@ -624,7 +701,7 @@ describe("transactions - end-to-end", () => {
 				{
 					hashKey: "rollback-missing",
 					operation: "delete",
-					conditions: [{ type: "item_exists" }],
+					condition: { op: "exists", args: [{ ref: "hashKey" }] },
 				},
 			],
 		});
@@ -830,7 +907,7 @@ describe("transactions - single-partition fast path", () => {
 			items: [
 				{ ...keys[0], operation: "put", data: "written" },
 				{ ...keys[1], operation: "delete" },
-				{ ...keys[2], operation: "check", conditions: [{ type: "item_exists" }] },
+				{ ...keys[2], operation: "check", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
 			],
 		});
 
@@ -852,7 +929,7 @@ describe("transactions - single-partition fast path", () => {
 		const result = await db.transactWriteItems({
 			items: [
 				{ ...keys[0], operation: "put", data: "never" },
-				{ ...keys[1], operation: "put", data: "never", conditions: [{ type: "item_exists" }] },
+				{ ...keys[1], operation: "put", data: "never", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
 			],
 		});
 

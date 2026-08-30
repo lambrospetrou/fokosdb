@@ -18,8 +18,11 @@ import { KeyBytes, KeyCodec } from "./partition-topology/key-codec.js";
 import invariant from "./invariant.js";
 import { MAX_ITEM_BYTES } from "./transaction-limits.js";
 import { PartitionStore } from "./partition/partition-store.js";
+import { compileConditionExpression } from "./expression/compiler.js";
+import type { ConditionExpression } from "./expression/types.js";
 
 const kb = (s?: string) => KeyCodec.encodeOptional(s);
+const compiledCondition = (condition: ConditionExpression) => compileConditionExpression(condition);
 
 type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 
@@ -252,7 +255,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "value",
-				conditions: [{ type: "item_not_exists" }],
+				condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 				kind: "text",
 			});
 
@@ -272,10 +275,10 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						conditions: [{ type: "item_not_exists" }],
+						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 						kind: "text",
 					}),
-				).rejects.toThrow(/item_not_exists.*v=1.*hk=\"hk\".*sk=\"sk\"/);
+				).rejects.toThrow("condition failed");
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -293,10 +296,10 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb(),
 						data: "overwrite",
-						conditions: [{ type: "item_not_exists" }],
+						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 						kind: "text",
 					}),
-				).rejects.toThrow("item_not_exists");
+				).rejects.toThrow("condition failed");
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb() });
@@ -313,7 +316,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "second",
-				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				kind: "text",
 			});
 
@@ -332,10 +335,10 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "stale",
-						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						kind: "text",
 					}),
-				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
+				).rejects.toThrow("condition failed");
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -351,10 +354,10 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "value",
-						conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						kind: "text",
 					}),
-				).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found null/);
+				).rejects.toThrow("condition failed");
 			});
 		});
 
@@ -368,7 +371,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v2",
-				conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				kind: "text",
 			});
 			expect(r2.version).toBe(2);
@@ -377,7 +380,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v3",
-				conditions: [{ type: "attribute_equals", attribute: "v", value: 2 }],
+				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 2 }] }),
 				kind: "text",
 			});
 			expect(r3.version).toBe(3);
@@ -393,10 +396,13 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "second",
-				conditions: [
-					{ type: "attribute_equals", attribute: "v", value: 1 },
-					{ type: "attribute_equals", attribute: "v", value: 1 },
-				],
+				condition: compiledCondition({
+					op: "and",
+					args: [
+						{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+						{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+					],
+				}),
 				kind: "text",
 			});
 
@@ -416,10 +422,16 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						conditions: [{ type: "item_not_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+						condition: compiledCondition({
+							op: "and",
+							args: [
+								{ op: "not_exists", args: [{ ref: "hashKey" }] },
+								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+							],
+						}),
 						kind: "text",
 					}),
-				).rejects.toThrow("item_not_exists");
+				).rejects.toThrow("condition failed");
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -439,13 +451,16 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						conditions: [
-							{ type: "attribute_equals", attribute: "v", value: 2 },
-							{ type: "attribute_equals", attribute: "v", value: 1 },
-						],
+						condition: compiledCondition({
+							op: "and",
+							args: [
+								{ op: "eq", args: [{ ref: "v" }, { val: 2 }] },
+								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+							],
+						}),
 						kind: "text",
 					}),
-				).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
+				).rejects.toThrow("condition failed");
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -459,7 +474,6 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "value",
-				conditions: [],
 				kind: "text",
 			});
 
@@ -589,7 +603,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await stub.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					conditions: [{ type: "item_exists" }],
+					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 				});
 
 				expect(result.deleted).toBe(true);
@@ -604,9 +618,9 @@ describe("PartitionDO - deleteItem", () => {
 						instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							conditions: [{ type: "item_exists" }],
+							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 						}),
-					).rejects.toThrow(/item_exists.*hk=\"hk\".*sk=\"sk\"/);
+					).rejects.toThrow("condition failed");
 				});
 
 				const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -618,8 +632,12 @@ describe("PartitionDO - deleteItem", () => {
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
 					await expect(
-						instance.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb(), conditions: [{ type: "item_exists" }] }),
-					).rejects.toThrow("item_exists");
+						instance.apiDeleteItem(ctx, {
+							hashKey: kb("hk"),
+							sortKey: kb(),
+							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+						}),
+					).rejects.toThrow("condition failed");
 				});
 			});
 		});
@@ -632,7 +650,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await stub.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				});
 
 				expect(result.deleted).toBe(true);
@@ -649,9 +667,9 @@ describe("PartitionDO - deleteItem", () => {
 						instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						}),
-					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found 2/);
+					).rejects.toThrow("condition failed");
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -668,9 +686,9 @@ describe("PartitionDO - deleteItem", () => {
 						instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							conditions: [{ type: "attribute_equals", attribute: "v", value: 1 }],
+							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						}),
-					).rejects.toThrow(/attribute_equals.*"v".*expected 1.*found null/);
+					).rejects.toThrow("condition failed");
 				});
 			});
 		});
@@ -683,7 +701,13 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await stub.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+					condition: compiledCondition({
+						op: "and",
+						args: [
+							{ op: "exists", args: [{ ref: "hashKey" }] },
+							{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+						],
+					}),
 				});
 
 				expect(result.deleted).toBe(true);
@@ -699,9 +723,15 @@ describe("PartitionDO - deleteItem", () => {
 						instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+							condition: compiledCondition({
+								op: "and",
+								args: [
+									{ op: "exists", args: [{ ref: "hashKey" }] },
+									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+								],
+							}),
 						}),
-					).rejects.toThrow("item_exists");
+					).rejects.toThrow("condition failed");
 				});
 			});
 
@@ -717,9 +747,15 @@ describe("PartitionDO - deleteItem", () => {
 						instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							conditions: [{ type: "item_exists" }, { type: "attribute_equals", attribute: "v", value: 1 }],
+							condition: compiledCondition({
+								op: "and",
+								args: [
+									{ op: "exists", args: [{ ref: "hashKey" }] },
+									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+								],
+							}),
 						}),
-					).rejects.toThrow(/attribute_equals.*expected 1.*found 2/);
+					).rejects.toThrow("condition failed");
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -732,7 +768,7 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
-				const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), conditions: [] });
+				const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 				expect(result.deleted).toBe(true);
 			});
@@ -991,7 +1027,13 @@ describe("PartitionDO - splitting", () => {
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
 			const hashKey = "forwarded-key";
-			const putResult = await stub.apiPutItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), data: "val", kind: "text" as const });
+			const putResult = await stub.apiPutItem(ctx, {
+				hashKey: kb(hashKey),
+				sortKey: kb("sk"),
+				data: "val",
+				kind: "text" as const,
+				condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+			});
 			expect(putResult.meta.forwardCount).toBe(1);
 			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
 			expect(childNames).toContain(putResult.meta.servedByActorName);
@@ -2066,7 +2108,12 @@ describe("PartitionDO — single-shot transaction", () => {
 			items: [
 				{ hashKey: kb("shot-new"), sortKey: kb("sk"), operation: "put", data: "written", kind: "text" },
 				{ hashKey: kb("shot-gone"), sortKey: kb("sk"), operation: "delete" },
-				{ hashKey: kb("shot-checked"), sortKey: kb("sk"), operation: "check", conditions: [{ type: "item_exists" }] },
+				{
+					hashKey: kb("shot-checked"),
+					sortKey: kb("sk"),
+					operation: "check",
+					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+				},
 			],
 		});
 
@@ -2093,7 +2140,12 @@ describe("PartitionDO — single-shot transaction", () => {
 			items: [
 				{ hashKey: kb("atomic-existing"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" },
 				{ hashKey: kb("atomic-other"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
-				{ hashKey: kb("atomic-absent"), sortKey: kb("sk"), operation: "check", conditions: [{ type: "item_exists" }] },
+				{
+					hashKey: kb("atomic-absent"),
+					sortKey: kb("sk"),
+					operation: "check",
+					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+				},
 			],
 		});
 

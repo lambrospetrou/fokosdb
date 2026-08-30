@@ -7,6 +7,7 @@ import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest } from "../transaction-types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
+import { compileConditionExpression } from "../expression/compiler.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -109,7 +110,14 @@ describe("TransactionParticipant - prepare", () => {
 
 			const request = prepareReq({
 				items: [
-					{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v", kind: "text", conditions: [{ type: "item_not_exists" }] },
+					{
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						operation: "put",
+						data: "v",
+						kind: "text",
+						condition: compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+					},
 				],
 			});
 			expect(participant.prepareLocal(request)).toEqual({
@@ -117,6 +125,18 @@ describe("TransactionParticipant - prepare", () => {
 				reason: { type: "condition_failed", hashKey: "hk", sortKey: "sk" },
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+		});
+	});
+
+	it("persists the compiled condition plan after prepare accepts it", async () => {
+		await withParticipant(({ participant, store }) => {
+			const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
+			const request = prepareReq({
+				items: [{ hashKey: kb("new"), sortKey: kb("sk"), operation: "put", data: "v", kind: "text", condition }],
+			});
+
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(store.queryPendingTxPage(null, 1)[0].conditions_json).toBe(JSON.stringify(condition));
 		});
 	});
 

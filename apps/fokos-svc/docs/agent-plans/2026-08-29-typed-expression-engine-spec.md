@@ -1,7 +1,7 @@
 # Typed expression engine
 
 Date: 2026-08-29  
-Status: **accepted design; M0-M4 implemented**
+Status: **accepted design; M0-M5 implemented**
 
 References:
 
@@ -914,7 +914,7 @@ Test in Workers SQLite:
 - Existing/missing row-read metrics.
 - Required-column behavior.
 
-### M5 — Write conditions
+### M5 — DONE — Write conditions
 
 Integrate all four write paths. Replace the old condition union/evaluator. Add public, RPC, HTTP, TC,
 and persistence changes listed in section 7.

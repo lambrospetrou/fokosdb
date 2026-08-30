@@ -1,8 +1,10 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { DATA_KINDS, type DataKind, type ItemCondition } from "../types.js";
+import { DATA_KINDS, type DataKind } from "../types.js";
 import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
+import type { CompiledConditionPlan } from "../expression/plan.js";
+import { evaluateConditionPlan, type ConditionEvaluationResult } from "../expression/runtime.js";
 
 // The on-disk `data_kind` code for json rows. json is stored as JSONB (a BLOB); a public read must
 // decode it to JSON text in SQL (`json(data)`) so JS never touches raw JSONB, while a migration read
@@ -80,8 +82,6 @@ export type PromotedKeyRow = { hash_key: KeyBytes; status: PromotedKeyStatus };
 
 export type SqlMetrics = { rowsRead: number; rowsWritten: number };
 
-export type ItemSnapshot = { hk: KeyBytes; sk: KeyBytes; found: true; v: number } | { hk: KeyBytes; sk: KeyBytes; found: false };
-
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -96,33 +96,6 @@ export type ItemSnapshot = { hk: KeyBytes; sk: KeyBytes; found: true; v: number 
  */
 function fromSqlKey(value: ArrayBuffer | Uint8Array): KeyBytes {
 	return KeyCodec.asKeyBytes(value instanceof Uint8Array ? value : new Uint8Array(value));
-}
-
-/**
- * Pure condition evaluation shared by the non-transactional putItem/deleteItem and the
- * transactional prepare path. Lives with the store (NOT the transaction participant) because
- * both paths evaluate the same conditions against the same item snapshot shape.
- */
-export function evaluateConditionsOnItem(item: ItemSnapshot, conditions: ItemCondition[], operationName: string): void {
-	const where = () => KeyCodec.pairForLog(item.hk, item.sk);
-	for (const condition of conditions) {
-		if (condition.type === "item_exists") {
-			if (!item.found) {
-				throw new Error(`fokos/${operationName}: condition item_exists failed — item does not exist (${where()})`);
-			}
-		} else if (condition.type === "item_not_exists") {
-			if (item.found) {
-				throw new Error(`fokos/${operationName}: condition item_not_exists failed — item already exists with v=${item.v} (${where()})`);
-			}
-		} else if (condition.type === "attribute_equals") {
-			const actual = item.found ? item[condition.attribute] : null;
-			if (actual !== condition.value) {
-				throw new Error(
-					`fokos/${operationName}: condition attribute_equals failed — attribute "${condition.attribute}" expected ${condition.value}, found ${actual} (${where()})`,
-				);
-			}
-		}
-	}
 }
 
 // Maps the on-disk integer `data_kind` code back to its string discriminant. The SELECTs cast the
@@ -371,18 +344,19 @@ export class PartitionStore {
 		};
 	}
 
-	/**
-	 * Lightweight existence/version/timestamp read for condition evaluation and prepare checks.
-	 * Metrics cover the single SELECT (counted into putItem/deleteItem meta when conditions exist).
-	 */
-	getItemStamp(hk: KeyBytes, sk: KeyBytes): { row?: { v: number; last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
-		const res = this.#storage.sql.exec<{ v: number; last_transaction_ts: number }>(
-			`SELECT v, last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+	/** Lightweight existence and timestamp read for an unconditional transaction prepare. */
+	getItemStamp(hk: KeyBytes, sk: KeyBytes): { row?: { last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
+		const res = this.#storage.sql.exec<{ last_transaction_ts: number }>(
+			`SELECT last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
 			hk,
 			sk,
 		);
 		const row = res.toArray()[0];
 		return { row, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+	}
+
+	evaluateCondition(plan: CompiledConditionPlan, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
+		return evaluateConditionPlan(this.#storage, plan, hk, sk);
 	}
 
 	/**

@@ -1,6 +1,8 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
-import type { DataKind, ItemCondition, ItemKey, JsonComposite, JsonValue } from "./types.js";
+import type { DataKind, ItemKey, JsonComposite, JsonValue } from "./types.js";
+import type { CompiledConditionPlan } from "./expression/plan.js";
+import type { ConditionExpression } from "./expression/types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -34,8 +36,8 @@ export type TransactionItem = TransactionItemKey & {
 	data?: Uint8Array | string;
 	/** Data kind discriminant; present for "put" (json ⇒ data is JSON text). */
 	kind?: DataKind;
-	/** Optional for all operation types. */
-	conditions?: ItemCondition[];
+	/** Optional for put and delete; required for check. */
+	condition?: CompiledConditionPlan;
 };
 
 export type PrepareRequest = {
@@ -215,20 +217,20 @@ export type TransactWriteItem =
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
 			data: string | Uint8Array | JsonComposite;
-			conditions?: ItemCondition[];
+			condition?: ConditionExpression;
 	  }
 	| {
 			operation: "delete";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
-			conditions?: ItemCondition[];
+			condition?: ConditionExpression;
 	  }
 	| {
 			operation: "check";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
-			/** Required and non-empty: a check with no conditions asserts nothing. */
-			conditions: ItemCondition[];
+			/** A check must have one condition because it does not write. */
+			condition: ConditionExpression;
 	  };
 
 export type TransactWriteItemsOptions = {
@@ -251,7 +253,7 @@ export type TCWriteOperation = {
 	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
 	data?: Uint8Array | string;
 	kind?: DataKind;
-	conditions?: ItemCondition[];
+	condition?: CompiledConditionPlan;
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };

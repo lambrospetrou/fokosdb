@@ -4,8 +4,17 @@ import * as v from "valibot";
 import { FokosDB } from "../../lib/db.js";
 import { PartitionContextCreator, type SplitConditions } from "../../lib/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../lib/partition-topology/router.js";
-import type { GetItemResult, InitiateReadResponse, JsonValue, QueryItemsResult } from "../../lib/types.js";
+import type {
+	ConditionExpression,
+	ExpressionReference,
+	ExpressionValue,
+	GetItemResult,
+	InitiateReadResponse,
+	JsonValue,
+	QueryItemsResult,
+} from "../../lib/types.js";
 import { PartitionDO } from "../../lib/do-partition.js";
+import { ExpressionError } from "../../lib/expression/errors.js";
 
 export { PartitionDO } from "../../lib/do-partition.js";
 export { TransactionCoordinatorDO } from "../../lib/do-transaction-coordinator.js";
@@ -27,20 +36,61 @@ const PartitionOptionsSchema = v.optional(
 	}),
 );
 
-const ItemConditionSchema = v.union([
-	v.object({ type: v.literal("item_exists") }),
-	v.object({ type: v.literal("item_not_exists") }),
-	v.object({ type: v.literal("attribute_equals"), attribute: v.literal("v"), value: v.number() }),
+const JsonValueSchema: v.GenericSchema<JsonValue> = v.lazy(() =>
+	v.union([v.string(), v.number(), v.boolean(), v.null(), v.array(JsonValueSchema), v.record(v.string(), JsonValueSchema)]),
+);
+
+const ExpressionReferenceSchema: v.GenericSchema<ExpressionReference> = v.union([
+	v.strictObject({ ref: v.literal("hashKey") }),
+	v.strictObject({ ref: v.literal("sortKey") }),
+	v.strictObject({ ref: v.literal("v") }),
+	v.strictObject({ ref: v.literal("ttl") }),
+	v.strictObject({ ref: v.literal("data"), path: v.optional(v.string()) }),
 ]);
 
+const ExpressionValueSchema: v.GenericSchema<ExpressionValue> = v.lazy(() =>
+	v.union([
+		v.strictObject({ val: JsonValueSchema }),
+		ExpressionReferenceSchema,
+		v.strictObject({ fn: v.string(), args: v.array(ExpressionValueSchema) }),
+	]),
+);
+
+const ConditionExpressionSchema: v.GenericSchema<ConditionExpression> = v.lazy(() =>
+	v.variant("op", [
+		v.strictObject({
+			op: v.union([v.literal("eq"), v.literal("ne"), v.literal("lt"), v.literal("lte"), v.literal("gt"), v.literal("gte")]),
+			args: v.tuple([ExpressionValueSchema, ExpressionValueSchema]),
+		}),
+		v.strictObject({ op: v.literal("between"), args: v.tuple([ExpressionValueSchema, ExpressionValueSchema, ExpressionValueSchema]) }),
+		v.strictObject({ op: v.literal("in"), args: v.tupleWithRest([ExpressionValueSchema, ExpressionValueSchema], ExpressionValueSchema) }),
+		v.strictObject({
+			op: v.union([v.literal("and"), v.literal("or")]),
+			args: v.tupleWithRest(
+				[v.lazy(() => ConditionExpressionSchema), v.lazy(() => ConditionExpressionSchema)],
+				v.lazy(() => ConditionExpressionSchema),
+			),
+		}),
+		v.strictObject({ op: v.literal("not"), args: v.tuple([v.lazy(() => ConditionExpressionSchema)]) }),
+		v.strictObject({
+			op: v.union([v.literal("exists"), v.literal("not_exists")]),
+			args: v.tuple([ExpressionReferenceSchema]),
+		}),
+		v.strictObject({
+			op: v.union([v.literal("begins_with"), v.literal("contains")]),
+			args: v.tuple([ExpressionValueSchema, ExpressionValueSchema]),
+		}),
+	]),
+);
+
 const PutItemBodySchema = v.pipe(
-	v.object({
+	v.strictObject({
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
 		ttlSeconds: v.optional(v.number()),
 		ttlEpochUTCSeconds: v.optional(v.number()),
 		data: v.string(),
-		conditions: v.optional(v.array(ItemConditionSchema)),
+		condition: v.optional(ConditionExpressionSchema),
 		partitionOptions: PartitionOptionsSchema,
 	}),
 	v.check(
@@ -55,10 +105,10 @@ const GetItemBodySchema = v.object({
 	partitionOptions: PartitionOptionsSchema,
 });
 
-const DeleteItemBodySchema = v.object({
+const DeleteItemBodySchema = v.strictObject({
 	hashKey: v.string(),
 	sortKey: v.optional(v.string()),
-	conditions: v.optional(v.array(ItemConditionSchema)),
+	condition: v.optional(ConditionExpressionSchema),
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -70,19 +120,19 @@ const TransactWriteItemBodySchema = v.variant("operation", [
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
 		data: v.string(),
-		conditions: v.optional(v.array(ItemConditionSchema)),
+		condition: v.optional(ConditionExpressionSchema),
 	}),
 	v.strictObject({
 		operation: v.literal("delete"),
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
-		conditions: v.optional(v.array(ItemConditionSchema)),
+		condition: v.optional(ConditionExpressionSchema),
 	}),
 	v.strictObject({
 		operation: v.literal("check"),
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
-		conditions: v.pipe(v.array(ItemConditionSchema), v.minLength(1)),
+		condition: ConditionExpressionSchema,
 	}),
 ]);
 
@@ -213,6 +263,9 @@ let cachedValidTokens: Set<string> | null = null;
 api.onError((err, c) => {
 	if (err instanceof HTTPException) {
 		return err.getResponse();
+	}
+	if (err instanceof ExpressionError) {
+		return c.json({ error: err.message, code: err.code }, 400);
 	}
 	console.error({
 		message: "Unexpected error in catch-all",

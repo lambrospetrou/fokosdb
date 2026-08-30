@@ -14,6 +14,7 @@ const textEncoder = new TextEncoder();
 export type ConditionEvaluationResult = {
 	itemPresent: boolean;
 	conditionOk: boolean;
+	lastTransactionTs: number | null;
 	rowsRead: number;
 	rowsWritten: number;
 };
@@ -43,7 +44,7 @@ export function evaluateConditionPlan(
 	}
 	const statement = composeConditionStatement(plan.sql);
 	try {
-		const cursor = storage.sql.exec<{ item_present: number; condition_ok: number }>(
+		const cursor = storage.sql.exec<{ item_present: number; condition_ok: number; last_transaction_ts: number | null }>(
 			statement,
 			hashKey,
 			sortKey,
@@ -53,6 +54,7 @@ export function evaluateConditionPlan(
 		return {
 			itemPresent: row.item_present === 1,
 			conditionOk: row.condition_ok === 1,
+			lastTransactionTs: row.last_transaction_ts,
 			rowsRead: cursor.rowsRead,
 			rowsWritten: cursor.rowsWritten,
 		};

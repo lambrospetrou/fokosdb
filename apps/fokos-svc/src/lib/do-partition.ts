@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, ItemCondition, OperationMetrics } from "./types.js";
+import { DataKind, OperationMetrics } from "./types.js";
+import type { CompiledConditionPlan } from "./expression/plan.js";
 import type {
 	CancelRequest,
 	CancelResponse,
@@ -43,9 +44,7 @@ import { collectBatch } from "./partition/batch-scan.js";
 import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
-	evaluateConditionsOnItem,
 	PartitionStore,
-	type ItemSnapshot,
 	type MigratedItem,
 	type ScanCursor,
 	type PendingTransactionCursor,
@@ -100,12 +99,12 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	data: string | Uint8Array;
 	kind: DataKind;
 	ttlEpochUTCSeconds?: number;
-	conditions?: ItemCondition[];
+	condition?: CompiledConditionPlan;
 };
 
 export type PutItemRpcResponse = { version: number; meta: OperationMetrics & PartitionInfoInternal };
 
-export type DeleteItemRpcRequest = ItemRpcKeys & { conditions?: ItemCondition[] };
+export type DeleteItemRpcRequest = ItemRpcKeys & { condition?: CompiledConditionPlan };
 
 export type DeleteItemRpcResponse = { deleted: boolean; meta: OperationMetrics & PartitionInfoInternal };
 
@@ -420,32 +419,28 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			intent: "write",
 			forward: async (stub, pCtx) => await stub.apiPutItem(pCtx, req),
 			local: async () => {
-				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
-				if (pendingRow) {
-					// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
-					// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
-					throw new Error(
-						`fokos/putItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
-					);
-				}
+				const { writeRes, conditionRes } = this.#store.transactionSync(() => {
+					const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
+					if (pendingRow) {
+						// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
+						// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
+						throw new Error(
+							`fokos/putItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
+						);
+					}
 
-				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
-				if (req.conditions && req.conditions.length > 0) {
-					const stamp = this.#store.getItemStamp(hashKey, sortKey);
-					conditionRes = stamp;
-					const item: ItemSnapshot = stamp.row
-						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
-						: { found: false, hk: hashKey, sk: sortKey };
-					evaluateConditionsOnItem(item, req.conditions, "putItem");
-				}
+					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
+					if (conditionRes && !conditionRes.conditionOk) throw new Error("fokos/putItem: condition failed");
 
-				const writeRes = this.#store.upsertItem({
-					hk: hashKey,
-					sk: sortKey,
-					data: req.data,
-					kind: req.kind,
-					ttlEpochUtcSeconds: req.ttlEpochUTCSeconds ?? null,
-					lastTransactionTs: Date.now(),
+					const writeRes = this.#store.upsertItem({
+						hk: hashKey,
+						sk: sortKey,
+						data: req.data,
+						kind: req.kind,
+						ttlEpochUtcSeconds: req.ttlEpochUTCSeconds ?? null,
+						lastTransactionTs: Date.now(),
+					});
+					return { writeRes, conditionRes };
 				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
@@ -483,26 +478,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			intent: "delete",
 			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, req),
 			local: async () => {
-				const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
-				if (pendingRow) {
-					// FIXME: ATC §4 optimization — see same comment in putItem.
-					throw new Error(
-						`fokos/deleteItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
-					);
-				}
+				const { writeRes, conditionRes } = this.#store.transactionSync(() => {
+					const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
+					if (pendingRow) {
+						// FIXME: ATC §4 optimization — see same comment in putItem.
+						throw new Error(
+							`fokos/deleteItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
+						);
+					}
 
-				let conditionRes: { rowsRead: number; rowsWritten: number } | null = null;
-				if (req.conditions && req.conditions.length > 0) {
-					const stamp = this.#store.getItemStamp(hashKey, sortKey);
-					conditionRes = stamp;
-					const item: ItemSnapshot = stamp.row
-						? { found: true, hk: hashKey, sk: sortKey, v: stamp.row.v }
-						: { found: false, hk: hashKey, sk: sortKey };
-					evaluateConditionsOnItem(item, req.conditions, "deleteItem");
-				}
+					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
+					if (conditionRes && !conditionRes.conditionOk) throw new Error("fokos/deleteItem: condition failed");
 
-				// Keep deletion watermark consistent with transactional deletes.
-				const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
+					// Keep deletion watermark consistent with transactional deletes.
+					const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
+					return { writeRes, conditionRes };
+				});
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					deleted: writeRes.deleted,

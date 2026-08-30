@@ -5,6 +5,7 @@ import type {
 	TransactWriteItemsOptions,
 } from "./transaction-types.js";
 import type { JsonComposite, JsonValue } from "./json-types.js";
+import type { ConditionExpression } from "./expression/types.js";
 
 // ─── Item data kinds ────────────────────────────────────────────────────────────
 
@@ -46,11 +47,6 @@ export interface ItemDeleter {
 	deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult>;
 }
 
-export type ItemCondition =
-	| { type: "item_exists" }
-	| { type: "item_not_exists" }
-	| { type: "attribute_equals"; attribute: "v"; value: number };
-
 export type PutItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
@@ -60,14 +56,14 @@ export type PutItemOptions = {
 
 	data: string | Uint8Array | JsonComposite;
 
-	conditions?: ItemCondition[];
+	condition?: ConditionExpression;
 };
 
 export type DeleteItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
 
-	conditions?: ItemCondition[];
+	condition?: ConditionExpression;
 };
 
 export type ItemKey = {

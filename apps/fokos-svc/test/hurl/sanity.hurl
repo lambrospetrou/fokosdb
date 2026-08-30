@@ -80,7 +80,7 @@ Content-Type: application/json
 {
   "hashKey": "cond#item",
   "data": "v1",
-  "conditions": [{ "type": "item_not_exists" }]
+  "condition": { "op": "not_exists", "args": [{ "ref": "hashKey" }] }
 }
 HTTP 200
 
@@ -90,7 +90,7 @@ Content-Type: application/json
 {
   "hashKey": "cond#item",
   "data": "v2",
-  "conditions": [{ "type": "item_not_exists" }]
+  "condition": { "op": "not_exists", "args": [{ "ref": "hashKey" }] }
 }
 HTTP *
 [Asserts]
@@ -132,7 +132,7 @@ POST {{base_url}}/api/rpc/{{database_name}}/deleteItem
 Content-Type: application/json
 {
   "hashKey": "cond#item",
-  "conditions": [{ "type": "item_exists" }]
+  "condition": { "op": "exists", "args": [{ "ref": "hashKey" }] }
 }
 HTTP 200
 
@@ -239,7 +239,7 @@ POST {{base_url}}/api/rpc/{{database_name}}/transactWriteItems
 Content-Type: application/json
 {
   "items": [
-    { "hashKey": "tx#item1", "operation": "check", "conditions": [{ "type": "item_exists" }] },
+    { "hashKey": "tx#item1", "operation": "check", "condition": { "op": "exists", "args": [{ "ref": "hashKey" }] } },
     { "hashKey": "tx#item2", "operation": "delete" }
   ]
 }

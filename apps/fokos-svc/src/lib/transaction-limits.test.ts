@@ -9,8 +9,10 @@ import {
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
+import { compileConditionExpression } from "./expression/compiler.js";
 
 const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops);
+const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
 
 function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x"): TransactWriteOperationLike {
 	return { hashKey, sortKey, operation: "put", data };
@@ -48,7 +50,7 @@ describe("validateTransactWriteOperations", () => {
 				putOp("a"),
 				putOp("a", "s1"),
 				{ hashKey: "b", operation: "delete" },
-				{ hashKey: "c", sortKey: "s", operation: "check", conditions: [{ type: "item_exists" }] },
+				{ hashKey: "c", sortKey: "s", operation: "check", condition: itemExists },
 			]),
 		).not.toThrow();
 	});
@@ -104,25 +106,22 @@ describe("validateTransactWriteOperations", () => {
 		expect(() =>
 			validate([
 				{ hashKey: "a", operation: "delete" },
-				{ hashKey: "b", operation: "check", conditions: [{ type: "item_exists" }] },
+				{ hashKey: "b", operation: "check", condition: itemExists },
 			]),
 		).not.toThrow();
 	});
 
 	it("rejects data on a delete or a check", () => {
 		expect(() => validate([{ hashKey: "a", operation: "delete", data: "x" }])).toThrow(/"delete" operation must not carry data/);
-		expect(() => validate([{ hashKey: "a", operation: "check", conditions: [{ type: "item_exists" }], data: "x" }])).toThrow(
+		expect(() => validate([{ hashKey: "a", operation: "check", condition: itemExists, data: "x" }])).toThrow(
 			/"check" operation must not carry data/,
 		);
 		// An empty string is still a data field.
 		expect(() => validate([{ hashKey: "a", operation: "delete", data: "" }])).toThrow(/"delete" operation must not carry data/);
 	});
 
-	it("rejects a check without conditions", () => {
-		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(/"check" operation requires at least one condition/);
-		expect(() => validate([{ hashKey: "a", operation: "check", conditions: [] }])).toThrow(
-			/"check" operation requires at least one condition/,
-		);
+	it("rejects a check without a condition", () => {
+		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(/"check" operation requires a condition/);
 	});
 
 	it("accepts an item at the per-item byte limit and rejects one over it", () => {
@@ -148,6 +147,16 @@ describe("validateTransactWriteOperations", () => {
 		const ops = Array.from({ length: atLimit }, (_, i) => putOp(`hk-${i}`, undefined, maxItem));
 		expect(() => validate(ops)).not.toThrow();
 		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(/total payload exceeds 4 MB/);
+	});
+
+	it("includes serialized condition plans in the transaction payload", () => {
+		const condition = { ...itemExists, identity: "x".repeat(52 * 1024) };
+		const ops: TransactWriteOperationLike[] = Array.from({ length: 80 }, (_, i) => ({
+			hashKey: `condition-${i}`,
+			operation: "check",
+			condition,
+		}));
+		expect(() => validate(ops)).toThrow(/total payload exceeds 4 MB/);
 	});
 });
 

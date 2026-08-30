@@ -6,7 +6,9 @@ export const CONDITION_FIXED_BINDING_COUNT = 2;
 
 export function composeConditionStatement(predicateSql: string): string {
 	return `WITH requested(requested_hk, requested_sk) AS (VALUES (?, ?))
-SELECT i.hk IS NOT NULL AS item_present, CASE WHEN (${predicateSql}) THEN 1 ELSE 0 END AS condition_ok
+SELECT i.hk IS NOT NULL AS item_present,
+       CASE WHEN (${predicateSql}) THEN 1 ELSE 0 END AS condition_ok,
+       i.last_transaction_ts
 FROM requested
 LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
 }

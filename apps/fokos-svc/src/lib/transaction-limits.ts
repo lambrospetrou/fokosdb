@@ -11,7 +11,7 @@
 
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { TransactionOperationType } from "./transaction-types.js";
-import type { ItemCondition } from "./types.js";
+import type { CompiledConditionPlan } from "./expression/plan.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -66,7 +66,7 @@ export type TransactWriteOperationLike = {
 	operation: TransactionOperationType;
 	// Already-encoded data (json stringified upstream), so payload accounting is a plain byte/char count.
 	data?: Uint8Array | string;
-	conditions?: ItemCondition[];
+	condition?: CompiledConditionPlan;
 };
 
 function isEmptyKey(k: string | Uint8Array): boolean {
@@ -172,8 +172,8 @@ export function validateTransactWriteOperations(
 		} else if (op.data != null) {
 			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry data (${at})`);
 		}
-		if (op.operation === "check" && !op.conditions?.length) {
-			throw new Error(`fokos: transactWriteItems "check" operation requires at least one condition (${at})`);
+		if (op.operation === "check" && !op.condition) {
+			throw new Error(`fokos: transactWriteItems "check" operation requires a condition (${at})`);
 		}
 		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
 		// commitLocal's keyset check and the TC's two-phase read pairing use.
@@ -191,6 +191,7 @@ export function validateTransactWriteOperations(
 			validateItemDataSize(op.data, "transactWriteItems");
 			totalBytes += itemDataBytes(op.data);
 		}
+		if (op.condition) totalBytes += itemDataBytes(JSON.stringify(op.condition));
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {

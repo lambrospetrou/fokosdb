@@ -13,6 +13,7 @@ import type {
 } from "./partition-peer.js";
 import { PartitionStore, type MigratedItem, type ScanCursor, type PromotedKeyStatus } from "./partition-store.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { compileConditionExpression } from "../expression/compiler.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -90,6 +91,7 @@ describe("SplitMigration — hash child", () => {
 		const base = makeBase();
 		const pCtx = hashCtx(base, [0, 1]);
 		const parentCtx = hashCtx(base, [0]);
+		const conditionsJson = JSON.stringify(compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }));
 		const lock = {
 			hk: kb("a"),
 			sk: kb("1"),
@@ -98,7 +100,7 @@ describe("SplitMigration — hash child", () => {
 			operation: "put",
 			data: "d",
 			kind: "text" as const,
-			conditions_json: null,
+			conditions_json: conditionsJson,
 			coordinator_do_id: "tc-1",
 			created_at: 1000,
 		};
@@ -110,6 +112,7 @@ describe("SplitMigration — hash child", () => {
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			expect(menv.store.pendingLockFor(kb("a"), kb("1"))?.transaction_id).toBe("tx1");
+			expect(menv.store.queryPendingTxPage(null, 1)[0].conditions_json).toBe(conditionsJson);
 			expect(menv.store.getMaxDeletedTs()).toBe(4567);
 		});
 	});

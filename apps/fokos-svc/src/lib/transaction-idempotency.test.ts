@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { TCWriteOperation } from "./transaction-types.js";
+import { compileConditionExpression } from "./expression/compiler.js";
 
 describe("hashTransactionOperations", () => {
 	it("is stable for the same operation set", () => {
@@ -30,19 +31,23 @@ describe("hashTransactionOperations", () => {
 		expect(hashTransactionOperations([del])).not.toBe(hashTransactionOperations([put("a", "s", "v")]));
 	});
 
-	it("changes when the conditions change", () => {
+	it("changes when the condition changes", () => {
 		const base = put("a", "s", "v");
-		const withCondition: TCWriteOperation = { ...base, conditions: [{ type: "item_not_exists" }] };
-		expect(hashTransactionOperations([withCondition])).not.toBe(hashTransactionOperations([base]));
+		const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
+		expect(hashTransactionOperations([{ ...base, condition }])).not.toBe(hashTransactionOperations([base]));
+	});
+
+	it("uses canonical condition identity instead of generated SQL", () => {
+		const base = put("a", "s", "v");
+		const condition = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 1 }] });
+		const reformatted = { ...condition, sql: `(${condition.sql})` };
+		expect(hashTransactionOperations([{ ...base, condition: reformatted }])).toBe(hashTransactionOperations([{ ...base, condition }]));
 	});
 
 	// Presence flags exist for this: without them the empty string would chain like no field at all.
-	it("distinguishes absent data from empty data, and absent conditions from empty conditions", () => {
+	it("distinguishes absent data from empty data", () => {
 		const noData: TCWriteOperation = { ...put("a", "s", ""), data: undefined, kind: undefined };
 		expect(hashTransactionOperations([put("a", "s", "")])).not.toBe(hashTransactionOperations([noData]));
-
-		const base = put("a", "s", "v");
-		expect(hashTransactionOperations([{ ...base, conditions: [] }])).not.toBe(hashTransactionOperations([base]));
 	});
 
 	// `kind` is chained, so the text "5" and the single byte 0x35 cannot fingerprint the same.

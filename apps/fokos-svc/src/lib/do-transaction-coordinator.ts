@@ -198,7 +198,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					op.data ?? null,
 					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
 					op.kind === undefined ? null : DATA_KINDS.indexOf(op.kind),
-					op.conditions ? JSON.stringify(op.conditions) : null,
+					op.condition ? JSON.stringify(op.condition) : null,
 					op.partitionContext.doName,
 				);
 			}
@@ -848,6 +848,6 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		operation: row.operation as TransactionItem["operation"],
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
 		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
-		conditions: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
+		condition: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
 	}));
 }
