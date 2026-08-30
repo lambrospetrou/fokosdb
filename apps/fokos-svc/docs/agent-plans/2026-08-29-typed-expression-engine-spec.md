@@ -152,7 +152,7 @@ type ConditionExpression =
   | { op: "not"; args: readonly [condition: ConditionExpression] }
   | { op: "exists" | "not_exists"; args: readonly [reference: ExpressionReference] }
   | {
-      op: "starts_with";
+      op: "begins_with";
       args: readonly [value: ExpressionValue, prefix: ExpressionValue];
     }
   | {
@@ -302,6 +302,20 @@ Expression references use logical public keys:
 Use canonical key bytes for ordering. Use logical key values for `attribute_type`, `size`, projection,
 and functions that need public text or bytes.
 
+A string key literal stays the caller's public string in the compiled plan (section 6.3). The
+partition encodes it with `KeyCodec.encode` when it materializes the bindings. Semantic validation
+rejects an empty string literal against a key reference: `KeyCodec` rejects empty keys, and the
+absent sort key is missing, not the empty string.
+
+A key comparison must match only rows whose logical key type is compatible with the literal. The
+canonical byte order does not enforce this for every operation. Binary keys sort above all text keys,
+so `gt` and `gte` with a text literal would match every binary-keyed row, `ne` would match every
+binary-keyed row, and a byte-level `contains` search could match inside a binary key's payload. The
+compiler must add a logical-key-type guard (first canonical byte is not `0xFF`) to `gt`, `gte`, `ne`,
+and `contains` on key references. `eq`, `lt`, `lte`, `between`, `in`, and `begins_with` need no
+guard: UTF-8 never contains the byte `0xFF`, so a text literal cannot equal, prefix-match, or sort
+above a binary key. Apply the same rule mirrored when byte key literals ship later.
+
 Binary key literals are deferred. Direct binary-key comparison, prefix, or containment against a
 literal is not in version one. A safe function such as `sqlite.hex` can return text for comparison.
 
@@ -342,8 +356,9 @@ condition: { op: "not_exists", args: [{ ref: "hashKey" }] }
 
 ### 5.3 Prefix and containment
 
-`starts_with` is case-sensitive. Do not compile it to `LIKE`. Use a fixed prefix operation such as
-`substr` or `instr`. It supports two compatible text values or two byte-valued expressions. Direct
+`begins_with` is case-sensitive. Do not compile it to `LIKE`. Use a fixed prefix operation such as
+`substr` or `instr`. It supports two compatible text values or two byte-valued expressions. A text
+prefix literal against a key reference binds as canonical key bytes (section 4.4). Direct
 byte-prefix literals are deferred.
 
 `contains` supports:
@@ -354,6 +369,11 @@ byte-prefix literals are deferred.
 
 Reject array/object search values. Direct byte search literals are deferred.
 Use compiler-owned `json_each` only for scalar array containment and object size.
+
+Byte-mode `begins_with` and `contains` on the whole `data` reference must include the `data_kind`
+guard. A JSONB row is physically a BLOB, but its logical type is array or object, so it must never
+match a byte prefix or a byte subsequence search. The storage class alone cannot make this
+distinction.
 
 ### 5.4 Size and attribute type
 
@@ -399,6 +419,11 @@ The compiler requires an exact allowlist match, removes the `sqlite.` namespace,
 arguments, and emits the fixed SQLite name. It enforces the global 32-argument limit. SQLite checks
 exact arity, input types, coercion, and null behavior. Direct SQLite calls use SQLite semantics, not
 Fokos semantic-function rules.
+
+The pattern and escape arguments of `glob` and `like` must be literals. Semantic validation rejects
+a non-literal pattern and a pattern above the 50-byte Workers pattern limit. A row-derived pattern
+could exceed the limit at runtime and abort the whole statement, and with query filters the same row
+would abort every retry of that page.
 
 The version-one allowlist contains deterministic functions only in every context. A later extension
 can add argument-aware or read-only-context rules for date/time and nondeterministic functions.
@@ -452,7 +477,9 @@ in the actual Workers SQLite runtime before release.
 4. Count all operation bindings.
 
 Partition DOs receive compiled plans. They only check plan version, context, SQL/binding size, and
-required metadata. This trust model requires controlled callers of the partition namespace.
+required metadata. After statement composition and immediately before execution, the partition
+materializes the plan's binding descriptors into SQL parameter values (section 6.3). This trust
+model requires controlled callers of the partition namespace.
 
 Keep the validator and compiler independent of Workers, routing, and Durable Objects. If direct
 untrusted partition callers are allowed later, run the same library in the partition or authenticate
@@ -467,6 +494,7 @@ compiled plans.
 | JSON path dereferences | 32 |
 | `in` choices | 100 before SQL binding validation |
 | SQLite function arguments | At most 32 |
+| `glob`/`like` pattern literal | At most 50 encoded bytes |
 | One path | 4 KiB encoded |
 | Canonical expression payload | At least 512 KiB; below the 2 MiB SQLite value limit |
 | Compiled SQL | Below 100 KiB |
@@ -475,16 +503,34 @@ compiled plans.
 Export limits from one module. Test each limit and one value above it. Retrieve current Cloudflare
 limits again before implementation.
 
-### 6.3 Direct bindings
+### 6.3 Binding descriptors
 
-Version one binds each scalar literal and path directly. It does not pack or deduplicate bindings.
-The compiler binds each array or object literal as canonical JSON text after the composite-literal
-milestone ships. Compiler-owned JSON functions convert or iterate that binding in SQLite.
+A compiled plan carries an ordered list of binding descriptors instead of materialized SQL values.
+Every descriptor is one JSON-safe scalar, so a plan survives JSON persistence and RPC unchanged:
 
-Count expression bindings, fixed operation bindings, range/cursor bindings, and combined
-filter/projection bindings. One serialized composite literal counts as one binding each time the SQL
-uses it. Reject a request before routing if the complete statement can exceed 100 bindings. The
-partition performs the same final count after statement composition.
+- `val` — a scalar literal: string, number, Boolean, or null. Binds as-is.
+- `json` — canonical JSON text for one array or object literal (after the composite-literal
+  milestone). Binds as text into the fixed `jsonb(?)`, `json(?)`, or `json_each(?)` forms.
+- `keyText` — a string key literal, stored as the caller's public string. The partition binds
+  `KeyCodec.encode(value)` as canonical key bytes.
+- `path` — one SQLite JSON path string.
+
+The kind names follow the native type vocabulary (section 4.2), so future binary literals extend the
+set unambiguously: `keyBytes` for a binary key literal and `bytes` for a binary data literal, each
+carried as base64 text. The kind tags are persisted inside plans, so a rename is a plan-version
+change — do not shorten them.
+
+The partition materializes descriptors in order, after statement composition and immediately before
+execution. `KeyCodec.encode` is pure and deterministic, so a retry, a recovery replay, and a
+migrated lock all materialize identical bindings.
+
+Key references compile to SQL columns and need no binding. The target item's own key is a fixed
+operation binding that the partition supplies from the request.
+
+Version one does not pack or deduplicate bindings. Count expression bindings, fixed operation
+bindings, range/cursor bindings, and combined filter/projection bindings. One descriptor counts as
+one binding each time the SQL uses it. Reject a request before routing if the complete statement can
+exceed 100 bindings. The partition performs the same final count after statement composition.
 
 An AST can contain 100 `in` choices but still fail the SQL binding limit.
 
@@ -504,13 +550,15 @@ A compiled plan contains:
 
 - Plan version and context.
 - Compiler-generated SQL fragments.
-- Ordered bound values.
+- Ordered binding descriptors (section 6.3).
 - Required columns and complete-data/JSON-path dependencies.
 - Result type/presence metadata.
 - Projection output mapping when needed.
 - Canonical expression identity.
 
-Plans use plain structured-clone values and do not contain the recursive AST.
+Plans contain only JSON-serializable values. They do not contain the recursive AST or any byte
+value. Invariant: a compiled plan must round-trip through `JSON.stringify` and `JSON.parse`
+unchanged. Test this on every plan fixture; it keeps the `conditions_json` persistence lossless.
 
 Persist transaction condition plans in the existing `tc_items.conditions_json` and
 `pending_transactions.conditions_json` columns. Do not rename these SQL columns. Include serialized
@@ -825,10 +873,12 @@ hostile bound path text.
 ### M3 — Function allowlist and semantic validation
 
 Deliver explicit `size`/`attribute_type` compilation, the deterministic SQLite scalar allowlist,
-complete scalar AST validation, explicit composite-literal rejection, and required-column analysis.
+complete scalar AST validation, explicit composite-literal rejection, empty-key-literal rejection,
+the literal-only `glob`/`like` pattern rule, and required-column analysis.
 
-Test every operator shape, arity, type rule, unknown field/function, deterministic write policy, and
-rejection of aggregate/window/table/connection/extension functions.
+Test every operator shape, arity, type rule, unknown field/function, deterministic write policy,
+rejection of aggregate/window/table/connection/extension functions, empty key literals, and
+non-literal or oversized `glob`/`like` patterns.
 
 ### M4 — SQLite compiler
 
@@ -838,8 +888,9 @@ Deliver:
 - Missing/null handling.
 - Strict scalar comparison and logical operations.
 - `between`, direct-placeholder `in`, existence, prefix, containment, size, and attribute type.
+- Logical-key-type guards for `gt`, `gte`, `ne`, and `contains` on key references.
 - Safe SQLite scalar calls.
-- Direct bindings and binding-count metadata.
+- Binding descriptors, partition-side materialization, and binding-count metadata.
 - Missing-item evaluation.
 - Result presence/type metadata.
 
@@ -855,6 +906,10 @@ Test in Workers SQLite:
   the SQL limit.
 - Binding limit at 100 and 101.
 - Generated SQL and bound-value separation.
+- Plan JSON round-trip equality on every compiled fixture.
+- Mixed string and binary sort keys: `gt`, `gte`, `ne`, and `contains` with a text literal do not
+  match binary-keyed rows; `eq`, `lt`, `between`, and `begins_with` fixtures confirm no guard is
+  needed.
 - Primary-key query plan for missing-item evaluation.
 - Existing/missing row-read metrics.
 - Required-column behavior.
@@ -879,7 +934,7 @@ Deliver:
 - One traversal that validates, enforces limits, writes canonical JSON text, and feeds identity bytes.
 - Canonical JSON text bindings with explicit logical `array` or `object` metadata.
 - Compiler-owned `jsonb(?)`, `json(?)`, and `json_each(?)` forms where each operation needs them.
-- Persistence and structured-clone support for the serialized bindings in compiled plans.
+- Persistence and JSON round-trip support for the serialized bindings in compiled plans.
 
 Test nested and empty composites, array order, canonical object-key order, escaped strings, all JSON
 scalar children, cycles, unsupported runtime values, depth, and payload limits. Test different object
@@ -950,7 +1005,8 @@ The feature is complete when all milestones pass and:
 These items are not part of M0-M9:
 
 - **Binding compaction:** If needed, evaluate a bound JSON/`json_each` argument pool, numbered binding
-  reuse, or one shared filter/projection pool. Measure it before replacing direct bindings.
+  reuse, or one shared filter/projection pool. Measure it before replacing one-descriptor-per-use
+  bindings.
 - **Untrusted partition callers:** Re-run validation/compilation in partitions or authenticate plans.
 - **Composite equality:** Define object order, array order, number normalization, missing/null rules,
   traversal limits, and cost. Do not use JSONB byte equality.
@@ -1047,7 +1103,8 @@ const SQLITE_CORE_FUNCTIONS = new Set([
 Notes:
 
 - `glob(pattern, value)` and `like(pattern, value[, escape])` use SQLite argument order and the
-  Workers 50-byte pattern limit.
+  Workers 50-byte pattern limit. The pattern and escape arguments must be literals, validated before
+  routing (section 5.5).
 - `length(text)` counts Unicode code points. `octet_length(text)` counts encoded bytes. Fokos `size`
   has its own semantics.
 - `coalesce`, `ifnull`, and `iif` use SQLite null and truth rules.
