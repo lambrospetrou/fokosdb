@@ -42,11 +42,6 @@ title, the state, the date, and the References list.
 | Reviewer | Team | Status | Date |
 | --- | --- | --- | --- |
 | <name> | <team> | not-reviewed | |
-
-References:
-
-- `docs/agent-plans/<date>-<file>.md`
-- [<title>](<url>)
 ```
 
 ## 2. Table of Contents
@@ -139,7 +134,16 @@ No account of the discussion.
 The questions a reviewer will ask, answered before the review. Add each question
 that comes up during the review, with its answer, so it is asked once.
 
-## 9. Appendix (optional)
+## 9. References
+
+```
+References:
+
+- `docs/agent-plans/<date>-<file>.md`
+- [<title>](<url>)
+```
+
+## 10. Appendix (optional)
 
 Secondary material: a long diagram, raw data, a detailed table. Keep it small. An
 appendix is not a place to move content that is too messy to write properly.
