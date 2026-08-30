@@ -1,7 +1,11 @@
 # Stateless transaction coordination
 
 Date: 2026-08-29
-Status: **proposal; not implemented**
+Status: **rejected — the performance regression is a blocker.** The driver runs in a
+Worker, which has no durable storage, so the decision write costs one network round
+trip. A write with a `clientRequestToken` grows from three round trips to four.
+Superseded by `docs/agent-plans/2026-08-30-bounded-stateful-transaction-coordination.md`,
+which keeps the correctness analysis of this document and reuses its independent wins.
 
 References:
 
