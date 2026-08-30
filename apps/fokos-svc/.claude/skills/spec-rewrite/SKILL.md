@@ -25,6 +25,7 @@ You rewrite the form. You do not change the design.
   in one sitting.
 - **No moving target code references.** If you have to reference code, refer to file and function names,
   not to a line number or a commit hash. The code may change, but the function name is stable.
+- **Use 120 characters per line.** If a sentence is longer, break it into two or more sentences.
 
 ## Procedure
 
