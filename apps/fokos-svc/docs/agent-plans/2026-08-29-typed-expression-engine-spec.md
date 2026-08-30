@@ -1,7 +1,7 @@
 # Typed expression engine
 
 Date: 2026-08-29  
-Status: **accepted design; M0-M3 implemented**
+Status: **accepted design; M0-M4 implemented**
 
 References:
 
@@ -880,7 +880,7 @@ Test every operator shape, arity, type rule, unknown field/function, determinist
 rejection of aggregate/window/table/connection/extension functions, empty key literals, and
 non-literal or oversized `glob`/`like` patterns.
 
-### M4 — SQLite compiler
+### M4 — DONE — SQLite compiler
 
 Deliver:
 

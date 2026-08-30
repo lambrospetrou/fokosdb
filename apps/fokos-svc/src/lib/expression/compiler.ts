@@ -1,0 +1,332 @@
+import type { JsonPrimitive } from "../json-types.js";
+import { ExpressionError } from "./errors.js";
+import { canonicalConditionIdentity } from "./identity.js";
+import { EXPRESSION_LIMITS } from "./limits.js";
+import {
+	composeConditionStatement,
+	CONDITION_FIXED_BINDING_COUNT,
+	CONDITION_PLAN_VERSION,
+	type CompiledConditionPlan,
+	type ExpressionBindingDescriptor,
+} from "./plan.js";
+import { validateConditionExpression } from "./semantic.js";
+import type { ConditionExpression, ExpressionReference, ExpressionValue } from "./types.js";
+
+type CompileContext = {
+	bindings: ExpressionBindingDescriptor[];
+	completeData: boolean;
+	paths: Set<string>;
+};
+
+type ValueMode = "logical" | "key" | "sqlite";
+
+const textEncoder = new TextEncoder();
+const BYTES_KIND = 0;
+const TEXT_KIND = 1;
+const JSON_KIND = 2;
+const SCALAR_TYPES_SQL = "'null', 'boolean', 'number', 'text', 'bytes'";
+const ORDERED_TYPES_SQL = "'number', 'text', 'bytes'";
+
+export function compileConditionExpression(
+	condition: ConditionExpression,
+	fixedBindingCount = CONDITION_FIXED_BINDING_COUNT,
+): CompiledConditionPlan {
+	const analysis = validateConditionExpression(condition);
+	const context: CompileContext = { bindings: [], completeData: false, paths: new Set() };
+	const sql = compileCondition(condition, context);
+	const sqlBytes = textEncoder.encode(composeConditionStatement(sql)).byteLength;
+	if (sqlBytes > EXPRESSION_LIMITS.compiledSqlBytes) throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	const completeBindingCount = fixedBindingCount + context.bindings.length;
+	if (completeBindingCount > EXPRESSION_LIMITS.completeStatementBindings) {
+		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
+	}
+	return {
+		version: CONDITION_PLAN_VERSION,
+		kind: "condition",
+		sql,
+		bindings: context.bindings,
+		bindingCount: context.bindings.length,
+		completeBindingCount,
+		requiredColumns: analysis.requiredColumns,
+		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
+		result: { nativeTypes: ["boolean"], canBeMissing: false },
+		identity: canonicalConditionIdentity(condition),
+	};
+}
+
+function compileCondition(condition: ConditionExpression, context: CompileContext): string {
+	switch (condition.op) {
+		case "eq":
+		case "ne":
+		case "lt":
+		case "lte":
+		case "gt":
+		case "gte":
+			return compileComparison(condition.op, condition.args[0], condition.args[1], context);
+		case "between":
+			return `(${compileComparison("gte", condition.args[0], condition.args[1], context)} AND ${compileComparison("lte", condition.args[0], condition.args[2], context)})`;
+		case "in":
+			return compileIn(condition.args, context);
+		case "and":
+		case "or": {
+			const operator = condition.op === "and" ? " AND " : " OR ";
+			return `(${condition.args.map((arg) => compileCondition(arg, context)).join(operator)})`;
+		}
+		case "not":
+			return `(NOT ${compileCondition(condition.args[0], context)})`;
+		case "exists":
+			return `(${renderPresent(condition.args[0], context)})`;
+		case "not_exists":
+			return `(NOT ${renderPresent(condition.args[0], context)})`;
+		case "begins_with":
+			return compileBeginsWith(condition.args[0], condition.args[1], context);
+		case "contains":
+			return compileContains(condition.args[0], condition.args[1], context);
+	}
+}
+
+function compileComparison(
+	op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte",
+	left: ExpressionValue,
+	right: ExpressionValue,
+	context: CompileContext,
+): string {
+	const [leftMode, rightMode] = comparisonModes(left, right);
+	const leftPresent = renderPresent(left, context);
+	const rightPresent = renderPresent(right, context);
+	const leftType = renderType(left, context);
+	const rightType = renderType(right, context);
+	const allowedLeftType = renderType(left, context);
+	const leftValue = renderValue(left, leftMode, context);
+	const rightValue = renderValue(right, rightMode, context);
+	const allowedTypes = op === "eq" || op === "ne" ? SCALAR_TYPES_SQL : ORDERED_TYPES_SQL;
+	const comparison =
+		op === "eq"
+			? `(${leftValue} IS ${rightValue})`
+			: op === "ne"
+				? `(NOT (${leftValue} IS ${rightValue}))`
+				: `${leftValue} ${comparisonOperator(op)} ${rightValue}`;
+	return `(${leftPresent} AND ${rightPresent} AND ${leftType} = ${rightType} AND ${allowedLeftType} IN (${allowedTypes}) AND ${comparison})`;
+}
+
+function comparisonOperator(op: "lt" | "lte" | "gt" | "gte"): string {
+	switch (op) {
+		case "lt":
+			return "<";
+		case "lte":
+			return "<=";
+		case "gt":
+			return ">";
+		case "gte":
+			return ">=";
+	}
+}
+
+function compileIn(args: readonly ExpressionValue[], context: CompileContext): string {
+	const target = args[0];
+	const choices = args.slice(1);
+	const firstType = literalNativeType(choices[0]);
+	if (firstType !== undefined && firstType !== "null" && choices.every((choice) => literalNativeType(choice) === firstType)) {
+		const mode: ValueMode = isDirectKeyReference(target) && firstType === "text" ? "key" : "logical";
+		const present = renderPresent(target, context);
+		const type = renderType(target, context);
+		const value = renderValue(target, mode, context);
+		const choiceSql = choices.map((choice) => renderValue(choice, mode, context)).join(", ");
+		return `(${present} AND ${type} = '${firstType}' AND ${value} IN (${choiceSql}))`;
+	}
+	return `(${choices.map((choice) => compileComparison("eq", target, choice, context)).join(" OR ")})`;
+}
+
+function compileBeginsWith(value: ExpressionValue, prefix: ExpressionValue, context: CompileContext): string {
+	const [valueMode, prefixMode] = comparisonModes(value, prefix);
+	const valuePresent = renderPresent(value, context);
+	const prefixPresent = renderPresent(prefix, context);
+	const valueType = renderType(value, context);
+	const prefixType = renderType(prefix, context);
+	const allowedValueType = renderType(value, context);
+	const valueSql = renderValue(value, valueMode, context);
+	const prefixLengthSql = renderValue(prefix, prefixMode, context);
+	const prefixSql = renderValue(prefix, prefixMode, context);
+	return `(${valuePresent} AND ${prefixPresent} AND ${valueType} = ${prefixType} AND ${allowedValueType} IN ('text', 'bytes') AND substr(${valueSql}, 1, length(${prefixLengthSql})) IS ${prefixSql})`;
+}
+
+function compileContains(container: ExpressionValue, search: ExpressionValue, context: CompileContext): string {
+	const [containerMode, searchMode] = comparisonModes(container, search);
+	const scalarContainerPresent = renderPresent(container, context);
+	const scalarSearchPresent = renderPresent(search, context);
+	const scalarContainerType = renderType(container, context);
+	const scalarSearchType = renderType(search, context);
+	const allowedScalarContainerType = renderType(container, context);
+	const scalarContainerValue = renderValue(container, containerMode, context);
+	const scalarSearchValue = renderValue(search, searchMode, context);
+	const scalar = `(${scalarContainerPresent} AND ${scalarSearchPresent} AND ${scalarContainerType} = ${scalarSearchType} AND ${allowedScalarContainerType} IN ('text', 'bytes') AND instr(${scalarContainerValue}, ${scalarSearchValue}) > 0)`;
+	const arrayContainerPresent = renderPresent(container, context);
+	const arraySearchPresent = renderPresent(search, context);
+	const arrayContainerType = renderType(container, context);
+	const arraySearchType = renderType(search, context);
+	const memberSearchType = renderType(search, context);
+	const arrayContainerValue = renderValue(container, "logical", context);
+	const arraySearchValue = renderValue(search, "logical", context);
+	const eachType =
+		"CASE je.type WHEN 'null' THEN 'null' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' ELSE 'missing' END";
+	const array = `(CASE WHEN ${arrayContainerPresent} AND ${arraySearchPresent} AND ${arrayContainerType} = 'array' AND ${arraySearchType} IN ('null', 'boolean', 'number', 'text') THEN EXISTS (SELECT 1 FROM json_each(${arrayContainerValue}) AS je WHERE ${eachType} = ${memberSearchType} AND je.value IS ${arraySearchValue}) ELSE 0 END)`;
+	return `(${scalar} OR ${array})`;
+}
+
+function renderPresent(value: ExpressionValue, context: CompileContext): string {
+	if ("val" in value) return "1";
+	if ("ref" in value) return referencePresent(value, context);
+	if (value.fn === "attribute_type" || value.fn.startsWith("sqlite.")) return "1";
+	if (value.fn === "size") {
+		const inputType = renderType(value.args[0], context);
+		return `(${inputType} IN ('text', 'bytes', 'array', 'object'))`;
+	}
+	throw new ExpressionError("invalid_function", "unknown expression function");
+}
+
+function renderType(value: ExpressionValue, context: CompileContext): string {
+	if ("val" in value) return `'${literalType(value.val as JsonPrimitive)}'`;
+	if ("ref" in value) return referenceType(value, context);
+	if (value.fn === "size") return "'number'";
+	if (value.fn === "attribute_type") return "'text'";
+	if (value.fn.startsWith("sqlite.")) {
+		const call = renderSqliteCall(value.fn.slice("sqlite.".length), value.args, context);
+		return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
+	}
+	throw new ExpressionError("invalid_function", "unknown expression function");
+}
+
+function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileContext): string {
+	if ("val" in value) return bindLiteral(value.val as JsonPrimitive, mode, context);
+	if ("ref" in value) return referenceValue(value, mode, context);
+	if (value.fn === "attribute_type") return renderType(value.args[0], context);
+	if (value.fn === "size") return renderSize(value.args[0], context);
+	if (value.fn.startsWith("sqlite.")) return renderSqliteCall(value.fn.slice("sqlite.".length), value.args, context);
+	throw new ExpressionError("invalid_function", "unknown expression function");
+}
+
+function renderSize(value: ExpressionValue, context: CompileContext): string {
+	const scalarType = renderType(value, context);
+	const scalarValue = renderValue(value, "logical", context);
+	const compositeType = renderType(value, context);
+	const compositeValue = renderValue(value, "logical", context);
+	return `CASE WHEN ${scalarType} IN ('text', 'bytes') THEN octet_length(${scalarValue}) WHEN ${compositeType} IN ('array', 'object') THEN (SELECT count(*) FROM json_each(${compositeValue})) END`;
+}
+
+function renderSqliteCall(name: string, args: readonly ExpressionValue[], context: CompileContext): string {
+	return `${name}(${args.map((arg) => renderValue(arg, "sqlite", context)).join(", ")})`;
+}
+
+function referencePresent(reference: ExpressionReference, context: CompileContext): string {
+	switch (reference.ref) {
+		case "hashKey":
+		case "v":
+		case "data":
+			if (reference.ref === "data" && reference.path !== undefined) {
+				recordDataReference(reference, context);
+				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_type(i.data, ${bindPath(reference.path, context)}) IS NOT NULL ELSE 0 END`;
+			}
+			if (reference.ref === "data") context.completeData = true;
+			return "(i.hk IS NOT NULL)";
+		case "sortKey":
+			return `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
+		case "ttl":
+			return `(i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL)`;
+	}
+}
+
+function referenceType(reference: ExpressionReference, context: CompileContext): string {
+	switch (reference.ref) {
+		case "hashKey":
+			return keyType("i.hk", "i.hk IS NOT NULL");
+		case "sortKey":
+			return keyType("i.sk", "i.hk IS NOT NULL AND length(i.sk) > 0");
+		case "v":
+			return `CASE WHEN i.hk IS NOT NULL THEN 'number' ELSE 'missing' END`;
+		case "ttl":
+			return `CASE WHEN i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL THEN 'number' ELSE 'missing' END`;
+		case "data":
+			if (reference.path !== undefined) {
+				recordDataReference(reference, context);
+				const path = bindPath(reference.path, context);
+				return `CASE WHEN i.hk IS NULL OR i.data_kind <> ${JSON_KIND} THEN 'missing' ELSE ${jsonTypeSql(`json_type(i.data, ${path})`)} END`;
+			}
+			context.completeData = true;
+			return `CASE WHEN i.hk IS NULL THEN 'missing' WHEN i.data_kind = ${BYTES_KIND} THEN 'bytes' WHEN i.data_kind = ${TEXT_KIND} THEN 'text' WHEN i.data_kind = ${JSON_KIND} THEN ${jsonTypeSql("json_type(i.data)")} ELSE 'missing' END`;
+	}
+}
+
+function referenceValue(reference: ExpressionReference, mode: ValueMode, context: CompileContext): string {
+	switch (reference.ref) {
+		case "hashKey":
+			return mode === "key" ? "i.hk" : logicalKeyValue("i.hk");
+		case "sortKey":
+			return mode === "key" ? "i.sk" : logicalKeyValue("i.sk");
+		case "v":
+			return "i.v";
+		case "ttl":
+			return "i.ttl_epoch_utc_seconds";
+		case "data":
+			if (reference.path !== undefined) {
+				recordDataReference(reference, context);
+				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_extract(i.data, ${bindPath(reference.path, context)}) END`;
+			}
+			context.completeData = true;
+			if (mode === "sqlite") return "i.data";
+			return `CASE WHEN i.data_kind = ${JSON_KIND} AND json_type(i.data) IN ('array', 'object') THEN i.data WHEN i.data_kind = ${JSON_KIND} THEN json_extract(i.data, '$') ELSE i.data END`;
+	}
+}
+
+function keyType(column: string, present: string): string {
+	return `CASE WHEN ${present} THEN CASE WHEN substr(${column}, 1, 1) = x'ff' THEN 'bytes' ELSE 'text' END ELSE 'missing' END`;
+}
+
+function logicalKeyValue(column: string): string {
+	return `CASE WHEN substr(${column}, 1, 1) = x'ff' THEN substr(${column}, 2) ELSE CAST(${column} AS TEXT) END`;
+}
+
+function jsonTypeSql(jsonType: string): string {
+	return `CASE ${jsonType} WHEN 'null' THEN 'null' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'array' THEN 'array' WHEN 'object' THEN 'object' ELSE 'missing' END`;
+}
+
+function comparisonModes(left: ExpressionValue, right: ExpressionValue): readonly [ValueMode, ValueMode] {
+	if ((isDirectKeyReference(left) && isTextLiteral(right)) || (isDirectKeyReference(right) && isTextLiteral(left))) return ["key", "key"];
+	if (isDirectKeyReference(left) && isDirectKeyReference(right)) return ["key", "key"];
+	return ["logical", "logical"];
+}
+
+function isDirectKeyReference(value: ExpressionValue): boolean {
+	return "ref" in value && (value.ref === "hashKey" || value.ref === "sortKey");
+}
+
+function isTextLiteral(value: ExpressionValue): boolean {
+	return "val" in value && typeof value.val === "string";
+}
+
+function literalNativeType(value: ExpressionValue): "null" | "boolean" | "number" | "text" | undefined {
+	if (!("val" in value)) return;
+	return literalType(value.val as JsonPrimitive);
+}
+
+function literalType(value: JsonPrimitive): "null" | "boolean" | "number" | "text" {
+	if (value === null) return "null";
+	if (typeof value === "boolean") return "boolean";
+	if (typeof value === "number") return "number";
+	return "text";
+}
+
+function bindLiteral(value: JsonPrimitive, mode: ValueMode, context: CompileContext): string {
+	if (mode === "key" && typeof value === "string") context.bindings.push({ kind: "keyText", value });
+	else context.bindings.push({ kind: "val", value: typeof value === "number" && Object.is(value, -0) ? 0 : value });
+	return "?";
+}
+
+function bindPath(path: string, context: CompileContext): string {
+	context.bindings.push({ kind: "path", value: path });
+	return "?";
+}
+
+function recordDataReference(reference: Extract<ExpressionReference, { ref: "data" }>, context: CompileContext): void {
+	if (reference.path === undefined) context.completeData = true;
+	else context.paths.add(reference.path);
+}

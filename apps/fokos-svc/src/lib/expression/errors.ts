@@ -5,7 +5,9 @@ export type ExpressionErrorCode =
 	| "invalid_function"
 	| "invalid_arity"
 	| "invalid_type"
-	| "complexity_limit";
+	| "complexity_limit"
+	| "sql_limit"
+	| "runtime_capability";
 
 export class ExpressionError extends Error {
 	readonly name = "ExpressionError";
