@@ -9,7 +9,7 @@ Review a written design against the code that must implement it. Find the defect
 that become bugs, data loss, or an outage after the spec ships.
 
 You review. You do not rewrite the document and you do not implement it. If the
-user wants the document reformatted, use the `spec-rewrite` skill instead.
+user wants the document reformatted, use the `spec-write` skill instead.
 
 ## Rules
 
@@ -122,5 +122,5 @@ a section.
 ### 7. Offer the next step
 
 End with one line: offer to open the blockers as edits to the spec, or to run
-`spec-rewrite` if the document also needs reformatting. Do not start either
+`spec-write` if the document also needs reformatting. Do not start either
 without the user's word.

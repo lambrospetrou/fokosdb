@@ -1,5 +1,5 @@
 ---
-name: spec-rewrite
+name: spec-write
 description: Rewrite a spec, plan, design doc, or RFC into the project RFC format and into ASD-STE100 Simplified Technical English, and remove commentary that belongs to the discussion instead of the spec. Use when the user asks to rewrite, reformat, clean up, tighten, or "make an RFC" out of a document under docs/ (agent-plans, adr, ideas), or when a generated plan must become a reviewable spec.
 ---
 
