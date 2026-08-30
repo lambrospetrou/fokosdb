@@ -1,7 +1,7 @@
 # Typed expression engine
 
 Date: 2026-08-29  
-Status: **accepted design; M0-M2 implemented**
+Status: **accepted design; M0-M3 implemented**
 
 References:
 
@@ -870,7 +870,7 @@ Deliver:
 Test stable identity, field/argument order, valid/special paths, malformed paths, path limits, and
 hostile bound path text.
 
-### M3 — Function allowlist and semantic validation
+### M3 — DONE — Function allowlist and semantic validation
 
 Deliver explicit `size`/`attribute_type` compilation, the deterministic SQLite scalar allowlist,
 complete scalar AST validation, explicit composite-literal rejection, empty-key-literal rejection,

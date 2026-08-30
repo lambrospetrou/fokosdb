@@ -1,5 +1,4 @@
 import { bench, describe } from "vitest";
-import { validateConditionExpressionValibot } from "./semantic-valibot.js";
 import { validateConditionExpression } from "./semantic.js";
 import type { ConditionExpression } from "./types.js";
 
@@ -167,22 +166,13 @@ const cases = [
 ] as const satisfies readonly { name: string; expression: ConditionExpression }[];
 
 for (const benchmark of cases) {
-	const manualResult = validateConditionExpression(benchmark.expression);
-	const valibotResult = validateConditionExpressionValibot(benchmark.expression);
-	if (JSON.stringify(manualResult) !== JSON.stringify(valibotResult)) throw new Error(`benchmark analysis mismatch: ${benchmark.name}`);
+	validateConditionExpression(benchmark.expression);
 
 	describe(benchmark.name, () => {
 		bench(
-			"manual",
+			"custom",
 			() => {
 				validateConditionExpression(benchmark.expression);
-			},
-			{ time: 500, warmupTime: 100 },
-		);
-		bench(
-			"valibot",
-			() => {
-				validateConditionExpressionValibot(benchmark.expression);
 			},
 			{ time: 500, warmupTime: 100 },
 		);
