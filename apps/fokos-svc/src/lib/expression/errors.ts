@@ -1,4 +1,11 @@
-export type ExpressionErrorCode = "invalid_ast" | "invalid_literal" | "invalid_path" | "complexity_limit";
+export type ExpressionErrorCode =
+	| "invalid_ast"
+	| "invalid_literal"
+	| "invalid_path"
+	| "invalid_function"
+	| "invalid_arity"
+	| "invalid_type"
+	| "complexity_limit";
 
 export class ExpressionError extends Error {
 	readonly name = "ExpressionError";
