@@ -4,13 +4,22 @@ import type {
 	TransactGetItemsOptions,
 	TransactWriteItemsOptions,
 } from "./transaction-types.js";
+import type { JsonComposite, JsonValue } from "./json-types.js";
 
 // ─── Item data kinds ────────────────────────────────────────────────────────────
 
-export type JsonPrimitive = string | number | boolean | null;
-export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
-// Top-level accepted composites only (start restricted; top-level primitives excluded initially).
-export type JsonComposite = JsonValue[] | { [key: string]: JsonValue };
+export type { JsonComposite, JsonPrimitive, JsonValue } from "./json-types.js";
+
+export { EXPRESSION_LIMITS } from "./expression/limits.js";
+export type { ExpressionLimitName } from "./expression/limits.js";
+export { EXPRESSION_NATIVE_TYPES } from "./expression/types.js";
+export type {
+	ConditionExpression,
+	ExpressionNativeType,
+	ExpressionReference,
+	ExpressionValue,
+	ProjectionExpression,
+} from "./expression/types.js";
 
 // ONE source of truth: the array. The on-disk `data_kind` column stores the compact integer code =
 // the array index; the TS/public discriminant is the readable string literal. Both lookups are index
