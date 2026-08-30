@@ -36,7 +36,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Create RpcTargets for the partition DOs and LRU cache them in the Worker to skip the getActor calls and go directly to the partition DOs.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
-- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the coordinator ID as tie breaker.
+- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the transaction ID as tie breaker, since it is stable no matter which coordinator stamps or resumes the transaction.
 - Count item data sizes in UTF-8 bytes, to match the `octet_length` the store uses. The current UTF-16 count under-counts non-ASCII data by up to 3x, so the item and transaction size caps admit more than they intend.
 - Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
