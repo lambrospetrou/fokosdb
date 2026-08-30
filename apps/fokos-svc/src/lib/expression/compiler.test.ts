@@ -36,7 +36,7 @@ describe("condition SQLite compiler", () => {
 
 	it("emits direct placeholders for a homogeneous in expression", () => {
 		const plan = compileConditionExpression({ op: "in", args: [{ ref: "v" }, { val: 1 }, { val: 2 }, { val: 3 }] });
-		expect(plan.sql).toMatch(/ IN \(\?, \?, \?\)/);
+		expect(plan.sql).toMatch(/ IN \(\?3, \?4, \?5\)/);
 		expect(plan.bindings.filter((binding) => binding.kind === "val")).toEqual([
 			{ kind: "val", value: 1 },
 			{ kind: "val", value: 2 },
@@ -73,16 +73,41 @@ describe("condition SQLite compiler", () => {
 		expect(plan.dataDependencies).toEqual({ completeData: true, paths: ["$.a"] });
 	});
 
-	it("keeps descriptor count equal to SQL placeholder count", () => {
+	it("numbers parameters densely after the two fixed key bindings", () => {
 		for (const condition of [
 			{ op: "eq", args: [{ ref: "data", path: "$.value" }, { val: null }] },
 			{ op: "begins_with", args: [{ ref: "data", path: "$.value" }, { val: "prefix" }] },
 			{ op: "contains", args: [{ ref: "data", path: "$.values" }, { val: true }] },
 			{ op: "eq", args: [{ fn: "size", args: [{ ref: "data", path: "$.values" }] }, { val: 3 }] },
+			// The scalar branch of contains folds away for a number search.
+			{ op: "contains", args: [{ ref: "data", path: "$.tags" }, { val: 3 }] },
+			// The array branch of contains folds away for a text-literal container.
+			{ op: "contains", args: [{ val: "abc" }, { val: "b" }] },
 		] as const satisfies readonly ConditionExpression[]) {
+			const message = JSON.stringify(condition);
 			const plan = compileConditionExpression(condition);
-			expect(composeConditionStatement(plan.sql).match(/\?/g)?.length).toBe(plan.completeBindingCount);
+			const indexes = new Set([...plan.sql.matchAll(/\?(\d+)/g)].map((match) => Number(match[1])));
+			expect(indexes.size, message).toBe(plan.bindingCount);
+			for (let i = 0; i < plan.bindingCount; i++) expect(indexes.has(3 + i), message).toBe(true);
+			expect(composeConditionStatement(plan.sql).match(/\?(?!\d)/g)?.length, message).toBe(2);
 		}
+	});
+
+	it("shares one binding for a fragment rendered many times", () => {
+		const plan = compileConditionExpression({ op: "between", args: [{ ref: "data", path: "$.count" }, { val: 2 }, { val: 4 }] });
+		expect(plan.bindings).toEqual([
+			{ kind: "path", value: "$.count" },
+			{ kind: "val", value: 2 },
+			{ kind: "val", value: 4 },
+		]);
+	});
+
+	it("folds literal-side guards out of the generated SQL", () => {
+		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 1 }] });
+		expect(plan.bindings).toEqual([{ kind: "val", value: 1 }]);
+		expect(plan.sql).not.toContain("1 AND");
+		expect(plan.sql).not.toContain("IN ('null', 'boolean', 'number', 'text', 'bytes')");
+		expect(plan.sql).toContain("= 'number'");
 	});
 
 	it("materializes Boolean literals as Workers SQLite integers", () => {

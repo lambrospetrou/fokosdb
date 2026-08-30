@@ -4,38 +4,31 @@ import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
 import { validateReadJsonPath } from "./path.js";
 import type { ConditionExpression, ExpressionReference, ExpressionValue, ProjectionExpression } from "./types.js";
-
-const textEncoder = new TextEncoder();
+import { utf8WithinLimit } from "./utf8.js";
 
 class IdentityWriter {
-	readonly #chunks: string[] = [];
-
-	#append(value: string): void {
-		this.#chunks.push(value);
-	}
+	#out = "";
 
 	#writeScalar(value: unknown): void {
 		const scalar: JsonPrimitive = validateScalarLiteral(value);
-		this.#append(JSON.stringify(scalar));
+		this.#out += JSON.stringify(scalar);
 	}
 
 	#writeReference(reference: ExpressionReference): void {
-		this.#append('{"ref":');
-		this.#append(JSON.stringify(reference.ref));
+		this.#out += `{"ref":${JSON.stringify(reference.ref)}`;
 		if (reference.ref === "data" && reference.path !== undefined) {
 			validateReadJsonPath(reference.path);
-			this.#append(',"path":');
-			this.#append(JSON.stringify(reference.path));
+			this.#out += `,"path":${JSON.stringify(reference.path)}`;
 		}
-		this.#append("}");
+		this.#out += "}";
 	}
 
 	writeValue(value: ExpressionValue): void {
 		if (typeof value !== "object" || value === null) throw new ExpressionError("invalid_ast", "invalid expression value");
 		if ("val" in value) {
-			this.#append('{"val":');
+			this.#out += '{"val":';
 			this.#writeScalar(value.val);
-			this.#append("}");
+			this.#out += "}";
 			return;
 		}
 		if ("ref" in value) {
@@ -43,50 +36,43 @@ class IdentityWriter {
 			return;
 		}
 		if (!("fn" in value) || !Array.isArray(value.args)) throw new ExpressionError("invalid_ast", "invalid expression value");
-		this.#append('{"fn":');
-		this.#append(JSON.stringify(value.fn));
-		this.#append(',"args":[');
+		this.#out += `{"fn":${JSON.stringify(value.fn)},"args":[`;
 		for (let i = 0; i < value.args.length; i++) {
-			if (i > 0) this.#append(",");
+			if (i > 0) this.#out += ",";
 			this.writeValue(value.args[i]);
 		}
-		this.#append("]}");
+		this.#out += "]}";
 	}
 
 	writeCondition(condition: ConditionExpression): void {
-		this.#append('{"op":');
-		this.#append(JSON.stringify(condition.op));
-		this.#append(',"args":[');
+		this.#out += `{"op":${JSON.stringify(condition.op)},"args":[`;
 		const nestedConditions = condition.op === "and" || condition.op === "or" || condition.op === "not";
 		for (let i = 0; i < condition.args.length; i++) {
-			if (i > 0) this.#append(",");
+			if (i > 0) this.#out += ",";
 			if (nestedConditions) this.writeCondition(condition.args[i] as ConditionExpression);
 			else this.writeValue(condition.args[i] as ExpressionValue);
 		}
-		this.#append("]}");
+		this.#out += "]}";
 	}
 
 	writeProjection(projection: readonly ProjectionExpression[]): void {
-		this.#append("[");
+		this.#out += "[";
 		for (let i = 0; i < projection.length; i++) {
-			if (i > 0) this.#append(",");
-			this.#append('{"expr":');
-			this.writeValue(projection[i].expr);
-			if (projection[i].as !== undefined) {
-				this.#append(',"as":');
-				this.#append(JSON.stringify(projection[i].as));
-			}
-			this.#append("}");
+			const entry = projection[i];
+			if (i > 0) this.#out += ",";
+			this.#out += '{"expr":';
+			this.writeValue(entry.expr);
+			if (entry.as !== undefined) this.#out += `,"as":${JSON.stringify(entry.as)}`;
+			this.#out += "}";
 		}
-		this.#append("]");
+		this.#out += "]";
 	}
 
 	finish(): string {
-		const identity = this.#chunks.join("");
-		if (textEncoder.encode(identity).byteLength > EXPRESSION_LIMITS.canonicalPayloadBytes) {
+		if (!utf8WithinLimit(this.#out, EXPRESSION_LIMITS.canonicalPayloadBytes)) {
 			throw new ExpressionError("complexity_limit", "canonical identity exceeds the payload limit");
 		}
-		return identity;
+		return this.#out;
 	}
 }
 

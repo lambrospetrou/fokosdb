@@ -15,7 +15,8 @@ export class ExpressionError extends Error {
 	constructor(
 		readonly code: ExpressionErrorCode,
 		message: string,
+		options?: ErrorOptions,
 	) {
-		super(`fokos/expression: ${message}`);
+		super(`fokos/expression: ${message}`, options);
 	}
 }

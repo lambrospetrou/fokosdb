@@ -1,22 +1,14 @@
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-
-const textEncoder = new TextEncoder();
-const CONTROL_CHAR = /^[\u0000-\u001f]$/;
-const DECIMAL_DIGIT = /^[0-9]$/;
-const HEX_DIGIT = /^[0-9A-Fa-f]$/;
-const UNQUOTED_FORBIDDEN = /^[\u0000-\u0020"\\]$/;
+import { utf8WithinLimit } from "./utf8.js";
 
 /** Validates one bounded SQLite JSON read path without retaining parsed path segments. */
 export function validateReadJsonPath(path: unknown): asserts path is string {
 	if (typeof path !== "string" || path[0] !== "$") invalidPath();
-	if (path.length > EXPRESSION_LIMITS.jsonPathBytes) {
+	if (!utf8WithinLimit(path, EXPRESSION_LIMITS.jsonPathBytes)) {
 		throw new ExpressionError("complexity_limit", "JSON path exceeds the path limit");
 	}
 	if (path.isWellFormed?.() === false || path.includes("\0")) invalidPath();
-	if (textEncoder.encode(path).byteLength > EXPRESSION_LIMITS.jsonPathBytes) {
-		throw new ExpressionError("complexity_limit", "JSON path exceeds the path limit");
-	}
 
 	let i = 1;
 	let dereferences = 0;
@@ -39,12 +31,22 @@ function invalidPath(): never {
 	throw new ExpressionError("invalid_path", "invalid SQLite JSON path");
 }
 
+// Single-character range comparisons compare one UTF-16 code unit each, so they classify ASCII
+// grammar characters without per-character regular expression calls.
+function isDecimalDigit(char: string): boolean {
+	return char >= "0" && char <= "9";
+}
+
+function isHexDigit(char: string): boolean {
+	return isDecimalDigit(char) || (char >= "A" && char <= "F") || (char >= "a" && char <= "f");
+}
+
 function scanQuotedLabel(path: string, start: number): number {
 	let i = start;
 	while (i < path.length) {
 		const char = path[i];
 		if (char === '"') return i + 1;
-		if (CONTROL_CHAR.test(char)) invalidPath();
+		if (char <= "\u001f") invalidPath();
 		if (char !== "\\") {
 			i++;
 			continue;
@@ -58,7 +60,7 @@ function scanQuotedLabel(path: string, start: number): number {
 		}
 		if (escape !== "u" || i + 4 >= path.length) invalidPath();
 		for (let j = 1; j <= 4; j++) {
-			if (!HEX_DIGIT.test(path[i + j])) invalidPath();
+			if (!isHexDigit(path[i + j])) invalidPath();
 		}
 		if (path[i + 1] === "0" && path[i + 2] === "0" && path[i + 3] === "0" && path[i + 4] === "0") invalidPath();
 		i += 5;
@@ -70,7 +72,8 @@ function scanLabel(path: string, start: number): number {
 	if (path[start] === '"') return scanQuotedLabel(path, start + 1);
 	let i = start;
 	while (i < path.length && path[i] !== "." && path[i] !== "[") {
-		if (UNQUOTED_FORBIDDEN.test(path[i])) invalidPath();
+		const char = path[i];
+		if (char <= " " || char === '"' || char === "\\") invalidPath();
 		i++;
 	}
 	if (i === start) invalidPath();
@@ -84,14 +87,14 @@ function scanArrayIndex(path: string, start: number): number {
 		i += 2;
 		const digitStart = i;
 		let nonZero = false;
-		while (i < path.length && DECIMAL_DIGIT.test(path[i])) {
+		while (i < path.length && isDecimalDigit(path[i])) {
 			if (path[i] !== "0") nonZero = true;
 			i++;
 		}
 		if (i === digitStart || !nonZero) invalidPath();
 	} else {
 		const digitStart = i;
-		while (i < path.length && DECIMAL_DIGIT.test(path[i])) i++;
+		while (i < path.length && isDecimalDigit(path[i])) i++;
 		if (i === digitStart) invalidPath();
 	}
 	if (path[i] !== "]") invalidPath();

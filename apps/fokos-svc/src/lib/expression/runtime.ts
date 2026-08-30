@@ -8,8 +8,7 @@ import {
 	type CompiledConditionPlan,
 	type ExpressionBindingDescriptor,
 } from "./plan.js";
-
-const textEncoder = new TextEncoder();
+import { utf8WithinLimit } from "./utf8.js";
 
 export type ConditionEvaluationResult = {
 	itemPresent: boolean;
@@ -38,11 +37,10 @@ export function evaluateConditionPlan(
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
 ): ConditionEvaluationResult {
-	validateConditionPlan(plan);
+	const statement = validateConditionPlan(plan);
 	if (plan.completeBindingCount !== plan.bindingCount + CONDITION_FIXED_BINDING_COUNT) {
 		throw new ExpressionError("sql_limit", "condition plan has an invalid complete binding count");
 	}
-	const statement = composeConditionStatement(plan.sql);
 	try {
 		const cursor = storage.sql.exec<{ item_present: number; condition_ok: number; last_transaction_ts: number | null }>(
 			statement,
@@ -60,18 +58,21 @@ export function evaluateConditionPlan(
 		};
 	} catch (error) {
 		if (error instanceof ExpressionError) throw error;
-		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression");
+		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
 	}
 }
 
-export function validateConditionPlan(plan: CompiledConditionPlan): void {
+/** Validates the plan and returns the composed statement so the caller does not compose it again. */
+export function validateConditionPlan(plan: CompiledConditionPlan): string {
 	if (plan.version !== CONDITION_PLAN_VERSION || plan.kind !== "condition") {
 		throw new ExpressionError("runtime_capability", "unsupported condition plan version or kind");
 	}
-	if (textEncoder.encode(composeConditionStatement(plan.sql)).byteLength > EXPRESSION_LIMITS.compiledSqlBytes) {
+	const statement = composeConditionStatement(plan.sql);
+	if (!utf8WithinLimit(statement, EXPRESSION_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	if (plan.bindings.length !== plan.bindingCount || plan.completeBindingCount > EXPRESSION_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "condition plan has an invalid binding count");
 	}
+	return statement;
 }

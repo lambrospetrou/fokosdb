@@ -3,8 +3,9 @@ import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
 import { validateReadJsonPath } from "./path.js";
-import { isAllowedSqliteScalarFunction, SQLITE_MATH_FUNCTIONS } from "./sqlite-functions.js";
+import { SQLITE_FUNCTION_ARITY, SQLITE_MATH_FUNCTIONS } from "./sqlite-functions.js";
 import { EXPRESSION_NATIVE_TYPES, type ExpressionNativeType } from "./types.js";
+import { utf8WithinLimit } from "./utf8.js";
 
 export const EXPRESSION_REQUIRED_COLUMNS = ["hk", "sk", "v", "ttl_epoch_utc_seconds", "data_kind", "data"] as const;
 
@@ -32,7 +33,6 @@ type AnalysisContext = {
 	requiredColumns: Set<ExpressionRequiredColumn>;
 };
 
-const textEncoder = new TextEncoder();
 const equalityTypes = new Set<ExpressionNativeType>(["null", "boolean", "number", "text", "bytes"]);
 const orderedTypes = new Set<ExpressionNativeType>(["number", "text", "bytes"]);
 const prefixTypes = new Set<ExpressionNativeType>(["text", "bytes"]);
@@ -235,7 +235,7 @@ function analyzeValue(expression: unknown, depth: number, context: AnalysisConte
 		assertFields(expression, "val");
 		return literalFacts(validateScalarLiteral(expression.val));
 	}
-	if (Object.hasOwn(expression, "ref")) return analyzeReference(expression, depth, context);
+	if (Object.hasOwn(expression, "ref")) return analyzeReferenceNode(expression, context);
 	if (Object.hasOwn(expression, "fn")) return analyzeFunction(expression, depth, context);
 	throw new ExpressionError("invalid_ast", "invalid expression value");
 }
@@ -243,6 +243,10 @@ function analyzeValue(expression: unknown, depth: number, context: AnalysisConte
 function analyzeReference(expression: unknown, depth: number, context: AnalysisContext): ValueFacts {
 	assertDepth(depth);
 	assertNode(expression, "invalid expression reference");
+	return analyzeReferenceNode(expression, context);
+}
+
+function analyzeReferenceNode(expression: Record<string, unknown>, context: AnalysisContext): ValueFacts {
 	assertFields(expression, "ref", undefined, "path");
 	if (typeof expression.ref !== "string") throw new ExpressionError("invalid_ast", "invalid expression reference");
 	const hasPath = Object.hasOwn(expression, "path");
@@ -294,12 +298,12 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 
 	if (!expression.fn.startsWith("sqlite.")) throw new ExpressionError("invalid_function", "unknown expression function");
 	const name = expression.fn.slice("sqlite.".length);
-	if (!isAllowedSqliteScalarFunction(name)) throw new ExpressionError("invalid_function", "SQLite function is not allowed");
+	const arity = SQLITE_FUNCTION_ARITY.get(name);
+	if (arity === undefined) throw new ExpressionError("invalid_function", "SQLite function is not allowed");
 	if (args.length > EXPRESSION_LIMITS.sqliteFunctionArguments) {
 		throw new ExpressionError("complexity_limit", "SQLite function argument limit exceeded");
 	}
-	if (name === "glob") assertArity(args, 2);
-	if (name === "like") assertArity(args, 2, 3);
+	assertArity(args, arity[0], arity[1]);
 
 	const fixedResult = fixedSqliteResult(name);
 	let dynamicTypes: Set<ExpressionNativeType> | undefined;
@@ -319,7 +323,7 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 function validatePatternArguments(name: string, args: readonly unknown[]): void {
 	const pattern = stringLiteral(args[0]);
 	if (pattern === undefined) throw new ExpressionError("invalid_type", `${name} pattern must be a string literal`);
-	if (textEncoder.encode(pattern).byteLength > EXPRESSION_LIMITS.sqlitePatternBytes) {
+	if (!utf8WithinLimit(pattern, EXPRESSION_LIMITS.sqlitePatternBytes)) {
 		throw new ExpressionError("complexity_limit", "SQLite pattern limit exceeded");
 	}
 	if (name === "like" && args.length === 3 && stringLiteral(args[2]) === undefined) {

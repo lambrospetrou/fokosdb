@@ -156,6 +156,24 @@ describe("compiled condition runtime", () => {
 		expect((await evaluate(item, condition)).conditionOk).toBe(false);
 	});
 
+	it("keeps the SQLite failure as the runtime error cause", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-runtime.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const plan = { ...compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }), sql: "no_such_function()" };
+			const error = (() => {
+				try {
+					evaluateConditionPlan(state.storage, plan, KeyCodec.encode("item"), KeyCodec.encodeOptional(undefined));
+					return undefined;
+				} catch (caught) {
+					return caught as Error;
+				}
+			})();
+			expect(error?.name).toBe("ExpressionError");
+			expect(error?.message).toMatch(/could not evaluate/);
+			expect(error?.cause).toBeInstanceOf(Error);
+		});
+	});
+
 	it("uses a primary-key lookup and reports existing versus missing row reads", async () => {
 		const condition: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
 		const plan = compileConditionExpression(condition);

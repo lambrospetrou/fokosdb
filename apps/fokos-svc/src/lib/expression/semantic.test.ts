@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { SQLITE_CORE_FUNCTIONS, SQLITE_MATH_FUNCTIONS, SQLITE_SCALAR_FUNCTIONS } from "./sqlite-functions.js";
+import { SQLITE_CORE_FUNCTIONS, SQLITE_FUNCTION_ARITY, SQLITE_MATH_FUNCTIONS, SQLITE_SCALAR_FUNCTIONS } from "./sqlite-functions.js";
 import { analyzeExpressionValue, validateConditionExpression } from "./semantic.js";
 import { INVALID_CONDITION_SHAPE_FIXTURES, VALID_CONDITION_SHAPE_FIXTURES } from "./test-fixtures.js";
 import type { ConditionExpression } from "./types.js";
@@ -52,9 +52,23 @@ describe("function validation", () => {
 		expect(SQLITE_MATH_FUNCTIONS.size).toBe(26);
 	});
 
-	it.each([...SQLITE_SCALAR_FUNCTIONS])("accepts sqlite.%s", (name) => {
-		const args = name === "glob" ? [{ val: "*" }, { val: "value" }] : name === "like" ? [{ val: "%" }, { val: "value" }] : [];
+	it("declares an arity for every allowed SQLite function", () => {
+		expect([...SQLITE_FUNCTION_ARITY.keys()].sort()).toEqual([...SQLITE_SCALAR_FUNCTIONS].sort());
+	});
+
+	it.each([...SQLITE_SCALAR_FUNCTIONS])("accepts sqlite.%s at its minimum arity", (name) => {
+		const [minimum = 0] = SQLITE_FUNCTION_ARITY.get(name) ?? [];
+		const args = Array.from({ length: minimum }, () => ({ val: "a" }));
 		expect(() => value({ fn: `sqlite.${name}`, args })).not.toThrow();
+	});
+
+	it("rejects allowed SQLite functions outside their arity", () => {
+		expect(() => value({ fn: "sqlite.abs", args: [] })).toThrow(/argument/);
+		expect(() => value({ fn: "sqlite.abs", args: [{ val: 1 }, { val: 2 }] })).toThrow(/argument/);
+		expect(() => value({ fn: "sqlite.pi", args: [{ val: 1 }] })).toThrow(/argument/);
+		expect(() => value({ fn: "sqlite.replace", args: [{ val: "a" }, { val: "b" }] })).toThrow(/argument/);
+		expect(() => value({ fn: "sqlite.coalesce", args: [{ val: "a" }] })).toThrow(/argument/);
+		expect(() => value({ fn: "sqlite.round", args: [{ val: 1 }, { val: 2 }, { val: 3 }] })).toThrow(/argument/);
 	});
 
 	it.each(["size", "attribute_type"])("accepts %s", (name) => {
