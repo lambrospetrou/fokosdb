@@ -109,4 +109,6 @@ A parent partition in `split_started` or `split_completed` no longer owns any ke
 
 ### Background recovery (stale-TX alarm)
 
+A split parent in `split_started` or `split_completed` and a child in `migration_initialized` or `migration_migrating` must skip stale-transaction recovery. Use the independent `txPendingCanSweep` guard. These partitions do not own authoritative, complete lock state.
+
 When the stale-TX alarm calls `recoverTransaction` on the TC and gets a terminal outcome back (`COMMITTED` / `CANCELLED`), it must apply the outcome by calling the **public** `commit()` / `cancel()` methods — not by inlining SQL or calling private helpers. The public methods encode the migration guard and split routing; bypassing them can write data to the wrong partition or skip child forwarding.

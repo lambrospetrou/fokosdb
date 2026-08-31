@@ -120,15 +120,16 @@ Out of scope, with the reason.
 
 Each step ships on its own.
 
-1. `runCommit` sends keys, not the payload, and the `committed` answer waits for every participant
-   (4.3.6). This step also adds the two retryable errors and the commit fan-out request budget.
-2. Move `initiateRead` into the Worker (4.3.4).
-3. Skip the stale-transaction recovery job on a split parent and on a still-migrating child (4.3.2),
-   with the guard `ttlCanSweep` already applies to the TTL sweep. This step needs nothing from the
-   other steps and pays for itself alone: recovery from either role cannot make progress today, so
-   each cycle spends a coordinator RPC and a child fan-out for nothing, and holds a slot in
-   `listStalePendingTx`. It must ship before step 4, because it is what keeps a split parent's copies
-   away from the `not_found` that the sweep creates.
+1. **Done.** `runCommit` sends keys, not the payload, and the `committed` answer waits for every
+   participant (4.3.6). This step also adds the two retryable errors and the commit fan-out request
+   budget.
+2. **Done.** Move `initiateRead` into the Worker (4.3.4).
+3. **Done.** Skip the stale-transaction recovery job on a split parent and on a still-migrating child
+   (4.3.2), with an independent `txPendingCanSweep` guard that applies the same ownership rules as the
+   TTL sweep. This step needs nothing from the other steps and pays for itself alone. Recovery from
+   either role cannot make progress today. Each cycle spends a coordinator RPC and a child fan-out for
+   no result, and holds a slot in `listStalePendingTx`. It must ship before step 4, because it keeps a
+   split parent's copies away from the `not_found` that the sweep creates.
 4. Add the garbage collection lifecycle: payload stripping, row deletion at the terminal transition,
    the sweep alarm, the alarm recovery budget, and the `clientRequestToken` length limit (4.3.1 to
    4.3.3).
@@ -270,9 +271,9 @@ never reaches the `not_found` path.
   `deleteAllPendingTx` in one `transactionSync` (`src/lib/do-partition.ts`). This is the collection
   point for every copy.
 - **New: a split parent and a still-migrating child skip the stale-transaction recovery job.** The
-  guard is the one `ttlCanSweep` already applies to the TTL sweep: skip while the migration status is
-  `migration_initialized` or `migration_migrating`, and skip while the split status is `split_started`
-  or `split_completed`.
+  independent `txPendingCanSweep` guard applies the same ownership rules as the TTL sweep: skip while
+  the migration status is `migration_initialized` or `migration_migrating`, and skip while the split
+  status is `split_started` or `split_completed`.
 
 The new rule gives up nothing, because recovery from either role cannot make progress today. A parent
 pokes the coordinator, gets `COMMITTED`, and calls its own `txCommit`, which routes every key to the

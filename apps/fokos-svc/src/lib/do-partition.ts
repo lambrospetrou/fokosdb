@@ -419,6 +419,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return splitStatus !== "split_started" && splitStatus !== "split_completed";
 	}
 
+	private txPendingCanSweep(): boolean {
+		const pCtx = this.#_partitionContext;
+		if (!pCtx) return false;
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
+		// A migrating child does not yet have complete, authoritative transaction locks.
+		if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") return false;
+		const splitStatus = this.ensureTopology(pCtx).splitStatus()?.status;
+		// A split parent holds redundant lock copies while its children own the keys.
+		return splitStatus !== "split_started" && splitStatus !== "split_completed";
+	}
+
 	///////////////////////////////
 	// API methods (PartitionAPI)
 	///////////////////////////////
@@ -2038,47 +2049,49 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			////////////////////////////////////////
 			// ── Job: Stale transaction recovery
 			try {
-				const staleTxRows = this.#participant.listStaleTransactions(PartitionDO.STALE_TX_MS, 10);
-				for (const row of staleTxRows) {
-					if (!row.coordinator_do_id) continue;
-					try {
-						const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
-						const result = await tcStub.recoverTransaction(row.transaction_id);
+				if (this.txPendingCanSweep()) {
+					const staleTxRows = this.#participant.listStaleTransactions(PartitionDO.STALE_TX_MS, 10);
+					for (const row of staleTxRows) {
+						if (!row.coordinator_do_id) continue;
+						try {
+							const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
+							const result = await tcStub.recoverTransaction(row.transaction_id);
 
-						// Both branches route on the keys THIS node has locked. That covers the descendants
-						// this node forwarded to, and leaves any other holder to its own alarm — which is
-						// already the case today whenever prepare forwarded every item, since this node
-						// would then hold no row for the transaction and never wake for it.
-						const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
+							// Both branches route on the keys THIS node has locked. That covers the descendants
+							// this node forwarded to, and leaves any other holder to its own alarm — which is
+							// already the case today whenever prepare forwarded every item, since this node
+							// would then hold no row for the transaction and never wake for it.
+							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 
-						if (result.state === "COMMITTED") {
-							if (pendingRows.length > 0) {
-								const transactionTimestamp = pendingRows[0].transaction_ts;
-								await this.txCommit(this.pCtx(), {
+							if (result.state === "COMMITTED") {
+								if (pendingRows.length > 0) {
+									const transactionTimestamp = pendingRows[0].transaction_ts;
+									await this.txCommit(this.pCtx(), {
+										transactionId: row.transaction_id,
+										transactionTimestamp,
+										// Keys only: commit applies the payload from this partition's own
+										// pending_transactions rows, so the request carries routing
+										// information and nothing else.
+										items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
+									});
+								}
+							} else if (result.state === "CANCELLED" || result.state === "not_found") {
+								// "not_found" means the TC has no record, which it may only reach after the
+								// transaction is terminal — so it can never have committed. See the TC's
+								// retention rules before making it delete non-terminal rows.
+								await this.txCancel(this.pCtx(), {
 									transactionId: row.transaction_id,
-									transactionTimestamp,
-									// Keys only: commit applies the payload from this partition's own
-									// pending_transactions rows, so the request carries routing
-									// information and nothing else.
 									items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
 								});
 							}
-						} else if (result.state === "CANCELLED" || result.state === "not_found") {
-							// "not_found" means the TC has no record, which it may only reach after the
-							// transaction is terminal — so it can never have committed. See the TC's
-							// retention rules before making it delete non-terminal rows.
-							await this.txCancel(this.pCtx(), {
+						} catch (e) {
+							console.error({
+								...this.logParams(),
+								message: "fokos/partition: failed to poke stale TC",
 								transactionId: row.transaction_id,
-								items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
+								error: String(e),
 							});
 						}
-					} catch (e) {
-						console.error({
-							...this.logParams(),
-							message: "fokos/partition: failed to poke stale TC",
-							transactionId: row.transaction_id,
-							error: String(e),
-						});
 					}
 				}
 			} catch (error) {
@@ -2137,7 +2150,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				// Job: Stale transaction recovery.
-				if (this.#store.hasAnyPendingTx()) {
+				if (this.txPendingCanSweep() && this.#store.hasAnyPendingTx()) {
 					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
 				}
 			});
