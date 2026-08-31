@@ -671,6 +671,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			)
 			.toArray();
 
+		// FIXME: drive these transactions concurrently with a bounded fan-out, and stop the loop after a
+		// fixed wall-clock budget. Today each one is awaited in turn and each can retry a participant for
+		// tens of seconds, so a busy shard can spend the whole alarm here and never reach the work that
+		// runs after the loop.
 		for (const row of rows) {
 			// FIXME Move this into the SQL above.
 			if (Date.now() - row.created_at < STALE_THRESHOLD_MS) continue;

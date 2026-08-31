@@ -4,16 +4,6 @@
 **Date:** 2026-08-30
 **Author:** Lambros
 
-References:
-
-- `docs/agent-plans/2026-08-29-stateless-transaction-coordination.md` (rejected predecessor)
-- `docs/agent-plans/dynamodb-distributed-transactions-plan.md`
-- `docs/agent-plans/2026-08-23-single-partition-transaction-fast-path.md`
-- [Distributed Transactions at Scale in Amazon DynamoDB, USENIX ATC 2023](https://www.usenix.org/system/files/atc23-idziorek.pdf)
-- [Amazon DynamoDB transactions: `ClientRequestToken`](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html)
-- [Cloudflare Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
-- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
-
 ---
 
 ## Table of Contents
@@ -98,7 +88,11 @@ size derives from `rootTreesN`, and the two smaller problems are documented resi
 In scope. Each statement must be true when the work is finished:
 
 1. Coordinator storage per shard is bounded: the in-flight transactions plus one
-   idempotency window of small rows. Nothing is kept forever.
+   idempotency window of small rows. A decided transaction keeps only a small
+   `tc_state` row, and the sweep deletes it one window after it completed. One residual
+   stays: a transaction whose participant is permanently unreachable never completes, so
+   its keys and its participant rows stay until the participant returns. Its payload does
+   not (4.3.1).
 2. A multi-partition write costs hop + 2 round trips, the same as today. No path gets
    slower.
 3. A multi-partition read transaction costs 2 round trips, one less than today.
@@ -136,19 +130,23 @@ Out of scope, with the reason:
 Each step is shippable on its own.
 
 1. `runCommit` sends keys, not the payload, and the `committed` answer waits for every
-   participant (4.3.6).
-2. Add the lock-age guard (4.3.5).
-3. Move `initiateRead` into the Worker (4.3.4).
-4. Add the garbage-collection lifecycle: payload stripping, row deletion on
-   confirmation, the sweep alarm, and the `clientRequestToken` length limit (4.3.1 to
-   4.3.3). The sweep is what exposes the split-parent copies to `not_found`, so this
-   step also ships the per-confirmed-child copy cleanup in `txCommit` (4.3.2) and the
-   guard scoping of 4.3.5.
+   participant (4.3.6). This adds the two retryable errors and the commit-fan-out
+   request budget.
+2. Move `initiateRead` into the Worker (4.3.4).
+3. Add the garbage-collection lifecycle: payload stripping, row deletion on
+   confirmation, the sweep alarm, the alarm recovery budget, and the
+   `clientRequestToken` length limit (4.3.1 to 4.3.3). The sweep is what exposes the
+   split-parent copies to `not_found`, so this step also ships the per-confirmed-child
+   copy cleanup in `txCommit` (4.3.2).
+4. Add the lock-age guard with its operator tools in one step (4.3.5): the three poke
+   outcomes, the quarantine that keeps a guarded transaction out of the stale scan, the
+   guard log line with its full field set, and the `debugForceResolveTransaction` RPC on
+   `PartitionDO`. The guard compares against `IDEMPOTENCY_WINDOW_MS` and its error state
+   has no resolution path without the RPC, so it cannot ship before step 3 and cannot
+   ship without the RPC.
 5. Derive the default pool size from `rootTreesN`, and add the per-call
    `numTxCoordinators` parameter to `transactWriteItems` (4.3.7). Breaking change:
    existing databases are deleted, not migrated (4.3.9).
-6. Add the guard's operator tools (4.3.5): the `debugForceResolveTransaction` RPC on
-   `PartitionDO`, and the guard log line with its full field set.
 
 ---
 
@@ -273,6 +271,15 @@ harmless:
   withholds the success. The coordinator then does not confirm, retries, and the retry
   cleans up, because the children are idempotent. The stale-transaction alarm resolves
   through the public `txCommit`, so it inherits this cleanup.
+
+  Two mechanics change to make this possible. First, the child fan-out in `txCommit`
+  becomes `Promise.allSettled`: `Promise.all` rejects on the first child failure and
+  discards the results of the others, so "each child that succeeded" is not knowable
+  from it. The parent still collects the failures and rethrows, so a failed child keeps
+  the coordinator from confirming. Second, `PartitionStore` gains a delete keyed by
+  `(transaction_id, hk, sk)` over one child's item set. The two deletes it has today are
+  both too wide: `deletePendingTx` drops every key of the transaction, and
+  `deletePendingTxForHashKey` drops every transaction on a hash key.
 - **A commit copy owned by an unconfirmed child is never deleted.** Migration fetches
   are hash-sliced: a child fetches only the pending rows inside its own slice. A
   still-migrating child can therefore depend on the parent's copy as its only source of
@@ -299,12 +306,30 @@ harmless:
   The rule becomes: after each run, set the next alarm to the earlier of the
   stale-transaction need and the earliest `completed_at + IDEMPOTENCY_WINDOW_MS`. Arm
   nothing only when the shard holds no non-terminal row and no completed row.
-- `IDEMPOTENCY_WINDOW_MS` defaults to 10 minutes. DynamoDB documents the same window
-  for `ClientRequestToken`. The value is set when the `FokosDB` instance is created and
-  **must not change afterwards**. The sweep and the lock-age guard (4.3.5) both compare
-  against it, and a changed value re-scopes rows that completed under the old one:
-  drift in one direction fires false guard errors, drift in the other re-executes
-  replays that were still inside the promised window.
+- **The recovery loop gets a deadline, so the sweep always runs.** `alarm()` drives up
+  to 100 non-terminal transactions one at a time, each awaiting a fan-out that can retry
+  for tens of seconds. A busy shard can therefore spend the whole alarm inside recovery
+  and never reach the sweep, which loses the storage bound of goal 1. The loop stops at
+  `ALARM_RECOVERY_BUDGET_MS` (30 s) of wall clock, finishes the transaction in hand, and
+  leaves the rest to the next alarm. The sweep then runs on every alarm, not only on a
+  quiet one. **FIXME:** the loop also drives the transactions sequentially; it should
+  drive them concurrently with a bounded fan-out.
+- **The sweep is batched.** At the throughput ceiling one window holds about 600,000
+  rows (4.3.8), so a single unbounded `DELETE` is not safe inside one alarm. The sweep
+  deletes at most `SWEEP_BATCH_ROWS` (1,000) per run and re-arms immediately while more
+  expired rows remain. `tc_state` is `WITHOUT ROWID`, so the statement selects the
+  primary key rather than using `DELETE ... LIMIT`:
+  `DELETE FROM tc_state WHERE idempotency_token IN (SELECT idempotency_token FROM
+  tc_state WHERE completed_at < ? LIMIT ?)`.
+- `IDEMPOTENCY_WINDOW_MS` is 10 minutes. DynamoDB documents the same window for
+  `ClientRequestToken`. It is **one exported constant in one module**, imported by
+  `TransactionCoordinatorDO` for the sweep and by `PartitionDO` for the lock-age guard
+  (4.3.5). It is not a per-instance option and it does not travel in `PartitionContext`:
+  both readers need it inside an alarm, where no request is in flight, and a single
+  constant is the only form that cannot drift between them. Drift in one direction fires
+  false guard errors, drift in the other re-executes replays that were still inside the
+  promised window. Changing the constant is a deploy that re-scopes every row already
+  written under the old value, so treat it as a breaking change, not a tunable.
 - The window is the new, documented contract for `clientRequestToken`: a replay inside
   the window returns the recorded outcome; a replay after the window is a new
   execution. Today the window is unbounded because nothing is deleted. A replay with
@@ -326,31 +351,89 @@ item has a pending write, read again, compare `lastCommittedTs`, abort on any ch
 - Cost drops from hop + 2 round trips to 2 round trips.
 - The pool serves writes and recovery only.
 - When the Worker dies mid-read, nothing leaks. The client retries.
+- **Accepted residual: the fan-out now runs under the Worker's connection limit.** A
+  Worker may hold 6 connections at a time waiting for response headers. The [Workers
+  limits](https://developers.cloudflare.com/workers/platform/limits/) page lists fetch,
+  KV, Cache, R2, Queues and TCP for that limit and does not say whether a Durable Object
+  stub call counts. If it does, a read over N partitions costs `ceil(N / 6)` waves per
+  phase instead of one, so the 2 round trips above become a ceiling rather than a
+  measurement. The read stays in the Worker either way: it removes the coordinator hop
+  and all read load from the pool, which is the point. Measure only if
+  `transactGetItems` latency over many partitions becomes a complaint.
 
 #### 4.3.5 The lock-age guard
+
+**The guard decides per transaction, not per lock row.** The release primitive is
+already per transaction (`deletePendingTx`), and the alarm already iterates distinct
+transaction ids, so a per-key decision would need bookkeeping that buys nothing: a
+transaction cannot hold both an owned and a routed-away lock on one partition. A split
+parent forwards every key, and a promotion cutover is deferred while any lock exists on
+that hash key. The alarm loads this transaction's local pending rows once, routes them,
+and takes the oldest `created_at` among them as the lock age.
 
 The stale-transaction alarm handles the three poke outcomes differently:
 
 1. **The poke fails as an RPC error** (the coordinator shard is unreachable): retry on
    the next alarm cycle. The row waits at the coordinator; nothing is lost.
-2. **`not_found`, and the key routes away from this partition** (a split parent's
-   leftover copy, 4.3.2): delete the local copy silently. The sweep implies every
-   owning child confirmed, so the copy is redundant.
-3. **`not_found`, this partition owns the key, and the lock's `created_at` is older
-   than `IDEMPOTENCY_WINDOW_MS`**: raise an operational error (log and alert) and do
-   not release. This state is unreachable by an outage alone — the sweep waits for this
-   participant's confirmation, so a down participant delays garbage collection instead
-   of losing its row (see the FAQ). Reaching it means invariant 1 or 2 of 4.3.2 broke,
-   and a silent release would hide a possible atomicity violation. The lock stays held
-   until an operator resolves it with the debug RPC below.
+2. **`not_found`, and the keys route away from this partition** (a split parent's
+   leftover copy, 4.3.2): delete the local rows silently, with a direct
+   `deletePendingTx` on the store — **not** through `txCancel`. The public path exists so
+   that recovery applying an outcome carries the migration guard and the split routing
+   with it. This case applies no outcome: the sweep already implies every owning child
+   confirmed, so the rows are pure garbage and fanning a cancel out to the children only
+   spends RPCs on partitions that hold nothing.
+3. **`not_found`, this partition owns the keys, and the oldest lock's `created_at` is
+   older than `IDEMPOTENCY_WINDOW_MS`**: raise an operational error (log and alert) and
+   do not release. This state is unreachable by an outage alone — the sweep waits for
+   this participant's confirmation, so a down participant delays garbage collection
+   instead of losing its row (see the FAQ). Reaching it means invariant 1 or 2 of 4.3.2
+   broke, and a silent release would hide a possible atomicity violation. The lock stays
+   held until an operator resolves it with the debug RPC below.
 
-The operator tools ship in milestone 6:
+**A guarded transaction leaves the stale scan.** Case 3 creates the first lock this
+system never releases on its own, and the scan that finds it is
+`SELECT DISTINCT transaction_id, coordinator_do_id FROM pending_transactions WHERE
+created_at < ? LIMIT 10`, served by the `created_at` index. A guarded transaction is
+permanently the oldest, so ten of them fill every cycle forever and no other stale
+transaction on the partition is ever recovered. The keys of those other transactions
+then stay locked, and a held lock makes every non-transactional write to its key throw.
+One invariant break would grow into a partition-wide write outage — and case 3 fires for
+many transactions at once when it fires at all, because its cause is systemic.
+
+The quarantine is one nullable column:
+
+```sql
+-- pending_transactions: set by the lock-age guard, cleared by debugForceResolveTransaction.
+-- NULL for every healthy lock.
+guarded_at INTEGER
+```
+
+- The guard sets `guarded_at` in the same statement that decides not to release.
+- `listStalePendingTx` adds `AND guarded_at IS NULL`. The plan does not change: that scan
+  already reads rows rather than covering from `pending_transactions_created_at`, because
+  `coordinator_do_id` is not in that index.
+- `debugForceResolveTransaction` clears `guarded_at` as part of resolving the
+  transaction, so the operator tool and the quarantine are one mechanism.
+- The guard logs on the transition into quarantine, not once per alarm cycle.
+
+The column is durable on purpose. An in-memory set would cost no schema, but it is lost
+on eviction — the guard would re-fire, re-alert and re-starve for one cycle after every
+eviction — and an operator could not answer "which locks are stuck?" from storage. The
+cost of the column is near zero: `pending_transactions` rows are transient, and a NULL
+integer adds nothing to a row.
+
+The tradeoff to accept: a quarantined transaction is never poked again, so it cannot
+heal itself if its coordinator later returns. That is the intended behavior. Case 3 means
+an invariant broke, and the resolution is an operator who has looked at the two possible
+outcomes, not a retry that guesses.
+
+The operator tools ship with the guard, in milestone 4:
 
 - **The guard log line** carries everything the operator needs:
   `"fokos/partition: lock-age guard: over-age lock with not_found"`, plus
-  `transactionId`, `coordinatorDoId`, the encoded `hashKey` and `sortKey`,
-  `lockCreatedAt`, `lockAgeMs`, `windowMs`, and the partition's `doName` and
-  `partitionId`.
+  `transactionId`, `coordinatorDoId`, the encoded keys of every lock this transaction
+  holds here, `lockCreatedAt` and `lockAgeMs` of the oldest of them, `windowMs`, and the
+  partition's `doName` and `partitionId`.
 - **The debug RPC**:
   `debugForceResolveTransaction(pCtx, { transactionId, outcome: "commit" | "cancel" })`
   on `PartitionDO`. It resolves through the public `txCommit` / `txCancel` with keys
@@ -359,9 +442,9 @@ The operator tools ship in milestone 6:
 
 A `not_found` for an owned lock younger than the window releases it, as today.
 
-The guard and the sweep must read the same configured value. Two constants drift, and
-drift in one direction raises false alarms while drift in the other restores the silent
-cancel.
+The guard and the sweep read the one `IDEMPOTENCY_WINDOW_MS` constant of 4.3.3. Two
+constants would drift, and drift in one direction raises false alarms while drift in the
+other restores the silent cancel.
 
 #### 4.3.6 The commit fan-out: keys only, and the answer waits for it
 
@@ -389,11 +472,49 @@ the key itself, so a commit reaches forwarded locks on children without a broadc
 participant confirmed. Today `drivePrepare` catches a `runCommit` failure and answers
 `committed` anyway, so a client can read a stale value from the one participant that
 did not apply. This plan changes the answer: when the commit fan-out cannot complete
-inside the request's retry budget, the coordinator answers a retryable **in-doubt**
-error, and the alarm finishes the commit. `PREPARED` stays final — the in-doubt error
+inside the request's retry budget, the coordinator answers a retryable **commit-pending**
+error, and the alarm finishes the commit. `PREPARED` stays final — the commit-pending error
 never means cancelled.
 
-What the client does with the in-doubt error:
+**The two retryable errors.** Both are thrown, not returned. `InitiateWriteResponse`
+carries decisions — `committed` and `cancelled` — and a third outcome member would invite
+a caller to treat a non-answer as terminal; the coordinator already throws for the
+undecided states. Only one of the two is new: the undecided throw exists today, and this
+plan names it.
+
+The error is called commit-pending, not in-doubt. Classic two-phase commit uses
+"in doubt" for a participant that does not know the outcome. Here the coordinator has no
+doubt: the decision is durable and `PREPARED` is final, so the transaction will commit.
+The only unknown is when every participant has applied it. The two errors are separate
+because they promise different things to a client with no token: undecided may still
+cancel, commit-pending will commit.
+
+| Error | Thrown from | Meaning | Predicate |
+| --- | --- | --- | --- |
+| undecided | `CREATED`, `PREPARING` | The outcome may still be either. | `isTransactionUndecidedError` |
+| commit-pending | `PREPARED`, `COMMITTING` | The transaction will commit. Not every participant applied it yet. | `isTransactionCommitPendingError` |
+
+Both predicates are exported next to `isPartitionExceededDatabaseSizeError`, which is how
+this library already exposes a testable error class. `FokosDB.transactWriteItems` does not
+retry either one: a write retry is the caller's decision, because a tokenless retry is a
+second transaction.
+
+**The request budget.** `runCommit` retries a participant up to 10 times with up to 2 s of
+backoff, so the fan-out can hold a request for roughly 20 s before it gives up. Gating the
+answer on it makes that the client's wait. The fan-out inside a request therefore stops at
+`COMMIT_FANOUT_REQUEST_BUDGET_MS` (5 s) of wall clock and answers commit-pending. The alarm keeps
+the full budget, because nothing waits on it.
+
+**The split window.** A partition that starts a split after a transaction prepared on it
+fails every forwarded commit until its children finish migrating: the parent passes
+`ensureMigration`, and each migrating child rejects `txCommit`. Today that answers
+`committed` and the alarm finishes the work; under this rule it answers commit-pending for the
+length of the migration, which is minutes for a large partition. The blast radius is the
+transactions that prepared before `startSplit` and no others — a prepare arriving during
+the split is rejected and the transaction cancels — so this is a small, bounded set. It is
+the accepted cost of goal 8.
+
+What the client does with the commit-pending error:
 
 - With a `clientRequestToken`: retry. The replay reaches the same shard, `runCommit`
   retries the missing participants, and the answer is `committed` once every one
@@ -410,7 +531,15 @@ receives `committed` can read what it wrote on every participant.
 
 - The default becomes `numTxCoordinators = 2 * rootTreesN`, replacing the constant
   100. The multiplier is a placeholder; Open Question 4.4.1 tracks it. The option in
-  `FokosDBOptions` stays for explicit sizing.
+  `FokosDBOptions` stays for explicit sizing, and is renamed from
+  `numTransactionCoordinators` to `numTxCoordinators` so the instance option and the
+  per-call parameter carry one name.
+- The coordinator shard group is renamed from `<tableName>.tc` to
+  `fokos_tc.<tableName>`, for consistency with the naming convention across the
+  library. A shard's Durable Object name is `<shardGroupName>-<shard>`, so this moves
+  every coordinator to a new object. That is safe only because the release already
+  deletes existing databases (4.3.9); shards under the old name are unreachable
+  afterwards and drain themselves through their own sweep.
 - `transactWriteItems` accepts a new optional `numTxCoordinators` parameter that
   overrides the instance value for that call. This grows the pool for new transactions
   without a redeploy. `transactGetItems` needs no parameter: read transactions run in
@@ -472,28 +601,45 @@ on maximum keys. A typical shard holds far less.
 
 #### 4.3.9 Deployment, migration, rollback
 
-- Schema changes ship through `SQLSchemaMigrations`: `tc_state.completed_at`, and
-  nullable payload columns on `tc_items`.
+- Two schema changes ship through `SQLSchemaMigrations`: `tc_state.completed_at` with its
+  partial index (4.3.3), and `pending_transactions.guarded_at` (4.3.5). Payload stripping
+  needs no migration — `tc_items.data`, `data_kind` and `conditions_json` are already
+  nullable. Both tables are pre-release, so the migrations are edited in place rather
+  than added as `ALTER TABLE` steps.
 - **This is a breaking release. Existing databases are deleted and recreated, not
   migrated.** The default pool size change can route a token to a different shard, so
   a replay against a pre-upgrade database could execute twice. No compatibility path
   is kept; `destroy()` removes the old data.
 - Keys-only commit changes `CommitRequest.items` to `TransactionItemKey[]` (4.3.6).
   Participant behavior is unchanged, and the release is breaking anyway.
-- `destroy()` sweeps the pool up to the instance's configured `numTxCoordinators`. A
-  deployment that passed a larger per-call value must set the instance option to the
-  largest value it ever used before it calls `destroy()`, or the extra shards keep
-  their idempotency rows.
-- `destroy()` must iterate the coordinator shards in batches of fewer than 1,000. A
-  single invocation is capped at 1,000 subrequests ([Workers
-  limits](https://developers.cloudflare.com/workers/platform/limits/)), and the pool
-  can hold up to `2 * 65,000` shards. Today's `staticShardedTCs.all()` fans out to
-  every shard at once and breaks past the cap.
+- `destroy()` sweeps the pool up to the instance's configured `numTxCoordinators`, so a
+  deployment that passed a larger per-call value leaves shards outside that range
+  untouched. **This is bounded, not permanent.** Every shard arms its own alarm and
+  deletes its own `tc_state` rows one idempotency window after `completed_at` (4.3.3),
+  so an unswept shard drains itself with no help from `destroy()`. The residual is one
+  window: for `IDEMPOTENCY_WINDOW_MS` after `destroy()`, a replayed
+  `clientRequestToken` can still be answered from an unswept shard with the destroyed
+  table's outcome. After that the shard is empty and the replay is a new execution.
+  Reaching every shard is therefore a storage-reclamation nicety, not a correctness
+  requirement.
+- `destroy()` must iterate the coordinator shards in filtered batches. The platform is
+  not the constraint: a Worker invocation allows 1,000 subrequests on Free and 10,000 on
+  Paid ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)),
+  raisable to 10 million on request. The constraint is `StaticShardedDO`, whose `all()`
+  and `tryAll()` throw outright above 1,000 shards, while `some()` and `trySome()` take a
+  `filterFn` and have no such guard. The pool can hold up to `2 * 65,000` shards, so
+  `destroy()` uses `some()` over successive shard ranges.
 - **TODO(cleanup), independent of this plan:** the partition traversal in `destroy()`
   (`traverseForDestroy`) has the same exposure for a table with more than about 1,000
   partitions. It predates this plan; batch it the same way.
-- Rollback: garbage collection is additive and can be disabled. Stripped or deleted
-  rows are not restored, which only widens the window in which a replay re-executes.
+- Rollback is not uniform across the release. Garbage collection is additive and can be
+  disabled: stripped or deleted rows are not restored, which only widens the window in
+  which a replay re-executes. The other two changes cannot be rolled back with a flag.
+  `CommitRequest.items` becomes `TransactionItemKey[]`, so the coordinator and the
+  partitions must deploy together — a half-rolled-back pair disagrees on the wire shape.
+  The gated `committed` answer changes what a client observes, so a deploy in either
+  direction has transactions in flight that answer under the old rule and transactions
+  that answer under the new one.
 
 #### 4.3.10 Testing
 
@@ -514,6 +660,10 @@ Garbage collection:
 - A token replay with different operations throws inside the window.
 - An idle shard sweeps its last completed rows with no further traffic: the alarm
   re-arms until the window passes (4.3.3).
+- A shard with more expired rows than `SWEEP_BATCH_ROWS` deletes them across several
+  alarm runs and re-arms until none remain (4.3.3).
+- A shard whose recovery loop exceeds `ALARM_RECOVERY_BUDGET_MS` still runs the sweep in
+  that same alarm (4.3.3).
 - A `clientRequestToken` longer than `MAX_CLIENT_REQUEST_TOKEN_BYTES` throws at the
   client boundary, before any coordinator RPC (4.3.3).
 
@@ -527,6 +677,12 @@ Lock-age guard and split-parent copies:
   stops poking for it afterwards.
 - The operational error fires only for a `not_found` on a lock whose key the partition
   owns, older than the window, and the lock is not released.
+- A quarantined transaction leaves the stale scan: with ten guarded transactions held,
+  an eleventh, younger stale transaction on the same partition still recovers on the next
+  alarm cycle, and the guard logs once per transaction rather than once per cycle
+  (4.3.5).
+- `debugForceResolveTransaction` clears `guarded_at`, and the resolved transaction's
+  locks are gone afterwards (4.3.5).
 - A failed poke (coordinator unreachable) retries and never raises the error.
 - The guard log line carries every field of 4.3.5, and `debugForceResolveTransaction`
   resolves the lock through the public paths.
@@ -539,9 +695,15 @@ Reads in the Worker:
 Commit with keys, and the gated answer:
 
 - A multi-megabyte transaction commits with commit RPCs that carry no payload.
-- A commit with one unreachable participant answers the retryable in-doubt error,
+- A commit with one unreachable participant answers the retryable commit-pending error,
   never `committed`. After the participant returns, a token replay answers
   `committed`, and a `getItem` on every written key returns the new value (4.3.6).
+- `isTransactionCommitPendingError` matches that error and `isTransactionUndecidedError` does
+  not, and the reverse holds for a transaction still in `PREPARING` (4.3.6).
+- The commit-pending answer arrives within `COMMIT_FANOUT_REQUEST_BUDGET_MS`, not after the
+  alarm's full retry budget (4.3.6).
+- A transaction that prepared before a split answers commit-pending while the children
+  migrate, and answers `committed` on a token replay once migration completes (4.3.6).
 
 Pool size:
 
@@ -666,10 +828,44 @@ return. This is today's behavior, unchanged and accepted. The async decision mir
 Future extensions (section 6) is the mitigation if this becomes a problem in practice.
 
 **What does a client see when a participant is down during the commit?**
-A retryable in-doubt error, never `committed` (4.3.6). The decision is durable and the
+A retryable commit-pending error, never `committed` (4.3.6). The decision is durable and the
 alarm finishes the commit. A replay with the same `clientRequestToken` answers
 `committed` once every participant confirmed. A tokenless retry is a new transaction —
 the same ambiguity a lost response gives today.
+
+**Why an error at all, instead of retrying until every participant applies?**
+The coordinator does retry — that is what `COMMIT_FANOUT_REQUEST_BUDGET_MS` buys. The
+error is what happens when the retries run out, and they must run out: a participant can
+be unreachable for hours, and a request that waits for it never returns and holds the
+shard. So the choice is not "error or retry"; it is which answer to give when the retry
+budget ends. `committed` would be the lie this plan removes, and `cancelled` would be
+false because `PREPARED` is final. A retryable error is the only truthful answer left.
+
+**Does the commit-pending answer weaken read-your-writes?**
+No — it is what makes goal 8 a guarantee. Goal 8 is conditional: a client that receives
+`committed` can read what it wrote everywhere. A client that receives commit-pending
+received no `committed`, so it has nothing to read back yet; it retries with its token
+and gets `committed` once the last participant confirms. The window in which one
+participant has applied the transaction and another has not is not created by this
+change — it exists between the first and last commit RPC today, and two-phase commit is
+atomic in its outcome, not in the instant that outcome becomes visible. What changes is
+only whether the client is told `committed` before that window closes.
+
+**What exactly is the commit-pending error?**
+A thrown error, matched by the exported `isTransactionCommitPendingError` (4.3.6). It is not a
+member of `InitiateWriteResponse`, because that union carries decisions and a third
+member would let a caller treat a non-answer as terminal. It is separate from the
+undecided error (`isTransactionUndecidedError`) because the two promise different things:
+undecided may still cancel, commit-pending will commit. A client with a `clientRequestToken`
+retries either one. A client without a token retries an commit-pending error only when a second
+application is harmless.
+
+**Does `destroy()` have to reach every coordinator shard?**
+No, and it cannot when a per-call `numTxCoordinators` grew the pool past the instance
+value. Every shard sweeps its own `tc_state` one idempotency window after each
+transaction completes (4.3.3), so an unswept shard empties itself. The exposure is one
+window: within it, a replayed token can still be answered from an unswept shard with the
+destroyed table's outcome (4.3.9).
 
 **Can a participant outage outlast the idempotency window and strand a lock?**
 No. The sweep waits for that participant, not the other way around. The timeline: the
@@ -704,3 +900,14 @@ the read load from the pool.
 One thing: the `clientRequestToken` idempotency window becomes finite (10 minutes by
 default) instead of accidentally infinite. A replay after the window is a new
 execution. DynamoDB documents the same contract.
+
+## References
+
+- `docs/agent-plans/2026-08-29-stateless-transaction-coordination.md` (rejected predecessor)
+- `docs/agent-plans/dynamodb-distributed-transactions-plan.md`
+- `docs/agent-plans/2026-08-23-single-partition-transaction-fast-path.md`
+- [Distributed Transactions at Scale in Amazon DynamoDB, USENIX ATC 2023](https://www.usenix.org/system/files/atc23-idziorek.pdf)
+- [Amazon DynamoDB transactions: `ClientRequestToken`](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html)
+- [Cloudflare Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
+- [Cloudflare Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
+
