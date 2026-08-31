@@ -130,9 +130,9 @@ Each step ships on its own.
    either role cannot make progress today. Each cycle spends a coordinator RPC and a child fan-out for
    no result, and holds a slot in `listStalePendingTx`. It must ship before step 4, because it keeps a
    split parent's copies away from the `not_found` that the sweep creates.
-4. Add the garbage collection lifecycle: payload stripping, row deletion at the terminal transition,
-   the sweep alarm, the alarm recovery budget, and the `clientRequestToken` length limit (4.3.1 to
-   4.3.3).
+4. **Done.** Add the garbage collection lifecycle: payload stripping, row deletion at the terminal
+   transition, the sweep alarm, the alarm recovery budget, and the `clientRequestToken` length limit
+   (4.3.1 to 4.3.3).
 5. Add the lock-age guard with its operator tools (4.3.5): the three poke outcomes, the quarantine that
    keeps a guarded transaction out of the stale scan, the guard log line with its full field set, and
    the `debugForceResolveTransaction` RPC on `PartitionDO`. The guard compares against

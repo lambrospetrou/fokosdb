@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
+import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { PartitionContextCreator, type PartitionNamespaceKey } from "./partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./partition-topology/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "./transaction-limits.js";
@@ -467,6 +468,22 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	// key rules. A limit or a rule that applies through one API and not another is a bug in itself:
 	// the caller cannot know which of two equivalent calls will be accepted.
 	describe("FokosDB — limits and key validation are uniform across the APIs", () => {
+		it("rejects an over-size clientRequestToken before the coordinator RPC", async () => {
+			const db = makeDB();
+			const initiateWrite = vi.spyOn(TransactionCoordinatorDO.prototype, "initiateWrite");
+			try {
+				await expect(
+					db.transactWriteItems({
+						items: [{ hashKey: "token-limit", operation: "put", data: "value" }],
+						clientRequestToken: `${"é".repeat(32)}x`,
+					}),
+				).rejects.toThrow(/clientRequestToken exceeds 64 bytes/);
+				expect(initiateWrite).not.toHaveBeenCalled();
+			} finally {
+				initiateWrite.mockRestore();
+			}
+		});
+
 		it("caps putItem data at the same per-item limit as a transactional put", async () => {
 			const db = makeDB();
 			const tooBig = new Uint8Array(MAX_ITEM_BYTES + 1);

@@ -41,6 +41,7 @@ import {
 	singlePartitionTarget,
 	validateTransactGetItemCount,
 	validateTransactWriteOperations,
+	validateClientRequestToken,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "./partition-topology/types.js";
@@ -215,9 +216,7 @@ export class FokosDB {
 	}
 
 	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
-		if (opts.clientRequestToken !== undefined && opts.clientRequestToken.trim().length === 0) {
-			throw new Error("fokosdb: clientRequestToken must be a non-empty string when provided");
-		}
+		if (opts.clientRequestToken !== undefined) validateClientRequestToken(opts.clientRequestToken);
 
 		// Encode each put and compile each condition once at this boundary. A `data` field set on a non-put
 		// by a non-TypeScript caller stays present so validation rejects it.

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
+	MAX_CLIENT_REQUEST_TOKEN_BYTES,
 	MAX_ITEM_BYTES,
 	MAX_ITEMS_PER_TX,
 	MAX_PAYLOAD_BYTES_PER_TX,
+	validateClientRequestToken,
 	validateItemKeys,
 	validateTransactGetItemCount,
 	validateTransactWriteOperations,
@@ -17,6 +19,18 @@ const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "has
 function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x"): TransactWriteOperationLike {
 	return { hashKey, sortKey, operation: "put", data };
 }
+
+describe("validateClientRequestToken", () => {
+	it("accepts exactly 64 UTF-8 bytes and rejects one more", () => {
+		expect(() => validateClientRequestToken("é".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES / 2))).not.toThrow();
+		expect(() => validateClientRequestToken(`${"é".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES / 2)}x`)).toThrow(/exceeds 64 bytes/);
+	});
+
+	it("rejects an empty or whitespace-only token", () => {
+		expect(() => validateClientRequestToken("")).toThrow(/non-empty/);
+		expect(() => validateClientRequestToken(" \t ")).toThrow(/non-empty/);
+	});
+});
 
 describe("validateItemKeys", () => {
 	it("accepts ordinary keys", () => {

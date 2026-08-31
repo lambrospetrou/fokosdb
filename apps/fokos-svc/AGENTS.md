@@ -66,7 +66,8 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 - Conflict detection: `last_transaction_ts` column on items; `max_deleted_ts` in `deletion_metadata` for items that were deleted.
 - Non-transactional writes (`putItem`/`deleteItem`) are **rejected** (not delayed) if a pending transaction holds the item's lock.
 - TC recovery: PartitionDO alarms poke stale TCs via `recoverTransaction()`; TC alarm retries stale in-flight transactions.
-- Idempotency: `clientRequestToken` → TC DO name = idempotency token.
+- TC storage: payload is stripped at `PREPARED` or `CANCELLING`; item and participant rows are deleted only at the terminal transition.
+- Idempotency: `clientRequestToken` is 1 to 64 UTF-8 bytes and names the TC DO. The terminal `tc_state` row remains for 10 minutes after completion, then the TC alarm deletes it.
 
 **Read transactions (`transactGetItems`)**:
 

@@ -16,6 +16,7 @@ import type {
 import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
 import { DESTROY_ABORT_SENTINEL } from "./cf-utils.js";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
+import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "./transaction-limits.js";
 
 type TcStateRow = {
 	idempotency_token: string;
@@ -23,6 +24,7 @@ type TcStateRow = {
 	state: TCState;
 	transaction_ts: number;
 	created_at: number;
+	completed_at: number | null;
 	rejection_reason_json: string | null;
 	operations_hash: string;
 };
@@ -89,6 +91,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 state                   TEXT    NOT NULL,
                 transaction_ts          INTEGER NOT NULL,
                 created_at              INTEGER NOT NULL,
+                completed_at            INTEGER,
                 rejection_reason_json   TEXT,
                 -- Fingerprint of the operation set this token was first used for. A replay whose
                 -- operations hash differently is a different request wearing the same token, and is
@@ -98,6 +101,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 			) WITHOUT ROWID, STRICT;
 
 			CREATE INDEX IF NOT EXISTS tc_state_transaction_id ON tc_state (transaction_id);
+			CREATE INDEX IF NOT EXISTS idx_tc_state_completed_at ON tc_state (completed_at) WHERE completed_at IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS tc_participants (
                 transaction_id          TEXT    NOT NULL,
@@ -150,6 +154,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#migrations.runAllSync();
 		});
+	}
+
+	private async ensureAlarmAt(targetMs: number): Promise<void> {
+		const existing = await this.ctx.storage.getAlarm();
+		if (existing === null || targetMs < existing) await this.ctx.storage.setAlarm(targetMs);
 	}
 
 	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse> {
@@ -221,9 +230,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}
 		});
 
-		if (!(await this.ctx.storage.getAlarm())) {
-			await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
-		}
+		await this.ensureAlarmAt(Date.now() + STALE_THRESHOLD_MS);
 
 		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, COMMIT_FANOUT_REQUEST_BUDGET_MS);
 	}
@@ -307,6 +314,37 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
+	private stripPayload(transactionId: string): void {
+		this.ctx.storage.sql.exec(
+			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL WHERE transaction_id = ?`,
+			transactionId,
+		);
+	}
+
+	private completeTransaction(
+		transactionId: string,
+		idempotencyToken: string,
+		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
+	): number | null {
+		const expectedState = terminalState === "COMMITTED" ? "COMMITTING" : "CANCELLING";
+		const completedAt = Date.now();
+		let transitioned = false;
+		this.ctx.storage.transactionSync(() => {
+			const transition = this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = ?, completed_at = ? WHERE idempotency_token = ? AND state = ?`,
+				terminalState,
+				completedAt,
+				idempotencyToken,
+				expectedState,
+			);
+			if (transition.rowsWritten === 0) return;
+			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE transaction_id = ?`, transactionId);
+			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE transaction_id = ?`, transactionId);
+			transitioned = true;
+		});
+		return transitioned ? completedAt : null;
+	}
+
 	private async drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
@@ -364,10 +402,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		if (!firstRejectionReason) {
 			// All accepted — PREPARED is the point of no return
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
-				idempotencyToken,
-			);
+			this.ctx.storage.transactionSync(() => {
+				const transition = this.ctx.storage.sql.exec(
+					`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
+					idempotencyToken,
+				);
+				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
+			});
 			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs).catch((e) =>
 				console.error({
 					message: "fokos/tc: background commit failed",
@@ -379,11 +420,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return this.loadFinalResponse(transactionId, idempotencyToken);
 		}
 
-		this.ctx.storage.sql.exec(
-			`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ? WHERE idempotency_token = ? AND state = 'PREPARING'`,
-			stringifyReason(firstRejectionReason),
-			idempotencyToken,
-		);
+		this.ctx.storage.transactionSync(() => {
+			const transition = this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ? WHERE idempotency_token = ? AND state = 'PREPARING'`,
+				stringifyReason(firstRejectionReason),
+				idempotencyToken,
+			);
+			if (transition.rowsWritten > 0) this.stripPayload(transactionId);
+		});
 		await this.runCancel(transactionId, idempotencyToken);
 		return this.loadFinalResponse(transactionId, idempotencyToken);
 	}
@@ -447,10 +491,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`, transactionId)
 				.toArray()[0]?.n ?? 0;
 		if (uncommitted === 0) {
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'COMMITTED' WHERE idempotency_token = ? AND state = 'COMMITTING'`,
-				idempotencyToken,
-			);
+			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
+			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
 		}
 	}
 
@@ -505,10 +547,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				)
 				.toArray()[0]?.n ?? 0;
 		if (stillPending === 0) {
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'CANCELLED' WHERE idempotency_token = ? AND state = 'CANCELLING'`,
-				idempotencyToken,
-			);
+			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "CANCELLED");
+			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
 		}
 	}
 
@@ -568,44 +608,49 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
 
 		if (allAccepted) {
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
-				idempotencyToken,
-			);
+			this.ctx.storage.transactionSync(() => {
+				const transition = this.ctx.storage.sql.exec(
+					`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
+					idempotencyToken,
+				);
+				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
+			});
 			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs);
 		} else if (anyRejected) {
 			const reasonJson = firstNewRejectionReason ? stringifyReason(firstNewRejectionReason) : stringifyReason({ type: "transient_error" });
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = COALESCE(rejection_reason_json, ?)
+			this.ctx.storage.transactionSync(() => {
+				const transition = this.ctx.storage.sql.exec(
+					`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = COALESCE(rejection_reason_json, ?)
                  WHERE idempotency_token = ? AND state = 'PREPARING'`,
-				reasonJson,
-				idempotencyToken,
-			);
+					reasonJson,
+					idempotencyToken,
+				);
+				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
+			});
 			await this.runCancel(transactionId, idempotencyToken);
 		}
 		// If some participants still NULL, leave in PREPARING; alarm will retry
 	}
 
 	async alarm(): Promise<void> {
+		const recoveryStartedAt = Date.now();
 		const rows = this.ctx.storage.sql
 			.exec<{
 				idempotency_token: string;
 				transaction_id: string;
 				state: TCState;
-				created_at: number;
 			}>(
-				`SELECT idempotency_token, transaction_id, state, created_at
-                 FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 100`,
+				`SELECT idempotency_token, transaction_id, state
+                 FROM tc_state
+                 WHERE state NOT IN ('COMMITTED', 'CANCELLED') AND created_at <= ?
+                 ORDER BY created_at, idempotency_token LIMIT 100`,
+				recoveryStartedAt - STALE_THRESHOLD_MS,
 			)
 			.toArray();
 
-		// FIXME: drive these transactions concurrently with a bounded fan-out, and stop the loop after a
-		// fixed wall-clock budget. Today each one is awaited in turn and each can retry a participant for
-		// tens of seconds, so a busy shard can spend the whole alarm here and never reach the work that
-		// runs after the loop.
+		// FIXME: drive these transactions concurrently with a bounded fan-out.
 		for (const row of rows) {
-			// FIXME Move this into the SQL above.
-			if (Date.now() - row.created_at < STALE_THRESHOLD_MS) continue;
+			if (Date.now() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) break;
 			try {
 				const coordinatorDoId = this.ctx.id.toString();
 				switch (row.state) {
@@ -633,12 +678,37 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}
 		}
 
-		const remaining =
+		const now = Date.now();
+		const cutoff = now - IDEMPOTENCY_WINDOW_MS;
+		this.ctx.storage.sql.exec(
+			`DELETE FROM tc_state WHERE idempotency_token IN (
+				SELECT idempotency_token FROM tc_state
+				WHERE completed_at < ? ORDER BY completed_at, idempotency_token LIMIT ?
+			)`,
+			cutoff,
+			SWEEP_BATCH_ROWS,
+		);
+
+		const hasExpiredRows =
 			this.ctx.storage.sql
-				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED')`)
-				.toArray()[0]?.n ?? 0;
-		if (remaining > 0) {
-			await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
+				.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)
+				.toArray()[0] !== undefined;
+		const hasNonTerminalRows =
+			this.ctx.storage.sql
+				.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`)
+				.toArray()[0] !== undefined;
+		const earliestCompletedAt = this.ctx.storage.sql
+			.exec<{ completed_at: number | null }>(`SELECT MIN(completed_at) AS completed_at FROM tc_state WHERE completed_at IS NOT NULL`)
+			.toArray()[0]?.completed_at;
+
+		let nextAlarmAt: number | null = hasNonTerminalRows ? now + STALE_THRESHOLD_MS : null;
+		if (earliestCompletedAt != null) {
+			const sweepAt = earliestCompletedAt + IDEMPOTENCY_WINDOW_MS + 1;
+			nextAlarmAt = nextAlarmAt === null ? sweepAt : Math.min(nextAlarmAt, sweepAt);
+		}
+		if (hasExpiredRows) nextAlarmAt = now;
+		if (nextAlarmAt !== null) {
+			await this.ensureAlarmAt(Math.max(now, nextAlarmAt));
 		}
 	}
 
@@ -712,7 +782,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRow(idempotencyToken: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json, operations_hash
+				`SELECT idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, rejection_reason_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
 			)

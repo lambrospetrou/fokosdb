@@ -30,6 +30,22 @@ export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 
 export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
+export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
+export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
+export const SWEEP_BATCH_ROWS = 1_000;
+export const ALARM_RECOVERY_BUDGET_MS = 30_000;
+
+const textEncoder = new TextEncoder();
+
+export function validateClientRequestToken(token: string): void {
+	if (token.trim().length === 0) {
+		throw new Error("fokosdb: clientRequestToken must be a non-empty string when provided");
+	}
+	const bytes = textEncoder.encode(token).byteLength;
+	if (bytes > MAX_CLIENT_REQUEST_TOKEN_BYTES) {
+		throw new Error(`fokosdb: clientRequestToken exceeds ${MAX_CLIENT_REQUEST_TOKEN_BYTES} bytes when UTF-8 encoded (got ${bytes})`);
+	}
+}
 
 /**
  * Lower bound on the stored size of one item's data: exact for binary, UTF-16 code units for text.

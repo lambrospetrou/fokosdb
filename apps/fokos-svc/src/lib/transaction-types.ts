@@ -251,7 +251,10 @@ export type TransactWriteItem =
 
 export type TransactWriteItemsOptions = {
 	items: TransactWriteItem[];
-	/** Idempotency key. Reusing one for a DIFFERENT item set is rejected. */
+	/**
+	 * Idempotency key, 1 to 64 UTF-8 bytes. A completed outcome is retained for 10 minutes. Reusing the
+	 * token for a different item set during that window is rejected.
+	 */
 	clientRequestToken?: string;
 };
 
