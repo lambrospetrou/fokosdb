@@ -1478,8 +1478,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		const { items } = this.#participant.readForTransactionLocal({ items: route.items });
-		// Parity with the coordinator path: an item locked by an in-progress two-phase transaction has
-		// a write that may or may not land, so the read cannot claim a committed snapshot.
+		// Parity with the two-phase path: an item locked by an in-progress transaction has a write that
+		// may or may not land, so the read cannot claim a committed snapshot.
 		if (items.some((item) => item.hasPendingWrite)) {
 			return { outcome: "aborted", reason: "pending_write" };
 		}
@@ -1525,7 +1525,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * The server-side authority for the single-partition fast paths. One DO must execute every item:
 	 * either this one owns them all, or exactly one child does and the whole request is handed over.
 	 * Anything else raises the fallback error and touches nothing, so the caller can run the
-	 * coordinator path.
+	 * two-phase path.
 	 *
 	 * Forwarding hops cost latency but not correctness — the nodes in between own nothing and do
 	 * nothing.
@@ -2263,7 +2263,7 @@ const FAST_PATH_FALLBACK_SENTINEL = "single-partition fast path not applicable";
  * Raised when a single-shot transaction reaches a partition that cannot execute the whole item set
  * alone — the items straddle a split or a promotion boundary below this node. It carries ZERO side
  * effects, so it is safe to raise from any depth of a forwarding chain: it propagates up through the
- * intermediate routers untouched, and the caller runs the coordinator path instead.
+ * intermediate routers untouched, and the caller runs the two-phase path instead.
  */
 function errSinglePartitionFastPathFallback(operationName: string): Error {
 	return new Error(`fokos/partition: ${FAST_PATH_FALLBACK_SENTINEL}, items span more than one partition (${operationName}).`);
@@ -2272,7 +2272,7 @@ function errSinglePartitionFastPathFallback(operationName: string): Error {
 /**
  * True for errSinglePartitionFastPathFallback, including after it has crossed a DO RPC boundary.
  * A transport failure carries no sentinel, so it is never mistaken for a fallback and never
- * silently retried on the coordinator path.
+ * silently retried on the two-phase path.
  */
 export function isSinglePartitionFastPathFallbackError(e: unknown): boolean {
 	return e instanceof Error && e.message.includes(FAST_PATH_FALLBACK_SENTINEL);

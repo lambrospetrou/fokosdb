@@ -123,12 +123,12 @@ type ReadForTransactionItemValueOf<D> =
 	| { found: false };
 
 /**
- * RPC result (participant→TC). Keys are canonical KeyBytes and sortKey is always present (the empty
- * KeyBytes [] is the absent sentinel), matching the request side: the TC is an INTERNAL hop, and per
- * the KeyCodec contract ("encode at entry, decode at exit, compare bytes in between") it compares
- * bytes and never decodes. `db.ts` decodes at the public exit.
+ * RPC result (participant→Worker read driver). Keys are canonical KeyBytes and sortKey is always
+ * present (the empty KeyBytes [] is the absent sentinel), matching the request side. Per the KeyCodec
+ * contract ("encode at entry, decode at exit, compare bytes in between"), the driver compares bytes
+ * and never decodes. `db.ts` decodes at the public exit.
  *
- * `lastCommittedTs` / `hasPendingWrite` are TC-only 2PC bookkeeping and are stripped by `db.ts`.
+ * `lastCommittedTs` / `hasPendingWrite` are read-driver bookkeeping and are stripped by `db.ts`.
  * `lastCommittedTs` is NOT the conflict datum on its own — it is wall-clock milliseconds, so two
  * writes inside one millisecond are indistinguishable. The item's `version` (`v`) is the monotonic
  * per-item counter that decides a conflict; the timestamp is a second signal that catches a
@@ -198,7 +198,7 @@ export type ReadSnapshotRequest = {
  * There is no `read_conflict`: a partition DO is single-threaded and reads the whole set with no
  * `await` in between, so the result already IS a consistent snapshot and no second phase can
  * disagree with the first. `pending_write` stays, so a lock held by an in-progress two-phase
- * transaction aborts the read exactly as it does on the coordinator path.
+ * transaction aborts the read exactly as it does on the two-phase path.
  */
 export type ReadSnapshotResponse =
 	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
@@ -312,7 +312,7 @@ export type InitiateWriteResponse =
 			reason: RejectionReason;
 	  };
 
-// Wire-IN type (db.ts → TC): keys are canonical KeyBytes (sortKey [] = absent).
+// Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).
 export type TCReadItem = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;

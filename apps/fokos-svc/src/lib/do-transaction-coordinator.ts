@@ -5,11 +5,8 @@ import type { PartitionContextResolved } from "./partition-topology/partition-co
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import { DATA_KINDS, type DataKind } from "./types.js";
 import type {
-	InitiateReadRequest,
-	InitiateReadResponseEncoded,
 	InitiateWriteRequest,
 	InitiateWriteResponse,
-	ReadForTransactionItemResultEncoded,
 	RecoverTransactionResult,
 	RejectionReason,
 	TCState,
@@ -587,111 +584,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			await this.runCancel(transactionId, idempotencyToken);
 		}
 		// If some participants still NULL, leave in PREPARING; alarm will retry
-	}
-
-	async initiateRead(request: InitiateReadRequest): Promise<InitiateReadResponseEncoded> {
-		const transactionId = crypto.randomUUID().replaceAll("-", "");
-
-		// Group items by partition, keeping the context alongside.
-		const partitionMap = new Map<string, { pCtx: PartitionContextResolved; items: InitiateReadRequest["items"] }>();
-		for (const item of request.items) {
-			const doName = item.partitionContext.doName;
-			let entry = partitionMap.get(doName);
-			if (!entry) {
-				entry = { pCtx: item.partitionContext, items: [] };
-				partitionMap.set(doName, entry);
-			}
-			entry.items.push(item);
-		}
-		const partitionEntries = [...partitionMap.values()];
-
-		// Phase 1
-		const phase1Settled = await Promise.allSettled(
-			partitionEntries.map(({ pCtx, items }) =>
-				tryWhile(
-					async () =>
-						await PartitionDO.getByName(this.env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
-							transactionId,
-							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
-						}),
-					(_err, nextAttempt) => nextAttempt <= 5,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				),
-			),
-		);
-
-		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
-		for (const r of phase1Settled) {
-			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
-			phase1Flat.push(...r.value.items);
-		}
-
-		if (phase1Flat.some((item) => item.hasPendingWrite)) {
-			return { outcome: "aborted", reason: "pending_write" };
-		}
-
-		// Phase 2 — verify no concurrent mutations
-		const phase2Settled = await Promise.allSettled(
-			partitionEntries.map(({ pCtx, items }) =>
-				tryWhile(
-					async () =>
-						await PartitionDO.getByName(this.env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
-							transactionId,
-							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
-						}),
-					(_err, nextAttempt) => nextAttempt <= 5,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				),
-			),
-		);
-
-		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
-		for (const r of phase2Settled) {
-			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
-			phase2Flat.push(...r.value.items);
-		}
-
-		if (phase2Flat.some((item) => item.hasPendingWrite)) {
-			return { outcome: "aborted", reason: "pending_write" };
-		}
-
-		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
-		// flattens the replies, so result order is not request order. KeyCodec.pairKey is the ONE identity
-		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
-		// returns a bigint, a primitive, so Map lookup compares by value.
-		const itemIdentity = (r: ReadForTransactionItemResultEncoded): bigint => KeyCodec.pairKey(r.hashKey, r.sortKey);
-
-		// Did both phases observe the same committed state? `version` (the item's `v`) is the primary
-		// datum: a monotonic per-item counter, so unlike a wall-clock timestamp it cannot miss two writes
-		// landing inside the same millisecond. This mirrors the LSN comparison the DynamoDB paper uses
-		// for its read transactions. `lastCommittedTs` is a second signal that catches a delete+recreate
-		// landing back on the same version, whenever the timestamps differ. An item absent in both phases
-		// compares equal and is not a conflict.
-		const sameCommittedState = (a: ReadForTransactionItemResultEncoded, b: ReadForTransactionItemResultEncoded): boolean => {
-			if (a.found !== b.found) return false;
-			if (a.found && b.found && a.version !== b.version) return false;
-			return a.lastCommittedTs === b.lastCommittedTs;
-		};
-
-		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so
-		// the caller reads result[i] as the answer to items[i] instead of re-matching on keys. Neither
-		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
-		// request order is restored here, once, from the same pairKey identity.
-		const phase1ByKey = new Map(phase1Flat.map((r) => [itemIdentity(r), r]));
-		const phase2ByKey = new Map(phase2Flat.map((r) => [itemIdentity(r), r]));
-		const items: ReadForTransactionItemResultEncoded[] = [];
-		for (const requested of request.items) {
-			const key = KeyCodec.pairKey(requested.hashKey, requested.sortKey);
-			const p1 = phase1ByKey.get(key);
-			const p2 = phase2ByKey.get(key);
-			// A requested key with no reply means a participant dropped it — never expected, and not
-			// something to answer with a short array, so it fails the read like any other read failure.
-			if (!p1 || !p2) return { outcome: "aborted", reason: "transient_error" };
-			if (!sameCommittedState(p1, p2)) return { outcome: "aborted", reason: "read_conflict" };
-			items.push(p1);
-		}
-
-		return { outcome: "committed", items };
 	}
 
 	async alarm(): Promise<void> {

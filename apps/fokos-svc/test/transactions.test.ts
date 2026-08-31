@@ -505,8 +505,8 @@ describe("transactions - end-to-end", () => {
 	it("transactGetItems returns items positionally matched to the request", async () => {
 		/**
 		 * Keys from `partitions` distinct partitions, `perPartition` each, ordered so that consecutive keys
-		 * sit in DIFFERENT partitions (round-robin over the buckets). The TC groups items by partition, so a
-		 * response returned in group order cannot come back in this order — which is what makes it a test of
+		 * sit in DIFFERENT partitions (round-robin over the buckets). The driver groups items by partition,
+		 * so a response returned in group order cannot come back in this order — which is what makes it a test of
 		 * the positional guarantee rather than of luck. Both counts must be >= 2 for that to hold.
 		 */
 		function interleavedKeysAcrossPartitions(
@@ -570,6 +570,66 @@ describe("transactions - end-to-end", () => {
 		const dupResult = await db.transactGetItems({ items: withDuplicate });
 		invariant(dupResult.outcome === "committed");
 		expect(dupResult.items.map((item) => item.hashKey)).toEqual(withDuplicate.map((k) => k.hashKey));
+	});
+
+	describe("Worker read transaction driver", () => {
+		afterEach(() => {
+			vi.restoreAllMocks();
+		});
+
+		function keysAcrossPartitions(db: FokosDB, count: number, prefix: string): Array<{ hashKey: string; sortKey: string }> {
+			const byPartition = new Map<string, { hashKey: string; sortKey: string }>();
+			for (let i = 0; byPartition.size < count; i++) {
+				const key = { hashKey: `${prefix}-${i}`, sortKey: "sk" };
+				byPartition.set(partitionNameOf(db, key), key);
+			}
+			return [...byPartition.values()];
+		}
+
+		it("aborts after phase one when a participant reports a pending write", async () => {
+			const db = makeDB();
+			const keys = keysAcrossPartitions(db, 2, "read-pending");
+			const pendingPartition = partitionNameOf(db, keys[0]);
+			const original = PartitionDO.prototype.txReadForTransaction;
+			const spy = vi.spyOn(PartitionDO.prototype, "txReadForTransaction").mockImplementation(async function (
+				this: PartitionDO,
+				pCtx,
+				request,
+			) {
+				const response = await original.call(this, pCtx, request);
+				if (pCtx.doName !== pendingPartition) return response;
+				return { items: response.items.map((item) => ({ ...item, hasPendingWrite: true })) };
+			});
+
+			await expect(db.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "pending_write" });
+			expect(spy).toHaveBeenCalledTimes(2);
+		});
+
+		it("aborts when committed item state changes between the two phases", async () => {
+			const db = makeDB();
+			const keys = keysAcrossPartitions(db, 2, "read-conflict");
+			for (const key of keys) await db.putItem({ ...key, data: "value" });
+			const changingPartition = partitionNameOf(db, keys[0]);
+			const callsByPartition = new Map<string, number>();
+			const transactionIds = new Set<string>();
+			const original = PartitionDO.prototype.txReadForTransaction;
+			const spy = vi.spyOn(PartitionDO.prototype, "txReadForTransaction").mockImplementation(async function (
+				this: PartitionDO,
+				pCtx,
+				request,
+			) {
+				transactionIds.add(request.transactionId);
+				const call = (callsByPartition.get(pCtx.doName) ?? 0) + 1;
+				callsByPartition.set(pCtx.doName, call);
+				const response = await original.call(this, pCtx, request);
+				if (pCtx.doName !== changingPartition || call !== 2) return response;
+				return { items: response.items.map((item) => ({ ...item, lastCommittedTs: item.lastCommittedTs + 1 })) };
+			});
+
+			await expect(db.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "read_conflict" });
+			expect(spy).toHaveBeenCalledTimes(4);
+			expect(transactionIds.size).toBe(1);
+		});
 	});
 
 	it.each([
@@ -1025,9 +1085,9 @@ describe("transactions - single-partition fast path", () => {
 
 	/** Counts the RPCs each read path makes, so a test can assert which one ran. */
 	function countReadPathCalls() {
-		const partitionCalls = vi.spyOn(PartitionDO.prototype, "txReadSnapshot");
-		const coordinatorCalls = vi.spyOn(TransactionCoordinatorDO.prototype, "initiateRead");
-		return { partitionCalls, coordinatorCalls };
+		const snapshotCalls = vi.spyOn(PartitionDO.prototype, "txReadSnapshot");
+		const transactionCalls = vi.spyOn(PartitionDO.prototype, "txReadForTransaction");
+		return { snapshotCalls, transactionCalls };
 	}
 
 	/** The same, for the write paths. */
@@ -1037,7 +1097,7 @@ describe("transactions - single-partition fast path", () => {
 		return { partitionCalls, coordinatorCalls };
 	}
 
-	it("reads a single-partition key set in one round trip, and answers exactly as the coordinator does", async () => {
+	it("reads a single-partition key set in one round trip, and answers exactly as the two-phase driver does", async () => {
 		const db = makeDB();
 		const slowDb = makeDB({ singlePartitionFastPath: false });
 
@@ -1049,21 +1109,21 @@ describe("transactions - single-partition fast path", () => {
 			await slowDb.putItem({ ...key, data: `data-${key.hashKey}` });
 		}
 
-		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
 		const fast = await db.transactGetItems({ items: keys });
-		expect(partitionCalls).toHaveBeenCalledTimes(1);
-		expect(coordinatorCalls).not.toHaveBeenCalled();
+		expect(snapshotCalls).toHaveBeenCalledTimes(1);
+		expect(transactionCalls).not.toHaveBeenCalled();
 
 		// The option off pins the other path for the same key set, and both answers must agree
 		// item by item, in request order.
 		const slow = await slowDb.transactGetItems({ items: keys });
-		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
+		expect(transactionCalls).toHaveBeenCalledTimes(2);
 		expect(fast).toEqual(slow);
 		invariant(fast.outcome === "committed");
 		expect(fast.items.map((i) => i.found)).toEqual([true, true, false]);
 	});
 
-	it("keeps a key set that spans partitions on the coordinator path", async () => {
+	it("drives a multi-partition read from the Worker in two phases", async () => {
 		const db = makeDB();
 		const keys = [
 			{ hashKey: "span-a", sortKey: "sk" },
@@ -1072,44 +1132,44 @@ describe("transactions - single-partition fast path", () => {
 		expect(countDistinctPartitions(db, keys)).toBe(2);
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
-		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
 		const result = await db.transactGetItems({ items: keys });
 
 		expect(result.outcome).toBe("committed");
-		expect(partitionCalls).not.toHaveBeenCalled();
-		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
+		expect(snapshotCalls).not.toHaveBeenCalled();
+		expect(transactionCalls).toHaveBeenCalledTimes(4);
 	});
 
-	it("runs the coordinator path when the partition answers that it cannot execute the whole set", async () => {
+	it("runs the Worker two-phase path when the partition cannot execute the whole set", async () => {
 		const db = makeDB();
 		const keys = keysInOnePartition(db, 2, "fast-fallback");
 		for (const key of keys) await db.putItem({ ...key, data: `data-${key.hashKey}` });
 
 		// A partition raises this when the items straddle a split or a promotion below it. Standing in
 		// for that setup here keeps the test on what db.ts owns: recognising the sentinel and finishing
-		// the read on the coordinator path. The raise itself is covered in do-partition.test.ts.
-		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
-		partitionCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (readSnapshot)."));
+		// the read through the two-phase path. The raise itself is covered in do-partition.test.ts.
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
+		snapshotCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (readSnapshot)."));
 
 		const result = await db.transactGetItems({ items: keys });
 
-		expect(partitionCalls).toHaveBeenCalledTimes(1);
-		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
+		expect(snapshotCalls).toHaveBeenCalledTimes(1);
+		expect(transactionCalls).toHaveBeenCalledTimes(2);
 		invariant(result.outcome === "committed");
 		expect(result.items.map((i) => i.found)).toEqual([true, true]);
 		expect(result.items.map((i) => (i.found ? i.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
 	});
 
-	it("surfaces a transport failure instead of retrying it on the coordinator path", async () => {
+	it("surfaces a fast-path transport failure instead of starting the two-phase path", async () => {
 		const db = makeDB();
 		const keys = keysInOnePartition(db, 2, "fast-transport");
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
-		const { partitionCalls, coordinatorCalls } = countReadPathCalls();
-		partitionCalls.mockRejectedValue(new Error("Network connection lost."));
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
+		snapshotCalls.mockRejectedValue(new Error("Network connection lost."));
 
 		await expect(db.transactGetItems({ items: keys })).rejects.toThrow(/Network connection lost/);
-		expect(coordinatorCalls).not.toHaveBeenCalled();
+		expect(transactionCalls).not.toHaveBeenCalled();
 	});
 
 	it("writes a single-partition transaction in one round trip, with no coordinator", async () => {

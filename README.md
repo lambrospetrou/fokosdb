@@ -49,7 +49,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Enforce the expiration ttl for items. `ttlSeconds` is currently dropped without error, and a transactional put clears an existing expiry because `TransactionItem` carries no ttl.
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
-- Decide how to handle location hints (example: root partitions use location hint but child partitions do not to stay close to the root and make the forwarding and migrations faster).
+- Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
 - Add jurisdictions support.
 - Allow custom split conditions in user-provided function of the partition DO class, and also for custom item selection per child partition.
 - Implement projections, filter expression, and update expressions as described in `docs/agent-plans/2026-08-29-typed-expression-engine-spec.md`. Condition expressions are fully implemented.

@@ -27,9 +27,9 @@ Run `npm run cf-typegen` after changing bindings in either file. Each project ha
 Two Durable Object classes do all the work:
 
 - **`PartitionDO`** (`src/lib/do-partition.ts`) — stores items in SQLite. One DO per partition shard. Handles single-item reads/writes and participates in 2PC as a transaction resource manager. Automatically splits into child partitions when storage thresholds are met.
-- **`TransactionCoordinatorDO`** (`src/lib/do-transaction-coordinator.ts`) — one DO per write transaction (named by idempotency token). Drives 2-phase commit across multiple PartitionDOs. Ephemeral for read transactions.
+- **`TransactionCoordinatorDO`** (`src/lib/do-transaction-coordinator.ts`) — one DO per write transaction (named by idempotency token). Drives 2-phase commit across multiple PartitionDOs. Read transactions run in the Worker.
 
-The `FokosDB` class (`src/lib/db.ts`) is the client-side entry point. It routes requests to the correct partition using `PartitionTopologyRouterImpl` and delegates transactions to `TransactionCoordinatorDO`.
+The `FokosDB` class (`src/lib/db.ts`) is the client-side entry point. It routes requests with `PartitionTopologyRouterImpl`, delegates multi-partition writes to `TransactionCoordinatorDO`, and drives multi-partition reads directly.
 
 ### Data Model
 
@@ -71,7 +71,7 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 **Read transactions (`transactGetItems`)**:
 
 - Two-phase double-read: read once, check no pending writes, read again, compare `lastCommittedTs`. If anything changed → abort.
-- Ephemeral TC (random UUID name). No SQLite state persisted. If TC crashes mid-read, client retries.
+- The Worker drives both phases directly. No coordinator or durable read state exists. If the Worker stops mid-read, the client retries.
 
 **Key invariants**:
 
