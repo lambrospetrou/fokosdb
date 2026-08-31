@@ -69,6 +69,7 @@ export type PendingTransactionRow = {
 	ttl_epoch_utc_seconds: number | null;
 	coordinator_do_id: string;
 	created_at: number;
+	guarded_at: number | null;
 };
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
@@ -232,6 +233,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
                 ttl_epoch_utc_seconds INTEGER,
+				guarded_at            INTEGER,
 				data                  ANY,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) STRICT;
@@ -860,8 +862,8 @@ export class PartitionStore {
 			// pending_transactions is never queried by JSON path, so json data is stored raw (as text),
 			// not JSONB, the data_kind tag lets commit reconstruct the kind for upsertItem.
 			`INSERT OR IGNORE INTO pending_transactions
-			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at, guarded_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
 			row.transaction_id,
@@ -873,6 +875,7 @@ export class PartitionStore {
 			row.ttl_epoch_utc_seconds,
 			row.coordinator_do_id,
 			row.created_at,
+			row.guarded_at,
 		);
 	}
 
@@ -884,18 +887,20 @@ export class PartitionStore {
 		);
 	}
 
-	/**
-	 * Does this partition hold ANY pending lock? The alarm scheduler asks once per background pass, and
-	 * only to decide whether to arm the stale-transaction alarm (`do-partition.ts`).
-	 *
-	 * `LIMIT 1` on purpose, NOT `COUNT(*)`. A count has to walk every entry of the narrowest index to
-	 * answer, and nothing needs the number. Measured over 20k pending rows: `COUNT(*)` reads 20,000
-	 * rows, this reads **1**. Both use the same plan,
-	 * `SCAN pending_transactions USING COVERING INDEX pending_transactions_created_at`, so this one
-	 * stops on the first index leaf and never touches a wide table row.
-	 */
+	/** Does this partition hold any pending lock? */
 	hasAnyPendingTx(): boolean {
 		return this.#storage.sql.exec(`SELECT 1 FROM pending_transactions LIMIT 1`).toArray().length > 0;
+	}
+
+	/**
+	 * Does this partition hold any unguarded lock? The alarm scheduler asks once per background pass to
+	 * decide whether to arm stale-transaction recovery.
+	 *
+	 * `LIMIT 1` is intentional. A count walks every matching entry, while this query stops at the first
+	 * unguarded row.
+	 */
+	hasAnyUnguardedPendingTx(): boolean {
+		return this.#storage.sql.exec(`SELECT 1 FROM pending_transactions WHERE guarded_at IS NULL LIMIT 1`).toArray().length > 0;
 	}
 
 	pendingLockCountForHashKey(hk: KeyBytes): number {
@@ -946,6 +951,8 @@ export class PartitionStore {
 		data: string | Uint8Array | null;
 		kind: DataKind | null;
 		ttl_epoch_utc_seconds: number | null;
+		created_at: number;
+		guarded_at: number | null;
 	}[] {
 		return this.#storage.sql
 			.exec<{
@@ -956,8 +963,11 @@ export class PartitionStore {
 				data: string | ArrayBuffer | null;
 				data_kind: number | null;
 				ttl_epoch_utc_seconds: number | null;
+				created_at: number;
+				guarded_at: number | null;
 			}>(
-				`SELECT hk, sk, transaction_ts, operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
+				`SELECT hk, sk, transaction_ts, operation, data, data_kind, ttl_epoch_utc_seconds, created_at, guarded_at
+				 FROM pending_transactions WHERE transaction_id = ?`,
 				transactionId,
 			)
 			.toArray()
@@ -994,11 +1004,25 @@ export class PartitionStore {
 		return this.#storage.sql
 			.exec<{ transaction_id: string; coordinator_do_id: string }>(
 				`SELECT DISTINCT transaction_id, coordinator_do_id
-                     FROM pending_transactions WHERE created_at < ? LIMIT ?`,
+                     FROM pending_transactions WHERE created_at < ? AND guarded_at IS NULL LIMIT ?`,
 				staleBeforeTs,
 				limit,
 			)
 			.toArray();
+	}
+
+	guardPendingTx(transactionId: string, guardedAt: number): boolean {
+		return (
+			this.#storage.sql.exec(
+				`UPDATE pending_transactions SET guarded_at = ? WHERE transaction_id = ? AND guarded_at IS NULL`,
+				guardedAt,
+				transactionId,
+			).rowsWritten > 0
+		);
+	}
+
+	clearPendingTxGuard(transactionId: string): void {
+		this.#storage.sql.exec(`UPDATE pending_transactions SET guarded_at = NULL WHERE transaction_id = ?`, transactionId);
 	}
 
 	deletePendingTx(transactionId: string): void {
@@ -1035,9 +1059,10 @@ export class PartitionStore {
 			ttl_epoch_utc_seconds: number | null;
 			coordinator_do_id: string;
 			created_at: number;
+			guarded_at: number | null;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at`;
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at, guarded_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);

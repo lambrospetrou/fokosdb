@@ -104,6 +104,7 @@ describe("SplitMigration — hash child", () => {
 			ttl_epoch_utc_seconds: 777,
 			coordinator_do_id: "tc-1",
 			created_at: 1000,
+			guarded_at: 987,
 		};
 
 		await withMigrationEnv(async (menv) => {
@@ -116,6 +117,7 @@ describe("SplitMigration — hash child", () => {
 			expect(menv.store.queryPendingTxPage(null, 1)[0]).toMatchObject({
 				conditions_json: conditionsJson,
 				ttl_epoch_utc_seconds: 777,
+				guarded_at: 987,
 			});
 			expect(menv.store.getMaxDeletedTs()).toBe(4567);
 		});

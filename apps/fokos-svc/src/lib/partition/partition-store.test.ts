@@ -466,6 +466,7 @@ describe("PartitionStore - TTL deletion", () => {
 				ttl_epoch_utc_seconds: null,
 				coordinator_do_id: "tc",
 				created_at: 1,
+				guarded_at: null,
 			});
 			store.insertPromotedKey(kb("queued"), "queued", 1);
 			store.insertPromotedKey(kb("promoting"), "promoting", 1);
@@ -552,6 +553,7 @@ describe("PartitionStore - pending transactions", () => {
 			ttl_epoch_utc_seconds: null,
 			coordinator_do_id: "tc-1",
 			created_at: 1000,
+			guarded_at: null,
 		};
 	}
 
@@ -597,6 +599,32 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock({ ...lockRow("b", "1", "tx-new"), created_at: 5000 });
 			const stale = store.listStalePendingTx(2000, 10);
 			expect(stale).toEqual([{ transaction_id: "tx-old", coordinator_do_id: "tc-1" }]);
+		});
+	});
+
+	it("quarantines a transaction once and excludes it from the stale scan", async () => {
+		await withStore((store) => {
+			store.insertPendingLock(lockRow("a", "1", "tx-guarded"));
+			expect(store.guardPendingTx("tx-guarded", 2000)).toBe(true);
+			expect(store.guardPendingTx("tx-guarded", 3000)).toBe(false);
+			expect(store.listPendingTxItems("tx-guarded")[0].guarded_at).toBe(2000);
+			expect(store.hasAnyPendingTx()).toBe(true);
+			expect(store.hasAnyUnguardedPendingTx()).toBe(false);
+			expect(store.listStalePendingTx(5000, 10)).toEqual([]);
+
+			store.clearPendingTxGuard("tx-guarded");
+			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-guarded", coordinator_do_id: "tc-1" }]);
+		});
+	});
+
+	it("does not let ten quarantined transactions hide an unguarded stale transaction", async () => {
+		await withStore((store) => {
+			for (let i = 0; i < 11; i++) {
+				const transactionId = `tx-${i}`;
+				store.insertPendingLock(lockRow(`hk-${i}`, "1", transactionId));
+				if (i < 10) store.guardPendingTx(transactionId, 2000);
+			}
+			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_do_id: "tc-1" }]);
 		});
 	});
 

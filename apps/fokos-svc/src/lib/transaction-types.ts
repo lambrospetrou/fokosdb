@@ -102,6 +102,13 @@ export type CancelRequest = {
 
 export type CancelResponse = { outcome: "cancelled" };
 
+export type DebugForceResolveTransactionRequest = {
+	transactionId: TransactionId;
+	outcome: "commit" | "cancel";
+};
+
+export type DebugForceResolveTransactionResponse = CommitResponse | CancelResponse;
+
 // ─── PartitionDO — ReadForTransaction ─────────────────────────────────────────
 
 export type ReadForTransactionRequest = {

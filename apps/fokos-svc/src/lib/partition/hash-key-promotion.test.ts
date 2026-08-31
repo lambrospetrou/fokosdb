@@ -275,6 +275,7 @@ function insertLock(store: PartitionStore, hk: KeyBytes, transactionId: string):
 		ttl_epoch_utc_seconds: null,
 		coordinator_do_id: "tc-1",
 		created_at: 1000,
+		guarded_at: null,
 	});
 }
 

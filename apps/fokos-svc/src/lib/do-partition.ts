@@ -6,6 +6,8 @@ import type {
 	CancelResponse,
 	CommitRequest,
 	CommitResponse,
+	DebugForceResolveTransactionRequest,
+	DebugForceResolveTransactionResponse,
 	PrepareRequest,
 	PrepareResponse,
 	ReadForTransactionRequest,
@@ -74,6 +76,7 @@ import {
 import { PageBudget } from "./query/page-budget.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "./cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import { IDEMPOTENCY_WINDOW_MS } from "./transaction-limits.js";
 
 export interface PartitionAPI {
 	apiPutItem(ctx: PartitionContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
@@ -173,6 +176,10 @@ export type PartitionDOStub = {
 	txReadForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
 	txReadSnapshot(ctx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse>;
 	txExecuteSingleShot(ctx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse>;
+	debugForceResolveTransaction(
+		ctx: PartitionContextResolved,
+		request: DebugForceResolveTransactionRequest,
+	): Promise<DebugForceResolveTransactionResponse>;
 };
 
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
@@ -1446,6 +1453,28 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { outcome: "cancelled" };
 	}
 
+	async debugForceResolveTransaction(
+		pCtx: PartitionContextResolved,
+		request: DebugForceResolveTransactionRequest,
+	): Promise<DebugForceResolveTransactionResponse> {
+		return await this.#rpc("debugForceResolveTransaction", async () => {
+			this.ensurePartitionContext(pCtx);
+			await this.ensureMigration("debugForceResolveTransaction");
+			const pendingRows = this.#store.listPendingTxItems(request.transactionId);
+			const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
+			const response =
+				request.outcome === "commit"
+					? await this.txCommit(pCtx, {
+							transactionId: request.transactionId,
+							transactionTimestamp: pendingRows[0]?.transaction_ts ?? Date.now(),
+							items,
+						})
+					: await this.txCancel(pCtx, { transactionId: request.transactionId, items });
+			this.#store.clearPendingTxGuard(request.transactionId);
+			return response;
+		});
+	}
+
 	async txReadForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		return await this.#rpc("txReadForTransaction", async () => await this.#txReadForTransaction(pCtx, request));
 	}
@@ -2057,32 +2086,51 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 							const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
 							const result = await tcStub.recoverTransaction(row.transaction_id);
 
-							// Both branches route on the keys THIS node has locked. That covers the descendants
-							// this node forwarded to, and leaves any other holder to its own alarm — which is
-							// already the case today whenever prepare forwarded every item, since this node
-							// would then hold no row for the transaction and never wake for it.
 							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
+							if (pendingRows.length === 0) continue;
+							const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
 
 							if (result.state === "COMMITTED") {
-								if (pendingRows.length > 0) {
-									const transactionTimestamp = pendingRows[0].transaction_ts;
-									await this.txCommit(this.pCtx(), {
-										transactionId: row.transaction_id,
-										transactionTimestamp,
-										// Keys only: commit applies the payload from this partition's own
-										// pending_transactions rows, so the request carries routing
-										// information and nothing else.
-										items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
-									});
-								}
-							} else if (result.state === "CANCELLED" || result.state === "not_found") {
-								// "not_found" means the TC has no record, which it may only reach after the
-								// transaction is terminal — so it can never have committed. See the TC's
-								// retention rules before making it delete non-terminal rows.
-								await this.txCancel(this.pCtx(), {
+								await this.txCommit(this.pCtx(), {
 									transactionId: row.transaction_id,
-									items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
+									transactionTimestamp: pendingRows[0].transaction_ts,
+									items,
 								});
+							} else if (result.state === "CANCELLED") {
+								await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
+							} else if (result.state === "not_found") {
+								const { local } = this.groupItemsByRouting(items, "read", "staleTransactionRecovery");
+								if (local.length === 0) {
+									this.#store.deletePendingTx(row.transaction_id);
+									continue;
+								}
+
+								const now = Date.now();
+								const lockCreatedAt = Math.min(...pendingRows.map((pending) => pending.created_at));
+								const lockAgeMs = now - lockCreatedAt;
+								if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
+									if (this.#store.guardPendingTx(row.transaction_id, now)) {
+										const pCtx = this.pCtx();
+										console.error({
+											...this.logParams(),
+											message: "fokos/partition: lock-age guard: over-age lock with not_found",
+											transactionId: row.transaction_id,
+											coordinatorDoId: row.coordinator_do_id,
+											keys: pendingRows.map((pending) => ({
+												hashKey: pending.hk.toBase64({ alphabet: "base64url" }),
+												sortKey: pending.sk.toBase64({ alphabet: "base64url" }),
+											})),
+											lockCreatedAt,
+											lockAgeMs,
+											windowMs: IDEMPOTENCY_WINDOW_MS,
+											doName: pCtx.doName,
+											partitionId: pCtx.partitionId,
+										});
+									}
+									continue;
+								}
+
+								await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
 							}
 						} catch (e) {
 							console.error({
@@ -2150,7 +2198,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				// Job: Stale transaction recovery.
-				if (this.txPendingCanSweep() && this.#store.hasAnyPendingTx()) {
+				if (this.txPendingCanSweep() && this.#store.hasAnyUnguardedPendingTx()) {
 					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
 				}
 			});

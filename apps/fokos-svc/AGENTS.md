@@ -114,4 +114,6 @@ A parent partition in `split_started` or `split_completed` no longer owns any ke
 
 A split parent in `split_started` or `split_completed` and a child in `migration_initialized` or `migration_migrating` must skip stale-transaction recovery. Use the independent `txPendingCanSweep` guard. These partitions do not own authoritative, complete lock state.
 
-When the stale-TX alarm calls `recoverTransaction` on the TC and gets a terminal outcome back (`COMMITTED` / `CANCELLED`), it must apply the outcome by calling the **public** `commit()` / `cancel()` methods — not by inlining SQL or calling private helpers. The public methods encode the migration guard and split routing; bypassing them can write data to the wrong partition or skip child forwarding.
+A `not_found` result has three paths. Delete directly when all keys route away. Cancel an owned lock that is no older than `IDEMPOTENCY_WINDOW_MS`. Quarantine an older owned lock by setting `guarded_at`, log the lock-age guard error once, and wait for `debugForceResolveTransaction`. Guarded transactions must stay out of the stale scan and its alarm scheduling.
+
+When the stale-TX alarm calls `recoverTransaction` on the TC and gets a terminal outcome back (`COMMITTED` / `CANCELLED`), it must apply the outcome by calling the **public** `commit()` / `cancel()` methods — not by inlining SQL or calling private helpers. The public methods encode the migration guard and split routing; bypassing them can write data to the wrong partition or skip child forwarding. `debugForceResolveTransaction` follows the same rule.

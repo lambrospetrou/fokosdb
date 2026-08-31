@@ -1,6 +1,6 @@
 # RFC — Bounded stateful transaction coordination
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-08-30
 **Author:** Lambros
 
@@ -133,16 +133,17 @@ Each step ships on its own.
 4. **Done.** Add the garbage collection lifecycle: payload stripping, row deletion at the terminal
    transition, the sweep alarm, the alarm recovery budget, and the `clientRequestToken` length limit
    (4.3.1 to 4.3.3).
-5. Derive the default pool size from `rootTreesN`, rename the option to `numTxCoordinators`, and rename
-   the shard group to `fokos_tc.<tableName>` (4.3.7). This is a breaking change: existing databases are
-   deleted, not migrated (4.3.9).
-6. Add the lock-age guard with its operator tools (4.3.5): the three poke outcomes, the quarantine that
-   keeps a guarded transaction out of the stale scan, the guard log line with its full field set, and
-   the `debugForceResolveTransaction` RPC on `PartitionDO`. The guard compares against
+5. **Done.** Derive the default pool size from `rootTreesN`, rename the option to `numTxCoordinators`,
+   and rename the shard group to `fokos_tc.<tableName>` (4.3.7). This is a breaking change: existing
+   databases are deleted, not migrated (4.3.9).
+6. **Done.** Add the lock-age guard with its operator tools (4.3.5): the three poke outcomes, the
+   quarantine that keeps a guarded transaction out of the stale scan, and the guard log line with its
+   full field set. It also adds the `debugForceResolveTransaction` RPC on `PartitionDO`. The guard reads
    `IDEMPOTENCY_WINDOW_MS`, so it cannot ship before step 4. Its error state has no resolution path
    without the RPC, so it cannot ship without the RPC.
-7. **Optional.** Add the per-call `numTxCoordinators` parameter to `transactWriteItems` (4.3.7). Ship
-   it only if a deployment needs it.
+7. **Not planned.** Do not add the per-call `numTxCoordinators` parameter. The dynamic transaction
+   coordinator pool RFC (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`) replaces
+   this manual override.
 
 ---
 
@@ -437,7 +438,7 @@ argument. The coordinator has no record, because that is what `not_found` means.
 finds the outcome from the other partitions: look at the other keys of the transaction and see whether
 they carry its writes.
 
-The operator tools ship with the guard, in milestone 5.
+The operator tools ship with the guard, in milestone 6.
 
 - **The guard log line** carries everything the operator needs:
   `"fokos/partition: lock-age guard: over-age lock with not_found"`, plus `transactionId`,

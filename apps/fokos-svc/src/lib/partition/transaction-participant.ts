@@ -140,6 +140,7 @@ export class TransactionParticipant {
 					ttl_epoch_utc_seconds: item.ttlAt ?? null,
 					coordinator_do_id: request.coordinatorDoId,
 					created_at: this.#now(),
+					guarded_at: null,
 				});
 			}
 
