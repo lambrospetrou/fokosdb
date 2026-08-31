@@ -6,7 +6,7 @@ export type ExpressionNativeType = (typeof EXPRESSION_NATIVE_TYPES)[number];
 
 export type ExpressionReference = { ref: "hashKey" } | { ref: "sortKey" } | { ref: "v" } | { ref: "ttl" } | { ref: "data"; path?: string };
 
-export type ExpressionValue = { val: JsonValue } | ExpressionReference | { fn: string; args: readonly ExpressionValue[] };
+export type ExpressionValue = { val: JsonValue } | { b64: string } | ExpressionReference | { fn: string; args: readonly ExpressionValue[] };
 
 export type ConditionExpression =
 	| {

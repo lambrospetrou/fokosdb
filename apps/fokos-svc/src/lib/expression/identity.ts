@@ -1,4 +1,5 @@
 import type { JsonPrimitive } from "../json-types.js";
+import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
@@ -29,6 +30,10 @@ class IdentityWriter {
 			this.#out += '{"val":';
 			this.#writeScalar(value.val);
 			this.#out += "}";
+			return;
+		}
+		if ("b64" in value) {
+			this.#out += `{"b64":${JSON.stringify(decodeByteLiteral(value).canonical)}}`;
 			return;
 		}
 		if ("ref" in value) {

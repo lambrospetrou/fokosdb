@@ -79,3 +79,19 @@ describe("canonical expression identity", () => {
 		expect(() => canonicalValueIdentity(aboveLimit)).toThrow(/payload limit/);
 	});
 });
+
+describe("byte literal identity", () => {
+	it("canonicalizes every encoding of one byte value", () => {
+		const canonical = canonicalValueIdentity({ b64: "YWI=" });
+		expect(canonical).toBe('{"b64":"YWI="}');
+		expect(canonicalValueIdentity({ b64: "YWI" })).toBe(canonical);
+	});
+
+	it("keeps a byte literal distinct from the text literal with equal content", () => {
+		expect(canonicalValueIdentity({ b64: "YWI=" })).not.toBe(canonicalValueIdentity({ val: "ab" }));
+	});
+
+	it("rejects an invalid byte literal", () => {
+		expect(() => canonicalValueIdentity({ b64: "" } as unknown as ExpressionValue)).toThrow(/byte literal/);
+	});
+});

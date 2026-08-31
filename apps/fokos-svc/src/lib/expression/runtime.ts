@@ -1,4 +1,5 @@
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { decodeBase64Bytes } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
@@ -27,6 +28,10 @@ export function materializeExpressionBindings(descriptors: readonly ExpressionBi
 				return descriptor.value;
 			case "keyText":
 				return KeyCodec.encode(descriptor.value);
+			case "keyB64":
+				return KeyCodec.encode(decodeBase64Bytes(descriptor.value));
+			case "b64":
+				return decodeBase64Bytes(descriptor.value);
 		}
 	});
 }

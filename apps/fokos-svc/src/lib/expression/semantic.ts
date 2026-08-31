@@ -1,4 +1,5 @@
 import type { JsonPrimitive } from "../json-types.js";
+import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
@@ -26,6 +27,7 @@ type ValueFacts = {
 	types: ReadonlySet<ExpressionNativeType>;
 	directReference?: DirectReference;
 	emptyStringLiteral?: true;
+	byteLiteral?: true;
 };
 
 type AnalysisContext = {
@@ -42,17 +44,21 @@ const nullTypes = new Set<ExpressionNativeType>(["null"]);
 const booleanTypes = new Set<ExpressionNativeType>(["boolean"]);
 const numberTypes = new Set<ExpressionNativeType>(["number"]);
 const textTypes = new Set<ExpressionNativeType>(["text"]);
+const bytesTypes = new Set<ExpressionNativeType>(["bytes"]);
 const missingNumberTypes = new Set<ExpressionNativeType>(["missing", "number"]);
 const missingTextBytesTypes = new Set<ExpressionNativeType>(["missing", "text", "bytes"]);
 const nullNumberTypes = new Set<ExpressionNativeType>(["null", "number"]);
 const nullTextTypes = new Set<ExpressionNativeType>(["null", "text"]);
 const nullBytesTypes = new Set<ExpressionNativeType>(["null", "bytes"]);
 const allTypes = new Set<ExpressionNativeType>(EXPRESSION_NATIVE_TYPES);
+// A JSON path yields JSON types only; the whole `data` reference is the sole source of `bytes`.
+const dataPathTypes = new Set<ExpressionNativeType>(EXPRESSION_NATIVE_TYPES.filter((type) => type !== "bytes"));
 const nullValue: ValueFacts = { types: nullTypes };
 const booleanValue: ValueFacts = { types: booleanTypes };
 const numberValue: ValueFacts = { types: numberTypes };
 const textValue: ValueFacts = { types: textTypes };
 const emptyTextValue: ValueFacts = { types: textTypes, emptyStringLiteral: true };
+const byteLiteralValue: ValueFacts = { types: bytesTypes, byteLiteral: true };
 const missingNumberValue: ValueFacts = { types: missingNumberTypes };
 const nullNumberValue: ValueFacts = { types: nullNumberTypes };
 const nullTextValue: ValueFacts = { types: nullTextTypes };
@@ -62,6 +68,7 @@ const sortKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference
 const versionValue: ValueFacts = { types: missingNumberTypes, directReference: "v" };
 const ttlValue: ValueFacts = { types: missingNumberTypes, directReference: "ttl" };
 const dataValue: ValueFacts = { types: allTypes, directReference: "data" };
+const dataPathValue: ValueFacts = { types: dataPathTypes, directReference: "data" };
 const sqliteNumberFunctions = new Set([
 	"abs",
 	"glob",
@@ -186,11 +193,16 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 			if (args.length < 2) throw new ExpressionError("invalid_arity", "invalid expression argument count");
 			if (args.length - 1 > EXPRESSION_LIMITS.inChoices) throw new ExpressionError("complexity_limit", "in choice limit exceeded");
 			const target = analyzeValue(args[0], depth + 1, context);
+			let byteChoice = false;
+			let scalarChoice = false;
 			for (let i = 1; i < args.length; i++) {
 				const choice = analyzeValue(args[i], depth + 1, context);
 				assertNoEmptyKeyLiteral(target, choice);
 				assertCompatible(target, choice, equalityTypes);
+				if (choice.byteLiteral) byteChoice = true;
+				else if (Object.hasOwn(args[i] as object, "val")) scalarChoice = true;
 			}
+			if (byteChoice && scalarChoice) throw new ExpressionError("invalid_type", "in choices must not mix byte and scalar literals");
 			return;
 		}
 		case "and":
@@ -235,6 +247,11 @@ function analyzeValue(expression: unknown, depth: number, context: AnalysisConte
 		assertFields(expression, "val");
 		return literalFacts(validateScalarLiteral(expression.val));
 	}
+	if (Object.hasOwn(expression, "b64")) {
+		assertFields(expression, "b64");
+		decodeByteLiteral(expression as { b64: unknown });
+		return byteLiteralValue;
+	}
 	if (Object.hasOwn(expression, "ref")) return analyzeReferenceNode(expression, context);
 	if (Object.hasOwn(expression, "fn")) return analyzeFunction(expression, depth, context);
 	throw new ExpressionError("invalid_ast", "invalid expression value");
@@ -271,8 +288,9 @@ function analyzeReferenceNode(expression: Record<string, unknown>, context: Anal
 		case "data":
 			context.requiredColumns.add("data_kind");
 			context.requiredColumns.add("data");
-			if (hasPath) validateReadJsonPath(expression.path);
-			return dataValue;
+			if (!hasPath) return dataValue;
+			validateReadJsonPath(expression.path);
+			return dataPathValue;
 		default:
 			throw new ExpressionError("invalid_ast", "unknown expression reference");
 	}

@@ -130,3 +130,39 @@ describe("condition SQLite compiler", () => {
 		expect(() => compileConditionExpression(condition)).toThrow(/SQL limit/);
 	});
 });
+
+describe("byte literal compilation", () => {
+	it("binds a key byte literal as canonical tagged key bytes", () => {
+		const plan = compileConditionExpression({ op: "gt", args: [{ ref: "sortKey" }, { b64: "YWI" }] });
+		expect(plan.bindings).toContainEqual({ kind: "keyB64", value: "YWI=" });
+		expect(materializeExpressionBindings([{ kind: "keyB64", value: "YWI=" }])).toEqual([KeyCodec.encode(new Uint8Array([0x61, 0x62]))]);
+		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
+	});
+
+	it("binds a byte data literal as untagged bytes", () => {
+		const plan = compileConditionExpression({ op: "begins_with", args: [{ ref: "data" }, { b64: "AQI=" }] });
+		expect(plan.bindings).toContainEqual({ kind: "b64", value: "AQI=" });
+		expect(materializeExpressionBindings([{ kind: "b64", value: "AQI=" }])).toEqual([new Uint8Array([1, 2])]);
+		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
+	});
+
+	it("binds a key containment search as untagged bytes", () => {
+		const plan = compileConditionExpression({ op: "contains", args: [{ ref: "sortKey" }, { b64: "Yg==" }] });
+		expect(plan.bindings).toContainEqual({ kind: "b64", value: "Yg==" });
+		expect(plan.bindings.some((binding) => binding.kind === "keyB64")).toBe(false);
+	});
+
+	it("emits direct placeholders for byte choices against a key", () => {
+		const plan = compileConditionExpression({ op: "in", args: [{ ref: "hashKey" }, { b64: "YQ==" }, { b64: "Yg==" }] });
+		expect(plan.sql).toMatch(/ IN \(\?3, \?4\)/);
+		expect(plan.bindings).toEqual([
+			{ kind: "keyB64", value: "YQ==" },
+			{ kind: "keyB64", value: "Yg==" },
+		]);
+	});
+
+	it("keeps base64 text out of generated SQL", () => {
+		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "data" }, { b64: "AQID" }] });
+		expect(plan.sql).not.toContain("AQID");
+	});
+});

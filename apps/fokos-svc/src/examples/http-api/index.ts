@@ -51,6 +51,7 @@ const ExpressionReferenceSchema: v.GenericSchema<ExpressionReference> = v.union(
 const ExpressionValueSchema: v.GenericSchema<ExpressionValue> = v.lazy(() =>
 	v.union([
 		v.strictObject({ val: JsonValueSchema }),
+		v.strictObject({ b64: v.string() }),
 		ExpressionReferenceSchema,
 		v.strictObject({ fn: v.string(), args: v.array(ExpressionValueSchema) }),
 	]),

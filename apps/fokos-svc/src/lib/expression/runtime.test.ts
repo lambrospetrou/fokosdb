@@ -236,4 +236,72 @@ describe("compiled condition runtime", () => {
 			expect(missing.rowsRead).toBe(0);
 		});
 	});
+
+	it("matches binary keys through byte literals and never matches a text key", async () => {
+		const bytes = (...values: number[]) => new Uint8Array(values).toBase64();
+		// The text sort key "ab" and the binary sort key carry identical content. Every condition below
+		// holds for the binary key only: the logical key type keeps a byte literal off a text key.
+		const binaryItem: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
+		const textItem: StoredFixture = { hashKey: "item", sortKey: "ab", kind: "text", data: "value" };
+		for (const condition of [
+			{ op: "eq", args: [{ ref: "sortKey" }, { b64: bytes(0x61, 0x62) }] },
+			{ op: "ne", args: [{ ref: "sortKey" }, { b64: bytes(0x61) }] },
+			{ op: "lt", args: [{ ref: "sortKey" }, { b64: bytes(0x7a) }] },
+			{ op: "lte", args: [{ ref: "sortKey" }, { b64: bytes(0x61, 0x62) }] },
+			{ op: "gt", args: [{ ref: "sortKey" }, { b64: bytes(0x61) }] },
+			{ op: "gte", args: [{ ref: "sortKey" }, { b64: bytes(0x61, 0x62) }] },
+			{ op: "between", args: [{ ref: "sortKey" }, { b64: bytes(0x61) }, { b64: bytes(0x7a) }] },
+			{ op: "in", args: [{ ref: "sortKey" }, { b64: bytes(0x63) }, { b64: bytes(0x61, 0x62) }] },
+			{ op: "begins_with", args: [{ ref: "sortKey" }, { b64: bytes(0x61) }] },
+			{ op: "contains", args: [{ ref: "sortKey" }, { b64: bytes(0x62) }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			const label = JSON.stringify(condition);
+			expect((await evaluate(binaryItem, condition)).conditionOk, label).toBe(true);
+			expect((await evaluate(textItem, condition)).conditionOk, label).toBe(false);
+		}
+	});
+
+	it("searches binary key content without the 0xFF tag", async () => {
+		// The needle sits at the end of the key, so a tagged search would find nothing.
+		const item: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
+		expect(
+			(await evaluate(item, { op: "contains", args: [{ ref: "sortKey" }, { b64: new Uint8Array([0x62]).toBase64() }] })).conditionOk,
+		).toBe(true);
+		expect(
+			(await evaluate(item, { op: "contains", args: [{ ref: "sortKey" }, { b64: new Uint8Array([0xff, 0x61]).toBase64() }] })).conditionOk,
+		).toBe(false);
+	});
+
+	it("matches byte data and never matches a JSONB row", async () => {
+		const byteItem: StoredFixture = { hashKey: "item", kind: "bytes", data: new Uint8Array([1, 2, 3]) };
+		const jsonItem: StoredFixture = { hashKey: "item", kind: "json", data: [1, 2, 3] };
+		for (const condition of [
+			{ op: "eq", args: [{ ref: "data" }, { b64: "AQID" }] },
+			{ op: "ne", args: [{ ref: "data" }, { b64: "AQI=" }] },
+			{ op: "begins_with", args: [{ ref: "data" }, { b64: "AQI=" }] },
+			{ op: "contains", args: [{ ref: "data" }, { b64: "Ag==" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			const label = JSON.stringify(condition);
+			expect((await evaluate(byteItem, condition)).conditionOk, label).toBe(true);
+			expect((await evaluate(jsonItem, condition)).conditionOk, label).toBe(false);
+		}
+	});
+
+	it("uses a primary-key lookup for a byte key literal", async () => {
+		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "sortKey" }, { b64: "YWI=" }] });
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-plan.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const hashKey = KeyCodec.encode("item");
+			const sortKey = KeyCodec.encode(new Uint8Array([0x61, 0x62]));
+			const queryPlan = state.storage.sql
+				.exec<{
+					detail: string;
+				}>(`EXPLAIN QUERY PLAN ${composeConditionStatement(plan.sql)}`, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings))
+				.toArray();
+			expect(
+				queryPlan.some((row) => /SEARCH i USING (?:COVERING )?INDEX .*\(hk=\? AND sk=\?\)/.test(row.detail)),
+				JSON.stringify(queryPlan),
+			).toBe(true);
+		});
+	});
 });

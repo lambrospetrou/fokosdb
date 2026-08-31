@@ -238,3 +238,47 @@ describe("expression limits and required columns", () => {
 		expect(value({ fn: "sqlite.lower", args: [{ val: "VALUE" }] }).requiredColumns).toEqual([]);
 	});
 });
+
+describe("byte literal validation", () => {
+	it.each([
+		["key equality", { op: "eq", args: [{ ref: "sortKey" }, { b64: "YWI=" }] }],
+		["key ordering", { op: "gt", args: [{ ref: "sortKey" }, { b64: "YWI=" }] }],
+		["key bounds", { op: "between", args: [{ ref: "sortKey" }, { b64: "YQ==" }, { b64: "eg==" }] }],
+		["a key choice list", { op: "in", args: [{ ref: "hashKey" }, { b64: "YQ==" }, { b64: "Yg==" }] }],
+		["a key prefix", { op: "begins_with", args: [{ ref: "hashKey" }, { b64: "YQ==" }] }],
+		["a key subsequence", { op: "contains", args: [{ ref: "sortKey" }, { b64: "Yg==" }] }],
+		["byte data equality", { op: "eq", args: [{ ref: "data" }, { b64: "AQID" }] }],
+		["a byte data prefix", { op: "begins_with", args: [{ ref: "data" }, { b64: "AQI=" }] }],
+		["size of a byte literal", { op: "eq", args: [{ fn: "size", args: [{ b64: "AQID" }] }, { val: 3 }] }],
+	] as const)("accepts %s", (_name, expression) => {
+		expect(() => condition(expression)).not.toThrow();
+	});
+
+	it.each([
+		["an empty literal", { b64: "" }],
+		["text that is not base64", { b64: "not base64!" }],
+		["base64url text", { b64: "-_8=" }],
+		["a non-string literal", { b64: 1 }],
+	] as const)("rejects %s", (_name, literal) => {
+		expect(() => condition({ op: "eq", args: [{ ref: "data" }, literal] })).toThrow(/byte literal/);
+	});
+
+	it("rejects a byte literal above the payload limit", () => {
+		const atLimit = { b64: "A".repeat(EXPRESSION_LIMITS.canonicalPayloadBytes - 1) + "=" };
+		const aboveLimit = { b64: "A".repeat(EXPRESSION_LIMITS.canonicalPayloadBytes) + "=" };
+		expect(() => condition({ op: "eq", args: [{ ref: "data" }, atLimit] })).not.toThrow();
+		expect(() => condition({ op: "eq", args: [{ ref: "data" }, aboveLimit] })).toThrow(/payload limit/);
+	});
+
+	it.each([
+		["a number", { op: "eq", args: [{ ref: "v" }, { b64: "YQ==" }] }],
+		["text", { op: "eq", args: [{ val: "ab" }, { b64: "YWI=" }] }],
+		["a byte search on a JSON array", { op: "contains", args: [{ ref: "data", path: "$.tags" }, { b64: "YQ==" }] }],
+	] as const)("rejects a byte literal against %s", (_name, expression) => {
+		expect(() => condition(expression)).toThrow(/type/);
+	});
+
+	it("rejects a byte literal mixed with a scalar literal in one in choice list", () => {
+		expect(() => condition({ op: "in", args: [{ ref: "sortKey" }, { b64: "YQ==" }, { val: "b" }] })).toThrow(/mix byte and scalar/);
+	});
+});

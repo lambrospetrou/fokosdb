@@ -16,6 +16,8 @@ LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.reque
 export type ExpressionBindingDescriptor =
 	| { kind: "val"; value: JsonPrimitive }
 	| { kind: "keyText"; value: string }
+	| { kind: "keyB64"; value: string }
+	| { kind: "b64"; value: string }
 	| { kind: "path"; value: string };
 
 export type CompiledConditionPlan = {

@@ -1,7 +1,7 @@
 # Typed expression engine
 
 Date: 2026-08-29  
-Status: **accepted design; M0-M5 implemented**
+Status: **accepted design; M0-M6 implemented**
 
 ---
 
@@ -95,7 +95,7 @@ type ExpressionReference =
 
 type ExpressionValue =
   | { val: JsonValue }
-  | { bytes: string }
+  | { b64: string }
   | ExpressionReference
   | { fn: string; args: readonly ExpressionValue[] };
 ```
@@ -108,10 +108,10 @@ type ExpressionValue =
 
 Expression literals are JSON values: string, number, Boolean, null, array, or object. Reject direct
 `Uint8Array` literals: a compiled plan must stay JSON-serializable. A byte literal uses an explicit
-tagged value, `{ bytes: string }`.
+tagged value, `{ b64: string }`. The tag names the encoding, so another encoding can be added beside
+it later.
 
-`bytes` carries standard base64 text with padding. Its native type is `bytes`, never `text`. It ships
-in M7; semantic validation rejects it before that milestone.
+`b64` carries standard base64 text. Its native type is `bytes`, never `text`.
 
 Scalar literals use SQLite-compatible scalar bindings. Array and object literals use canonical JSON
 text bindings. The compiler serializes each composite literal once while it traverses the caller AST.
@@ -312,12 +312,12 @@ binary-keyed row, and a byte-level `contains` search could match inside a binary
 compiler must add a logical-key-type guard (first canonical byte is not `0xFF`) to `gt`, `gte`, `ne`,
 and `contains` on key references. `eq`, `lt`, `lte`, `between`, `in`, and `begins_with` need no
 guard: UTF-8 never contains the byte `0xFF`, so a text literal cannot equal, prefix-match, or sort
-above a binary key. A byte literal (M7) mirrors the rule: every text key sorts below every binary
-key, so `lt`, `lte`, and `ne` against a byte literal need the opposite guard. The compiler derives
-both directions from one logical-key-type comparison, so one guard serves every operation.
+above a binary key. A byte literal mirrors the rule: every text key sorts below every binary key, so
+`lt`, `lte`, and `ne` against a byte literal need the opposite guard. The compiler derives both
+directions from one logical-key-type comparison, so one guard serves every operation.
 
-Before M7, a byte literal cannot be written. An allowlisted function can still reach the content of a
-binary key, because a function argument compiles as a logical value and drops the `0xFF` tag:
+An allowlisted function can also reach the content of a binary key, because a function argument
+compiles as a logical value and drops the `0xFF` tag:
 
 ```ts
 { op: "eq", args: [{ ref: "sortKey" }, { fn: "sqlite.unhex", args: [{ val: "6162" }] }] }
@@ -367,7 +367,7 @@ condition: { op: "not_exists", args: [{ ref: "hashKey" }] }
 `begins_with` is case-sensitive. Do not compile it to `LIKE`. Use a fixed prefix operation such as
 `substr` or `instr`. It supports two compatible text values or two byte-valued expressions. A text
 prefix literal against a key reference binds as canonical key bytes (section 4.4). A byte prefix
-literal against a key reference binds the same way and ships in M7.
+literal against a key reference binds the same way.
 
 `contains` supports:
 
@@ -375,8 +375,8 @@ literal against a key reference binds the same way and ships in M7.
 - Byte subsequence search when both expressions produce bytes.
 - JSON array membership for scalar string, number, Boolean, or null values.
 
-Reject array/object search values. A byte search literal ships in M7. Key containment compares
-logical values on both sides, so the `0xFF` tag is never part of the searched content.
+Reject array/object search values. Key containment compares logical values on both sides, so the
+`0xFF` tag is never part of the searched content.
 Use compiler-owned `json_each` only for scalar array containment and object size.
 
 Byte-mode `begins_with` and `contains` on the whole `data` reference must include the `data_kind`
@@ -522,13 +522,14 @@ Every descriptor is one JSON-safe scalar, so a plan survives JSON persistence an
   milestone). Binds as text into the fixed `jsonb(?)`, `json(?)`, or `json_each(?)` forms.
 - `keyText` — a string key literal, stored as the caller's public string. The partition binds
   `KeyCodec.encode(value)` as canonical key bytes.
+- `keyB64` — a byte literal that a key reference uses, as canonical base64 text. The partition binds
+  `KeyCodec.encode(decoded)` as canonical key bytes.
+- `b64` — a byte literal that byte `data` or a key containment search uses, as canonical base64 text.
+  The partition binds the decoded bytes as a BLOB.
 - `path` — one SQLite JSON path string.
 
-M7 adds two kinds that follow the same native type vocabulary (section 4.2): `keyBytes` for a byte
-literal that a key reference uses, and `bytes` for a byte literal that byte data uses. Both carry
-base64 text. The partition binds `KeyCodec.encode(decoded)` for `keyBytes` and the decoded bytes for
-`bytes`. The kind tags are persisted inside plans, so a rename is a plan-version change — do not
-shorten them.
+A kind tag names the source encoding, and the tags are persisted inside plans, so a rename is a
+plan-version change — do not shorten them.
 
 The partition materializes descriptors in order, after statement composition and immediately before
 execution. `KeyCodec.encode` is pure and deterministic, so a retry, a recovery replay, and a
@@ -932,20 +933,22 @@ and persistence changes listed in section 7.
 Test all operators on put/delete, JSON conditions, no-write on failure, lock/check order,
 two-phase/single-shot behavior, idempotency, plan persistence/size, migration, and split routing.
 
-### M6 — Binary key and data literals
+### M6 — DONE — Binary key and data literals
 
-This milestone is additive. M1-M6 must reject the `bytes` literal during semantic validation. Plans
+This milestone is additive. M1-M5 must reject the `b64` literal during semantic validation. Plans
 compiled before this milestone must stay valid when it ships.
 
 Deliver:
 
-- The `{ bytes: string }` value in the public AST, with the native type `bytes`.
+- The `{ b64: string }` value in the public AST, with the native type `bytes`.
 - Validation that decodes the base64 text once, rejects text that does not decode, and enforces the
   canonical expression payload limit. The plan descriptor stores the canonical re-encoded text.
 - Canonical identity from the decoded bytes, so two encodings of one value give one identity.
-- The `keyBytes` descriptor for a byte literal against `hashKey` or `sortKey`. The comparison uses
+- The `keyB64` descriptor for a byte literal against `hashKey` or `sortKey`. The comparison uses
   canonical tagged key bytes, so it keeps the primary-key lookup.
-- The `bytes` descriptor for a byte literal against byte `data`, bound as a BLOB.
+- The `b64` descriptor for a byte literal against byte `data`, bound as a BLOB. `contains` on a key
+  reference uses the same descriptor: containment compares logical values, so the `0xFF` tag stays
+  out of the searched content.
 - `eq`, `ne`, `lt`, `lte`, `gt`, `gte`, `between`, `in`, and `begins_with` on key references.
 - `eq`, `ne`, `begins_with`, and `contains` on byte `data`, with the existing data-kind guard.
 
@@ -967,7 +970,7 @@ Test in Workers SQLite:
 - A text literal and a byte literal with equal content against both a text key and a binary key.
 - Prefix and containment on byte data, and no match against a JSONB row.
 - Empty, malformed, and oversized literal rejection.
-- Plan JSON round-trip equality for `keyBytes` and `bytes` descriptors.
+- Plan JSON round-trip equality for `keyB64` and `b64` descriptors.
 - Primary-key query plan for a byte key literal.
 
 ### M7 — Projections
@@ -1058,8 +1061,8 @@ These items are not part of M0-M10:
 - **Untrusted partition callers:** Re-run validation/compilation in partitions or authenticate plans.
 - **Composite equality:** Define object order, array order, number normalization, missing/null rules,
   traversal limits, and cost. Do not use JSONB byte equality.
-- **Nested binary values:** Add a tagged format for bytes inside array and object literals. M7
-  covers only complete key and data literals.
+- **Nested binary values:** Add a tagged format for bytes inside array and object literals. Version
+  one covers only complete key and data literals.
 - **Sets:** Add stored types, uniqueness, equality, containment, size, and update rules.
 - **Nested projections:** Define overlap, arrays, reverse indexes, aliases, missing values, and
   collisions.

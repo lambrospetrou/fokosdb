@@ -1,4 +1,5 @@
 import type { JsonPrimitive } from "../json-types.js";
+import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { canonicalConditionIdentity } from "./identity.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
@@ -198,7 +199,7 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 	const choices = args.slice(1);
 	const firstType = literalNativeType(choices[0]);
 	if (firstType !== undefined && firstType !== "null" && choices.every((choice) => literalNativeType(choice) === firstType)) {
-		const mode: ValueMode = isDirectKeyReference(target) && firstType === "text" ? "key" : "logical";
+		const mode: ValueMode = isDirectKeyReference(target) && (firstType === "text" || firstType === "bytes") ? "key" : "logical";
 		const terms: string[] = [];
 		if (!addTerm(terms, renderPresent(target, context))) return "(0)";
 		const type = renderType(target, context);
@@ -229,8 +230,12 @@ function compileBeginsWith(value: ExpressionValue, prefix: ExpressionValue, cont
 	return `(${terms.join(" AND ")})`;
 }
 
+/**
+ * Containment always compares logical values, never canonical key bytes: the `0xFF` binary-key tag
+ * must not become part of the searched content, or a subsequence search on a key would only match at
+ * the start. The logical key type guard still keeps text keys and binary keys apart.
+ */
 function compileContains(container: ExpressionValue, search: ExpressionValue, context: CompileContext): string {
-	const [containerMode, searchMode] = comparisonModes(container, search);
 	const containerPresent = renderPresent(container, context);
 	const searchPresent = renderPresent(search, context);
 	const containerType = renderType(container, context);
@@ -243,7 +248,7 @@ function compileContains(container: ExpressionValue, search: ExpressionValue, co
 		addTerm(scalarTerms, searchPresent) &&
 		pushTypeGuards(scalarTerms, containerType, searchType, PREFIX_TYPE_NAMES)
 	) {
-		scalarTerms.push(`instr(${renderValue(container, containerMode, context)}, ${renderValue(search, searchMode, context)}) > 0`);
+		scalarTerms.push(`instr(${renderValue(container, "logical", context)}, ${renderValue(search, "logical", context)}) > 0`);
 		scalar = `(${scalarTerms.join(" AND ")})`;
 	}
 
@@ -269,6 +274,7 @@ function compileContains(container: ExpressionValue, search: ExpressionValue, co
 
 function renderPresent(value: ExpressionValue, context: CompileContext): string {
 	if ("val" in value) return "1";
+	if ("b64" in value) return "1";
 	if ("ref" in value) return referencePresent(value, context);
 	if (value.fn === "attribute_type" || value.fn.startsWith("sqlite.")) return "1";
 	if (value.fn === "size") {
@@ -282,6 +288,7 @@ function renderPresent(value: ExpressionValue, context: CompileContext): string 
 
 function renderType(value: ExpressionValue, context: CompileContext): string {
 	if ("val" in value) return `'${literalType(value.val as JsonPrimitive)}'`;
+	if ("b64" in value) return "'bytes'";
 	if ("ref" in value) return referenceType(value, context);
 	if (value.fn === "size") return "'number'";
 	if (value.fn === "attribute_type") return "'text'";
@@ -294,6 +301,7 @@ function renderType(value: ExpressionValue, context: CompileContext): string {
 
 function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileContext): string {
 	if ("val" in value) return bindLiteral(value.val as JsonPrimitive, mode, context);
+	if ("b64" in value) return bindByteLiteral(value, mode, context);
 	if ("ref" in value) return referenceValue(value, mode, context);
 	if (value.fn === "attribute_type") return renderType(value.args[0], context);
 	if (value.fn === "size") return renderSize(value.args[0], context);
@@ -388,7 +396,7 @@ function jsonTypeSql(jsonType: string): string {
 }
 
 function comparisonModes(left: ExpressionValue, right: ExpressionValue): readonly [ValueMode, ValueMode] {
-	if ((isDirectKeyReference(left) && isTextLiteral(right)) || (isDirectKeyReference(right) && isTextLiteral(left))) return ["key", "key"];
+	if ((isDirectKeyReference(left) && isKeyLiteral(right)) || (isDirectKeyReference(right) && isKeyLiteral(left))) return ["key", "key"];
 	if (isDirectKeyReference(left) && isDirectKeyReference(right)) return ["key", "key"];
 	return ["logical", "logical"];
 }
@@ -397,11 +405,12 @@ function isDirectKeyReference(value: ExpressionValue): boolean {
 	return "ref" in value && (value.ref === "hashKey" || value.ref === "sortKey");
 }
 
-function isTextLiteral(value: ExpressionValue): boolean {
-	return "val" in value && typeof value.val === "string";
+function isKeyLiteral(value: ExpressionValue): boolean {
+	return ("val" in value && typeof value.val === "string") || "b64" in value;
 }
 
-function literalNativeType(value: ExpressionValue): "null" | "boolean" | "number" | "text" | undefined {
+function literalNativeType(value: ExpressionValue): "null" | "boolean" | "number" | "text" | "bytes" | undefined {
+	if ("b64" in value) return "bytes";
 	if (!("val" in value)) return;
 	return literalType(value.val as JsonPrimitive);
 }
@@ -419,6 +428,11 @@ function bindLiteral(value: JsonPrimitive, mode: ValueMode, context: CompileCont
 			? { kind: "keyText", value }
 			: { kind: "val", value: typeof value === "number" && Object.is(value, -0) ? 0 : value };
 	return bindDescriptor(descriptor, context);
+}
+
+function bindByteLiteral(value: { b64: string }, mode: ValueMode, context: CompileContext): string {
+	const { canonical } = decodeByteLiteral(value);
+	return bindDescriptor({ kind: mode === "key" ? "keyB64" : "b64", value: canonical }, context);
 }
 
 function bindPath(path: string, context: CompileContext): string {
