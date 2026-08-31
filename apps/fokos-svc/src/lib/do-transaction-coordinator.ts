@@ -72,6 +72,15 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 
 const STALE_THRESHOLD_MS = 5_000;
 
+/**
+ * Wall-clock budget for the commit fan-out when a request waits on it. Past this deadline the
+ * coordinator stops dispatching participant RPCs, leaves the unconfirmed participant with the
+ * transaction in COMMITTING, and the caller receives the commit-pending error; the alarm then
+ * finishes the fan-out with the full retry budget, because nothing waits on it. Without the
+ * budget, one unreachable participant would hold the request, and the shard, for tens of seconds.
+ */
+export const COMMIT_FANOUT_REQUEST_BUDGET_MS = 5_000;
+
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
@@ -219,7 +228,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			await this.ctx.storage.setAlarm(Date.now() + STALE_THRESHOLD_MS);
 		}
 
-		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId);
+		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, COMMIT_FANOUT_REQUEST_BUDGET_MS);
 	}
 
 	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
@@ -230,12 +239,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			case "CANCELLED":
 				return this.loadFinalResponse(transactionId, idempotencyToken, existingRow);
 			case "PREPARING": {
-				await this.runPrepareRecovery(transactionId, idempotencyToken);
+				await this.runPrepareRecovery(transactionId, idempotencyToken, COMMIT_FANOUT_REQUEST_BUDGET_MS);
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "PREPARED":
 			case "COMMITTING": {
-				await this.runCommit(transactionId, idempotencyToken);
+				await this.runCommit(transactionId, idempotencyToken, COMMIT_FANOUT_REQUEST_BUDGET_MS);
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "CANCELLING": {
@@ -244,35 +253,41 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}
 			case "CREATED": {
 				const coordinatorDoId = this.ctx.id.toString();
-				return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId);
+				return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, COMMIT_FANOUT_REQUEST_BUDGET_MS);
 			}
 		}
 	}
 
 	/**
-	 * Maps the state machine to the client's answer. The answer follows the DECISION, never the
-	 * cleanup: a state is terminal for the caller as soon as the outcome can no longer change, even
-	 * though participants may still be catching up.
+	 * Maps the state machine to the client's answer.
 	 *
-	 * - PREPARED is the point of no return. Every participant voted to accept and holds its locks, and
-	 *   nothing transitions PREPARED → CANCELLING (both writers of CANCELLING guard on state =
-	 *   'PREPARING'), so the transaction WILL commit. Reporting anything else would be false.
-	 * - CANCELLING is decided too: a cancelled transaction applied nothing anywhere, so outstanding
-	 *   cleanup cannot change what the caller observes.
-	 * - CREATED / PREPARING are genuinely undecided — those, and only those, ask the caller to retry.
-	 *
-	 * Returning early with cleanup outstanding is safe because `alarm()` reschedules itself while any
-	 * non-terminal row remains, so it drives the stragglers to completion.
+	 * - COMMITTED: every participant confirmed the commit, so "committed" also promises
+	 *   read-your-writes — a caller that receives it can read what it wrote on every participant.
+	 * - PREPARED / COMMITTING: the decision is durable and PREPARED is the point of no return
+	 *   (nothing transitions PREPARED → CANCELLING; both writers of CANCELLING guard on state =
+	 *   'PREPARING'), so the transaction WILL commit — but some participant has not applied it yet.
+	 *   Answering "committed" would let a caller read a stale value from that participant, so these
+	 *   states throw the commit-pending error instead. `alarm()` finishes the fan-out, and a retry
+	 *   with the same token answers "committed" once the last participant confirms.
+	 * - CANCELLING / CANCELLED: a cancelled transaction applied nothing anywhere, so outstanding
+	 *   cleanup cannot change what the caller observes, and the answer follows the decision. Only
+	 *   the lock release lags, and `alarm()` drives that too.
+	 * - CREATED / PREPARING: genuinely undecided — those, and only those, ask the caller to retry.
 	 */
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
 		const row = existingRow ?? this.loadStateRow(idempotencyToken)!;
 		switch (row.state) {
-			case "PREPARED":
-			case "COMMITTING":
 			case "COMMITTED":
 				// The transaction is all-or-nothing, so "committed" already says every operation applied.
 				// Nothing per-item to report, and so no tc_items read on this path.
 				return { outcome: "committed", transactionId, idempotencyToken };
+			case "PREPARED":
+			case "COMMITTING":
+				// The outcome is decided and final, but not every participant has applied it yet, so
+				// this is not a terminal answer for the caller: retry with the same token.
+				throw new Error(
+					`fokos/tc: transaction ${transactionId} ${COMMIT_PENDING_SENTINEL} (state=${row.state}): the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
+				);
 			case "CANCELLING":
 			case "CANCELLED":
 				return {
@@ -285,8 +300,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				};
 			case "CREATED":
 			case "PREPARING":
-				// No decision yet — the alarm will drive it. This is the only retryable answer.
-				throw new Error(`fokos/tc: transaction ${transactionId} outcome is not yet decided (state=${row.state}), retry later`);
+				// No decision yet — the alarm will drive it. The outcome can still go either way, so
+				// this answer promises nothing and only asks the caller to retry.
+				throw new Error(`fokos/tc: transaction ${transactionId} ${UNDECIDED_SENTINEL} (state=${row.state}), retry later`);
 			default: {
 				const _exhaustive: never = row.state;
 				throw new Error(`fokos/tc: unexpected transaction state ${_exhaustive}`);
@@ -294,7 +310,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async drivePrepare(transactionId: string, idempotencyToken: string, coordinatorDoId: string): Promise<InitiateWriteResponse> {
+	private async drivePrepare(
+		transactionId: string,
+		idempotencyToken: string,
+		coordinatorDoId: string,
+		commitRequestBudgetMs?: number,
+	): Promise<InitiateWriteResponse> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'PREPARING' WHERE idempotency_token = ? AND state = 'CREATED'`,
 			idempotencyToken,
@@ -350,7 +371,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
 				idempotencyToken,
 			);
-			await this.runCommit(transactionId, idempotencyToken).catch((e) =>
+			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs).catch((e) =>
 				console.error({
 					message: "fokos/tc: background commit failed",
 					transactionId,
@@ -370,15 +391,23 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return this.loadFinalResponse(transactionId, idempotencyToken);
 	}
 
-	private async runCommit(transactionId: string, idempotencyToken: string): Promise<void> {
+	/**
+	 * `requestBudgetMs` bounds the fan-out when a request waits on it (see
+	 * COMMIT_FANOUT_REQUEST_BUDGET_MS). Undefined — the alarm and the recovery paths — means no
+	 * deadline, so those keep the full retry budget.
+	 */
+	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'COMMITTING' WHERE idempotency_token = ? AND state IN ('PREPARED', 'COMMITTING')`,
 			idempotencyToken,
 		);
 
 		const stateRow = this.loadStateRow(idempotencyToken)!;
-		const items = this.loadItems(transactionId);
-		const itemsByPartition = groupByPartition(items);
+		// Keys only, as in runCancel: every participant applies the payload from its own
+		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
+		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
+		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
+		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + requestBudgetMs;
 
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
@@ -391,13 +420,17 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		await Promise.allSettled(
 			pendingParticipants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
+				const partitionKeys = keysByPartition.get(p.partition_do_name) ?? [];
 				await tryWhile(
 					async () => {
+						// Past the request budget, stop dispatching: this participant stays unconfirmed,
+						// the transaction stays in COMMITTING, the caller receives the commit-pending
+						// error, and the alarm finishes the fan-out.
+						if (Date.now() > deadlineMs) return;
 						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCommit(pCtx, {
 							transactionId,
 							transactionTimestamp: stateRow.transaction_ts,
-							items: toTransactionItems(partitionItems),
+							items: toTransactionItemKeys(partitionKeys),
 						});
 						this.ctx.storage.sql.exec(
 							`UPDATE tc_participants SET commit_outcome = 'committed' WHERE transaction_id = ? AND partition_do_name = ?`,
@@ -482,7 +515,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async runPrepareRecovery(transactionId: string, idempotencyToken: string): Promise<void> {
+	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<void> {
 		const stateRow = this.loadStateRow(idempotencyToken);
 		if (!stateRow) return;
 
@@ -542,7 +575,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				`UPDATE tc_state SET state = 'PREPARED' WHERE idempotency_token = ? AND state = 'PREPARING'`,
 				idempotencyToken,
 			);
-			await this.runCommit(transactionId, idempotencyToken);
+			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs);
 		} else if (anyRejected) {
 			const reasonJson = firstNewRejectionReason ? stringifyReason(firstNewRejectionReason) : stringifyReason({ type: "transient_error" });
 			this.ctx.storage.sql.exec(
@@ -822,6 +855,31 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			)
 			.toArray();
 	}
+}
+
+// Recognised by message substring for the same reason as the partition's over-size sentinel: DO RPC
+// carries only an error's message across the boundary, so a dedicated error class would not survive
+// the hop. Each throw site interpolates its sentinel into the message, so the predicate and the
+// message cannot drift apart. The two sentinels must not contain each other.
+const UNDECIDED_SENTINEL = "outcome is not yet decided";
+const COMMIT_PENDING_SENTINEL = "commit is pending";
+
+/**
+ * True for the retryable error a caller receives while a transaction is still CREATED or PREPARING:
+ * the outcome can still be either committed or cancelled.
+ */
+export function isTransactionUndecidedError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes(UNDECIDED_SENTINEL);
+}
+
+/**
+ * True for the retryable error a caller receives while a transaction is PREPARED or COMMITTING: the
+ * decision is durable, so the transaction will commit, but not every participant has applied it yet.
+ * Kept distinct from undecided because the two promise different things to a caller with no token —
+ * an undecided transaction can still cancel, a commit-pending one cannot.
+ */
+export function isTransactionCommitPendingError(e: unknown): boolean {
+	return e instanceof Error && e.message.includes(COMMIT_PENDING_SENTINEL);
 }
 
 function deserializePartitionContext(json: string): PartitionContextResolved {

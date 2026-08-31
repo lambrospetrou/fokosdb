@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import { isTransactionCommitPendingError, isTransactionUndecidedError, TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import type { InitiateWriteResponse, RejectionReason, TCState } from "./transaction-types.js";
 
@@ -73,19 +73,35 @@ async function withCoordinator(fn: (tc: WithLoadFinalResponse, state: DurableObj
 	});
 }
 
-describe("TransactionCoordinatorDO - loadFinalResponse answers from the decision, not the cleanup", () => {
-	// PREPARED is the point of no return: every participant accepted, and nothing transitions
-	// PREPARED → CANCELLING. COMMITTING has already begun applying. Both MUST report committed even
-	// while a straggling participant has not acknowledged, or the caller is told a durable write failed.
-	it.each(["PREPARED", "COMMITTING", "COMMITTED"] as const)("reports committed in state %s", async (tcState) => {
+describe("TransactionCoordinatorDO - loadFinalResponse: committed only after every participant confirmed", () => {
+	it("reports committed in state COMMITTED", async () => {
 		await withCoordinator((tc, state) => {
-			seed(state, tcState);
+			seed(state, "COMMITTED");
 			// toEqual, not toMatchObject: an item echo reappearing here is a failure, not an extra.
 			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
 			});
+		});
+	});
+
+	// The decision is durable and PREPARED is final, so these transactions WILL commit — but a
+	// straggling participant has not applied yet, and a caller that reads now could see a stale
+	// value from it. The answer must be the retryable commit-pending error, never "committed".
+	it.each(["PREPARED", "COMMITTING"] as const)("throws the commit-pending error in state %s", async (tcState) => {
+		await withCoordinator((tc, state) => {
+			seed(state, tcState);
+			let err: unknown;
+			try {
+				tc.loadFinalResponse(TX_ID, TOKEN);
+			} catch (e) {
+				err = e;
+			}
+			expect(isTransactionCommitPendingError(err)).toBe(true);
+			expect(isTransactionUndecidedError(err)).toBe(false);
+			expect(String(err)).toMatch(/commit is pending/);
+			expect(String(err)).toMatch(new RegExp(`state=${tcState}`));
 		});
 	});
 
@@ -114,11 +130,19 @@ describe("TransactionCoordinatorDO - loadFinalResponse answers from the decision
 		});
 	});
 
-	// The only states where the outcome can still go either way, and so the only retryable answer.
-	it.each(["CREATED", "PREPARING"] as const)("throws a retryable error in undecided state %s", async (tcState) => {
+	// The only states where the outcome can still go either way, and so the only other retryable answer.
+	it.each(["CREATED", "PREPARING"] as const)("throws the undecided error in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
 			seed(state, tcState);
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrowError(/outcome is not yet decided/);
+			let err: unknown;
+			try {
+				tc.loadFinalResponse(TX_ID, TOKEN);
+			} catch (e) {
+				err = e;
+			}
+			expect(isTransactionUndecidedError(err)).toBe(true);
+			expect(isTransactionCommitPendingError(err)).toBe(false);
+			expect(String(err)).toMatch(/outcome is not yet decided/);
 		});
 	});
 });

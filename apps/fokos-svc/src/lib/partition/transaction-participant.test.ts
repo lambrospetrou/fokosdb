@@ -382,10 +382,7 @@ describe("TransactionParticipant - commit", () => {
 				participant.commitLocal({
 					transactionId: request.transactionId,
 					transactionTimestamp: request.transactionTimestamp,
-					items: [
-						request.items[0],
-						{ hashKey: kb("c"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" },
-					],
+					items: [request.items[0], { hashKey: kb("c"), sortKey: KeyCodec.encodeOptional(undefined) }],
 				}),
 			).toThrow(/not found in pending_transactions/);
 		});

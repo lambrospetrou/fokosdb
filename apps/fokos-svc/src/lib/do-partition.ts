@@ -14,7 +14,6 @@ import type {
 	ReadSnapshotResponse,
 	SingleShotRequest,
 	SingleShotResponse,
-	TransactionItem,
 } from "./transaction-types.js";
 import {
 	areImmutableOptionsEqual,
@@ -2055,18 +2054,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						if (result.state === "COMMITTED") {
 							if (pendingRows.length > 0) {
 								const transactionTimestamp = pendingRows[0].transaction_ts;
-								const items: TransactionItem[] = pendingRows.map((r) => ({
-									hashKey: r.hk,
-									sortKey: r.sk,
-									operation: r.operation as TransactionItem["operation"],
-									data: r.data ?? undefined,
-									kind: r.kind ?? undefined,
-									ttlAt: r.ttl_epoch_utc_seconds ?? undefined,
-								}));
 								await this.txCommit(this.pCtx(), {
 									transactionId: row.transaction_id,
 									transactionTimestamp,
-									items,
+									// Keys only: commit applies the payload from this partition's own
+									// pending_transactions rows, so the request carries routing
+									// information and nothing else.
+									items: pendingRows.map((r) => ({ hashKey: r.hk, sortKey: r.sk })),
 								});
 							}
 						} else if (result.state === "CANCELLED" || result.state === "not_found") {

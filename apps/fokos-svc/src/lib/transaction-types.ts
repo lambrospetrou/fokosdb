@@ -72,8 +72,13 @@ export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; r
 export type CommitRequest = {
 	transactionId: TransactionId;
 	transactionTimestamp: TransactionTimestamp;
-	/** Items to apply. Same items as those accepted in prepare. */
-	items: TransactionItem[];
+	/**
+	 * The keys this transaction locked, the same shape `CancelRequest.items` uses. Each participant
+	 * applies the payload from its own `pending_transactions` rows, which prepare wrote, so the wire
+	 * items carry routing information and nothing else. The keys stay because routing derives the
+	 * owning child partition from the key itself.
+	 */
+	items: TransactionItemKey[];
 };
 
 export type CommitResponse = { outcome: "committed" };

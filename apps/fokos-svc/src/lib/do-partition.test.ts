@@ -2046,9 +2046,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		await stub.txCommit(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
+			// Keys only: the participant applies the payload from its own pending_transactions rows.
 			items: [
-				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
-				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
+				{ hashKey: kb("alice"), sortKey: kb("sk2") },
+				{ hashKey: kb("bob"), sortKey: kb("sk1") },
 			],
 		});
 
@@ -2160,7 +2161,11 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 		const { ctx, stub } = makeStub(OVER_SIZE);
 		// No prepare ran, so commit finds no pending rows and is a no-op — enough to prove it routed.
 		await expect(
-			stub.txCommit(ctx, { transactionId: crypto.randomUUID(), transactionTimestamp: Date.now(), items: txItems }),
+			stub.txCommit(ctx, {
+				transactionId: crypto.randomUUID(),
+				transactionTimestamp: Date.now(),
+				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
+			}),
 		).resolves.toEqual({ outcome: "committed" });
 	});
 
@@ -2327,7 +2332,15 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		await triggerHashSplitThreshold(stub, ctx, 1);
 		await drainSplitTree(stub);
 		expect((await stub.status()).splitStatus?.status).toBe("split_completed");
-		expect(await stub.txCommit(ctx, { transactionId, transactionTimestamp, items })).toEqual({ outcome: "committed" });
+		expect(
+			await stub.txCommit(ctx, {
+				transactionId,
+				transactionTimestamp,
+				// Keys only: the split parent routes them to the children, which apply from their own
+				// pending_transactions rows.
+				items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })),
+			}),
+		).toEqual({ outcome: "committed" });
 		expect(await stub.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
 			found: true,
 			item: { data: "value", ttlAt },
@@ -2344,7 +2357,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 			const items = [{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const }];
 			const transactionTimestamp = Date.now() + i;
 			expect(await stub.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
-			await stub.txCommit(ctx, { transactionId, transactionTimestamp, items });
+			await stub.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
 			if ((await stub.status()).splitStatus) break;
 		}
 

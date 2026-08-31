@@ -8,7 +8,7 @@ import type {
 	ReadForTransactionResponse,
 	SingleShotRequest,
 	SingleShotResponse,
-	TransactionItem,
+	TransactionItemKey,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
@@ -178,7 +178,9 @@ export class TransactionParticipant {
 		return { outcome: "committed" };
 	}
 
-	#applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItem[]): void {
+	// Items are keys only: every per-item fact applied here (operation, data, kind, conditions) comes
+	// from the partition's own pending_transactions row that prepare wrote.
+	#applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItemKey[]): void {
 		for (const item of items) {
 			const sk = item.sortKey;
 			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
