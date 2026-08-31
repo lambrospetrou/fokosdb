@@ -1,4 +1,5 @@
 import { env } from "cloudflare:workers";
+import { StaticShardedDO } from "durable-utils/do-sharding";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
@@ -32,6 +33,42 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(meta.servedByActorName).toBeTypeOf("string");
 			}
 			expect(query.partitionMetas).not.toHaveLength(0);
+		});
+	});
+
+	describe("FokosDB — transaction coordinator pool", () => {
+		it("derives two coordinators per root partition", () => {
+			expect(makeDBFor(ns, { rootTreesN: 1 }).options().numTxCoordinators).toBe(2);
+			expect(makeDBFor(ns, { rootTreesN: 3 }).options().numTxCoordinators).toBe(6);
+		});
+
+		it("uses and validates an explicit numTxCoordinators value", () => {
+			expect(makeDBFor(ns, { rootTreesN: 3, numTxCoordinators: 5 }).options().numTxCoordinators).toBe(5);
+			for (const numTxCoordinators of [0, -1, 1.5]) {
+				expect(() => makeDBFor(ns, { numTxCoordinators })).toThrow(/numTxCoordinators must be an integer greater or equal to 1/);
+			}
+		});
+
+		it("destroys coordinator pools larger than 1,000 shards in filtered batches", async () => {
+			const db = makeDBFor(ns, { rootTreesN: 501 });
+			const some = vi.spyOn(StaticShardedDO.prototype, "some").mockResolvedValue([]);
+			const all = vi.spyOn(StaticShardedDO.prototype, "all");
+			const traverse = vi.spyOn(db.options().topology, "traverseForDestroy").mockResolvedValue();
+			try {
+				await expect(db.destroy()).resolves.toEqual({ ok: true });
+				expect(all).not.toHaveBeenCalled();
+				expect(some).toHaveBeenCalledTimes(2);
+				const calls = (some as unknown as { mock: { calls: Array<[unknown, { filterFn: (shard: number) => boolean }]> } }).mock.calls;
+				const firstFilter = calls[0][1].filterFn;
+				const secondFilter = calls[1][1].filterFn;
+				expect([firstFilter(0), firstFilter(999), firstFilter(1000)]).toEqual([true, true, false]);
+				expect([secondFilter(999), secondFilter(1000), secondFilter(1001)]).toEqual([false, true, true]);
+				expect(traverse).toHaveBeenCalledTimes(1);
+			} finally {
+				some.mockRestore();
+				all.mockRestore();
+				traverse.mockRestore();
+			}
 		});
 	});
 
@@ -544,13 +581,13 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 // Builds a FokosDB over a fresh, isolated table for the given partition DO namespace. Generous split
 // thresholds keep every key on a single root partition so these tests exercise FokosDB.queryItems'
 // cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in do-partition.test.ts).
-function makeDBFor(ns: PartitionNamespaceKey) {
+function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; numTxCoordinators?: number }) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns,
 		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName,
-		rootTreesN: 1,
+		rootTreesN: options?.rootTreesN ?? 1,
 		hashSplitN: 2,
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 500 },
@@ -559,6 +596,7 @@ function makeDBFor(ns: PartitionNamespaceKey) {
 	return new FokosDB({
 		topology: new PartitionTopologyRouterImpl(base),
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
+		numTxCoordinators: options?.numTxCoordinators,
 	});
 }
 

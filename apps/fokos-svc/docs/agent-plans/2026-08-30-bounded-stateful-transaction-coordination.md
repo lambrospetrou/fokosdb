@@ -133,14 +133,14 @@ Each step ships on its own.
 4. **Done.** Add the garbage collection lifecycle: payload stripping, row deletion at the terminal
    transition, the sweep alarm, the alarm recovery budget, and the `clientRequestToken` length limit
    (4.3.1 to 4.3.3).
-5. Add the lock-age guard with its operator tools (4.3.5): the three poke outcomes, the quarantine that
+5. Derive the default pool size from `rootTreesN`, rename the option to `numTxCoordinators`, and rename
+   the shard group to `fokos_tc.<tableName>` (4.3.7). This is a breaking change: existing databases are
+   deleted, not migrated (4.3.9).
+6. Add the lock-age guard with its operator tools (4.3.5): the three poke outcomes, the quarantine that
    keeps a guarded transaction out of the stale scan, the guard log line with its full field set, and
    the `debugForceResolveTransaction` RPC on `PartitionDO`. The guard compares against
    `IDEMPOTENCY_WINDOW_MS`, so it cannot ship before step 4. Its error state has no resolution path
    without the RPC, so it cannot ship without the RPC.
-6. Derive the default pool size from `rootTreesN`, rename the option to `numTxCoordinators`, and rename
-   the shard group to `fokos_tc.<tableName>` (4.3.7). This is a breaking change: existing databases are
-   deleted, not migrated (4.3.9).
 7. **Optional.** Add the per-call `numTxCoordinators` parameter to `transactWriteItems` (4.3.7). Ship
    it only if a deployment needs it.
 

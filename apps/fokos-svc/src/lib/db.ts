@@ -52,7 +52,8 @@ import { PageBudget } from "./query/page-budget.js";
 import { compileConditionExpression } from "./expression/compiler.js";
 import { PartitionContextResolved } from "./partition-topology/partition-context.js";
 
-export const DEFAULT_NUM_TRANSACTION_COORDINATORS = 100;
+const TX_COORDINATORS_PER_ROOT_TREE = 2;
+const TX_COORDINATOR_DESTROY_BATCH_SIZE = 1_000;
 
 // The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
@@ -108,10 +109,12 @@ export type FokosDBOptions = {
 	topology: PartitionTopologyRouter;
 	transactionCoordinatorNs: DurableObjectNamespace<TransactionCoordinatorDO>;
 
-	// TODO Temporary since ideally the transaction coordinators should also auto-scale.
-	// This is safe to increase if needed except for retrying the same transaction with the same idempotency token.
-	// Data partitions record the actual DO name they should reach out for recovering the transaction.
-	numTransactionCoordinators?: number;
+	/**
+	 * Coordinator pool size. Defaults to two coordinators per root partition. Retries with the same
+	 * clientRequestToken must use the same value. In-flight recovery uses the coordinator ID stored in
+	 * participant locks and does not depend on this value.
+	 */
+	numTxCoordinators?: number;
 
 	/**
 	 * Runs a transaction whose items are all owned by ONE partition against that partition directly,
@@ -141,17 +144,18 @@ export class FokosDB {
 	#staticShardedTCs: StaticShardedDO<TransactionCoordinatorDO>;
 
 	constructor(options: FokosDBOptions) {
+		const partitionContext = options.topology.partitionContext();
 		this.#options = {
 			...options,
-			numTransactionCoordinators: options.numTransactionCoordinators ?? DEFAULT_NUM_TRANSACTION_COORDINATORS,
+			numTxCoordinators: options.numTxCoordinators ?? TX_COORDINATORS_PER_ROOT_TREE * partitionContext.rootTreesN,
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
-		if (!Number.isInteger(this.#options.numTransactionCoordinators) || this.#options.numTransactionCoordinators <= 0) {
-			throw new Error("fokosdb: numTransactionCoordinators must be an integer greater or equal to 1");
+		if (!Number.isInteger(this.#options.numTxCoordinators) || this.#options.numTxCoordinators <= 0) {
+			throw new Error("fokosdb: numTxCoordinators must be an integer greater or equal to 1");
 		}
 		this.#staticShardedTCs = new StaticShardedDO(this.#options.transactionCoordinatorNs, {
-			numShards: this.#options.numTransactionCoordinators,
-			shardGroupName: `${this.#options.topology.partitionContext().tableName}.tc`,
+			numShards: this.#options.numTxCoordinators,
+			shardGroupName: `fokos_tc.${partitionContext.tableName}`,
 		});
 	}
 
@@ -602,8 +606,8 @@ export class FokosDB {
 		// coordinator commit into a partition that was just emptied and leave rows behind the traversal has
 		// already passed. Every shard is swept, not only the ones that hold rows: the shard for a given
 		// idempotency token is not knowable from here, and a shard with no rows costs one wipe of empty
-		// storage.
-		await this.#staticShardedTCs.all(async (tcStub: DurableObjectStub<TransactionCoordinatorDO>, shard: number) => {
+		// storage. Batches use `some` because `StaticShardedDO.all` rejects pools larger than 1,000 shards.
+		const destroyCoordinator = async (tcStub: DurableObjectStub<TransactionCoordinatorDO>, shard: number) => {
 			try {
 				await tcStub.destroyCoordinator();
 			} catch (e) {
@@ -611,7 +615,11 @@ export class FokosDB {
 				if (!isDestroyAbortError(e)) throw e;
 			}
 			console.warn(`Destroyed transaction coordinator shard ${shard}`);
-		});
+		};
+		for (let start = 0; start < this.#options.numTxCoordinators; start += TX_COORDINATOR_DESTROY_BATCH_SIZE) {
+			const end = Math.min(start + TX_COORDINATOR_DESTROY_BATCH_SIZE, this.#options.numTxCoordinators);
+			await this.#staticShardedTCs.some(destroyCoordinator, { filterFn: (shard) => shard >= start && shard < end });
+		}
 
 		// The router owns the traversal (child-discovery order, range-root resolution, dedup);
 		// FokosDB supplies the two callbacks that perform the RPCs.

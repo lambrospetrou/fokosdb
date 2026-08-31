@@ -31,6 +31,8 @@ Two Durable Object classes do all the work:
 
 The `FokosDB` class (`src/lib/db.ts`) is the client-side entry point. It routes requests with `PartitionTopologyRouterImpl`, delegates multi-partition writes to `TransactionCoordinatorDO`, and drives multi-partition reads directly.
 
+The coordinator pool uses the shard group `fokos_tc.<tableName>`. Its size is `numTxCoordinators` or, by default, two shards per root partition. Retries with the same `clientRequestToken` must use the same pool size. In-flight recovery uses the coordinator ID in each participant lock and does not depend on the current pool size.
+
 ### Data Model
 
 Items are keyed by `hashKey` (required) + `sortKey` (optional, defaults to `""`). Data is `Uint8Array | string`. Items have a `version` counter (incremented on every write) and an optional TTL.

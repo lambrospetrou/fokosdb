@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../src/lib/db.js";
 import { PartitionDO } from "../src/lib/do-partition.js";
@@ -844,7 +845,7 @@ describe("transactions - end-to-end", () => {
 		const db = new FokosDB({
 			topology,
 			transactionCoordinatorNs: spyTCNs,
-			numTransactionCoordinators: 3,
+			numTxCoordinators: 3,
 		});
 
 		for (let i = 0; i < 10; i++) {
@@ -865,8 +866,8 @@ describe("transactions - end-to-end", () => {
 		// One idFromName call per transactWriteItems.
 		expect(calledTCNames).toHaveLength(10);
 
-		// StaticShardedDO names shards as `${shardGroupName}-${index}`, and shardGroupName is `${tableName}.tc.`
-		const expectedTCNames = new Set([`${dbName}.tc-0`, `${dbName}.tc-1`, `${dbName}.tc-2`]);
+		// StaticShardedDO names shards as `${shardGroupName}-${index}`.
+		const expectedTCNames = new Set([`fokos_tc.${dbName}-0`, `fokos_tc.${dbName}-1`, `fokos_tc.${dbName}-2`]);
 		for (const name of calledTCNames) {
 			expect(expectedTCNames.has(name)).toBe(true);
 		}
@@ -874,6 +875,44 @@ describe("transactions - end-to-end", () => {
 		// With 10 transactions across 3 shards, we are asserting >= 2 distinct TCs per coordinator.
 		const uniqueTCNames = new Set(calledTCNames);
 		expect(uniqueTCNames.size).toBeGreaterThanOrEqual(2);
+	});
+
+	it("keeps token replay on the same shard only when the pool size is unchanged", async () => {
+		const tableName = `tcpool.${crypto.randomUUID()}`;
+		const partitionContext = PartitionContextCreator.create({
+			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			tableName,
+			rootTreesN: 1,
+			hashSplitN: 2,
+			rangeSplitN: 2,
+			hashSplitConditions: { maxSizeMb: 100 },
+			rangeSplitConditions: { maxSizeMb: 500 },
+		});
+		const topology = new PartitionTopologyRouterImpl(partitionContext);
+		const db2 = new FokosDB({ topology, transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO, numTxCoordinators: 2 });
+		const db3 = new FokosDB({ topology, transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO, numTxCoordinators: 3 });
+		const shardFor = async (token: string, size: number) => {
+			const pool = new StaticShardedDO(env.TRANSACTION_COORDINATOR_DO, { numShards: size, shardGroupName: `fokos_tc.${tableName}` });
+			return (await pool.tryOne(token, async () => undefined)).shard;
+		};
+		let token = "";
+		for (let i = 0; i < 100 && token === ""; i++) {
+			const candidate = `pool-token-${i}`;
+			if ((await shardFor(candidate, 2)) !== (await shardFor(candidate, 3))) token = candidate;
+		}
+		expect(token).not.toBe("");
+		const operation = { hashKey: "pool-replay", operation: "put" as const, data: "value" };
+
+		const first = await db2.transactWriteItems({ items: [operation], clientRequestToken: token });
+		const replay = await db2.transactWriteItems({ items: [operation], clientRequestToken: token });
+		expect(replay).toEqual(first);
+
+		vi.advanceTimersByTime(1);
+		const rerouted = await db3.transactWriteItems({ items: [operation], clientRequestToken: token });
+		expect(rerouted.outcome).toBe("committed");
+		expect(rerouted.transactionId).not.toBe(first.transactionId);
+		await expect(db3.getItem({ hashKey: operation.hashKey })).resolves.toMatchObject({ found: true, item: { version: 2 } });
 	});
 });
 

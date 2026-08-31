@@ -2466,7 +2466,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 	});
 
-	it("commits the TTL stored in a stale pending row", async () => {
+	it("recovers by stored coordinator ID and commits the TTL in a stale pending row", async () => {
 		const { ctx, stub } = makeStub();
 		await stub.status(ctx);
 		const transactionId = crypto.randomUUID();
@@ -2504,7 +2504,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await state.storage.setAlarm(Date.now());
 		});
 
+		const getCoordinatorById = vi.spyOn(TransactionCoordinatorDO, "get");
 		await waitForAlarm(stub);
+		expect(getCoordinatorById).toHaveBeenCalledWith(env.TRANSACTION_COORDINATOR_DO, tcId.toString());
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "value", ttlAt },
