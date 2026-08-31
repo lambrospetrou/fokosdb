@@ -226,7 +226,7 @@ describe("expression limits and required columns", () => {
 				{ op: "eq", args: [{ ref: "hashKey" }, { val: "key" }] },
 				{ op: "eq", args: [{ ref: "sortKey" }, { val: "sort" }] },
 				{ op: "gte", args: [{ ref: "v" }, { val: 1 }] },
-				{ op: "exists", args: [{ ref: "ttl" }] },
+				{ op: "exists", args: [{ ref: "ttlAt" }] },
 				{ op: "eq", args: [{ fn: "attribute_type", args: [{ ref: "data", path: "$.value" }] }, { val: "text" }] },
 				{ op: "exists", args: [{ ref: "data" }] },
 			],

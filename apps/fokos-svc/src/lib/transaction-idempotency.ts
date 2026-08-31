@@ -25,11 +25,17 @@ function hashOperation(op: TCWriteOperation): bigint {
 	// One token carrying the operation, the kind, and WHICH optional fields are present. Without the
 	// presence flags an absent field and a present-but-empty one would chain identically, so
 	// `data: ""` would fingerprint the same as no data at all.
-	h = hash64(`${op.operation}|${op.kind ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}`, h);
+	h = hash64(
+		`${op.operation}|${op.kind ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}${op.ttlAt === undefined ? 0 : 1}`,
+		h,
+	);
 	if (op.data !== undefined) {
 		// string → UTF-8 inside xxhash; Uint8Array → hashed in place. `kind` is already chained above,
 		// so text "5" and the bytes 0x35 cannot collide.
 		h = hash64(op.data, h);
+	}
+	if (op.ttlAt !== undefined) {
+		h = hash64(String(op.ttlAt), h);
 	}
 	if (op.condition !== undefined) {
 		h = hash64(op.condition.identity, h);

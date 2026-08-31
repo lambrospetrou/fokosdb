@@ -21,6 +21,12 @@ describe("hashTransactionOperations", () => {
 		expect(hashTransactionOperations([put("a", "s", "v2")])).not.toBe(hashTransactionOperations([put("a", "s", "v1")]));
 	});
 
+	it("changes when the TTL is added or changed", () => {
+		const base = put("a", "s", "v");
+		expect(hashTransactionOperations([{ ...base, ttlAt: 100 }])).not.toBe(hashTransactionOperations([base]));
+		expect(hashTransactionOperations([{ ...base, ttlAt: 100 }])).not.toBe(hashTransactionOperations([{ ...base, ttlAt: 101 }]));
+	});
+
 	it("changes when a key changes", () => {
 		expect(hashTransactionOperations([put("a", "s", "v")])).not.toBe(hashTransactionOperations([put("b", "s", "v")]));
 		expect(hashTransactionOperations([put("a", "s2", "v")])).not.toBe(hashTransactionOperations([put("a", "s", "v")]));

@@ -4,7 +4,12 @@ export const EXPRESSION_NATIVE_TYPES = ["missing", "null", "boolean", "number", 
 
 export type ExpressionNativeType = (typeof EXPRESSION_NATIVE_TYPES)[number];
 
-export type ExpressionReference = { ref: "hashKey" } | { ref: "sortKey" } | { ref: "v" } | { ref: "ttl" } | { ref: "data"; path?: string };
+export type ExpressionReference =
+	| { ref: "hashKey" }
+	| { ref: "sortKey" }
+	| { ref: "v" }
+	| { ref: "ttlAt" }
+	| { ref: "data"; path?: string };
 
 export type ExpressionValue = { val: JsonValue } | ExpressionReference | { fn: string; args: readonly ExpressionValue[] };
 

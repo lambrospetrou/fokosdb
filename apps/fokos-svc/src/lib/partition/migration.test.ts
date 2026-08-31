@@ -101,6 +101,7 @@ describe("SplitMigration — hash child", () => {
 			data: "d",
 			kind: "text" as const,
 			conditions_json: conditionsJson,
+			ttl_epoch_utc_seconds: 777,
 			coordinator_do_id: "tc-1",
 			created_at: 1000,
 		};
@@ -112,7 +113,10 @@ describe("SplitMigration — hash child", () => {
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			expect(menv.store.pendingLockFor(kb("a"), kb("1"))?.transaction_id).toBe("tx1");
-			expect(menv.store.queryPendingTxPage(null, 1)[0].conditions_json).toBe(conditionsJson);
+			expect(menv.store.queryPendingTxPage(null, 1)[0]).toMatchObject({
+				conditions_json: conditionsJson,
+				ttl_epoch_utc_seconds: 777,
+			});
 			expect(menv.store.getMaxDeletedTs()).toBe(4567);
 		});
 	});

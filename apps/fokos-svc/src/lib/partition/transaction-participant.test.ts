@@ -106,7 +106,7 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with condition_failed when an item condition does not hold", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "existing", kind: "text", ttlAt: null, lastTransactionTs: 1 });
 
 			const request = prepareReq({
 				items: [
@@ -128,21 +128,24 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
-	it("persists the compiled condition plan after prepare accepts it", async () => {
+	it("persists the compiled condition plan and TTL after prepare accepts it", async () => {
 		await withParticipant(({ participant, store }) => {
 			const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
 			const request = prepareReq({
-				items: [{ hashKey: kb("new"), sortKey: kb("sk"), operation: "put", data: "v", kind: "text", condition }],
+				items: [{ hashKey: kb("new"), sortKey: kb("sk"), operation: "put", data: "v", kind: "text", ttlAt: 777, condition }],
 			});
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.queryPendingTxPage(null, 1)[0].conditions_json).toBe(JSON.stringify(condition));
+			expect(store.queryPendingTxPage(null, 1)[0]).toMatchObject({
+				conditions_json: JSON.stringify(condition),
+				ttl_epoch_utc_seconds: 777,
+			});
 		});
 	});
 
 	it("rejects with timestamp_conflict when the item's last transaction is not older", async () => {
 		await withParticipant(({ participant, store }) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "v", kind: "text", ttlEpochUtcSeconds: null, lastTransactionTs: BASE_NOW + 50 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "v", kind: "text", ttlAt: null, lastTransactionTs: BASE_NOW + 50 });
 
 			const atTs = prepareReq({
 				transactionTimestamp: BASE_NOW + 50, // equal to last_transaction_ts → conflict
@@ -169,7 +172,7 @@ describe("TransactionParticipant - prepare", () => {
 				sk: kb("sk"),
 				data: "from-tx",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: BASE_NOW + 4_000,
 			});
 
@@ -179,7 +182,7 @@ describe("TransactionParticipant - prepare", () => {
 				sk: kb("sk"),
 				data: "from-put",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: BASE_NOW,
 			});
 
@@ -250,7 +253,7 @@ describe("TransactionParticipant - prepare", () => {
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "v",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: BASE_NOW + 500,
 			});
 
@@ -279,7 +282,7 @@ describe("TransactionParticipant - commit", () => {
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "old",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: 1,
 			});
 			store.upsertItem({
@@ -287,13 +290,20 @@ describe("TransactionParticipant - commit", () => {
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "kept",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: 1,
 			});
 
 			const request = prepareReq({
 				items: [
-					{ hashKey: kb("to-put"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "new-value", kind: "text" },
+					{
+						hashKey: kb("to-put"),
+						sortKey: KeyCodec.encodeOptional(undefined),
+						operation: "put",
+						data: "new-value",
+						kind: "text",
+						ttlAt: 777,
+					},
 					{ hashKey: kb("to-delete"), sortKey: KeyCodec.encodeOptional(undefined), operation: "delete" },
 					{ hashKey: kb("to-check"), sortKey: KeyCodec.encodeOptional(undefined), operation: "check" },
 				],
@@ -301,13 +311,16 @@ describe("TransactionParticipant - commit", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
 			const commitTs = request.transactionTimestamp;
-			expect(
-				participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: commitTs, items: request.items }),
-			).toEqual({ outcome: "committed" });
+			const commitItems = request.items.map((item) => (item.operation === "put" ? { ...item, ttlAt: 999 } : item));
+			expect(participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: commitTs, items: commitItems })).toEqual(
+				{
+					outcome: "committed",
+				},
+			);
 
-			// put: written with the commit timestamp, and the promotion hook saw the upsert.
+			// Commit applies the expiry instant from the prepared row, not from the commit request.
 			const put = store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row;
-			expect(put).toMatchObject({ data: "new-value", last_transaction_ts: commitTs });
+			expect(put).toMatchObject({ data: "new-value", ttl_epoch_utc_seconds: 777, last_transaction_ts: commitTs });
 			expect(upserts).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
 			// delete: row gone and the deletion watermark advanced to the commit timestamp.
@@ -379,6 +392,20 @@ describe("TransactionParticipant - commit", () => {
 	});
 });
 
+describe("TransactionParticipant - single shot", () => {
+	it("stores the TTL of a put", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			expect(
+				participant.executeSingleShot({
+					items: [{ hashKey: kb("ttl-put"), sortKey, operation: "put", data: "value", kind: "text", ttlAt: 777 }],
+				}),
+			).toEqual({ outcome: "committed" });
+			expect(store.getItem(kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
+		});
+	});
+});
+
 describe("TransactionParticipant - cancel", () => {
 	it("removes every lock of the transaction so the items become preparable again", async () => {
 		await withParticipant(({ participant, store }) => {
@@ -407,14 +434,14 @@ describe("TransactionParticipant - readForTransaction", () => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			// Two writes inside the SAME millisecond: last_transaction_ts is identical, only `v` moves.
 			// This is the pair the two-phase read must be able to tell apart.
-			store.upsertItem({ hk: kb("k"), sk, data: "first", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
+			store.upsertItem({ hk: kb("k"), sk, data: "first", kind: "text", ttlAt: 777, lastTransactionTs: 100 });
 			const before = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
-			store.upsertItem({ hk: kb("k"), sk, data: "second", kind: "text", ttlEpochUtcSeconds: 777, lastTransactionTs: 100 });
+			store.upsertItem({ hk: kb("k"), sk, data: "second", kind: "text", ttlAt: 777, lastTransactionTs: 100 });
 			const after = participant.readForTransactionLocal({ items: [{ hashKey: kb("k"), sortKey: sk }] }).items[0];
 
 			invariant(before.found && after.found);
-			expect(before.ttlEpochUTCSeconds).toBe(777);
+			expect(before.ttlAt).toBe(777);
 			// The timestamps are identical, so a timestamp-only comparison cannot see the write at all.
 			expect(before.lastCommittedTs).toBe(after.lastCommittedTs);
 			// `v` does, which is why it is the primary conflict datum.
@@ -430,7 +457,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 				sk: KeyCodec.encodeOptional(undefined),
 				data: "value",
 				kind: "text",
-				ttlEpochUtcSeconds: null,
+				ttlAt: null,
 				lastTransactionTs: 42,
 			});
 			const lock = prepareReq({
@@ -456,7 +483,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 					data: "value",
 					kind: "text",
 					version: 1,
-					ttlEpochUTCSeconds: undefined,
+					ttlAt: undefined,
 					lastCommittedTs: 42,
 					hasPendingWrite: false,
 				},

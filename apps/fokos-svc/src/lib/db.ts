@@ -96,6 +96,12 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 	}
 }
 
+function validateTtlAt(ttlAt: number | undefined, where: string): void {
+	if (ttlAt === undefined) return;
+	if (!Number.isInteger(ttlAt)) throw new Error(`fokos: ${where} ttlAt must be an integer`);
+	if (ttlAt <= 0) throw new Error(`fokos: ${where} ttlAt must be greater than zero`);
+}
+
 export type FokosDBOptions = {
 	topology: PartitionTopologyRouter;
 	transactionCoordinatorNs: DurableObjectNamespace<TransactionCoordinatorDO>;
@@ -152,9 +158,7 @@ export class FokosDB {
 	}
 
 	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
-		if (opts.ttlEpochUTCSeconds !== undefined || opts.ttlSeconds !== undefined) {
-			throw new Error("fokosdb: TTL expiration not yet implemented");
-		}
+		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
@@ -166,13 +170,12 @@ export class FokosDB {
 		validateItemDataSize(encoded.data, "putItem");
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
-		// ttlSeconds is deliberately not forwarded: no layer honours it yet.
 		const res = await stub.apiPutItem(partitionContext, {
 			hashKey,
 			sortKey,
 			data: encoded.data,
 			kind: encoded.kind,
-			ttlEpochUTCSeconds: opts.ttlEpochUTCSeconds,
+			ttlAt: opts.ttlAt,
 			condition,
 		});
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
@@ -219,7 +222,9 @@ export class FokosDB {
 		// by a non-TypeScript caller stays present so validation rejects it.
 		const prepared = opts.items.map((item) => {
 			const condition = item.condition ? compileConditionExpression(item.condition) : undefined;
-			return item.operation === "put" ? { ...item, ...encodeItemData(item.data), condition } : { ...item, condition };
+			if (item.operation !== "put") return { ...item, condition };
+			validateTtlAt(item.ttlAt, "transactWriteItems");
+			return { ...item, ...encodeItemData(item.data), condition };
 		});
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
 		const keys = validateTransactWriteOperations(prepared);
@@ -438,7 +443,7 @@ export class FokosDB {
 					// json data arrives as JSON text — parse it once here to the public JsonValue.
 					data: decodeItemData(item.kind, item.data),
 					kind: item.kind,
-					ttlEpochUTCSeconds: item.ttl_epoch_utc_seconds ?? undefined,
+					ttlAt: item.ttl_epoch_utc_seconds ?? undefined,
 					version: item.v,
 				});
 			}

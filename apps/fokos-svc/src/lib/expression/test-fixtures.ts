@@ -7,7 +7,7 @@ export type ExpressionSemanticItem = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
 	v: number;
-	ttl?: number;
+	ttlAt?: number;
 	data: string | Uint8Array | JsonValue;
 	kind: DataKind;
 };
@@ -64,7 +64,7 @@ export const MISSING_NULL_SEMANTIC_FIXTURES = [
 	{
 		name: "an absent TTL is missing",
 		item: textItem,
-		condition: { op: "not_exists", args: [{ ref: "ttl" }] },
+		condition: { op: "not_exists", args: [{ ref: "ttlAt" }] },
 		expected: true,
 	},
 	{
@@ -161,7 +161,7 @@ export const VALID_CONDITION_SHAPE_FIXTURES = [
 			],
 		},
 	},
-	{ name: "not", condition: { op: "not", args: [{ op: "exists", args: [{ ref: "ttl" }] }] } },
+	{ name: "not", condition: { op: "not", args: [{ op: "exists", args: [{ ref: "ttlAt" }] }] } },
 	{ name: "exists", condition: { op: "exists", args: [{ ref: "data", path: "$.value" }] } },
 	{ name: "not_exists", condition: { op: "not_exists", args: [{ ref: "sortKey" }] } },
 	{ name: "begins_with", condition: { op: "begins_with", args: [{ ref: "data" }, { val: "prefix" }] } },
@@ -188,14 +188,14 @@ export const INVALID_CONDITION_SHAPE_FIXTURES = [
 			op: "not",
 			args: [
 				{ op: "exists", args: [{ ref: "v" }] },
-				{ op: "exists", args: [{ ref: "ttl" }] },
+				{ op: "exists", args: [{ ref: "ttlAt" }] },
 			],
 		},
 	},
 	{ name: "exists with no reference", condition: { op: "exists", args: [] } },
-	{ name: "exists with two references", condition: { op: "exists", args: [{ ref: "v" }, { ref: "ttl" }] } },
+	{ name: "exists with two references", condition: { op: "exists", args: [{ ref: "v" }, { ref: "ttlAt" }] } },
 	{ name: "not_exists with no reference", condition: { op: "not_exists", args: [] } },
-	{ name: "not_exists with two references", condition: { op: "not_exists", args: [{ ref: "v" }, { ref: "ttl" }] } },
+	{ name: "not_exists with two references", condition: { op: "not_exists", args: [{ ref: "v" }, { ref: "ttlAt" }] } },
 	{ name: "exists with a value", condition: { op: "exists", args: [{ val: 1 }] } },
 	{ name: "begins_with with one argument", condition: { op: "begins_with", args: [{ ref: "data" }] } },
 	{ name: "begins_with with three arguments", condition: { op: "begins_with", args: [{ ref: "data" }, { val: "a" }, { val: "b" }] } },

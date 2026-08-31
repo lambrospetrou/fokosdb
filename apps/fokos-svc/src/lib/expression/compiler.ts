@@ -328,7 +328,7 @@ function referencePresent(reference: ExpressionReference, context: CompileContex
 			return "(i.hk IS NOT NULL)";
 		case "sortKey":
 			return `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
-		case "ttl":
+		case "ttlAt":
 			return `(i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL)`;
 	}
 }
@@ -341,7 +341,7 @@ function referenceType(reference: ExpressionReference, context: CompileContext):
 			return keyType("i.sk", "i.hk IS NOT NULL AND length(i.sk) > 0");
 		case "v":
 			return `CASE WHEN i.hk IS NOT NULL THEN 'number' ELSE 'missing' END`;
-		case "ttl":
+		case "ttlAt":
 			return `CASE WHEN i.hk IS NOT NULL AND i.ttl_epoch_utc_seconds IS NOT NULL THEN 'number' ELSE 'missing' END`;
 		case "data":
 			if (reference.path !== undefined) {
@@ -362,7 +362,7 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 			return mode === "key" ? "i.sk" : logicalKeyValue("i.sk");
 		case "v":
 			return "i.v";
-		case "ttl":
+		case "ttlAt":
 			return "i.ttl_epoch_utc_seconds";
 		case "data":
 			if (reference.path !== undefined) {

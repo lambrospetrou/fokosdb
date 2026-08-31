@@ -137,6 +137,7 @@ export class TransactionParticipant {
 					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
 					kind: item.kind ?? null,
 					conditions_json: item.condition ? JSON.stringify(item.condition) : null,
+					ttl_epoch_utc_seconds: item.ttlAt ?? null,
 					coordinator_do_id: request.coordinatorDoId,
 					created_at: this.#now(),
 				});
@@ -196,7 +197,7 @@ export class TransactionParticipant {
 					data: pendingRow.data,
 					// For kind=json -> pendingRow.data is raw JSON text; upsertItem re-encodes it to JSONB.
 					kind: pendingRow.kind,
-					ttlEpochUtcSeconds: null,
+					ttlAt: pendingRow.ttl_epoch_utc_seconds,
 					lastTransactionTs: transactionTimestamp,
 				});
 				this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
@@ -264,7 +265,7 @@ export class TransactionParticipant {
 						data: item.data,
 						// For kind=json -> data is raw JSON text; upsertItem re-encodes it to JSONB.
 						kind: item.kind,
-						ttlEpochUtcSeconds: null,
+						ttlAt: item.ttlAt ?? null,
 						lastTransactionTs: transactionTimestamp,
 					});
 					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
@@ -316,7 +317,7 @@ export class TransactionParticipant {
 					// `v` is the conflict datum for the TC's two-phase read AND the public version, so the
 					// caller can feed it straight back into an attribute_equals condition.
 					version: itemRow.v,
-					ttlEpochUTCSeconds: itemRow.ttl_epoch_utc_seconds ?? undefined,
+					ttlAt: itemRow.ttl_epoch_utc_seconds ?? undefined,
 					lastCommittedTs,
 					hasPendingWrite,
 				});

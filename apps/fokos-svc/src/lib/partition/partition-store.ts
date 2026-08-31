@@ -66,6 +66,7 @@ export type PendingTransactionRow = {
 	data: string | Uint8Array | null;
 	kind: DataKind | null;
 	conditions_json: string | null;
+	ttl_epoch_utc_seconds: number | null;
 	coordinator_do_id: string;
 	created_at: number;
 };
@@ -125,7 +126,7 @@ export function estimateItemBytes(item: MigratedItem): number {
 
 export function estimatePendingTxBytes(row: PendingTransactionRow): number {
 	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
+	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
 }
 
 /**
@@ -189,7 +190,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 PRIMARY KEY (hk, sk)
             ) STRICT;
 
-            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hk, sk, est_row_bytes);`,
+            CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hk, sk, est_row_bytes);
+            CREATE INDEX IF NOT EXISTS idx_items_ttl ON items (ttl_epoch_utc_seconds, hk, sk)
+                WHERE ttl_epoch_utc_seconds IS NOT NULL;`,
 	},
 	{
 		idMonotonicInc: 2,
@@ -228,6 +231,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 operation             TEXT    NOT NULL,
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
+                ttl_epoch_utc_seconds INTEGER,
 				data                  ANY,
                 PRIMARY KEY (hk, sk, transaction_id)
             ) STRICT;
@@ -407,7 +411,7 @@ export class PartitionStore {
 		/** json ⇒ `data` is JSON text, wrapped with jsonb() into the binary form on write. */
 		data: string | Uint8Array;
 		kind: DataKind;
-		ttlEpochUtcSeconds: number | null;
+		ttlAt: number | null;
 		lastTransactionTs: number;
 	}): {
 		version: number;
@@ -450,7 +454,7 @@ export class PartitionStore {
 			opts.hk,
 			opts.sk,
 			DATA_KINDS.indexOf(opts.kind),
-			opts.ttlEpochUtcSeconds,
+			opts.ttlAt,
 			opts.lastTransactionTs,
 			opts.data,
 		);
@@ -499,6 +503,52 @@ export class PartitionStore {
 			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, delEst, opts.hk);
 		}
 		return { deleted, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
+	}
+
+	/**
+	 * Deletes one bounded chunk of expired, unlocked items and updates all deletion bookkeeping in the
+	 * same storage transaction. The victim scan uses only metadata columns and never reads item data.
+	 */
+	deleteExpiredItems(nowSeconds: number, limit: number): { deletedRows: number; deletedBytes: number } {
+		return this.transactionSync(() => {
+			const rows = this.#storage.sql
+				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number }>(
+					`DELETE FROM items
+					 WHERE rowid IN (
+					     SELECT i.rowid FROM items i INDEXED BY idx_items_ttl
+					      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
+					        AND i.ttl_epoch_utc_seconds <= ?1
+					        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
+					        AND NOT EXISTS (SELECT 1 FROM promoted_keys pk WHERE pk.hash_key = i.hk)
+					      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
+					      LIMIT ?2
+					 )
+					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds`,
+					nowSeconds,
+					limit,
+				)
+				.toArray();
+
+			const bytesByHashKey = new Map<string, { hk: KeyBytes; bytes: number }>();
+			let deletedBytes = 0;
+			let maxExpirySeconds = 0;
+			for (const row of rows) {
+				const hk = fromSqlKey(row.hk);
+				const key = hk.toBase64({ alphabet: "base64url" });
+				const current = bytesByHashKey.get(key);
+				if (current) current.bytes += row.est_row_bytes;
+				else bytesByHashKey.set(key, { hk, bytes: row.est_row_bytes });
+				deletedBytes += row.est_row_bytes;
+				maxExpirySeconds = Math.max(maxExpirySeconds, row.ttl_epoch_utc_seconds);
+			}
+
+			for (const { hk, bytes } of bytesByHashKey.values()) {
+				this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, bytes, hk);
+			}
+			if (rows.length > 0) this.bumpMaxDeletedTs(maxExpirySeconds * 1000);
+
+			return { deletedRows: rows.length, deletedBytes };
+		});
 	}
 
 	/** The transactional "check" operation: bumps the item's timestamp without changing data. */
@@ -810,8 +860,8 @@ export class PartitionStore {
 			// pending_transactions is never queried by JSON path, so json data is stored raw (as text),
 			// not JSONB, the data_kind tag lets commit reconstruct the kind for upsertItem.
 			`INSERT OR IGNORE INTO pending_transactions
-			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, coordinator_do_id, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
 			row.transaction_id,
@@ -820,6 +870,7 @@ export class PartitionStore {
 			row.data,
 			codeFromNullableKind(row.kind),
 			row.conditions_json,
+			row.ttl_epoch_utc_seconds,
 			row.coordinator_do_id,
 			row.created_at,
 		);
@@ -862,26 +913,40 @@ export class PartitionStore {
 		hk: KeyBytes,
 		sk: KeyBytes,
 		transactionId: string,
-	): { operation: string; data: string | Uint8Array | null; kind: DataKind | null } | undefined {
+	): { operation: string; data: string | Uint8Array | null; kind: DataKind | null; ttl_epoch_utc_seconds: number | null } | undefined {
 		const row = this.#storage.sql
 			.exec<{
 				operation: string;
 				data: string | ArrayBuffer | null;
 				data_kind: number | null;
+				ttl_epoch_utc_seconds: number | null;
 			}>(
-				`SELECT operation, data, data_kind FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
+				`SELECT operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
 				hk,
 				sk,
 				transactionId,
 			)
 			.toArray()[0];
-		return row ? { operation: row.operation, data: fromSqlData(row.data), kind: kindFromNullableCode(row.data_kind) } : undefined;
+		return row
+			? {
+					operation: row.operation,
+					data: fromSqlData(row.data),
+					kind: kindFromNullableCode(row.data_kind),
+					ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
+				}
+			: undefined;
 	}
 
 	/** Stale-transaction recovery: the locked items of one transaction, data converted. */
-	listPendingTxItems(
-		transactionId: string,
-	): { hk: KeyBytes; sk: KeyBytes; transaction_ts: number; operation: string; data: string | Uint8Array | null; kind: DataKind | null }[] {
+	listPendingTxItems(transactionId: string): {
+		hk: KeyBytes;
+		sk: KeyBytes;
+		transaction_ts: number;
+		operation: string;
+		data: string | Uint8Array | null;
+		kind: DataKind | null;
+		ttl_epoch_utc_seconds: number | null;
+	}[] {
 		return this.#storage.sql
 			.exec<{
 				hk: ArrayBuffer;
@@ -890,7 +955,11 @@ export class PartitionStore {
 				operation: string;
 				data: string | ArrayBuffer | null;
 				data_kind: number | null;
-			}>(`SELECT hk, sk, transaction_ts, operation, data, data_kind FROM pending_transactions WHERE transaction_id = ?`, transactionId)
+				ttl_epoch_utc_seconds: number | null;
+			}>(
+				`SELECT hk, sk, transaction_ts, operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
+				transactionId,
+			)
 			.toArray()
 			.map(({ data_kind, ...row }) => ({
 				...row,
@@ -963,11 +1032,12 @@ export class PartitionStore {
 			data: string | ArrayBuffer | null;
 			data_kind: number | null;
 			conditions_json: string | null;
+			ttl_epoch_utc_seconds: number | null;
 			coordinator_do_id: string;
 			created_at: number;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, coordinator_do_id, created_at`;
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);

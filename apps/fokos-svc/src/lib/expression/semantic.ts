@@ -20,7 +20,7 @@ export type ConditionExpressionAnalysis = {
 	requiredColumns: readonly ExpressionRequiredColumn[];
 };
 
-type DirectReference = "hashKey" | "sortKey" | "v" | "ttl" | "data";
+type DirectReference = "hashKey" | "sortKey" | "v" | "ttlAt" | "data";
 
 type ValueFacts = {
 	types: ReadonlySet<ExpressionNativeType>;
@@ -60,7 +60,7 @@ const nullBytesValue: ValueFacts = { types: nullBytesTypes };
 const hashKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "hashKey" };
 const sortKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "sortKey" };
 const versionValue: ValueFacts = { types: missingNumberTypes, directReference: "v" };
-const ttlValue: ValueFacts = { types: missingNumberTypes, directReference: "ttl" };
+const ttlValue: ValueFacts = { types: missingNumberTypes, directReference: "ttlAt" };
 const dataValue: ValueFacts = { types: allTypes, directReference: "data" };
 const sqliteNumberFunctions = new Set([
 	"abs",
@@ -264,7 +264,7 @@ function analyzeReferenceNode(expression: Record<string, unknown>, context: Anal
 			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
 			context.requiredColumns.add("v");
 			return versionValue;
-		case "ttl":
+		case "ttlAt":
 			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
 			context.requiredColumns.add("ttl_epoch_utc_seconds");
 			return ttlValue;

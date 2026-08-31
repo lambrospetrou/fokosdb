@@ -1,6 +1,6 @@
 # RFC — Item TTL expiration in partition Durable Objects
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-08-30
 **Author:** Lambros
 
