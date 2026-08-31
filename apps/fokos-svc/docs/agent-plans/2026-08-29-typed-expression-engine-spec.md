@@ -3,14 +3,6 @@
 Date: 2026-08-29  
 Status: **accepted design; M0-M5 implemented**
 
-References:
-
-- [DynamoDB condition and filter expressions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.OperatorsAndFunctions.html)
-- `docs/agent-plans/item-data-kinds-jsonb.md`
-- `docs/adr/001-query-items-operation.md`
-- `docs/agent-plans/query-items-design.md`
-- `docs/agent-plans/key-codec-bytes-implementation.md`
-
 ---
 
 ## 1. Goal and scope
@@ -940,26 +932,7 @@ and persistence changes listed in section 7.
 Test all operators on put/delete, JSON conditions, no-write on failure, lock/check order,
 two-phase/single-shot behavior, idempotency, plan persistence/size, migration, and split routing.
 
-### M6 — Composite JSON literal bindings
-
-This milestone is additive. M1-M5 must reject array and object literals during semantic validation.
-Scalar condition expressions and their compiled plans must remain compatible when this milestone
-ships.
-
-Deliver:
-
-- A canonical JSON serializer for array and object literals.
-- One traversal that validates, enforces limits, writes canonical JSON text, and feeds identity bytes.
-- Canonical JSON text bindings with explicit logical `array` or `object` metadata.
-- Compiler-owned `jsonb(?)`, `json(?)`, and `json_each(?)` forms where each operation needs them.
-- Persistence and JSON round-trip support for the serialized bindings in compiled plans.
-
-Test nested and empty composites, array order, canonical object-key order, escaped strings, all JSON
-scalar children, cycles, unsupported runtime values, depth, and payload limits. Test different object
-insertion orders with equal identities and equal bindings. Test `size`, `attribute_type`, `contains`,
-and condition expressions in Workers SQLite.
-
-### M7 — Binary key and data literals
+### M6 — Binary key and data literals
 
 This milestone is additive. M1-M6 must reject the `bytes` literal during semantic validation. Plans
 compiled before this milestone must stay valid when it ships.
@@ -997,7 +970,7 @@ Test in Workers SQLite:
 - Plan JSON round-trip equality for `keyBytes` and `bytes` descriptors.
 - Primary-key query plan for a byte key literal.
 
-### M8 — Projections
+### M7 — Projections
 
 Deliver in this order:
 
@@ -1007,6 +980,25 @@ Deliver in this order:
 
 Test default names, aliases, duplicates, missing/null, computed values, composite literals, reverse
 paths, all source kinds, absent projection compatibility, transaction ordering, and split reads.
+
+### M8 — Composite JSON literal bindings
+
+This milestone is additive. M1-M5 must reject array and object literals during semantic validation.
+Scalar condition expressions and their compiled plans must remain compatible when this milestone
+ships.
+
+Deliver:
+
+- A canonical JSON serializer for array and object literals.
+- One traversal that validates, enforces limits, writes canonical JSON text, and feeds identity bytes.
+- Canonical JSON text bindings with explicit logical `array` or `object` metadata.
+- Compiler-owned `jsonb(?)`, `json(?)`, and `json_each(?)` forms where each operation needs them.
+- Persistence and JSON round-trip support for the serialized bindings in compiled plans.
+
+Test nested and empty composites, array order, canonical object-key order, escaped strings, all JSON
+scalar children, cycles, unsupported runtime values, depth, and payload limits. Test different object
+insertion orders with equal identities and equal bindings. Test `size`, `attribute_type`, `contains`,
+and condition expressions in Workers SQLite.
 
 ### M9 — Query filters
 
@@ -1106,6 +1098,16 @@ Required future behavior:
 - For transaction updates, either materialize the result during prepare or require deterministic
   expressions and evaluate against the locked image.
 - Reuse projections for old/new return values.
+
+## References
+
+Only read these if the above is not clear.
+
+- [DynamoDB condition and filter expressions](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.OperatorsAndFunctions.html)
+- `docs/agent-plans/item-data-kinds-jsonb.md`
+- `docs/adr/001-query-items-operation.md`
+- `docs/agent-plans/query-items-design.md`
+- `docs/agent-plans/key-codec-bytes-implementation.md`
 
 ---
 
