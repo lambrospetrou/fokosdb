@@ -51,8 +51,8 @@ export type PutItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
 
-	ttlSeconds?: number;
-	ttlEpochUTCSeconds?: number;
+	/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
+	ttlAt?: number;
 
 	data: string | Uint8Array | JsonComposite;
 
@@ -102,7 +102,8 @@ export type GetItemResult =
 				sortKey?: string | Uint8Array;
 				data: string | Uint8Array | JsonValue;
 				kind: DataKind;
-				ttlEpochUTCSeconds?: number;
+				/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
+				ttlAt?: number;
 				version: number;
 			};
 			meta: OperationMetrics & PartitionInfo & {};
@@ -216,7 +217,8 @@ export type QueryItemsResult = {
 		sortKey?: string | Uint8Array;
 		data: string | Uint8Array | JsonValue;
 		kind: DataKind;
-		ttlEpochUTCSeconds?: number;
+		/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
+		ttlAt?: number;
 		version: number;
 	}>;
 	count: number;

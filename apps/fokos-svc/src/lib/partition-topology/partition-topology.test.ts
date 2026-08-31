@@ -119,12 +119,9 @@ describe("RangePartitionTopologyImpl — serves/rejects/forwards by sort-key ran
 		const rootStub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(rootStub, rootCtx, makeHashCtx(base));
 
-		// Write ~50 KB items until a range split is queued AND at least RANGE_SPLIT_N items exist.
-		// Both conditions are needed: computeRangeSplitBoundaries refuses to split fewer than N items
-		// (it cannot make N non-empty children), so a split queued at 1 item stays queued forever.
-		// The empty schema already occupies ~57 KB of the 0.1 MB budget, so a single item can cross
-		// the size threshold on its own — do not rely on the size trigger to imply enough items.
-		const bigData = "x".repeat(50 * 1024);
+		// Each row stays below the 10% overage band, so two rows can land before the split starts.
+		// Two rows are required because each child must receive at least one row.
+		const bigData = "x".repeat(24 * 1024);
 		for (let i = 0; i < 10; i++) {
 			await rootStub.apiPutItem(rootCtx, {
 				hashKey: kb("alice"),
@@ -198,7 +195,7 @@ describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
 		const stub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 		await setupRootRangeDO(stub, rootCtx, makeHashCtx(base));
 
-		const bigData = "x".repeat(50 * 1024);
+		const bigData = "x".repeat(24 * 1024);
 		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: bigData, kind: "text" });
 		await stub.apiPutItem(rootCtx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: bigData, kind: "text" });
 

@@ -48,6 +48,7 @@ type TcItemRow = {
 	// Persisted so the reconstructed TransactionItem carries the kind through prepare/commit; for json,
 	// `data` is the JSON text (the DO re-encodes to JSONB on commit). NULL for delete/check (no data).
 	data_kind: number | null;
+	ttl_epoch_utc_seconds: number | null;
 	conditions_json: string | null;
 	partition_do_name: string;
 };
@@ -109,6 +110,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 operation           TEXT    NOT NULL,
                 data                ANY,
                 data_kind           INTEGER,
+                ttl_epoch_utc_seconds INTEGER,
                 conditions_json     TEXT,
                 partition_do_name   TEXT    NOT NULL,
                 PRIMARY KEY (transaction_id, hk, sk)
@@ -189,8 +191,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			);
 			for (const op of request.items) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, partition_do_name)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
@@ -198,6 +200,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					op.data ?? null,
 					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
 					op.kind === undefined ? null : DATA_KINDS.indexOf(op.kind),
+					op.ttlAt ?? null,
 					op.condition ? JSON.stringify(op.condition) : null,
 					op.partitionContext.doName,
 				);
@@ -794,7 +797,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadItems(transactionId: string): TcItemRow[] {
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name
+				`SELECT transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, partition_do_name
                  FROM tc_items WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -852,6 +855,7 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		operation: row.operation as TransactionItem["operation"],
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
 		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
+		ttlAt: row.ttl_epoch_utc_seconds ?? undefined,
 		condition: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
 	}));
 }

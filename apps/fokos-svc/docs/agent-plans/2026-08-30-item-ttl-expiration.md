@@ -1,6 +1,6 @@
 # RFC — Item TTL expiration in partition Durable Objects
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-08-30
 **Author:** Lambros
 
@@ -30,9 +30,11 @@ Four gaps follow:
 
 1. **The public API rejects TTL.** `FokosDB.putItem` throws `"fokosdb: TTL expiration not yet implemented"`
    when the caller gives `ttlSeconds` or `ttlEpochUTCSeconds`.
-2. **A transaction cannot carry a TTL.** `TransactWriteItem` has no TTL field. `TransactionItem` has no
-   TTL field. `pending_transactions` has no TTL column. `TransactionParticipant` writes
-   `ttlEpochUtcSeconds: null` on both the commit path and the single-shot path.
+2. **A transaction cannot carry a TTL.** `TransactWriteItem` has no TTL field. `TCWriteOperation` has
+   none, and the coordinator's `tc_items` table — from which the coordinator rebuilds every prepare —
+   has no TTL column. `TransactionItem` has no TTL field. `pending_transactions` has no TTL column.
+   `TransactionParticipant` writes `ttlEpochUtcSeconds: null` on both the commit path and the
+   single-shot path.
 3. **No index finds expired rows.** A sweep would scan the whole table.
 4. **No job deletes expired rows.** Storage grows without limit. A Durable Object holds at most 10 GB.
 
@@ -63,6 +65,10 @@ for the hash key of the item.
 
 ### 1.3 Glossary
 
+- **`ttlAt`** — the one public and wire field that carries the expiry instant: epoch UTC, in seconds.
+  Every TypeScript type uses this name, except the store row types that mirror SQL rows
+  (`MigratedItem`, `PendingTransactionRow`), which keep the column name `ttl_epoch_utc_seconds` in the
+  same way they keep `last_transaction_ts`.
 - **Expiry instant** — the value of `items.ttl_epoch_utc_seconds` for one row, in seconds.
 - **Expired row** — a row whose expiry instant is at or before the current time.
 - **Sweep** — one pass that deletes expired rows.
@@ -75,9 +81,9 @@ for the hash key of the item.
 
 ### 2.1 In scope
 
-1. `FokosDB.putItem` accepts `ttlSeconds` and `ttlEpochUTCSeconds` and stores the expiry instant.
-2. `FokosDB.transactWriteItems` accepts the same two fields on a `put` operation, and a committed
-   transactional put stores the expiry instant.
+1. `FokosDB.putItem` accepts one field, `ttlAt`, and stores it as the expiry instant.
+2. `FokosDB.transactWriteItems` accepts `ttlAt` on a `put` operation, and a committed transactional
+   put stores the expiry instant — on the coordinator path and on the single-shot path alike.
 3. Stale transaction recovery replays a transactional put with the same expiry instant as the first
    try.
 4. A background sweeper deletes expired rows from the partition that owns them.
@@ -85,7 +91,7 @@ for the hash key of the item.
    and it waits `sleepMs` after it deletes `maxRowsBeforeSleep` rows or `maxBytesBeforeSleep` bytes.
 6. The sweeper never deletes a row that a pending transaction locks.
 7. The sweeper never runs while the partition migrates or after the partition splits.
-8. A TTL delete moves `deletion_metadata.max_deleted_ts` forward by the expiry instant of the row.
+8. A TTL delete moves `deletion_metadata.max_deleted_ts` forward to the expiry instant of the row.
 9. Every public RPC of `PartitionDO` passes through one wrapper method.
 
 ### 2.2 Out of scope
@@ -96,8 +102,8 @@ for the hash key of the item.
 - **An alarm for the sweeper.** Section 4.2.9 states how the timer starts instead.
 - **Storage reclaim.** Deleting a row frees a SQLite page for reuse. Whether the page returns to the
   operating system is Open Question 4.3.1.
-- **A per-table switch for TTL.** The partition always honours the column. A subclass that wants no
-  sweeper overrides the configuration in section 4.2.11.
+- **A per-table switch for TTL.** The partition always honours the column, and the configuration of
+  section 4.2.11 has no off switch.
 
 ### 2.3 Requirements
 
@@ -118,13 +124,13 @@ for the hash key of the item.
 Each milestone ships on its own and leaves the system correct.
 
 **M1 — Schema and the write path.** The schema changes of section 4.2.1, the validation of section
-4.2.2, the TTL fields on `TransactWriteItem` and `TransactionItem`, the TTL column on
-`pending_transactions`, and the recovery path. After M1 a user can store an expiry instant and read it
-back. Nothing expires yet.
+4.2.2, the `ttlAt` field on `TransactWriteItem`, `TCWriteOperation` and `TransactionItem`, the TTL
+column on `pending_transactions` and on `tc_items`, and the operations hash. After M1 a user can store
+an expiry instant and read it back. Nothing expires yet.
 
 **M2 — The sweeper.** The `TtlExpiry` class of section 4.2.4, its guard conditions, its watermark rule,
-and the timer that the constructor of `PartitionDO` arms. After M2 a partition that wakes deletes its
-expired rows.
+the timer that the constructor of `PartitionDO` arms, and the arm on migration completion. After M2 a
+partition that wakes deletes its expired rows.
 
 **M3 — The RPC wrapper.** The wrapper of section 4.2.10, and the call to `TtlExpiry.arm` inside it.
 After M3 a request arms the timer, so a partition that already runs does not wait for the next wake.
@@ -139,11 +145,12 @@ An item can carry an expiry instant. The partition that owns the item deletes it
 passes. The partition deletes in small chunks and it yields between two chunks, so a partition with
 100,000 expired rows does not stop serving requests.
 
-A timer inside the Durable Object drives the sweeper. The timer has three sources:
+A timer inside the Durable Object drives the sweeper. The timer has four sources:
 
 1. The constructor of `PartitionDO` arms it 500 ms after the object wakes.
 2. The sweeper re-arms it after a cycle that still finds expired rows.
 3. Every public RPC arms it, if no timer is pending.
+4. The background work arms it after a child migration completes.
 
 The sweeper does not use an alarm. A partition that gets no request does not wake, so it does not
 sweep. The item stays on disk until the next request or the next wake. This is the cost of the design,
@@ -231,44 +238,67 @@ ttl_epoch_utc_seconds INTEGER,
 The column holds the expiry instant of a prepared put until the transaction commits. It is `NULL` for a
 `delete` operation and for a `check` operation, in the same way `data_kind` is.
 
+**Migration 1 of the transaction coordinator, the `tc_items` table.** Add the same column:
+
+```sql
+ttl_epoch_utc_seconds INTEGER,
+```
+
+The coordinator writes its state ahead of every outbound RPC and rebuilds every prepare — the first
+attempt, a retry, and a crash recovery — from `tc_items`. A value that is not in this table does not
+survive the coordinator, so the column is as load-bearing as the one on `pending_transactions`.
+
 #### 4.2.2 TTL on the write path
 
-**`FokosDB.putItem` resolves the value.** The public API keeps both fields. `db.ts` turns them into one
-expiry instant and sends only `ttlEpochUTCSeconds` to the partition. The rules:
+**One field, passed through.** The public API takes one optional field, `ttlAt`: the epoch instant in
+seconds at which the item expires. The caller computes the instant; no layer reads a clock on its
+behalf. DynamoDB works the same way — the TTL attribute is a number the caller wrote, and the service
+only ever compares it. The value of a request is therefore a pure function of what the caller wrote:
+a retry carries the same bytes as the first attempt. Sections 5.6 and 5.7 state what the two dropped
+conveniences would have cost.
 
-1. When the caller gives both `ttlSeconds` and `ttlEpochUTCSeconds`, `putItem` throws.
-2. When the caller gives `ttlSeconds`, `putItem` computes
-   `Math.floor(Date.now() / 1000) + ttlSeconds`.
-3. The value must be an integer. `putItem` throws for a value that is not an integer.
-4. The value must be in the future. `putItem` throws when the expiry instant is at or before
-   `Math.floor(Date.now() / 1000)`.
+**Validation.** `db.ts` checks the field once, at the public boundary, for `putItem` and for a `put`
+inside `transactWriteItems`:
 
-Rule 4 rejects a TTL in the past. A caller that wants to delete an item calls `deleteItem`. A TTL in
-the past is a bug in the caller, most often a millisecond value in a seconds field, and a throw finds
-it at once.
+1. `ttlAt` must be an integer. A non-integer throws.
+2. `ttlAt` must be greater than zero. Zero or a negative value throws.
 
-`db.ts` holds the only definition of the conversion, so a transaction and a single put agree.
+A `ttlAt` at or before the current time is valid. The item is expired the moment it lands, a read
+returns it until the sweeper deletes it (section 4.2.3), and the next cycle deletes it. DynamoDB
+accepts a past timestamp too, and section 5.6 states why rejecting one is worse.
 
 **A put with no TTL clears the TTL.** `PartitionStore.upsertItem` already writes
 `ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds`. A put replaces the whole item, so it also
 replaces the expiry instant. A caller that wants to keep the TTL must send it again.
 
-**The transaction path carries the value through five places:**
+**The single put path.** `db.ts` sends `ttlAt` on the `apiPutItem` request, and `PartitionDO` passes
+it to `upsertItem`. The wire request and the store already carry the value under the name
+`ttlEpochUTCSeconds`; the field renames to `ttlAt` (glossary, section 1.3) and the throw at the
+boundary goes away.
 
-1. `TransactWriteItem`, the `put` variant, gets `ttlSeconds` and `ttlEpochUTCSeconds`.
-2. `db.ts` validates and resolves them with the same rules, then sets `ttlEpochUTCSeconds` on the
-   `TransactionItem`.
-3. `TransactionItem` gets `ttlEpochUTCSeconds`.
-4. `PartitionStore.insertPendingLock` writes the value into the new column of `pending_transactions`.
+**The transaction path carries the value through the coordinator:**
+
+1. `TransactWriteItem`, the `put` variant, gets `ttlAt`. `db.ts` validates it and copies it onto the
+   `TCWriteOperation`.
+2. `TransactionCoordinatorDO.initiateWrite` persists the value into the new `tc_items` column of
+   section 4.2.1.
+3. `hashTransactionOperations` folds `ttlAt` into the operations hash. Two requests that differ only
+   in `ttlAt` are different transactions, and an idempotent replay still hashes the same because the
+   value is deterministic.
+4. `toTransactionItems` copies the column onto `TransactionItem.ttlAt`, so the coordinator's prepare
+   and the single-shot path carry the same shape.
+5. `PartitionStore.insertPendingLock` writes the value into the new column of `pending_transactions`.
    `PendingTransactionRow` gets the field.
-5. `TransactionParticipant` reads `pendingRow.ttl_epoch_utc_seconds` on the commit path and passes it
-   to `upsertItem`. It reads `item.ttlEpochUTCSeconds` on the single-shot path, which holds no pending
-   row.
+6. `TransactionParticipant` passes the value to `upsertItem` on commit. The commit path reads it from
+   the pending row — `getPendingTxOp` gets the column — and never from the request items, which only
+   name the keys. The single-shot path reads `item.ttlAt`, because it holds no pending row.
 
-**Stale transaction recovery must carry the value too.** The recovery job in
-`PartitionDO.runBackgroundWork` rebuilds a `TransactionItem[]` from the pending rows and calls
-`txCommit`. The rebuild must copy `ttl_epoch_utc_seconds`. Without it a recovered transaction writes
-an item with no TTL, so the same write keeps or loses its TTL by chance.
+**Recovery and split inheritance carry the value for free, and each needs a test.** Stale transaction
+recovery rebuilds a `TransactionItem[]` and calls `txCommit`, and commit reads the TTL from the
+pending row, so recovery needs no copy of its own. A split child inherits pending locks through
+`queryPendingTxPage`, whose rows are `PendingTransactionRow` — the compiler enforces that column. But
+`getPendingTxOp` and `listPendingTxItems` return their own inline row types, which the compiler does
+not connect to the schema, so tests 17 and 19 of section 4.2.15 hold both paths.
 
 #### 4.2.3 Read behaviour
 
@@ -276,9 +306,9 @@ A read returns an expired row as an ordinary item, until the sweeper deletes it.
 `getItem`, `queryItems`, `transactGetItems`, a condition of type `item_exists` or `item_not_exists`, and
 the timestamp check inside `prepare`.
 
-The caller filters. Every read result already carries `ttlEpochUTCSeconds`: `GetItemResult`,
-`QueryItemsResult`, and the read result of a transaction. The public documentation of `ttlSeconds` must
-state the contract.
+The caller filters. Every read result already carries the value — `GetItemResult`,
+`QueryItemsResult`, and the read result of a transaction — and the field renames to `ttlAt` there
+too. The public documentation of `ttlAt` must state the contract.
 
 #### 4.2.4 The `TtlExpiry` class
 
@@ -295,6 +325,8 @@ export type TtlExpiryDeps = {
     /** Read late, so a subclass of PartitionDO can override the values. */
     config: () => TtlSweepConfig;
     now?: () => number;
+    /** The yield and the sleep of section 4.2.6. Defaults to scheduler.wait; a test injects a counter. */
+    wait?: (ms: number) => Promise<void>;
 };
 
 export class TtlExpiry {
@@ -436,13 +468,13 @@ runCycle():
     if res.deletedRows < chunkSize:    return { more: false }
 
     if rowsSinceSleep >= maxRowsBeforeSleep or bytesSinceSleep >= maxBytesBeforeSleep:
-        await sleep(sleepMs)
+        await wait(sleepMs)
         rowsSinceSleep = 0, bytesSinceSleep = 0
     else:
-        await yieldToEventLoop()
+        await wait(0)
 ```
 
-Four rules follow from the loop.
+Five rules follow from the loop.
 
 **`canSweep` runs before every chunk, not once per cycle.** A split can start while a cycle runs. The
 check reads two storage KV keys, which the Durable Object holds in memory, so the cost per chunk is
@@ -451,6 +483,13 @@ small.
 **The loop yields between two chunks even when it does not sleep.** A chunk is synchronous, so a run of
 100 chunks with no `await` would hold the isolate for the whole run. The yield lets a queued request
 run. The sweeper never holds the input gate across a chunk.
+
+**Both the yield and the sleep are `scheduler.wait`.** The yield must be a macrotask, because a
+queued request is an event, not a microtask: `await Promise.resolve()` drains only the microtask
+queue and lets no request run. `scheduler.wait(0)` is the platform's macrotask yield, and
+`scheduler.wait(sleepMs)` is the sleep, so the loop has one waiting primitive. The loop reaches it
+through the `wait` dependency of section 4.2.4, which defaults to `scheduler.wait`, so a test counts
+the sleeps without a fake timer.
 
 **A partial chunk ends the cycle.** `deletedRows < chunkSize` means no more row matches the filters
 now. The rows that stay are locked or promoted, and the sweeper leaves them to the next cycle. A commit
@@ -471,7 +510,10 @@ stops otherwise. The cap bounds one continuous run and gives the other work of t
    `migration_migrating`. The child does not hold all of its rows, and it does not hold its inherited
    locks, so the lock guard of section 4.2.4 cannot see a lock that has not arrived. The migration also
    ends with `PartitionStore.rebuildKeySizeEstimates`, which would lose the decrements of a concurrent
-   sweep. The sweeper stops and re-arms, because the state ends.
+   sweep. The sweeper stops and does not re-arm itself — `runCycle` returns the same `more: false` for
+   every guard, so the timer callback cannot tell this case apart. The re-arm comes from outside:
+   `runBackgroundWork` arms the timer after the migration job writes `migration_completed` (section
+   4.2.9, source 4), so the child sweeps the expired rows it inherited without waiting for a request.
 3. **The partition split.** The split status is `split_started` or `split_completed`. Section 4.2.12
    states why.
 
@@ -501,15 +543,28 @@ The timer is a private field of the `TtlExpiry` instance, and that instance is a
 `PartitionDO` instance. It must not be a `static` field. Several Durable Object instances of one class
 can share one isolate, so a static handle would let one partition clear the timer of another.
 
-Three sources arm the timer:
+Four sources arm the timer:
 
 1. **The constructor.** `PartitionDO` calls `arm(500)` after it builds `TtlExpiry`. The call is outside
    `blockConcurrencyWhile`, and it follows the pattern the constructor already uses for the colo
    lookup.
 2. **The sweeper.** `runCycle` reports `more: true`, so the timer callback re-arms.
 3. **A request.** The RPC wrapper of section 4.2.10 calls `arm()`.
+4. **Migration completion.** `runBackgroundWork` calls `arm()` after the migration job writes
+   `migration_completed`. A child inherits the expired rows of its parent, migration is background
+   work and not a wrapped RPC, and nothing else wakes a child that gets no traffic — without this
+   source the guard of section 4.2.7 case 2 would hold those rows on disk until the first request.
 
 `arm` returns at once when a timer is already pending, so the cost per RPC is one null check.
+
+**The timer callback never throws.** It wraps `runCycle` in a try/catch, logs the error with
+`logParams`, and does not re-arm. An uncaught throw in a `setTimeout` callback is an unhandled
+rejection that carries no partition context into the log. `runCycle` itself throws to its caller, so
+a direct call in a test sees the failure — only the timer callback swallows it. A transient error
+heals on the next arm, from any of the four sources. A persistent error, such as a schema change that
+breaks the pinned plan of section 4.2.4 or an invalid configuration of section 4.2.11, costs one
+failed chunk per arm instead of a hot loop, and every failure is one log line. Test 22 forces this
+path, so a broken chunk fails a local run and not production.
 
 **The sweeper does not arm a timer for a future expiry.** A cycle that finds no expired row stops. A
 partition whose next expiry is one hour away holds no timer for that hour. The next request arms the
@@ -587,7 +642,13 @@ so the base constructor would read the value of the base class. A method lives o
 override works from the constructor onward. `TtlExpiry` calls it through the `config` callback on every
 cycle, which also keeps an override correct after construction.
 
-A subclass that wants no sweeper returns `maxRowsPerCycle: 0`.
+**`runCycle` validates the configuration before its first chunk.** `chunkSize`, `maxRowsPerCycle`,
+`maxRowsBeforeSleep` and `maxBytesBeforeSleep` must be integers greater than zero. `sleepMs` and
+`initialDelayMs` must be integers of at least zero, so a test can pass `sleepMs: 0`. An invalid
+configuration throws. Without the check, `maxRowsPerCycle: 0` would make every cycle return
+`more: true` before its first chunk, and the timer would re-arm itself every 500 ms forever on a
+sweeper that never sweeps — a busy loop that holds the Durable Object awake for nothing. There is no
+off switch: the partition always honours the column (section 2.2).
 
 #### 4.2.12 Concurrency with split and migration
 
@@ -604,9 +665,13 @@ The rule removes the case: a parent at `split_started` or `split_completed` owns
 children sweep their own rows. The rule also matches the routing rule of `AGENTS.md`. It applies to a
 range partition that became a router in the same way.
 
-**A row that the child does receive is safe.** The parent deletes it and bumps to `row.ttl`. The child
-deletes its own copy later and bumps to the same `row.ttl`, because section 4.2.8 makes the bump a
-function of the row. The two watermarks agree.
+**A sweep before the split and a sweep after it land the same value.** The parent may sweep at
+`split_queued`, before any child pulls a row — a premature pull cannot happen, because the parent's
+batch RPCs assert `split_started` or later. A row the parent sweeps then never reaches the child, but
+its bump does: the child pulls `maxDeletedTs` from the parent, and the parent's watermark already
+carries `row.ttl`. A row the parent does not sweep reaches the child, and the child bumps its own
+watermark to the same `row.ttl` when it sweeps its copy later. Either order lands the same value,
+because section 4.2.8 makes the bump a function of the row.
 
 **Cursor paging is safe under a concurrent delete.** `PartitionStore.queryItemsPage` and
 `PartitionStore.queryRangeItemsPage` resume with a row-value comparison on `(hk, sk)`, and the child
@@ -658,12 +723,13 @@ To roll back, revert the change and destroy the namespaces again.
 
 #### 4.2.15 Testing
 
-The tests use no mock and no fake timer. `TtlExpiry` takes a `PartitionStore` and three plain
-functions, so a test builds the real class over real storage and drives it.
+The tests use no mock and no fake timer. `TtlExpiry` takes a `PartitionStore` and plain functions, so
+a test builds the real class over real storage and drives it.
 
 `partition-store.test.ts` already has the harness: `withStore` opens a real `PartitionStore` over real
 Durable Object storage through `runInDurableObject`. The tests for `TtlExpiry` use the same harness,
-pass `sleepMs: 0` through the `config` callback, and call `runCycle` directly. No test waits on a timer.
+pass `sleepMs: 0` through the `config` callback, and call `runCycle` directly. No test waits on a
+timer, except tests 22 and 23, which exercise the timer path and arm with a zero delay.
 
 The cases:
 
@@ -688,17 +754,30 @@ The cases:
 8. `runCycle` drains a backlog larger than one chunk, and it reports `more: true` at `maxRowsPerCycle`.
 9. `runCycle` reports `more: false` when the last chunk is partial, and when no row is expired.
 10. `runCycle` sleeps once per `maxRowsBeforeSleep` rows, and once per `maxBytesBeforeSleep` bytes for
-    large items. The test counts the sleeps through the `config` callback.
+    large items. The test counts the sleeps through the `wait` dependency.
 11. `runCycle` returns at once when a cycle already runs.
 12. `canSweep` returning false stops the cycle before the first chunk, and it also stops a cycle that
     already runs, before the next chunk.
 13. `arm` sets one timer, and a second call while the timer is pending does nothing.
-14. `putItem` with `ttlSeconds` stores the resolved instant, and a put with no TTL clears it.
-15. `putItem` throws for a TTL in the past, for both fields together, and for a value that is not an
-    integer.
-16. `transactWriteItems` with a TTL stores the instant after the commit.
+14. `putItem` with `ttlAt` stores the instant, and a put with no TTL clears it.
+15. `putItem` throws for a `ttlAt` that is not an integer, and for zero or a negative value. A `ttlAt`
+    in the past stores, and the next cycle deletes the row.
+16. `transactWriteItems` with a `ttlAt` stores the instant after the commit, on the single-shot path
+    and on the coordinator path.
 17. A recovered transaction stores the same instant as the first try.
-18. An end-to-end test writes an item with a TTL of one second, waits, and finds the row deleted.
+18. An end-to-end test writes an item with a `ttlAt` one second ahead, waits, and finds the row
+    deleted.
+19. A transactional put with a `ttlAt` prepared before a hash split commits after the split, and the
+    child stores the instant. This holds the `queryPendingTxPage` lock-inheritance path.
+20. A `transactWriteItems` replay with the same `clientRequestToken` and the same `ttlAt` returns the
+    stored outcome. A replay with a different `ttlAt` is rejected as a different operation set.
+21. `runCycle` throws for a configuration whose `maxRowsPerCycle` or `chunkSize` is zero, negative, or
+    not an integer, before it deletes anything.
+22. A chunk that throws — forced through a `config` callback that throws — is caught by the timer
+    callback, the error is logged, and the timer stays disarmed. The same failure through a direct
+    `runCycle` call rethrows.
+23. A child that completes migration arms the timer, and the expired rows it inherited are deleted
+    without a request.
 
 ### 4.3 Open Questions
 
@@ -758,13 +837,43 @@ makes the watermark of a parent and a child differ forever.
 Rejected for now. The project is before its first release, so editing migration 1 and migration 2 in
 place keeps the schema readable. A new entry is right after the first release.
 
+### 5.6 Reject a `ttlAt` in the past
+
+`putItem` and `transactWriteItems` throw when `ttlAt` is at or before the current time, so a caller
+bug surfaces at once.
+
+Rejected. The check reads a wall clock, so the same request is valid or invalid depending on when it
+arrives. A `transactWriteItems` replay with a `clientRequestToken` must reach the coordinator ledger
+to learn the stored outcome; a client that retries after the instant passed would throw at the
+boundary instead, and never learn that its transaction committed. Accepting the value has no such
+case and needs no clock: the item is expired on arrival and the sweeper deletes it. DynamoDB accepts
+a past timestamp for the same reason.
+
+### 5.7 A relative `ttlSeconds` convenience field
+
+The API also accepts a relative `ttlSeconds`, and `db.ts` resolves `now + ttlSeconds` into the
+absolute instant at the boundary.
+
+Rejected. The resolution makes the wire value non-deterministic: two sends of the same request carry
+two different instants. A `clientRequestToken` replay then fails the operations-hash check as a
+different set of operations — which is exactly the mistake the hash exists to catch — and the only
+way out is to exclude the TTL from the hash and accept the drift silently. One absolute field keeps
+the request a pure function of what the caller wrote. A caller that wants a relative TTL adds two
+numbers.
+
 ---
 
 ## 6. Frequently Asked Questions
 
 **Why does a read return an expired item?** Because the sweeper is the only mechanism that removes it,
 and a read does not check the expiry instant. Section 5.1 states the tradeoff. Every read result
-carries `ttlEpochUTCSeconds`, so a caller that needs the stronger contract filters on it.
+carries `ttlAt`, so a caller that needs the stronger contract filters on it.
+
+**What happens when a caller writes milliseconds into `ttlAt`?** A millisecond epoch is a far-future
+instant — around the year 57,000 — so the item never expires and storage holds it. No guard rejects
+it: a bound tight enough to catch the mistake would also reject a legitimate far expiry, and DynamoDB
+draws the same line. Its only guard sits on the other side — it ignores an expiry more than five
+years in the past — which this design does not need, because a past `ttlAt` is simply swept.
 
 **What happens to an expired item in a partition that gets no request?** It stays on disk. The
 partition does not wake, so it does not sweep. The next request, or the next wake for another reason,

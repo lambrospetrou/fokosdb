@@ -44,7 +44,7 @@ const ExpressionReferenceSchema: v.GenericSchema<ExpressionReference> = v.union(
 	v.strictObject({ ref: v.literal("hashKey") }),
 	v.strictObject({ ref: v.literal("sortKey") }),
 	v.strictObject({ ref: v.literal("v") }),
-	v.strictObject({ ref: v.literal("ttl") }),
+	v.strictObject({ ref: v.literal("ttlAt") }),
 	v.strictObject({ ref: v.literal("data"), path: v.optional(v.string()) }),
 ]);
 
@@ -84,21 +84,14 @@ const ConditionExpressionSchema: v.GenericSchema<ConditionExpression> = v.lazy((
 	]),
 );
 
-const PutItemBodySchema = v.pipe(
-	v.strictObject({
-		hashKey: v.string(),
-		sortKey: v.optional(v.string()),
-		ttlSeconds: v.optional(v.number()),
-		ttlEpochUTCSeconds: v.optional(v.number()),
-		data: v.string(),
-		condition: v.optional(ConditionExpressionSchema),
-		partitionOptions: PartitionOptionsSchema,
-	}),
-	v.check(
-		(input) => !(input.ttlSeconds !== undefined && input.ttlEpochUTCSeconds !== undefined),
-		"Only one of ttlSeconds or ttlEpochUTCSeconds may be provided, not both",
-	),
-);
+const PutItemBodySchema = v.strictObject({
+	hashKey: v.string(),
+	sortKey: v.optional(v.string()),
+	ttlAt: v.optional(v.number()),
+	data: v.string(),
+	condition: v.optional(ConditionExpressionSchema),
+	partitionOptions: PartitionOptionsSchema,
+});
 
 const GetItemBodySchema = v.object({
 	hashKey: v.string(),
@@ -121,6 +114,7 @@ const TransactWriteItemBodySchema = v.variant("operation", [
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
 		data: v.string(),
+		ttlAt: v.optional(v.number()),
 		condition: v.optional(ConditionExpressionSchema),
 	}),
 	v.strictObject({

@@ -17,7 +17,7 @@ type StoredFixture = {
 	sortKey?: string | Uint8Array;
 	data: string | Uint8Array | JsonValue;
 	kind: DataKind;
-	ttl?: number;
+	ttlAt?: number;
 };
 
 async function evaluate(item: StoredFixture | null, condition: ConditionExpression) {
@@ -36,7 +36,7 @@ function putFixture(storage: DurableObjectStorage, hashKey: KeyBytes, sortKey: K
 		sk: sortKey,
 		data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
 		kind: item.kind,
-		ttlEpochUtcSeconds: item.ttl ?? null,
+		ttlAt: item.ttlAt ?? null,
 		lastTransactionTs: 1,
 	});
 }
@@ -53,13 +53,13 @@ describe("compiled condition runtime", () => {
 			sortKey: "sort",
 			kind: "json",
 			data: { nullValue: null, enabled: true, count: 3, ratio: 1.5, text: "café", nested: { value: "yes" } },
-			ttl: 2_000_000_000,
+			ttlAt: 2_000_000_000,
 		};
 		for (const [condition, expected] of [
 			[{ op: "eq", args: [{ ref: "hashKey" }, { val: "item" }] }, true],
 			[{ op: "eq", args: [{ ref: "sortKey" }, { val: "sort" }] }, true],
 			[{ op: "eq", args: [{ ref: "v" }, { val: 1 }] }, true],
-			[{ op: "eq", args: [{ ref: "ttl" }, { val: 2_000_000_000 }] }, true],
+			[{ op: "eq", args: [{ ref: "ttlAt" }, { val: 2_000_000_000 }] }, true],
 			[{ op: "eq", args: [{ ref: "data", path: "$.nullValue" }, { val: null }] }, true],
 			[{ op: "eq", args: [{ ref: "data", path: "$.enabled" }, { val: true }] }, true],
 			[{ op: "ne", args: [{ ref: "data", path: "$.enabled" }, { val: false }] }, true],

@@ -566,6 +566,37 @@ describe("transactions - end-to-end", () => {
 		expect(dupResult.items.map((item) => item.hashKey)).toEqual(withDuplicate.map((k) => k.hashKey));
 	});
 
+	it.each([
+		["single-shot", true],
+		["coordinator", false],
+	] as const)("stores ttlAt on the %s transaction path", async (_path, singlePartitionFastPath) => {
+		const db = makeDB({ singlePartitionFastPath });
+		const key = { hashKey: `ttl-${crypto.randomUUID()}` };
+		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+
+		expect(await db.transactWriteItems({ items: [{ ...key, operation: "put", data: "value", ttlAt }] })).toMatchObject({
+			outcome: "committed",
+		});
+		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "value", ttlAt } });
+		const read = await db.transactGetItems({ items: [key] });
+		expect(read).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", ttlAt }] });
+	});
+
+	it("includes ttlAt in idempotent transaction identity", async () => {
+		const db = makeDB();
+		const key = { hashKey: `ttl-token-${crypto.randomUUID()}` };
+		const token = `ttl-token-${crypto.randomUUID()}`;
+		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+		const operation = { ...key, operation: "put" as const, data: "value", ttlAt };
+
+		const first = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
+		expect(await db.transactWriteItems({ items: [operation], clientRequestToken: token })).toEqual(first);
+		await expect(db.transactWriteItems({ items: [{ ...operation, ttlAt: ttlAt + 1 }], clientRequestToken: token })).rejects.toThrow(
+			/was already used for a different set of operations/,
+		);
+		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt, version: 1 } });
+	});
+
 	it("idempotency: retrying transactWriteItems with same clientRequestToken returns same result", async () => {
 		const db = makeDB();
 

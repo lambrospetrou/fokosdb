@@ -18,6 +18,7 @@ import { KeyBytes, KeyCodec } from "./partition-topology/key-codec.js";
 import invariant from "./invariant.js";
 import { MAX_ITEM_BYTES } from "./transaction-limits.js";
 import { PartitionStore } from "./partition/partition-store.js";
+import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { compileConditionExpression } from "./expression/compiler.js";
 import type { ConditionExpression } from "./expression/types.js";
 
@@ -174,7 +175,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	});
 
 	describe("TTL", () => {
-		it("stores and returns ttlEpochUTCSeconds when set on put", async ({ expect }) => {
+		it("stores and returns ttlAt when set on put", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
@@ -182,25 +183,25 @@ describe("PartitionDO - putItem / getItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "val",
-				ttlEpochUTCSeconds: ttl,
+				ttlAt: ttl,
 				kind: "text",
 			});
 			const result = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
-			expect(result).toMatchObject({ found: true, item: { ttlEpochUTCSeconds: ttl } });
+			expect(result).toMatchObject({ found: true, item: { ttlAt: ttl } });
 		});
 
-		it("ttlEpochUTCSeconds is absent when not set on put", async ({ expect }) => {
+		it("ttlAt is absent when not set on put", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "val", kind: "text" as const });
 			const result = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true });
-			if (result.found) expect(result.item.ttlEpochUTCSeconds).toBeUndefined();
+			if (result.found) expect(result.item.ttlAt).toBeUndefined();
 		});
 
-		it("clears ttlEpochUTCSeconds when an item is overwritten without TTL", async ({ expect }) => {
+		it("clears ttlAt when an item is overwritten without TTL", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
@@ -208,14 +209,40 @@ describe("PartitionDO - putItem / getItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v1",
-				ttlEpochUTCSeconds: ttl,
+				ttlAt: ttl,
 				kind: "text",
 			});
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const });
 			const result = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
-			if (result.found) expect(result.item.ttlEpochUTCSeconds).toBeUndefined();
+			if (result.found) expect(result.item.ttlAt).toBeUndefined();
+		});
+
+		it("arms a new sweep from an RPC after the previous cycle stops", async ({ expect }) => {
+			const { ctx, stub } = makeStub();
+			await stub.apiPutItem(ctx, {
+				hashKey: kb("rpc-arm"),
+				sortKey: kb("sk"),
+				data: "value",
+				kind: "text",
+				ttlAt: Math.floor(Date.now() / 1000) + 3600,
+			});
+			await scheduler.wait(600);
+
+			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+				state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1`);
+			});
+			await scheduler.wait(600);
+			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+				expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).toArray()[0].n).toBe(1);
+			});
+
+			await stub.status();
+			await scheduler.wait(600);
+			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+				expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items`).toArray()[0].n).toBe(0);
+			});
 		});
 	});
 
@@ -1059,13 +1086,9 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	describe("multi-level splits", async () => {
-		it("keeps all items accessible after splits at multiple tree depths (~10 items per partition trigger threshold)", async ({
-			expect,
-		}) => {
-			// Items are ~10 KB each so ~10 fill 0.1 MB and trigger a split at any given partition.
-			// With splitN=3 and 100 total items, the root and multiple generations of children
-			// all split, creating a deep tree that exercises the full forwarding chain.
-			const ITEM_SIZE_BYTES = 10 * 1024;
+		it("keeps all items accessible after splits at multiple tree depths", async ({ expect }) => {
+			// One row stays below the 10% overage band, so a successful crossing write can queue each split.
+			const ITEM_SIZE_BYTES = 4 * 1024;
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.1 } });
@@ -1079,14 +1102,18 @@ describe("PartitionDO - splitting", () => {
 
 				// Writes transiently fail while a split migration is in progress.
 				// Drain the full split tree and retry until the write lands.
+				let written = false;
 				for (let attempt = 0; attempt < 20; attempt++) {
 					try {
 						await stub.apiPutItem(ctx, { hashKey: kb(hashKey), sortKey: kb(sortKey), data: dummyData, kind: "text" as const });
+						written = true;
 						break;
 					} catch (e: unknown) {
 						expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
+						await drainSplitTree(stub);
 					}
 				}
+				expect(written, `write did not land for ${hashKey}`).toBe(true);
 				await drainSplitTree(stub);
 				// console.log("BOOM 1 - end", { item: hashKey });
 			}
@@ -1301,6 +1328,63 @@ describe("PartitionDO - splitting", () => {
 			// This might be flaky - but ideally we should have items across more than 1 children.
 			expect(foundIds.size).toBeGreaterThan(1);
 		});
+
+		it("arms TTL deletion after child migration completes", async ({ expect }) => {
+			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			await stub.apiPutItem(ctx, { hashKey: kb("ttl-migration"), sortKey: kb("sk"), data: "value", kind: "text" });
+			await triggerHashSplitThreshold(stub, ctx, 1);
+
+			let releaseMigration!: () => void;
+			const migrationGate = new Promise<void>((resolve) => {
+				releaseMigration = resolve;
+			});
+			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
+				await runInDurableObject(
+					PartitionDO.getByName(env.PARTITION_DO, doName),
+					async (instance: PartitionDO, state: DurableObjectState) => {
+						instance.__testing__beforeMigrationComplete = async () => {
+							state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1`);
+							await migrationGate;
+						};
+					},
+				);
+			}
+
+			await waitForAlarm(stub);
+			const childContexts = ((await stub.status()).splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			await scheduler.wait(600);
+			let expiredBeforeCompletion = 0;
+			for (const childCtx of childContexts) {
+				await runInDurableObject(
+					PartitionDO.getByName(env.PARTITION_DO, childCtx.doName),
+					async (_instance: PartitionDO, state: DurableObjectState) => {
+						expiredBeforeCompletion += state.storage.sql
+							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL`)
+							.toArray()[0].n;
+					},
+				);
+			}
+			expect(expiredBeforeCompletion).toBeGreaterThan(0);
+			releaseMigration();
+			for (const childCtx of childContexts) {
+				await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, childCtx.doName));
+			}
+			await vi.waitFor(
+				async () => {
+					let expiredRows = 0;
+					for (const childCtx of childContexts) {
+						const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
+						await runInDurableObject(childStub, async (_instance: PartitionDO, state: DurableObjectState) => {
+							expiredRows += state.storage.sql
+								.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL`)
+								.toArray()[0].n;
+						});
+					}
+					expect(expiredRows).toBe(0);
+				},
+				{ timeout: 5000, interval: 100 },
+			);
+		}, 15_000);
 
 		it("putItem is rejected while migration is in progress", async ({ expect }) => {
 			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
@@ -2223,6 +2307,33 @@ describe("PartitionDO — single-shot transaction", () => {
 });
 
 describe("PartitionDO — two-phase commit queues splits", () => {
+	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
+		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = Date.now();
+		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+		const items = [
+			{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
+		];
+		expect(
+			await stub.txPrepare(ctx, {
+				transactionId,
+				transactionTimestamp,
+				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+				items,
+			}),
+		).toEqual({ outcome: "accepted" });
+
+		await triggerHashSplitThreshold(stub, ctx, 1);
+		await drainSplitTree(stub);
+		expect((await stub.status()).splitStatus?.status).toBe("split_completed");
+		expect(await stub.txCommit(ctx, { transactionId, transactionTimestamp, items })).toEqual({ outcome: "committed" });
+		expect(await stub.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
+			found: true,
+			item: { data: "value", ttlAt },
+		});
+	});
+
 	it("queues a split once committed transactions push the partition over the threshold", async () => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const data = "x".repeat(64 * 1024);
@@ -2242,6 +2353,53 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		expect(splitStatus).toBeDefined();
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 		await drainSplitTree(stub);
+	});
+});
+
+describe("PartitionDO — stale transaction recovery", () => {
+	it("commits the TTL stored in a stale pending row", async () => {
+		const { ctx, stub } = makeStub();
+		await stub.status(ctx);
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = Date.now() - 10_000;
+		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+		const tcId = env.TRANSACTION_COORDINATOR_DO.newUniqueId();
+		const tcStub = TransactionCoordinatorDO.get(env.TRANSACTION_COORDINATOR_DO, tcId);
+
+		await runInDurableObject(tcStub, async (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
+			state.storage.sql.exec(
+				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, operations_hash)
+				 VALUES (?, ?, 'COMMITTED', ?, ?, ?)`,
+				`stale-${transactionId}`,
+				transactionId,
+				transactionTimestamp,
+				transactionTimestamp,
+				"0000000000000000",
+			);
+		});
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const store = new PartitionStore(state.storage);
+			store.insertPendingLock({
+				hk: kb("stale-ttl"),
+				sk: kb("sk"),
+				transaction_id: transactionId,
+				transaction_ts: transactionTimestamp,
+				operation: "put",
+				data: "value",
+				kind: "text",
+				conditions_json: null,
+				ttl_epoch_utc_seconds: ttlAt,
+				coordinator_do_id: tcId.toString(),
+				created_at: transactionTimestamp,
+			});
+			await state.storage.setAlarm(Date.now());
+		});
+
+		await waitForAlarm(stub);
+		expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "value", ttlAt },
+		});
 	});
 });
 
@@ -2677,7 +2835,7 @@ describe("PartitionDO — range split", () => {
 						sk: kb(String(i).padStart(3, "0")),
 						data: "x",
 						kind: "text",
-						ttlEpochUtcSeconds: null,
+						ttlAt: null,
 						lastTransactionTs: 0,
 					});
 				}
@@ -2704,7 +2862,7 @@ describe("PartitionDO — range split", () => {
 						sk: kb(sk),
 						data: new Uint8Array(MAX_ITEM_BYTES),
 						kind: "bytes",
-						ttlEpochUtcSeconds: null,
+						ttlAt: null,
 						lastTransactionTs: 0,
 					});
 				}

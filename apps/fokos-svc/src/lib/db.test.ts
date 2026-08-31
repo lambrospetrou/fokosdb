@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { PartitionContextCreator, type PartitionNamespaceKey } from "./partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "./partition-topology/router.js";
@@ -31,6 +31,42 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(meta.servedByActorName).toBeTypeOf("string");
 			}
 			expect(query.partitionMetas).not.toHaveLength(0);
+		});
+	});
+
+	describe("FokosDB — TTL", () => {
+		it("stores, returns, and clears ttlAt", async () => {
+			const db = makeDB();
+			const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+
+			await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v1", ttlAt });
+			expect(await db.getItem({ hashKey: "ttl", sortKey: "item" })).toMatchObject({ found: true, item: { ttlAt } });
+			expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0].ttlAt).toBe(ttlAt);
+
+			await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
+			const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
+			expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
+			if (cleared.found) expect(cleared.item.ttlAt).toBeUndefined();
+		});
+
+		it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {
+			const db = makeDB();
+			await expect(db.putItem({ hashKey: "invalid-ttl", data: "v", ttlAt })).rejects.toThrow(/ttlAt/);
+			await expect(db.transactWriteItems({ items: [{ hashKey: "invalid-ttl-tx", operation: "put", data: "v", ttlAt }] })).rejects.toThrow(
+				/ttlAt/,
+			);
+		});
+
+		it("accepts a past ttlAt and deletes the item in a later cycle", async () => {
+			const db = makeDB();
+			const ttlAt = Math.max(1, Math.floor(Date.now() / 1000) - 1);
+			await db.putItem({ hashKey: "past-ttl", data: "v", ttlAt });
+			expect(await db.getItem({ hashKey: "past-ttl" })).toMatchObject({ found: true, item: { ttlAt } });
+
+			await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).found).toBe(false), {
+				timeout: 3_000,
+				interval: 100,
+			});
 		});
 	});
 

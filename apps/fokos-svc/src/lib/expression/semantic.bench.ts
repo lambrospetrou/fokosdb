@@ -45,8 +45,8 @@ const cases = [
 				{
 					op: "or",
 					args: [
-						{ op: "not_exists", args: [{ ref: "ttl" }] },
-						{ op: "gt", args: [{ ref: "ttl" }, { val: 1_788_000_000 }] },
+						{ op: "not_exists", args: [{ ref: "ttlAt" }] },
+						{ op: "gt", args: [{ ref: "ttlAt" }, { val: 1_788_000_000 }] },
 					],
 				},
 			],

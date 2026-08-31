@@ -36,6 +36,8 @@ export type TransactionItem = TransactionItemKey & {
 	data?: Uint8Array | string;
 	/** Data kind discriminant; present for "put" (json ⇒ data is JSON text). */
 	kind?: DataKind;
+	/** Epoch UTC seconds. Present only for a put that has an expiry instant. */
+	ttlAt?: number;
 	/** Optional for put and delete; required for check. */
 	condition?: CompiledConditionPlan;
 };
@@ -105,7 +107,14 @@ export type ReadForTransactionRequest = {
 // The value half of a read result, shared by the RPC and public variants. Only `data` differs
 // between them (JSON text on the wire, parsed JsonValue in public), so it is the one type parameter.
 type ReadForTransactionItemValueOf<D> =
-	| { found: true; data: D; kind: DataKind; version: number; ttlEpochUTCSeconds?: number }
+	| {
+			found: true;
+			data: D;
+			kind: DataKind;
+			version: number;
+			/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
+			ttlAt?: number;
+	  }
 	| { found: false };
 
 /**
@@ -217,6 +226,8 @@ export type TransactWriteItem =
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
 			data: string | Uint8Array | JsonComposite;
+			/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
+			ttlAt?: number;
 			condition?: ConditionExpression;
 	  }
 	| {
@@ -253,6 +264,7 @@ export type TCWriteOperation = {
 	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
 	data?: Uint8Array | string;
 	kind?: DataKind;
+	ttlAt?: number;
 	condition?: CompiledConditionPlan;
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;

@@ -4,6 +4,18 @@
 # Target the remote deployment (see test/hurl/vars_remote.env for configuration):
 #   npm run test:hurl:remote -- test/hurl/sanity.hurl
 
+# ── Put an already-expired item ────────────────────────────────────────────────
+# This item will be deleted by the TTL sweeper during the test suite run, and is asserted further down.
+
+POST {{base_url}}/api/rpc/{{database_name}}/putItem
+Content-Type: application/json
+{
+  "hashKey": "ttl#expired",
+  "data": "expired",
+  "ttlAt": 1
+}
+HTTP 200
+
 # ── Hello ──────────────────────────────────────────────────────────────────────
 
 GET {{base_url}}/api/hello/world
@@ -336,7 +348,7 @@ HTTP 400
 [Asserts]
 jsonpath "$.error" == "Validation failed"
 
-# ── Error: both ttl fields provided ───────────────────────────────────────────
+# ── Error: retired TTL fields are rejected ────────────────────────────────────
 
 POST {{base_url}}/api/rpc/{{database_name}}/putItem
 Content-Type: application/json
@@ -349,3 +361,15 @@ Content-Type: application/json
 HTTP 400
 [Asserts]
 jsonpath "$.error" == "Validation failed"
+
+# ── The expired item was deleted ───────────────────────────────────────────────
+# If this assertion fails, check that the suite duration still exceeds the TTL sweep timer delay (initialDelayMs).
+
+POST {{base_url}}/api/rpc/{{database_name}}/getItem
+Content-Type: application/json
+{
+  "hashKey": "ttl#expired"
+}
+HTTP 200
+[Asserts]
+jsonpath "$.found" == false

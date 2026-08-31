@@ -61,6 +61,7 @@ import {
 import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "./partition/migration.js";
 import { PromotionManager } from "./partition/hash-key-promotion.js";
 import { TransactionParticipant } from "./partition/transaction-participant.js";
+import { TtlExpiry, type TtlSweepConfig } from "./partition/ttl-expiry.js";
 import { AddResult } from "./bloom-filter.js";
 import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "./partition-topology/partial-range-topology.js";
 import {
@@ -98,7 +99,7 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	/** Encoded at the db.ts boundary (json ⇒ JSON text). */
 	data: string | Uint8Array;
 	kind: DataKind;
-	ttlEpochUTCSeconds?: number;
+	ttlAt?: number;
 	condition?: CompiledConditionPlan;
 };
 
@@ -115,7 +116,7 @@ export type GetItemRpcRequest = ItemRpcKeys;
 export type GetItemRpcResponse =
 	| {
 			found: true;
-			item: { data: string | Uint8Array; kind: DataKind; ttlEpochUTCSeconds?: number; version: number };
+			item: { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number };
 			meta: OperationMetrics & PartitionInfoInternal;
 	  }
 	| { found: false; meta: OperationMetrics & PartitionInfoInternal };
@@ -208,6 +209,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#promotion: PromotionManager;
+	#ttl: TtlExpiry;
 
 	#_parentPartitionContext?: PartitionContextLivePartition;
 	#_partitionContext?: PartitionContextLivePartition;
@@ -248,6 +250,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			},
 			logParams: () => this.logParams(),
 		});
+		this.#ttl = new TtlExpiry({
+			store: this.#store,
+			canSweep: () => this.ttlCanSweep(),
+			logParams: () => this.logParams(),
+			config: () => this.fokosTtlConfig(),
+		});
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#store.runMigrations();
 
@@ -277,6 +285,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 			}
 		});
+		this.#ttl.arm(this.fokosTtlConfig().initialDelayMs);
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
 		// We swallow errors — this must never affect the DO's lifecycle.
@@ -299,7 +308,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		opts: InitFromSplitOptions,
 		__testing__completeMigration?: boolean,
 		__testing__splitStatus?: SplitStatusKVItem,
-	) {
+	): Promise<void> {
+		return await this.#rpc(
+			"internalInitFromSplit",
+			async () => await this.#internalInitFromSplit(opts, __testing__completeMigration, __testing__splitStatus),
+		);
+	}
+
+	async #internalInitFromSplit(
+		opts: InitFromSplitOptions,
+		__testing__completeMigration?: boolean,
+		__testing__splitStatus?: SplitStatusKVItem,
+	): Promise<void> {
 		const { parentPartitionContext, newPartitionContext, newPartitionRangeDepth, splitType } = opts;
 
 		if (this.#_partitionContext) {
@@ -378,6 +398,28 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return { cfColo: "", cfLoc: "", cfFl: "" };
 	}
 
+	protected fokosTtlConfig(): TtlSweepConfig {
+		return {
+			chunkSize: 100,
+			sleepMs: 1000,
+			maxRowsBeforeSleep: 10_000,
+			maxBytesBeforeSleep: 50 * 1024 * 1024,
+			maxRowsPerCycle: 100_000,
+			initialDelayMs: 500,
+		};
+	}
+
+	private ttlCanSweep(): boolean {
+		const pCtx = this.#_partitionContext;
+		if (!pCtx) return false;
+		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
+		// A migrating child does not yet have all rows or inherited transaction locks.
+		if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") return false;
+		const splitStatus = this.ensureTopology(pCtx).splitStatus()?.status;
+		// A split parent no longer owns a key range; its children sweep their own rows.
+		return splitStatus !== "split_started" && splitStatus !== "split_completed";
+	}
+
 	///////////////////////////////
 	// API methods (PartitionAPI)
 	///////////////////////////////
@@ -386,6 +428,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * INTERNAL ONLY FOR TESTING.
 	 */
 	async status(pCtx?: PartitionContextLivePartition) {
+		return await this.#rpc("status", async () => await this.#status(pCtx));
+	}
+
+	async #status(pCtx?: PartitionContextLivePartition) {
 		// The pCtx is only provided during tests, since any other use-case in production should initialize the DO already as part of the public API.
 		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
 		return {
@@ -401,6 +447,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async internalTriggerMigration(): Promise<void> {
+		return await this.#rpc("internalTriggerMigration", async () => await this.#internalTriggerMigration());
+	}
+
+	async #internalTriggerMigration(): Promise<void> {
 		invariant(this.pCtx(), "fokos/partition.triggerMigration: partition context is required");
 		const isMigrating = await this.ensureMigration("triggerMigration", false);
 		if (isMigrating) {
@@ -409,6 +459,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
+		return await this.#rpc("apiPutItem", async () => await this.#apiPutItem(pCtx, req));
+	}
+
+	async #apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("putItem");
 		const { hashKey, sortKey } = req;
@@ -437,7 +491,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						sk: sortKey,
 						data: req.data,
 						kind: req.kind,
-						ttlEpochUtcSeconds: req.ttlEpochUTCSeconds ?? null,
+						ttlAt: req.ttlAt ?? null,
 						lastTransactionTs: Date.now(),
 					});
 					return { writeRes, conditionRes };
@@ -468,6 +522,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async apiDeleteItem(pCtx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
+		return await this.#rpc("apiDeleteItem", async () => await this.#apiDeleteItem(pCtx, req));
+	}
+
+	async #apiDeleteItem(pCtx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("deleteItem");
 		const { hashKey, sortKey } = req;
@@ -517,6 +575,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async apiGetItem(pCtx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
+		return await this.#rpc("apiGetItem", async () => await this.#apiGetItem(pCtx, req));
+	}
+
+	async #apiGetItem(pCtx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 
 		if (await this.ensureMigration("getItem", false)) {
@@ -549,10 +611,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// Internal RPC: reads directly from local storage, bypassing split forwarding.
 	// Called by child partitions during migration to avoid a forwarding loop back into the child.
 	async internalGetItemDirect(req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
-		return await this.readItemLocally(this.pCtx(), req);
+		return await this.#rpc("internalGetItemDirect", async () => await this.readItemLocally(this.pCtx(), req));
 	}
 
 	async apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
+		return await this.#rpc("apiQueryItems", async () => await this.#apiQueryItems(pCtx, req));
+	}
+
+	async #apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 
 		// If still migrating, read directly from the parent (mirrors getItem / getItemDirect).
@@ -594,7 +660,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// out to children via queryItemsAsRangeNode would route back to the calling migrating child,
 	// causing an infinite loop (child → queryItemsDirect → walkRangeChildren → child.queryItems → …).
 	async internalQueryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
-		return this.queryItemsLocal(this.pCtx(), req);
+		return await this.#rpc("internalQueryItemsDirect", async () => await this.queryItemsLocal(this.pCtx(), req));
 	}
 
 	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
@@ -776,6 +842,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		childPartitionContext: PartitionContextResolved;
 		cursor: ScanCursor | null;
 	}): Promise<GetItemsBatchResult> {
+		return await this.#rpc("migrationGetItemsBatch", async () => await this.#migrationGetItemsBatch(opts));
+	}
+
+	async #migrationGetItemsBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: ScanCursor | null;
+	}): Promise<GetItemsBatchResult> {
 		const pCtx = this.pCtx();
 
 		// Range-child migration (promotion or range-split).
@@ -879,6 +952,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PendingTransactionCursor | null;
 	}): Promise<GetPartitionTransactionMetadataResult> {
+		return await this.#rpc(
+			"migrationGetPartitionTransactionMetadata",
+			async () => await this.#migrationGetPartitionTransactionMetadata(opts),
+		);
+	}
+
+	async #migrationGetPartitionTransactionMetadata(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PendingTransactionCursor | null;
+	}): Promise<GetPartitionTransactionMetadataResult> {
 		const pCtx = this.pCtx();
 		const maxDeletedTs = this.#store.getMaxDeletedTs();
 
@@ -966,6 +1049,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async migrationAcknowledgeChildComplete(childDoName: string): Promise<void> {
+		return await this.#rpc("migrationAcknowledgeChildComplete", async () => await this.#migrationAcknowledgeChildComplete(childDoName));
+	}
+
+	async #migrationAcknowledgeChildComplete(childDoName: string): Promise<void> {
 		const topology = this.ensureTopology(this.pCtx());
 		// Atomically transition topology and clean up parent's pending_transactions when
 		// all children have migrated. Children now own authoritative copies; parent's are redundant.
@@ -981,6 +1068,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// (forward-pointers) for the keys it now owns. Only the set transfers — never the data, which lives
 	// in the autonomous range structure (the range-root name is recomputable from the hashKey).
 	async migrationGetPromotedKeysBatch(opts: {
+		childPartitionContext: PartitionContextResolved;
+		cursor: PromotedKeyCursor | null;
+	}): Promise<GetPromotedKeysBatchResult> {
+		return await this.#rpc("migrationGetPromotedKeysBatch", async () => await this.#migrationGetPromotedKeysBatch(opts));
+	}
+
+	async #migrationGetPromotedKeysBatch(opts: {
 		childPartitionContext: PartitionContextResolved;
 		cursor: PromotedKeyCursor | null;
 	}): Promise<GetPromotedKeysBatchResult> {
@@ -1005,6 +1099,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	// Called by a promoted range root once its item migration is complete.
 	async migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
+		return await this.#rpc("migrationAcknowledgePromotionComplete", async () => await this.#migrationAcknowledgePromotionComplete(hashKey));
+	}
+
+	async #migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
 		const pCtx = this.pCtx();
 		invariant(isHashPartition(pCtx), "fokos/partition.migrationAcknowledgePromotionComplete: only hash partitions can have promoted keys");
 		await this.#promotion.acknowledgePromotionComplete(hashKey);
@@ -1178,6 +1276,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async destroyPartition(): Promise<void> {
+		return await this.#rpc("destroyPartition", async () => await this.#destroyPartition());
+	}
+
+	async #destroyPartition(): Promise<void> {
+		this.#ttl.disarm();
 		console.warn({
 			...this.logParams(),
 			message: "fokos/partition: Destroying partition — deleting all storage.",
@@ -1211,6 +1314,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	////////////////////////
 
 	async txPrepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
+		return await this.#rpc("txPrepare", async () => await this.#txPrepare(pCtx, request));
+	}
+
+	async #txPrepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("prepare");
 
@@ -1239,6 +1346,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async txCommit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
+		return await this.#rpc("txCommit", async () => await this.#txCommit(pCtx, request));
+	}
+
+	async #txCommit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("commit"); // reject while this partition is migrating
 
@@ -1291,6 +1402,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * descendant lock waits for its own stale-tx recovery alarm.
 	 */
 	async txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
+		return await this.#rpc("txCancel", async () => await this.#txCancel(pCtx, request));
+	}
+
+	async #txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		// reject while this partition is migrating - it will recover it on its own.
 		await this.ensureMigration("cancel");
@@ -1322,6 +1437,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async txReadForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+		return await this.#rpc("txReadForTransaction", async () => await this.#txReadForTransaction(pCtx, request));
+	}
+
+	async #txReadForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
@@ -1347,6 +1466,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * only to detect interleaving ACROSS partitions, and here there is none to detect.
 	 */
 	async txReadSnapshot(pCtx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
+		return await this.#rpc("txReadSnapshot", async () => await this.#txReadSnapshot(pCtx, request));
+	}
+
+	async #txReadSnapshot(pCtx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readSnapshot");
 
@@ -1374,6 +1497,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * items cannot start belonging to another DO between the check and the write.
 	 */
 	async txExecuteSingleShot(pCtx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse> {
+		return await this.#rpc("txExecuteSingleShot", async () => await this.#txExecuteSingleShot(pCtx, request));
+	}
+
+	async #txExecuteSingleShot(pCtx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse> {
 		this.ensurePartitionContext(pCtx);
 		invariant(request.items.length > 0, "fokos/partition.executeSingleShot: at least one item is required");
 		await this.ensureMigration("executeSingleShot");
@@ -1773,7 +1900,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// json arrives here as JSON text (decoded in SQL); db.ts parses it once at the public boundary.
 				data: result.data,
 				kind: result.kind,
-				ttlEpochUTCSeconds: result.ttl_epoch_utc_seconds ? Number(result.ttl_epoch_utc_seconds) : undefined,
+				ttlAt: result.ttl_epoch_utc_seconds ?? undefined,
 				version: result.v,
 			},
 			meta: actorMeta,
@@ -1869,6 +1996,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						},
 						(_error, nextAttempt) => nextAttempt <= 5,
 					);
+					if (this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS) === "migration_completed") {
+						this.#ttl.arm();
+					}
 				}
 			} catch (error) {
 				console.error({
@@ -1931,6 +2061,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 									operation: r.operation as TransactionItem["operation"],
 									data: r.data ?? undefined,
 									kind: r.kind ?? undefined,
+									ttlAt: r.ttl_epoch_utc_seconds ?? undefined,
 								}));
 								await this.txCommit(this.pCtx(), {
 									transactionId: row.transaction_id,
@@ -2065,6 +2196,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				this.#_partialRangeTopology.toSnapshot(),
 			);
 		}
+	}
+
+	async #rpc<T>(_name: string, fn: () => Promise<T>): Promise<T> {
+		// TODO Add observability and canonical logs.
+		this.#ttl.arm();
+		return await fn();
 	}
 
 	private logParams() {
