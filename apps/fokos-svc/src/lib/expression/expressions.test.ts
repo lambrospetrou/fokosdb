@@ -90,7 +90,7 @@ beforeAll(async () => {
 				sk: KeyCodec.encodeOptional(item.sortKey),
 				data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
 				kind: item.kind,
-				ttlEpochUtcSeconds: item.ttl ?? null,
+				ttlAt: item.ttl ?? null,
 				lastTransactionTs: 1,
 			});
 		}
@@ -176,8 +176,8 @@ describe("expression showcase: comparison operators", () => {
 
 describe("expression showcase: existence and logical operators", () => {
 	showcase([
-		{ name: "exists on the TTL", item: shippedOrder, condition: { op: "exists", args: [{ ref: "ttl" }] } },
-		{ name: "not_exists on an absent TTL", item: pendingOrder, condition: { op: "not_exists", args: [{ ref: "ttl" }] } },
+		{ name: "exists on the TTL", item: shippedOrder, condition: { op: "exists", args: [{ ref: "ttlAt" }] } },
+		{ name: "not_exists on an absent TTL", item: pendingOrder, condition: { op: "not_exists", args: [{ ref: "ttlAt" }] } },
 		{ name: "not_exists on an absent sort key", item: note, condition: { op: "not_exists", args: [{ ref: "sortKey" }] } },
 		{
 			name: "exists on a nested field",
@@ -588,7 +588,7 @@ describe("expression showcase: complex expressions", () => {
 				op: "and",
 				args: [
 					{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-					{ op: "gt", args: [{ ref: "ttl" }, { val: 1_900_000_000 }] },
+					{ op: "gt", args: [{ ref: "ttlAt" }, { val: 1_900_000_000 }] },
 				],
 			},
 		},
