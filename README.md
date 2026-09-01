@@ -13,10 +13,41 @@ Read the article introducing FokosDB and explaining the reasoning behind its arc
 
 ## Project structure
 
-FokosDB is not yet extracted into a properly structured package and is now mixed into a test Worker that exposes any number of databases through a REST API.
+This is a pnpm workspace.
 
-This is intentional to allow quick iteration during initial development.
-Once there is a stable version ready, I will properly refactor the directory structure and publish an NPM library with only the actual FokosDB library.
+```
+packages/
+  fokosdb/            the published library
+    src/client/       FokosDB and the routing surface  -> fokosdb/client
+    src/server/       the Durable Object classes       -> fokosdb/server
+    src/shared/       code both entries use, inlined into each at build time
+examples/
+  http-api/           deployable Worker exposing tables over REST
+```
+
+`fokosdb` publishes exactly two subpath exports, `fokosdb/client` and `fokosdb/server`. There is no
+bare `fokosdb` import. See [`packages/fokosdb/README.md`](./packages/fokosdb/README.md) for the API
+and for the Durable Object re-export that wrangler requires.
+
+## Commands
+
+This repo uses pnpm. If you do not have it, install it with `npm install -g pnpm`, or enable the version Node ships with by running `corepack enable pnpm`.
+
+Run these from the repo root.
+
+| Command           | Purpose                                                          |
+| ----------------- | ---------------------------------------------------------------- |
+| `pnpm install`    | Install every workspace package                                  |
+| `pnpm build`      | Build the library into `packages/fokosdb/dist`                   |
+| `pnpm test`       | Build, then run the library and example suites in real `workerd` |
+| `pnpm dev`        | Build, then boot the example Workers with wrangler               |
+| `pnpm check`      | Typecheck every package and check formatting                     |
+| `pnpm fmt`        | Format the repo                                                  |
+| `pnpm lint:pkg`   | `publint` on the packaged library                                |
+| `pnpm cf-typegen` | Regenerate every `worker-configuration.d.ts`                     |
+
+The examples import the library's built `dist/`, not its sources, so `pnpm build` has to run before
+their tests. The `test` and `dev` scripts already do this.
 
 ## TODO
 
@@ -84,10 +115,10 @@ npm test
 
 ```sh
 # terminal 1
-rm -rf ./apps/fokos-svc/src/examples/http-api/.wrangler && npm run dev
+rm -rf ./examples/http-api/.wrangler && pnpm dev
 
 # terminal 2
-npm run test:hurl
+pnpm --filter "@fokosdb-example/http-api" test:hurl
 ```
 
 ## Contributing

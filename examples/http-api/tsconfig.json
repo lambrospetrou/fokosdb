@@ -1,0 +1,10 @@
+{
+	"extends": "../../packages/fokosdb/tsconfig.json",
+	"compilerOptions": {
+		// This worker is a separate wrangler project, so it has its own generated Env.
+		// `@cloudflare/vitest-pool-workers/types` provides `cloudflare:test` for the integration test.
+		"types": ["./worker-configuration.d.ts", "node", "@cloudflare/vitest-pool-workers/types"]
+	},
+	"include": ["./**/*.ts", "./worker-configuration.d.ts"],
+	"exclude": []
+}

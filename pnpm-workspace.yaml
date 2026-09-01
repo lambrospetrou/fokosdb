@@ -1,0 +1,11 @@
+packages:
+  - "packages/*"
+  - "examples/*"
+
+# Native dependencies whose install scripts must run: workerd and esbuild unpack the platform
+# binaries the Workers runtime and its bundler need, and hurl fetches its release archive.
+allowBuilds:
+  "@orangeopensource/hurl": true
+  esbuild: true
+  sharp: true
+  workerd: true

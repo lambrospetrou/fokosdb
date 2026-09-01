@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.wrangler/
+worker-configuration.d.ts
+examples/http-api/test/hurl/report-json/
+docs/ideas/
+docs/agent-plans/
+.claude/
+pnpm-lock.yaml

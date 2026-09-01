@@ -1,0 +1,31 @@
+{
+	"name": "@fokosdb-example/http-api",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy --secrets-file .env.production",
+		"test": "vitest run",
+		"cf-typegen": "wrangler types",
+		"test:hurl": "npx dotenv -e test/hurl/.env.dev-hurl -- hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2 test/hurl/*.hurl",
+		"test:hurl:run": "npx dotenv -e test/hurl/.env.dev-hurl -- hurl --variables-file test/hurl/vars.env --test --report-json test/hurl/report-json --connect-timeout 2",
+		"pretest:hurl:remote": "rm -rf test/hurl/report-json && mkdir -p test/hurl/report-json",
+		"test:hurl:remote": "npx dotenv -e test/hurl/.env.production-hurl -- hurl --variables-file test/hurl/vars_remote.env --test --report-json test/hurl/report-json --connect-timeout 2"
+	},
+	"dependencies": {
+		"fokosdb": "workspace:*",
+		"hono": "^4.12.22",
+		"valibot": "^1.4.0"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.16.9",
+		"@orangeopensource/hurl": "^8.0.1",
+		"@types/node": "^25.6.0",
+		"dotenv-cli": "^11.0.0",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.7",
+		"wrangler": "^4.94.0"
+	}
+}

@@ -1,0 +1,18 @@
+{
+	"name": "fokosdb-monorepo",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "pnpm --filter \"fokosdb\" build",
+		"check": "pnpm build && pnpm -r check && prettier --check .",
+		"fmt": "prettier --write .",
+		"dev": "pnpm build && pnpm --filter \"./examples/*\" -r dev",
+		"test": "pnpm build && pnpm --filter \"fokosdb\" test && pnpm --filter \"./examples/*\" -r test",
+		"lint:pkg": "pnpm --filter \"fokosdb\" lint:pkg",
+		"cf-typegen": "pnpm -r cf-typegen"
+	},
+	"devDependencies": {
+		"prettier": "3.8.3"
+	},
+	"packageManager": "pnpm@11.25.0+sha512.5cde925b4f075f725eb71fbae18a42ffe784524789f19b61c731cb8721ec28aaee160e01a8d5af4fedb2a42cdbf300efe23db356b0d4a17b4d63e11f8ab7c956"
+}

@@ -1,0 +1,59 @@
+{
+	"name": "fokosdb",
+	"version": "0.0.0",
+	"description": "A strongly consistent bottomless key-value database on top of Cloudflare Durable Objects",
+	"license": "MIT",
+	"author": "Lambros Petrou",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/lambrospetrou/fokosdb.git",
+		"directory": "packages/fokosdb"
+	},
+	"homepage": "https://github.com/lambrospetrou/fokosdb#readme",
+	"bugs": "https://github.com/lambrospetrou/fokosdb/issues",
+	"keywords": [
+		"cloudflare",
+		"durable-objects",
+		"workers",
+		"database",
+		"key-value",
+		"transactions"
+	],
+	"type": "module",
+	"sideEffects": false,
+	"exports": {
+		"./client": {
+			"types": "./dist/client/index.d.ts",
+			"import": "./dist/client/index.js"
+		},
+		"./server": {
+			"types": "./dist/server/index.d.ts",
+			"import": "./dist/server/index.js"
+		}
+	},
+	"files": [
+		"dist"
+	],
+	"scripts": {
+		"build": "tsdown",
+		"check": "tsc --noEmit",
+		"check:keys": "bash ../../tools/check-key-invariants.sh",
+		"lint:pkg": "publint",
+		"test": "pnpm check && pnpm check:keys && vitest run --printConsoleTrace",
+		"bench:expression": "vitest bench --config vitest.benchmark.config.ts",
+		"cf-typegen": "wrangler types"
+	},
+	"dependencies": {
+		"durable-utils": "^0.3.7",
+		"xxhash-wasm": "^1.1.0"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.16.9",
+		"@types/node": "^25.6.0",
+		"publint": "^0.3.15",
+		"tsdown": "^0.15.6",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.7",
+		"wrangler": "^4.94.0"
+	}
+}
