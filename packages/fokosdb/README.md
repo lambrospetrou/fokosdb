@@ -8,15 +8,27 @@ with an API and transaction model modelled on DynamoDB.
 
 ## Install
 
-The package is not on npm yet. Every commit on `main` is published as an installable preview build,
-so pin one by its commit SHA:
+Every commit on `main` is published as an installable preview build. Pin one by its commit SHA:
 
 ```sh
-npm install https://pkg.pr.new/lambrospetrou/fokosdb/fokosdb@7527ec6
+npm install https://pkg.pr.new/lambrospetrou/fokosdb@afce6cb
 ```
 
-The URL of each build is posted as a commit comment. A preview build is removed six months after it
-is published, or one month after its last download, so re-pin a newer build from time to time.
+`@main` always resolves to the newest build on `main`. It is convenient, but it is a moving pointer,
+so an install is not reproducible:
+
+```sh
+npm install https://pkg.pr.new/fokosdb@main
+```
+
+A preview build reports its version as `0.0.0-preview-<sha>`. It is removed six months after it is
+published, or one month after its last download.
+
+If you want the manually published version on NPM:
+
+```sh
+npm install fokosdb@dev
+```
 
 ## Two subpath imports
 

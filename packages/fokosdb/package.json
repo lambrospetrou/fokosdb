@@ -41,7 +41,8 @@
 		"lint:pkg": "publint",
 		"test": "pnpm check && pnpm check:keys && vitest run --printConsoleTrace",
 		"bench:expression": "vitest bench --config vitest.benchmark.config.ts",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"publish:dev": "V=$(npm pkg get version | tr -d '\"') && SHA=$(git rev-parse --short HEAD) && pnpm build && npm pkg set version=\"0.0.0-dev.$(date -u +%Y%m%d%H%M%S).g$SHA\" && npm publish --tag dev; npm pkg set version=\"$V\""
 	},
 	"dependencies": {
 		"durable-utils": "^0.3.7",

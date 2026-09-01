@@ -45,4 +45,8 @@ jobs:
 
       # This must run only once per workflow. To add a package, pass it here rather than adding a
       # second invocation.
-      - run: pnpm exec pkg-pr-new publish --commentWithSha "./packages/fokosdb"
+      #
+      # `--previewVersion` rewrites the published version to `0.0.0-preview-<sha>`. Without it every
+      # preview build calls itself `0.0.0`, so two different builds are indistinguishable to a
+      # package manager and to anyone reading a lockfile.
+      - run: pnpm exec pkg-pr-new publish --commentWithSha --previewVersion "./packages/fokosdb"

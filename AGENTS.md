@@ -28,6 +28,7 @@ first, so the client-bundle guards gate every published build. Keep the `pkg-pr-
 to one invocation in that workflow, and pass extra packages as extra arguments; a second invocation
 is treated as spam. The workflow publishes only when `lambrospetrou` triggers it, and the username
 is written out in the workflow, so it needs an edit if the account or the repository owner changes.
+Preview install URLs are documented as `pkg.pr.new/lambrospetrou/fokosdb/fokosdb@<sha>`.
 
 There are two wrangler projects:
 
