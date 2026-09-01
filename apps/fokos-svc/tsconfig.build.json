@@ -1,0 +1,14 @@
+{
+	"extends": "./tsconfig.json",
+	"compilerOptions": {
+		"allowJs": false,
+		"declaration": true,
+		"declarationMap": true,
+		"noEmit": false,
+		"outDir": "./dist",
+		"rootDir": "./src/lib",
+		"sourceMap": true
+	},
+	"include": ["./src/lib/**/*.ts", "./src/uint8array-hex.d.ts", "./worker-configuration.d.ts"],
+	"exclude": ["./src/lib/**/*.bench.ts", "./src/lib/**/*.test.ts", "./src/lib/**/test-fixtures.ts"]
+}
