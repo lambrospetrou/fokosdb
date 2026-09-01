@@ -19,9 +19,10 @@ import {
 	QueryItemsOptions,
 	QueryItemsResult,
 } from "./types.js";
-import { PartitionDO, isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "./do-partition.js";
+import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "./partition-errors.js";
 import { isDestroyAbortError } from "./cf-utils.js";
-import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import { partitionStub, partitionStubByName } from "./do-stubs.js";
+import type { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "./partition-topology/router.js";
 import type {
 	InitiateReadResponseEncoded,
@@ -175,7 +176,7 @@ export class FokosDB {
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
+		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiPutItem(partitionContext, {
 			hashKey,
 			sortKey,
@@ -193,7 +194,7 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
+		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey });
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
@@ -213,7 +214,7 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
+		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, condition });
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
@@ -277,7 +278,7 @@ export class FokosDB {
 		if (!target) return null;
 
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-		const stub = PartitionDO.getByName(env[target.ns], target.doName);
+		const stub = partitionStubByName(env[target.ns], target.doName);
 		const request = { items: items.map(({ partitionContext: _partitionContext, ...item }) => item) };
 
 		let response: SingleShotResponse;
@@ -344,7 +345,7 @@ export class FokosDB {
 		const target = singlePartitionTarget(items);
 		if (!target) return null;
 
-		const stub = PartitionDO.getByName(env[target.ns], target.doName);
+		const stub = partitionStubByName(env[target.ns], target.doName);
 		const request = { items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) };
 		try {
 			return await tryWhile(
@@ -381,7 +382,7 @@ export class FokosDB {
 			partitionEntries.map(({ pCtx, items }) =>
 				tryWhile(
 					async () =>
-						await PartitionDO.getByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
+						await partitionStubByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
 							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
 						}),
@@ -406,7 +407,7 @@ export class FokosDB {
 			partitionEntries.map(({ pCtx, items }) =>
 				tryWhile(
 					async () =>
-						await PartitionDO.getByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
+						await partitionStubByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
 							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
 						}),
@@ -522,7 +523,7 @@ export class FokosDB {
 					: null;
 
 			const { doId, partitionContext } = this.#options.topology.pickPartition(query.hashKey, KeyCodec.encodeOptional(undefined));
-			const stub = PartitionDO.get(env[this.#options.topology.partitionContext().ns], doId);
+			const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
 
 			const rpcResult = await stub.apiQueryItems(partitionContext, {
 				hashKey: query.hashKey,
@@ -625,13 +626,13 @@ export class FokosDB {
 		// FokosDB supplies the two callbacks that perform the RPCs.
 		await this.#options.topology.traverseForDestroy(
 			async (ctx) => {
-				const stub = PartitionDO.getByName(env[ns], ctx.doName);
+				const stub = partitionStubByName(env[ns], ctx.doName);
 				console.warn(`Destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 				const { splitStatus, promotedKeys } = await stub.status(ctx);
 				return { splitStatus, promotedKeys };
 			},
 			async (ctx) => {
-				const stub = PartitionDO.getByName(env[ns], ctx.doName);
+				const stub = partitionStubByName(env[ns], ctx.doName);
 				try {
 					await stub.destroyPartition();
 				} catch (e) {

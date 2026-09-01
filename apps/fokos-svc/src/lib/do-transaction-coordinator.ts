@@ -13,7 +13,8 @@ import type {
 	TransactionItem,
 	TransactionItemKey,
 } from "./transaction-types.js";
-import { isPartitionExceededDatabaseSizeError, PartitionDO } from "./do-partition.js";
+import { PartitionDO } from "./do-partition.js";
+import { isPartitionExceededDatabaseSizeError } from "./partition-errors.js";
 import { DESTROY_ABORT_SENTINEL } from "./cf-utils.js";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "./transaction-limits.js";

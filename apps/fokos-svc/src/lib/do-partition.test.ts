@@ -1,13 +1,8 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import {
-	InitFromSplitOptions,
-	isPartitionExceededDatabaseSizeError,
-	isSinglePartitionFastPathFallbackError,
-	PartitionDO,
-	QueryItemsRpcRequest,
-} from "./do-partition.js";
+import { InitFromSplitOptions, PartitionDO, QueryItemsRpcRequest } from "./do-partition.js";
+import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "./partition-errors.js";
 import { PartitionContextCreator } from "./partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-topology/partition-id.js";
