@@ -1,0 +1,48 @@
+# Publishes an installable preview build of `fokosdb` for every commit on `main`, and for every pull
+# request that the repository owner opens from a branch of this repository.
+#
+# The `if` below is a security control, not a filter for noise. This workflow builds and publishes
+# the code of the branch that triggers it, so without the check anyone could open a pull request
+# from a fork and publish a tarball under this repository's name.
+#
+# The URL for each build is posted as a commit comment by the pkg.pr.new GitHub App, which must be
+# installed on this repository: https://github.com/apps/pkg-pr-new
+#
+# `pnpm build` runs the client-bundle guards in packages/fokosdb/tsdown.config.ts, so a build that
+# leaks server code into the client entry never gets published.
+name: Preview release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions: {}
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Nothing publishes unless lambrospetrou triggered it, and a pull request must also come from a
+    # branch of this repository and have been opened by that account. The username is written out
+    # rather than taken from `github.repository_owner`, so that moving this repository to another
+    # account or to an organization stops the publishes instead of widening who can cause one.
+    if: >-
+      github.actor == 'lambrospetrou' &&
+      (github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login == 'lambrospetrou'))
+    steps:
+      - uses: actions/checkout@v7
+
+      - run: corepack enable
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+      # This must run only once per workflow. To add a package, pass it here rather than adding a
+      # second invocation.
+      - run: pnpm exec pkg-pr-new publish --commentWithSha "./packages/fokosdb"

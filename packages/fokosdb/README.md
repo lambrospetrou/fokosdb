@@ -8,9 +8,15 @@ with an API and transaction model modelled on DynamoDB.
 
 ## Install
 
+The package is not on npm yet. Every commit on `main` is published as an installable preview build,
+so pin one by its commit SHA:
+
 ```sh
-npm install fokosdb
+npm install https://pkg.pr.new/lambrospetrou/fokosdb/fokosdb@7527ec6
 ```
+
+The URL of each build is posted as a commit comment. A preview build is removed six months after it
+is published, or one month after its last download, so re-pin a newer build from time to time.
 
 ## Two subpath imports
 

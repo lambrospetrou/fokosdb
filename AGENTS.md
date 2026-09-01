@@ -22,6 +22,13 @@ This is a pnpm workspace. Run these from the repo root.
 
 The examples import the library's built `dist/`, not its sources, so a source change needs a `pnpm build` before an example picks it up. `pnpm test` and `pnpm dev` already do this.
 
+`.github/workflows/preview-release.yml` publishes an installable preview build of the library for
+every commit on `main`, and for pull requests opened from a branch of this repository, through [pkg.pr.new](https://pkg.pr.new/). It runs `pnpm build`
+first, so the client-bundle guards gate every published build. Keep the `pkg-pr-new publish` call
+to one invocation in that workflow, and pass extra packages as extra arguments; a second invocation
+is treated as spam. The workflow publishes only when `lambrospetrou` triggers it, and the username
+is written out in the workflow, so it needs an edit if the account or the repository owner changes.
+
 There are two wrangler projects:
 
 - `packages/fokosdb/wrangler.jsonc` — the library worker. It is never deployed. It gives `vitest` and `wrangler types` an entrypoint (`packages/fokosdb/test/worker-entry.ts`) that exports the library Durable Objects.
