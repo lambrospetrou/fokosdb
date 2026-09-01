@@ -4,7 +4,7 @@
 	"type": "module",
 	"scripts": {
 		"build": "pnpm --filter \"fokosdb\" build",
-		"check": "pnpm build && pnpm -r check && prettier --check .",
+		"check": "pnpm build && pnpm lint:pkg && pnpm -r check && prettier --check .",
 		"fmt": "prettier --write .",
 		"dev": "pnpm build && pnpm --filter \"./examples/*\" -r dev",
 		"test": "pnpm build && pnpm --filter \"fokosdb\" test && pnpm --filter \"./examples/*\" -r test",
