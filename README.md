@@ -57,7 +57,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Use an instance of the FokosDB (without transactions) as the durability ledger for Transaction Coordinators to allow stateless coordinators so that data partitions would be able to start recovery on any of them. It adds an extra hop though in the transaction flow. Or put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Garbage collect the transactions data from the tx coordinators. Only delete a transaction that is already COMMITTED or CANCELLED, since partitions read a missing transaction as cancelled.
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Garbage collect the items table after splits and hash key promotions.
@@ -65,6 +64,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Use the partial range topology within each partition to speed up transactions as well.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
+- Maybe put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Create RpcTargets for the partition DOs and LRU cache them in the Worker to skip the getActor calls and go directly to the partition DOs.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
 - Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the transaction ID as tie breaker, since it is stable no matter which coordinator stamps or resumes the transaction.
@@ -77,7 +77,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 - Proper structured errors thrown to differentiate user vs server errors. Pick ONE failure model: a failed condition throws in `putItem` but is a returned `cancelled` value in `transactWriteItems`. Report one cancellation reason per operation, in request order.
 - Expose an RPC/API to trigger a manual split.
-- Enforce the expiration ttl for items. `ttlSeconds` is currently dropped without error, and a transactional put clears an existing expiry because `TransactionItem` carries no ttl.
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
