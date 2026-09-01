@@ -39,6 +39,8 @@ Run `pnpm cf-typegen` after changing bindings in either file. Each project has i
 
 **The client must never import a Durable Object class as a value.** Doing so pulls the whole server implementation into `dist/client`. Use the type-only helpers in `shared/do-stubs.ts` to get a typed stub, and keep class imports on the client side `import type`. `shared/partition-errors.ts` exists for the same reason: the client matches on those errors, and the predicates must not drag in `do-partition.ts`.
 
+`pnpm build` enforces this rule. The `check-client-bundle` plugin in `packages/fokosdb/tsdown.config.ts` walks the chunks that the client entry imports and fails the build if a module below `src/server/` is in one of them. The same plugin pins the external packages that the client may import and holds the client bundle under a size budget. It also prints the raw, minified and gzipped size of each entry together with the chunks that the entry imports, which is what a consumer really ships; `esbuild` is a devDependency for that minify step. Keep the plugin inline in the `plugins` array: `defineConfig` gives its hooks their types, so a separate helper would need `rolldown` as a devDependency only for the plugin types.
+
 Cohesive folders stay whole inside `shared/` even when only one side uses them. An entry pulls in only the modules it names, so placing a server-only module in `shared/` costs the client bundle nothing.
 
 ## Architecture

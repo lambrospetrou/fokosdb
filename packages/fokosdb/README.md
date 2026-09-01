@@ -98,13 +98,13 @@ package export condition for.
 
 ## Scripts
 
-| Command                 | Purpose                                                      |
-| ----------------------- | ------------------------------------------------------------ |
-| `pnpm build`            | Build `dist/client` and `dist/server` with tsdown            |
-| `pnpm test`             | Typecheck, key invariants, then vitest inside real `workerd` |
-| `pnpm lint:pkg`         | `publint` on the packaged output                             |
-| `pnpm cf-typegen`       | Regenerate `worker-configuration.d.ts`                       |
-| `pnpm bench:expression` | Expression engine benchmarks                                 |
+| Command                 | Purpose                                                                                                        |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `pnpm build`            | Build `dist/client` and `dist/server` with tsdown, which also reports entry sizes and guards the client bundle |
+| `pnpm test`             | Typecheck, key invariants, then vitest inside real `workerd`                                                   |
+| `pnpm lint:pkg`         | `publint` on the packaged output                                                                               |
+| `pnpm cf-typegen`       | Regenerate `worker-configuration.d.ts`                                                                         |
+| `pnpm bench:expression` | Expression engine benchmarks                                                                                   |
 
 `wrangler.jsonc` here is never deployed. It gives vitest and `wrangler types` an entry point
 (`test/worker-entry.ts`) that exports the library Durable Objects.
