@@ -3,10 +3,31 @@ import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
+import {
+	type ExpressionContext,
+	type ValueFacts,
+	EXPRESSION_CONTEXT_ALL,
+	arraySearchTypes,
+	booleanValue,
+	byteLiteralValue,
+	dataPathValue,
+	dataValue,
+	emptyTextValue,
+	equalityTypes,
+	getOperationDefinition,
+	hashKeyValue,
+	matchesContext,
+	nullValue,
+	numberValue,
+	orderedTypes,
+	prefixTypes,
+	sortKeyValue,
+	textValue,
+	ttlValue,
+	versionValue,
+} from "./operation-registry.js";
 import { validateReadJsonPath } from "./path.js";
-import { SQLITE_FUNCTION_ARITY, SQLITE_MATH_FUNCTIONS } from "./sqlite-functions.js";
 import { EXPRESSION_NATIVE_TYPES, type ExpressionNativeType } from "./types.js";
-import { utf8WithinLimit } from "./utf8.js";
 
 export const EXPRESSION_REQUIRED_COLUMNS = ["hk", "sk", "v", "ttl_epoch_utc_seconds", "data_kind", "data"] as const;
 
@@ -21,97 +42,26 @@ export type ConditionExpressionAnalysis = {
 	requiredColumns: readonly ExpressionRequiredColumn[];
 };
 
-type DirectReference = "hashKey" | "sortKey" | "v" | "ttlAt" | "data";
-
-type ValueFacts = {
-	types: ReadonlySet<ExpressionNativeType>;
-	directReference?: DirectReference;
-	emptyStringLiteral?: true;
-	byteLiteral?: true;
-};
-
 type AnalysisContext = {
 	operatorsAndFunctions: number;
 	requiredColumns: Set<ExpressionRequiredColumn>;
+	expressionContext: ExpressionContext;
 };
 
-const equalityTypes = new Set<ExpressionNativeType>(["null", "boolean", "number", "text", "bytes"]);
-const orderedTypes = new Set<ExpressionNativeType>(["number", "text", "bytes"]);
-const prefixTypes = new Set<ExpressionNativeType>(["text", "bytes"]);
-const sizeInputTypes = new Set<ExpressionNativeType>(["text", "bytes", "array", "object"]);
-const arraySearchTypes = new Set<ExpressionNativeType>(["null", "boolean", "number", "text"]);
-const nullTypes = new Set<ExpressionNativeType>(["null"]);
-const booleanTypes = new Set<ExpressionNativeType>(["boolean"]);
-const numberTypes = new Set<ExpressionNativeType>(["number"]);
-const textTypes = new Set<ExpressionNativeType>(["text"]);
-const bytesTypes = new Set<ExpressionNativeType>(["bytes"]);
-const missingNumberTypes = new Set<ExpressionNativeType>(["missing", "number"]);
-const missingTextBytesTypes = new Set<ExpressionNativeType>(["missing", "text", "bytes"]);
-const nullNumberTypes = new Set<ExpressionNativeType>(["null", "number"]);
-const nullTextTypes = new Set<ExpressionNativeType>(["null", "text"]);
-const nullBytesTypes = new Set<ExpressionNativeType>(["null", "bytes"]);
-const allTypes = new Set<ExpressionNativeType>(EXPRESSION_NATIVE_TYPES);
-// A JSON path yields JSON types only; the whole `data` reference is the sole source of `bytes`.
-const dataPathTypes = new Set<ExpressionNativeType>(EXPRESSION_NATIVE_TYPES.filter((type) => type !== "bytes"));
-const nullValue: ValueFacts = { types: nullTypes };
-const booleanValue: ValueFacts = { types: booleanTypes };
-const numberValue: ValueFacts = { types: numberTypes };
-const textValue: ValueFacts = { types: textTypes };
-const emptyTextValue: ValueFacts = { types: textTypes, emptyStringLiteral: true };
-const byteLiteralValue: ValueFacts = { types: bytesTypes, byteLiteral: true };
-const missingNumberValue: ValueFacts = { types: missingNumberTypes };
-const nullNumberValue: ValueFacts = { types: nullNumberTypes };
-const nullTextValue: ValueFacts = { types: nullTextTypes };
-const nullBytesValue: ValueFacts = { types: nullBytesTypes };
-const hashKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "hashKey" };
-const sortKeyValue: ValueFacts = { types: missingTextBytesTypes, directReference: "sortKey" };
-const versionValue: ValueFacts = { types: missingNumberTypes, directReference: "v" };
-const ttlValue: ValueFacts = { types: missingNumberTypes, directReference: "ttlAt" };
-const dataValue: ValueFacts = { types: allTypes, directReference: "data" };
-const dataPathValue: ValueFacts = { types: dataPathTypes, directReference: "data" };
-const sqliteNumberFunctions = new Set([
-	"abs",
-	"glob",
-	"instr",
-	"length",
-	"like",
-	"octet_length",
-	"round",
-	"sign",
-	"unicode",
-	...SQLITE_MATH_FUNCTIONS,
-]);
-const sqliteTextFunctions = new Set([
-	"char",
-	"concat",
-	"concat_ws",
-	"hex",
-	"lower",
-	"ltrim",
-	"quote",
-	"replace",
-	"rtrim",
-	"substr",
-	"substring",
-	"trim",
-	"typeof",
-	"upper",
-]);
-
-export function analyzeExpressionValue(expression: unknown): ExpressionValueAnalysis {
-	const context = createContext();
+export function analyzeExpressionValue(expression: unknown, expressionContext: ExpressionContext = "condition"): ExpressionValueAnalysis {
+	const context = createContext(expressionContext);
 	const facts = analyzeValue(expression, 1, context);
 	return { nativeTypes: orderedTypesFrom(facts.types), requiredColumns: requiredColumnsFrom(context) };
 }
 
 export function validateConditionExpression(expression: unknown): ConditionExpressionAnalysis {
-	const context = createContext();
+	const context = createContext("condition");
 	analyzeCondition(expression, 1, context);
 	return { requiredColumns: requiredColumnsFrom(context) };
 }
 
-function createContext(): AnalysisContext {
-	return { operatorsAndFunctions: 0, requiredColumns: new Set() };
+function createContext(expressionContext: ExpressionContext = "condition"): AnalysisContext {
+	return { operatorsAndFunctions: 0, requiredColumns: new Set(), expressionContext };
 }
 
 function requiredColumnsFrom(context: AnalysisContext): readonly ExpressionRequiredColumn[] {
@@ -303,62 +253,25 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 	const args = expression.args;
 	countOperation(context);
 
-	if (expression.fn === "size" || expression.fn === "attribute_type") {
-		assertArity(args, 1);
-		const input = analyzeValue(args[0], depth + 1, context);
-		if (expression.fn === "attribute_type") return textValue;
-		if (!hasAnyType(input.types, sizeInputTypes)) throw new ExpressionError("invalid_type", "invalid size input type");
-		for (const type of input.types) {
-			if (!sizeInputTypes.has(type)) return missingNumberValue;
+	const operation = getOperationDefinition(expression.fn);
+	if (!operation || !matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
+		if (expression.fn.startsWith("sqlite.")) {
+			throw new ExpressionError("invalid_function", "SQLite function is not allowed");
 		}
-		return numberValue;
+		throw new ExpressionError("invalid_function", "unknown expression function");
 	}
 
-	if (!expression.fn.startsWith("sqlite.")) throw new ExpressionError("invalid_function", "unknown expression function");
-	const name = expression.fn.slice("sqlite.".length);
-	const arity = SQLITE_FUNCTION_ARITY.get(name);
-	if (arity === undefined) throw new ExpressionError("invalid_function", "SQLite function is not allowed");
-	if (args.length > EXPRESSION_LIMITS.sqliteFunctionArguments) {
+	if (operation.name.startsWith("sqlite.") && args.length > EXPRESSION_LIMITS.sqliteFunctionArguments) {
 		throw new ExpressionError("complexity_limit", "SQLite function argument limit exceeded");
 	}
-	assertArity(args, arity[0], arity[1]);
+	assertArity(args, operation.arity[0], operation.arity[1]);
 
-	const fixedResult = fixedSqliteResult(name);
-	let dynamicTypes: Set<ExpressionNativeType> | undefined;
+	const argFacts: ValueFacts[] = [];
 	for (let i = 0; i < args.length; i++) {
-		const argument = analyzeValue(args[i], depth + 1, context);
-		if (fixedResult === undefined && (name !== "nullif" || i === 0)) {
-			dynamicTypes ??= new Set(["null"]);
-			for (const type of argument.types) {
-				if (type !== "missing") dynamicTypes.add(type);
-			}
-		}
+		argFacts.push(analyzeValue(args[i], depth + 1, context));
 	}
-	if (name === "glob" || name === "like") validatePatternArguments(name, args);
-	return fixedResult ?? { types: dynamicTypes ?? nullTypes };
-}
 
-function validatePatternArguments(name: string, args: readonly unknown[]): void {
-	const pattern = stringLiteral(args[0]);
-	if (pattern === undefined) throw new ExpressionError("invalid_type", `${name} pattern must be a string literal`);
-	if (!utf8WithinLimit(pattern, EXPRESSION_LIMITS.sqlitePatternBytes)) {
-		throw new ExpressionError("complexity_limit", "SQLite pattern limit exceeded");
-	}
-	if (name === "like" && args.length === 3 && stringLiteral(args[2]) === undefined) {
-		throw new ExpressionError("invalid_type", "like escape must be a string literal");
-	}
-}
-
-function stringLiteral(value: unknown): string | undefined {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return;
-	const literal = (value as { val?: unknown }).val;
-	return typeof literal === "string" ? literal : undefined;
-}
-
-function fixedSqliteResult(name: string): ValueFacts | undefined {
-	if (sqliteNumberFunctions.has(name)) return nullNumberValue;
-	if (sqliteTextFunctions.has(name)) return nullTextValue;
-	if (name === "unhex") return nullBytesValue;
+	return operation.typeRule(argFacts, args);
 }
 
 function literalFacts(value: JsonPrimitive): ValueFacts {

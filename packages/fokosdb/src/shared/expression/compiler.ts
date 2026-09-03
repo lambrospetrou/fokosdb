@@ -4,6 +4,13 @@ import { ExpressionError } from "./errors.js";
 import { canonicalConditionIdentity } from "./identity.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
+	type ExpressionContext,
+	type OperationRenderers,
+	EXPRESSION_CONTEXT_ALL,
+	getOperationDefinition,
+	matchesContext,
+} from "./operation-registry.js";
+import {
 	composeConditionStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
@@ -20,6 +27,7 @@ type CompileContext = {
 	paramOffset: number;
 	completeData: boolean;
 	paths: Set<string>;
+	expressionContext: ExpressionContext;
 };
 
 type ValueMode = "logical" | "key" | "sqlite";
@@ -31,7 +39,6 @@ const EQUALITY_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "te
 const ORDERED_TYPE_NAMES: readonly string[] = ["number", "text", "bytes"];
 const PREFIX_TYPE_NAMES: readonly string[] = ["text", "bytes"];
 const ARRAY_SEARCH_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "text"];
-const SIZE_INPUT_TYPE_NAMES: readonly string[] = ["text", "bytes", "array", "object"];
 const JSON_EACH_TYPE_SQL =
 	"CASE je.type WHEN 'null' THEN 'null' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' ELSE 'missing' END";
 
@@ -46,6 +53,7 @@ export function compileConditionExpression(
 		paramOffset: fixedBindingCount,
 		completeData: false,
 		paths: new Set(),
+		expressionContext: "condition",
 	};
 	const sql = compactParameters(compileCondition(condition, context), context);
 	if (!utf8WithinLimit(composeConditionStatement(sql), EXPRESSION_LIMITS.compiledSqlBytes)) {
@@ -272,16 +280,23 @@ function compileContains(container: ExpressionValue, search: ExpressionValue, co
 	return `(${scalar} OR ${array})`;
 }
 
+function makeRenderers(context: CompileContext): OperationRenderers {
+	return {
+		renderValue: (val, mode) => renderValue(val, mode, context),
+		renderType: (val) => renderType(val, context),
+		renderPresent: (val) => renderPresent(val, context),
+		renderSize: (val) => renderSize(val, context),
+	};
+}
+
 function renderPresent(value: ExpressionValue, context: CompileContext): string {
 	if ("val" in value) return "1";
 	if ("b64" in value) return "1";
 	if ("ref" in value) return referencePresent(value, context);
-	if (value.fn === "attribute_type" || value.fn.startsWith("sqlite.")) return "1";
-	if (value.fn === "size") {
-		const inputType = renderType(value.args[0], context);
-		const inputConst = constTypeName(inputType);
-		if (inputConst !== undefined) return SIZE_INPUT_TYPE_NAMES.includes(inputConst) ? "1" : "0";
-		return `(${inputType} IN (${typeListSql(SIZE_INPUT_TYPE_NAMES)}))`;
+	const operation = getOperationDefinition(value.fn);
+	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
+		if (operation.renderPresent) return operation.renderPresent(value.args, makeRenderers(context));
+		return "1";
 	}
 	throw new ExpressionError("invalid_function", "unknown expression function");
 }
@@ -290,10 +305,10 @@ function renderType(value: ExpressionValue, context: CompileContext): string {
 	if ("val" in value) return `'${literalType(value.val as JsonPrimitive)}'`;
 	if ("b64" in value) return "'bytes'";
 	if ("ref" in value) return referenceType(value, context);
-	if (value.fn === "size") return "'number'";
-	if (value.fn === "attribute_type") return "'text'";
-	if (value.fn.startsWith("sqlite.")) {
-		const call = renderSqliteCall(value.fn.slice("sqlite.".length), value.args, context);
+	const operation = getOperationDefinition(value.fn);
+	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
+		if (operation.renderType) return operation.renderType(value.args, makeRenderers(context));
+		const call = `${operation.name.slice("sqlite.".length)}(${value.args.map((arg) => renderValue(arg, "sqlite", context)).join(", ")})`;
 		return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
 	}
 	throw new ExpressionError("invalid_function", "unknown expression function");
@@ -303,9 +318,10 @@ function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileCo
 	if ("val" in value) return bindLiteral(value.val as JsonPrimitive, mode, context);
 	if ("b64" in value) return bindByteLiteral(value, mode, context);
 	if ("ref" in value) return referenceValue(value, mode, context);
-	if (value.fn === "attribute_type") return renderType(value.args[0], context);
-	if (value.fn === "size") return renderSize(value.args[0], context);
-	if (value.fn.startsWith("sqlite.")) return renderSqliteCall(value.fn.slice("sqlite.".length), value.args, context);
+	const operation = getOperationDefinition(value.fn);
+	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
+		return operation.renderValue(value.args, makeRenderers(context));
+	}
 	throw new ExpressionError("invalid_function", "unknown expression function");
 }
 
@@ -317,10 +333,6 @@ function renderSize(value: ExpressionValue, context: CompileContext): string {
 	if (typeConst === "array" || typeConst === "object") return `(SELECT count(*) FROM json_each(${valueSql}))`;
 	if (typeConst !== undefined) return "NULL";
 	return `CASE WHEN ${type} IN ('text', 'bytes') THEN octet_length(${valueSql}) WHEN ${type} IN ('array', 'object') THEN (SELECT count(*) FROM json_each(${valueSql})) END`;
-}
-
-function renderSqliteCall(name: string, args: readonly ExpressionValue[], context: CompileContext): string {
-	return `${name}(${args.map((arg) => renderValue(arg, "sqlite", context)).join(", ")})`;
 }
 
 function referencePresent(reference: ExpressionReference, context: CompileContext): string {
