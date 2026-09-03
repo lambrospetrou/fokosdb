@@ -1,6 +1,7 @@
 export const EXPRESSION_LIMITS = {
 	operatorsAndFunctions: 300,
 	astDepth: 32,
+	updateActions: 32,
 	jsonPathDereferences: 32,
 	inChoices: 100,
 	sqliteFunctionArguments: 32,

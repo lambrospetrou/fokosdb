@@ -1,4 +1,5 @@
 import type { JsonPrimitive } from "../json-types.js";
+import { getActionDefinition } from "./action-registry.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
@@ -26,7 +27,7 @@ import {
 	ttlValue,
 	versionValue,
 } from "./operation-registry.js";
-import { validateReadJsonPath } from "./path.js";
+import { type PathSegment, isParentPath, pathsEqual, validateReadJsonPath, validateWriteJsonPath } from "./path.js";
 import { EXPRESSION_NATIVE_TYPES, type ExpressionNativeType } from "./types.js";
 
 export const EXPRESSION_REQUIRED_COLUMNS = ["hk", "sk", "v", "ttl_epoch_utc_seconds", "data_kind", "data"] as const;
@@ -39,6 +40,10 @@ export type ExpressionValueAnalysis = {
 };
 
 export type ConditionExpressionAnalysis = {
+	requiredColumns: readonly ExpressionRequiredColumn[];
+};
+
+export type UpdateExpressionAnalysis = {
 	requiredColumns: readonly ExpressionRequiredColumn[];
 };
 
@@ -57,6 +62,12 @@ export function analyzeExpressionValue(expression: unknown, expressionContext: E
 export function validateConditionExpression(expression: unknown): ConditionExpressionAnalysis {
 	const context = createContext("condition");
 	analyzeCondition(expression, 1, context);
+	return { requiredColumns: requiredColumnsFrom(context) };
+}
+
+export function validateUpdateExpression(expression: unknown): UpdateExpressionAnalysis {
+	const context = createContext("update-value");
+	analyzeUpdate(expression, context);
 	return { requiredColumns: requiredColumnsFrom(context) };
 }
 
@@ -187,6 +198,86 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 		}
 		default:
 			throw new ExpressionError("invalid_ast", "unknown condition operator");
+	}
+}
+
+function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
+	if (!Array.isArray(expression) || expression.length === 0) {
+		throw new ExpressionError("invalid_ast", "update expression must contain at least one action");
+	}
+	if (expression.length > EXPRESSION_LIMITS.updateActions) {
+		throw new ExpressionError("complexity_limit", "update action limit exceeded");
+	}
+
+	context.requiredColumns.add("data_kind");
+	context.requiredColumns.add("data");
+
+	type ParsedTarget = {
+		action: string;
+		segments: readonly PathSegment[];
+	};
+	const targets: ParsedTarget[] = [];
+
+	for (const item of expression) {
+		assertNode(item, "invalid update action");
+		if (typeof item.action !== "string") {
+			throw new ExpressionError("invalid_ast", "invalid update action");
+		}
+		const actionDef = getActionDefinition(item.action);
+		if (!actionDef) {
+			throw new ExpressionError("invalid_ast", "unknown update action");
+		}
+		if (actionDef.hasValue) {
+			if (!Object.hasOwn(item, "value")) {
+				throw new ExpressionError("invalid_ast", "set action requires value");
+			}
+			assertFields(item, "action", "target", "value");
+		} else {
+			assertFields(item, "action", "target");
+		}
+		assertNode(item.target, "invalid update target");
+		assertFields(item.target, "ref", "path");
+		if (item.target.ref !== "data" || typeof item.target.path !== "string") {
+			throw new ExpressionError("invalid_ast", "invalid update target");
+		}
+		const segments = validateWriteJsonPath(item.target.path, { allowAppend: actionDef.allowAppend });
+		if (segments.length === 0) {
+			throw new ExpressionError("invalid_path", "target path must not be root");
+		}
+		targets.push({ action: item.action, segments });
+
+		if (actionDef.hasValue) {
+			analyzeValue(item.value, 1, context);
+		}
+	}
+
+	for (let i = 0; i < targets.length; i++) {
+		for (let j = i + 1; j < targets.length; j++) {
+			if (pathsEqual(targets[i].segments, targets[j].segments)) {
+				throw new ExpressionError("invalid_path", "duplicate target path");
+			}
+			if (isParentPath(targets[i].segments, targets[j].segments) || isParentPath(targets[j].segments, targets[i].segments)) {
+				throw new ExpressionError("invalid_path", "overlapping target paths");
+			}
+		}
+	}
+
+	const removalsByParent: { parent: readonly PathSegment[]; hasPlain: boolean; hasReverse: boolean }[] = [];
+	for (const t of targets) {
+		if (t.action !== "remove") continue;
+		const last = t.segments[t.segments.length - 1];
+		if (last.kind !== "index" && last.kind !== "reverseIndex") continue;
+		const parent = t.segments.slice(0, -1);
+		let entry = removalsByParent.find((e) => pathsEqual(e.parent, parent));
+		if (!entry) {
+			entry = { parent, hasPlain: false, hasReverse: false };
+			removalsByParent.push(entry);
+		}
+		if (last.kind === "index") entry.hasPlain = true;
+		if (last.kind === "reverseIndex") entry.hasReverse = true;
+		if (entry.hasPlain && entry.hasReverse) {
+			throw new ExpressionError("invalid_path", "cannot mix plain and reverse index removals under the same parent");
+		}
 	}
 }
 

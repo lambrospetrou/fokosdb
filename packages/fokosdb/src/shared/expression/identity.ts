@@ -3,8 +3,15 @@ import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { validateScalarLiteral } from "./literal.js";
-import { validateReadJsonPath } from "./path.js";
-import type { ConditionExpression, ExpressionReference, ExpressionValue, ProjectionExpression } from "./types.js";
+import { validateReadJsonPath, validateWriteJsonPath } from "./path.js";
+import type {
+	ConditionExpression,
+	ExpressionReference,
+	ExpressionValue,
+	ProjectionExpression,
+	UpdateAction,
+	UpdateTarget,
+} from "./types.js";
 import { utf8WithinLimit } from "./utf8.js";
 
 class IdentityWriter {
@@ -73,6 +80,57 @@ class IdentityWriter {
 		this.#out += "]";
 	}
 
+	#writeTarget(target: UpdateTarget, allowAppend: boolean): void {
+		if (typeof target !== "object" || target === null || target.ref !== "data" || typeof target.path !== "string") {
+			throw new ExpressionError("invalid_ast", "invalid update target");
+		}
+		for (const field in target) {
+			if (field !== "ref" && field !== "path") throw new ExpressionError("invalid_ast", "invalid update target fields");
+		}
+		const segments = validateWriteJsonPath(target.path, { allowAppend });
+		if (segments.length === 0) throw new ExpressionError("invalid_path", "target path must not be root");
+		this.#out += `{"ref":"data","path":${JSON.stringify(target.path)}}`;
+	}
+
+	writeUpdate(update: readonly UpdateAction[]): void {
+		if (!Array.isArray(update) || update.length === 0) {
+			throw new ExpressionError("invalid_ast", "update expression must contain at least one action");
+		}
+		if (update.length > EXPRESSION_LIMITS.updateActions) {
+			throw new ExpressionError("complexity_limit", "update action limit exceeded");
+		}
+		this.#out += "[";
+		for (let i = 0; i < update.length; i++) {
+			const action = update[i];
+			if (typeof action !== "object" || action === null) throw new ExpressionError("invalid_ast", "invalid update action");
+			if (i > 0) this.#out += ",";
+			if (action.action === "set") {
+				for (const field in action) {
+					if (field !== "action" && field !== "target" && field !== "value") {
+						throw new ExpressionError("invalid_ast", "invalid action fields");
+					}
+				}
+				this.#out += '{"action":"set","target":';
+				this.#writeTarget(action.target, true);
+				this.#out += ',"value":';
+				this.writeValue(action.value);
+				this.#out += "}";
+			} else if (action.action === "remove") {
+				for (const field in action) {
+					if (field !== "action" && field !== "target") {
+						throw new ExpressionError("invalid_ast", "invalid action fields");
+					}
+				}
+				this.#out += '{"action":"remove","target":';
+				this.#writeTarget(action.target, false);
+				this.#out += "}";
+			} else {
+				throw new ExpressionError("invalid_ast", "unknown update action");
+			}
+		}
+		this.#out += "]";
+	}
+
 	finish(): string {
 		if (!utf8WithinLimit(this.#out, EXPRESSION_LIMITS.canonicalPayloadBytes)) {
 			throw new ExpressionError("complexity_limit", "canonical identity exceeds the payload limit");
@@ -99,5 +157,12 @@ export function canonicalConditionIdentity(condition: ConditionExpression): stri
 export function canonicalProjectionIdentity(projection: readonly ProjectionExpression[]): string {
 	const writer = new IdentityWriter();
 	writer.writeProjection(projection);
+	return writer.finish();
+}
+
+/** Returns canonical identity text for an update expression. */
+export function canonicalUpdateIdentity(update: readonly UpdateAction[]): string {
+	const writer = new IdentityWriter();
+	writer.writeUpdate(update);
 	return writer.finish();
 }

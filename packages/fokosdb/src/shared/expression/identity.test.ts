@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import type { ConditionExpression, ExpressionValue, ProjectionExpression } from "./types.js";
+import type { ConditionExpression, ExpressionValue, ProjectionExpression, UpdateAction } from "./types.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalValueIdentity } from "./identity.js";
+import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity, canonicalValueIdentity } from "./identity.js";
 
 const versionEqualsOne: ConditionExpression = { op: "eq", args: [{ ref: "v" }, { val: 1 }] };
 
@@ -93,5 +93,39 @@ describe("byte literal identity", () => {
 
 	it("rejects an invalid byte literal", () => {
 		expect(() => canonicalValueIdentity({ b64: "" } as unknown as ExpressionValue)).toThrow(/byte literal/);
+	});
+});
+
+describe("update identity", () => {
+	it("generates stable update identity with fixed field order", () => {
+		const update: readonly UpdateAction[] = [
+			{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } },
+			{ action: "remove", target: { ref: "data", path: "$.tempToken" } },
+		];
+		expect(canonicalUpdateIdentity(update)).toBe(
+			'[{"action":"set","target":{"ref":"data","path":"$.status"},"value":{"val":"active"}},{"action":"remove","target":{"ref":"data","path":"$.tempToken"}}]',
+		);
+	});
+
+	it("does not sort actions and distinguishes different declared orders", () => {
+		const orderA: readonly UpdateAction[] = [
+			{ action: "set", target: { ref: "data", path: "$.list[#]" }, value: { val: "x" } },
+			{ action: "remove", target: { ref: "data", path: "$.list[0]" } },
+		];
+		const orderB: readonly UpdateAction[] = [
+			{ action: "remove", target: { ref: "data", path: "$.list[0]" } },
+			{ action: "set", target: { ref: "data", path: "$.list[#]" }, value: { val: "x" } },
+		];
+		expect(canonicalUpdateIdentity(orderA)).not.toBe(canonicalUpdateIdentity(orderB));
+	});
+
+	it("does not depend on caller object field insertion order within an action", () => {
+		const regular: readonly UpdateAction[] = [{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }];
+		const reordered = [{ value: { val: 1 }, target: { path: "$.a", ref: "data" }, action: "set" }] as unknown as readonly UpdateAction[];
+		expect(canonicalUpdateIdentity(reordered)).toBe(canonicalUpdateIdentity(regular));
+	});
+
+	it("rejects an empty update action list", () => {
+		expect(() => canonicalUpdateIdentity([])).toThrow(/at least one action/);
 	});
 });

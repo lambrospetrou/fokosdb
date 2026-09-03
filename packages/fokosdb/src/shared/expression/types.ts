@@ -45,3 +45,9 @@ export type ProjectionExpression = {
 	expr: ExpressionValue;
 	as?: string;
 };
+
+export type UpdateTarget = { ref: "data"; path: string };
+
+export type UpdateAction = { action: "set"; target: UpdateTarget; value: ExpressionValue } | { action: "remove"; target: UpdateTarget };
+
+export type UpdateExpression = readonly UpdateAction[];
