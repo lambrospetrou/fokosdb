@@ -1,10 +1,13 @@
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import { PartitionDO } from "../../server/do-partition.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
-import { compileConditionExpression } from "./compiler.js";
+import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { composeConditionStatement, CONDITION_PLAN_VERSION } from "./plan.js";
+import { composeConditionStatement, CONDITION_PLAN_VERSION, UPDATE_PLAN_VERSION } from "./plan.js";
 import { materializeExpressionBindings } from "./runtime.js";
-import type { ConditionExpression } from "./types.js";
+import type { ConditionExpression, UpdateExpression } from "./types.js";
 
 describe("condition SQLite compiler", () => {
 	it("creates a versioned JSON-safe condition plan", () => {
@@ -164,5 +167,212 @@ describe("byte literal compilation", () => {
 	it("keeps base64 text out of generated SQL", () => {
 		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "data" }, { b64: "AQID" }] });
 		expect(plan.sql).not.toContain("AQID");
+	});
+});
+
+describe("update SQLite compiler", () => {
+	it("creates a versioned JSON-safe update plan", () => {
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } },
+			{ action: "remove", target: { ref: "data", path: "$.tempToken" } },
+		];
+		const plan = compileUpdateExpression(update);
+		expect(plan.version).toBe(UPDATE_PLAN_VERSION);
+		expect(plan.kind).toBe("update");
+		expect(plan.requiredColumns).toContain("data_kind");
+		expect(plan.requiredColumns).toContain("data");
+		expect(plan.dataDependencies.paths).toEqual(["$.status", "$.tempToken"]);
+		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
+	});
+
+	it("nests document expressions with accumulator starting at i.data", () => {
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } },
+			{ action: "remove", target: { ref: "data", path: "$.b" } },
+		];
+		const plan = compileUpdateExpression(update);
+		expect(plan.documentSql).toMatch(/^jsonb_remove\(jsonb_set\(i\.data, \?\d+, \?\d+\), \?\d+\)$/);
+	});
+
+	it("renders boolean and null literals accurately for JSONB document", () => {
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.active" }, value: { val: true } },
+			{ action: "set", target: { ref: "data", path: "$.disabled" }, value: { val: false } },
+			{ action: "set", target: { ref: "data", path: "$.none" }, value: { val: null } },
+		];
+		const plan = compileUpdateExpression(update);
+		expect(plan.documentSql).toContain("jsonb('true')");
+		expect(plan.documentSql).toContain("jsonb('false')");
+		expect(plan.documentSql).toContain("NULL");
+	});
+
+	it("sorts removals of plain array indices under same parent in descending index order", () => {
+		const update: UpdateExpression = [
+			{ action: "remove", target: { ref: "data", path: "$.list[1]" } },
+			{ action: "remove", target: { ref: "data", path: "$.list[2]" } },
+			{ action: "remove", target: { ref: "data", path: "$.list[0]" } },
+		];
+		const plan = compileUpdateExpression(update);
+		const pathsInOrder = plan.bindings.filter((b) => b.kind === "path").map((b) => b.value);
+		expect(pathsInOrder).toEqual(["$.list[2]", "$.list[1]", "$.list[0]"]);
+	});
+
+	it("builds applicability guards for target validity and document result type", () => {
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.user.name" }, value: { val: "Alice" } },
+			{ action: "set", target: { ref: "data", path: "$.tags[#]" }, value: { val: "new" } },
+			{ action: "set", target: { ref: "data", path: "$.scores[0]" }, value: { val: 100 } },
+		];
+		const plan = compileUpdateExpression(update);
+		expect(plan.applicableSql).toContain("i.hk IS NOT NULL");
+		expect(plan.applicableSql).toContain("i.data_kind = 2");
+		expect(plan.applicableSql).toContain("json_type(i.data, ?");
+		expect(plan.applicableSql).toContain("= 'object'");
+		expect(plan.applicableSql).toContain("= 'array'");
+		expect(plan.applicableSql).toContain("IS NOT NULL");
+		expect(plan.applicableSql).toContain("json_type(");
+		expect(plan.applicableSql).toContain("IN ('array', 'object')");
+	});
+
+	it("compiles if_not_exists and arithmetic expressions", () => {
+		const update: UpdateExpression = [
+			{
+				action: "set",
+				target: { ref: "data", path: "$.loginCount" },
+				value: {
+					fn: "+",
+					args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.loginCount" }, { val: 0 }] }, { val: 1 }],
+				},
+			},
+		];
+		const plan = compileUpdateExpression(update);
+		expect(plan.documentSql).toContain("+");
+		expect(plan.documentSql).toContain("CASE WHEN");
+		expect(plan.applicableSql).toContain("abs(");
+		expect(plan.applicableSql).toContain("< 1e999");
+	});
+
+	it("numbers parameters densely starting from ?1", () => {
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } },
+			{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 5 } },
+		];
+		const plan = compileUpdateExpression(update);
+		const allParams = new Set<number>();
+		for (const match of plan.documentSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
+		for (const match of plan.applicableSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
+		for (let i = 1; i <= plan.bindingCount; i++) {
+			expect(allParams.has(i)).toBe(true);
+		}
+	});
+
+	it("evaluates pre-image document expression in Workers SQLite", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{ action: "remove", target: { ref: "data", path: "$.a" } },
+				{ action: "set", target: { ref: "data", path: "$.b" }, value: { ref: "data", path: "$.a" } },
+				{ action: "set", target: { ref: "data", path: "$.c" }, value: { ref: "data", path: "$.b" } },
+			];
+			const plan = compileUpdateExpression(update);
+			const bindings = materializeExpressionBindings(plan.bindings);
+			const initialJson = JSON.stringify({ a: 1, b: 2, c: 3 });
+			const dataParam = `?${plan.bindings.length + 1}`;
+			const row = state.storage.sql
+				.exec<{ doc: string; applicable: number }>(
+					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
+					...bindings,
+					initialJson,
+				)
+				.one();
+			expect(JSON.parse(row.doc)).toEqual({ b: 1, c: 2 });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("evaluates plain array index removal order in Workers SQLite", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{ action: "remove", target: { ref: "data", path: "$.r[1]" } },
+				{ action: "remove", target: { ref: "data", path: "$.r[2]" } },
+			];
+			const plan = compileUpdateExpression(update);
+			const bindings = materializeExpressionBindings(plan.bindings);
+			const initialJson = JSON.stringify({ r: ["c", "h", "n", "s", "x"] });
+			const dataParam = `?${plan.bindings.length + 1}`;
+			const row = state.storage.sql
+				.exec<{ doc: string; applicable: number }>(
+					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
+					...bindings,
+					initialJson,
+				)
+				.one();
+			expect(JSON.parse(row.doc)).toEqual({ r: ["c", "s", "x"] });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("rejects invalid target in applicability check in Workers SQLite", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 1 } }];
+			const plan = compileUpdateExpression(update);
+			const bindings = materializeExpressionBindings(plan.bindings);
+			const initialJson = JSON.stringify({ a: 1 });
+			const dataParam = `?${plan.bindings.length + 1}`;
+			const row = state.storage.sql
+				.exec<{ applicable: number }>(
+					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+					 SELECT (${plan.applicableSql}) AS applicable FROM i`,
+					...bindings,
+					initialJson,
+				)
+				.one();
+			expect(row.applicable).toBe(0);
+		});
+	});
+
+	it("evaluates if_not_exists and arithmetic increment in Workers SQLite", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.loginCount" },
+					value: {
+						fn: "+",
+						args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.loginCount" }, { val: 0 }] }, { val: 1 }],
+					},
+				},
+			];
+			const plan = compileUpdateExpression(update);
+			const bindings = materializeExpressionBindings(plan.bindings);
+			const dataParam = `?${plan.bindings.length + 1}`;
+
+			const row1 = state.storage.sql
+				.exec<{ doc: string; applicable: number }>(
+					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
+					...bindings,
+					JSON.stringify({}),
+				)
+				.one();
+			expect(JSON.parse(row1.doc)).toEqual({ loginCount: 1 });
+			expect(row1.applicable).toBe(1);
+
+			const row2 = state.storage.sql
+				.exec<{ doc: string; applicable: number }>(
+					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
+					...bindings,
+					JSON.stringify({ loginCount: 5 }),
+				)
+				.one();
+			expect(JSON.parse(row2.doc)).toEqual({ loginCount: 6 });
+			expect(row2.applicable).toBe(1);
+		});
 	});
 });

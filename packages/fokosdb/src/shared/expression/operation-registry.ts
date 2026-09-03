@@ -230,6 +230,14 @@ function buildSqliteOperations(): OperationDefinition[] {
 	return operations;
 }
 
+// SQLite evaluates 1e999 as +Infinity. In SQLite, `abs(x) < 1e999` evaluates to 1 for finite
+// numbers, 0 for +/-Infinity, and NULL for NaN. This guard verifies both operands are numbers
+// and the arithmetic result is finite, because JSON cannot store NaN or Infinity.
+function renderArithmeticPresent(symbol: "+" | "-" | "*", args: readonly ExpressionValue[], renderers: OperationRenderers): string {
+	const op = `(${renderers.renderValue(args[0], "sqlite")} ${symbol} ${renderers.renderValue(args[1], "sqlite")})`;
+	return `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])} AND ${renderers.renderType(args[0])} = 'number' AND ${renderers.renderType(args[1])} = 'number' AND abs(${op}) < 1e999)`;
+}
+
 const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 	{
 		name: "attribute_type",
@@ -278,9 +286,10 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			return { types: resultTypes };
 		},
 		renderValue: (args, renderers) =>
-			`if_not_exists(${renderers.renderValue(args[0], "sqlite")}, ${renderers.renderValue(args[1], "sqlite")})`,
+			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "sqlite")} ELSE ${renderers.renderValue(args[1], "sqlite")} END`,
 		renderPresent: (args, renderers) => `(${renderers.renderPresent(args[0])} OR ${renderers.renderPresent(args[1])})`,
-		renderType: (args, renderers) => renderers.renderType(args[0]),
+		renderType: (args, renderers) =>
+			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderType(args[0])} ELSE ${renderers.renderType(args[1])} END`,
 	},
 	{
 		name: "+",
@@ -294,7 +303,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			return nullable ? nullNumberValue : numberValue;
 		},
 		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} + ${renderers.renderValue(args[1], "sqlite")})`,
-		renderPresent: (args, renderers) => `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])})`,
+		renderPresent: (args, renderers) => renderArithmeticPresent("+", args, renderers),
 		renderType: () => "'number'",
 	},
 	{
@@ -309,7 +318,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			return nullable ? nullNumberValue : numberValue;
 		},
 		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} - ${renderers.renderValue(args[1], "sqlite")})`,
-		renderPresent: (args, renderers) => `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])})`,
+		renderPresent: (args, renderers) => renderArithmeticPresent("-", args, renderers),
 		renderType: () => "'number'",
 	},
 	{
@@ -324,7 +333,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			return nullable ? nullNumberValue : numberValue;
 		},
 		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} * ${renderers.renderValue(args[1], "sqlite")})`,
-		renderPresent: (args, renderers) => `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])})`,
+		renderPresent: (args, renderers) => renderArithmeticPresent("*", args, renderers),
 		renderType: () => "'number'",
 	},
 ];

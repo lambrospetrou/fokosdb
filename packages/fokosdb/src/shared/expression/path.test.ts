@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { validateReadJsonPath } from "./path.js";
+import { parentJsonPath, validateReadJsonPath } from "./path.js";
 
 const validPaths = ["$", "$.profile.email", "$.items[0]", "$.items[#-1]", '$."special.label"', '$."items[0]"', '$.""'];
 
@@ -78,5 +78,24 @@ describe("SQLite read JSON paths", () => {
 			expect(row.value).toBe(7);
 			expect(state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM items").one().count).toBe(0);
 		});
+	});
+});
+
+describe("parentJsonPath", () => {
+	it.each([
+		["$.a", "$"],
+		["$.user.name", "$.user"],
+		["$.items[0]", "$.items"],
+		["$.items[#]", "$.items"],
+		["$[0]", "$"],
+		["$[#]", "$"],
+		['$."special.label"', "$"],
+		['$.user."display name"', "$.user"],
+		['$.user."quote\\"inside"', "$.user"],
+		['$."a.b".name', '$."a.b"'],
+		['$."a.b"[0]', '$."a.b"'],
+		["$", "$"],
+	])("extracts parent of %s as %s", (path, expectedParent) => {
+		expect(parentJsonPath(path)).toBe(expectedParent);
 	});
 });

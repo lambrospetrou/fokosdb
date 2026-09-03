@@ -127,6 +127,40 @@ export function validateWriteJsonPath(path: unknown, options?: { allowAppend?: b
 	return segments;
 }
 
+/** Extracts the parent JSON path by removing the last selector. */
+export function parentJsonPath(path: string): string {
+	if (typeof path !== "string" || path.length <= 1) return "$";
+
+	const lastChar = path[path.length - 1];
+
+	if (lastChar === "]") {
+		const openBracket = path.lastIndexOf("[");
+		return path.slice(0, openBracket) || "$";
+	}
+
+	if (lastChar === '"') {
+		let i = path.length - 2;
+		while (i >= 2) {
+			if (path[i] === '"') {
+				let slashes = 0;
+				let j = i - 1;
+				while (j >= 0 && path[j] === "\\") {
+					slashes++;
+					j--;
+				}
+				if (slashes % 2 === 0 && j >= 1 && path[j] === ".") {
+					return path.slice(0, j) || "$";
+				}
+			}
+			i--;
+		}
+		return "$";
+	}
+
+	const lastDot = path.lastIndexOf(".");
+	return path.slice(0, lastDot) || "$";
+}
+
 function invalidPath(): never {
 	throw new ExpressionError("invalid_path", "invalid SQLite JSON path");
 }

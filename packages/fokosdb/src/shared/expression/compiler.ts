@@ -1,7 +1,7 @@
 import type { JsonPrimitive } from "../json-types.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
-import { canonicalConditionIdentity } from "./identity.js";
+import { canonicalConditionIdentity, canonicalUpdateIdentity } from "./identity.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
 	type ExpressionContext,
@@ -10,15 +10,18 @@ import {
 	getOperationDefinition,
 	matchesContext,
 } from "./operation-registry.js";
+import { parentJsonPath, validateWriteJsonPath } from "./path.js";
 import {
 	composeConditionStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
+	UPDATE_PLAN_VERSION,
 	type CompiledConditionPlan,
+	type CompiledUpdatePlan,
 	type ExpressionBindingDescriptor,
 } from "./plan.js";
-import { validateConditionExpression } from "./semantic.js";
-import type { ConditionExpression, ExpressionReference, ExpressionValue } from "./types.js";
+import { validateConditionExpression, validateUpdateExpression } from "./semantic.js";
+import type { ConditionExpression, ExpressionReference, ExpressionValue, UpdateAction, UpdateExpression, UpdateTarget } from "./types.js";
 import { utf8WithinLimit } from "./utf8.js";
 
 type CompileContext = {
@@ -77,6 +80,152 @@ export function compileConditionExpression(
 	};
 }
 
+export function compileUpdateExpression(update: UpdateExpression): CompiledUpdatePlan {
+	const analysis = validateUpdateExpression(update);
+	const orderedActions = orderUpdateActions(update);
+	const context: CompileContext = {
+		bindings: [],
+		bindingIndexByKey: new Map(),
+		paramOffset: 0,
+		completeData: false,
+		paths: new Set(),
+		expressionContext: "update-value",
+	};
+
+	let accumulator = "i.data";
+	for (const action of orderedActions) {
+		context.paths.add(action.target.path);
+		const pathParam = bindPath(action.target.path, context);
+		if (action.action === "set") {
+			const valueSql = renderUpdateValue(action.value, context);
+			accumulator = `jsonb_set(${accumulator}, ${pathParam}, ${valueSql})`;
+		} else {
+			accumulator = `jsonb_remove(${accumulator}, ${pathParam})`;
+		}
+	}
+	const rawDocumentSql = accumulator;
+
+	const applicableTerms: string[] = ["(i.hk IS NOT NULL)", `(i.data_kind = ${JSON_KIND})`];
+
+	for (const action of orderedActions) {
+		if (action.action === "set") {
+			applicableTerms.push(targetGuardSql(action.target, context));
+			const presentSql = renderPresent(action.value, context);
+			if (presentSql !== "1") {
+				applicableTerms.push(`(${presentSql})`);
+			}
+		}
+	}
+
+	applicableTerms.push(`(json_type(${rawDocumentSql}) IN ('array', 'object'))`);
+
+	const rawApplicableSql = `(CASE WHEN ${applicableTerms.join(" AND ")} THEN 1 ELSE 0 END)`;
+
+	const [documentSql, applicableSql] = compactPlanParameters([rawDocumentSql, rawApplicableSql], context);
+
+	if (
+		!utf8WithinLimit(documentSql, EXPRESSION_LIMITS.compiledSqlBytes) ||
+		!utf8WithinLimit(applicableSql, EXPRESSION_LIMITS.compiledSqlBytes)
+	) {
+		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	}
+	if (context.bindings.length > EXPRESSION_LIMITS.completeStatementBindings) {
+		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
+	}
+
+	return {
+		version: UPDATE_PLAN_VERSION,
+		kind: "update",
+		documentSql,
+		applicableSql,
+		bindings: context.bindings,
+		bindingCount: context.bindings.length,
+		requiredColumns: analysis.requiredColumns,
+		dataDependencies: {
+			completeData: context.completeData,
+			paths: [...context.paths],
+		},
+		identity: canonicalUpdateIdentity(update),
+	};
+}
+
+function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAction[] {
+	type PlainIndexRemoval = {
+		index: number;
+		actionIndex: number;
+		action: UpdateAction;
+	};
+	const groups = new Map<string, PlainIndexRemoval[]>();
+
+	for (let i = 0; i < actions.length; i++) {
+		const action = actions[i];
+		if (action.action !== "remove") continue;
+		const segments = validateWriteJsonPath(action.target.path, { allowAppend: false });
+		const last = segments[segments.length - 1];
+		if (last.kind === "index") {
+			const parent = parentJsonPath(action.target.path);
+			let group = groups.get(parent);
+			if (!group) {
+				group = [];
+				groups.set(parent, group);
+			}
+			group.push({ index: last.index, actionIndex: i, action });
+		}
+	}
+
+	let needsReorder = false;
+	for (const group of groups.values()) {
+		if (group.length > 1) {
+			for (let i = 0; i < group.length - 1; i++) {
+				if (group[i].index < group[i + 1].index) {
+					needsReorder = true;
+					break;
+				}
+			}
+		}
+		if (needsReorder) break;
+	}
+
+	if (!needsReorder) return actions;
+
+	const result = [...actions];
+	for (const group of groups.values()) {
+		if (group.length <= 1) continue;
+		const sorted = [...group].sort((a, b) => b.index - a.index);
+		for (let i = 0; i < group.length; i++) {
+			result[group[i].actionIndex] = sorted[i].action;
+		}
+	}
+
+	return result;
+}
+
+function targetGuardSql(target: UpdateTarget, context: CompileContext): string {
+	const segments = validateWriteJsonPath(target.path, { allowAppend: true });
+	const last = segments[segments.length - 1];
+	if (last.kind === "member") {
+		const parentPath = parentJsonPath(target.path);
+		const parentParam = bindPath(parentPath, context);
+		return `(json_type(i.data, ${parentParam}) = 'object')`;
+	}
+	if (last.kind === "append") {
+		const parentPath = parentJsonPath(target.path);
+		const parentParam = bindPath(parentPath, context);
+		return `(json_type(i.data, ${parentParam}) = 'array')`;
+	}
+	const targetParam = bindPath(target.path, context);
+	return `(json_type(i.data, ${targetParam}) IS NOT NULL)`;
+}
+
+function renderUpdateValue(value: ExpressionValue, context: CompileContext): string {
+	if ("val" in value) {
+		if (value.val === true) return "jsonb('true')";
+		if (value.val === false) return "jsonb('false')";
+		if (value.val === null) return "NULL";
+	}
+	return renderValue(value, "sqlite", context);
+}
+
 /**
  * Removes bindings whose numbered parameter no longer appears in the SQL. Constant folding can
  * discard a rendered fragment after its binding was registered; Workers SQLite requires the
@@ -84,9 +233,15 @@ export function compileConditionExpression(
  * densely and in their original order.
  */
 function compactParameters(sql: string, context: CompileContext): string {
+	return compactPlanParameters([sql], context)[0];
+}
+
+function compactPlanParameters(sqlList: string[], context: CompileContext): string[] {
 	const used = new Set<number>();
-	for (const match of sql.matchAll(/\?(\d+)/g)) used.add(Number(match[1]));
-	if (used.size === context.bindings.length) return sql;
+	for (const sql of sqlList) {
+		for (const match of sql.matchAll(/\?(\d+)/g)) used.add(Number(match[1]));
+	}
+	if (used.size === context.bindings.length) return sqlList;
 	const remap = new Map<number, number>();
 	const survivors: ExpressionBindingDescriptor[] = [];
 	for (const index of [...used].sort((a, b) => a - b)) {
@@ -94,7 +249,7 @@ function compactParameters(sql: string, context: CompileContext): string {
 		remap.set(index, context.paramOffset + survivors.length);
 	}
 	context.bindings = survivors;
-	return sql.replace(/\?(\d+)/g, (_, digits: string) => `?${remap.get(Number(digits))}`);
+	return sqlList.map((sql) => sql.replace(/\?(\d+)/g, (_, digits: string) => `?${remap.get(Number(digits))}`));
 }
 
 function compileCondition(condition: ConditionExpression, context: CompileContext): string {
