@@ -189,7 +189,7 @@ describe("TransactionParticipant - prepare", () => {
 	});
 
 	it("materializes update document in pending_transactions at prepare and applies it at commit", async () => {
-		await withParticipant(({ participant, store }) => {
+		await withParticipant(({ participant, store, upserts }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
 				hk: kb("user"),
@@ -238,6 +238,12 @@ describe("TransactionParticipant - prepare", () => {
 			expect(store.measureItemBytes({ hk: kb("user"), sk, data: pending?.data as Uint8Array, kind: "json" })).toBe(
 				materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K,
 			);
+
+			// An update reports its new key size like a put does, so promotion and split accounting see
+			// the growth of an item that the request itself never carried.
+			expect(upserts).toEqual([
+				{ hashKey: kb("user"), keyEstBytes: materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K },
+			]);
 		});
 	});
 

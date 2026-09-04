@@ -7,6 +7,7 @@ import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
@@ -461,6 +462,45 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("updateItemSingleShot keeps est_row_bytes and key_size_estimates in step with the stored document", async () => {
+		await withStore((store, state) => {
+			const hk = kb("hk");
+			const sk = kb("s1");
+			store.upsertItem({ hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			const before = kseBytes(state, "hk");
+
+			const plan = compileUpdateExpression([
+				{ action: "set", target: { ref: "data", path: "$.note" }, value: { val: "a considerably longer note than the first one" } },
+			]);
+			const res = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 2 });
+
+			// The size the update stored is measured over the document the update wrote, and the key's
+			// estimate carries exactly that row. An update grows an item without carrying its bytes, so
+			// this accounting is what keeps promotion and split decisions correct.
+			const row = state.storage.sql
+				.exec<{ e: number; d: number }>(`SELECT est_row_bytes AS e, octet_length(data) AS d FROM items WHERE hk = ? AND sk = ?`, hk, sk)
+				.one();
+			expect(row.e).toBe(row.d + hk.byteLength + sk.byteLength + EST_ROW_BYTES_K);
+			expect(res.keyEstBytes).toBe(row.e);
+			expect(kseBytes(state, "hk")).toBe(row.e);
+			expect(row.e).toBeGreaterThan(before!);
+		});
+	});
+
+	it("insertItemIfAbsent ingests a row above the item size limit, which upsertItem refuses", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			const sk = kb("big");
+			// A migration copies rows that were accepted under the limit of their time, so the ingest
+			// path carries no size guard. A guard there would drop an item when the limit falls.
+			const oversized = "x".repeat(MAX_ITEM_BYTES + 1);
+			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, lastTransactionTs: 1 })).toThrow(/exceeds/);
+
+			store.insertItemIfAbsent({ hk, sk, data: oversized, kind: "text", ttl_epoch_utc_seconds: null, v: 7, last_transaction_ts: 1 });
+			expect(store.getItem(hk, sk).row).toMatchObject({ v: 7, data: oversized });
+		});
+	});
+
 	it("separates a byte value from every other inapplicable update", async () => {
 		await withStore((store) => {
 			const hk = kb("text-key");
@@ -468,9 +508,7 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, lastTransactionTs: 1 });
 			// A missing target parent is inapplicable, but the values are fine, so the cause is not the
 			// value type. Only that distinction lets a caller tell a fixable value from a stale item.
-			const missingParent = compileUpdateExpression([
-				{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } },
-			]);
+			const missingParent = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } }]);
 			const probe = store.probeUpdate(missingParent, hk, sk);
 			expect(probe.applicable).toBe(false);
 			expect(probe.valueTypeOk).toBe(true);

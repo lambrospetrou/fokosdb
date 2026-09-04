@@ -1,6 +1,6 @@
 # RFC — Update expressions for transactWriteItems
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-09-02
 **Author:** Lambros
 
@@ -128,9 +128,11 @@ That spec lists update expressions as future work and states the required behavi
 ## 3. Milestones
 
 Each milestone keeps the tests and the type checks green. M1 to M3 change no public API, so they can ship
-alone. M4 is the first milestone a caller can use.
+alone. M4 is the first milestone a caller can use. Every milestone is shipped.
 
 ### M1 — Operation registry and action registry
+
+**Status:** Completed
 
 Collapse the per-operation branches into one declarative table. Today a new Fokos operation needs one branch in
 `analyzeFunction` in `src/shared/expression/semantic.ts`, and three branches in `src/shared/expression/compiler.ts`:
@@ -167,17 +169,23 @@ This milestone changes no behaviour. The proof is that every existing compiled p
 
 ### M2 — Update AST, validation, and identity
 
+**Status:** Completed
+
 Deliver the public AST of section 4.2.1, the write path validator, the target rules, the overlap detection, the
 canonical update identity, and the `updateActions` limit. The library validates an update and produces its
 identity. It does not compile one.
 
 ### M3 — Scalar update compiler
 
+**Status:** Completed
+
 Deliver the document expression of section 4.2.5 for `set` and `remove`, with scalar values only. Deliver the
 value operations `if_not_exists`, `+`, `-`, and `*`. Deliver the applicability guards, the result type guard,
 the size guard, the binding descriptors, and the `CompiledUpdatePlan`. Test every rule in Workers SQLite.
 
 ### M4 — transactWriteItems integration
+
+**Status:** Completed
 
 Wire the plan into both write paths, with materialization at prepare. Deliver the public and RPC types, the
 `tc_items` column, the `PartitionStore` methods, the participant changes, the two rejection reasons, the
@@ -190,7 +198,12 @@ uses. The precheck of section 4.2.10 is one definition for both operations and b
 
 ### M5 — Hardening and documentation
 
+**Status:** Completed
+
 Run the acceptance matrix of section 4.2.12. Measure an update on a 400 KiB item. Add happy path examples in the `expressions.test.ts` in a describe block dedicated for updates.
+
+The 400 KiB measurement is in the table at the end of section 4.2.13. The showcase examples are the three
+`expression showcase: update ...` blocks of `packages/fokosdb/src/shared/expression/expressions.test.ts`.
 
 ---
 
@@ -755,6 +768,25 @@ The rest of the cost model:
 - The payload of an update request is the size of the plan, not the size of the item. A change of one field in
   a 400 KiB item sends about 200 bytes instead of 400 KiB.
 - The document expression grows with the action count. The limits of section 4.2.14 bound it.
+
+**One 400 KiB item.** Measured in the Workers SQLite runtime over one JSON item whose stored row is 399,525
+bytes, with 300 runs of each statement after a warm-up, and one action that sets a scalar member. The loops are
+timed from outside the Durable Object, because Workers freezes the clock between two I/O operations. An empty
+loop of 300 calls costs 1 ms to 2 ms, which is the floor of every row below.
+
+| Statement | Total for 300 runs | For one run |
+| --- | --- | --- |
+| The probe | 19 ms to 20 ms | about 0.07 ms |
+| `UPDATE` with the inline size guard | 34 ms to 36 ms | about 0.12 ms |
+| The pending lock insert of the two-phase path | 84 ms to 87 ms | about 0.29 ms |
+| `measureItemBytes` for a `put` of the same item | 95 ms to 96 ms | about 0.32 ms |
+| `upsertItem` for a `put` of the same item | 205 ms to 207 ms | about 0.69 ms |
+
+An update of one member of a 400 KiB item costs about a sixth of a `put` of the same item, and the request
+carries about 200 bytes instead of 400 KiB. The two statements a `put` needs — the measure in the check pass and
+the upsert — together cost about 1.0 ms, against about 0.19 ms for the probe and the `UPDATE` of an update.
+`jsonb_set` splices the value instead of parsing and re-encoding the whole document, which is where the
+difference comes from.
 
 #### 4.2.14 Limits
 

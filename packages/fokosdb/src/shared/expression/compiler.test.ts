@@ -448,9 +448,21 @@ describe("update SQLite compiler", () => {
 			// SQLite carries a JSON boolean as 1 or 0, so a function that returns one of its arguments
 			// must receive that argument already encoded as JSON. Otherwise `true` lands as the number 1.
 			const update: UpdateExpression = [
-				{ action: "set", target: { ref: "data", path: "$.viaCoalesce" }, value: { fn: "sqlite.coalesce", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] } },
-				{ action: "set", target: { ref: "data", path: "$.viaIfnull" }, value: { fn: "sqlite.ifnull", args: [{ ref: "data", path: "$.off" }, { val: 0 }] } },
-				{ action: "set", target: { ref: "data", path: "$.viaIfNotExists" }, value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] } },
+				{
+					action: "set",
+					target: { ref: "data", path: "$.viaCoalesce" },
+					value: { fn: "sqlite.coalesce", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] },
+				},
+				{
+					action: "set",
+					target: { ref: "data", path: "$.viaIfnull" },
+					value: { fn: "sqlite.ifnull", args: [{ ref: "data", path: "$.off" }, { val: 0 }] },
+				},
+				{
+					action: "set",
+					target: { ref: "data", path: "$.viaIfNotExists" },
+					value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] },
+				},
 			];
 			const plan = compileUpdateExpression(update);
 			const row = runUpdatePlan(state, plan, JSON.stringify({ flag: true, off: false }));

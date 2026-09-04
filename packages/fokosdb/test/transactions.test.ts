@@ -1561,6 +1561,58 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 	});
 
+	it("rejects update with update_not_applicable when an operand is missing or the arithmetic is not finite", async () => {
+		const db = makeDB({ singlePartitionFastPath });
+		const key = { hashKey: `operand-${crypto.randomUUID()}` };
+		await db.putItem({ ...key, data: { big: 1e308 } });
+
+		// An update never invents a value: a value that reads an absent path rejects the operation
+		// instead of storing a null.
+		const missingOperand = await db.transactWriteItems({
+			items: [
+				{
+					...key,
+					operation: "update",
+					update: [{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.absent" } }],
+				},
+			],
+		});
+		expect(missingOperand).toMatchObject({
+			outcome: "cancelled",
+			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+		});
+
+		// JSON holds no Infinity and no NaN, so an arithmetic result that is not finite rejects too.
+		const overflow = await db.transactWriteItems({
+			items: [
+				{
+					...key,
+					operation: "update",
+					update: [
+						{
+							action: "set",
+							target: { ref: "data", path: "$.big" },
+							value: {
+								fn: "*",
+								args: [
+									{ ref: "data", path: "$.big" },
+									{ ref: "data", path: "$.big" },
+								],
+							},
+						},
+					],
+				},
+			],
+		});
+		expect(overflow).toMatchObject({
+			outcome: "cancelled",
+			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+		});
+
+		// Neither rejection wrote anything.
+		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { version: 1, data: { big: 1e308 } } });
+	});
+
 	it("remove on missing path is a no-op that still increments version", async () => {
 		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `noop-${crypto.randomUUID()}` };
