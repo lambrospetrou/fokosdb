@@ -6,9 +6,9 @@ import type { JsonValue } from "../json-types.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
-import { compileConditionExpression } from "./compiler.js";
+import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
 import { evaluateConditionPlan } from "./runtime.js";
-import type { ConditionExpression } from "./types.js";
+import type { ConditionExpression, UpdateExpression } from "./types.js";
 
 /**
  * The showcase suite for condition expressions. Every case here is a happy-path example of how a
@@ -634,6 +634,380 @@ describe("expression showcase: complex expressions", () => {
 					{ op: "eq", args: [{ fn: "size", args: [{ ref: "data" }] }, { val: 4 }] },
 				],
 			},
+		},
+	]);
+});
+
+// ─── update expressions ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The showcase suite for update expressions. Every case seeds one fresh JSON item, applies one
+ * update to it, and shows the stored document that comes back. As above, there are no error cases:
+ * this is the place to read to learn what an update can express.
+ */
+
+/** The hash key of every update case. A case reads it back with a `hashKey` reference. */
+const updateHashKey = "customer#update";
+
+/** The document every update case starts from, unless the case needs another shape. */
+const account = {
+	status: "active",
+	loginCount: 4,
+	credit: 100,
+	discount: null,
+	profile: { name: "ada", country: "de" },
+	tags: ["beta", "eu"],
+	history: [{ code: "created" }, { code: "verified" }],
+	tempToken: "t-9",
+};
+
+/** The account document without one member, which is what a `remove` of that member must give. */
+function accountWithout(key: keyof typeof account): Record<string, JsonValue> {
+	const { [key]: _removed, ...rest } = account;
+	return rest;
+}
+
+/** Seeds one item, applies the update through the single-shot write path, and reads the item back. */
+async function applyUpdate(before: JsonValue, update: UpdateExpression): Promise<JsonValue> {
+	const hk = KeyCodec.encode(updateHashKey);
+	const sk = KeyCodec.encode(`update#${crypto.randomUUID()}`);
+	return await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
+		const store = new PartitionStore(state.storage);
+		store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+		store.updateItemSingleShot({ hk, sk, plan: compileUpdateExpression(update), lastTransactionTs: 2 });
+		return JSON.parse(store.getItem(hk, sk).row?.data as string) as JsonValue;
+	});
+}
+
+type UpdateShowcaseCase = {
+	name: string;
+	/** The document before the update. Defaults to the account above. */
+	before?: JsonValue;
+	update: UpdateExpression;
+	/** The complete document the update stores. */
+	after: JsonValue;
+};
+
+function updateShowcase(cases: readonly UpdateShowcaseCase[]): void {
+	it.each(cases)("$name", async ({ before = account, update, after }) => {
+		expect(await applyUpdate(before, update)).toEqual(after);
+	});
+}
+
+describe("expression showcase: update actions", () => {
+	updateShowcase([
+		{
+			name: "set replaces a top-level field",
+			update: [{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "closed" } }],
+			after: { ...account, status: "closed" },
+		},
+		{
+			name: "set replaces a nested field",
+			update: [{ action: "set", target: { ref: "data", path: "$.profile.country" }, value: { val: "fr" } }],
+			after: { ...account, profile: { name: "ada", country: "fr" } },
+		},
+		{
+			name: "set adds a member to an existing object",
+			update: [{ action: "set", target: { ref: "data", path: "$.profile.tier" }, value: { val: "gold" } }],
+			after: { ...account, profile: { name: "ada", country: "de", tier: "gold" } },
+		},
+		{
+			name: "set writes one array element by index",
+			update: [{ action: "set", target: { ref: "data", path: "$.tags[0]" }, value: { val: "ga" } }],
+			after: { ...account, tags: ["ga", "eu"] },
+		},
+		{
+			name: "set writes the last array element through a reverse index",
+			update: [{ action: "set", target: { ref: "data", path: "$.history[#-1].code" }, value: { val: "shipped" } }],
+			after: { ...account, history: [{ code: "created" }, { code: "shipped" }] },
+		},
+		{
+			name: "set appends to an array through the append form",
+			update: [{ action: "set", target: { ref: "data", path: "$.tags[#]" }, value: { val: "vip" } }],
+			after: { ...account, tags: ["beta", "eu", "vip"] },
+		},
+		{
+			name: "remove deletes a top-level field",
+			update: [{ action: "remove", target: { ref: "data", path: "$.tempToken" } }],
+			after: accountWithout("tempToken"),
+		},
+		{
+			name: "remove deletes a nested field",
+			update: [{ action: "remove", target: { ref: "data", path: "$.profile.country" } }],
+			after: { ...account, profile: { name: "ada" } },
+		},
+		{
+			name: "remove deletes one array element and closes the gap",
+			update: [{ action: "remove", target: { ref: "data", path: "$.tags[0]" } }],
+			after: { ...account, tags: ["eu"] },
+		},
+		{
+			name: "remove of an absent path changes nothing",
+			update: [{ action: "remove", target: { ref: "data", path: "$.coupon" } }],
+			after: account,
+		},
+		{
+			name: "one update carries many actions over many branches",
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "closed" } },
+				{ action: "set", target: { ref: "data", path: "$.profile.tier" }, value: { val: "gold" } },
+				{ action: "set", target: { ref: "data", path: "$.tags[#]" }, value: { val: "vip" } },
+				{ action: "remove", target: { ref: "data", path: "$.tempToken" } },
+			],
+			after: {
+				...accountWithout("tempToken"),
+				status: "closed",
+				profile: { name: "ada", country: "de", tier: "gold" },
+				tags: ["beta", "eu", "vip"],
+			},
+		},
+	]);
+});
+
+describe("expression showcase: update values", () => {
+	updateShowcase([
+		{
+			name: "if_not_exists supplies a default for an absent field",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.nickname" },
+					value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.nickname" }, { val: "anon" }] },
+				},
+			],
+			after: { ...account, nickname: "anon" },
+		},
+		{
+			name: "if_not_exists keeps the stored value of a present field",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.status" },
+					value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.status" }, { val: "unknown" }] },
+				},
+			],
+			after: account,
+		},
+		{
+			name: "if_not_exists keeps a stored JSON null, which coalesce would replace",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.discount" },
+					value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.discount" }, { val: 0 }] },
+				},
+			],
+			after: account,
+		},
+		{
+			name: "a counter increments with + over if_not_exists",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.loginCount" },
+					value: {
+						fn: "+",
+						args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.loginCount" }, { val: 0 }] }, { val: 1 }],
+					},
+				},
+			],
+			after: { ...account, loginCount: 5 },
+		},
+		{
+			name: "the same counter form starts an absent counter from its default",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.visits" },
+					value: {
+						fn: "+",
+						args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.visits" }, { val: 0 }] }, { val: 1 }],
+					},
+				},
+			],
+			after: { ...account, visits: 1 },
+		},
+		{
+			name: "- subtracts one stored field from another",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.credit" },
+					value: {
+						fn: "-",
+						args: [
+							{ ref: "data", path: "$.credit" },
+							{ ref: "data", path: "$.loginCount" },
+						],
+					},
+				},
+			],
+			after: { ...account, credit: 96 },
+		},
+		{
+			name: "* scales a stored number",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.credit" },
+					value: { fn: "*", args: [{ ref: "data", path: "$.credit" }, { val: 1.5 }] },
+				},
+			],
+			after: { ...account, credit: 150 },
+		},
+		{
+			name: "a multiplication by -1 negates a stored number",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.credit" },
+					value: { fn: "*", args: [{ val: -1 }, { ref: "data", path: "$.credit" }] },
+				},
+			],
+			after: { ...account, credit: -100 },
+		},
+		{
+			name: "a division is a multiplication by a reciprocal",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.credit" },
+					value: {
+						fn: "*",
+						args: [
+							{ ref: "data", path: "$.credit" },
+							{ fn: "sqlite.pow", args: [{ ref: "data", path: "$.loginCount" }, { val: -1 }] },
+						],
+					},
+				},
+			],
+			after: { ...account, credit: 25 },
+		},
+		{
+			name: "a SQLite function normalizes a field in place",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.profile.name" },
+					value: { fn: "sqlite.upper", args: [{ ref: "data", path: "$.profile.name" }] },
+				},
+			],
+			after: { ...account, profile: { name: "ADA", country: "de" } },
+		},
+		{
+			name: "concat builds a new member from two stored fields",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.profile.slug" },
+					value: {
+						fn: "sqlite.concat",
+						args: [{ ref: "data", path: "$.profile.country" }, { val: "-" }, { ref: "data", path: "$.profile.name" }],
+					},
+				},
+			],
+			after: { ...account, profile: { name: "ada", country: "de", slug: "de-ada" } },
+		},
+		{
+			name: "round trims a computed number",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.credit" },
+					value: {
+						fn: "sqlite.round",
+						args: [{ fn: "*", args: [{ ref: "data", path: "$.credit" }, { val: 1.075 }] }, { val: 1 }],
+					},
+				},
+			],
+			after: { ...account, credit: 107.5 },
+		},
+		{
+			name: "size stores the element count of an array",
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.tagCount" }, value: { fn: "size", args: [{ ref: "data", path: "$.tags" }] } },
+			],
+			after: { ...account, tagCount: 2 },
+		},
+		{
+			name: "attribute_type stores the type of a field",
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.discountType" },
+					value: { fn: "attribute_type", args: [{ ref: "data", path: "$.discount" }] },
+				},
+			],
+			after: { ...account, discountType: "null" },
+		},
+		{
+			name: "a text hash key becomes a stored member",
+			update: [{ action: "set", target: { ref: "data", path: "$.owner" }, value: { ref: "hashKey" } }],
+			after: { ...account, owner: updateHashKey },
+		},
+		{
+			name: "the item version of the pre-image becomes a stored member",
+			update: [{ action: "set", target: { ref: "data", path: "$.rev" }, value: { ref: "v" } }],
+			after: { ...account, rev: 1 },
+		},
+		{
+			name: "a boolean literal stays a boolean, and a null literal stays a null",
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.verified" }, value: { val: true } },
+				{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: null } },
+			],
+			after: { ...account, verified: true, status: null },
+		},
+	]);
+});
+
+describe("expression showcase: update order and the pre-image", () => {
+	updateShowcase([
+		{
+			name: "every value reads the pre-image, never the result of an earlier action",
+			before: { a: 1, b: 2, c: 3 },
+			update: [
+				{ action: "remove", target: { ref: "data", path: "$.a" } },
+				{ action: "set", target: { ref: "data", path: "$.b" }, value: { ref: "data", path: "$.a" } },
+				{ action: "set", target: { ref: "data", path: "$.c" }, value: { ref: "data", path: "$.b" } },
+			],
+			after: { b: 1, c: 2 },
+		},
+		{
+			name: "two fields swap in one update, with no read and no retry",
+			before: { a: 1, b: 2 },
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.a" }, value: { ref: "data", path: "$.b" } },
+				{ action: "set", target: { ref: "data", path: "$.b" }, value: { ref: "data", path: "$.a" } },
+			],
+			after: { a: 2, b: 1 },
+		},
+		{
+			name: "two removals of array indexes remove the two elements the caller named",
+			before: { r: ["c", "h", "n", "s", "x"] },
+			update: [
+				{ action: "remove", target: { ref: "data", path: "$.r[1]" } },
+				{ action: "remove", target: { ref: "data", path: "$.r[2]" } },
+			],
+			after: { r: ["c", "s", "x"] },
+		},
+		{
+			name: "the action order is significant: a set before a removal",
+			before: { list: ["a", "b", "c"] },
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.list[1]" }, value: { val: "z" } },
+				{ action: "remove", target: { ref: "data", path: "$.list[0]" } },
+			],
+			after: { list: ["z", "c"] },
+		},
+		{
+			name: "the action order is significant: the same two actions, reversed",
+			before: { list: ["a", "b", "c"] },
+			update: [
+				{ action: "remove", target: { ref: "data", path: "$.list[0]" } },
+				{ action: "set", target: { ref: "data", path: "$.list[1]" }, value: { val: "z" } },
+			],
+			after: { list: ["b", "z"] },
 		},
 	]);
 });
