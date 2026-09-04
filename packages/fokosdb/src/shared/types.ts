@@ -20,6 +20,9 @@ export type {
 	ExpressionReference,
 	ExpressionValue,
 	ProjectionExpression,
+	UpdateAction,
+	UpdateExpression,
+	UpdateTarget,
 } from "./expression/types.js";
 
 // ONE source of truth: the array. The on-disk `data_kind` column stores the compact integer code =

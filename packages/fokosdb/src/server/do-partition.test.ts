@@ -13,6 +13,7 @@ import { KeyBytes, KeyCodec } from "../shared/partition-topology/key-codec.js";
 import invariant from "../shared/invariant.js";
 import { IDEMPOTENCY_WINDOW_MS, MAX_ITEM_BYTES } from "../shared/transaction-limits.js";
 import { PartitionStore } from "../shared/partition/partition-store.js";
+import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { MIGRATION_KV_KEYS, type PartitionSplitMigrationStatus } from "../shared/partition/migration.js";
 import { compileConditionExpression } from "../shared/expression/compiler.js";
@@ -2806,9 +2807,10 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		// child receives after migration, avoiding fragile databaseSize comparisons.
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 1 } });
 
-		// Alice data exceeds the 512KB promotion threshold for maxSizeMb=1.
-		const aliceData = "x".repeat(600 * 1024);
-		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: aliceData, kind: "text" as const });
+		// Alice data exceeds the 512KB promotion threshold for maxSizeMb=1 across two items under the 400KB cap.
+		const aliceChunk = "x".repeat(300 * 1024);
+		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: aliceChunk, kind: "text" as const });
+		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: aliceChunk, kind: "text" as const });
 
 		// Wait for: detect → 'promoting' → range-root migration → 'promoted' → GC clears local alice items.
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
@@ -3160,10 +3162,11 @@ describe("PartitionDO — range split", () => {
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (const sk of ["a", "b", "c"]) {
+					const dataBytes = MAX_ITEM_BYTES - kb("alice").byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;
 					store.upsertItem({
 						hk: kb("alice"),
 						sk: kb(sk),
-						data: new Uint8Array(MAX_ITEM_BYTES),
+						data: new Uint8Array(dataBytes),
 						kind: "bytes",
 						ttlAt: null,
 						lastTransactionTs: 0,

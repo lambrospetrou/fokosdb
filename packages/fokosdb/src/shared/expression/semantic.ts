@@ -201,6 +201,28 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 	}
 }
 
+// The types a JSON document can hold. `null` and `missing` are absent on purpose: neither is a value
+// that decides whether an expression can produce a document member, and `null` is written as JSON null.
+const JSON_VALUE_TYPES: readonly ExpressionNativeType[] = ["boolean", "number", "text", "array", "object"];
+
+/**
+ * Refuses a `set` value that a JSON document can never hold.
+ *
+ * JSON has no byte type. A value whose only non-null outcome is bytes — a byte literal, or `unhex` —
+ * can never write a valid document, so it fails here, at compile time, with a message the caller can
+ * act on. A value that is bytes for SOME items only — a key reference, which is text for a text key
+ * and bytes for a binary one — passes here, and the compiler carries a per-item type test into
+ * `applicableSql` instead.
+ *
+ * A byte literal is still a valid ARGUMENT: `size` over one is a number, and that is a valid value.
+ * The test is therefore over the type of the whole value, never over the nodes inside it.
+ */
+function assertUpdateValueTypes(facts: ValueFacts): void {
+	if (facts.types.has("bytes") && !JSON_VALUE_TYPES.some((type) => facts.types.has(type))) {
+		throw new ExpressionError("invalid_type", "an update value must not be bytes");
+	}
+}
+
 function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 	if (!Array.isArray(expression) || expression.length === 0) {
 		throw new ExpressionError("invalid_ast", "update expression must contain at least one action");
@@ -247,7 +269,7 @@ function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 		targets.push({ action: item.action, segments });
 
 		if (actionDef.hasValue) {
-			analyzeValue(item.value, 1, context);
+			assertUpdateValueTypes(analyzeValue(item.value, 1, context));
 		}
 	}
 

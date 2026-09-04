@@ -50,6 +50,7 @@ type TcItemRow = {
 	data_kind: number | null;
 	ttl_epoch_utc_seconds: number | null;
 	conditions_json: string | null;
+	update_json: string | null;
 	partition_do_name: string;
 };
 
@@ -123,6 +124,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 data_kind           INTEGER,
                 ttl_epoch_utc_seconds INTEGER,
                 conditions_json     TEXT,
+                update_json         TEXT,
                 partition_do_name   TEXT    NOT NULL,
                 PRIMARY KEY (transaction_id, hk, sk)
             ) WITHOUT ROWID, STRICT;
@@ -207,17 +209,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			);
 			for (const op of request.items) {
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, partition_do_name)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
 					op.operation,
 					op.data ?? null,
-					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
+					// data and kind travel together: put carries both; delete/check/update carry neither (NULL kind).
 					op.kind === undefined ? null : DATA_KINDS.indexOf(op.kind),
 					op.ttlAt ?? null,
 					op.condition ? JSON.stringify(op.condition) : null,
+					op.update ? JSON.stringify(op.update) : null,
 					op.partitionContext.doName,
 				);
 			}
@@ -317,7 +320,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 	private stripPayload(transactionId: string): void {
 		this.ctx.storage.sql.exec(
-			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL WHERE transaction_id = ?`,
+			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL, update_json = NULL WHERE transaction_id = ?`,
 			transactionId,
 		);
 	}
@@ -793,7 +796,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadItems(transactionId: string): TcItemRow[] {
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, partition_do_name
+				`SELECT transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name
                  FROM tc_items WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -878,5 +881,6 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
 		ttlAt: row.ttl_epoch_utc_seconds ?? undefined,
 		condition: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
+		update: row.update_json ? JSON.parse(row.update_json) : undefined,
 	}));
 }

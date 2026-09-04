@@ -2,8 +2,11 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
+import { compileUpdateExpression } from "../expression/compiler.js";
+import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
-import { EST_ROW_BYTES_K, PartitionStore } from "./partition-store.js";
+import { PartitionStore } from "./partition-store.js";
+import { EST_ROW_BYTES_K } from "./item-size.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
@@ -398,6 +401,83 @@ describe("PartitionStore - items", () => {
 				.exec<{ c: number }>(`SELECT jsonb_extract(data, '$.count') AS c FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j2"))
 				.toArray()[0].c;
 			expect(count).toBe(7);
+		});
+	});
+
+	it("updateItemSingleShot distinguishes a missing item from an oversized result", async () => {
+		await withStore((store) => {
+			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
+			const plan = compileUpdateExpression(update);
+			expect(() =>
+				store.updateItemSingleShot({
+					hk: kb("missing-hk"),
+					sk: kb("missing-sk"),
+					plan,
+					lastTransactionTs: 1,
+				}),
+			).toThrow(/not found/);
+		});
+	});
+
+	it("stores text hashKey and sortKey references as JSON strings", async () => {
+		await withStore((store) => {
+			const hk = kb("my-hash-key");
+			const sk = kb("my-sort-key");
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.hk" }, value: { ref: "hashKey" } },
+				{ action: "set", target: { ref: "data", path: "$.sk" }, value: { ref: "sortKey" } },
+			];
+			const plan = compileUpdateExpression(update);
+			store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 2 });
+			const { row } = store.getItem(hk, sk);
+			expect(row).toBeDefined();
+			const data = JSON.parse(row!.data as string);
+			expect(data).toEqual({ hk: "my-hash-key", sk: "my-sort-key" });
+		});
+	});
+
+	it("rejects hashKey and sortKey references when keys are binary, and names the cause", async () => {
+		await withStore((store) => {
+			const hk = kb(new Uint8Array([1, 2, 3]));
+			const sk = kb(new Uint8Array([4, 5, 6]));
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			// A function around the reference must not escape the test: SQLite carries the untagged key
+			// bytes through, and the result is still a blob that a JSON document cannot hold.
+			const values = [
+				{ ref: "hashKey" as const },
+				{ ref: "sortKey" as const },
+				{ fn: "sqlite.ifnull" as const, args: [{ ref: "hashKey" as const }, { val: "fallback" }] },
+				{ fn: "sqlite.coalesce" as const, args: [{ ref: "sortKey" as const }, { val: "fallback" }] },
+			];
+			for (const value of values) {
+				const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression);
+				const probe = store.probeUpdate(plan, hk, sk);
+				expect(probe.applicable).toBe(false);
+				expect(probe.valueTypeOk).toBe(false);
+			}
+			// The item is untouched: an inapplicable update writes nothing.
+			expect(JSON.parse(store.getItem(hk, sk).row?.data as string)).toEqual({});
+		});
+	});
+
+	it("separates a byte value from every other inapplicable update", async () => {
+		await withStore((store) => {
+			const hk = kb("text-key");
+			const sk = kb("text-sort");
+			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			// A missing target parent is inapplicable, but the values are fine, so the cause is not the
+			// value type. Only that distinction lets a caller tell a fixable value from a stale item.
+			const missingParent = compileUpdateExpression([
+				{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } },
+			]);
+			const probe = store.probeUpdate(missingParent, hk, sk);
+			expect(probe.applicable).toBe(false);
+			expect(probe.valueTypeOk).toBe(true);
+
+			// A text key is a valid update value, so the same plan that fails over a binary key applies here.
+			const keyValue = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
+			expect(store.probeUpdate(keyValue, hk, sk)).toMatchObject({ applicable: true, valueTypeOk: true });
 		});
 	});
 });

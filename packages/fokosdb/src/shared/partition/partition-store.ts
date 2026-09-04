@@ -3,26 +3,84 @@ import { DATA_KINDS, type DataKind } from "../types.js";
 import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
-import type { CompiledConditionPlan } from "../expression/plan.js";
-import { evaluateConditionPlan, type ConditionEvaluationResult } from "../expression/runtime.js";
-
-// The on-disk `data_kind` code for json rows. json is stored as JSONB (a BLOB); a public read must
-// decode it to JSON text in SQL (`json(data)`) so JS never touches raw JSONB, while a migration read
-// copies the JSONB blob verbatim. This fixed integer is safe to interpolate into SQL.
-const JSON_KIND_CODE = DATA_KINDS.indexOf("json");
+import { UPDATE_MAX_TRAILING_BINDING_COUNT, type CompiledConditionPlan, type CompiledUpdatePlan } from "../expression/plan.js";
+import {
+	evaluateConditionPlan,
+	probeUpdatePlan,
+	validateUpdatePlan,
+	materializeExpressionBindings,
+	type ConditionEvaluationResult,
+	type UpdateProbeResult,
+} from "../expression/runtime.js";
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
 
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
 const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data`;
 
-// Fixed per-row overhead added to est_row_bytes. See the "items" migration for what K covers.
-export const EST_ROW_BYTES_K = 100;
+/**
+ * The statement-local parameters that follow an update plan's own.
+ *
+ * `?1` and `?2` are the keys, and the plan owns up to `completeBindingCount`; a statement appends its
+ * parameters after that. This numbers them in call order and collects their values in the same order,
+ * so the SQL and the bound list cannot drift apart, and a statement that needs one parameter fewer
+ * simply asks for one fewer. The widest tail any statement builds sets
+ * `UPDATE_MAX_TRAILING_BINDING_COUNT`, which the compiler charges to every update plan.
+ *
+ * BIND a value that changes between calls; interpolate one that does not. Workers SQLite keeps a
+ * prepared statement for each distinct SQL string, so a literal that varies per call compiles a new
+ * statement every time. Measured over 2000 runs of one 826-byte UPDATE in the Workers runtime: 56 ms
+ * with a bound parameter, 52 ms with a constant literal, and 169 ms with a literal that changed each
+ * run. That is why the TTL and the timestamps bind, while the json kind code is interpolated. A
+ * compiled document expression varies per update EXPRESSION and not per call, so it keeps its
+ * statement across the calls that repeat it.
+ */
+class StatementTail {
+	readonly #offset: number;
+	readonly #planBindings: unknown[];
+	readonly #values: unknown[] = [];
+
+	constructor(plan: CompiledUpdatePlan) {
+		this.#offset = plan.completeBindingCount;
+		this.#planBindings = materializeExpressionBindings(plan.bindings);
+	}
+
+	/** Reserves the next parameter for `value` and returns its `?N` reference. */
+	param(value: unknown): string {
+		// The compiler charges UPDATE_MAX_TRAILING_BINDING_COUNT to EVERY update plan, so a statement
+		// that binds a wider tail has silently lowered the budget for every update expression, and the
+		// plans already compiled against the old number can overflow the cap on this statement alone.
+		invariant(
+			this.#values.length < UPDATE_MAX_TRAILING_BINDING_COUNT,
+			`fokos/partition-store: statement tail exceeds UPDATE_MAX_TRAILING_BINDING_COUNT (${UPDATE_MAX_TRAILING_BINDING_COUNT})`,
+		);
+		return `?${this.#offset + this.#values.push(value)}`;
+	}
+
+	/** The complete bound list: the keys, then the plan's parameters, then this statement's own. */
+	bindings(hk: KeyBytes, sk: KeyBytes): unknown[] {
+		// A statement that embeds only documentSql still binds every plan parameter, so a parameter that
+		// only applicableSql uses is a gap in the numbering. SQLite counts the parameters of a statement
+		// by the HIGHEST index it references, so the count matches this list only while the tail reaches
+		// past completeBindingCount. With an empty tail the highest index is whatever documentSql happens
+		// to use, and the statement would be given more values than it has parameters.
+		invariant(this.#values.length > 0, "fokos/partition-store: an update statement needs at least one tail parameter");
+		return [hk, sk, ...this.#planBindings, ...this.#values];
+	}
+}
 
 /**
- * The ONLY definition of the est_row_bytes formula. `dataExpr` must be the same SQL that produces the
- * stored `data` value (e.g. `jsonb(?6)`), so the size is always measured on what SQLite writes.
+ * The size guard that every user write statement carries is an INVARIANT, not a decision.
+ *
+ * Both transactional write paths measure the row in their check pass, with the same SQL the write
+ * uses, and reject there — before anything is written. Only the non-transactional `putItem` has no
+ * earlier pass and can legitimately reach this. Raising, rather than reporting zero rows to every
+ * caller, keeps that asymmetry in one place: `putItem` lets the error reach its caller, and anywhere
+ * else the throw rolls back the storage transaction the write runs inside, which is what an
+ * unreachable state deserves.
  */
-function estRowBytesExpr(dataExpr: string, hkParam: string, skParam: string): string {
-	return `octet_length(${dataExpr}) + octet_length(${hkParam}) + octet_length(${skParam}) + ${EST_ROW_BYTES_K}`;
+function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
+	throw new Error(`fokos/partition: stored item exceeds ${MAX_ITEM_BYTES / 1024} KB (${KeyCodec.pairForLog(hk, sk)})`);
 }
 
 /**
@@ -365,6 +423,10 @@ export class PartitionStore {
 		return evaluateConditionPlan(this.#storage, plan, hk, sk);
 	}
 
+	probeUpdate(plan: CompiledUpdatePlan, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
+		return probeUpdatePlan(this.#storage, plan, hk, sk);
+	}
+
 	/**
 	 * The row's currently stored `est_row_bytes`, or 0 when the row is absent. `upsertItem` and
 	 * `deleteItem` both need it to compute the `key_size_estimates` delta, and it is the only read
@@ -401,16 +463,33 @@ export class PartitionStore {
 	}
 
 	/**
+	 * The exact `est_row_bytes` that `upsertItem` would store for this value, measured by SQLite over
+	 * the same expression the write uses. It reads no row: the statement has no FROM clause, so the
+	 * cost is the encode that the write would pay anyway.
+	 *
+	 * Both transactional write paths call it in their CHECK pass. A write that cannot fit is then
+	 * rejected before anything is written, which is what keeps the size guard below unreachable on a
+	 * two-phase commit — the pass that is not allowed to fail.
+	 */
+	measureItemBytes(opts: { hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): number {
+		const dataExpr = itemDataExpr(opts.kind, opts.data, "?3");
+		return this.#storage.sql
+			.exec<{ est_row_bytes: number }>(`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes`, opts.hk, opts.sk, opts.data)
+			.one().est_row_bytes;
+	}
+
+	/**
 	 * The items upsert with est_row_bytes / key_size_estimates bookkeeping — the single
 	 * definition used by BOTH the non-transactional putItem and the transactional commit apply.
 	 * Returns the new item version and the key's updated size estimate (feeds promotion checks).
+	 * Throws when the row would exceed MAX_ITEM_BYTES, which writes nothing — see throwItemTooLarge.
 	 * Metrics cover ONLY the items upsert statement (matching the DO's previous meta math —
 	 * the old-estimate read and the key_size_estimates upsert were never counted).
 	 */
 	upsertItem(opts: {
 		hk: KeyBytes;
 		sk: KeyBytes;
-		/** json ⇒ `data` is JSON text, wrapped with jsonb() into the binary form on write. */
+		/** json ⇒ JSON text from a client put, or a raw JSONB blob from a commit apply. */
 		data: string | Uint8Array;
 		kind: DataKind;
 		ttlAt: number | null;
@@ -423,10 +502,8 @@ export class PartitionStore {
 	} {
 		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
 
-		// json text is encoded to JSONB inside the DO; bytes/text bind verbatim. This is a fixed SQL
-		// fragment chosen by the kind discriminant, never user input, so it is injection-safe.
 		// data binds last (?6) because est_row_bytes must measure this same expression.
-		const dataExpr = opts.kind === "json" ? "jsonb(?6)" : "?6";
+		const dataExpr = itemDataExpr(opts.kind, opts.data, "?6");
 
 		// INVARIANT: last_transaction_ts is monotonic per item — it must never move backwards.
 		//
@@ -444,7 +521,8 @@ export class PartitionStore {
 		// bumpItemLastTransactionTs applies the same rule for the transactional "check" operation.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
 			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
-			 VALUES (?1, ?2, ?3, ?4, 1, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr})
+			 SELECT ?1, ?2, ?3, ?4, 1, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
+			 WHERE ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
@@ -459,9 +537,10 @@ export class PartitionStore {
 			opts.ttlAt,
 			opts.lastTransactionTs,
 			opts.data,
+			MAX_ITEM_BYTES,
 		);
 		const rows = writeRes.toArray();
-		invariant(rows.length === 1, `fokos/partition-store.upsertItem: RETURNING expected 1 row, got ${rows.length}`);
+		if (rows.length === 0) throwItemTooLarge(opts.hk, opts.sk);
 		const version = rows[0].v;
 		invariant(
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
@@ -859,8 +938,9 @@ export class PartitionStore {
 	/** Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. */
 	insertPendingLock(row: PendingTransactionRow): void {
 		this.#storage.sql.exec(
-			// pending_transactions is never queried by JSON path, so json data is stored raw (as text),
-			// not JSONB, the data_kind tag lets commit reconstruct the kind for upsertItem.
+			// pending_transactions is never queried by JSON path, so a put's json data is stored raw, as
+			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
+			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
 			`INSERT OR IGNORE INTO pending_transactions
 			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at, guarded_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -877,6 +957,120 @@ export class PartitionStore {
 			row.created_at,
 			row.guarded_at,
 		);
+	}
+
+	/**
+	 * Locks an item and materializes the complete new document into its pending row, so that commit
+	 * applies a payload that is already a plain put.
+	 *
+	 * The row stores the raw JSONB blob, NOT `json(...)` text. A JSONB-to-text-to-JSONB round trip is
+	 * not size-stable: `jsonb_set` keeps a string element unescaped, while re-parsing the rendered
+	 * text bakes the escapes into the blob, so `{"k":"he said \"hi\""}` grows by 4 bytes. Storing the
+	 * blob makes the bytes that `probeUpdate` measured at prepare the exact bytes commit writes.
+	 */
+	insertPendingUpdateLock(opts: {
+		hk: KeyBytes;
+		sk: KeyBytes;
+		transaction_id: string;
+		transaction_ts: number;
+		created_at: number;
+		coordinator_do_id: string;
+		plan: CompiledUpdatePlan;
+		conditions_json: string | null;
+		ttlAt?: number;
+	}): { rowsRead: number; rowsWritten: number } {
+		validateUpdatePlan(opts.plan);
+		const tail = new StatementTail(opts.plan);
+		const transactionIdParam = tail.param(opts.transaction_id);
+		const transactionTsParam = tail.param(opts.transaction_ts);
+		const createdAtParam = tail.param(opts.created_at);
+		const coordinatorParam = tail.param(opts.coordinator_do_id);
+		const conditionsParam = tail.param(opts.conditions_json);
+		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
+		// here, so the statement carries the branch it needs instead of testing a flag at run time. The
+		// VALUE still binds — see StatementTail for why a per-call value must not be interpolated.
+		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
+
+		const res = this.#storage.sql.exec(
+			`INSERT OR IGNORE INTO pending_transactions (
+				hk, sk, transaction_id, transaction_ts, created_at, coordinator_do_id,
+				operation, data_kind, conditions_json, ttl_epoch_utc_seconds, guarded_at, data
+			)
+			SELECT ?1, ?2, ${transactionIdParam}, ${transactionTsParam}, ${createdAtParam}, ${coordinatorParam},
+			       'update', ${JSON_KIND_CODE}, ${conditionsParam},
+			       ${ttlExpr},
+			       NULL,
+			       ${opts.plan.documentSql}
+			FROM items AS i
+			WHERE i.hk = ?1 AND i.sk = ?2`,
+			...tail.bindings(opts.hk, opts.sk),
+		);
+		return { rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+	}
+
+	/** Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge. */
+	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: CompiledUpdatePlan; ttlAt?: number; lastTransactionTs: number }): {
+		version: number;
+		keyEstBytes: number;
+		rowsRead: number;
+		rowsWritten: number;
+	} {
+		validateUpdatePlan(opts.plan);
+		// Zero means the row is absent, never a row of zero size: est_row_bytes always carries both keys
+		// and EST_ROW_BYTES_K. Answering here separates the two causes of an UPDATE that writes no row,
+		// so the size guard below can report the one cause that is left.
+		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
+		if (oldEst === 0) {
+			throw new Error(`fokos/partition: item not found (${KeyCodec.pairForLog(opts.hk, opts.sk)})`);
+		}
+		const docExpr = opts.plan.documentSql;
+		const hkParam = "?1";
+		const skParam = "?2";
+		const tail = new StatementTail(opts.plan);
+		const lastTsParam = tail.param(opts.lastTransactionTs);
+		// The TTL column is only assigned when the operation sets one; otherwise the statement leaves it
+		// alone, so the TTL of the pre-image survives without a run-time test. The value still binds.
+		const ttlAssignment = opts.ttlAt === undefined ? "" : `, ttl_epoch_utc_seconds = ${tail.param(opts.ttlAt)}`;
+		const limitParam = tail.param(MAX_ITEM_BYTES);
+
+		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
+			`UPDATE items AS i
+			    SET data = ${docExpr},
+			        est_row_bytes = ${estRowBytesExpr(docExpr, hkParam, skParam)},
+			        v = v + 1,
+			        last_transaction_ts = MAX(last_transaction_ts, ${lastTsParam})${ttlAssignment}
+			  WHERE i.hk = ${hkParam} AND i.sk = ${skParam}
+			    AND ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
+			 RETURNING v, est_row_bytes`,
+			...tail.bindings(opts.hk, opts.sk),
+		);
+		const rows = writeRes.toArray();
+		if (rows.length === 0) {
+			throwItemTooLarge(opts.hk, opts.sk);
+		}
+		const version = rows[0].v;
+		invariant(
+			typeof version === "number" && Number.isInteger(version) && version >= 1,
+			`fokos/partition-store.updateItemSingleShot: unexpected version value: ${version}`,
+		);
+		const newEst = rows[0].est_row_bytes;
+		const kseRow = this.#storage.sql
+			.exec<{ est_bytes: number }>(
+				`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
+				 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
+				 RETURNING est_bytes`,
+				opts.hk,
+				newEst,
+				oldEst,
+			)
+			.toArray()[0];
+
+		return {
+			version,
+			keyEstBytes: kseRow?.est_bytes ?? newEst,
+			rowsRead: writeRes.rowsRead,
+			rowsWritten: writeRes.rowsWritten,
+		};
 	}
 
 	pendingTxCountFor(transactionId: string): number {

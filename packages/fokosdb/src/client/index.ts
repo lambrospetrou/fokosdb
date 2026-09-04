@@ -17,4 +17,4 @@ export { PartitionTopologyRouterImpl } from "../shared/partition-topology/router
 export type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
 
 export { ExpressionError } from "../shared/expression/errors.js";
-export { compileConditionExpression } from "../shared/expression/compiler.js";
+export { compileConditionExpression, compileUpdateExpression } from "../shared/expression/compiler.js";

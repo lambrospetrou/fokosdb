@@ -14,6 +14,9 @@ import {
 	type JsonValue,
 	type QueryItemsResult,
 	type SplitConditions,
+	type UpdateAction,
+	type UpdateExpression,
+	type UpdateTarget,
 } from "fokosdb/client";
 import { PartitionDO } from "fokosdb/server";
 
@@ -108,6 +111,25 @@ const DeleteItemBodySchema = v.strictObject({
 	partitionOptions: PartitionOptionsSchema,
 });
 
+const UpdateTargetSchema: v.GenericSchema<UpdateTarget> = v.strictObject({
+	ref: v.literal("data"),
+	path: v.string(),
+});
+
+const UpdateActionSchema: v.GenericSchema<UpdateAction> = v.variant("action", [
+	v.strictObject({
+		action: v.literal("set"),
+		target: UpdateTargetSchema,
+		value: ExpressionValueSchema,
+	}),
+	v.strictObject({
+		action: v.literal("remove"),
+		target: UpdateTargetSchema,
+	}),
+]);
+
+const UpdateExpressionSchema: v.GenericSchema<UpdateExpression> = v.array(UpdateActionSchema);
+
 // Mirrors the `TransactWriteItem` union. `strictObject` turns a field belonging to another variant —
 // data on a delete — into a 400 that names it, instead of silently stripping it.
 const TransactWriteItemBodySchema = v.variant("operation", [
@@ -130,6 +152,14 @@ const TransactWriteItemBodySchema = v.variant("operation", [
 		hashKey: v.string(),
 		sortKey: v.optional(v.string()),
 		condition: ConditionExpressionSchema,
+	}),
+	v.strictObject({
+		operation: v.literal("update"),
+		hashKey: v.string(),
+		sortKey: v.optional(v.string()),
+		update: UpdateExpressionSchema,
+		ttlAt: v.optional(v.number()),
+		condition: v.optional(ConditionExpressionSchema),
 	}),
 ]);
 

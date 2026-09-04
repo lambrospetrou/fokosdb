@@ -79,12 +79,20 @@ const binaryItem: ShowcaseItem = {
 	data: new Uint8Array([0xde, 0xad, 0xbe, 0xef]),
 };
 
+// An item whose JSON field holds a string that looks like a number or a boolean.
+const stringLiteralItem: ShowcaseItem = {
+	hashKey: "customer#acme",
+	sortKey: "order#string-literal",
+	kind: "json",
+	data: { code: "5", enabled: "true" },
+};
+
 const partition = PartitionDO.getByName(env.PARTITION_DO, `expression-showcase.${crypto.randomUUID()}`);
 
 beforeAll(async () => {
 	await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		for (const item of [shippedOrder, pendingOrder, note, binaryItem]) {
+		for (const item of [shippedOrder, pendingOrder, note, binaryItem, stringLiteralItem]) {
 			store.upsertItem({
 				hk: KeyCodec.encode(item.hashKey),
 				sk: KeyCodec.encodeOptional(item.sortKey),
@@ -169,6 +177,28 @@ describe("expression showcase: comparison operators", () => {
 			name: "eq rejects the other order",
 			item: pendingOrder,
 			condition: { op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "shipped" }] },
+			expected: false,
+		},
+		{
+			name: "eq on a string that looks like a number",
+			item: stringLiteralItem,
+			condition: { op: "eq", args: [{ ref: "data", path: "$.code" }, { val: "5" }] },
+		},
+		{
+			name: "eq on a string that looks like a number does not match a real number",
+			item: stringLiteralItem,
+			condition: { op: "eq", args: [{ ref: "data", path: "$.code" }, { val: 5 }] },
+			expected: false,
+		},
+		{
+			name: "eq on a string that looks like a boolean",
+			item: stringLiteralItem,
+			condition: { op: "eq", args: [{ ref: "data", path: "$.enabled" }, { val: "true" }] },
+		},
+		{
+			name: "eq on a string that looks like a boolean does not match a real boolean",
+			item: stringLiteralItem,
+			condition: { op: "eq", args: [{ ref: "data", path: "$.enabled" }, { val: true }] },
 			expected: false,
 		},
 	]);

@@ -26,7 +26,7 @@ function hashOperation(op: TCWriteOperation): bigint {
 	// presence flags an absent field and a present-but-empty one would chain identically, so
 	// `data: ""` would fingerprint the same as no data at all.
 	h = hash64(
-		`${op.operation}|${op.kind ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}${op.ttlAt === undefined ? 0 : 1}`,
+		`${op.operation}|${op.kind ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}${op.ttlAt === undefined ? 0 : 1}${op.update === undefined ? 0 : 1}`,
 		h,
 	);
 	if (op.data !== undefined) {
@@ -39,6 +39,9 @@ function hashOperation(op: TCWriteOperation): bigint {
 	}
 	if (op.condition !== undefined) {
 		h = hash64(op.condition.identity, h);
+	}
+	if (op.update !== undefined) {
+		h = hash64(op.update.identity, h);
 	}
 	return h;
 }

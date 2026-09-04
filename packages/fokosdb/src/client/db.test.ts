@@ -6,6 +6,8 @@ import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.j
 import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
+import { KeyCodec } from "../shared/partition-topology/key-codec.js";
+import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -530,10 +532,20 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				/item data exceeds 400 KB/,
 			);
 
+			// Between the two ceilings: under the client's data check, over the store's row measure. The
+			// non-transactional putItem is the only caller with no earlier pass, so the store's guard is
+			// its answer, and it must leave the item absent.
+			const overRow = new Uint8Array(MAX_ITEM_BYTES);
+			await expect(db.putItem({ hashKey: "over-row", data: overRow })).rejects.toThrow(/stored item exceeds 400 KB/);
+			await expect(db.getItem({ hashKey: "over-row" })).resolves.toMatchObject({ found: false });
+
 			// Exactly at the limit is accepted by both.
-			const atLimit = new Uint8Array(MAX_ITEM_BYTES);
-			await expect(db.putItem({ hashKey: "at-limit", data: atLimit })).resolves.toMatchObject({ version: 1 });
-			await expect(db.transactWriteItems({ items: [{ hashKey: "at-limit-tx", operation: "put", data: atLimit }] })).resolves.toMatchObject({
+			const atLimitPut = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit").byteLength - EST_ROW_BYTES_K);
+			await expect(db.putItem({ hashKey: "at-limit", data: atLimitPut })).resolves.toMatchObject({ version: 1 });
+			const atLimitTx = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit-tx").byteLength - EST_ROW_BYTES_K);
+			await expect(
+				db.transactWriteItems({ items: [{ hashKey: "at-limit-tx", operation: "put", data: atLimitTx }] }),
+			).resolves.toMatchObject({
 				outcome: "committed",
 			});
 		});

@@ -11,7 +11,7 @@ import {
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
-import { compileConditionExpression } from "./expression/compiler.js";
+import { compileConditionExpression, compileUpdateExpression } from "./expression/compiler.js";
 
 const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops);
 const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
@@ -136,6 +136,32 @@ describe("validateTransactWriteOperations", () => {
 
 	it("rejects a check without a condition", () => {
 		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(/"check" operation requires a condition/);
+	});
+
+	it("accepts a valid update operation with an update plan and no data", () => {
+		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		expect(() => validate([{ hashKey: "a", operation: "update", update: updatePlan }])).not.toThrow();
+	});
+
+	it("rejects an update operation without an update plan", () => {
+		expect(() => validate([{ hashKey: "a", operation: "update" }])).toThrow(/"update" operation requires an update plan/);
+	});
+
+	it("rejects an update operation carrying data", () => {
+		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		expect(() => validate([{ hashKey: "a", operation: "update", update: updatePlan, data: "forbidden" }])).toThrow(
+			/"update" operation must not carry data/,
+		);
+	});
+
+	it("rejects a non-update operation carrying an update plan", () => {
+		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		expect(() => validate([{ hashKey: "a", operation: "put", data: "x", update: updatePlan }])).toThrow(
+			/"put" operation must not carry an update plan/,
+		);
+		expect(() => validate([{ hashKey: "b", operation: "delete", update: updatePlan }])).toThrow(
+			/"delete" operation must not carry an update plan/,
+		);
 	});
 
 	it("accepts an item at the per-item byte limit and rejects one over it", () => {

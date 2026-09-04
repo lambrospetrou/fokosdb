@@ -5,9 +5,35 @@ import { PartitionDO } from "../../server/do-partition.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
-import { composeConditionStatement, CONDITION_PLAN_VERSION, UPDATE_PLAN_VERSION } from "./plan.js";
+import {
+	composeConditionStatement,
+	CONDITION_PLAN_VERSION,
+	UPDATE_FIXED_BINDING_COUNT,
+	UPDATE_MAX_TRAILING_BINDING_COUNT,
+	UPDATE_PLAN_VERSION,
+	type CompiledUpdatePlan,
+} from "./plan.js";
 import { materializeExpressionBindings } from "./runtime.js";
 import type { ConditionExpression, UpdateExpression } from "./types.js";
+
+/**
+ * Runs a compiled update plan against a literal document, with no items row.
+ *
+ * The plan numbers its own parameters after the two the real statements reserve for the keys, so the
+ * harness binds those two slots — unused here — before the plan's values, and the document last.
+ */
+function runUpdatePlan(state: DurableObjectState, plan: CompiledUpdatePlan, documentJson: string) {
+	const dataParam = `?${plan.completeBindingCount + 1}`;
+	return state.storage.sql
+		.exec<{ doc: string; applicable: number }>(
+			`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
+			 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
+			...new Array(UPDATE_FIXED_BINDING_COUNT).fill(null),
+			...materializeExpressionBindings(plan.bindings),
+			documentJson,
+		)
+		.one();
+}
 
 describe("condition SQLite compiler", () => {
 	it("creates a versioned JSON-safe condition plan", () => {
@@ -191,7 +217,7 @@ describe("update SQLite compiler", () => {
 			{ action: "remove", target: { ref: "data", path: "$.b" } },
 		];
 		const plan = compileUpdateExpression(update);
-		expect(plan.documentSql).toMatch(/^jsonb_remove\(jsonb_set\(i\.data, \?\d+, \?\d+\), \?\d+\)$/);
+		expect(plan.documentSql).toMatch(/^jsonb_remove\(jsonb_set\(i\.data, \?\d+, (?:json_quote\()?\?\d+\)?\), \?\d+\)$/);
 	});
 
 	it("renders boolean and null literals accurately for JSONB document", () => {
@@ -252,7 +278,9 @@ describe("update SQLite compiler", () => {
 		expect(plan.applicableSql).toContain("< 1e999");
 	});
 
-	it("numbers parameters densely starting from ?1", () => {
+	// The keys take ?1 and ?2 in every statement that runs the plan, so the plan's own parameters start
+	// after them and run densely to completeBindingCount. A statement appends its tail from there.
+	it("numbers parameters densely, after the reserved key parameters", () => {
 		const update: UpdateExpression = [
 			{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } },
 			{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 5 } },
@@ -261,9 +289,36 @@ describe("update SQLite compiler", () => {
 		const allParams = new Set<number>();
 		for (const match of plan.documentSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
 		for (const match of plan.applicableSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
-		for (let i = 1; i <= plan.bindingCount; i++) {
-			expect(allParams.has(i)).toBe(true);
-		}
+		expect(plan.completeBindingCount).toBe(UPDATE_FIXED_BINDING_COUNT + plan.bindingCount);
+		expect([...allParams].sort((a, b) => a - b)).toEqual(
+			Array.from({ length: plan.bindingCount }, (_, i) => UPDATE_FIXED_BINDING_COUNT + i + 1),
+		);
+	});
+
+	// Workers SQLite caps a query at 100 parameters, and the plan is only part of one: the keys precede
+	// it and the widest statement appends its own tail. Charging both at compile time turns what would
+	// be an opaque failure inside a transaction into a limit error the caller gets before it starts.
+	it("rejects an update whose widest statement would exceed the binding limit", () => {
+		const planCap = EXPRESSION_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
+		// One binding for each target path, one shared binding for the "$" parent that the target guards
+		// test, and one for each distinct literal. Only the literal count is free to vary.
+		const literalsAtCap = planCap - EXPRESSION_LIMITS.updateActions - 1;
+
+		// Spreads `total` distinct literals over the maximum number of actions.
+		const withLiterals = (total: number): UpdateExpression => {
+			const paired = total - EXPRESSION_LIMITS.updateActions;
+			let next = 0;
+			return Array.from({ length: EXPRESSION_LIMITS.updateActions }, (_, i) => ({
+				action: "set" as const,
+				target: { ref: "data" as const, path: `$.f${i}` },
+				value: i < paired ? { fn: "+" as const, args: [{ val: next++ }, { val: next++ }] } : { val: next++ },
+			}));
+		};
+
+		const atCap = compileUpdateExpression(withLiterals(literalsAtCap));
+		expect(atCap.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(EXPRESSION_LIMITS.completeStatementBindings);
+
+		expect(() => compileUpdateExpression(withLiterals(literalsAtCap + 1))).toThrow(/complete statement exceeds the binding limit/);
 	});
 
 	it("evaluates pre-image document expression in Workers SQLite", async () => {
@@ -275,17 +330,7 @@ describe("update SQLite compiler", () => {
 				{ action: "set", target: { ref: "data", path: "$.c" }, value: { ref: "data", path: "$.b" } },
 			];
 			const plan = compileUpdateExpression(update);
-			const bindings = materializeExpressionBindings(plan.bindings);
-			const initialJson = JSON.stringify({ a: 1, b: 2, c: 3 });
-			const dataParam = `?${plan.bindings.length + 1}`;
-			const row = state.storage.sql
-				.exec<{ doc: string; applicable: number }>(
-					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
-					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
-					...bindings,
-					initialJson,
-				)
-				.one();
+			const row = runUpdatePlan(state, plan, JSON.stringify({ a: 1, b: 2, c: 3 }));
 			expect(JSON.parse(row.doc)).toEqual({ b: 1, c: 2 });
 			expect(row.applicable).toBe(1);
 		});
@@ -299,17 +344,7 @@ describe("update SQLite compiler", () => {
 				{ action: "remove", target: { ref: "data", path: "$.r[2]" } },
 			];
 			const plan = compileUpdateExpression(update);
-			const bindings = materializeExpressionBindings(plan.bindings);
-			const initialJson = JSON.stringify({ r: ["c", "h", "n", "s", "x"] });
-			const dataParam = `?${plan.bindings.length + 1}`;
-			const row = state.storage.sql
-				.exec<{ doc: string; applicable: number }>(
-					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
-					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
-					...bindings,
-					initialJson,
-				)
-				.one();
+			const row = runUpdatePlan(state, plan, JSON.stringify({ r: ["c", "h", "n", "s", "x"] }));
 			expect(JSON.parse(row.doc)).toEqual({ r: ["c", "s", "x"] });
 			expect(row.applicable).toBe(1);
 		});
@@ -320,17 +355,7 @@ describe("update SQLite compiler", () => {
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 1 } }];
 			const plan = compileUpdateExpression(update);
-			const bindings = materializeExpressionBindings(plan.bindings);
-			const initialJson = JSON.stringify({ a: 1 });
-			const dataParam = `?${plan.bindings.length + 1}`;
-			const row = state.storage.sql
-				.exec<{ applicable: number }>(
-					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
-					 SELECT (${plan.applicableSql}) AS applicable FROM i`,
-					...bindings,
-					initialJson,
-				)
-				.one();
+			const row = runUpdatePlan(state, plan, JSON.stringify({ a: 1 }));
 			expect(row.applicable).toBe(0);
 		});
 	});
@@ -349,30 +374,149 @@ describe("update SQLite compiler", () => {
 				},
 			];
 			const plan = compileUpdateExpression(update);
-			const bindings = materializeExpressionBindings(plan.bindings);
-			const dataParam = `?${plan.bindings.length + 1}`;
-
-			const row1 = state.storage.sql
-				.exec<{ doc: string; applicable: number }>(
-					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
-					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
-					...bindings,
-					JSON.stringify({}),
-				)
-				.one();
+			const row1 = runUpdatePlan(state, plan, JSON.stringify({}));
 			expect(JSON.parse(row1.doc)).toEqual({ loginCount: 1 });
 			expect(row1.applicable).toBe(1);
 
-			const row2 = state.storage.sql
-				.exec<{ doc: string; applicable: number }>(
-					`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
-					 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
-					...bindings,
-					JSON.stringify({ loginCount: 5 }),
-				)
-				.one();
+			const row2 = runUpdatePlan(state, plan, JSON.stringify({ loginCount: 5 }));
 			expect(JSON.parse(row2.doc)).toEqual({ loginCount: 6 });
 			expect(row2.applicable).toBe(1);
 		});
+	});
+
+	it("preserves boolean values copied from data references", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-boolean-ref-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.flag" }, value: { ref: "data", path: "$.source" } },
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({ source: true }));
+			expect(JSON.parse(row.doc)).toEqual({ source: true, flag: true });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("preserves boolean literals in if_not_exists fallbacks", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-boolean-fallback-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.flag" },
+					value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.missing" }, { val: true }] },
+				},
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({}));
+			expect(JSON.parse(row.doc)).toEqual({ flag: true });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("preserves string values that look like JSON literals", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-string-literal-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.number" }, value: { val: "5" } },
+				{ action: "set", target: { ref: "data", path: "$.boolean" }, value: { val: "true" } },
+				{ action: "set", target: { ref: "data", path: "$.array" }, value: { val: "[1,2]" } },
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({}));
+			expect(JSON.parse(row.doc)).toEqual({ number: "5", boolean: "true", array: "[1,2]" });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("preserves string values copied from data references", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-string-ref-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.source" } },
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({ source: "5" }));
+			expect(JSON.parse(row.doc)).toEqual({ source: "5", copy: "5" });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("preserves booleans copied through a value-passing function", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-passthrough-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			// SQLite carries a JSON boolean as 1 or 0, so a function that returns one of its arguments
+			// must receive that argument already encoded as JSON. Otherwise `true` lands as the number 1.
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.viaCoalesce" }, value: { fn: "sqlite.coalesce", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] } },
+				{ action: "set", target: { ref: "data", path: "$.viaIfnull" }, value: { fn: "sqlite.ifnull", args: [{ ref: "data", path: "$.off" }, { val: 0 }] } },
+				{ action: "set", target: { ref: "data", path: "$.viaIfNotExists" }, value: { fn: "if_not_exists", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] } },
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({ flag: true, off: false }));
+			expect(JSON.parse(row.doc)).toEqual({ flag: true, off: false, viaCoalesce: true, viaIfnull: false, viaIfNotExists: true });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("rejects an update value that can only be bytes", () => {
+		// A JSON document has no byte type, so a value whose only non-null result is bytes can never
+		// write a valid document. SQLite would otherwise read the blob back as JSONB: a blob that
+		// happens to be valid JSONB becomes a silently wrong member, and one that is not leaves a
+		// document that no read can decode.
+		for (const value of [{ b64: "AQID" }, { fn: "sqlite.unhex" as const, args: [{ val: "01" }] }]) {
+			const update = [{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression;
+			expect(() => compileUpdateExpression(update)).toThrow(/must not be bytes/);
+		}
+	});
+
+	it("accepts a byte literal as the argument of a value that is not bytes", () => {
+		// The test is over the type of the whole value, not over the nodes inside it: the size of a byte
+		// literal is a number, and a number is a value a document can hold.
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.x" }, value: { fn: "size", args: [{ b64: "AQID" }] } },
+		];
+		expect(compileUpdateExpression(update).valueTypeSql).toBe("1");
+	});
+
+	it("carries a per-item byte test only for a value whose type is not known at compile time", () => {
+		// A key reference is text for a text key and bytes for a binary one, and a SQLite function is
+		// typed by what it returns for the row. Neither is decidable here, so the test moves into the
+		// statement. A literal is decided here and costs no SQL.
+		const dynamic: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } },
+			{ action: "set", target: { ref: "data", path: "$.f" }, value: { fn: "sqlite.ifnull", args: [{ ref: "sortKey" }, { val: "x" }] } },
+		];
+		const plan = compileUpdateExpression(dynamic);
+		expect(plan.valueTypeSql).toContain("<> 'bytes'");
+		expect(plan.applicableSql).toContain(plan.valueTypeSql);
+
+		const literal: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "text" } }];
+		expect(compileUpdateExpression(literal).valueTypeSql).toBe("1");
+	});
+
+	it("accepts a plan at the binding budget and refuses one binding more", () => {
+		// The budget belongs to the widest statement that embeds the plan, so the compiler charges the
+		// keys before the plan and the widest statement tail after it. One binding more must fail here,
+		// in the client, rather than at the partition with no useful error.
+		const budget = EXPRESSION_LIMITS.completeStatementBindings - UPDATE_FIXED_BINDING_COUNT - UPDATE_MAX_TRAILING_BINDING_COUNT;
+		// The action count is capped well below the binding budget, so the bindings come from the values.
+		// One action at every allowed slot binds its own target path, one literal, and the parent path
+		// they all share. An arithmetic value binds two literals instead of one, so each one adds exactly
+		// one binding. Every literal is distinct, because equal bindings are deduplicated into one.
+		const planWithBindings = (bindings: number): UpdateExpression => {
+			const paired = bindings - (2 * EXPRESSION_LIMITS.updateActions + 1);
+			let next = 0;
+			return Array.from({ length: EXPRESSION_LIMITS.updateActions }, (_, i) => ({
+				action: "set" as const,
+				target: { ref: "data" as const, path: `$.f${i}` },
+				value: i < paired ? { fn: "+" as const, args: [{ val: next++ }, { val: next++ }] } : { val: next++ },
+			}));
+		};
+
+		const plan = compileUpdateExpression(planWithBindings(budget));
+		expect(plan.bindingCount).toBe(budget);
+		expect(plan.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT).toBe(EXPRESSION_LIMITS.completeStatementBindings);
+		expect(() => compileUpdateExpression(planWithBindings(budget + 1))).toThrow(/binding limit/);
 	});
 });

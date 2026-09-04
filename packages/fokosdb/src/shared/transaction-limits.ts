@@ -11,7 +11,7 @@
 
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { TransactionOperationType } from "./transaction-types.js";
-import type { CompiledConditionPlan } from "./expression/plan.js";
+import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -21,10 +21,17 @@ export const MAX_HASH_KEY_BYTES = 1024;
 export const MAX_SORT_KEY_BYTES = 512;
 
 /**
- * Per-item data ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation
- * in a transaction — so one item cannot be larger through one API than the other. Without it a
- * single transactional put could carry the whole 4 MB transaction budget while `putItem` had no
- * ceiling at all.
+ * Per-item ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation in a
+ * transaction — so one item cannot be larger through one API than the other. Without it a single
+ * transactional put could carry the whole 4 MB transaction budget while `putItem` had no ceiling at
+ * all.
+ *
+ * Two checks hold it, and they measure different things. `itemDataBytes` counts a client's data as a
+ * lower bound, before the request leaves. The store measures the STORED row — the encoded data plus
+ * both keys plus the fixed per-row overhead — and that one is the truth, because an update writes
+ * bytes that no client ever sent. A write between the two ceilings therefore passes validation and is
+ * rejected by the partition, which is the intended order: the client check is a cheap early answer,
+ * not the definition.
  */
 export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 
@@ -53,12 +60,13 @@ export function validateClientRequestToken(token: string): void {
  * A string's UTF-8 size is at least its `length` (every code unit is one or more bytes) and at most
  * `length * 3`, so this NEVER over-counts and the limits built on it never reject a string that
  * would have fit. The cost is the other direction: text above U+07FF is 3 UTF-8 bytes per code unit,
- * so a 400 KB check can admit 1.2 MB of CJK. The store measures the truth with `octet_length` when it
- * writes `est_row_bytes` (`partition/partition-store.ts`).
+ * so a 400 KB check can admit 1.2 MB of CJK.
  *
- * FIXME: implement the real size accounting — exact UTF-8 length for values, and the KEYS counted
- * into the item's budget rather than capped separately, per
- * https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Constraints.html#limits-data-types
+ * Being a lower bound is what makes it safe to keep. The store measures the truth with `octet_length`
+ * over the value it writes, and it counts both keys and the per-row overhead as DynamoDB does
+ * (`estRowBytesExpr` in `partition/item-size.ts`). Every transactional write path measures that exact
+ * size in its check pass before it writes anything, so this function only has to avoid rejecting an
+ * item the store would have accepted. It never has to agree with the store.
  */
 export function itemDataBytes(data: Uint8Array | string): number {
 	return typeof data === "string" ? data.length : data.byteLength;
@@ -83,6 +91,7 @@ export type TransactWriteOperationLike = {
 	// Already-encoded data (json stringified upstream), so payload accounting is a plain byte/char count.
 	data?: Uint8Array | string;
 	condition?: CompiledConditionPlan;
+	update?: CompiledUpdatePlan;
 };
 
 function isEmptyKey(k: string | Uint8Array): boolean {
@@ -191,6 +200,12 @@ export function validateTransactWriteOperations(
 		if (op.operation === "check" && !op.condition) {
 			throw new Error(`fokos: transactWriteItems "check" operation requires a condition (${at})`);
 		}
+		if (op.operation === "update" && !op.update) {
+			throw new Error(`fokos: transactWriteItems "update" operation requires an update plan (${at})`);
+		}
+		if (op.operation !== "update" && op.update) {
+			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry an update plan (${at})`);
+		}
 		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
 		// commitLocal's keyset check and the TC's two-phase read pairing use.
 		//
@@ -203,11 +218,12 @@ export function validateTransactWriteOperations(
 			throw new Error(`fokos: transactWriteItems duplicate key (${at})`);
 		}
 		seen.add(identity);
-		if (op.data) {
+		if (op.data !== undefined) {
 			validateItemDataSize(op.data, "transactWriteItems");
 			totalBytes += itemDataBytes(op.data);
 		}
 		if (op.condition) totalBytes += itemDataBytes(JSON.stringify(op.condition));
+		if (op.update) totalBytes += itemDataBytes(JSON.stringify(op.update));
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {

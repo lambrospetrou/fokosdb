@@ -3,7 +3,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
-import { EST_ROW_BYTES_K, PartitionStore } from "./partition-store.js";
+import { PartitionStore } from "./partition-store.js";
+import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
 
 const kb = (value: string) => KeyCodec.encode(value);

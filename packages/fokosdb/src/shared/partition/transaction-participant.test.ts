@@ -7,7 +7,8 @@ import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest } from "../transaction-types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
-import { compileConditionExpression } from "../expression/compiler.js";
+import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
+import { EST_ROW_BYTES_K } from "./item-size.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -125,6 +126,118 @@ describe("TransactionParticipant - prepare", () => {
 				reason: { type: "condition_failed", hashKey: "hk", sortKey: "sk" },
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+		});
+	});
+
+	it("rejects with update_not_applicable when item is missing or not json", async () => {
+		await withParticipant(({ participant, store }) => {
+			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.field" }, value: { val: "new" } }]);
+
+			// Missing item
+			const missingReq = prepareReq({
+				items: [{ hashKey: kb("missing-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
+			});
+			expect(participant.prepareLocal(missingReq)).toEqual({
+				outcome: "rejected",
+				reason: { type: "update_not_applicable", hashKey: "missing-item", sortKey: undefined },
+			});
+
+			// Item exists but is kind: "text", not json
+			store.upsertItem({
+				hk: kb("text-item"),
+				sk: KeyCodec.encodeOptional(undefined),
+				data: "text content",
+				kind: "text",
+				ttlAt: null,
+				lastTransactionTs: 1,
+			});
+			const textReq = prepareReq({
+				items: [{ hashKey: kb("text-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
+			});
+			expect(participant.prepareLocal(textReq)).toEqual({
+				outcome: "rejected",
+				reason: { type: "update_not_applicable", hashKey: "text-item", sortKey: undefined },
+			});
+		});
+	});
+
+	it("rejects with update_value_is_bytes when a value evaluates to bytes for this item", async () => {
+		await withParticipant(({ participant, store }) => {
+			// The same plan is valid for a text key and not for a binary one, so the cause belongs to the
+			// item, not to the expression. A caller that only saw "not applicable" could not tell this
+			// apart from a missing item or a missing path, and could not act on it.
+			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
+			const sk = KeyCodec.encodeOptional(undefined);
+			const binaryKey = KeyCodec.encode(new Uint8Array([1, 2, 3]));
+			store.upsertItem({ hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+
+			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
+			expect(participant.prepareLocal(request)).toEqual({
+				outcome: "rejected",
+				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
+			});
+			// The rejection took no lock and wrote nothing.
+			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.getItem(binaryKey, sk).row?.v).toBe(1);
+
+			// The single-shot path answers with the same reason.
+			expect(participant.executeSingleShot({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] })).toEqual({
+				outcome: "rejected",
+				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
+			});
+		});
+	});
+
+	it("materializes update document in pending_transactions at prepare and applies it at commit", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			store.upsertItem({
+				hk: kb("user"),
+				sk,
+				data: JSON.stringify({ name: "Alice", score: 10 }),
+				kind: "json",
+				ttlAt: 555,
+				lastTransactionTs: 10,
+			});
+
+			const updatePlan = compileUpdateExpression([
+				{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 20 } },
+				{ action: "set", target: { ref: "data", path: "$.role" }, value: { val: "admin" } },
+			]);
+
+			const request = prepareReq({
+				items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: updatePlan }],
+			});
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+
+			// The lock row holds the complete new document as JSONB, and inherits the pre-image TTL. It is
+			// the binary form, NOT JSON text, so commit binds exactly the bytes the probe measured at
+			// prepare: a JSONB-to-text-to-JSONB round trip is not size-stable.
+			const pending = store.getPendingTxOp(kb("user"), sk, request.transactionId);
+			expect(pending?.operation).toBe("update");
+			expect(pending?.kind).toBe("json");
+			expect(pending?.ttl_epoch_utc_seconds).toBe(555);
+			expect(pending?.data).toBeInstanceOf(Uint8Array);
+			const materializedBytes = (pending?.data as Uint8Array).byteLength;
+
+			// Commit applies the materialized document
+			expect(
+				participant.commitLocal({
+					transactionId: request.transactionId,
+					transactionTimestamp: request.transactionTimestamp,
+					items: [{ hashKey: kb("user"), sortKey: sk }],
+				}),
+			).toEqual({ outcome: "committed" });
+
+			const committed = store.getItem(kb("user"), sk);
+			expect(committed.row?.v).toBe(2);
+			expect(committed.row?.ttl_epoch_utc_seconds).toBe(555);
+			expect(JSON.parse(committed.row?.data as string)).toEqual({ name: "Alice", score: 20, role: "admin" });
+
+			// Commit stored the pending bytes verbatim, so the size prepare accepted is the size on disk.
+			expect(store.measureItemBytes({ hk: kb("user"), sk, data: pending?.data as Uint8Array, kind: "json" })).toBe(
+				materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K,
+			);
 		});
 	});
 
@@ -401,6 +514,47 @@ describe("TransactionParticipant - single shot", () => {
 			expect(store.getItem(kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
 		});
 	});
+
+	it("executes single-shot update and preserves TTL when omitted", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			store.upsertItem({
+				hk: kb("u1"),
+				sk: sortKey,
+				data: JSON.stringify({ count: 1, name: "item1" }),
+				kind: "json",
+				ttlAt: 999,
+				lastTransactionTs: 10,
+			});
+
+			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }]);
+
+			const res = participant.executeSingleShot({
+				items: [{ hashKey: kb("u1"), sortKey, operation: "update", update: updatePlan }],
+			});
+			expect(res).toEqual({ outcome: "committed" });
+
+			const updated = store.getItem(kb("u1"), sortKey);
+			expect(updated.row?.v).toBe(2);
+			expect(JSON.parse(updated.row?.data as string)).toEqual({ count: 2, name: "item1" });
+			expect(updated.row?.ttl_epoch_utc_seconds).toBe(999);
+		});
+	});
+
+	it("rejects single-shot update with update_not_applicable when item is missing", async () => {
+		await withParticipant(({ participant }) => {
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+
+			const res = participant.executeSingleShot({
+				items: [{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan }],
+			});
+			expect(res).toEqual({
+				outcome: "rejected",
+				reason: { type: "update_not_applicable", hashKey: "missing-u", sortKey: undefined },
+			});
+		});
+	});
 });
 
 describe("TransactionParticipant - cancel", () => {
@@ -421,6 +575,44 @@ describe("TransactionParticipant - cancel", () => {
 				items: [{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v2", kind: "text" }],
 			});
 			expect(participant.prepareLocal(retry)).toEqual({ outcome: "accepted" });
+		});
+	});
+
+	// A cancelled update must leave no trace of the document prepare materialized: not the item, not
+	// its version, and not the size accounting that a materialized pending row would otherwise skew.
+	it("discards the materialized document of an update and leaves the item untouched", async () => {
+		await withParticipant(({ participant, store, upserts }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			store.upsertItem({ hk: kb("user"), sk, data: JSON.stringify({ score: 10 }), kind: "json", ttlAt: null, lastTransactionTs: 10 });
+
+			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 999 } }]);
+			const request = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+
+			participant.cancelLocal(request.transactionId);
+
+			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			const item = store.getItem(kb("user"), sk);
+			expect(item.row?.v).toBe(1);
+			expect(JSON.parse(item.row?.data as string)).toEqual({ score: 10 });
+			// Nothing was applied, so the split and promotion accounting was never told of a new size.
+			expect(upserts).toEqual([]);
+
+			// The key is preparable again, and the second update sees the ORIGINAL pre-image.
+			const retry = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
+			expect(participant.prepareLocal(retry)).toEqual({ outcome: "accepted" });
+			participant.commitLocal({
+				transactionId: retry.transactionId,
+				transactionTimestamp: retry.transactionTimestamp,
+				items: [{ hashKey: kb("user"), sortKey: sk }],
+			});
+			const committed = store.getItem(kb("user"), sk);
+			expect(committed.row?.v).toBe(2);
+			expect(JSON.parse(committed.row?.data as string)).toEqual({ score: 999 });
+			// Applied exactly once, for this key. The byte arithmetic of the estimate is partition-store's
+			// own test: est_row_bytes measures the stored JSONB, which is not the length of the JSON text.
+			expect(upserts).toHaveLength(1);
+			expect(upserts[0].hashKey).toEqual(kb("user"));
 		});
 	});
 });

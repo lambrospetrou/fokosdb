@@ -110,8 +110,11 @@ That spec lists update expressions as future work and states the required behavi
 ### 2.3 Requirements that constrain the solution
 
 - A partition must not load a JSON document into JavaScript. The document expression runs in SQLite.
-- Commit must not fail after prepare accepted. Every test that can reject an update runs at prepare.
-- The complete statement binding limit stays at 100, and the compiled SQL limit stays below 100 KiB.
+- Commit must not fail after prepare accepted. Every test that can reject a write runs at prepare — for a `put`
+  as well as for an update, because both now have a size that only the store can measure.
+- The complete statement binding limit stays at 100, and the compiled SQL limit stays below 100 KiB. A compiled
+  plan is a fragment of a statement, so the limit belongs to the statement, not to the plan. Section 4.2.14
+  gives the reserve this costs.
 - One item can hold at most `MAX_ITEM_BYTES` (400 KiB). `PartitionStore` must hold this limit, not only the
   client. Section 4.3 gives the mechanism.
 - A transaction can hold at most `MAX_PAYLOAD_BYTES_PER_TX` (4 MiB). This limit controls the bytes on the
@@ -181,10 +184,13 @@ Wire the plan into both write paths, with materialization at prepare. Deliver th
 validation rules, the idempotency change, and the HTTP example schema. After this milestone a caller can change
 one field of an item inside a transaction.
 
+The item size limit of section 4.3 ships here as well, and it changes a `put`. The limit is the stored row, not
+the client's data, so both write paths must measure a `put` in their check pass with the same SQL the write
+uses. The precheck of section 4.2.10 is one definition for both operations and both paths.
+
 ### M5 — Hardening and documentation
 
-Run the acceptance matrix of section 4.2.12. Measure an update on a 400 KiB item. Add the public examples and
-an ADR for the shipped semantics.
+Run the acceptance matrix of section 4.2.12. Measure an update on a 400 KiB item. Add happy path examples in the `expressions.test.ts` in a describe block dedicated for updates.
 
 ---
 
@@ -426,18 +432,34 @@ The compiler uses the JSONB variants, because `data` stores JSONB. `jsonb_set`, 
 and `jsonb_patch` all exist in the Workers SQLite runtime, and each returns a BLOB. `json_set` also accepts a
 JSONB argument, and it returns text.
 
-The two write paths wrap the expression differently:
+Both write paths store the expression unchanged. The single-shot path writes it into `items.data`, and the
+two-phase path writes it into the `data` column of the pending row. Neither converts it to text.
 
-| Path | Form | Reason |
+**A pending row of an update holds JSONB, not JSON text.** A `put` stores its JSON text there, because that is
+what the client sent, and `PartitionStore.upsertItem` encodes it at commit. An update must not do the same,
+because a JSONB-to-text-to-JSONB round trip is not size-stable. `jsonb_set` keeps a string element unescaped,
+and re-parsing the rendered text bakes the escapes into the blob, one byte for each character that JSON
+escaping expands. Measured in the Workers SQLite runtime, over the octet length of the whole document after
+`jsonb_set` wrote one string member:
+
+| Characters in the string that JSON escaping expands | Direct | After `jsonb(json(...))` |
 | --- | --- | --- |
-| Single-shot | `<document expression>` | The value goes straight into `items.data`, which holds JSONB. |
-| Two-phase prepare | `json(<document expression>)` | A pending row stores `json` data as JSON text, as it does for a `put`. |
+| None | 36 | 36 |
+| One newline | 27 | 28 |
+| Two backslashes | 30 | 32 |
+| Two backslashes and two quotation marks | 41 | 45 |
 
-The two-phase path therefore converts to text at prepare, and `PartitionStore.upsertItem` encodes it back to
-JSONB at commit. That conversion is the price of an unchanged commit path, which is the reason section 6.1 gives
-for materialization at prepare. Section 5.4 records the change that removes both conversions.
+Text above U+07FF does not grow, because JSON carries it verbatim. Only the escaped characters do.
 
-The store measures the size of the new value with `octet_length` over the same expression, as
+Prepare measures the document to answer the size test of section 4.2.7. If commit then stored a larger value,
+prepare could accept an update that commit cannot write, which breaks the invariant that commit never fails.
+Storing the blob makes the bytes prepare measured the exact bytes commit writes. `upsertItem` therefore reads
+the pair of the kind and the JavaScript type at its write site: for a `json` row a string is JSON text and needs
+`jsonb(?)`, and a `Uint8Array` is raw JSONB and binds verbatim. `MigratedItem` and `insertItemIfAbsent` already
+hold that rule for the migration path, so it adds no new convention. Section 5.4 records the same change for the
+`put` path, which is the only place a conversion remains.
+
+The store measures the size of the new value with the `estRowBytesExpr` formula over the same expression, as
 `PartitionStore.upsertItem` does for a `put`. `octet_length` accepts a JSONB value.
 
 #### 4.2.6 The order of a removal
@@ -463,8 +485,29 @@ An update applies only when every test passes:
 | The data is JSON | `i.data_kind = <json code>` |
 | The target of each `set` is valid | The rules below this table |
 | No operand is missing | The presence expression of each value, from `renderPresent` |
+| No value is bytes | `<the type expression of each value> <> 'bytes'`, the `valueTypeSql` of the plan |
 | The result stays a document | `json_type(<document expression>) IN ('array', 'object')` |
-| The result fits | `octet_length(<document expression>) <= MAX_ITEM_BYTES`, and section 4.3 |
+
+The six tests are the `applicableSql` of the compiled plan. The size test is separate, because it is not
+specific to an update: section 4.3 holds it for every write, and the probe of section 4.2.10 returns the measured
+size beside the applicability answer.
+
+**A JSON document cannot hold bytes, and the type is not always known when the plan compiles.** SQLite reads a
+BLOB argument of `jsonb_set` as JSONB, and it neither converts it nor refuses it: a blob that happens to be
+valid JSONB becomes a silently wrong member, and one that is not leaves a document that no later read can
+decode. Two layers hold the rule:
+
+- `validateUpdateExpression` refuses a value whose only non-null type is bytes — a byte literal, or `unhex`.
+  That answer is the same for every item, so it belongs at compile time, in the client. A byte literal is still
+  a valid ARGUMENT: `size` over one is a number.
+- The compiler carries a per-item test for a value that is bytes for SOME items only: a key reference, which is
+  text for a text key and bytes for a binary one, and any SQLite function, which is typed by what it returns
+  for the row. The test is the value's own type expression, so it also covers a function that wraps a key.
+
+**Only this cause is reported on its own.** The probe evaluates `valueTypeSql` beside `applicableSql`, and the
+participant answers `update_value_is_bytes` instead of `update_not_applicable` when it fails. It is the one
+cause a caller can act on: the same expression is valid for the next item. Every other cause — a missing item,
+a non-json item, a missing target parent, an index past the end — stays one answer, as DynamoDB reports its own.
 
 A guard is needed because the SQLite behaviour is silent in both directions. The measured behaviour in the
 Workers SQLite runtime is:
@@ -512,11 +555,16 @@ type CompiledUpdatePlan = {
   applicableSql: string;
   bindings: readonly ExpressionBindingDescriptor[];
   bindingCount: number;
+  completeBindingCount: number;
   requiredColumns: readonly ExpressionRequiredColumn[];
   dataDependencies: { completeData: boolean; paths: readonly string[] };
   identity: string;
 };
 ```
+
+`completeBindingCount` is `UPDATE_FIXED_BINDING_COUNT` plus `bindingCount`: the two key parameters that every
+statement binds first, plus the plan's own. Together they occupy `?1` to `completeBindingCount`, and a statement
+appends its own parameters from the next number. Section 4.2.14 gives the budget this creates.
 
 The plan reuses the binding descriptor kinds of the condition plan, and the same partition-side materialization.
 A plan holds only JSON-serializable values. Every plan fixture must survive `JSON.stringify` and `JSON.parse`
@@ -533,10 +581,12 @@ transaction can still hold it.
 | `TransactWriteItem` | Add the `update` variant of section 4.2.1. |
 | `TransactionItem`, `TCWriteOperation` | Add `update?: CompiledUpdatePlan`. |
 | `tc_items` | Add `update_json TEXT`. The coordinator rebuilds a prepare from this table. |
-| `pending_transactions` | No new column. An update stores a payload with the shape of a `put`. |
-| `RejectionReason` | Add `update_not_applicable` and `item_too_large`, each with the item key. |
+| `pending_transactions` | No new column. An update stores a payload with the shape of a `put`, as JSONB. |
+| `RejectionReason` | Add `update_not_applicable`, `update_value_is_bytes` and `item_too_large`, each with the item key. |
 | `validateTransactWriteOperations` | An `update` carries `update` and no `data`. Count the plan in the payload. |
-| `PartitionStore.upsertItem` | Take the item size limit as a binding, and return zero rows when the guard fails. |
+| `PartitionStore.upsertItem` | Take the item size limit as a binding, and throw when the guard writes no row. |
+| `PartitionStore.measureItemBytes` | New. The exact stored size of a `put`, for the check pass of section 4.2.10. |
+| `TransactionParticipant` | One private precheck holds every rejectable test. Both write paths call it. |
 | `hashOperation` | Chain the update plan identity and its presence flag. |
 | `FokosDB.transactWriteItems` | Compile the update once, beside the condition. |
 | `examples/http-api/index.ts` | Add the fourth `strictObject` variant and an update schema. |
@@ -547,7 +597,8 @@ change is allowed.
 The pending row of an update holds:
 
 - `operation` = `'update'`, which keeps the operation visible for accounting.
-- `data` = the complete new document, as JSON text, computed in SQL. Section 4.2.5 gives the reason for text.
+- `data` = the complete new document, as JSONB, computed in SQL. Section 4.2.5 gives the reason for the binary
+  form.
 - `data_kind` = the `json` code.
 - `ttl_epoch_utc_seconds` = the `ttlAt` of the operation when it is present, and the value of the pre-image when
   it is not.
@@ -558,16 +609,33 @@ row. Without this rule an update would clear the TTL of the item.
 
 #### 4.2.10 The two write paths
 
+**One precheck holds every rejectable test.** `TransactionParticipant` owns one private precheck, and both write
+paths run it in their check pass, before either path writes anything. It answers for a `put` and for an
+`update`, and it is the only place that can reject a write:
+
+| Operation | What the precheck runs | Rejections |
+| --- | --- | --- |
+| `put` | `PartitionStore.measureItemBytes`, one statement with no `FROM` clause | `item_too_large` |
+| `update` | The probe statement of this section | `update_not_applicable`, `update_value_is_bytes`, `item_too_large` |
+| `delete`, `check` | Nothing. Neither writes data, so neither has a size. | None |
+
+Both measures use the same SQL the write stores, so the answer is exact. Nothing after the check pass may
+reject: on the two-phase path prepare has already answered "accepted" and the coordinator is entitled to commit;
+on the single-shot path `transactionSync` rolls back on a throw and NOT on a returned rejection, so a rejection
+from the apply pass would keep the writes the pass had already made. A size guard that trips after the check
+pass is therefore an invariant failure, whose throw rolls the whole set back.
+
 **Two-phase prepare.** `prepareLocal` keeps its structure: it checks every item, then it locks every item.
 
-Check pass, for each update item:
+Check pass, for each item:
 
 1. Check the pending lock.
 2. Evaluate the condition on the committed state, with the existing condition plan.
-3. Run the probe statement. It returns `item_present`, `kind_ok`, `applicable`, and `new_size`.
-4. Reject with `update_not_applicable` when `applicable` is false.
-5. Reject with `item_too_large` when `new_size` exceeds `MAX_ITEM_BYTES`.
-6. Apply the timestamp rules, as a `put` does.
+3. Run the precheck. For an update the probe returns `item_present`, `applicable`, `new_size`, and
+   `last_transaction_ts`.
+4. Reject with the reason the precheck returned.
+5. Apply the timestamp rules. An update reuses the `last_transaction_ts` of its probe, instead of reading the
+   row again.
 
 Lock pass, for each update item: run one `INSERT INTO pending_transactions ... SELECT ... FROM items` that
 computes the document expression again and stores it.
@@ -585,14 +653,20 @@ UPDATE items
        est_row_bytes = <the estRowBytesExpr formula over the same expression>,
        v = v + 1,
        last_transaction_ts = MAX(last_transaction_ts, ?)
+       [, ttl_epoch_utc_seconds = ?]
  WHERE hk = ? AND sk = ?
    AND <the estRowBytesExpr formula over the same expression> <= ?
 RETURNING v, est_row_bytes
 ```
 
-The statement does not touch `ttl_epoch_utc_seconds`, so the TTL of the pre-image survives. `PartitionStore`
-owns this statement, and it keeps the `key_size_estimates` delta as `upsertItem` does. The caller passes the new
-size estimate to `onItemUpserted`, so promotion and split accounting stay correct.
+The TTL column keeps the value of the pre-image unless the operation sets `ttlAt`, which is the rule of section
+2.1. Which of the two applies is known when the statement is built, so the assignment in brackets is present
+only for an operation that sets `ttlAt`, and the statement carries no run-time test. The pending lock insert of
+the two-phase path branches the same way, between the bound value and `i.ttl_epoch_utc_seconds`. `PartitionStore` owns this statement, and it keeps the `key_size_estimates` delta as `upsertItem` does. The
+caller passes the new size estimate to `onItemUpserted`, so promotion and split accounting stay correct.
+
+The `WHERE` guard repeats the size test the check pass already answered. It is the invariant of section 4.3,
+which no code path may pass, not a second decision: `PartitionStore` raises when it writes no row.
 
 **Two operations on one item.** `validateTransactWriteOperations` already rejects a duplicate key, so no item
 has two actions from two operations. Per-item pre-image is therefore the complete rule. DynamoDB applies the
@@ -604,11 +678,13 @@ same restriction.
 | --- | --- |
 | Every value reads the pre-image | The compiled shape of section 4.2.5. Values render against `i.data`. |
 | The pre-image holds from prepare to commit | The pending lock. A non-transactional write to a locked key fails. |
-| Commit cannot fail after prepare accepted | Prepare materializes the document. Commit applies a stored payload. |
+| Commit cannot fail after prepare accepted | Prepare materializes the document and measures its exact stored size. Commit applies a stored payload. |
 | An update applies at most once | Commit deletes the pending row in the apply transaction. A re-prepare skips it. |
 | `v` increases by one for each update | `upsertItem` on the two-phase path, and `v = v + 1` on the single-shot path. |
 | `last_transaction_ts` never moves backwards | The `MAX` rule of both statements. |
-| An item never exceeds `MAX_ITEM_BYTES` | The statement guard of section 4.3, on every user write path. |
+| An item never exceeds `MAX_ITEM_BYTES` | The precheck of section 4.2.10 decides it. The statement guard of section 4.3 is the invariant behind it. |
+| A rejection writes nothing | Every rejectable test runs before the first write of either path. |
+| The size prepare measured is the size commit writes | The pending row of an update holds JSONB, so no conversion changes it. Section 4.2.5. |
 | A plan survives persistence | The JSON round-trip test on every plan fixture. |
 
 #### 4.2.12 Testing
@@ -633,8 +709,16 @@ Add these cases:
 9. **Size guard.** A `put` and an update that each exceed the limit write nothing, leave `v` and the stored row
    unchanged, and leave `key_size_estimates` unchanged. A migration ingest of an item above the current limit
    still succeeds.
-10. **Plans.** JSON round-trip equality, the binding limit at 100 and 101, and an update at the action limit.
-11. **Registry.** Every existing condition fixture compiles to the same SQL after M1.
+10. **The size limit rejects before any write.** A `put` between the client ceiling and the store ceiling — over
+    `MAX_ITEM_BYTES` as a stored row, under it as data — is cancelled with `item_too_large` on BOTH write paths,
+    and no item of the transaction is stored. On the two-phase path the rejection must come from prepare: a
+    transaction that reaches commit and cannot apply is stuck in `COMMITTING` forever.
+11. **The measured size is the stored size.** An update whose value needs escaping, sized to fit as JSONB but
+    not as re-parsed text, commits on both write paths.
+12. **Plans.** JSON round-trip equality, an update at the action limit, and the binding budget: a plan at
+    `completeStatementBindings` minus the reserve of section 4.2.14 compiles and commits on both write paths,
+    and one binding more is refused by the compiler.
+13. **Registry.** Every existing condition fixture compiles to the same SQL after M1.
 
 #### 4.2.13 Performance
 
@@ -655,10 +739,19 @@ The rest of the cost model:
 
 - A scalar update on the single-shot path costs one probe statement and one `UPDATE` statement, against one
   primary key lookup each. A `put` of the same item costs one read of the size estimate and one upsert.
+- A `put` also costs one `measureItemBytes` statement in the check pass of each transactional path. It has no
+  `FROM` clause, so it reads no row: the cost is the encode the write would pay anyway. That is the price of
+  the rule that commit cannot fail.
+- **Bind a value that changes between calls; interpolate one that does not.** Workers SQLite keeps a prepared
+  statement for each distinct SQL string, so a literal that varies per call compiles a new statement every
+  time. Measured over 2000 runs of one 826-byte `UPDATE` in the Workers runtime: 56 ms with a bound parameter,
+  52 ms with a constant literal, and 169 ms with a literal that changed each run. The TTL and the timestamps
+  therefore bind, and the `json` kind code is interpolated. A compiled document expression varies per update
+  expression and not per call, so it keeps its statement across the calls that repeat it.
 - The two-phase path evaluates the document expression twice at prepare, and copies the document once from
   `pending_transactions` to `items` at commit. For a 400 KiB item that is about 800 KiB of writes for one
   transaction. The second evaluation is the probe, which costs about 0.14 ms for a 300 KB item. Section 6.1
-  gives the reason.
+  gives the reason. Neither copy converts between JSONB and text, because the pending row holds JSONB.
 - The payload of an update request is the size of the plan, not the size of the item. A change of one field in
   a 400 KiB item sends about 200 bytes instead of 400 KiB.
 - The document expression grows with the action count. The limits of section 4.2.14 bound it.
@@ -672,10 +765,24 @@ The rest of the cost model:
 | AST depth | 32, the existing limit |
 | One path | 4 KiB encoded, the existing limit |
 | Complete statement bindings | 100, the existing limit |
+| `UPDATE_FIXED_BINDING_COUNT`, the keys every statement binds first | 2 |
+| `UPDATE_MAX_TRAILING_BINDING_COUNT`, the widest statement-local tail | 6 |
+| Bindings available to one update plan | 92 |
 | Compiled SQL | Below 100 KiB, the existing limit |
 
 The condition statement and the update statement are separate statements, so each counts its bindings on its
 own.
+
+**The budget belongs to the widest statement, not to the plan.** A compiled plan is a fragment, and three
+statements embed it: the probe, the single-shot `UPDATE`, and the pending lock insert. Each binds the keys
+before the plan and its own parameters after it, and the plan's numbering is fixed when it compiles. The
+compiler therefore charges both the reserve and the widest tail, exactly as `compileConditionExpression`
+charges `CONDITION_FIXED_BINDING_COUNT`. A plan that compiles runs on every path.
+
+Charging the widest tail to every plan is what makes the limit one number instead of three. The alternative is
+a plan that the single-shot path accepts and the two-phase path refuses, which is invisible to a caller,
+because the router picks the path. Raising a statement's tail therefore lowers the budget for every update
+expression, which is why the number lives beside the plan and not at the call site.
 
 ### 4.3 The item size limit at the store
 
@@ -699,8 +806,14 @@ RETURNING v, est_row_bytes
 
 Rules:
 
-- The statement returns zero rows when the guard fails. The caller reads zero rows as a rejection. The guard
-  raises no exception, so a rejection needs no rollback.
+- The statement returns zero rows when the guard fails. SQLite raises nothing, so the guard costs no rollback of
+  its own.
+- **The guard is the invariant, not the decision.** `PartitionStore` turns zero rows into a thrown error rather
+  than reporting it to every caller, because only the non-transactional `putItem` can legitimately reach it —
+  that path has no earlier pass, and the error is its answer. Both transactional paths measured the same size in
+  their check pass, so a throw there is an unreachable state, and it rolls back the storage transaction that the
+  write runs inside. Section 4.2.10 gives the reason a later rejection is not allowed. No caller tests a return
+  value for the guard.
 - One guard covers both branches of an upsert. A source row that the `WHERE` removes never reaches the conflict,
   so the `DO UPDATE` branch never runs.
 - The update statement of section 4.2.10 carries the same guard in its own `WHERE`, and it also returns zero
@@ -719,18 +832,25 @@ Two consequences:
 
 1. **The client check becomes a lower bound, and the store check becomes the truth.** `itemDataBytes` measures a
    string with `String.length`, which counts UTF-16 code units, so it never over-counts and it can accept text
-   that is three times larger in UTF-8. The store measures the stored bytes with `octet_length`. A `put` that
-   the client accepts can therefore now fail at the store. This closes the open item recorded in
-   `itemDataBytes` in `src/shared/transaction-limits.ts`. `est_row_bytes` also counts the keys and the fixed
-   per-row overhead, which is the accounting DynamoDB uses.
+   that is three times larger in UTF-8. The store measures the stored bytes with `octet_length`, and
+   `est_row_bytes` also counts the keys and the fixed per-row overhead, which is the accounting DynamoDB uses.
+   The two ceilings therefore differ for EVERY write, not only for text above U+07FF: a `put` of exactly
+   `MAX_ITEM_BYTES` of data is over the limit as a stored row. This closes the open item recorded in
+   `itemDataBytes` in `src/shared/transaction-limits.ts`.
+
+   A write between the two ceilings must be rejected by the check pass, not by the write statement.
+   `measureItemBytes` in the precheck of section 4.2.10 is what makes that true for a `put`. Without it a
+   two-phase put in that band is accepted by the client, accepted by prepare, and refused by the guard at
+   commit — and a transaction that has answered "accepted" cannot be cancelled, so it stays in `COMMITTING`
+   and holds its locks forever.
 2. **Internal data movement must not carry the guard.** `PartitionStore.insertItemIfAbsent` ingests rows during
    a migration, and those rows were accepted under the limit of their time. A guard there would drop an item
    when the limit falls, and `INSERT OR IGNORE` would drop it silently. The migration path therefore keeps no
    size guard.
 
-The two-phase path keeps the probe of section 4.2.10 as well. The probe reports `item_too_large` before the
-transaction locks any item, which is a clean rejection. The statement guard is the invariant that no code path
-can pass.
+Both write paths keep the precheck of section 4.2.10. It reports `item_too_large` before the transaction locks
+or writes anything, which is a clean rejection. The statement guard is the invariant that no code path can
+pass.
 
 ## 5. Future Work
 
@@ -765,31 +885,25 @@ composite element as text. The aggregate must restore the element type before it
 nested array and a nested object become strings. The second operand is usually a literal array, so the action
 needs section 5.1 first.
 
-### 5.4 JSONB in a pending row
+### 5.4 JSONB in the pending row of a `put`
 
-A pending row stores the `data` of a `json` item as JSON text. Prepare therefore wraps the document expression
-with `json(...)`, and `PartitionStore.upsertItem` encodes the text back to JSONB at commit. These two
-conversions are the only place where a document changes its representation between the two write paths.
+An update already stores JSONB in its pending row. Section 4.2.5 gives the reason, which is correctness and not
+cost: the size prepare measures must be the size commit writes. `upsertItem` therefore already reads the pair
+of `kind` and the JavaScript type at its write site, so the convention exists.
 
-Store the JSONB form in the pending row instead. Prepare then stores the document expression unchanged, and
-commit binds the blob verbatim. For an update of a 400 KiB item this removes one JSONB-to-text conversion at
-prepare and one text-to-JSONB parse at commit. Commit holds the lock and must not fail, so the removal at
-commit is the more important one. A `put` also moves its encode from commit to prepare, which is the pass that
-is allowed to reject. `estimatePendingTxBytes` then measures the stored bytes of a `json` row instead of a text
-length.
+A `put` still stores JSON text, and `upsertItem` encodes it to JSONB at commit. That is the one place left
+where a document changes its representation between the two write paths.
+
+Move the encode to prepare. `insertPendingLock` then binds `jsonb(?)` for a `json` row, and commit binds the
+blob verbatim. For a 400 KiB item this removes one text-to-JSONB parse from commit, which is the pass that holds
+the lock and must not fail, and adds it to prepare, which is the pass that is allowed to reject.
+`estimatePendingTxBytes` then measures the stored bytes of a `json` row instead of a text length.
 
 The change needs no schema change, because `pending_transactions.data` is already `ANY`.
 
-The cost is one rule at two write sites of `PartitionStore`. `kind` alone cannot say which form a value holds,
-because a `bytes` value is also a `Uint8Array`. Each site therefore reads the pair of `kind` and the JavaScript
-type: for a `json` row a string is JSON text and needs `jsonb(?)`, and a `Uint8Array` is raw JSONB and binds
-verbatim.
-
-- `upsertItem` — the commit apply passes a blob, and the two put paths pass text.
-- `insertPendingLock` — migration ingest passes a blob, and prepare of a `put` passes text.
-
-`MigratedItem` and `insertItemIfAbsent` already hold this rule for the migration path, so the change adds no
-new convention. Section 2.8 of `docs/agent-plans/item-data-kinds-jsonb.md` records the current rule, and it
+The cost is the same rule at one more write site: `insertPendingLock`, where migration ingest passes a blob and
+prepare of a `put` passes text. `MigratedItem` and `insertItemIfAbsent` already hold it for the migration path.
+Section 2.8 of `docs/agent-plans/item-data-kinds-jsonb.md` records the current rule for a pending row, and it
 must be rewritten with the change.
 
 ---
@@ -910,7 +1024,7 @@ A path addresses a JSON document. A `text` item and a `bytes` item have no paths
 No. `validateTransactWriteOperations` rejects a duplicate key. DynamoDB applies the same restriction.
 
 **What does a caller see when the update cannot apply?**
-The transaction is cancelled with `update_not_applicable` or `item_too_large`, and the reason carries the item
+The transaction is cancelled with `update_not_applicable`, `update_value_is_bytes` or `item_too_large`, and the reason carries the item
 key. This is the same shape a failed condition uses.
 
 **Does an update change the routing of a request?**
@@ -937,6 +1051,18 @@ item, and it uses an exception for an expected outcome. The measured cost does n
 
 This is not the repeated expression of section 4.3. That one is inside a single statement, and section 4.2.13
 measures it as free.
+
+**A `put` of exactly 400 KB used to be accepted. Why is it rejected now?**
+The limit is the stored row, and it always was: `est_row_bytes` counts the encoded data plus both keys plus the
+fixed per-row overhead, which is the accounting DynamoDB uses. Only the client check counted the data alone, and
+it stays a lower bound because it cannot know the encoded size. Section 4.3 gives the two consequences. The
+rejection is clean — the transaction is cancelled with `item_too_large` and writes nothing — because both write
+paths measure the stored size before they write.
+
+**Can a caller see a different answer on the two write paths?**
+No, and every rule here is written to keep it that way, because the router picks the path and the caller cannot.
+The size test measures the same bytes on both paths, which is why the pending row of an update holds JSONB. The
+binding budget charges the widest statement to every plan, which is why a plan that compiles runs everywhere.
 
 **Does the 4 MiB transaction payload cap bound the bytes a transaction writes?**
 No, and that is intended. The payload cap controls the network, which is the larger cost. A plan of about 200

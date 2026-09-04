@@ -1,8 +1,8 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
 import type { DataKind, ItemKey, JsonComposite, JsonValue } from "./types.js";
-import type { CompiledConditionPlan } from "./expression/plan.js";
-import type { ConditionExpression } from "./expression/types.js";
+import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
+import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ export type TransactionTimestamp = number; // Date.now() ms
 
 // ─── PartitionDO — Prepare ────────────────────────────────────────────────────
 
-export type TransactionOperationType = "put" | "delete" | "check";
+export type TransactionOperationType = "put" | "delete" | "check" | "update";
 
 /**
  * The key half of a wire-IN item (db.ts/TC → PartitionDO): canonical KeyBytes, with sortKey always
@@ -40,6 +40,8 @@ export type TransactionItem = TransactionItemKey & {
 	ttlAt?: number;
 	/** Optional for put and delete; required for check. */
 	condition?: CompiledConditionPlan;
+	/** Compiled update plan; present for "update". */
+	update?: CompiledUpdatePlan;
 };
 
 export type PrepareRequest = {
@@ -63,6 +65,15 @@ export type RejectionReason =
 			conflictingTransactionId: TransactionId;
 	  }
 	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
+	| { type: "update_not_applicable"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	/**
+	 * A `set` value evaluated to bytes for this item, and a JSON document cannot hold bytes. It is one
+	 * cause of an inapplicable update, reported on its own because the caller can act on it: a key
+	 * reference is a valid update value for a text key and not for a binary one, and a SQLite function
+	 * can return a blob for one item and text for the next.
+	 */
+	| { type: "update_value_is_bytes"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { type: "item_too_large"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| { type: "transient_error" };
 
 export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
@@ -181,11 +192,13 @@ export type SingleShotRequest = {
 };
 
 /**
- * Only two rejection reasons can reach a caller here: `condition_failed` and `pending_conflict`
- * against a two-phase transaction that holds a lock. `timestamp_conflict` and `clock_skew` order a
- * transaction against writes that interleave between its prepare and its commit, and this path has
- * no such window — one DO validates and applies the whole set serially inside one storage
- * transaction, so serializability comes from the execution order.
+ * Every rejection this path returns comes from its check pass, so the reasons are those of
+ * `TransactionParticipant.#precheckWrite` plus the pending-lock and condition tests that run before
+ * it. Listing them here would drift; what holds instead is which reasons CANNOT appear:
+ * `timestamp_conflict` and `clock_skew` order a transaction against writes that interleave between
+ * its prepare and its commit, and this path has no such window — one DO validates and applies the
+ * whole set serially inside one storage transaction, so serializability comes from the execution
+ * order.
  */
 export type SingleShotResponse = { outcome: "committed" } | { outcome: "rejected"; reason: RejectionReason };
 
@@ -254,6 +267,14 @@ export type TransactWriteItem =
 			sortKey?: string | Uint8Array;
 			/** A check must have one condition because it does not write. */
 			condition: ConditionExpression;
+	  }
+	| {
+			operation: "update";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			update: UpdateExpression;
+			ttlAt?: number;
+			condition?: ConditionExpression;
 	  };
 
 export type TransactWriteItemsOptions = {
@@ -281,6 +302,7 @@ export type TCWriteOperation = {
 	kind?: DataKind;
 	ttlAt?: number;
 	condition?: CompiledConditionPlan;
+	update?: CompiledUpdatePlan;
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };

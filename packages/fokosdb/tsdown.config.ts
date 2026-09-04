@@ -8,8 +8,15 @@ const CLIENT_FORBIDDEN_SRC = "src/server/";
 /** Bare specifiers that the client is allowed to import at runtime. */
 const CLIENT_ALLOWED_EXTERNALS = [/^cloudflare:workers$/, /^xxhash-wasm$/, /^durable-utils\//];
 
-/** Upper bound for the client entry and every chunk that it imports, in bytes. */
-const CLIENT_MAX_BYTES = 128 * 1024;
+/**
+ * Upper bound for the client entry and every chunk that it imports, in MINIFIED bytes.
+ *
+ * Minified, because that is the size a consumer ships: their bundler merges the entry with its chunks
+ * and minifies the result. Gating the unminified size instead makes a doc comment cost the same as
+ * code, so writing down why something works competes with the budget meant to catch a Durable Object
+ * class reaching the client — and that mistake is tens of kB minified, which this still catches.
+ */
+const CLIENT_MAX_BYTES = 72 * 1024;
 
 export default defineConfig({
 	entry: {
@@ -77,9 +84,9 @@ export default defineConfig({
 						);
 					}
 
-					const bytes = chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.code), 0);
+					const bytes = minifiedBytes(chunks);
 					if (bytes > CLIENT_MAX_BYTES) {
-						this.error(`The client bundle is ${(bytes / 1024).toFixed(1)} kB, over the ${CLIENT_MAX_BYTES / 1024} kB budget.`);
+						this.error(`The client bundle is ${(bytes / 1024).toFixed(1)} kB minified, over the ${CLIENT_MAX_BYTES / 1024} kB budget.`);
 					}
 				}
 
@@ -88,6 +95,18 @@ export default defineConfig({
 		},
 	],
 });
+
+/**
+ * Minifies each chunk on its own, because the chunks share symbol names and joining them first gives
+ * invalid code. The budget check and the report both measure these.
+ */
+function minifyChunks(chunks: Array<{ code: string }>): string[] {
+	return chunks.map((chunk) => transformSync(chunk.code, { minify: true, target: "esnext" }).code);
+}
+
+function minifiedBytes(chunks: Array<{ code: string }>): number {
+	return minifyChunks(chunks).reduce((total, code) => total + Buffer.byteLength(code), 0);
+}
 
 /**
  * Formats the size of each entry together with the chunks that it imports.
@@ -101,10 +120,9 @@ export default defineConfig({
 function bundleSizeReport(graphs: Array<{ entry: { fileName: string }; chunks: Array<{ code: string }> }>): string {
 	const kB = (bytes: number) => `${(bytes / 1024).toFixed(1)} kB`.padStart(9);
 	const lines = graphs.map(({ entry, chunks }) => {
-		// Each chunk is minified on its own, because the chunks share symbol names and joining them
-		// first gives invalid code. They are compressed together, because the consumer's bundler merges
-		// them into the one file that the network then compresses.
-		const minified = chunks.map((chunk) => transformSync(chunk.code, { minify: true, target: "esnext" }).code);
+		// The chunks are compressed together, because the consumer's bundler merges them into the one
+		// file that the network then compresses.
+		const minified = minifyChunks(chunks);
 		const rawBytes = chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.code), 0);
 		const minBytes = minified.reduce((total, code) => total + Buffer.byteLength(code), 0);
 		const gzipBytes = gzipSync(minified.join("\n")).byteLength;

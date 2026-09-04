@@ -6,13 +6,17 @@ import type {
 	ReadForTransactionItemResultEncoded,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
+	RejectionReason,
 	SingleShotRequest,
 	SingleShotResponse,
+	TransactionItem,
 	TransactionItemKey,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import type { UpdateProbeResult } from "../expression/runtime.js";
 
 // Decode a sort key for a user-facing result: the empty sentinel ([]) maps back to an absent sortKey.
 function decodeSortKey(sk: KeyBytes): string | Uint8Array | undefined {
@@ -48,6 +52,57 @@ export class TransactionParticipant {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
 		this.#onItemUpserted = deps.onItemUpserted;
+	}
+
+	/**
+	 * The applicability and size tests of ONE write item — the single definition both write paths run
+	 * in their CHECK pass, before either path writes anything.
+	 *
+	 * Every test that can reject a write belongs here, because neither path can reject later. The
+	 * two-phase path must not fail at commit: prepare has already answered "accepted" and the
+	 * coordinator is entitled to commit. The single-shot path must not reject after its apply loop has
+	 * started: `transactionSync` rolls back on a throw, not on a returned rejection, so a rejection
+	 * from the apply loop would keep the writes the loop had already made.
+	 *
+	 * The sizes are measured against the same SQL the write stores, so the answer here is exact:
+	 * `measureItemBytes` evaluates the put's own data expression, and the update probe evaluates the
+	 * document expression that both the pending row and the single-shot UPDATE store verbatim.
+	 *
+	 * Returns the update probe as well, because prepare reuses its `last_transaction_ts` instead of
+	 * reading the row a second time.
+	 */
+	#precheckWrite(
+		item: TransactionItem,
+		sk: KeyBytes,
+		rejectionKeys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+	): { reason: RejectionReason | null; probe: UpdateProbeResult | null } {
+		if (item.operation === "put") {
+			// A put always carries both data and kind; assert together so the measure gets a real kind.
+			invariant(
+				item.data !== undefined && item.kind !== undefined,
+				() => `fokos/partition.precheck: "put" item has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
+			);
+			const bytes = this.#store.measureItemBytes({ hk: item.hashKey, sk, data: item.data, kind: item.kind });
+			return { reason: bytes > MAX_ITEM_BYTES ? { type: "item_too_large", ...rejectionKeys } : null, probe: null };
+		}
+
+		if (item.operation === "update") {
+			invariant(item.update, "fokos/partition.precheck: update item missing update plan");
+			const probe = this.#store.probeUpdate(item.update, item.hashKey, sk);
+			if (!probe.applicable) {
+				// A value that evaluated to bytes is the one cause the probe separates out, because the
+				// caller can act on it. Every other cause — a missing item, a non-json item, a missing
+				// target path — is reported as one answer, as DynamoDB reports its own.
+				const type = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
+				return { reason: { type, ...rejectionKeys }, probe };
+			}
+			// An applicable update always measured its result; the probe returns NULL only when it is not.
+			invariant(probe.newSize !== null, "fokos/partition.precheck: applicable update reported no size");
+			return { reason: probe.newSize > MAX_ITEM_BYTES ? { type: "item_too_large", ...rejectionKeys } : null, probe };
+		}
+
+		// delete and check write no data, so neither has a size to test.
+		return { reason: null, probe: null };
 	}
 
 	prepareLocal(request: PrepareRequest): PrepareResponse {
@@ -100,11 +155,21 @@ export class TransactionParticipant {
 						reason: { type: "condition_failed", ...rejectionKeys },
 					};
 				}
+
+				const { reason: writeReason, probe } = this.#precheckWrite(item, sk, rejectionKeys);
+				if (writeReason) {
+					return { outcome: "rejected", reason: writeReason };
+				}
+
 				const itemStamp = conditionResult
 					? conditionResult.itemPresent
 						? { last_transaction_ts: conditionResult.lastTransactionTs! }
 						: undefined
-					: this.#store.getItemStamp(item.hashKey, sk).row;
+					: probe
+						? probe.itemPresent
+							? { last_transaction_ts: probe.lastTransactionTs! }
+							: undefined
+						: this.#store.getItemStamp(item.hashKey, sk).row;
 
 				if (itemStamp) {
 					if (request.transactionTimestamp <= itemStamp.last_transaction_ts) {
@@ -113,8 +178,12 @@ export class TransactionParticipant {
 							reason: { type: "timestamp_conflict", ...rejectionKeys },
 						};
 					}
-				} else if (item.operation === "put" || item.operation === "delete" || item.operation === "check") {
-					// A check on a non-existent item must also respect the deletion watermark.
+				} else {
+					// No stamp means no live item, so the deletion watermark is the only ordering signal left.
+					// This holds for every operation, including a check, which writes nothing but still orders
+					// itself against later transactions. An update never reaches it today, because an update
+					// applies only to an item that exists — but naming the operations here instead would make a
+					// later change to applicability drop the check in silence.
 					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
 						return {
 							outcome: "rejected",
@@ -127,21 +196,36 @@ export class TransactionParticipant {
 			// All checks passed — lock every item.
 			for (const item of request.items) {
 				const sk = item.sortKey;
-				this.#store.insertPendingLock({
-					hk: item.hashKey,
-					sk,
-					transaction_id: request.transactionId,
-					transaction_ts: request.transactionTimestamp,
-					operation: item.operation,
-					data: item.data ?? null,
-					// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
-					kind: item.kind ?? null,
-					conditions_json: item.condition ? JSON.stringify(item.condition) : null,
-					ttl_epoch_utc_seconds: item.ttlAt ?? null,
-					coordinator_do_id: request.coordinatorDoId,
-					created_at: this.#now(),
-					guarded_at: null,
-				});
+				if (item.operation === "update") {
+					invariant(item.update, "fokos/partition.prepare: update item missing update plan");
+					this.#store.insertPendingUpdateLock({
+						hk: item.hashKey,
+						sk,
+						transaction_id: request.transactionId,
+						transaction_ts: request.transactionTimestamp,
+						created_at: this.#now(),
+						coordinator_do_id: request.coordinatorDoId,
+						plan: item.update,
+						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
+						ttlAt: item.ttlAt,
+					});
+				} else {
+					this.#store.insertPendingLock({
+						hk: item.hashKey,
+						sk,
+						transaction_id: request.transactionId,
+						transaction_ts: request.transactionTimestamp,
+						operation: item.operation,
+						data: item.data ?? null,
+						// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
+						kind: item.kind ?? null,
+						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
+						ttl_epoch_utc_seconds: item.ttlAt ?? null,
+						coordinator_do_id: request.coordinatorDoId,
+						created_at: this.#now(),
+						guarded_at: null,
+					});
+				}
 			}
 
 			return { outcome: "accepted" };
@@ -188,17 +272,18 @@ export class TransactionParticipant {
 
 			if (!pendingRow) continue;
 
-			if (pendingRow.operation === "put") {
-				// A put always persisted both data and kind; assert together so upsertItem gets a real kind.
+			if (pendingRow.operation === "put" || pendingRow.operation === "update") {
+				// A put/update always persisted both data and kind; assert together so upsertItem gets a real kind.
 				invariant(
 					pendingRow.data !== null && pendingRow.kind !== null,
-					() => `fokos/partition.commit: pending "put" row has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
+					() => `fokos/partition.commit: pending "${pendingRow.operation}" row has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
 				);
 				const res = this.#store.upsertItem({
 					hk: item.hashKey,
 					sk,
+					// For kind=json a put's row holds JSON text, which upsertItem encodes to JSONB, and an
+					// update's row holds the JSONB that prepare materialized, which binds verbatim.
 					data: pendingRow.data,
-					// For kind=json -> pendingRow.data is raw JSON text; upsertItem re-encodes it to JSONB.
 					kind: pendingRow.kind,
 					ttlAt: pendingRow.ttl_epoch_utc_seconds,
 					lastTransactionTs: transactionTimestamp,
@@ -250,10 +335,20 @@ export class TransactionParticipant {
 						reason: { type: "condition_failed", ...rejectionKeys },
 					};
 				}
+
+				const { reason: writeReason } = this.#precheckWrite(item, sk, rejectionKeys);
+				if (writeReason) {
+					return { outcome: "rejected", reason: writeReason };
+				}
 			}
 
 			// Every item passed, so the whole set applies. Reaching this point inside transactionSync is
 			// what makes the transaction atomic: a throw below rolls the statements above back with it.
+			//
+			// Nothing below may RETURN a rejection. transactionSync commits whatever the callback wrote
+			// when the callback returns, so a rejection here would keep the writes of the items already
+			// applied. Every rejectable test therefore ran in the check pass above, and the store raises
+			// on a size guard it can no longer reach, which rolls the whole set back.
 			for (const item of request.items) {
 				const sk = item.sortKey;
 				if (item.operation === "put") {
@@ -269,6 +364,16 @@ export class TransactionParticipant {
 						// For kind=json -> data is raw JSON text; upsertItem re-encodes it to JSONB.
 						kind: item.kind,
 						ttlAt: item.ttlAt ?? null,
+						lastTransactionTs: transactionTimestamp,
+					});
+					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
+				} else if (item.operation === "update") {
+					invariant(item.update, "fokos/partition.singleShot: update item missing update plan");
+					const res = this.#store.updateItemSingleShot({
+						hk: item.hashKey,
+						sk,
+						plan: item.update,
+						ttlAt: item.ttlAt,
 						lastTransactionTs: transactionTimestamp,
 					});
 					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);

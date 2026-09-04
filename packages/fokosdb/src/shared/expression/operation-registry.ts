@@ -60,8 +60,20 @@ export type OperationArity = readonly [minimum: number, maximum: number];
 
 export type OperationTypeRule = (args: readonly ValueFacts[], rawArgs: readonly unknown[]) => ValueFacts;
 
+/**
+ * Callbacks an operation uses to render its arguments as SQL.
+ *
+ * `renderValue` has a mode that tells it what the generated SQL value is for:
+ * - "logical": a value for a comparison or a condition. It uses the natural SQLite type for the
+ *   expression, such as TEXT for a string or INTEGER for a number, and it may bind a parameter.
+ * - "key": a value for a hash or sort key comparison, encoded as key bytes.
+ * - "sqlite": a raw SQLite scalar for arithmetic or for one of the built-in SQLite functions.
+ * - "json": a value that is safe to pass to `jsonb_set` as the new document value. This mode must
+ *   preserve the JSON type, so a string stays a string, a number stays a number, and a boolean stays
+ *   a boolean.
+ */
 export type OperationRenderers = {
-	renderValue: (value: ExpressionValue, mode: "logical" | "key" | "sqlite") => string;
+	renderValue: (value: ExpressionValue, mode: "logical" | "key" | "sqlite" | "json") => string;
 	renderType: (value: ExpressionValue) => string;
 	renderPresent: (value: ExpressionValue) => string;
 	renderSize: (value: ExpressionValue) => string;
@@ -87,6 +99,16 @@ export type OperationDefinition = {
 	readonly typeRule: OperationTypeRule;
 	/** Compiles the SQL value expression. */
 	readonly renderValue: OperationRenderValue;
+	/**
+	 * Compiles the SQL value expression when the result becomes a member of a JSON document.
+	 * Defaults to `renderValue`.
+	 *
+	 * Only an operation that returns one of its arguments unchanged needs this. Such an operation must
+	 * render that argument in "json" mode too, or a boolean argument reaches it as SQLite's 1 or 0 and
+	 * lands in the document as a number. An operation that computes a NEW value — text, a number —
+	 * needs nothing, because the computed value is already what the document should hold.
+	 */
+	readonly renderJsonValue?: OperationRenderValue;
 	/** Compiles the SQL presence test. Defaults to always present ("1"). */
 	readonly renderPresent?: OperationRenderPresent;
 	/** Compiles the SQL native type expression. Defaults to SQLite typeof CASE. */
@@ -192,11 +214,27 @@ function validatePatternArguments(name: string, args: readonly unknown[]): void 
 	}
 }
 
+/**
+ * The SQLite functions that return one of their arguments unchanged, mapped to the index of their
+ * first VALUE argument. Everything before that index is a test, not a value: `iif` takes its
+ * condition first.
+ *
+ * These are the only built-in functions that need a "json" rendering, because they are the only ones
+ * whose result IS an argument. See `OperationDefinition.renderJsonValue`.
+ */
+const SQLITE_VALUE_PASSTHROUGH: ReadonlyMap<string, number> = new Map([
+	["coalesce", 0],
+	["ifnull", 0],
+	["nullif", 0],
+	["iif", 1],
+]);
+
 function buildSqliteOperations(): OperationDefinition[] {
 	const operations: OperationDefinition[] = [];
 	for (const name of SQLITE_SCALAR_FUNCTIONS) {
 		const arity = SQLITE_FUNCTION_ARITY.get(name);
 		if (!arity) continue;
+		const valueArgsFrom = SQLITE_VALUE_PASSTHROUGH.get(name);
 
 		operations.push({
 			name: `sqlite.${name}`,
@@ -220,6 +258,11 @@ function buildSqliteOperations(): OperationDefinition[] {
 				return { types: dynamicTypes ?? nullTypes };
 			},
 			renderValue: (args, renderers) => `${name}(${args.map((arg) => renderers.renderValue(arg, "sqlite")).join(", ")})`,
+			renderJsonValue:
+				valueArgsFrom === undefined
+					? undefined
+					: (args, renderers) =>
+							`${name}(${args.map((arg, i) => renderers.renderValue(arg, i < valueArgsFrom ? "sqlite" : "json")).join(", ")})`,
 			renderPresent: () => "1",
 			renderType: (args, renderers) => {
 				const call = `${name}(${args.map((arg) => renderers.renderValue(arg, "sqlite")).join(", ")})`;
@@ -287,7 +330,16 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 		},
 		renderValue: (args, renderers) =>
 			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "sqlite")} ELSE ${renderers.renderValue(args[1], "sqlite")} END`,
-		renderPresent: (args, renderers) => `(${renderers.renderPresent(args[0])} OR ${renderers.renderPresent(args[1])})`,
+		renderJsonValue: (args, renderers) =>
+			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "json")} ELSE ${renderers.renderValue(args[1], "json")} END`,
+		renderPresent: (args, renderers) => {
+			// The result is present when either branch is. A branch that is always present therefore
+			// decides the whole test, and folding it to "1" keeps a constant-true term out of the SQL.
+			const pathPresent = renderers.renderPresent(args[0]);
+			const fallbackPresent = renderers.renderPresent(args[1]);
+			if (pathPresent === "1" || fallbackPresent === "1") return "1";
+			return `(${pathPresent} OR ${fallbackPresent})`;
+		},
 		renderType: (args, renderers) =>
 			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderType(args[0])} ELSE ${renderers.renderType(args[1])} END`,
 	},

@@ -1,3 +1,29 @@
+/**
+ * Expression compiler.
+ *
+ * This file turns a condition expression or an update expression into a compiled plan. A compiled
+ * plan contains the SQL that Workers SQLite runs, the parameters that the SQL binds, and the extra
+ * checks that decide if the expression applies to an item.
+ *
+ * The main flow is:
+ *
+ * 1. Validate the expression tree. This checks syntax, argument counts, and types, and records the
+ *    JSON paths the expression reads from data.
+ * 2. Build a compile context. The context collects parameter bindings and tracks which data paths
+ *    are used.
+ * 3. Render the expression into SQL fragments. Literals become bound parameters, references become
+ *    column reads or JSON path lookups, and operations become SQL expressions.
+ * 4. Produce a compiled plan. A condition plan has a `sql` fragment that evaluates to the condition
+ *    result, and parameter descriptors. An update plan has a `documentSql` fragment that builds the
+ *    new JSONB document, an `applicableSql` guard that decides whether the update may run at all, a
+ *    `valueTypeSql` fragment that names one cause of an inapplicable update, and parameter
+ *    descriptors.
+ *
+ * At run time the caller binds the compiled parameters and executes the SQL. The plan is built once
+ * and can be reused for many items because the per-item values are supplied through the bound
+ * parameters, not through the SQL text.
+ */
+
 import type { JsonPrimitive } from "../json-types.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
@@ -15,12 +41,15 @@ import {
 	composeConditionStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
+	UPDATE_FIXED_BINDING_COUNT,
+	UPDATE_MAX_TRAILING_BINDING_COUNT,
 	UPDATE_PLAN_VERSION,
 	type CompiledConditionPlan,
 	type CompiledUpdatePlan,
 	type ExpressionBindingDescriptor,
 } from "./plan.js";
 import { validateConditionExpression, validateUpdateExpression } from "./semantic.js";
+import { DATA_KINDS } from "../types.js";
 import type { ConditionExpression, ExpressionReference, ExpressionValue, UpdateAction, UpdateExpression, UpdateTarget } from "./types.js";
 import { utf8WithinLimit } from "./utf8.js";
 
@@ -33,11 +62,13 @@ type CompileContext = {
 	expressionContext: ExpressionContext;
 };
 
-type ValueMode = "logical" | "key" | "sqlite";
+type ValueMode = "logical" | "key" | "sqlite" | "json";
 
-const BYTES_KIND = 0;
-const TEXT_KIND = 1;
-const JSON_KIND = 2;
+// The on-disk data_kind codes. DATA_KINDS is the ONE source: its index is the stored code, so these
+// cannot drift from what PartitionStore writes. Each is a fixed integer, safe to interpolate into SQL.
+const BYTES_KIND = DATA_KINDS.indexOf("bytes");
+const TEXT_KIND = DATA_KINDS.indexOf("text");
+const JSON_KIND = DATA_KINDS.indexOf("json");
 const EQUALITY_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "text", "bytes"];
 const ORDERED_TYPE_NAMES: readonly string[] = ["number", "text", "bytes"];
 const PREFIX_TYPE_NAMES: readonly string[] = ["text", "bytes"];
@@ -86,7 +117,8 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	const context: CompileContext = {
 		bindings: [],
 		bindingIndexByKey: new Map(),
-		paramOffset: 0,
+		// The keys take ?1 and ?2 in every statement that runs this plan, as they do for a condition.
+		paramOffset: UPDATE_FIXED_BINDING_COUNT,
 		completeData: false,
 		paths: new Set(),
 		expressionContext: "update-value",
@@ -106,6 +138,7 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	const rawDocumentSql = accumulator;
 
 	const applicableTerms: string[] = ["(i.hk IS NOT NULL)", `(i.data_kind = ${JSON_KIND})`];
+	const valueTypeTerms: string[] = [];
 
 	for (const action of orderedActions) {
 		if (action.action === "set") {
@@ -114,14 +147,27 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 			if (presentSql !== "1") {
 				applicableTerms.push(`(${presentSql})`);
 			}
+			const typeTermSql = valueTypeGuardSql(action.value, context);
+			if (typeTermSql !== "1") {
+				valueTypeTerms.push(typeTermSql);
+			}
 		}
+	}
+
+	// The type test is a term of applicableSql AND a fragment of its own, because the two answers are
+	// not the same rejection: a value that is bytes for this item names a cause the caller can fix,
+	// while everything else applicableSql tests is "the update does not apply". The probe reads the
+	// fragment separately to tell them apart.
+	const rawValueTypeSql = valueTypeTerms.length === 0 ? "1" : valueTypeTerms.join(" AND ");
+	if (valueTypeTerms.length > 0) {
+		applicableTerms.push(`(${rawValueTypeSql})`);
 	}
 
 	applicableTerms.push(`(json_type(${rawDocumentSql}) IN ('array', 'object'))`);
 
 	const rawApplicableSql = `(CASE WHEN ${applicableTerms.join(" AND ")} THEN 1 ELSE 0 END)`;
 
-	const [documentSql, applicableSql] = compactPlanParameters([rawDocumentSql, rawApplicableSql], context);
+	const [documentSql, applicableSql, valueTypeSql] = compactPlanParameters([rawDocumentSql, rawApplicableSql, rawValueTypeSql], context);
 
 	if (
 		!utf8WithinLimit(documentSql, EXPRESSION_LIMITS.compiledSqlBytes) ||
@@ -129,7 +175,12 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
-	if (context.bindings.length > EXPRESSION_LIMITS.completeStatementBindings) {
+	// The budget belongs to the WIDEST statement that runs this plan, not to the plan alone. Workers
+	// SQLite caps one query at completeStatementBindings parameters, and every such statement binds the
+	// keys before the plan and its own tail after it. Charging both here rejects an over-budget update
+	// in the client, with a limit error, instead of letting a partition fail on it mid-transaction.
+	const completeBindingCount = UPDATE_FIXED_BINDING_COUNT + context.bindings.length;
+	if (completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > EXPRESSION_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
 	}
 
@@ -138,8 +189,10 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		kind: "update",
 		documentSql,
 		applicableSql,
+		valueTypeSql,
 		bindings: context.bindings,
 		bindingCount: context.bindings.length,
+		completeBindingCount,
 		requiredColumns: analysis.requiredColumns,
 		dataDependencies: {
 			completeData: context.completeData,
@@ -218,12 +271,32 @@ function targetGuardSql(target: UpdateTarget, context: CompileContext): string {
 }
 
 function renderUpdateValue(value: ExpressionValue, context: CompileContext): string {
-	if ("val" in value) {
-		if (value.val === true) return "jsonb('true')";
-		if (value.val === false) return "jsonb('false')";
-		if (value.val === null) return "NULL";
+	return renderValue(value, "json", context);
+}
+
+/**
+ * The per-item test that one `set` value is a type a JSON document can hold.
+ *
+ * JSON has no byte type. `validateUpdateExpression` refuses a value that can ONLY be bytes, but two
+ * kinds of value are bytes for some items and not for others, and neither is decidable at compile
+ * time: a key reference is text for a text key and bytes for a binary one, and a SQLite function is
+ * typed by what it returns at run time. Without this test such a value writes a raw blob into the
+ * document, which SQLite reads back as JSONB — a byte that happens to be valid JSONB becomes a
+ * silently wrong member, and one that is not corrupts the document past the point where a read can
+ * decode it.
+ *
+ * Returns "1" when the type is a compile-time constant, which is the common case and costs nothing.
+ * A constant `bytes` throws: only a byte literal renders one, and `renderUpdateValue` has already
+ * refused it, so this is the guard behind that guard.
+ */
+function valueTypeGuardSql(value: ExpressionValue, context: CompileContext): string {
+	const typeSql = renderType(value, context);
+	const constType = constTypeName(typeSql);
+	if (constType !== undefined) {
+		if (constType === "bytes") throw new ExpressionError("invalid_type", "an update value must not be bytes");
+		return "1";
 	}
-	return renderValue(value, "sqlite", context);
+	return `(${typeSql} <> 'bytes')`;
 }
 
 /**
@@ -470,6 +543,28 @@ function renderType(value: ExpressionValue, context: CompileContext): string {
 }
 
 function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileContext): string {
+	if (mode === "json") {
+		if ("val" in value) {
+			if (value.val === true) return "jsonb('true')";
+			if (value.val === false) return "jsonb('false')";
+			if (value.val === null) return "NULL";
+			return bindLiteral(value.val as JsonPrimitive, "logical", context);
+		}
+		// A byte literal has no JSON form. validateUpdateExpression refuses it before compilation, so
+		// this answers only a caller that compiles a value the validator never saw.
+		if ("b64" in value) {
+			throw new ExpressionError("invalid_type", "an update value must not be bytes");
+		}
+		if ("ref" in value) return referenceValue(value, "json", context);
+		const operation = getOperationDefinition(value.fn);
+		if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
+			// An operation that returns one of its arguments must render that argument in "json" mode
+			// as well, which is what renderJsonValue is for. Everything else computes a new value that
+			// is already in its final form.
+			return (operation.renderJsonValue ?? operation.renderValue)(value.args, makeRenderers(context));
+		}
+		throw new ExpressionError("invalid_function", "unknown expression function");
+	}
 	if ("val" in value) return bindLiteral(value.val as JsonPrimitive, mode, context);
 	if ("b64" in value) return bindByteLiteral(value, mode, context);
 	if ("ref" in value) return referenceValue(value, mode, context);
@@ -542,10 +637,16 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 		case "data":
 			if (reference.path !== undefined) {
 				recordDataReference(reference, context);
-				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_extract(i.data, ${bindPath(reference.path, context)}) END`;
+				const path = bindPath(reference.path, context);
+				if (mode === "json") {
+					return `CASE json_type(i.data, ${path}) WHEN 'true' THEN jsonb('true') WHEN 'false' THEN jsonb('false') ELSE json_extract(i.data, ${path}) END`;
+				}
+				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_extract(i.data, ${path}) END`;
 			}
 			context.completeData = true;
-			if (mode === "sqlite") return "i.data";
+			// The stored JSONB is already the document form, so both modes bind the column verbatim: a
+			// SQLite function reads it as JSON, and jsonb_set stores it as a nested value.
+			if (mode === "sqlite" || mode === "json") return "i.data";
 			return `CASE WHEN i.data_kind = ${JSON_KIND} AND json_type(i.data) IN ('array', 'object') THEN i.data WHEN i.data_kind = ${JSON_KIND} THEN json_extract(i.data, '$') ELSE i.data END`;
 	}
 }

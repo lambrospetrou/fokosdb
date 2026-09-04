@@ -50,7 +50,7 @@ import { normalizeSkInterval } from "../shared/query/sk-interval.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import { PageBudget } from "../shared/query/page-budget.js";
-import { compileConditionExpression } from "../shared/expression/compiler.js";
+import { compileConditionExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
 import { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
@@ -223,10 +223,15 @@ export class FokosDB {
 	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
 		if (opts.clientRequestToken !== undefined) validateClientRequestToken(opts.clientRequestToken);
 
-		// Encode each put and compile each condition once at this boundary. A `data` field set on a non-put
-		// by a non-TypeScript caller stays present so validation rejects it.
+		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
+		// field set on a non-put by a non-TypeScript caller stays present so validation rejects it.
 		const prepared = opts.items.map((item) => {
 			const condition = item.condition ? compileConditionExpression(item.condition) : undefined;
+			if (item.operation === "update") {
+				validateTtlAt(item.ttlAt, "transactWriteItems");
+				const update = compileUpdateExpression(item.update);
+				return { ...item, update, condition };
+			}
 			if (item.operation !== "put") return { ...item, condition };
 			validateTtlAt(item.ttlAt, "transactWriteItems");
 			return { ...item, ...encodeItemData(item.data), condition };
