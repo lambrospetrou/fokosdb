@@ -114,7 +114,7 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 
 ## Testing
 
-Tests run in the actual Cloudflare Workers runtime via `@cloudflare/vitest-pool-workers`. Each test suite creates isolated namespaces using `crypto.randomUUID()` prefixes. Integration tests are in `packages/fokosdb/test/transactions.test.ts`; partition/topology tests in `packages/fokosdb/src/server/do-partition.test.ts`.
+Tests run in the actual Cloudflare Workers runtime via `@cloudflare/vitest-pool-workers`. Each test suite creates isolated namespaces using `crypto.randomUUID()` prefixes. Integration tests are in `packages/fokosdb/test/transactions.test.ts`. The `PartitionDO` suites live in `packages/fokosdb/test/partition-do/`, one file per behaviour, over the shared setup in `packages/fokosdb/test/partition-do/helpers.ts`.
 
 ## Rules for PartitionDO operations
 

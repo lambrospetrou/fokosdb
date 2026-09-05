@@ -1,10 +1,10 @@
 import { env } from "cloudflare:workers";
-import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, it, vi } from "vitest";
+import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { PartitionContextCreator } from "../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/router.js";
 import { PartitionDO } from "../src/server/do-partition.js";
+import { waitForAlarm } from "./partition-do/helpers.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.1 = 102 400 bytes; 2 × 50 KB items per partition → split triggers.
@@ -27,17 +27,6 @@ function makeDB(tableName: string) {
 	return new FokosDB({
 		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 		topology: new PartitionTopologyRouterImpl(base),
-	});
-}
-
-// Mirrors the waitForAlarm helper in do-partition.test.ts.
-async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
-	await runDurableObjectAlarm(stub);
-	await runInDurableObject(stub, async (instance: PartitionDO) => {
-		await vi.waitUntil(() => !instance.__testing__alarm_running && !instance.__testing__backgroundWorkRunning, {
-			timeout: 5000,
-			interval: 50,
-		});
 	});
 }
 

@@ -592,7 +592,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 // Builds a FokosDB over a fresh, isolated table for the given partition DO namespace. Generous split
 // thresholds keep every key on a single root partition so these tests exercise FokosDB.queryItems'
-// cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in do-partition.test.ts).
+// cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in test/partition-do/query-items.test.ts).
 function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; numTxCoordinators?: number }) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({

@@ -1189,7 +1189,7 @@ describe("transactions - single-partition fast path", () => {
 
 		// A partition raises this when the items straddle a split or a promotion below it. Standing in
 		// for that setup here keeps the test on what db.ts owns: recognising the sentinel and finishing
-		// the read through the two-phase path. The raise itself is covered in do-partition.test.ts.
+		// the read through the two-phase path. The raise itself is covered in test/partition-do/.
 		const { snapshotCalls, transactionCalls } = countReadPathCalls();
 		snapshotCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (readSnapshot)."));
 
@@ -1292,7 +1292,7 @@ describe("transactions - single-partition fast path", () => {
 		const keys = keysInOnePartition(db, 2, "fast-write-fallback");
 
 		// A partition raises this when the items straddle a split or a promotion below it. The raise
-		// itself is covered in do-partition.test.ts; what matters here is that db.ts recognises it and
+		// itself is covered in test/partition-do/; what matters here is that db.ts recognises it and
 		// finishes the write on the coordinator path.
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
 		partitionCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (executeSingleShot)."));

@@ -242,6 +242,42 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
 		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow();
 	});
+
+	// The readers are asserted here against hand-written bytes, not against the encoder's output. A
+	// round-trip test passes even if the encoder and the readers change the layout together; these
+	// literals pin the layout itself: [schema, rootIdx hi, rootIdx lo, depth, ...childIdx].
+	it("readers decode hand-written wire bytes", () => {
+		expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0, 0, 0]))).toBe(0);
+		expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0, 42, 0]))).toBe(42);
+		expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 1, 0, 0]))).toBe(256);
+		// 65000 = 0xFDE8
+		expect(PartitionIdHelper.rootIdx(new Uint8Array([0, 0xfd, 0xe8, 0]))).toBe(65000);
+
+		expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 0]))).toBe(0);
+		expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 1, 5]))).toBe(1);
+		expect(PartitionIdHelper.depth(new Uint8Array([0, 0, 0, 3, 0, 1, 2]))).toBe(3);
+
+		expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 1, 5]))).toBe(5);
+		expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 2, 3, 7]))).toBe(7);
+		expect(PartitionIdHelper.lastChildIdx(new Uint8Array([0, 0, 0, 3, 0, 1, 2]))).toBe(2);
+	});
+
+	it("doName builds the correct DO name from hand-written wire bytes", () => {
+		const base = makeBase();
+		// Root-only (rootIdx=5, depth=0)
+		expect(PartitionIdHelper.doName(base, new Uint8Array([0, 0, 5, 0]))).toBe("iddb.h.5");
+		// rootIdx > 255 (rootIdx=256, depth=0) — validates u16 encoding
+		expect(PartitionIdHelper.doName(base, new Uint8Array([0, 1, 0, 0]))).toBe("iddb.h.256");
+		// With children (rootIdx=5, depth=2, children=[3, 7])
+		expect(PartitionIdHelper.doName(base, new Uint8Array([0, 0, 5, 2, 3, 7]))).toBe("iddb.h.5.3.7");
+	});
+
+	it("doName and decode throw for unknown schema bytes (>1)", () => {
+		const base = makeBase();
+		const unknownSchema = new Uint8Array([2, 0, 0, 0]);
+		expect(() => PartitionIdHelper.doName(base, unknownSchema)).toThrow();
+		expect(() => PartitionIdHelper.decode(unknownSchema)).toThrow();
+	});
 });
 
 describe("rangePartitionDoName", () => {
