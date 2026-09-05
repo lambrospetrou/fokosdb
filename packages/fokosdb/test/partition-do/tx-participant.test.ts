@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "../../src/shared/partition-errors.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
@@ -8,14 +8,14 @@ import { resolveRangePartitionContext } from "../../src/shared/partition-topolog
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import {
+	PROMOTION_BIG_DATA,
+	PROMOTION_TEST_MAX_SIZE_MB,
 	compiledCondition,
 	drainSplitTree,
 	kb,
 	makeStub,
-	PROMOTION_BIG_DATA,
-	PROMOTION_TEST_MAX_SIZE_MB,
 	triggerHashSplitThreshold,
-	waitForAlarm,
+	waitForPromotedKeyStatus,
 } from "./helpers.js";
 
 describe("PartitionDO — transactions spanning local and promoted keys", () => {
@@ -27,15 +27,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
 		const rangeRootStub = PartitionDO.getByName(env.PARTITION_DO, rangeRootCtx.doName);
-		await vi.waitFor(
-			async () => {
-				await waitForAlarm(stub);
-				await waitForAlarm(rangeRootStub);
-				if ((await stub.status()).promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb("alice")) === 0)?.status !== "promoted")
-					throw new Error("not yet promoted");
-			},
-			{ timeout: 5000, interval: 100 },
-		);
+		await waitForPromotedKeyStatus(stub, "alice", ["promoted"], { drain: [stub, rangeRootStub] });
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
@@ -79,15 +71,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
 		const rangeRootStub = PartitionDO.getByName(env.PARTITION_DO, rangeRootCtx.doName);
-		await vi.waitFor(
-			async () => {
-				await waitForAlarm(stub);
-				await waitForAlarm(rangeRootStub);
-				if ((await stub.status()).promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb("alice")) === 0)?.status !== "promoted")
-					throw new Error("not yet promoted");
-			},
-			{ timeout: 5000, interval: 100 },
-		);
+		await waitForPromotedKeyStatus(stub, "alice", ["promoted"], { drain: [stub, rangeRootStub] });
 
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();

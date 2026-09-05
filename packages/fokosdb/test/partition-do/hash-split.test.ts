@@ -12,9 +12,10 @@ import {
 	assertSplitTreeComplete,
 	compiledCondition,
 	drainSplitTree,
+	expectSplitStatus,
 	kb,
 	makeStub,
-	type SplitStartedOrCompleted,
+	splitStatusOf,
 	triggerHashSplitThreshold,
 	waitForAlarm,
 } from "./helpers.js";
@@ -493,7 +494,7 @@ describe("PartitionDO - splitting", () => {
 
 			const parentState = await stub.status();
 			expect(parentState.splitStatus?.status).toBe("split_started");
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
 
 			// Run each child's migration alarm.
@@ -509,7 +510,7 @@ describe("PartitionDO - splitting", () => {
 			// Parent acknowledges all children and transitions to split_completed.
 			const finalParent = await stub.status();
 			expect(finalParent.splitStatus?.status).toBe("split_completed");
-			const finalSplit = finalParent.splitStatus as SplitStartedOrCompleted;
+			const finalSplit = expectSplitStatus(finalParent.splitStatus);
 			expect(finalSplit.migratedChildDoNames).toHaveLength(10);
 
 			// All migrations complete: root successfully forwards each item to the correct child.
@@ -567,7 +568,7 @@ describe("PartitionDO - splitting", () => {
 			}
 
 			await waitForAlarm(stub);
-			const childContexts = ((await stub.status()).splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = (await splitStatusOf(stub)).childPartitionContexts;
 			await scheduler.wait(600);
 			let expiredBeforeCompletion = 0;
 			for (const childCtx of childContexts) {
@@ -625,7 +626,7 @@ describe("PartitionDO - splitting", () => {
 			await waitForAlarm(stub);
 
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			const childCtx = childContexts[0];
 			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
 
@@ -671,7 +672,7 @@ describe("PartitionDO - splitting", () => {
 			await waitForAlarm(stub);
 
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			const childCtx = childContexts[0];
 			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
 
@@ -724,7 +725,7 @@ describe("PartitionDO - splitting", () => {
 
 			// Run all children's migrations. startSplit already triggered their alarms via fire-and-forget.
 			const parentState = await stub.status();
-			const childContexts = (parentState.splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			for (const childCtx of childContexts) {
 				const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
 				await waitForAlarm(childStub);

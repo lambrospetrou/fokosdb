@@ -7,7 +7,7 @@ import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { EST_ROW_BYTES_K } from "../../src/shared/partition/item-size.js";
-import { drainSplitTree, kb, makeQueuedRangeRoot, makeStub, type SplitStartedOrCompleted, waitForAlarm } from "./helpers.js";
+import { drainSplitTree, kb, makeQueuedRangeRoot, makeStub, splitStatusOf, waitForAlarm, waitForSplitCompleted } from "./helpers.js";
 
 describe("PartitionDO — range split", () => {
 	describe("queryItems leaf batching", () => {
@@ -88,14 +88,7 @@ describe("PartitionDO — range split", () => {
 		const buildSplitTree = async (N: number) => {
 			const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
 			expect(sks.length).toBeGreaterThanOrEqual(N);
-			await vi.waitFor(
-				async () => {
-					await drainSplitTree(rootStub);
-					const s = await rootStub.status();
-					if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
-				},
-				{ timeout: 5000, interval: 100 },
-			);
+			await waitForSplitCompleted(rootStub);
 			return { rootCtx, rootStub, sks };
 		};
 
@@ -263,7 +256,7 @@ describe("PartitionDO — range split", () => {
 		it("emits no cursor when the partition-visit cap is reached but every remaining child is outside the interval", async () => {
 			const N = 4;
 			const { rootCtx, rootStub, sks } = await buildSplitTree(N);
-			const children = ((await rootStub.status()).splitStatus as SplitStartedOrCompleted).childPartitionContexts;
+			const children = (await splitStatusOf(rootStub)).childPartitionContexts;
 			// Children are in ascending boundary order, so an exclusive upper bound at the third child's
 			// start boundary leaves exactly the first two intersecting the query.
 			const upper = children[2].rangePartition!.startBoundary!;

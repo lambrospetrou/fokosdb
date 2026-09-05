@@ -9,6 +9,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { expect, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import { isPartitionExceededDatabaseSizeError } from "../../src/shared/partition-errors.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { resolveRangePartitionContext } from "../../src/shared/partition-topology/partition-id.js";
@@ -18,6 +19,7 @@ import type { SplitStatusKVItem } from "../../src/shared/partition-topology/spli
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
+import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
 
@@ -46,8 +48,25 @@ export async function waitForAlarm(stub: DurableObjectStub<PartitionDO>) {
 //
 // It is NOT small enough to keep a crossing write inside the 10% reject grace band. That would need
 // <= 0.4: the chunk is RANGE_PROMOTION_FRACTION (0.25) * this * maxSizeMb, against a band of
-// 0.1 * maxSizeMb. Both callers are fine with overshooting, for different reasons — see each.
+// 0.1 * maxSizeMb. Both fillers below are fine with overshooting, for different reasons — see each.
 const FILLER_CHUNK_FRACTION = 0.7;
+
+/** Upper bound on filler writes, so a helper that never reaches its goal fails instead of hanging. */
+const MAX_FILLER_WRITES = 50;
+
+/**
+ * One filler item's payload for a partition whose limit is `maxSizeMb`, sized so that no single key
+ * can reach the promotion threshold on its own.
+ *
+ * `apiPutItem` does NOT enforce the per-item ceiling — that lives in db.ts and the coordinator — so a
+ * large `maxSizeMb` would silently write items no real client could send, and the tests would stop
+ * resembling the system they stand in for. The assertion keeps that honest.
+ */
+function fillerChunk(maxSizeMb: number): string {
+	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * FILLER_CHUNK_FRACTION);
+	expect(chunkBytes, "filler chunk exceeds MAX_ITEM_BYTES; lower maxSizeMb or FILLER_CHUNK_FRACTION").toBeLessThanOrEqual(MAX_ITEM_BYTES);
+	return "x".repeat(chunkBytes);
+}
 
 /**
  * Writes enough data spread across multiple hash keys to push the DB over maxSizeMb
@@ -61,19 +80,19 @@ export async function triggerHashSplitThreshold(
 ): Promise<void> {
 	// Overshooting the grace band is expected here: the loop below treats the over-size rejection as a
 	// normal exit, because it means a prior write already crossed the split threshold.
-	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * FILLER_CHUNK_FRACTION);
-	const data = "x".repeat(chunkBytes);
-	for (let i = 0; ; i++) {
+	const data = fillerChunk(maxSizeMb);
+	for (let i = 0; i < MAX_FILLER_WRITES; i++) {
 		try {
 			await stub.apiPutItem(ctx, { hashKey: kb(`_split_trig_${i}`), sortKey: kb("sk"), data, kind: "bytes" });
 		} catch (e) {
-			// "partition exceeded" means we crossed the reject band — split was queued by a prior write.
-			if (!String(e).includes("partition exceeded")) throw e;
-			break;
+			// An over-size rejection means a prior write already crossed the split threshold.
+			if (!isPartitionExceededDatabaseSizeError(e)) throw e;
+			return;
 		}
 		const { splitStatus } = await stub.status();
-		if (splitStatus?.status === "split_queued") break;
+		if (splitStatus?.status === "split_queued") return;
 	}
+	throw new Error(`triggerHashSplitThreshold: no split queued after ${MAX_FILLER_WRITES} writes`);
 }
 
 /**
@@ -89,7 +108,7 @@ export async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Prom
 
 	if (!state.splitStatus || state.splitStatus.status === "split_queued") return;
 
-	const splitStatus = state.splitStatus as SplitStartedOrCompleted;
+	const splitStatus = expectSplitStatus(state.splitStatus, state.partitionContext?.doName);
 	for (const childCtx of splitStatus.childPartitionContexts) {
 		const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
 
@@ -103,6 +122,78 @@ export async function drainSplitTree(stub: DurableObjectStub<PartitionDO>): Prom
 }
 
 /**
+ * Narrows an already-read split status to a started or completed split. Tests that reach for
+ * `childPartitionContexts` need that narrowing; failing here reports the status the partition was
+ * actually in, instead of surfacing an `undefined` several lines later.
+ */
+export function expectSplitStatus(status: SplitStatusKVItem | undefined, doName?: string): SplitStartedOrCompleted {
+	invariant(
+		status?.status === "split_started" || status?.status === "split_completed",
+		`${doName ?? "partition"}: expected a started or completed split, got ${status?.status ?? "none"}`,
+	);
+	return status;
+}
+
+/** Reads a partition's split status and narrows it with `expectSplitStatus`. */
+export async function splitStatusOf(stub: DurableObjectStub<PartitionDO>): Promise<SplitStartedOrCompleted> {
+	const state = await stub.status();
+	return expectSplitStatus(state.splitStatus, state.partitionContext?.doName);
+}
+
+/** The promotion status this partition holds for `hashKey`, or undefined if it holds no entry. */
+export async function promotedKeyStatus(
+	stub: DurableObjectStub<PartitionDO>,
+	hashKey: string,
+	ctx?: PartitionContextResolved,
+): Promise<PromotedKeyStatus | undefined> {
+	const { promotedKeys } = await stub.status(ctx);
+	return promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb(hashKey)) === 0)?.status;
+}
+
+/**
+ * Drives the given partitions' alarms and background work until `check` passes.
+ *
+ * Promotion and migration only advance on a background cycle, so a test cannot simply poll: each
+ * attempt has to run the alarms again. `label` completes the sentence "timed out waiting for ...".
+ */
+export async function drainUntil(
+	drain: DurableObjectStub<PartitionDO>[],
+	check: () => Promise<boolean>,
+	label: string,
+	timeoutMs = 5000,
+): Promise<void> {
+	await vi.waitFor(
+		async () => {
+			for (const stub of drain) await waitForAlarm(stub);
+			if (!(await check())) throw new Error(`timed out waiting for ${label}`);
+		},
+		{ timeout: timeoutMs, interval: 100 },
+	);
+}
+
+/**
+ * Drains alarms until `stub` reports one of `statuses` for `hashKey`. By default it drains the same
+ * partition it reads; pass `drain` when another partition owns the work that moves the status, such
+ * as a range root finishing its migration.
+ */
+export async function waitForPromotedKeyStatus(
+	stub: DurableObjectStub<PartitionDO>,
+	hashKey: string,
+	statuses: readonly PromotedKeyStatus[],
+	opts?: { drain?: DurableObjectStub<PartitionDO>[]; timeoutMs?: number },
+): Promise<void> {
+	await drainUntil(
+		opts?.drain ?? [stub],
+		async () => {
+			const status = await promotedKeyStatus(stub, hashKey);
+			return status !== undefined && statuses.includes(status);
+		},
+		`"${hashKey}" to reach ${statuses.join(" or ")}`,
+		opts?.timeoutMs,
+	);
+}
+
+/**
  * Recursively walks the split tree rooted at `nodeStub` and asserts every node that has split
  * has reached split_completed. Returns the count of split nodes (non-leaf nodes).
  */
@@ -110,12 +201,30 @@ export async function assertSplitTreeComplete(nodeStub: DurableObjectStub<Partit
 	const state = await nodeStub.status();
 	if (!state.splitStatus) return 0;
 	expect(state.splitStatus.status, `DO ${state.partitionContext?.doName} should be split_completed`).toBe("split_completed");
-	const split = state.splitStatus as SplitStartedOrCompleted;
+	const split = expectSplitStatus(state.splitStatus, state.partitionContext?.doName);
 	let count = 1;
 	for (const childCtx of split.childPartitionContexts) {
 		count += await assertSplitTreeComplete(PartitionDO.getByName(env.PARTITION_DO, childCtx.doName));
 	}
 	return count;
+}
+
+/** A structured log entry as the partition DO writes it to console.error. */
+export type LoggedEntry = { message?: string; transactionId?: string; [key: string]: unknown };
+
+/**
+ * Silences console.error for the test and collects what was written, so a test can assert on the
+ * DO's structured logs without the entries reaching the run output.
+ */
+export function captureConsoleError() {
+	const spy = vi.spyOn(console, "error").mockImplementation(() => {});
+	return {
+		spy,
+		/** Every entry logged with this `message`, in the order it was logged. */
+		withMessage(message: string): LoggedEntry[] {
+			return spy.mock.calls.map(([entry]) => entry as LoggedEntry).filter((log) => log.message === message);
+		},
+	};
 }
 
 export function makeStub(opts?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
@@ -171,14 +280,8 @@ export async function growPastSplitThreshold(
 	maxSizeMb: number,
 ): Promise<number> {
 	const target = maxSizeMb * 1024 * 1024;
-	const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * target * FILLER_CHUNK_FRACTION);
-	// chunkBytes scales with maxSizeMb, and apiPutItem does NOT enforce the per-item ceiling — that
-	// lives in db.ts and the coordinator — so a larger maxSizeMb would silently write items no real
-	// client could send, and the test would stop resembling the system it stands in for.
-	expect(chunkBytes, "filler chunk exceeds MAX_ITEM_BYTES; lower maxSizeMb or FILLER_CHUNK_FRACTION").toBeLessThanOrEqual(MAX_ITEM_BYTES);
-
-	const chunk = "x".repeat(chunkBytes);
-	for (let i = 0; i < 50; i++) {
+	const chunk = fillerChunk(maxSizeMb);
+	for (let i = 0; i < MAX_FILLER_WRITES; i++) {
 		const r = await stub.apiPutItem(ctx, { hashKey: kb(`_filler_${i}`), sortKey: kb("sk"), data: chunk, kind: "bytes" });
 		if (r.meta.databaseSize > target) return r.meta.databaseSize;
 	}
@@ -241,7 +344,7 @@ export async function makeQueuedRangeRoot(
 	return { rootCtx, rootStub, sks };
 }
 
-// Waits for a range partition's own split to finish, driving the whole subtree's migration each poll.
+// Waits for a partition's own split to finish, driving the whole subtree's migration each poll.
 export async function waitForSplitCompleted(stub: DurableObjectStub<PartitionDO>): Promise<void> {
 	await vi.waitFor(
 		async () => {

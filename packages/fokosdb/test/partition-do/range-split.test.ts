@@ -1,25 +1,24 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it, vi } from "vitest";
+import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { resolveRangePartitionContext } from "../../src/shared/partition-topology/partition-id.js";
 import { HashPartitionTopologyImpl } from "../../src/shared/partition-topology/split-policy.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
-import type { KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import {
+	PROMOTION_BIG_DATA,
+	PROMOTION_TEST_MAX_SIZE_MB,
 	drainSplitTree,
 	kb,
 	makeQueuedRangeRoot,
 	makeStub,
-	PROMOTION_BIG_DATA,
-	PROMOTION_TEST_MAX_SIZE_MB,
 	splitRangePartition,
-	type SplitStartedOrCompleted,
+	splitStatusOf,
 	triggerHashSplitThreshold,
-	waitForAlarm,
+	waitForPromotedKeyStatus,
 	waitForSplitCompleted,
 } from "./helpers.js";
 
@@ -29,16 +28,9 @@ describe("PartitionDO — range split", () => {
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
 		expect(sks.length).toBeGreaterThanOrEqual(N);
 
-		await vi.waitFor(
-			async () => {
-				await drainSplitTree(rootStub);
-				const s = await rootStub.status(rootCtx);
-				return s.splitStatus?.status === "split_completed" ? Promise.resolve() : Promise.reject(new Error("Split not completed yet"));
-			},
-			{ timeout: 5000, interval: 100 },
-		);
+		await waitForSplitCompleted(rootStub);
 
-		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+		const status = await splitStatusOf(rootStub);
 		expect(status.status).toBe("split_completed");
 		expect(status.childPartitionContexts).toHaveLength(N);
 
@@ -65,15 +57,8 @@ describe("PartitionDO — range split", () => {
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
 		const N = 4;
 		const { rootCtx, rootStub, sks } = await makeQueuedRangeRoot(N);
-		await vi.waitFor(
-			async () => {
-				await drainSplitTree(rootStub);
-				const s = await rootStub.status();
-				if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
-			},
-			{ timeout: 5000, interval: 100 },
-		);
-		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+		await waitForSplitCompleted(rootStub);
+		const status = await splitStatusOf(rootStub);
 
 		for (const sk of sks) {
 			// The N children form a total partition of the sort-key axis: each written sk is owned by exactly one.
@@ -93,15 +78,8 @@ describe("PartitionDO — range split", () => {
 
 	it("creates a brand-new leftmost child distinct from the router (no retain-leftmost)", async () => {
 		const { rootCtx, rootStub } = await makeQueuedRangeRoot(4);
-		await vi.waitFor(
-			async () => {
-				await drainSplitTree(rootStub);
-				const s = await rootStub.status();
-				if (s.splitStatus?.status !== "split_completed") throw new Error("split not completed yet");
-			},
-			{ timeout: 5000, interval: 100 },
-		);
-		const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+		await waitForSplitCompleted(rootStub);
+		const status = await splitStatusOf(rootStub);
 
 		const leftmost = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null);
 		expect(leftmost, "a leftmost child [−∞, B1) must exist").toBeDefined();
@@ -114,7 +92,7 @@ describe("PartitionDO — range split", () => {
 			const N = 2;
 			const { rootCtx, rootStub } = await makeQueuedRangeRoot(N);
 			await waitForSplitCompleted(rootStub);
-			const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+			const status = await splitStatusOf(rootStub);
 
 			// Every depth-1 child: rangeDepth=1, rangeAncestors=[] (matches the M1 table: depth 1 → []).
 			for (const childCtx of status.childPartitionContexts) {
@@ -146,7 +124,7 @@ describe("PartitionDO — range split", () => {
 				const keyPrefix = start === null ? "aa" : `${KeyCodec.decode(start) as string}~`;
 				await splitRangePartition(childStub, childCtx, keyPrefix);
 
-				const childSplit = (await childStub.status()).splitStatus as SplitStartedOrCompleted;
+				const childSplit = await splitStatusOf(childStub);
 				for (const grandchildCtx of childSplit.childPartitionContexts) {
 					const grandchildStub = PartitionDO.getByName(env.PARTITION_DO, grandchildCtx.doName);
 					expect((await grandchildStub.status()).depth).toBe(2);
@@ -166,7 +144,7 @@ describe("PartitionDO — range split", () => {
 			const N = 2;
 			const { rootCtx, rootStub } = await makeQueuedRangeRoot(N, { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 0 } });
 			await waitForSplitCompleted(rootStub);
-			const status = (await rootStub.status()).splitStatus as SplitStartedOrCompleted;
+			const status = await splitStatusOf(rootStub);
 
 			const leftChildCtx = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null)!;
 			const leftChildStub = PartitionDO.getByName(env.PARTITION_DO, leftChildCtx.doName);
@@ -218,32 +196,9 @@ describe("PartitionDO — range split", () => {
 			// range root migrates data → leaf acknowledges ("promoted").
 			const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(leafCtx, kb(hashKey), null, null);
 			const rangeRootStub = PartitionDO.getByName(env.PARTITION_DO, rangeRootCtx.doName);
-			await vi.waitFor(
-				async () => {
-					await waitForAlarm(leafStub);
-					const s = await leafStub.status();
-					if (
-						!["promoting", "promoted"].includes(
-							s.promotedKeys.find((e: { hashKey: KeyBytes; status: string }) => KeyCodec.compare(e.hashKey, kb(hashKey)) === 0)?.status ??
-								"",
-						)
-					)
-						throw new Error("not yet promoting");
-				},
-				{ timeout: 5000, interval: 100 },
-			);
-			await vi.waitFor(
-				async () => {
-					await waitForAlarm(rangeRootStub);
-					if (
-						(await leafStub.status()).promotedKeys.find(
-							(e: { hashKey: KeyBytes; status: string }) => KeyCodec.compare(e.hashKey, kb(hashKey)) === 0,
-						)?.status !== "promoted"
-					)
-						throw new Error("not yet promoted");
-				},
-				{ timeout: 5000, interval: 100 },
-			);
+			// Migration may complete in the same background cycle as cutover, so accept 'promoted' too.
+			await waitForPromotedKeyStatus(leafStub, hashKey, ["promoting", "promoted"]);
+			await waitForPromotedKeyStatus(leafStub, hashKey, ["promoted"], { drain: [rangeRootStub] });
 
 			// First getItem through root after promotion:
 			// Topology cache is warm → root goes directly to the leaf (1 hash hop).

@@ -9,7 +9,9 @@ import type { SplitStatusKVItem } from "../../src/shared/partition-topology/spli
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { MIGRATION_KV_KEYS, type PartitionSplitMigrationStatus } from "../../src/shared/partition/migration.js";
-import { kb, makeStub, waitForAlarm } from "./helpers.js";
+import { captureConsoleError, kb, makeStub, waitForAlarm } from "./helpers.js";
+
+const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 
 describe("PartitionDO — stale transaction recovery", () => {
 	afterEach(() => {
@@ -41,6 +43,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 		return store;
 	}
 
+	/**
+	 * Substitutes the coordinator stub with a fake that answers `not_found`.
+	 *
+	 * The substitution is at `TransactionCoordinatorDO.get`, not at the class prototype: `get` returns
+	 * an RPC stub whose target runs outside this isolate, so a prototype spy records nothing. It also
+	 * lets these tests store sentinel coordinator ids such as "missing-tc" in a lock row, which the
+	 * real `get` would reject as malformed. The partial fake is why the cast is here.
+	 */
 	function mockCoordinatorRecovery() {
 		const recoverTransaction = vi.fn(async () => ({ state: "not_found" as const }));
 		vi.spyOn(TransactionCoordinatorDO, "get").mockReturnValue({
@@ -119,7 +129,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const { ctx, stub } = makeStub();
 		await stub.status(ctx);
 		mockCoordinatorRecovery();
-		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
@@ -127,12 +137,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionId)).toBe(0);
 		});
-		expect(
-			consoleError.mock.calls.filter(([entry]) => {
-				const log = entry as { message?: string; transactionId?: string };
-				return log.message === "fokos/partition: lock-age guard: over-age lock with not_found" && log.transactionId === transactionId;
-			}),
-		).toHaveLength(0);
+		expect(consoleError.withMessage(LOCK_AGE_GUARD_LOG).filter((log) => log.transactionId === transactionId)).toHaveLength(0);
 	});
 
 	it("quarantines an over-age owned lock and logs the transition once", async () => {
@@ -141,7 +146,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const { ctx, stub } = makeStub();
 		await stub.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
-		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 		const coordinatorDoId = "missing-tc";
 		const hashKey = `guard-${transactionId}`;
@@ -159,12 +164,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 
 		expect(recoverTransaction).toHaveBeenCalledTimes(1);
-		const guardLogs = consoleError.mock.calls.filter(([entry]) => {
-			const log = entry as { message?: string; transactionId?: string };
-			return log.message === "fokos/partition: lock-age guard: over-age lock with not_found" && log.transactionId === transactionId;
-		});
+		const guardLogs = consoleError.withMessage(LOCK_AGE_GUARD_LOG).filter((log) => log.transactionId === transactionId);
 		expect(guardLogs).toHaveLength(1);
-		expect(guardLogs[0][0]).toMatchObject({
+		expect(guardLogs[0]).toMatchObject({
 			transactionId,
 			coordinatorDoId,
 			keys: [
@@ -192,7 +194,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		vi.spyOn(TransactionCoordinatorDO, "get").mockReturnValue({
 			recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
-		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
@@ -205,7 +207,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 
 		expect(recoverTransaction).toHaveBeenCalledTimes(1);
-		expect(consoleError).toHaveBeenCalledWith(
+		expect(consoleError.spy).toHaveBeenCalledWith(
 			expect.objectContaining({ message: "fokos/partition: failed to poke stale TC", transactionId }),
 		);
 	});
@@ -242,7 +244,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const { ctx, stub } = makeStub();
 		await stub.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
-		const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+		const consoleError = captureConsoleError();
 		const transactionIds = Array.from({ length: 11 }, () => crypto.randomUUID());
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
@@ -263,14 +265,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		expect(recoverTransaction).toHaveBeenCalledTimes(11);
 		expect(
-			consoleError.mock.calls.filter(([entry]) => {
-				const log = entry as { message?: string; transactionId?: string };
-				return (
-					log.message === "fokos/partition: lock-age guard: over-age lock with not_found" &&
-					log.transactionId !== undefined &&
-					transactionIds.includes(log.transactionId)
-				);
-			}),
+			consoleError
+				.withMessage(LOCK_AGE_GUARD_LOG)
+				.filter((log) => log.transactionId !== undefined && transactionIds.includes(log.transactionId)),
 		).toHaveLength(10);
 	});
 
