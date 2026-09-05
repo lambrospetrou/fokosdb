@@ -295,9 +295,12 @@ export async function growPastSplitThreshold(
 export const RANGE_SPLIT_MAX_SIZE_MB = 1;
 export const RANGE_ITEM_DATA = "x".repeat(50 * 1024); // ~50 KB/item → ~21 items cross the 1 MB threshold
 
-// Builds a range-structure leaf owning [−∞, +∞) (parent = a hash DO), migration-complete so it serves
-// locally, then writes distinct-sk items until a range split is queued. No retain-leftmost: on split it
-// becomes a pure router over N fresh children.
+// Builds a range structure for one hash key and populates it until a range split is queued.
+//
+// The range root is created by promoting the key, which is the only way one comes into existence:
+// `debugForcePromoteKey` queues the promotion and the background cycles run the real cutover,
+// migration and acknowledgement, so the root ends up in the same state a size-triggered promotion
+// would leave it in. On split it becomes a pure router over N fresh children — no retain-leftmost.
 export async function makeQueuedRangeRoot(
 	rangeSplitN: number,
 	overrides?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>,
@@ -318,20 +321,18 @@ export async function makeQueuedRangeRoot(
 		...overrides,
 	});
 	const hashParentCtx = new PartitionTopologyRouterImpl(base).pickPartition(kb("alice")).partitionContext;
+	const hashStub = PartitionDO.getByName(env.PARTITION_DO, hashParentCtx.doName);
 	const { partitionContext: rootCtx } = resolveRangePartitionContext(hashParentCtx, kb("alice"), null, null);
 	const rootStub = PartitionDO.getByName(env.PARTITION_DO, rootCtx.doName);
 
-	// Initialize as a ready leaf (migration complete → serves locally rather than 503).
-	await rootStub.internalInitFromSplit(
-		{
-			parentPartitionContext: hashParentCtx,
-			newPartitionContext: rootCtx,
-			newPartitionRangeDepth: 0,
-			splitType: "range",
-			rangeAncestors: [],
-		},
-		true, // __testing__completeMigration
-	);
+	// The root serves locally only once the promotion reaches "promoted"; before that it answers 503.
+	// The two waits are sequenced, and each drives only the partition that owns the next step: the hash
+	// DO performs the cutover, then the root runs its migration. Driving both at once starts a second
+	// migration pass that reaches the parent after it has already flipped the key to "promoted", which
+	// the parent rejects.
+	await hashStub.debugForcePromoteKey(hashParentCtx, kb("alice"));
+	await waitForPromotedKeyStatus(hashStub, "alice", ["promoting", "promoted"]);
+	await waitForPromotedKeyStatus(hashStub, "alice", ["promoted"], { drain: [rootStub] });
 
 	const sks: string[] = [];
 	for (let i = 0; i < 100; i++) {

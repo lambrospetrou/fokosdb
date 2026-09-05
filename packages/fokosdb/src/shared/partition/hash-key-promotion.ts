@@ -78,7 +78,22 @@ export class PromotionManager {
 	async maybeQueuePromotion(pCtx: PartitionContextLivePartition, hk: KeyBytes, newKeyEst: number): Promise<void> {
 		if (!isHashPartition(pCtx)) return;
 		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
-		if (threshold <= 0 || newKeyEst < threshold || this.hasStatus(hk)) return;
+		if (threshold <= 0 || newKeyEst < threshold) return;
+		await this.queuePromotion(pCtx, hk, newKeyEst);
+	}
+
+	/**
+	 * Queues `hk` for promotion to its own range structure, whatever its current size.
+	 *
+	 * `maybeQueuePromotion` reaches here once a key grows past the threshold on its own. Calling it
+	 * directly promotes a key the size heuristic has not caught yet — a known hot key an operator
+	 * wants moved now, before it grows. The work itself is identical either way: the next background
+	 * cycle runs the same `startPromotion` cutover.
+	 *
+	 * Returns false when the key already has a promotion entry, which makes repeated calls harmless.
+	 */
+	async queuePromotion(pCtx: PartitionContextLivePartition, hk: KeyBytes, newKeyEst?: number): Promise<boolean> {
+		if (!isHashPartition(pCtx) || this.hasStatus(hk)) return false;
 		const { inserted } = this.deps.store.insertPromotedKey(hk, "queued", Date.now());
 		await this.deps.scheduleWork({ delayMs: 10 });
 		console.log({
@@ -88,6 +103,7 @@ export class PromotionManager {
 			newKeyEst,
 			inserted,
 		});
+		return inserted;
 	}
 
 	async acknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {

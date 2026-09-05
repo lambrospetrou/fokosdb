@@ -181,6 +181,14 @@ export type PartitionDOStub = {
 		ctx: PartitionContextResolved,
 		request: DebugForceResolveTransactionRequest,
 	): Promise<DebugForceResolveTransactionResponse>;
+	debugForcePromoteKey(ctx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse>;
+};
+
+export type DebugForcePromoteKeyResponse = {
+	/** False when the key already had a promotion entry, so this call changed nothing. */
+	queued: boolean;
+	/** The key's promotion status after the call. */
+	status: PromotedKeyStatus | undefined;
 };
 
 // Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
@@ -311,22 +319,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 *
 	 * This is not meant to be called directly by clients.
 	 */
-	async internalInitFromSplit(
-		opts: InitFromSplitOptions,
-		__testing__completeMigration?: boolean,
-		__testing__splitStatus?: SplitStatusKVItem,
-	): Promise<void> {
-		return await this.#rpc(
-			"internalInitFromSplit",
-			async () => await this.#internalInitFromSplit(opts, __testing__completeMigration, __testing__splitStatus),
-		);
+	async internalInitFromSplit(opts: InitFromSplitOptions): Promise<void> {
+		return await this.#rpc("internalInitFromSplit", async () => await this.#internalInitFromSplit(opts));
 	}
 
-	async #internalInitFromSplit(
-		opts: InitFromSplitOptions,
-		__testing__completeMigration?: boolean,
-		__testing__splitStatus?: SplitStatusKVItem,
-	): Promise<void> {
+	async #internalInitFromSplit(opts: InitFromSplitOptions): Promise<void> {
 		const { parentPartitionContext, newPartitionContext, newPartitionRangeDepth, splitType } = opts;
 
 		if (this.#_partitionContext) {
@@ -380,14 +377,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 			// Fast path: begin migration in this request's event loop turn.
 			// this.scheduleBackgroundWork(0);
-
-			// FIXME Remove this shit and test properly through the public API.
-			if (__testing__completeMigration) {
-				this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-			}
-			if (__testing__splitStatus) {
-				this.ctx.storage.kv.put<SplitStatusKVItem>("__split_status", __testing__splitStatus);
-			}
 		});
 	}
 
@@ -1473,6 +1462,26 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					: await this.txCancel(pCtx, { transactionId: request.transactionId, items });
 			this.#store.clearPendingTxGuard(request.transactionId);
 			return response;
+		});
+	}
+
+	/**
+	 * Promotes `hashKey` to its own range structure now, instead of waiting for the key to grow past
+	 * `hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION`.
+	 *
+	 * This is the deterministic entry point to a flow that is otherwise driven by a size heuristic: an
+	 * operator can move a known hot key ahead of its growth. It only queues the work — the same
+	 * background cycle performs the cutover, the range root migration and the acknowledgement, so the
+	 * key reaches "promoted" through exactly the path a size-triggered promotion takes.
+	 *
+	 * Idempotent: a key that already has a promotion entry comes back with `queued: false`.
+	 */
+	async debugForcePromoteKey(pCtx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse> {
+		return await this.#rpc("debugForcePromoteKey", async () => {
+			this.ensurePartitionContext(pCtx);
+			await this.ensureMigration("debugForcePromoteKey");
+			const queued = await this.#promotion.queuePromotion(this.pCtx(), hashKey);
+			return { queued, status: this.#promotion.statusFor(hashKey) };
 		});
 	}
 
