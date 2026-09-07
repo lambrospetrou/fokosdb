@@ -379,6 +379,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	//////////////////////////////
 
 	/**
+	 * How long a prepared transaction may sit on this partition before the stale sweep asks its
+	 * coordinator to resolve it, and how far ahead the sweep's alarm is set. Read at each use, so a
+	 * subclass can vary it.
+	 */
+	fokosStaleTransactionMs(): number {
+		return PartitionDO.STALE_TX_MS;
+	}
+
+	/**
 	 * Overrideable method to get the location info.
 	 */
 	async fokosGetColoInfo(): Promise<ColoInfo> {
@@ -1340,7 +1349,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const response = this.#participant.prepareLocal(request);
 
 		if (response.outcome === "accepted") {
-			await this.ensureAlarmSet(Date.now() + PartitionDO.STALE_TX_MS);
+			await this.ensureAlarmSet(Date.now() + this.fokosStaleTransactionMs());
 		}
 
 		return response;
@@ -2073,7 +2082,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// ── Job: Stale transaction recovery
 			try {
 				if (this.txPendingCanSweep()) {
-					const staleTxRows = this.#participant.listStaleTransactions(PartitionDO.STALE_TX_MS, 10);
+					const staleTxRows = this.#participant.listStaleTransactions(this.fokosStaleTransactionMs(), 10);
 					for (const row of staleTxRows) {
 						if (!row.coordinator_do_id) continue;
 						try {
@@ -2193,7 +2202,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 				// Job: Stale transaction recovery.
 				if (this.txPendingCanSweep() && this.#store.hasAnyUnguardedPendingTx()) {
-					wantAlarm(Date.now() + PartitionDO.STALE_TX_MS);
+					wantAlarm(Date.now() + this.fokosStaleTransactionMs());
 				}
 			});
 

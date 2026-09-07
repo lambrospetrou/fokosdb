@@ -74,13 +74,15 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 const STALE_THRESHOLD_MS = 5_000;
 
 /**
- * Wall-clock budget for the commit fan-out when a request waits on it. Past this deadline the
- * coordinator stops dispatching participant RPCs, leaves the unconfirmed participant with the
- * transaction in COMMITTING, and the caller receives the commit-pending error; the alarm then
- * finishes the fan-out with the full retry budget, because nothing waits on it. Without the
- * budget, one unreachable participant would hold the request, and the shard, for tens of seconds.
+ * Wall-clock budget for a participant fan-out that a request waits on, commit and cancel alike.
+ * Past this deadline the coordinator stops dispatching participant RPCs and leaves the unconfirmed
+ * participant behind: a commit leaves the transaction in COMMITTING and the caller receives the
+ * commit-pending error, a cancel leaves it in CANCELLING and the caller receives the cancelled
+ * outcome it is already entitled to. The alarm then finishes the fan-out with the full retry
+ * budget, because nothing waits on it. Without the budget, one unreachable participant would hold
+ * the request, and the shard, for tens of seconds.
  */
-export const COMMIT_FANOUT_REQUEST_BUDGET_MS = 5_000;
+export const TX_FANOUT_REQUEST_BUDGET_MS = 5_000;
 
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
@@ -159,6 +161,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		});
 	}
 
+	//////////////////////////////
+	// User overridable methods.
+	//////////////////////////////
+
+	/**
+	 * The wall-clock budget a request-driven fan-out gets, read at each use so a subclass can vary
+	 * it. See TX_FANOUT_REQUEST_BUDGET_MS for what the deadline means for the caller.
+	 */
+	fokosFanoutRequestBudgetMs(): number {
+		return TX_FANOUT_REQUEST_BUDGET_MS;
+	}
+
+	//////////////////////////////
+	// Transaction methods.
+	//////////////////////////////
+
 	private async ensureAlarmAt(targetMs: number): Promise<void> {
 		const existing = await this.ctx.storage.getAlarm();
 		if (existing === null || targetMs < existing) await this.ctx.storage.setAlarm(targetMs);
@@ -236,7 +254,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		await this.ensureAlarmAt(Date.now() + STALE_THRESHOLD_MS);
 
-		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, COMMIT_FANOUT_REQUEST_BUDGET_MS);
+		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs());
 	}
 
 	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
@@ -247,21 +265,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			case "CANCELLED":
 				return this.loadFinalResponse(transactionId, idempotencyToken, existingRow);
 			case "PREPARING": {
-				await this.runPrepareRecovery(transactionId, idempotencyToken, COMMIT_FANOUT_REQUEST_BUDGET_MS);
+				await this.runPrepareRecovery(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "PREPARED":
 			case "COMMITTING": {
-				await this.runCommit(transactionId, idempotencyToken, COMMIT_FANOUT_REQUEST_BUDGET_MS);
+				await this.runCommit(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "CANCELLING": {
-				await this.runCancel(transactionId, idempotencyToken);
+				await this.runCancel(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "CREATED": {
 				const coordinatorDoId = this.ctx.id.toString();
-				return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, COMMIT_FANOUT_REQUEST_BUDGET_MS);
+				return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs());
 			}
 		}
 	}
@@ -353,7 +371,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		transactionId: string,
 		idempotencyToken: string,
 		coordinatorDoId: string,
-		commitRequestBudgetMs?: number,
+		requestBudgetMs?: number,
 	): Promise<InitiateWriteResponse> {
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_state SET state = 'PREPARING' WHERE idempotency_token = ? AND state = 'CREATED'`,
@@ -413,7 +431,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				);
 				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 			});
-			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs).catch((e) =>
+			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e) =>
 				console.error({
 					message: "fokos/tc: background commit failed",
 					transactionId,
@@ -432,13 +450,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			);
 			if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 		});
-		await this.runCancel(transactionId, idempotencyToken);
+		await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		return this.loadFinalResponse(transactionId, idempotencyToken);
 	}
 
 	/**
 	 * `requestBudgetMs` bounds the fan-out when a request waits on it (see
-	 * COMMIT_FANOUT_REQUEST_BUDGET_MS). Undefined — the alarm and the recovery paths — means no
+	 * TX_FANOUT_REQUEST_BUDGET_MS). Undefined — the alarm and the recovery paths — means no
 	 * deadline, so those keep the full retry budget.
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
@@ -500,11 +518,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async runCancel(transactionId: string, idempotencyToken: string): Promise<void> {
+	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
+	private async runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
 		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
+		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + requestBudgetMs;
 
 		// Cancel any participant not yet committed and not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
@@ -523,6 +543,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				await tryWhile(
 					async () => {
+						// Past the request budget, stop dispatching: this participant stays unconfirmed,
+						// the transaction stays in CANCELLING, and the alarm finishes the fan-out. The
+						// caller still receives the cancelled outcome, which applied nothing anywhere.
+						if (Date.now() > deadlineMs) return;
 						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCancel(pCtx, {
 							transactionId,
 							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
@@ -556,7 +580,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 	}
 
-	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<void> {
+	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
 		const stateRow = this.loadStateRow(idempotencyToken);
 		if (!stateRow) return;
 
@@ -619,7 +643,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				);
 				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 			});
-			await this.runCommit(transactionId, idempotencyToken, commitRequestBudgetMs);
+			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
 		} else if (anyRejected) {
 			const reasonJson = firstNewRejectionReason ? stringifyReason(firstNewRejectionReason) : stringifyReason({ type: "transient_error" });
 			this.ctx.storage.transactionSync(() => {
@@ -631,7 +655,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				);
 				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 			});
-			await this.runCancel(transactionId, idempotencyToken);
+			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		}
 		// If some participants still NULL, leave in PREPARING; alarm will retry
 	}
