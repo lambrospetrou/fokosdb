@@ -1,5 +1,5 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
@@ -9,7 +9,7 @@ import type { SplitStatusKVItem } from "../../src/shared/partition-topology/spli
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { MIGRATION_KV_KEYS, type PartitionSplitMigrationStatus } from "../../src/shared/partition/migration.js";
-import { captureConsoleError, kb, makeStub, waitForAlarm } from "./helpers.js";
+import { captureConsoleError, kb, makeStub } from "./helpers.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 
@@ -320,6 +320,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				"0000000000000000",
 			);
 		});
+		const getCoordinatorById = vi.spyOn(TransactionCoordinatorDO, "get");
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
 			store.insertPendingLock({
@@ -339,12 +340,13 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await state.storage.setAlarm(Date.now());
 		});
 
-		const getCoordinatorById = vi.spyOn(TransactionCoordinatorDO, "get");
-		await waitForAlarm(stub);
-		expect(getCoordinatorById).toHaveBeenCalledWith(env.TRANSACTION_COORDINATOR_DO, tcId.toString());
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
-			found: true,
-			item: { data: "value", ttlAt },
+		await runDurableObjectAlarm(stub);
+		await vi.waitFor(async () => {
+			expect(getCoordinatorById).toHaveBeenCalledWith(env.TRANSACTION_COORDINATOR_DO, tcId.toString());
+			expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
+				found: true,
+				item: { data: "value", ttlAt },
+			});
 		});
 	});
 });

@@ -1,10 +1,10 @@
 import { env } from "cloudflare:workers";
+import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { PartitionContextCreator } from "../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/router.js";
 import { PartitionDO } from "../src/server/do-partition.js";
-import { waitForAlarm } from "./partition-do/helpers.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.1 = 102 400 bytes; 2 × 50 KB items per partition → split triggers.
@@ -55,9 +55,9 @@ describe.skip("FokosDB.destroy()", () => {
 			allKeys.push(hk);
 		}
 
-		// Drain the split alarm on every partition.
+		// Run the scheduled split alarm on every partition.
 		for (const doName of doNamesSet) {
-			await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
+			await runDurableObjectAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
 		}
 
 		// Destroy twice: the second call must be a no-op on an already-destroyed database.

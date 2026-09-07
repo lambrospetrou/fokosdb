@@ -1,20 +1,18 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
-import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { HashPartitionTopologyImpl } from "../../src/shared/partition-topology/split-policy.js";
 import invariant from "../../src/shared/invariant.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { drainSplitTree, kb, makeStub, triggerHashSplitThreshold } from "./helpers.js";
+import { kb, makeStub } from "./helpers.js";
+import { makePartition } from "./partition-harness.js";
 
 describe("PartitionDO - partitionId encoding", () => {
 	it("encodes root and child partition IDs with correct byte layout and text doNames", ({ expect }) => {
 		// makeStub uses rootTreesN=1, so pickPartition always lands on rootIdx=0.
 		const { ctx } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
 
 		// Root: [version=0, rootIdx=0 (2 bytes big-endian), depth=0]
 		expect(Uint8Array.fromHex(ctx.partitionId)).toEqual(new Uint8Array([0, 0, 0, 0]));
@@ -70,32 +68,20 @@ describe("PartitionDO - partitionId encoding", () => {
 	});
 
 	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
-		const { ctx: pCtx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		let topology: HashPartitionTopologyImpl;
-		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage));
-		});
-		invariant(topology!, "topology should be initialized in the DO instance");
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
-		await stub.apiPutItem(pCtx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
-		const rootState = await stub.status();
+		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
+		const rootState = await partition.status();
 		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(pCtx.partitionId));
+		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(partition.ctx.partitionId));
 
-		// Trigger a split so children are initialized with their own cached bytes. Draining the whole
-		// tree, rather than only the parent's alarm, leaves no child still migrating when this file
+		// Split so children are initialized with their own cached bytes. splitHash drains the whole
+		// tree, rather than only the parent's alarm, so no child is still migrating when this file
 		// ends: background migration work that outlives the test worker breaks its teardown.
-		await triggerHashSplitThreshold(stub, pCtx, 1);
-		await drainSplitTree(stub);
-
-		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			const children = topology.childPartitionContexts();
-			for (const child of children!) {
-				const childStub = PartitionDO.getByName(env.PARTITION_DO, child.doName);
-				const childState = await childStub.status();
-				expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-				expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.partitionId));
-			}
-		});
+		for (const child of await partition.splitHash()) {
+			const childState = await child.status();
+			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
+			expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.ctx.partitionId));
+		}
 	});
 });

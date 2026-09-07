@@ -1,24 +1,18 @@
 import { env } from "cloudflare:workers";
-import { runInDurableObject } from "cloudflare:test";
-import { describe, it, vi } from "vitest";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
+import { describe, it } from "vitest";
 import { InitFromSplitOptions, PartitionDO } from "../../src/server/do-partition.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
-import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
-import { HashPartitionTopologyImpl, RANGE_PROMOTION_FRACTION } from "../../src/shared/partition-topology/split-policy.js";
-import invariant from "../../src/shared/invariant.js";
-import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
 import {
 	assertSplitTreeComplete,
-	compiledCondition,
-	drainSplitTree,
-	expectSplitStatus,
-	kb,
-	makeStub,
-	splitStatusOf,
-	triggerHashSplitThreshold,
-	waitForAlarm,
-} from "./helpers.js";
+	drainUntil,
+	makePartition,
+	TestPartition,
+	withMigrationBatchCap,
+	withMigrationHeld,
+} from "./partition-harness.js";
 
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
@@ -31,55 +25,39 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("sets split_pending status when data exceeds maxSizeMb", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-		await triggerHashSplitThreshold(stub, ctx, 1);
+		await partition.triggerHashSplit();
 
-		const { splitStatus } = await stub.status();
+		const { splitStatus } = await partition.status();
 		expect(splitStatus).toBeDefined();
 		// By the time of the assertion the split could be in any of these states.
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 	});
 
-	it("preserves split_queued status across subsequent writes before the alarm fires", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-
-		// All writes run inside the DO's execution context so the background alarm
-		// cannot fire between them, letting us assert the pre-alarm queued state.
-		await runInDurableObject(stub, async (instance: PartitionDO) => {
-			// Spread data across multiple keys so no single key hits the promotion threshold.
-			// Stop as soon as the split is queued to stay below the 10% reject band.
-			const chunkBytes = Math.floor(RANGE_PROMOTION_FRACTION * 1 * 1024 * 1024 * 0.65);
-			const tData = "x".repeat(chunkBytes);
-			for (let i = 0; ; i++) {
-				try {
-					await instance.apiPutItem(ctx, { hashKey: kb(`split-trig-${i}`), sortKey: kb("sk"), data: tData, kind: "text" as const });
-				} catch (e) {
-					if (!String(e).includes("partition exceeded")) throw e;
-					break;
-				}
-				const { splitStatus: s } = await instance.status();
-				if (s?.status === "split_queued") break;
-			}
-
-			const { splitStatus: after1 } = await instance.status();
-			expect(after1?.status).toBe("split_queued");
-
-			await instance.apiPutItem(ctx, { hashKey: kb("extra"), sortKey: kb("sk2"), data: "small", kind: "text" as const });
-
-			const { splitStatus: after2 } = await instance.status();
-			expect(after2?.status).toBe("split_queued");
-		});
+	it("preserves split_queued status across subsequent writes before the alarm runs", async ({ expect }) => {
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		try {
+			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+				await partition.triggerHashSplit(instance);
+				expect((await instance.status()).splitStatus?.status).toBe("split_queued");
+				await instance.apiPutItem(partition.ctx, { hashKey: kb("extra"), sortKey: kb("sk2"), data: "small", kind: "text" });
+				expect((await instance.status()).splitStatus?.status).toBe("split_queued");
+			});
+		} finally {
+			await partition.awaitSplitCompleted();
+		}
 	});
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const topologyRouter = new PartitionTopologyRouterImpl(ctx);
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const { ctx, stub } = partition;
 
-		await triggerHashSplitThreshold(stub, ctx, 1);
-		await waitForAlarm(stub);
+		await partition.triggerHashSplit();
+		await partition.runAlarm();
+		await partition.awaitSplitStarted();
 
-		const parentState = await stub.status();
+		const parentState = await partition.status();
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({
 			ns: "PARTITION_DO",
@@ -225,11 +203,11 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	it("exposes split status via status()", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 
-		await triggerHashSplitThreshold(stub, ctx, 1);
+		await partition.triggerHashSplit();
 
-		const { splitStatus } = await stub.status();
+		const { splitStatus } = await partition.status();
 		expect(splitStatus).toBeDefined();
 		// Background work may advance split past split_queued before status() is called.
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
@@ -252,7 +230,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		// The alarm must complete without throwing, and leave the partition unchanged.
-		await expect(waitForAlarm(stub)).resolves.not.toThrow();
+		await expect(runDurableObjectAlarm(stub)).resolves.not.toThrow();
 
 		const { splitStatus: after } = await stub.status();
 		expect(after).toBeUndefined();
@@ -262,11 +240,11 @@ describe("PartitionDO - splitting", () => {
 		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,
 		}) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			// Trigger the split condition and drain the tree so all migrations complete.
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
+			await partition.splitHash();
 
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
@@ -290,10 +268,10 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
+			await partition.splitHash();
 
 			const result = await stub.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
@@ -308,7 +286,8 @@ describe("PartitionDO - splitting", () => {
 			const ITEM_SIZE_BYTES = 4 * 1024;
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.1 } });
+			const { ctx, stub } = partition;
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
 
@@ -327,16 +306,16 @@ describe("PartitionDO - splitting", () => {
 						break;
 					} catch (e: unknown) {
 						expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
-						await drainSplitTree(stub);
+						await partition.awaitTreeSettled();
 					}
 				}
 				expect(written, `write did not land for ${hashKey}`).toBe(true);
-				await drainSplitTree(stub);
+				await partition.awaitTreeSettled();
 				// console.log("BOOM 1 - end", { item: hashKey });
 			}
 
 			// Flush any in-flight splits triggered by the last few writes.
-			await drainSplitTree(stub);
+			await partition.awaitTreeSettled();
 
 			// console.log("BOOM 2");
 
@@ -367,7 +346,7 @@ describe("PartitionDO - splitting", () => {
 			// Even with hash skew, at least 3 distinct instances must serve reads.
 			expect(servedByActorNames.size, "many distinct partition instances should have served requests").toBeGreaterThan(3);
 
-			const totalSplitNodes = await assertSplitTreeComplete(stub);
+			const totalSplitNodes = await assertSplitTreeComplete(partition);
 			expect(totalSplitNodes, "multiple levels of splits should have occurred").toBeGreaterThan(2);
 		});
 	}, 30_000);
@@ -377,16 +356,11 @@ describe("PartitionDO - splitting", () => {
 		const hashKey = "probe-key";
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			let topology: HashPartitionTopologyImpl;
-			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
-			});
-			invariant(topology!, "topology should be initialized in the DO instance");
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			// Root splits into two children.
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
+			await partition.splitHash();
 
 			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
 			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
@@ -394,10 +368,7 @@ describe("PartitionDO - splitting", () => {
 			expect(r1.meta.forwardCount).toBe(1);
 
 			// Split the child that owns hashKey.
-			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, kb(hashKey));
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-			await triggerHashSplitThreshold(childStub, childCtx, 1);
-			await drainSplitTree(childStub);
+			await (await partition.childOwning(hashKey)).splitHash();
 
 			// root → child → grandchild: hashDepth=2. Cache is cold so forwardCount=2 (two RPC hops).
 			const r2 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
@@ -406,19 +377,11 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			let topology: HashPartitionTopologyImpl;
-			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
-			});
-			invariant(topology!, "topology should be initialized in the DO instance");
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
-			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, kb(hashKey));
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-			await triggerHashSplitThreshold(childStub, childCtx, 1);
-			await drainSplitTree(childStub);
+			await partition.splitHash();
+			await (await partition.childOwning(hashKey)).splitHash();
 
 			// First request: cold cache — root→child→grandchild (two hops). Root learns depth=2.
 			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
@@ -432,30 +395,19 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			let topology: HashPartitionTopologyImpl;
-			await runInDurableObject(stub, async (instance: PartitionDO, doCtx: DurableObjectState) => {
-				topology = new HashPartitionTopologyImpl(ctx, doCtx, new PartitionStore(doCtx.storage));
-			});
-			invariant(topology!, "topology should be initialized in the DO instance");
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			// Build a two-level tree: root → child → grandchild.
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
-			const { partitionContext: childCtx } = topology.pickChildPartition(ctx, kb(hashKey));
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-			await triggerHashSplitThreshold(childStub, childCtx, 1);
-			await drainSplitTree(childStub);
+			await partition.splitHash();
+			await (await partition.childOwning(hashKey)).splitHash();
 
 			// Warm root's cache to depth=2 with one request (root→child→grandchild).
 			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r1.meta.hashDepth).toBe(2);
 
 			// Now split the grandchild, making it a router for great-grandchildren.
-			const { partitionContext: grandchildCtx } = topology.pickDescendantHashPartition(ctx, kb(hashKey), 2);
-			const grandchildStub = PartitionDO.getByName(env.PARTITION_DO, grandchildCtx.doName);
-			await triggerHashSplitThreshold(grandchildStub, grandchildCtx, 1);
-			await drainSplitTree(grandchildStub);
+			await (await partition.leafOwning(hashKey)).splitHash();
 
 			// Stale-cache request: root targets grandchild (cached depth=2) but it is now a router.
 			// Grandchild forwards one more level → root receives hashDepth=1, updates cache to depth=3,
@@ -472,8 +424,9 @@ describe("PartitionDO - splitting", () => {
 	}, 30_000);
 
 	describe("migration", () => {
-		it("reads during migration are served from the parent; writes are rejected; all data migrated correctly", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
+		it("migrates each item to exactly one child and preserves reads through the parent", async ({ expect }) => {
+			const partition = makePartition({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
@@ -489,25 +442,28 @@ describe("PartitionDO - splitting", () => {
 			}
 
 			// Trigger the split condition.
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await waitForAlarm(stub);
+			await partition.triggerHashSplit();
+			await partition.runAlarm();
+			await partition.awaitSplitStarted();
 
 			const parentState = await stub.status();
-			expect(parentState.splitStatus?.status).toBe("split_started");
+			expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
 
-			// Run each child's migration alarm.
+			// Run each child's migration to completion.
 			// startSplit fire-and-forget already triggered migration on each child, so their alarms
-			// may already be running or complete by the time we reach here. waitForAlarm handles both.
+			// may already be running or complete by the time we reach here. awaitMigrationCompleted
+			// handles both.
 			for (const childCtx of childContexts) {
 				const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-				await waitForAlarm(childStub);
+				await TestPartition.at(childCtx).awaitMigrationCompleted();
 				const state = await childStub.status();
 				expect(state.migrationStatus).toBe("migration_completed");
 			}
 
 			// Parent acknowledges all children and transitions to split_completed.
+			await partition.awaitSplitCompleted();
 			const finalParent = await stub.status();
 			expect(finalParent.splitStatus?.status).toBe("split_completed");
 			const finalSplit = expectSplitStatus(finalParent.splitStatus);
@@ -547,107 +503,75 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("arms TTL deletion after child migration completes", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			await stub.apiPutItem(ctx, { hashKey: kb("ttl-migration"), sortKey: kb("sk"), data: "value", kind: "text" });
-			await triggerHashSplitThreshold(stub, ctx, 1);
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			await partition.put({ hashKey: kb("ttl-migration"), sortKey: kb("sk"), data: "value", kind: "text" });
 
-			let releaseMigration!: () => void;
-			const migrationGate = new Promise<void>((resolve) => {
-				releaseMigration = resolve;
+			let children: TestPartition[] = [];
+			const countExpired = async () => {
+				let count = 0;
+				for (const child of children) {
+					count += await runInDurableObject(
+						child.stub,
+						(_instance: PartitionDO, state: DurableObjectState) =>
+							state.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL").one().n,
+					);
+				}
+				return count;
+			};
+			await withMigrationHeld(partition, async (waitForAllChildRequests) => {
+				await partition.triggerHashSplit();
+				await partition.awaitSplitStarted();
+				await waitForAllChildRequests();
+				children = await partition.children();
+				for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
+
+				// Simulate the item expiring mid-migration: the sweep must not run while a child is
+				// still migrating, so the expired row is still there until the hold releases.
+				for (const child of children) {
+					await runInDurableObject(child.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+						state.storage.sql.exec("UPDATE items SET ttl_epoch_utc_seconds = 1 WHERE hk = ?", kb("ttl-migration")),
+					);
+				}
+				expect(await countExpired()).toBe(1);
 			});
-			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
-				await runInDurableObject(
-					PartitionDO.getByName(env.PARTITION_DO, doName),
-					async (instance: PartitionDO, state: DurableObjectState) => {
-						instance.__testing__beforeMigrationComplete = async () => {
-							state.storage.sql.exec(`UPDATE items SET ttl_epoch_utc_seconds = 1`);
-							await migrationGate;
-						};
-					},
-				);
-			}
-
-			await waitForAlarm(stub);
-			const childContexts = (await splitStatusOf(stub)).childPartitionContexts;
-			await scheduler.wait(600);
-			let expiredBeforeCompletion = 0;
-			for (const childCtx of childContexts) {
-				await runInDurableObject(
-					PartitionDO.getByName(env.PARTITION_DO, childCtx.doName),
-					async (_instance: PartitionDO, state: DurableObjectState) => {
-						expiredBeforeCompletion += state.storage.sql
-							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL`)
-							.toArray()[0].n;
-					},
-				);
-			}
-			expect(expiredBeforeCompletion).toBeGreaterThan(0);
-			releaseMigration();
-			for (const childCtx of childContexts) {
-				await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, childCtx.doName));
-			}
-			await vi.waitFor(
-				async () => {
-					let expiredRows = 0;
-					for (const childCtx of childContexts) {
-						const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-						await runInDurableObject(childStub, async (_instance: PartitionDO, state: DurableObjectState) => {
-							expiredRows += state.storage.sql
-								.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE ttl_epoch_utc_seconds IS NOT NULL`)
-								.toArray()[0].n;
-						});
-					}
-					expect(expiredRows).toBe(0);
-				},
-				{ timeout: 5000, interval: 100 },
-			);
+			await drainUntil(children, async () => (await countExpired()) === 0, "TTL sweep after migration", 10_000);
 		}, 15_000);
 
 		it("putItem is rejected while migration is in progress", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			await partition.put({ hashKey: kb("key1"), sortKey: kb("sk"), data: "value1", kind: "text" });
 
-			await stub.apiPutItem(ctx, { hashKey: kb("key1"), sortKey: kb("sk"), data: "value1", kind: "text" as const });
-			await triggerHashSplitThreshold(stub, ctx, 1);
+			// Install the RPC delay before the write that triggers the split.
+			// Each child must read transaction metadata from the parent before it completes.
+			// Holding that response keeps the production migration pending while requests run.
+			// The original RPC executes after release, without changing its result.
+			await withMigrationHeld(partition, async (waitForAllChildRequests) => {
+				await partition.triggerHashSplit();
+				await partition.awaitSplitStarted();
+				await waitForAllChildRequests();
+				const child = await partition.childOwning("key1");
+				expect((await child.status()).migrationStatus).toBe("migration_migrating");
 
-			// Pre-install the gate on all child partitions before the parent alarm fires.
-			// The child DO names are deterministic, and miniflare keeps the same instance when
-			// initFromSplit + triggerMigration are called during the parent alarm — so the hook
-			// is already in place when runMigration runs, blocking it before migration_completed.
-			let releaseMigration!: () => void;
-			const migrationGate = new Promise<void>((resolve) => {
-				releaseMigration = resolve;
-			});
-			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
-				await runInDurableObject(PartitionDO.getByName(env.PARTITION_DO, doName), async (instance: PartitionDO) => {
-					instance.__testing__beforeMigrationComplete = () => migrationGate;
+				// Call putItem directly on the instance (not via RPC stub) so the error stays local.
+				// Going through the stub would cause workerd to log the remote throw as an uncaught
+				// exception, which Vitest surfaces as an unhandled rejection even though we catch it.
+				await runInDurableObject(child.stub, async (instance: PartitionDO) => {
+					await expect(
+						instance.apiPutItem(child.ctx, {
+							hashKey: kb("key1"),
+							sortKey: kb("sk"),
+							data: "new-value",
+							kind: "text",
+						}),
+					).rejects.toThrow("split in progress");
 				});
-			}
-
-			await waitForAlarm(stub);
-
-			const parentState = await stub.status();
-			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
-			const childCtx = childContexts[0];
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-
-			// Call putItem directly on the instance (not via RPC stub) so the error stays local.
-			// Going through the stub would cause workerd to log the remote throw as an uncaught
-			// exception, which Vitest surfaces as an unhandled rejection even though we catch it.
-			await expect(
-				runInDurableObject(childStub, (instance: PartitionDO) =>
-					instance.apiPutItem(childCtx, { hashKey: kb("key1"), sortKey: kb("sk"), data: "new-value", kind: "text" as const }),
-				),
-			).rejects.toThrow("split in progress");
-
-			releaseMigration();
-			for (const { doName } of childContexts) {
-				await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
-			}
-			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
+			});
+			expect((await (await partition.childOwning("key1")).status()).migrationStatus).toBe("migration_completed");
 		});
 
 		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			const seedItems = [
 				{ hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-1", kind: "text" as const },
@@ -656,48 +580,30 @@ describe("PartitionDO - splitting", () => {
 			for (const item of seedItems) {
 				await stub.apiPutItem(ctx, item);
 			}
-			await triggerHashSplitThreshold(stub, ctx, 1);
 
-			// Pre-install gate on all children before the parent alarm fires.
-			let releaseMigration!: () => void;
-			const migrationGate = new Promise<void>((resolve) => {
-				releaseMigration = resolve;
+			// Install the migration RPC delay before triggering the split.
+			await withMigrationHeld(partition, async (waitForAllChildRequests) => {
+				await partition.triggerHashSplit();
+				await partition.awaitSplitStarted();
+				await waitForAllChildRequests();
+				const child = (await partition.children())[0];
+
+				// Child migration is blocked at the gate — verify it is still migrating.
+				expect((await child.status()).migrationStatus).toBe("migration_migrating");
+
+				// While migration is in progress, getItem on the child must read through to the parent
+				// so callers can read data that has not yet been copied to the child.
+				for (const item of seedItems) {
+					const result = await child.get(item);
+					expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { servedByActorName: partition.doName } });
+				}
 			});
-			for (const { doName } of PartitionIdHelper.calculateHashChildPartitionIds(ctx)) {
-				await runInDurableObject(PartitionDO.getByName(env.PARTITION_DO, doName), async (instance: PartitionDO) => {
-					instance.__testing__beforeMigrationComplete = () => migrationGate;
-				});
-			}
-
-			await waitForAlarm(stub);
-
-			const parentState = await stub.status();
-			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
-			const childCtx = childContexts[0];
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-
-			// Child migration is blocked at the gate — verify it is still migrating.
-			expect((await childStub.status()).migrationStatus).toBe("migration_migrating");
-
-			// While migration is in progress, getItem on the child must read through to the parent
-			// so callers can read data that has not yet been copied to the child.
-			for (const item of seedItems) {
-				const result = await childStub.apiGetItem(childCtx, {
-					hashKey: item.hashKey,
-					sortKey: item.sortKey,
-				});
-				expect(result).toMatchObject({ found: true, item: { data: item.data } });
-			}
-
-			releaseMigration();
-			for (const { doName } of childContexts) {
-				await waitForAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
-			}
-			expect((await childStub.status()).migrationStatus).toBe("migration_completed");
+			await assertSplitTreeComplete(partition);
 		});
 
 		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
 
 			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
 			const seedItems = [
@@ -711,27 +617,12 @@ describe("PartitionDO - splitting", () => {
 				await stub.apiPutItem(ctx, item);
 			}
 
-			// Force 1-item batches on the parent so every item requires its own cursor-paginated round trip.
-			// estimateItemBytes always returns >> 1 byte, so the batch fills after the first item each time.
-			// This must be set before the parent alarm fires so children use the small limit when they
-			// call getItemsBatch during their migration (triggered via fire-and-forget from startSplit).
-			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				instance.__testing__migrationBatchLimitBytes = 1;
+			// One row per batch response forces a cursor-paginated round trip per item on every
+			// migration stream (items, pending transactions, promoted keys).
+			await withMigrationBatchCap(partition, 1, async ({ truncated }) => {
+				await partition.splitHash();
+				expect(truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
 			});
-
-			// Trigger split and run parent alarm.
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await waitForAlarm(stub);
-
-			// Run all children's migrations. startSplit already triggered their alarms via fire-and-forget.
-			const parentState = await stub.status();
-			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
-			for (const childCtx of childContexts) {
-				const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
-				await waitForAlarm(childStub);
-				const state = await childStub.status();
-				expect(state.migrationStatus).toBe("migration_completed");
-			}
 
 			// Every item is reachable through root via forwarding.
 			for (const item of seedItems) {
@@ -743,7 +634,7 @@ describe("PartitionDO - splitting", () => {
 				});
 			}
 
-			await assertSplitTreeComplete(stub);
+			await assertSplitTreeComplete(partition);
 		});
 
 		it("getItemDirect bypasses split forwarding and reads from local storage", async ({ expect }) => {

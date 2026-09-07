@@ -241,12 +241,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	// DOs too — they simply keep [] forever, since nothing ever writes this for a hash partition.
 	#_rangeAncestors: RangeAncestorInfo[] = [];
 
-	// ONLY USED FOR TESTING! DO NOT DEPEND ON THESE FIELDS FOR ANY LOGIC IN THE DO.
-	__testing__alarm_running = false;
-	__testing__backgroundWorkRunning = false;
-	__testing__migrationBatchLimitBytes?: number;
-	__testing__beforeMigrationComplete?: () => Promise<void>;
-
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
@@ -901,7 +895,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		invariant(isKnownChild, `fokos/partition.migrationGetItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
 
 		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
-		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
+		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 
 		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
@@ -928,7 +922,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		end: KeyBytes | null,
 		cursor: ScanCursor | null,
 	): GetItemsBatchResult {
-		const BATCH_LIMIT_BYTES = this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024;
+		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 		const lower = start ?? KeyCodec.encodeOptional(undefined);
 
@@ -1009,7 +1003,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 				include: (row) => KeyCodec.compare(row.hk, hk) === 0 && inChildRange(row.sk),
 				estimateBytes: estimatePendingTxBytes,
-				budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+				budgetBytes: 20 * 1024 * 1024,
 				pageSize: 1000,
 				startCursor: opts.cursor,
 			});
@@ -1043,7 +1037,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk),
 			estimateBytes: estimatePendingTxBytes,
-			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+			budgetBytes: 20 * 1024 * 1024,
 			pageSize: 1000,
 			startCursor: opts.cursor,
 		});
@@ -1097,7 +1091,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			advanceCursor: (row) => ({ hashKey: row.hash_key }),
 			include: (row) => isCorrectChild(row.hash_key),
 			estimateBytes: (row) => row.hash_key.byteLength + 16,
-			budgetBytes: this.__testing__migrationBatchLimitBytes ?? 20 * 1024 * 1024,
+			budgetBytes: 20 * 1024 * 1024,
 			pageSize: SCAN_LIMIT,
 			startCursor: opts.cursor,
 		});
@@ -1610,12 +1604,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			message: "fokos/partition: Alarm triggered.",
 			alarmInfo,
 		});
-		this.__testing__alarm_running = true;
-		try {
-			await this.runBackgroundWork();
-		} finally {
-			this.__testing__alarm_running = false;
-		}
+		await this.runBackgroundWork();
 	}
 
 	// RPC erases the KeyBytes brand: keys reach the DO already-encoded as Uint8Array (db.ts encodes at
@@ -1971,9 +1960,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			parent,
 			logParams: () => this.logParams(),
 			onPromotedKeyInherited: (_hashKey, _status) => {},
-			beforeComplete: async () => {
-				await this.__testing__beforeMigrationComplete?.();
-			},
 		});
 		await migration.runMigration(pCtx, parentCtx);
 	}
@@ -2028,8 +2014,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		 * - They should be crash-safe, meaning that if they crash they should not cause the rest jobs to not run and they should be able to resume or retry their work without causing inconsistencies or data loss.
 		 * - If they encounter an error, they should log it and reschedule the next run for some time in the future ensuring progress is made eventually.
 		 */
-		this.__testing__backgroundWorkRunning = true;
-
 		try {
 			////////////////////////////////////////////////////////
 			// ── Job: Partition migration (for child partitions)
@@ -2223,8 +2207,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					message: "fokos/partition: Background work ran, nothing to schedule forward.",
 				});
 			}
-
-			this.__testing__backgroundWorkRunning = false;
 		}
 	}
 

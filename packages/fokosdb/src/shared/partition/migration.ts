@@ -23,8 +23,6 @@ export type SplitMigrationDeps = {
 	logParams: () => Record<string, unknown>;
 	/** Keeps the DO's in-memory promoted-keys cache in sync with inherited entries. */
 	onPromotedKeyInherited: (hashKey: KeyBytes, status: PromotedKeyStatus) => void;
-	/** Test hook: awaited just before the final status transition + parent acknowledgement. */
-	beforeComplete?: () => Promise<void>;
 };
 
 /**
@@ -132,7 +130,6 @@ export class SplitMigration {
 			pkCursor = nextCursor;
 		}
 
-		await this.deps.beforeComplete?.();
 		store.rebuildKeySizeEstimates();
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
@@ -201,7 +198,6 @@ export class SplitMigration {
 			txCursor = nextCursor;
 		}
 
-		await this.deps.beforeComplete?.();
 		store.rebuildKeySizeEstimates();
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);

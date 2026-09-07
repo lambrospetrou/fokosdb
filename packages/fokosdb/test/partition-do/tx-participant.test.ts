@@ -4,30 +4,18 @@ import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "../../src/shared/partition-errors.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
-import { resolveRangePartitionContext } from "../../src/shared/partition-topology/partition-id.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
-import {
-	PROMOTION_BIG_DATA,
-	PROMOTION_TEST_MAX_SIZE_MB,
-	compiledCondition,
-	drainSplitTree,
-	kb,
-	makeStub,
-	triggerHashSplitThreshold,
-	waitForPromotedKeyStatus,
-} from "./helpers.js";
+import { compiledCondition, kb, makeStub } from "./helpers.js";
+import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
 describe("PartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
-		const { ctx, stub } = makeStub({
-			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
-		});
-		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
-		const rangeRootStub = PartitionDO.getByName(env.PARTITION_DO, rangeRootCtx.doName);
-		await waitForPromotedKeyStatus(stub, "alice", ["promoted"], { drain: [stub, rangeRootStub] });
+		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = partition;
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		const rangeRoot = await partition.awaitPromoted("alice");
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
@@ -54,10 +42,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		});
 
 		// alice/sk2 must be in the range root; bob/sk1 must be local on the hash DO.
-		const aliceResult = await rangeRootStub.apiGetItem(rangeRootCtx, {
-			hashKey: kb("alice"),
-			sortKey: kb("sk2"),
-		});
+		const aliceResult = await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk2") });
 		expect(aliceResult).toMatchObject({ found: true, item: { data: "from-txn" } });
 
 		const bobResult = await stub.apiGetItem(ctx, { hashKey: kb("bob"), sortKey: kb("sk1") });
@@ -65,13 +50,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	});
 
 	it("cancel via hash DO releases both local and promoted-key locks", async () => {
-		const { ctx, stub } = makeStub({
-			hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB },
-		});
-		await stub.apiPutItem(ctx, { hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
-		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, kb("alice"), null, null);
-		const rangeRootStub = PartitionDO.getByName(env.PARTITION_DO, rangeRootCtx.doName);
-		await waitForPromotedKeyStatus(stub, "alice", ["promoted"], { drain: [stub, rangeRootStub] });
+		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const { ctx, stub } = partition;
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
+		const rangeRoot = await partition.awaitPromoted("alice");
 
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
@@ -283,7 +265,8 @@ describe("PartitionDO — single-shot transaction", () => {
 	});
 
 	it("queues a split once its writes push the partition over the threshold", async () => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const { ctx, stub } = partition;
 		const data = "x".repeat(64 * 1024);
 
 		for (let i = 0; i < 40; i++) {
@@ -299,13 +282,14 @@ describe("PartitionDO — single-shot transaction", () => {
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
-		await drainSplitTree(stub);
+		await partition.awaitSplitCompleted();
 	});
 });
 
 describe("PartitionDO — two-phase commit queues splits", () => {
 	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const { ctx, stub } = partition;
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now();
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
@@ -321,9 +305,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 			}),
 		).toEqual({ outcome: "accepted" });
 
-		await triggerHashSplitThreshold(stub, ctx, 1);
-		await drainSplitTree(stub);
-		expect((await stub.status()).splitStatus?.status).toBe("split_completed");
+		await partition.splitHash();
 		expect(
 			await stub.txCommit(ctx, {
 				transactionId,
@@ -340,7 +322,8 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 	});
 
 	it("queues a split once committed transactions push the partition over the threshold", async () => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const { ctx, stub } = partition;
 		const data = "x".repeat(64 * 1024);
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
 
@@ -357,7 +340,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		const { splitStatus } = await stub.status();
 		expect(splitStatus).toBeDefined();
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
-		await drainSplitTree(stub);
+		await partition.awaitSplitCompleted();
 	});
 });
 
@@ -422,9 +405,9 @@ describe("PartitionDO — single-partition read snapshot", () => {
 		}
 
 		it("hands the whole request to the one child that owns every key, and falls back when the keys span two", async () => {
-			const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			await triggerHashSplitThreshold(stub, ctx, 1);
-			await drainSplitTree(stub);
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
+			await partition.splitHash();
 
 			// Routing is a pure hash of the key bytes, so this grouping is deterministic, not flaky.
 			const byChild = await keysByServingChild(stub, ctx, 10);

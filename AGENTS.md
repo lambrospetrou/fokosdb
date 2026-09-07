@@ -114,7 +114,13 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 
 ## Testing
 
-Tests run in the actual Cloudflare Workers runtime via `@cloudflare/vitest-pool-workers`. Each test suite creates isolated namespaces using `crypto.randomUUID()` prefixes. Integration tests are in `packages/fokosdb/test/transactions.test.ts`. The `PartitionDO` suites live in `packages/fokosdb/test/partition-do/`, one file per behaviour, over the shared setup in `packages/fokosdb/test/partition-do/helpers.ts`.
+Tests run in the actual Cloudflare Workers runtime via `@cloudflare/vitest-pool-workers`. Each test suite creates isolated namespaces using `crypto.randomUUID()` prefixes. Integration tests are in `packages/fokosdb/test/transactions.test.ts`. The `PartitionDO` suites live in `packages/fokosdb/test/partition-do/`, one file per behaviour. Use the small `makeStub` factory in `helpers.ts` for ordinary tests. Use `TestPartition` from `partition-harness.ts` only when a test drives a split, migration, or promotion.
+
+Use `triggerHashSplit`, `triggerPromotion`, and `triggerRangeSplit` when the test must inspect a transition. Use `splitHash` and `splitRange` when it needs a completed split. Filler hash keys belong to the target partition and are spread across its children. `makeRangeRoot` creates an empty range root without testing promotion detection; `makeTriggeredRangeRoot` also crosses the range-split threshold and returns all fixture sort keys. `runAlarm()` fires one scheduled alarm pass; the `await*` helpers and `drainUntil` poll durable state and run alarms only when progress stalls.
+
+For migration-in-progress tests, install `withMigrationHeld` before the crossing write. Its wait function returns after every child has reached the real transaction-metadata RPC. Cleanup releases the RPCs and restores the method in `finally`. Use `withMigrationBatchCap` to force cursor-paginated multi-batch migration without touching the real byte budget. Do not add production test hooks for tests.
+
+Global fake timers can run Durable Object background callbacks in the wrong I/O context. The transaction suite currently uses `vi.useFakeTimers({ shouldAdvanceTime: true })` and can log cross-object TTL errors even when its assertions pass. Partition lifecycle tests use normal timers and scheduled-alarm test APIs instead.
 
 ## Rules for PartitionDO operations
 
