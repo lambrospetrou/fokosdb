@@ -16,26 +16,25 @@ describe("PartitionDO - conditional putItem", () => {
 				kind: "text",
 			});
 
-			expect(result.version).toBe(1);
+			expect(result).toMatchObject({ outcome: "ok", version: 1 });
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 			expect(get).toMatchObject({ found: true, item: { data: "value" } });
 		});
 
-		it("throws when item already exists, leaving it unchanged", async ({ expect }) => {
+		it("rejects when item already exists, leaving it unchanged", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				await instance.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "original", kind: "text" as const });
 
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb("sk"),
-						data: "overwrite",
-						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
-						kind: "text",
-					}),
-				).rejects.toThrow("condition failed");
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb("sk"),
+					data: "overwrite",
+					condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -48,15 +47,14 @@ describe("PartitionDO - conditional putItem", () => {
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb(), data: "original", kind: "text" as const });
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb(),
-						data: "overwrite",
-						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
-						kind: "text",
-					}),
-				).rejects.toThrow("condition failed");
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb(),
+					data: "overwrite",
+					condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb() });
@@ -77,44 +75,42 @@ describe("PartitionDO - conditional putItem", () => {
 				kind: "text",
 			});
 
-			expect(result.version).toBe(2);
+			expect(result).toMatchObject({ outcome: "ok", version: 2 });
 		});
 
-		it("throws when v does not match, leaving the item unchanged", async ({ expect }) => {
+		it("rejects when v does not match, leaving the item unchanged", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb("sk"),
-						data: "stale",
-						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
-						kind: "text",
-					}),
-				).rejects.toThrow("condition failed");
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb("sk"),
+					data: "stale",
+					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 			expect(get).toMatchObject({ found: true, item: { data: "v2", version: 2 } });
 		});
 
-		it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
+		it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
 			const { ctx, stub } = makeStub();
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb("sk"),
-						data: "value",
-						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
-						kind: "text",
-					}),
-				).rejects.toThrow("condition failed");
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb("sk"),
+					data: "value",
+					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 		});
 
@@ -122,7 +118,7 @@ describe("PartitionDO - conditional putItem", () => {
 			const { ctx, stub } = makeStub();
 
 			const r1 = await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
-			expect(r1.version).toBe(1);
+			expect(r1).toMatchObject({ outcome: "ok", version: 1 });
 
 			const r2 = await stub.apiPutItem(ctx, {
 				hashKey: kb("hk"),
@@ -131,7 +127,7 @@ describe("PartitionDO - conditional putItem", () => {
 				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				kind: "text",
 			});
-			expect(r2.version).toBe(2);
+			expect(r2).toMatchObject({ outcome: "ok", version: 2 });
 
 			const r3 = await stub.apiPutItem(ctx, {
 				hashKey: kb("hk"),
@@ -140,7 +136,7 @@ describe("PartitionDO - conditional putItem", () => {
 				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 2 }] }),
 				kind: "text",
 			});
-			expect(r3.version).toBe(3);
+			expect(r3).toMatchObject({ outcome: "ok", version: 3 });
 		});
 	});
 
@@ -163,7 +159,7 @@ describe("PartitionDO - conditional putItem", () => {
 				kind: "text",
 			});
 
-			expect(result.version).toBe(2);
+			expect(result).toMatchObject({ outcome: "ok", version: 2 });
 		});
 
 		it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
@@ -174,21 +170,20 @@ describe("PartitionDO - conditional putItem", () => {
 			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "original", kind: "text" as const });
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb("sk"),
-						data: "overwrite",
-						condition: compiledCondition({
-							op: "and",
-							args: [
-								{ op: "not_exists", args: [{ ref: "hashKey" }] },
-								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-							],
-						}),
-						kind: "text",
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb("sk"),
+					data: "overwrite",
+					condition: compiledCondition({
+						op: "and",
+						args: [
+							{ op: "not_exists", args: [{ ref: "hashKey" }] },
+							{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+						],
 					}),
-				).rejects.toThrow("condition failed");
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -203,21 +198,20 @@ describe("PartitionDO - conditional putItem", () => {
 
 			// attribute_equals v=2 passes, then attribute_equals v=1 fails.
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(ctx, {
-						hashKey: kb("hk"),
-						sortKey: kb("sk"),
-						data: "overwrite",
-						condition: compiledCondition({
-							op: "and",
-							args: [
-								{ op: "eq", args: [{ ref: "v" }, { val: 2 }] },
-								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-							],
-						}),
-						kind: "text",
+				const res = await instance.apiPutItem(ctx, {
+					hashKey: kb("hk"),
+					sortKey: kb("sk"),
+					data: "overwrite",
+					condition: compiledCondition({
+						op: "and",
+						args: [
+							{ op: "eq", args: [{ ref: "v" }, { val: 2 }] },
+							{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+						],
 					}),
-				).rejects.toThrow("condition failed");
+					kind: "text",
+				});
+				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -234,7 +228,7 @@ describe("PartitionDO - conditional putItem", () => {
 				kind: "text",
 			});
 
-			expect(result.version).toBe(1);
+			expect(result).toMatchObject({ outcome: "ok", version: 1 });
 		});
 	});
 });
@@ -252,21 +246,20 @@ describe("PartitionDO - deleteItem", () => {
 					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 				});
 
-				expect(result.deleted).toBe(true);
+				expect(result).toMatchObject({ outcome: "ok", deleted: true });
 				expect((await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).found).toBe(false);
 			});
 
-			it("throws when item does not exist, making the operation a no-op", async ({ expect }) => {
+			it("rejects when item does not exist, making the operation a no-op", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
-						}),
-					).rejects.toThrow("condition failed");
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 
 				const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -277,13 +270,12 @@ describe("PartitionDO - deleteItem", () => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb(),
-							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
-						}),
-					).rejects.toThrow("condition failed");
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb(),
+						condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 			});
 		});
@@ -299,23 +291,22 @@ describe("PartitionDO - deleteItem", () => {
 					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				});
 
-				expect(result.deleted).toBe(true);
+				expect(result).toMatchObject({ outcome: "ok", deleted: true });
 			});
 
-			it("throws when v does not match, leaving the item untouched", async ({ expect }) => {
+			it("rejects when v does not match, leaving the item untouched", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
 				await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 				await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const }); // v is now 2
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
-						}),
-					).rejects.toThrow("condition failed");
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -324,17 +315,16 @@ describe("PartitionDO - deleteItem", () => {
 				});
 			});
 
-			it("throws when the item does not exist (actual v is null)", async ({ expect }) => {
+			it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
 				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
-						}),
-					).rejects.toThrow("condition failed");
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 			});
 		});
@@ -356,7 +346,7 @@ describe("PartitionDO - deleteItem", () => {
 					}),
 				});
 
-				expect(result.deleted).toBe(true);
+				expect(result).toMatchObject({ outcome: "ok", deleted: true });
 			});
 
 			it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
@@ -365,19 +355,18 @@ describe("PartitionDO - deleteItem", () => {
 				// item_exists is listed first and will fail since no item exists.
 				// attribute_equals would never be reached.
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb("sk"),
-							condition: compiledCondition({
-								op: "and",
-								args: [
-									{ op: "exists", args: [{ ref: "hashKey" }] },
-									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-								],
-							}),
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						condition: compiledCondition({
+							op: "and",
+							args: [
+								{ op: "exists", args: [{ ref: "hashKey" }] },
+								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+							],
 						}),
-					).rejects.toThrow("condition failed");
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 			});
 
@@ -389,19 +378,18 @@ describe("PartitionDO - deleteItem", () => {
 
 				// item_exists passes, then attribute_equals v=1 fails.
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
-					await expect(
-						instance.apiDeleteItem(ctx, {
-							hashKey: kb("hk"),
-							sortKey: kb("sk"),
-							condition: compiledCondition({
-								op: "and",
-								args: [
-									{ op: "exists", args: [{ ref: "hashKey" }] },
-									{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-								],
-							}),
+					const res = await instance.apiDeleteItem(ctx, {
+						hashKey: kb("hk"),
+						sortKey: kb("sk"),
+						condition: compiledCondition({
+							op: "and",
+							args: [
+								{ op: "exists", args: [{ ref: "hashKey" }] },
+								{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
+							],
 						}),
-					).rejects.toThrow("condition failed");
+					});
+					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -416,7 +404,7 @@ describe("PartitionDO - deleteItem", () => {
 				await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
 				const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
-				expect(result.deleted).toBe(true);
+				expect(result).toMatchObject({ outcome: "ok", deleted: true });
 			});
 		});
 	});

@@ -4,6 +4,24 @@
  * They live apart from the partition implementation because the client recognises them too, and
  * matching on them must not pull the Durable Object classes into the client bundle.
  */
+import type { ConditionCheckImage, OperationMetrics, PartitionInfo } from "./types.js";
+import type { RejectionReason } from "./transaction-types.js";
+
+export class ConditionCheckFailedError extends Error {
+	readonly reason: RejectionReason;
+	readonly meta: OperationMetrics & PartitionInfo;
+
+	get item(): ConditionCheckImage | undefined {
+		return this.reason.type === "condition_failed" ? this.reason.item : undefined;
+	}
+
+	constructor(reason: RejectionReason, meta: OperationMetrics & PartitionInfo) {
+		super("fokos: condition failed");
+		this.name = "ConditionCheckFailedError";
+		this.reason = reason;
+		this.meta = meta;
+	}
+}
 
 // Durable Object RPC carries only an error's message across the boundary — not its class, not any
 // custom property — so the transaction coordinator recognises backpressure by this substring.

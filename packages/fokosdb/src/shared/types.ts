@@ -33,6 +33,24 @@ export type {
 export const DATA_KINDS = ["bytes", "text", "json"] as const; // index = on-disk code
 export type DataKind = (typeof DATA_KINDS)[number]; // "bytes" | "text" | "json"
 
+export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
+
+export type ConditionCheckImageOf<D> = {
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
+	data: D;
+	kind: DataKind;
+	version: number;
+	/** Epoch UTC seconds. Absent when the item has no expiry instant. */
+	ttlAt?: number;
+};
+
+/** Wire variant. json data is JSON text, which db.ts parses once at the public boundary. */
+export type ConditionCheckImageEncoded = ConditionCheckImageOf<string | Uint8Array>;
+
+/** Public variant, surfaced by db.ts. */
+export type ConditionCheckImage = ConditionCheckImageOf<string | Uint8Array | JsonValue>;
+
 // Encoded for the wire / store WRITE — JSON already stringified at the db.ts boundary, so the DO
 // only ever sees `string | Uint8Array`. JSON text → store as jsonb(data)
 export type EncodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: string };
@@ -60,6 +78,8 @@ export type PutItemOptions = {
 	data: string | Uint8Array | JsonComposite;
 
 	condition?: ConditionExpression;
+
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
 export type DeleteItemOptions = {
@@ -67,6 +87,8 @@ export type DeleteItemOptions = {
 	sortKey?: string | Uint8Array;
 
 	condition?: ConditionExpression;
+
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
 export type ItemKey = {

@@ -1,6 +1,6 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
-import type { DataKind, ItemKey, JsonComposite, JsonValue } from "./types.js";
+import type { ConditionCheckImage, ConditionCheckImageEncoded, DataKind, ItemKey, JsonComposite, JsonValue } from "./types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
 
@@ -55,8 +55,8 @@ export type PrepareRequest = {
 
 // Result/OUT type: keys are decoded to the public form (string for UTF-8, Uint8Array for binary) by
 // the producing participant, so rejections are user-readable and JSON-serializable for the TC.
-export type RejectionReason =
-	| { type: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+export type RejectionReasonOf<I = ConditionCheckImage> =
+	| { type: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; item?: I }
 	| { type: "timestamp_conflict"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| {
 			type: "pending_conflict";
@@ -75,6 +75,9 @@ export type RejectionReason =
 	| { type: "update_value_is_bytes"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| { type: "item_too_large"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| { type: "transient_error" };
+
+export type RejectionReasonEncoded = RejectionReasonOf<ConditionCheckImageEncoded>;
+export type RejectionReason = RejectionReasonOf<ConditionCheckImage>;
 
 export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
 

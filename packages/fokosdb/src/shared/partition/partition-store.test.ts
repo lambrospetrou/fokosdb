@@ -109,6 +109,47 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("getItemImage returns imageBytes equal to byte length of data across data kinds and non-ASCII characters", async () => {
+		await withStore((store) => {
+			const unicodeText = "hello € and Ω";
+			const expectedTextBytes = new TextEncoder().encode(unicodeText).byteLength;
+			store.upsertItem({ hk: kb("hk"), sk: kb("text"), data: unicodeText, kind: "text", ttlAt: 1234, lastTransactionTs: 1 });
+			const textRes = store.getItemImage(kb("hk"), kb("text"));
+			expect(textRes.row).toEqual({
+				data: unicodeText,
+				kind: "text",
+				version: 1,
+				ttlAt: 1234,
+				imageBytes: expectedTextBytes,
+			});
+			expect(textRes.rowsRead).toBe(1);
+
+			const bin = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
+			store.upsertItem({ hk: kb("hk"), sk: kb("bytes"), data: bin, kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
+			const bytesRes = store.getItemImage(kb("hk"), kb("bytes"));
+			expect(bytesRes.row).toEqual({
+				data: bin,
+				kind: "bytes",
+				version: 1,
+				imageBytes: 4,
+			});
+
+			const jsonText = JSON.stringify({ key: "value", num: 42 });
+			const expectedJsonBytes = new TextEncoder().encode(jsonText).byteLength;
+			store.upsertItem({ hk: kb("hk"), sk: kb("json"), data: jsonText, kind: "json", ttlAt: 5678, lastTransactionTs: 1 });
+			const jsonRes = store.getItemImage(kb("hk"), kb("json"));
+			expect(jsonRes.row).toEqual({
+				data: jsonText,
+				kind: "json",
+				version: 1,
+				ttlAt: 5678,
+				imageBytes: expectedJsonBytes,
+			});
+
+			expect(store.getItemImage(kb("hk"), kb("absent")).row).toBeUndefined();
+		});
+	});
+
 	it("maintains key_size_estimates across put, overwrite, and delete", async () => {
 		await withStore((store, state) => {
 			const est1 = expectedRowBytes("aaaa", kb("hk"), kb("s1"));

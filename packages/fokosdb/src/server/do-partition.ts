@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, OperationMetrics } from "../shared/types.js";
+import { DataKind, OperationMetrics, type ConditionCheckImageEncoded, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
 import type { CompiledConditionPlan } from "../shared/expression/plan.js";
 import type {
 	CancelRequest,
@@ -14,6 +14,8 @@ import type {
 	ReadForTransactionResponse,
 	ReadSnapshotRequest,
 	ReadSnapshotResponse,
+	RejectionReason,
+	RejectionReasonEncoded,
 	SingleShotRequest,
 	SingleShotResponse,
 } from "../shared/transaction-types.js";
@@ -104,13 +106,29 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	kind: DataKind;
 	ttlAt?: number;
 	condition?: CompiledConditionPlan;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
-export type PutItemRpcResponse = { version: number; meta: OperationMetrics & PartitionInfoInternal };
+export type PutItemRpcResponse =
+	| { outcome: "ok"; version: number; meta: OperationMetrics & PartitionInfoInternal }
+	| {
+			outcome: "rejected";
+			reason: RejectionReasonEncoded;
+			meta: OperationMetrics & PartitionInfoInternal;
+	  };
 
-export type DeleteItemRpcRequest = ItemRpcKeys & { condition?: CompiledConditionPlan };
+export type DeleteItemRpcRequest = ItemRpcKeys & {
+	condition?: CompiledConditionPlan;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
+};
 
-export type DeleteItemRpcResponse = { deleted: boolean; meta: OperationMetrics & PartitionInfoInternal };
+export type DeleteItemRpcResponse =
+	| { outcome: "ok"; deleted: boolean; meta: OperationMetrics & PartitionInfoInternal }
+	| {
+			outcome: "rejected";
+			reason: RejectionReasonEncoded;
+			meta: OperationMetrics & PartitionInfoInternal;
+	  };
 
 export type GetItemRpcRequest = ItemRpcKeys;
 
@@ -483,7 +501,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			intent: "write",
 			forward: async (stub, pCtx) => await stub.apiPutItem(pCtx, req),
 			local: async () => {
-				const { writeRes, conditionRes } = this.#store.transactionSync(() => {
+				const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
+				const localRes = this.#store.transactionSync(() => {
 					const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 					if (pendingRow) {
 						// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
@@ -494,7 +513,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					}
 
 					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
-					if (conditionRes && !conditionRes.conditionOk) throw new Error("fokos/putItem: condition failed");
+					if (conditionRes && !conditionRes.conditionOk) {
+						const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
+						return { outcome: "rejected" as const, conditionRes, image };
+					}
 
 					const writeRes = this.#store.upsertItem({
 						hk: hashKey,
@@ -504,13 +526,53 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						ttlAt: req.ttlAt ?? null,
 						lastTransactionTs: Date.now(),
 					});
-					return { writeRes, conditionRes };
+					return { outcome: "ok" as const, writeRes, conditionRes };
 				});
+
+				if (localRes.outcome === "rejected") {
+					const { rowsRead, rowsWritten } = localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes;
+					const item: ConditionCheckImageEncoded | undefined = localRes.image?.row
+						? {
+								hashKey: KeyCodec.decode(hashKey),
+								...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
+								data: localRes.image.row.data,
+								kind: localRes.image.row.kind,
+								version: localRes.image.row.version,
+								...(localRes.image.row.ttlAt !== undefined ? { ttlAt: localRes.image.row.ttlAt } : {}),
+							}
+						: undefined;
+					return {
+						outcome: "rejected",
+						reason: {
+							type: "condition_failed",
+							hashKey: KeyCodec.decode(hashKey),
+							...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
+							...(item ? { item } : {}),
+						},
+						meta: {
+							rowsRead,
+							rowsWritten,
+							databaseSize: this.#store.databaseSize,
+							servedByActorId: this.ctx.id.toString(),
+							servedByActorName: pCtx.doName,
+							servedByPartitionId: pCtx.partitionId,
+							forwardCount: 0,
+							hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+							rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+							_internal: {
+								rangeAncestors: this.#_rangeAncestors,
+							},
+						},
+					};
+				}
+
+				const { writeRes, conditionRes } = localRes;
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
 
 				await this.checkSplits(pCtx, hashKey, sortKey);
 				return {
+					outcome: "ok",
 					version: writeRes.version,
 					meta: {
 						rowsRead,
@@ -546,7 +608,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			intent: "delete",
 			forward: async (stub, pCtx) => await stub.apiDeleteItem(pCtx, req),
 			local: async () => {
-				const { writeRes, conditionRes } = this.#store.transactionSync(() => {
+				const wantsImage = req.returnValuesOnConditionCheckFailure === "all_old";
+				const localRes = this.#store.transactionSync(() => {
 					const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 					if (pendingRow) {
 						// FIXME: ATC §4 optimization — see same comment in putItem.
@@ -556,14 +619,57 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					}
 
 					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
-					if (conditionRes && !conditionRes.conditionOk) throw new Error("fokos/deleteItem: condition failed");
+					if (conditionRes && !conditionRes.conditionOk) {
+						const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
+						return { outcome: "rejected" as const, conditionRes, image };
+					}
 
 					// Keep deletion watermark consistent with transactional deletes.
 					const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
-					return { writeRes, conditionRes };
+					return { outcome: "ok" as const, writeRes, conditionRes };
 				});
+
+				if (localRes.outcome === "rejected") {
+					const { rowsRead, rowsWritten } = localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes;
+					const item: ConditionCheckImageEncoded | undefined = localRes.image?.row
+						? {
+								hashKey: KeyCodec.decode(hashKey),
+								...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
+								data: localRes.image.row.data,
+								kind: localRes.image.row.kind,
+								version: localRes.image.row.version,
+								...(localRes.image.row.ttlAt !== undefined ? { ttlAt: localRes.image.row.ttlAt } : {}),
+							}
+						: undefined;
+					return {
+						outcome: "rejected",
+						reason: {
+							type: "condition_failed",
+							hashKey: KeyCodec.decode(hashKey),
+							...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
+							...(item ? { item } : {}),
+						},
+						meta: {
+							rowsRead,
+							rowsWritten,
+							databaseSize: this.#store.databaseSize,
+							servedByActorId: this.ctx.id.toString(),
+							servedByActorName: pCtx.doName,
+							servedByPartitionId: pCtx.partitionId,
+							forwardCount: 0,
+							hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+							rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+							_internal: {
+								rangeAncestors: this.#_rangeAncestors,
+							},
+						},
+					};
+				}
+
+				const { writeRes, conditionRes } = localRes;
 				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
+					outcome: "ok",
 					deleted: writeRes.deleted,
 					meta: {
 						rowsRead,

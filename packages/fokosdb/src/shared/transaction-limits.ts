@@ -268,3 +268,9 @@ export function singlePartitionTarget<T extends { partitionContext: PartitionCon
 	}
 	return target;
 }
+
+export function validateReturnValuesOnConditionCheckFailure(value?: string): void {
+	if (value !== undefined && value !== "none" && value !== "all_old") {
+		throw new Error(`fokos: returnValuesOnConditionCheckFailure must be 'none' or 'all_old' (got '${value}')`);
+	}
+}

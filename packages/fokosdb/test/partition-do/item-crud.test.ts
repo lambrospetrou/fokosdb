@@ -78,7 +78,7 @@ describe("PartitionDO - putItem / getItem", () => {
 
 		const result = await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 
-		expect(result.version).toBe(1);
+		expect(result).toMatchObject({ outcome: "ok", version: 1 });
 	});
 
 	it("increments version on each subsequent write to the same key", async ({ expect }) => {
@@ -88,9 +88,9 @@ describe("PartitionDO - putItem / getItem", () => {
 		const r2 = await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const });
 		const r3 = await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v3", kind: "text" as const });
 
-		expect(r1.version).toBe(1);
-		expect(r2.version).toBe(2);
-		expect(r3.version).toBe(3);
+		expect(r1).toMatchObject({ outcome: "ok", version: 1 });
+		expect(r2).toMatchObject({ outcome: "ok", version: 2 });
+		expect(r3).toMatchObject({ outcome: "ok", version: 3 });
 	});
 
 	it("getItem returns the current version", async ({ expect }) => {
@@ -113,7 +113,7 @@ describe("PartitionDO - putItem / getItem", () => {
 		const get1 = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk1") });
 		const get2 = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk2") });
 
-		expect(r1.version).toBe(1);
+		expect(r1).toMatchObject({ outcome: "ok", version: 1 });
 		expect(get1).toMatchObject({ found: true, item: { version: 2 } });
 		expect(get2).toMatchObject({ found: true, item: { version: 1 } });
 	});
@@ -255,6 +255,7 @@ describe("PartitionDO - deleteItem", () => {
 
 		const result = await stub.apiDeleteItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk") });
 		expect(result).toEqual({
+			outcome: "ok",
 			deleted: false,
 			meta: {
 				rowsRead: 0,
@@ -279,7 +280,7 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 		const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
-		expect(result.deleted).toBe(true);
+		expect(result).toMatchObject({ outcome: "ok", deleted: true });
 		const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 		expect(get.found).toBe(false);
 	});
@@ -291,7 +292,7 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 		const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
-		expect(result.deleted).toBe(false);
+		expect(result).toMatchObject({ outcome: "ok", deleted: false });
 	});
 
 	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({ expect }) => {
@@ -321,7 +322,7 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "with-sort", kind: "text" as const });
 
 		const result = await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb() });
-		expect(result.deleted).toBe(true);
+		expect(result).toMatchObject({ outcome: "ok", deleted: true });
 
 		expect((await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb() })).found).toBe(false);
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -338,7 +339,7 @@ describe("PartitionDO - deleteItem", () => {
 		await stub.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 		const result = await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "fresh", kind: "text" as const });
 
-		expect(result.version).toBe(1);
+		expect(result).toMatchObject({ outcome: "ok", version: 1 });
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "fresh", version: 1 },

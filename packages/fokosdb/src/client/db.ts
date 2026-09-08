@@ -27,6 +27,8 @@ import type { PartitionTopologyRouter } from "../shared/partition-topology/route
 import type {
 	InitiateReadResponseEncoded,
 	ReadForTransactionItemResultEncoded,
+	RejectionReason,
+	RejectionReasonEncoded,
 	SingleShotResponse,
 	TCWriteOperation,
 	TCReadItem,
@@ -39,11 +41,13 @@ import {
 	encodeSortKey,
 	validateItemDataSize,
 	validateItemKeys,
+	validateReturnValuesOnConditionCheckFailure,
 	singlePartitionTarget,
 	validateTransactGetItemCount,
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 } from "../shared/transaction-limits.js";
+import { ConditionCheckFailedError } from "../shared/partition-errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
 import { normalizeSkInterval } from "../shared/query/sk-interval.js";
@@ -98,6 +102,19 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 		});
 		throw new Error("fokos: failed to parse json item data returned by the store", { cause: err });
 	}
+}
+
+function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason {
+	if (reason.type === "condition_failed" && reason.item) {
+		return {
+			...reason,
+			item: {
+				...reason.item,
+				data: decodeItemData(reason.item.kind, reason.item.data),
+			},
+		};
+	}
+	return reason as RejectionReason;
 }
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
@@ -167,6 +184,7 @@ export class FokosDB {
 	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
 		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
+		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
@@ -184,7 +202,11 @@ export class FokosDB {
 			kind: encoded.kind,
 			ttlAt: opts.ttlAt,
 			condition,
+			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 		});
+		if (res.outcome === "rejected") {
+			throw new ConditionCheckFailedError(decodeRejectionReason(res.reason), publicMeta(res.meta));
+		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
@@ -210,12 +232,21 @@ export class FokosDB {
 
 	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
+		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
-		const res = await stub.apiDeleteItem(partitionContext, { hashKey, sortKey, condition });
+		const res = await stub.apiDeleteItem(partitionContext, {
+			hashKey,
+			sortKey,
+			condition,
+			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
+		});
+		if (res.outcome === "rejected") {
+			throw new ConditionCheckFailedError(decodeRejectionReason(res.reason), publicMeta(res.meta));
+		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}

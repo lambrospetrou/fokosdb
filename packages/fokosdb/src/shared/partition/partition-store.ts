@@ -408,6 +408,44 @@ export class PartitionStore {
 		};
 	}
 
+	/**
+	 * Secondary read run only after a failed condition on an existing row when the caller
+	 * asked for an image.
+	 */
+	getItemImage(
+		hk: KeyBytes,
+		sk: KeyBytes,
+	): {
+		row?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number; imageBytes: number };
+		rowsRead: number;
+		rowsWritten: number;
+	} {
+		const res = this.#storage.sql.exec<{
+			data: string | ArrayBuffer;
+			data_kind: number;
+			v: number;
+			ttl_epoch_utc_seconds: number | null;
+			image_bytes: number;
+		}>(
+			`SELECT ${DATA_SELECT_DECODED}, data_kind, v, ttl_epoch_utc_seconds, octet_length(CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END) AS image_bytes FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+			hk,
+			sk,
+		);
+		const row = res.toArray()[0];
+		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		return {
+			row: {
+				data: fromSqlData(row.data),
+				kind: kindFromCode(row.data_kind),
+				version: row.v,
+				...(row.ttl_epoch_utc_seconds != null ? { ttlAt: row.ttl_epoch_utc_seconds } : {}),
+				imageBytes: row.image_bytes,
+			},
+			rowsRead: res.rowsRead,
+			rowsWritten: res.rowsWritten,
+		};
+	}
+
 	/** Lightweight existence and timestamp read for an unconditional transaction prepare. */
 	getItemStamp(hk: KeyBytes, sk: KeyBytes): { row?: { last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
 		const res = this.#storage.sql.exec<{ last_transaction_ts: number }>(
