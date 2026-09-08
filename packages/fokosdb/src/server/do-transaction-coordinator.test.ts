@@ -215,6 +215,35 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
+	it("keys tc_state by transaction_id and enforces unique idempotency_token", async () => {
+		await withCoordinator((_tc, state) => {
+			const columns = state.storage.sql.exec<{ name: string; pk: number }>(`PRAGMA table_info(tc_state)`).toArray();
+			const pkColumn = columns.find((c) => c.pk > 0);
+			expect(pkColumn?.name).toBe("transaction_id");
+
+			const indexes = state.storage.sql.exec<{ name: string; unique: number }>(`PRAGMA index_list(tc_state)`).toArray();
+			const tokenIndex = indexes.find((idx) => idx.name === "tc_state_idempotency_token");
+			expect(tokenIndex).toBeDefined();
+			expect(tokenIndex?.unique).toBe(1);
+
+			insertState(state, {
+				token: "unique-token",
+				transactionId: "tx-unique-1",
+				state: "CREATED",
+				createdAt: 1_000,
+			});
+
+			expect(() => {
+				insertState(state, {
+					token: "unique-token",
+					transactionId: "tx-unique-2",
+					state: "CREATED",
+					createdAt: 1_000,
+				});
+			}).toThrow(/UNIQUE constraint failed/);
+		});
+	});
+
 	it("strips payload in the PREPARED transition but retains routing keys", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
