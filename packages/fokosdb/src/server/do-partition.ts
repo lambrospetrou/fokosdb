@@ -2110,7 +2110,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// ── Job: Partition migration (for child partitions)
 			try {
 				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-				if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") {
+				const parentAckPending = this.ctx.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
+				if (
+					migrationStatus === "migration_initialized" ||
+					migrationStatus === "migration_migrating" ||
+					(migrationStatus === "migration_completed" && parentAckPending)
+				) {
 					if (migrationStatus === "migration_initialized") {
 						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
 					}
@@ -2268,7 +2273,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			this.#store.transactionSync(() => {
 				// Job: Partition migration for child partitions.
 				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-				if (postStatus === "migration_migrating") {
+				const postParentAckPending = this.ctx.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
+				if (postStatus === "migration_migrating" || postParentAckPending) {
 					wantAlarm(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 				}
 

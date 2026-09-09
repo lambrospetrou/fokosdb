@@ -190,6 +190,50 @@ describe("SplitMigration — status gate", () => {
 			expect(calls.childAcks).toEqual([]);
 		});
 	});
+
+	it("retries parent ack if status is migration_completed and parent ack is pending", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+
+		await withMigrationEnv(async (menv) => {
+			menv.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+			menv.storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
+			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("a", "1")], 10) });
+			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
+
+			// Skips data copy and only retries parent acknowledgement.
+			expect(calls.itemCursors).toEqual([]);
+			expect(calls.txCalls).toBe(0);
+			expect(calls.childAcks).toEqual([pCtx.doName]);
+			expect(menv.parentAckPending()).toBeUndefined();
+		});
+	});
+
+	it("retains parent ack pending flag and completes on retry if parent ack fails initially", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+		const all = [item("a", "1")];
+
+		await withMigrationEnv(async (menv) => {
+			const peerFailing = makeFakePeer({ items: pagedItemBatches(all, 10), failChildAck: true });
+			await expect(menv.makeMigration(peerFailing.peer).runMigration(pCtx, parentCtx)).rejects.toThrow(/simulated ack failure/);
+
+			// Data is already copied and status is completed, but ack is pending.
+			expect(menv.status()).toBe("migration_completed");
+			expect(menv.parentAckPending()).toBe(true);
+			expect(peerFailing.calls.childAcks).toEqual([]);
+
+			// Second attempt (e.g. from alarm or retry loop) retries only the ack.
+			const peerSucceeding = makeFakePeer();
+			await menv.makeMigration(peerSucceeding.peer).runMigration(pCtx, parentCtx);
+
+			expect(peerSucceeding.calls.itemCursors).toEqual([]);
+			expect(peerSucceeding.calls.childAcks).toEqual([pCtx.doName]);
+			expect(menv.parentAckPending()).toBeUndefined();
+		});
+	});
 });
 
 // ─── Harness ──────────────────────────────────────────────────────────────────
@@ -260,6 +304,7 @@ type FakePeerOptions = {
 	pkBatches?: GetPromotedKeysBatchResult[];
 	/** 1-based getItemsBatch call number that throws once (simulated crash mid-migration). */
 	failItemsCall?: number;
+	failChildAck?: boolean;
 };
 
 function makeFakePeer(opts: FakePeerOptions = {}) {
@@ -273,6 +318,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 	let txIdx = 0;
 	let pkIdx = 0;
 	let failItemsCall = opts.failItemsCall ?? 0;
+	let failChildAck = opts.failChildAck ?? false;
 	const peer: PartitionPeer = {
 		async migrationGetItemsBatch({ cursor }) {
 			calls.itemCursors.push(cursor);
@@ -291,6 +337,10 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 			return opts.pkBatches?.[pkIdx++] ?? { rows: [], nextCursor: null };
 		},
 		async migrationAcknowledgeChildComplete(childDoName) {
+			if (failChildAck) {
+				failChildAck = false;
+				throw new Error("simulated ack failure");
+			}
 			calls.childAcks.push(childDoName);
 		},
 		async migrationAcknowledgePromotionComplete(hashKey) {
@@ -309,6 +359,7 @@ type MigrationEnv = {
 	makeMigration: (peer: PartitionPeer) => SplitMigration;
 	status: () => PartitionSplitMigrationStatus | undefined;
 	cursor: () => ScanCursor | null | undefined;
+	parentAckPending: () => boolean | undefined;
 };
 
 // Real DO storage (vitest-pool-workers); the peer is the only fake — exactly what the gateway
@@ -333,6 +384,7 @@ async function withMigrationEnv(fn: (menv: MigrationEnv) => Promise<void>): Prom
 				}),
 			status: () => state.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
 			cursor: () => state.storage.kv.get<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR),
+			parentAckPending: () => state.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING),
 		});
 	});
 }

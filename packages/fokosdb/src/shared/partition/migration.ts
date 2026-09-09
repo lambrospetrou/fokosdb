@@ -11,6 +11,7 @@ export type PartitionSplitMigrationStatus = "migration_initialized" | "migration
 export const MIGRATION_KV_KEYS = {
 	SPLIT_MIGRATION_STATUS: "__split_migration_status",
 	SPLIT_MIGRATION_CURSOR: "__split_migration_cursor",
+	PARENT_ACK_PENDING: "__split_migration_parent_ack_pending",
 } as const;
 
 export type SplitMigrationDeps = {
@@ -36,6 +37,14 @@ export class SplitMigration {
 
 	async runMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
 		const migrationStatus = this.deps.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
+		if (migrationStatus === "migration_completed") {
+			if (this.deps.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING)) {
+				await this.acknowledgeParent(pCtx, parentCtx);
+				this.deps.storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
+			}
+			return;
+		}
+
 		if (migrationStatus !== "migration_migrating") {
 			console.log({
 				...this.deps.logParams(),
@@ -46,13 +55,31 @@ export class SplitMigration {
 		}
 
 		if (isHashPartition(pCtx)) {
-			await this.runHashChildMigration(pCtx);
+			await this.runHashChildMigration(pCtx, parentCtx);
 		} else {
 			await this.runRangeChildMigration(pCtx, parentCtx);
 		}
 	}
 
-	private async runHashChildMigration(pCtx: PartitionContextResolved): Promise<void> {
+	private async acknowledgeParent(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
+		try {
+			if (isHashPartition(parentCtx) && !isHashPartition(pCtx)) {
+				await this.deps.parent.migrationAcknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
+			} else {
+				await this.deps.parent.migrationAcknowledgeChildComplete(pCtx.doName);
+			}
+		} catch (error) {
+			console.error({
+				...this.deps.logParams(),
+				message: "fokos/partition.acknowledgeParent: failed",
+				error: String(error),
+				errorProps: error,
+			});
+			throw error;
+		}
+	}
+
+	private async runHashChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
 		const { store, storage, parent } = this.deps;
 
 		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
@@ -133,7 +160,9 @@ export class SplitMigration {
 		store.rebuildKeySizeEstimates();
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
-		await parent.migrationAcknowledgeChildComplete(pCtx.doName);
+		storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
+		await this.acknowledgeParent(pCtx, parentCtx);
+		storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
 
 		console.log({
 			...this.deps.logParams(),
@@ -201,13 +230,9 @@ export class SplitMigration {
 		store.rebuildKeySizeEstimates();
 		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
-
-		// Notify the parent: a promotion root calls migrationAcknowledgePromotionComplete; a range-split child calls migrationAcknowledgeChildComplete.
-		if (isHashPartition(parentCtx)) {
-			await parent.migrationAcknowledgePromotionComplete(pCtx.rangePartition!.hashKey);
-		} else {
-			await parent.migrationAcknowledgeChildComplete(pCtx.doName);
-		}
+		storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
+		await this.acknowledgeParent(pCtx, parentCtx);
+		storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
 
 		console.log({
 			...this.deps.logParams(),
