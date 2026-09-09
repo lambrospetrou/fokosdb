@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { kb } from "./helpers.js";
+import { kb, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
 	PROMOTION_TEST_MAX_SIZE_MB,
@@ -44,7 +44,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
-			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }],
+			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
 		try {
@@ -76,7 +76,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
-			items: [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }],
+			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
 		try {

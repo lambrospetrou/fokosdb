@@ -22,11 +22,11 @@ const OPERATIONS_SEED = 0x666f6b6f735f7478n; // "fokos_tx"
 function hashOperation(op: TCWriteOperation): bigint {
 	let h = hash64(op.hashKey, OPERATIONS_SEED);
 	h = hash64(op.sortKey, h);
-	// One token carrying the operation, the kind, and WHICH optional fields are present. Without the
-	// presence flags an absent field and a present-but-empty one would chain identically, so
-	// `data: ""` would fingerprint the same as no data at all.
+	// One token carrying the operation, the kind, the returnValues flag, and WHICH optional fields
+	// are present. Without the presence flags an absent field and a present-but-empty one would
+	// chain identically, so `data: ""` would fingerprint the same as no data at all.
 	h = hash64(
-		`${op.operation}|${op.kind ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}${op.ttlAt === undefined ? 0 : 1}${op.update === undefined ? 0 : 1}`,
+		`${op.operation}|${op.kind ?? ""}|${op.returnValuesOnConditionCheckFailure ?? ""}|${op.data === undefined ? 0 : 1}${op.condition === undefined ? 0 : 1}${op.ttlAt === undefined ? 0 : 1}${op.update === undefined ? 0 : 1}`,
 		h,
 	);
 	if (op.data !== undefined) {
@@ -49,10 +49,8 @@ function hashOperation(op: TCWriteOperation): bigint {
 /**
  * Fingerprints a whole operation set as a 16-char hex string.
  *
- * The fold across operations is a wrapping ADD, which is commutative: the same items in a different
- * order are the same request and must produce the same fingerprint. Sorting first would give the
- * same property but costs a sorted copy of the set on every call, including the common path where
- * nothing is being compared.
+ * The fold across operations is ordered and non-commutative: results are positional to the request,
+ * so the same operations in a different order are a different request.
  *
  * Hex, not INTEGER, because Durable Object SQL cannot bind a JS bigint ("Cannot convert a BigInt
  * value to a number") and `Number()` would silently drop precision above 2^53.
@@ -61,11 +59,9 @@ function hashOperation(op: TCWriteOperation): bigint {
  * deliberately crafted collision would only mislead the client that crafted it.
  */
 export function hashTransactionOperations(ops: readonly TCWriteOperation[]): string {
-	let total = 0n;
+	let h = hash64(`${ops.length}`, OPERATIONS_SEED);
 	for (const op of ops) {
-		total = (total + hashOperation(op)) & U64_MASK;
+		h = hash64(hashOperation(op).toString(16), h);
 	}
-	// Final chain through the item count: it avalanches the plain sum and pins the set size, so a set
-	// whose members happen to sum to another set's total is still distinguished.
-	return hash64(`${ops.length}`, total).toString(16).padStart(16, "0");
+	return h.toString(16).padStart(16, "0");
 }

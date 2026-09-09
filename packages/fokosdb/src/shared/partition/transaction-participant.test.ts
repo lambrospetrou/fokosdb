@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
-import type { PrepareRequest } from "../transaction-types.js";
+import type { PrepareRequest, TransactionItem } from "../transaction-types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
@@ -39,12 +39,17 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 	});
 }
 
-function prepareReq(overrides: Partial<PrepareRequest> & Pick<PrepareRequest, "items">): PrepareRequest {
+// Stamps the request-order opIndex, as db.ts and the transaction coordinator do for a real request.
+function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): TransactionItem[] {
+	return items.map((item, i) => ({ ...item, opIndex: i }));
+}
+
+function prepareReq(overrides: Omit<Partial<PrepareRequest>, "items"> & { items: Omit<TransactionItem, "opIndex">[] }): PrepareRequest {
 	return {
 		transactionId: overrides.transactionId ?? crypto.randomUUID(),
 		coordinatorDoId: overrides.coordinatorDoId ?? "tc-test",
 		transactionTimestamp: overrides.transactionTimestamp ?? BASE_NOW + 100,
-		items: overrides.items,
+		items: withOpIndex(overrides.items),
 	};
 }
 
@@ -92,7 +97,7 @@ describe("TransactionParticipant - prepare", () => {
 			expect(participant.prepareLocal(first)).toEqual({ outcome: "accepted" });
 
 			const second = prepareReq({ items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" }] });
-			expect(participant.prepareLocal(second)).toEqual({
+			expect(participant.prepareLocal(second)).toMatchObject({
 				outcome: "rejected",
 				reason: {
 					type: "pending_conflict",
@@ -121,7 +126,7 @@ describe("TransactionParticipant - prepare", () => {
 					},
 				],
 			});
-			expect(participant.prepareLocal(request)).toEqual({
+			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "condition_failed", hashKey: "hk", sortKey: "sk" },
 			});
@@ -137,7 +142,7 @@ describe("TransactionParticipant - prepare", () => {
 			const missingReq = prepareReq({
 				items: [{ hashKey: kb("missing-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
 			});
-			expect(participant.prepareLocal(missingReq)).toEqual({
+			expect(participant.prepareLocal(missingReq)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "update_not_applicable", hashKey: "missing-item", sortKey: undefined },
 			});
@@ -154,7 +159,7 @@ describe("TransactionParticipant - prepare", () => {
 			const textReq = prepareReq({
 				items: [{ hashKey: kb("text-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
 			});
-			expect(participant.prepareLocal(textReq)).toEqual({
+			expect(participant.prepareLocal(textReq)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "update_not_applicable", hashKey: "text-item", sortKey: undefined },
 			});
@@ -172,7 +177,7 @@ describe("TransactionParticipant - prepare", () => {
 			store.upsertItem({ hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
 
 			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
-			expect(participant.prepareLocal(request)).toEqual({
+			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
 			});
@@ -181,7 +186,9 @@ describe("TransactionParticipant - prepare", () => {
 			expect(store.getItem(binaryKey, sk).row?.v).toBe(1);
 
 			// The single-shot path answers with the same reason.
-			expect(participant.executeSingleShot({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] })).toEqual({
+			expect(
+				participant.executeSingleShot({ items: withOpIndex([{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }]) }),
+			).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
 			});
@@ -270,7 +277,7 @@ describe("TransactionParticipant - prepare", () => {
 				transactionTimestamp: BASE_NOW + 50, // equal to last_transaction_ts → conflict
 				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" }],
 			});
-			expect(participant.prepareLocal(atTs)).toEqual({
+			expect(participant.prepareLocal(atTs)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "timestamp_conflict", hashKey: "hk", sortKey: "sk" },
 			});
@@ -311,7 +318,7 @@ describe("TransactionParticipant - prepare", () => {
 				transactionTimestamp: BASE_NOW + 2_000,
 				items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "stale", kind: "text" }],
 			});
-			expect(participant.prepareLocal(superseded)).toEqual({
+			expect(participant.prepareLocal(superseded)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "timestamp_conflict", hashKey: "hk", sortKey: "sk" },
 			});
@@ -328,7 +335,7 @@ describe("TransactionParticipant - prepare", () => {
 				transactionTimestamp: BASE_NOW + 200,
 				items: [{ hashKey: kb("absent"), sortKey: KeyCodec.encodeOptional(undefined), operation: "check" }],
 			});
-			expect(participant.prepareLocal(atWatermark)).toEqual({
+			expect(participant.prepareLocal(atWatermark)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "timestamp_conflict", hashKey: "absent", sortKey: undefined },
 			});
@@ -383,7 +390,7 @@ describe("TransactionParticipant - prepare", () => {
 					{ hashKey: kb("conflicting"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" },
 				],
 			});
-			expect(participant.prepareLocal(request)).toEqual({
+			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "timestamp_conflict", hashKey: "conflicting", sortKey: undefined },
 			});
@@ -514,7 +521,7 @@ describe("TransactionParticipant - single shot", () => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			expect(
 				participant.executeSingleShot({
-					items: [{ hashKey: kb("ttl-put"), sortKey, operation: "put", data: "value", kind: "text", ttlAt: 777 }],
+					items: withOpIndex([{ hashKey: kb("ttl-put"), sortKey, operation: "put", data: "value", kind: "text", ttlAt: 777 }]),
 				}),
 			).toEqual({ outcome: "committed" });
 			expect(store.getItem(kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
@@ -536,7 +543,7 @@ describe("TransactionParticipant - single shot", () => {
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }]);
 
 			const res = participant.executeSingleShot({
-				items: [{ hashKey: kb("u1"), sortKey, operation: "update", update: updatePlan }],
+				items: withOpIndex([{ hashKey: kb("u1"), sortKey, operation: "update", update: updatePlan }]),
 			});
 			expect(res).toEqual({ outcome: "committed" });
 
@@ -553,9 +560,9 @@ describe("TransactionParticipant - single shot", () => {
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
 
 			const res = participant.executeSingleShot({
-				items: [{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan }],
+				items: withOpIndex([{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan }]),
 			});
-			expect(res).toEqual({
+			expect(res).toMatchObject({
 				outcome: "rejected",
 				reason: { type: "update_not_applicable", hashKey: "missing-u", sortKey: undefined },
 			});

@@ -198,6 +198,7 @@ export type {
 	TCReadItem,
 	TransactWriteItem,
 	TransactWriteItemsOptions,
+	TransactWriteOperationResult,
 	TransactGetItemsOptions,
 } from "./transaction-types.js";
 

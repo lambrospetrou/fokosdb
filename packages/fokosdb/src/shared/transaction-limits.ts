@@ -10,8 +10,9 @@
  */
 
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
-import type { TransactionOperationType } from "./transaction-types.js";
+import type { ParticipantOperationResultEncoded, RejectionReasonEncoded, TransactionOperationType } from "./transaction-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
+import type { ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -37,6 +38,7 @@ export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 
 export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
+export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const SWEEP_BATCH_ROWS = 1_000;
@@ -92,6 +94,7 @@ export type TransactWriteOperationLike = {
 	data?: Uint8Array | string;
 	condition?: CompiledConditionPlan;
 	update?: CompiledUpdatePlan;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
 function isEmptyKey(k: string | Uint8Array): boolean {
@@ -206,6 +209,7 @@ export function validateTransactWriteOperations(
 		if (op.operation !== "update" && op.update) {
 			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry an update plan (${at})`);
 		}
+		validateReturnValuesOnConditionCheckFailure(op.returnValuesOnConditionCheckFailure);
 		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
 		// commitLocal's keyset check and the TC's two-phase read pairing use.
 		//
@@ -273,4 +277,53 @@ export function validateReturnValuesOnConditionCheckFailure(value?: string): voi
 	if (value !== undefined && value !== "none" && value !== "all_old") {
 		throw new Error(`fokos: returnValuesOnConditionCheckFailure must be 'none' or 'all_old' (got '${value}')`);
 	}
+}
+
+/**
+ * Enforces MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX over one answer, in request order.
+ *
+ * Sorts by opIndex, then walks: an image that would take the running total above the cap is dropped
+ * and marked, and so is every later image. A result that already carries `itemOmitted` was dropped
+ * one level down, so it is left alone and its bytes are not counted — they are not being sent.
+ *
+ * `imageBytes` is the byte count the partition measured with the image itself, so every level caps
+ * on one number and no two levels measure the same image differently.
+ */
+export function applyImageCap(
+	results: ParticipantOperationResultEncoded[],
+	cap: number = MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX,
+): ParticipantOperationResultEncoded[] {
+	results.sort((a, b) => a.opIndex - b.opIndex);
+	let runningBytes = 0;
+	let exceeded = false;
+	for (const r of results) {
+		if (r.outcome !== "rejected" || r.itemOmitted || r.imageBytes === undefined) continue;
+		if (exceeded || runningBytes + r.imageBytes > cap) {
+			exceeded = true;
+			if (r.reason.type === "condition_failed") delete r.reason.item;
+			r.itemOmitted = "response_too_large";
+		} else {
+			runningBytes += r.imageBytes;
+		}
+	}
+	return results;
+}
+
+/**
+ * The rejection reason one node reports for its whole answer: the rejected result with the lowest
+ * request index, so the answer never depends on which child replied first.
+ *
+ * The image is stripped. A reason travels to the transaction-level `reason` and to
+ * `tc_state.rejection_reason_json`, and neither may carry up to MAX_ITEM_BYTES of item data. The
+ * image stays on the per-operation result that owns it.
+ */
+export function pickWinningReason(results: ParticipantOperationResultEncoded[]): RejectionReasonEncoded {
+	let winner: (ParticipantOperationResultEncoded & { outcome: "rejected" }) | undefined;
+	for (const r of results) {
+		if (r.outcome === "rejected" && (winner === undefined || r.opIndex < winner.opIndex)) winner = r;
+	}
+	if (!winner) return { type: "transient_error" };
+	const reason: RejectionReasonEncoded = { ...winner.reason };
+	if (reason.type === "condition_failed") delete reason.item;
+	return reason;
 }

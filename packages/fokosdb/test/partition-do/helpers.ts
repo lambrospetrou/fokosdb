@@ -13,9 +13,19 @@ import { PartitionContextCreator } from "../../src/shared/partition-topology/par
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import type { SplitStatusKVItem } from "../../src/shared/partition-topology/split-state.js";
+import type { TransactionItem } from "../../src/shared/transaction-types.js";
 
 export const kb = (s?: string) => KeyCodec.encodeOptional(s);
 export const compiledCondition = (condition: ConditionExpression) => compileConditionExpression(condition);
+
+/**
+ * Stamps the request-order opIndex onto prepare and single-shot items, as db.ts and the transaction
+ * coordinator do for a real request. Every result carries the index back, so a test that omits it
+ * would not exercise the merge the production paths run.
+ */
+export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): TransactionItem[] {
+	return items.map((item, i) => ({ ...item, opIndex: i }));
+}
 
 export type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
 export type PartitionOptions = Partial<Parameters<typeof PartitionContextCreator.create>[0]>;

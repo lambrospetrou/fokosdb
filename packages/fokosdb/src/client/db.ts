@@ -26,6 +26,7 @@ import type { TransactionCoordinatorDO } from "../server/do-transaction-coordina
 import type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
 import type {
 	InitiateReadResponseEncoded,
+	InitiateWriteResponseEncoded,
 	ReadForTransactionItemResultEncoded,
 	RejectionReason,
 	RejectionReasonEncoded,
@@ -34,6 +35,8 @@ import type {
 	TCReadItem,
 	TransactGetItemsOptions,
 	TransactWriteItemsOptions,
+	TransactWriteOperationResult,
+	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-types.js";
 import {
 	encodeHashKey,
@@ -115,6 +118,16 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 		};
 	}
 	return reason as RejectionReason;
+}
+
+function decodeOperationResult(res: TransactWriteOperationResultEncoded): TransactWriteOperationResult {
+	if (res.outcome === "passed") return { outcome: "passed" };
+	if (res.outcome === "not_evaluated") return { outcome: "not_evaluated" };
+	return {
+		outcome: "rejected",
+		reason: decodeRejectionReason(res.reason),
+		...(res.itemOmitted ? { itemOmitted: res.itemOmitted } : {}),
+	};
 }
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
@@ -272,7 +285,7 @@ export class FokosDB {
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-			return { ...item, hashKey, sortKey, partitionContext };
+			return { ...item, opIndex: i, hashKey, sortKey, partitionContext };
 		});
 
 		if (!opts.clientRequestToken) {
@@ -293,9 +306,17 @@ export class FokosDB {
 
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See InitiateWriteResponse.
-		return await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
+		const encoded = await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
 		});
+		if (encoded.outcome === "committed") return encoded;
+		return {
+			outcome: "cancelled",
+			transactionId: encoded.transactionId,
+			idempotencyToken: encoded.idempotencyToken,
+			reason: decodeRejectionReason(encoded.reason),
+			results: encoded.results.map(decodeOperationResult),
+		};
 	}
 
 	/**
@@ -328,7 +349,13 @@ export class FokosDB {
 			// A partition past its size cap is healthy, just full. The coordinator answers a prepare that
 			// throws this with a cancelled transaction, and this path must answer identically.
 			if (isPartitionExceededDatabaseSizeError(err)) {
-				return { outcome: "cancelled", transactionId, idempotencyToken: transactionId, reason: { type: "transient_error" } };
+				return {
+					outcome: "cancelled",
+					transactionId,
+					idempotencyToken: transactionId,
+					reason: { type: "transient_error" },
+					results: items.map(() => ({ outcome: "not_evaluated" })),
+				};
 			}
 			throw err;
 		}
@@ -336,7 +363,13 @@ export class FokosDB {
 		if (response.outcome === "committed") {
 			return { outcome: "committed", transactionId, idempotencyToken: transactionId };
 		}
-		return { outcome: "cancelled", transactionId, idempotencyToken: transactionId, reason: response.reason };
+		return {
+			outcome: "cancelled",
+			transactionId,
+			idempotencyToken: transactionId,
+			reason: decodeRejectionReason(response.reason),
+			results: response.results.map(decodeOperationResult),
+		};
 	}
 
 	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {

@@ -1,6 +1,14 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { KeyBytes } from "./partition-topology/key-codec.js";
-import type { ConditionCheckImage, ConditionCheckImageEncoded, DataKind, ItemKey, JsonComposite, JsonValue } from "./types.js";
+import type {
+	ConditionCheckImage,
+	ConditionCheckImageEncoded,
+	DataKind,
+	ItemKey,
+	JsonComposite,
+	JsonValue,
+	ReturnValuesOnConditionCheckFailure,
+} from "./types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
 
@@ -31,6 +39,11 @@ export type TransactionItemKey = {
 // Wire-IN type (db.ts/TC → PartitionDO): keys are canonical KeyBytes (encoded at the db.ts entry).
 // sortKey is always present — the empty KeyBytes ([]) is the absent sentinel.
 export type TransactionItem = TransactionItemKey & {
+	/**
+	 * Position of this operation in the caller's request. Every result carries it back, so a node
+	 * that owns a subset of the operations still merges by request order and never by arrival order.
+	 */
+	opIndex: number;
 	operation: TransactionOperationType;
 	/** Required for "put". Already encoded (JSON stringified at the db.ts boundary), so string | Uint8Array. */
 	data?: Uint8Array | string;
@@ -42,6 +55,7 @@ export type TransactionItem = TransactionItemKey & {
 	condition?: CompiledConditionPlan;
 	/** Compiled update plan; present for "update". */
 	update?: CompiledUpdatePlan;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
 export type PrepareRequest = {
@@ -79,7 +93,37 @@ export type RejectionReasonOf<I = ConditionCheckImage> =
 export type RejectionReasonEncoded = RejectionReasonOf<ConditionCheckImageEncoded>;
 export type RejectionReason = RejectionReasonOf<ConditionCheckImage>;
 
-export type PrepareResponse = { outcome: "accepted" } | { outcome: "rejected"; reason: RejectionReason };
+/** Wire variant. `imageBytes` is coordinator bookkeeping, which db.ts strips. */
+export type TransactWriteOperationResultEncoded =
+	| { outcome: "passed" }
+	| { outcome: "not_evaluated" }
+	| {
+			outcome: "rejected";
+			reason: RejectionReasonEncoded;
+			imageBytes?: number;
+			itemOmitted?: "response_too_large";
+	  };
+
+/** What a participant answers: the same result, labelled with the index the request gave it. */
+export type ParticipantOperationResultEncoded = TransactWriteOperationResultEncoded & { opIndex: number };
+
+/** Public variant, surfaced by db.ts. */
+export type TransactWriteOperationResult =
+	| { outcome: "passed" }
+	| { outcome: "not_evaluated" }
+	| {
+			outcome: "rejected";
+			reason: RejectionReason;
+			itemOmitted?: "response_too_large";
+	  };
+
+export type PrepareResponse =
+	| { outcome: "accepted" }
+	| {
+			outcome: "rejected";
+			reason: RejectionReasonEncoded;
+			results?: ParticipantOperationResultEncoded[];
+	  };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
 
@@ -203,7 +247,19 @@ export type SingleShotRequest = {
  * whole set serially inside one storage transaction, so serializability comes from the execution
  * order.
  */
-export type SingleShotResponse = { outcome: "committed" } | { outcome: "rejected"; reason: RejectionReason };
+export type SingleShotResponse =
+	| { outcome: "committed" }
+	| {
+			outcome: "rejected";
+			reason: RejectionReasonEncoded;
+			/**
+			 * One result for each operation of the request. Required, unlike the `results` of a
+			 * PrepareResponse: an absent array there means an execution failure, and this path has none.
+			 * One DO evaluates the whole set, so every rejection comes from its check pass, which answers
+			 * for every operation it looked at.
+			 */
+			results: ParticipantOperationResultEncoded[];
+	  };
 
 // ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
 
@@ -257,12 +313,14 @@ export type TransactWriteItem =
 			/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
 			ttlAt?: number;
 			condition?: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
 	| {
 			operation: "delete";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
 			condition?: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
 	| {
 			operation: "check";
@@ -270,6 +328,7 @@ export type TransactWriteItem =
 			sortKey?: string | Uint8Array;
 			/** A check must have one condition because it does not write. */
 			condition: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
 	| {
 			operation: "update";
@@ -278,6 +337,7 @@ export type TransactWriteItem =
 			update: UpdateExpression;
 			ttlAt?: number;
 			condition?: ConditionExpression;
+			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  };
 
 export type TransactWriteItemsOptions = {
@@ -297,6 +357,8 @@ export type TransactGetItemsOptions = {
 
 // Wire-IN type (db.ts → TC): keys are canonical KeyBytes (sortKey [] = absent).
 export type TCWriteOperation = {
+	/** Position of this operation in the caller's request; see TransactionItem.opIndex. */
+	opIndex: number;
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
 	operation: TransactionOperationType;
@@ -306,6 +368,7 @@ export type TCWriteOperation = {
 	ttlAt?: number;
 	condition?: CompiledConditionPlan;
 	update?: CompiledUpdatePlan;
+	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };
@@ -316,23 +379,22 @@ export type InitiateWriteRequest = {
 	items: TCWriteOperation[];
 };
 
+export type InitiateWriteResponseEncoded =
+	| {
+			outcome: "committed";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+	  }
+	| {
+			outcome: "cancelled";
+			transactionId: TransactionId;
+			idempotencyToken: IdempotencyToken;
+			reason: RejectionReasonEncoded;
+			results: TransactWriteOperationResultEncoded[];
+	  };
+
 /**
- * Result of TC.initiateWrite, and the public result of FokosDB.transactWriteItems — ONE type, because
- * it carries no keys for `db.ts` to decode. There is deliberately no item array: a write transaction
- * is all-or-nothing, so echoing the keys back tells the caller only what it already sent. DynamoDB's
- * TransactWriteItems answers the same way, returning consumed capacity and nothing item-shaped.
- *
- * `RejectionReason` keys are in public form, unlike every other TC→db.ts value, because the reason is
- * PERSISTED in `tc_state.rejection_reason_json` and replayed verbatim on an idempotent retry. Storing
- * bytes there would need the same `$u8` JSON tagging plus a decode on every replay.
- *
- * FIXME: `cancelled` reports ONE reason for the whole transaction, so a caller with 100 operations
- * cannot tell which one failed unless the reason happens to carry a key (`transient_error` and
- * `clock_skew` carry none). DynamoDB returns `CancellationReasons` — one entry per operation, in
- * REQUEST ORDER, with `Code: "None"` for the operations that were fine — and raises it as a typed
- * `TransactionCanceledException`. We should do both: a positional per-operation reason array, and
- * typed errors that share the `RejectionReason` union with the non-transactional path. That also
- * lets a size-rejected prepare say so instead of reporting `transient_error`.
+ * Result of TC.initiateWrite, and the public result of FokosDB.transactWriteItems.
  */
 export type InitiateWriteResponse =
 	| {
@@ -345,6 +407,7 @@ export type InitiateWriteResponse =
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
 			reason: RejectionReason;
+			results: TransactWriteOperationResult[];
 	  };
 
 // Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).

@@ -8,6 +8,7 @@ import type {
 	CommitResponse,
 	DebugForceResolveTransactionRequest,
 	DebugForceResolveTransactionResponse,
+	ParticipantOperationResultEncoded,
 	PrepareRequest,
 	PrepareResponse,
 	ReadForTransactionRequest,
@@ -18,6 +19,7 @@ import type {
 	RejectionReasonEncoded,
 	SingleShotRequest,
 	SingleShotResponse,
+	TransactionItem,
 } from "../shared/transaction-types.js";
 import {
 	areImmutableOptionsEqual,
@@ -78,7 +80,7 @@ import {
 import { PageBudget } from "../shared/query/page-budget.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
+import { applyImageCap, IDEMPOTENCY_WINDOW_MS, pickWinningReason } from "../shared/transaction-limits.js";
 import { errExceededDatabaseSize, errSinglePartitionFastPathFallback } from "../shared/partition-errors.js";
 
 export interface PartitionAPI {
@@ -1439,16 +1441,47 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		const { local, forwarded } = this.groupItemsByRouting(request.items, "write", "prepare");
 
-		const tasks: Promise<PrepareResponse>[] = [];
+		type SubTask = { items: TransactionItem[]; promise: Promise<PrepareResponse> };
+		const tasks: SubTask[] = [];
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
-			tasks.push(this.getChildStub(childPCtx).txPrepare(childPCtx, { ...request, items }));
+			tasks.push({
+				items,
+				promise: this.getChildStub(childPCtx).txPrepare(childPCtx, { ...request, items }),
+			});
 		}
 		if (local.length > 0) {
-			tasks.push(this.prepareLocal({ ...request, items: local }));
+			tasks.push({
+				items: local,
+				promise: this.prepareLocal({ ...request, items: local }),
+			});
 		}
 		if (tasks.length === 0) return { outcome: "accepted" };
-		const results = await Promise.all(tasks);
-		return results.find((r) => r.outcome === "rejected") ?? { outcome: "accepted" };
+
+		const responses = await Promise.all(tasks.map((t) => t.promise));
+
+		// An execution failure belongs to no operation and outranks every per-operation rejection, so
+		// it travels up as it arrived, without an array. It is the one answer that carries none.
+		const executionFailure = responses.find((r) => r.outcome === "rejected" && !r.results);
+		if (executionFailure) return executionFailure;
+
+		if (!responses.some((r) => r.outcome === "rejected")) return { outcome: "accepted" };
+
+		// This node answers for every operation it was given, whichever child evaluated it. A child
+		// that accepted sends no array, so its operations passed.
+		const mergedResults: ParticipantOperationResultEncoded[] = [];
+		for (let i = 0; i < tasks.length; i++) {
+			const resp = responses[i];
+			if (resp.outcome === "accepted") {
+				for (const item of tasks[i].items) {
+					mergedResults.push({ outcome: "passed", opIndex: item.opIndex });
+				}
+			} else if (resp.results) {
+				mergedResults.push(...resp.results);
+			}
+		}
+
+		applyImageCap(mergedResults);
+		return { outcome: "rejected", reason: pickWinningReason(mergedResults), results: mergedResults };
 	}
 
 	private async prepareLocal(request: PrepareRequest): Promise<PrepareResponse> {

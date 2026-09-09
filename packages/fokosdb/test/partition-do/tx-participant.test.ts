@@ -6,7 +6,7 @@ import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallback
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
-import { compiledCondition, kb, makeStub } from "./helpers.js";
+import { compiledCondition, kb, makeStub, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
 describe("PartitionDO — transactions spanning local and promoted keys", () => {
@@ -24,10 +24,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
-			],
+			]),
 		});
 		expect(prepareResp.outcome).toBe("accepted");
 
@@ -61,10 +61,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "alice-data", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
-			],
+			]),
 		});
 		expect(prepareResp.outcome).toBe("accepted");
 
@@ -84,10 +84,10 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			transactionId: txId2,
 			transactionTimestamp: Date.now() + 1,
 			coordinatorDoId: coordId,
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "retried", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "retried", kind: "text" },
-			],
+			]),
 		});
 		expect(prepareResp2.outcome).toBe("accepted");
 		await stub.txCancel(ctx, {
@@ -105,7 +105,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	// written and every "write" is refused for size.
 	const OVER_SIZE = { hashSplitConditions: { maxSizeMb: 0.000_001 } };
 
-	const txItems = [{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put" as const, data: "d", kind: "text" as const }];
+	const txItems = withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put" as const, data: "d", kind: "text" as const }]);
 
 	// An over-size partition is healthy, just full.
 	// The isPartitionOverSizeError assertion is the load-bearing one: the coordinator uses it to skip
@@ -168,7 +168,7 @@ describe("PartitionDO — single-shot transaction", () => {
 		await stub.apiPutItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk"), data: "keep", kind: "text" as const });
 
 		const res = await stub.txExecuteSingleShot(ctx, {
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("shot-new"), sortKey: kb("sk"), operation: "put", data: "written", kind: "text" },
 				{ hashKey: kb("shot-gone"), sortKey: kb("sk"), operation: "delete" },
 				{
@@ -177,7 +177,7 @@ describe("PartitionDO — single-shot transaction", () => {
 					operation: "check",
 					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 				},
-			],
+			]),
 		});
 
 		expect(res).toEqual({ outcome: "committed" });
@@ -200,7 +200,7 @@ describe("PartitionDO — single-shot transaction", () => {
 
 		// The failing item is LAST, so a non-atomic implementation would already have written the first.
 		const res = await stub.txExecuteSingleShot(ctx, {
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("atomic-existing"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" },
 				{ hashKey: kb("atomic-other"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
 				{
@@ -209,10 +209,10 @@ describe("PartitionDO — single-shot transaction", () => {
 					operation: "check",
 					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 				},
-			],
+			]),
 		});
 
-		expect(res).toEqual({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" } });
+		expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" } });
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "v1", version: 1 },
@@ -228,15 +228,15 @@ describe("PartitionDO — single-shot transaction", () => {
 			transactionId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
-			items: [{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "two-phase", kind: "text" }],
+			items: withOpIndex([{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "two-phase", kind: "text" }]),
 		});
 		expect(prepared.outcome).toBe("accepted");
 
 		const res = await stub.txExecuteSingleShot(ctx, {
-			items: [
+			items: withOpIndex([
 				{ hashKey: kb("shot-free"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
 				{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
-			],
+			]),
 		});
 
 		// The two-phase transaction may still commit, so this one loses rather than overwriting it.
@@ -256,7 +256,9 @@ describe("PartitionDO — single-shot transaction", () => {
 		// written and every write is refused for size.
 		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
 		const error = await stub
-			.txExecuteSingleShot(ctx, { items: [{ hashKey: kb("over-size"), sortKey: kb("sk"), operation: "put", data: "d", kind: "text" }] })
+			.txExecuteSingleShot(ctx, {
+				items: withOpIndex([{ hashKey: kb("over-size"), sortKey: kb("sk"), operation: "put", data: "d", kind: "text" }]),
+			})
 			.then(
 				() => null,
 				(e: unknown) => e,
@@ -271,7 +273,7 @@ describe("PartitionDO — single-shot transaction", () => {
 
 		for (let i = 0; i < 40; i++) {
 			const res = await stub.txExecuteSingleShot(ctx, {
-				items: [{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }],
+				items: withOpIndex([{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }]),
 			});
 			expect(res.outcome).toBe("committed");
 			if ((await stub.status()).splitStatus) break;
@@ -293,9 +295,9 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now();
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
-		const items = [
+		const items = withOpIndex([
 			{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
-		];
+		]);
 		expect(
 			await stub.txPrepare(ctx, {
 				transactionId,
@@ -329,7 +331,9 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 		for (let i = 0; i < 40; i++) {
 			const transactionId = crypto.randomUUID();
-			const items = [{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const }];
+			const items = withOpIndex([
+				{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const },
+			]);
 			const transactionTimestamp = Date.now() + i;
 			expect(await stub.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
 			await stub.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
@@ -373,7 +377,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			transactionId: crypto.randomUUID(),
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
-			items: [{ hashKey: kb("snap-locked"), sortKey: kb("sk"), operation: "put", data: "pending", kind: "text" }],
+			items: withOpIndex([{ hashKey: kb("snap-locked"), sortKey: kb("sk"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(prepared.outcome).toBe("accepted");
 

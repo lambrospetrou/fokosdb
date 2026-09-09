@@ -9,11 +9,19 @@ describe("hashTransactionOperations", () => {
 		expect(hashTransactionOperations([put("a", "s", "v")])).toBe(hashTransactionOperations([put("a", "s", "v")]));
 	});
 
-	// The fold is a wrapping add precisely so this holds without sorting: the same items sent in a
-	// different order are the same request, and must replay rather than be rejected.
-	it("ignores operation order", () => {
+	it("changes when operation order changes", () => {
 		const ops = [put("a", "s1", "v1"), put("b", "s2", "v2"), put("c", "s3", "v3")];
-		expect(hashTransactionOperations([...ops].reverse())).toBe(hashTransactionOperations(ops));
+		expect(hashTransactionOperations([...ops].reverse())).not.toBe(hashTransactionOperations(ops));
+	});
+
+	it("changes when returnValuesOnConditionCheckFailure changes", () => {
+		const base = put("a", "s", "v");
+		expect(hashTransactionOperations([{ ...base, returnValuesOnConditionCheckFailure: "all_old" }])).not.toBe(
+			hashTransactionOperations([base]),
+		);
+		expect(hashTransactionOperations([{ ...base, returnValuesOnConditionCheckFailure: "all_old" }])).not.toBe(
+			hashTransactionOperations([{ ...base, returnValuesOnConditionCheckFailure: "none" }]),
+		);
 	});
 
 	// The whole point of B8: same keys, different payload must NOT replay as committed.
@@ -81,6 +89,9 @@ function put(hashKey: string, sortKey: string, data: string): TCWriteOperation {
 		operation: "put",
 		data,
 		kind: "text",
+		// Never read by the fingerprint: the fold is ordered, so the position of the operation in the
+		// array already carries the request order that opIndex repeats.
+		opIndex: 0,
 		// Never read by the fingerprint — routing is not part of the request's identity.
 		partitionContext: undefined as never,
 	};

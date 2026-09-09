@@ -3,9 +3,16 @@ import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isTransactionCommitPendingError, isTransactionUndecidedError, TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { PartitionDO } from "./do-partition.js";
+import { errExceededDatabaseSize } from "../shared/partition-errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
-import type { InitiateWriteRequest, InitiateWriteResponse, RejectionReason, TCState } from "../shared/transaction-types.js";
+import type {
+	InitiateWriteRequest,
+	InitiateWriteResponse,
+	PrepareResponse,
+	RejectionReason,
+	TCState,
+} from "../shared/transaction-types.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -25,6 +32,7 @@ type CoordinatorInternals = {
 	alarm(): Promise<void>;
 	initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse>;
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponse;
+	cancelTransactionInStore(transactionId: string): void;
 	drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
@@ -56,15 +64,15 @@ function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionRea
 	// A realistic item set, one row with a sort key and one without. The response must not depend on
 	// it: a committed transaction reports no items.
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
-		 VALUES (?, ?, ?, 'put', 'v', 1, NULL, 'p1')`,
+		`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		 VALUES (?, ?, ?, 0, 'put', 'v', 1, NULL, 'p1')`,
 		TX_ID,
 		kb("hk1"),
 		kb("sk1"),
 	);
 	state.storage.sql.exec(
-		`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, conditions_json, partition_do_name)
-		 VALUES (?, ?, ?, 'delete', NULL, NULL, NULL, 'p1')`,
+		`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, conditions_json, partition_do_name)
+		 VALUES (?, ?, ?, 1, 'delete', NULL, NULL, NULL, 'p1')`,
 		TX_ID,
 		kb("hk2"),
 		ABSENT_SK,
@@ -101,15 +109,30 @@ function insertState(
 	);
 }
 
-function insertParticipant(state: DurableObjectState, outcome: { prepare?: string; commit?: string; cancel?: string }): void {
+function insertParticipant(
+	state: DurableObjectState,
+	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareResponse },
+): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
-			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome)
-		 VALUES (?, 'p1', '{}', ?, ?, ?)`,
+			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json)
+		 VALUES (?, ?, '{}', ?, ?, ?, ?)`,
 		TX_ID,
+		outcome.name ?? "p1",
 		outcome.prepare ?? null,
 		outcome.commit ?? null,
 		outcome.cancel ?? null,
+		outcome.answer === undefined ? null : JSON.stringify(outcome.answer),
+	);
+}
+
+function insertImage(state: DurableObjectState, transactionId: string, opIndex: number, data: string): void {
+	state.storage.sql.exec(
+		`INSERT INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+		 VALUES (?, ?, 1, 1, NULL, ?)`,
+		transactionId,
+		opIndex,
+		data,
 	);
 }
 
@@ -167,7 +190,7 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 		await withCoordinator((tc, state) => {
 			const reason: RejectionReason = { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" };
 			seed(state, tcState, reason);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
 				outcome: "cancelled",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -293,6 +316,176 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
+	// A prepare that keeps throwing decides nothing: the transaction can still commit once the
+	// participant answers. Cancelling on it would turn transient trouble into a lost transaction.
+	it("leaves a transaction PREPARING when a participant still has no answer and none rejected", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { prepare: "accepted", name: "p1" });
+			insertParticipant(state, { name: "p2" });
+			const txPrepare = vi.fn(async () => {
+				throw errExceededDatabaseSize("txPrepare");
+			});
+			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			expect(
+				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
+			).toBe("PREPARING");
+			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(/outcome is not yet decided/);
+		});
+	});
+
+	// An execution failure says the transaction could not run, not that a caller's premise was wrong.
+	// It belongs to no operation, so it outranks a condition rejection another participant reported,
+	// and the images that rejection collected are not the caller's answer.
+	it("reports an execution failure over a condition rejection and drops the images with it", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, {
+				name: "p1",
+				prepare: "rejected",
+				answer: { outcome: "rejected", reason: { type: "clock_skew", serverTimestampMs: 10, transactionTimestampMs: 99 } },
+			});
+			insertParticipant(state, {
+				name: "p2",
+				prepare: "rejected",
+				answer: {
+					outcome: "rejected",
+					reason: { type: "condition_failed", hashKey: "hk2" },
+					results: [{ opIndex: 1, outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" }, imageBytes: 6 }],
+				},
+			});
+			insertImage(state, TX_ID, 1, "image-1");
+
+			tc.cancelTransactionInStore(TX_ID);
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.reason).toEqual({ type: "clock_skew", serverTimestampMs: 10, transactionTimestampMs: 99 });
+				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			}
+			expect(countRows(state, "tc_results")).toBe(0);
+		});
+	});
+
+	// A prepare that throws after its retries leaves its operations with no result at all. The caller
+	// must still receive one entry for each operation it sent, and a retryable reason to act on.
+	it("leaves the operations of a thrown prepare not_evaluated and cancels with transient_error", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1" });
+			insertParticipant(state, { name: "p2" });
+			const throwingPrepare = vi.fn(async () => {
+				throw new Error("partition unreachable");
+			});
+			const rejectingPrepare = vi.fn(async () => ({
+				outcome: "rejected" as const,
+				reason: { type: "condition_failed" as const, hashKey: "hk2" },
+				results: [
+					{
+						opIndex: 1,
+						outcome: "rejected" as const,
+						reason: {
+							type: "condition_failed" as const,
+							hashKey: "hk2",
+							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+						},
+						imageBytes: 7,
+					},
+				],
+			}));
+			vi.spyOn(PartitionDO, "getByName").mockImplementation(
+				(_ns, name) => ({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+			);
+			vi.spyOn(tc, "runCancel").mockResolvedValue();
+
+			const response = await tc.drivePrepare(TX_ID, TOKEN, "coordinator-id");
+
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.reason).toEqual({ type: "transient_error" });
+				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			}
+			// The rejecting participant's image is not the caller's answer, so none survives the decision.
+			expect(countRows(state, "tc_results")).toBe(0);
+		});
+	});
+
+	// The recovery pass must not suppress images because a participant has not answered yet: that
+	// participant is the one being re-prepared, and it can come back accepted, which leaves the
+	// transaction on the merge path. A suppressed image would then reach the caller as a rejection
+	// with no item and no itemOmitted, which reads as "the item does not exist".
+	it("keeps the images of a recovered participant when another has not answered yet", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1" });
+			insertParticipant(state, { name: "p2" });
+			const acceptingPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
+			const rejectingPrepare = vi.fn(async () => ({
+				outcome: "rejected" as const,
+				reason: { type: "condition_failed" as const, hashKey: "hk2" },
+				results: [
+					{
+						opIndex: 1,
+						outcome: "rejected" as const,
+						reason: {
+							type: "condition_failed" as const,
+							hashKey: "hk2",
+							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+						},
+						imageBytes: 7,
+					},
+				],
+			}));
+			vi.spyOn(PartitionDO, "getByName").mockImplementation(
+				(_ns, name) => ({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+			);
+			vi.spyOn(tc, "runCancel").mockResolvedValue();
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.results[0]).toEqual({ outcome: "passed" });
+				expect(response.results[1]).toMatchObject({
+					outcome: "rejected",
+					reason: { type: "condition_failed", hashKey: "hk2", item: { data: "image-1", version: 1 } },
+				});
+			}
+		});
+	});
+
+	// The answer is written with the prepare outcome it belongs to, so a coordinator evicted between a
+	// participant's answer and the decision still reports what that participant actually said. Without
+	// the stored answer the recovery path could only report transient_error.
+	it("recovers a persisted clock_skew as clock_skew, not as transient_error", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, {
+				name: "p1",
+				prepare: "rejected",
+				answer: { outcome: "rejected", reason: { type: "clock_skew", serverTimestampMs: 5, transactionTimestampMs: 500 } },
+			});
+			insertParticipant(state, { name: "p2", prepare: "accepted" });
+			vi.spyOn(tc, "runCancel").mockResolvedValue();
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.reason).toEqual({ type: "clock_skew", serverTimestampMs: 5, transactionTimestampMs: 500 });
+			}
+		});
+	});
+
 	it("strips payload in the CANCELLING transition", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
@@ -353,12 +546,97 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(row).toMatchObject({ state: "CANCELLED", completed_at: expect.any(Number) });
 			expect(countRows(state, "tc_items")).toBe(0);
 			expect(countRows(state, "tc_participants")).toBe(0);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
 				outcome: "cancelled",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
 				reason,
 			});
+		});
+	});
+
+	it("stores images in tc_results only and keeps tc_state.results_json and answer_json free of item data", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			const largeData = "A".repeat(50_000);
+			state.storage.sql.exec(
+				`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				 VALUES (?, 'p1', '{}', 'rejected', ?)`,
+				TX_ID,
+				JSON.stringify({
+					outcome: "rejected",
+					reason: { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
+					// A participant answers for every operation it owns, not only the ones it rejected.
+					results: [
+						{
+							opIndex: 0,
+							outcome: "rejected",
+							reason: { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
+							imageBytes: 50_000,
+						},
+						{ opIndex: 1, outcome: "passed" },
+					],
+				}),
+			);
+			state.storage.sql.exec(
+				`INSERT INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+				 VALUES (?, 0, 1, 1, NULL, ?)`,
+				TX_ID,
+				largeData,
+			);
+
+			tc.cancelTransactionInStore(TX_ID);
+
+			const stateRow = state.storage.sql
+				.exec<{
+					results_json: string;
+					rejection_reason_json: string;
+				}>(`SELECT results_json, rejection_reason_json FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.toArray()[0];
+
+			expect(stateRow.results_json).not.toContain(largeData);
+			expect(stateRow.results_json).not.toContain('"item"');
+			expect(stateRow.rejection_reason_json).not.toContain(largeData);
+			expect(stateRow.rejection_reason_json).not.toContain('"item"');
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.results).toHaveLength(2);
+				expect(response.results[1]).toEqual({ outcome: "passed" });
+				expect(response.results[0].outcome).toBe("rejected");
+				if (response.results[0].outcome === "rejected" && response.results[0].reason.type === "condition_failed") {
+					expect(response.results[0].reason.item?.data).toBe(largeData);
+				}
+			}
+		});
+	});
+
+	// The array is positional to the request, so a gap must stay a gap. Filling it by push order would
+	// shift every later operation onto its neighbour's outcome, and its neighbour's image with it.
+	it("reports an operation no participant answered as not_evaluated, without shifting the array", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(
+				`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json, prepare_outcome, answer_json)
+				 VALUES (?, 'p1', '{}', 'rejected', ?)`,
+				TX_ID,
+				JSON.stringify({
+					outcome: "rejected",
+					reason: { type: "condition_failed", hashKey: "hk2" },
+					results: [{ opIndex: 1, outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" } }],
+				}),
+			);
+
+			tc.cancelTransactionInStore(TX_ID);
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.results).toHaveLength(2);
+				expect(response.results[0]).toEqual({ outcome: "not_evaluated" });
+				expect(response.results[1]).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" } });
+			}
 		});
 	});
 
@@ -404,6 +682,40 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			await state.storage.deleteAlarm();
 			await tc.alarm();
 			expect(countRows(state, "tc_state")).toBe(0);
+		});
+	});
+
+	// tc_results is keyed by transaction_id, and the sweep selects one batch of ids and deletes both
+	// tables by it. A tc_results row that outlived its tc_state row would be unreachable and unswept.
+	it("deletes the images of every transaction it sweeps, and leaves the rest alone", async () => {
+		await withCoordinator(async (tc, state) => {
+			vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
+			insertState(state, {
+				token: "expired-token",
+				transactionId: "tx-expired",
+				state: "CANCELLED",
+				createdAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
+				completedAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
+			});
+			insertImage(state, "tx-expired", 0, "expired-image-0");
+			insertImage(state, "tx-expired", 1, "expired-image-1");
+			insertState(state, {
+				token: "live-token",
+				transactionId: "tx-live",
+				state: "CANCELLED",
+				createdAt: BASE_TIME,
+				completedAt: BASE_TIME,
+			});
+			insertImage(state, "tx-live", 0, "live-image-0");
+
+			await tc.alarm();
+
+			const remaining = state.storage.sql
+				.exec<{ transaction_id: string }>(`SELECT transaction_id FROM tc_results ORDER BY op_index`)
+				.toArray()
+				.map((r) => r.transaction_id);
+			expect(remaining).toEqual(["tx-live"]);
+			expect(countRows(state, "tc_state")).toBe(1);
 		});
 	});
 

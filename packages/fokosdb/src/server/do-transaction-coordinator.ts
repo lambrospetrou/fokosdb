@@ -6,18 +6,27 @@ import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type {
 	InitiateWriteRequest,
-	InitiateWriteResponse,
+	InitiateWriteResponseEncoded,
+	ParticipantOperationResultEncoded,
+	PrepareResponse,
 	RecoverTransactionResult,
-	RejectionReason,
+	RejectionReasonEncoded,
 	TCState,
 	TransactionItem,
 	TransactionItemKey,
+	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-types.js";
 import { PartitionDO } from "./do-partition.js";
 import { isPartitionExceededDatabaseSizeError } from "../shared/partition-errors.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
-import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
+import {
+	ALARM_RECOVERY_BUDGET_MS,
+	applyImageCap,
+	IDEMPOTENCY_WINDOW_MS,
+	pickWinningReason,
+	SWEEP_BATCH_ROWS,
+} from "../shared/transaction-limits.js";
 
 type TcStateRow = {
 	transaction_id: string;
@@ -26,7 +35,22 @@ type TcStateRow = {
 	transaction_ts: number;
 	created_at: number;
 	completed_at: number | null;
+	/**
+	 * Top-level rejection reason for the cancelled transaction (RejectionReasonEncoded).
+	 * Carries keys only; item images are omitted to protect row size.
+	 * Binary keys are tagged with $u8 to survive JSON serialization.
+	 */
 	rejection_reason_json: string | null;
+	/**
+	 * Per-operation outcome array (TransactWriteOperationResultEncoded[]), ordered by request opIndex.
+	 * Stores outcome codes, reasons (keys only), and itemOmitted markers.
+	 * Item images are omitted and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
+	 */
+	results_json: string | null;
+	/**
+	 * Fingerprint of the operation set in request order.
+	 * Detects token reuse across different operations and prevents mismatched replays.
+	 */
 	operations_hash: string;
 };
 
@@ -37,12 +61,20 @@ type TcParticipantRow = {
 	prepare_outcome: string | null;
 	commit_outcome: string | null;
 	cancel_outcome: string | null;
+	/**
+	 * Serialized PrepareResponse from a rejected participant with item images stripped.
+	 * Retains opIndex, rejection reason (keys only), and imageBytes for coordinator capping.
+	 * NULL for an accepted participant.
+	 */
+	answer_json: string | null;
 };
 
 type TcItemRow = {
 	transaction_id: string;
 	hk: ArrayBuffer;
 	sk: ArrayBuffer;
+	/** Request-order index of this operation, carried through prepare so nodes merge by index. */
+	op_index: number;
 	operation: string;
 	data: string | ArrayBuffer | null;
 	// Persisted so the reconstructed TransactionItem carries the kind through prepare/commit; for json,
@@ -52,18 +84,80 @@ type TcItemRow = {
 	conditions_json: string | null;
 	update_json: string | null;
 	partition_do_name: string;
+	/** 1 for "all_old", 0 for "none". Reconstructs TransactionItem during initial prepare and recovery. */
+	return_values_on_condition_check_failure: number;
 };
 
-// tc_state.rejection_reason_json must round-trip binary (Uint8Array) keys through JSON, which plain
-// JSON.stringify mangles. These tag/restore Uint8Array values so a rejected transaction over binary
-// keys still reports the exact key after reload.
-function stringifyReason(reason: RejectionReason): string {
-	return JSON.stringify(reason, (_k, v) => (v instanceof Uint8Array ? { $u8: Array.from(v) } : v));
+type TcResultRow = {
+	transaction_id: string;
+	op_index: number;
+	image_kind: number;
+	image_version: number;
+	image_ttl_epoch_utc_seconds: number | null;
+	/**
+	 * Raw image payload (TEXT for text/json, BLOB for bytes).
+	 * Stored in individual rows to avoid JSON encoding expansion and protect tc_state row size limits.
+	 */
+	image_data: string | ArrayBuffer;
+};
+
+// Every JSON column here — rejection reasons, participant answers, and the results array — can hold
+// binary (Uint8Array) keys, which plain JSON.stringify mangles. These tag and restore them, so a
+// cancelled transaction over binary keys still reports the exact key after reload.
+function stringifyTagged(value: unknown): string {
+	return JSON.stringify(value, (_k, v) => (v instanceof Uint8Array ? { $u8: Array.from(v) } : v));
 }
-function parseReason(json: string): RejectionReason {
+
+function parseTagged<T>(json: string): T {
 	return JSON.parse(json, (_k, v) =>
 		v && typeof v === "object" && Array.isArray((v as { $u8?: unknown }).$u8) ? new Uint8Array((v as { $u8: number[] }).$u8) : v,
-	) as RejectionReason;
+	) as T;
+}
+
+function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEncoded {
+	if (reason.type !== "condition_failed" || reason.item === undefined) return reason;
+	const stripped = { ...reason };
+	delete stripped.item;
+	return stripped;
+}
+
+/**
+ * The answer as it is stored: every item image removed, every `imageBytes` kept.
+ *
+ * The images go to tc_results instead, because a `$u8` tag costs about four characters for each byte
+ * and one answer can carry MAX_ITEMS_PER_TX of them. `imageBytes` stays so the coordinator can apply
+ * the cap at CANCELLING without reading the images back.
+ */
+function stripImagesFromPrepareResponse(r: PrepareResponse): PrepareResponse {
+	if (r.outcome === "accepted") return r;
+	return {
+		outcome: "rejected",
+		reason: reasonWithoutImage(r.reason),
+		...(r.results
+			? {
+					results: r.results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res)),
+				}
+			: {}),
+	};
+}
+
+/**
+ * The execution failure a stored answer REPORTS, or null when it reports none.
+ *
+ * A NULL prepare_outcome is deliberately not one. That participant has not answered yet, and
+ * recovery can still re-prepare it into an acceptance, which leaves the transaction on the merge
+ * path. Suppressing an image on the strength of a NULL row would then hand the caller a rejected
+ * operation with no item and no itemOmitted, which reads as "the item does not exist".
+ *
+ * So a caller that decides whether to STORE images uses this alone, and only the merge — which runs
+ * when no row can change again — adds the NULL case on top.
+ */
+function reportedExecutionFailure(p: TcParticipantRow): RejectionReasonEncoded | null {
+	if (p.prepare_outcome !== "rejected") return null;
+	const ans = p.answer_json ? parseTagged<PrepareResponse>(p.answer_json) : null;
+	// A rejection that carries per-operation results is a check-pass rejection, not a failure to run.
+	if (ans && ans.outcome === "rejected" && ans.results) return null;
+	return (ans && ans.outcome === "rejected" ? ans.reason : null) ?? { type: "transient_error" };
 }
 
 // tc_items hk/sk are BLOB; materialize a read column as KeyBytes (trusted re-brand, no copy of bytes).
@@ -96,7 +190,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_ts          INTEGER NOT NULL,
                 created_at              INTEGER NOT NULL,
                 completed_at            INTEGER,
+                -- Top-level RejectionReasonEncoded for the transaction. Keys only, no item images.
                 rejection_reason_json   TEXT,
+                -- Positional TransactWriteOperationResultEncoded array. Item images are omitted
+                -- and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
+                results_json            TEXT,
                 -- Fingerprint of the operation set this token was first used for. A replay whose
                 -- operations hash differently is a different request wearing the same token, and is
                 -- rejected instead of being answered with this transaction's outcome.
@@ -114,6 +212,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 prepare_outcome         TEXT,
                 commit_outcome          TEXT,
                 cancel_outcome          TEXT,
+                -- Serialized PrepareResponse with item images stripped (imageBytes kept for capping).
+                answer_json             TEXT,
                 PRIMARY KEY (transaction_id, partition_do_name)
             ) WITHOUT ROWID, STRICT;
 
@@ -121,6 +221,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_id      TEXT    NOT NULL,
                 hk                  BLOB    NOT NULL,
                 sk                  BLOB    NOT NULL DEFAULT x'',
+                -- Request-order index of this operation for positional result merging.
+                op_index            INTEGER NOT NULL,
                 operation           TEXT    NOT NULL,
                 data                ANY,
                 data_kind           INTEGER,
@@ -128,7 +230,21 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 conditions_json     TEXT,
                 update_json         TEXT,
                 partition_do_name   TEXT    NOT NULL,
+                -- 1 for "all_old", 0 for "none". Reconstructs TransactionItem during prepare recovery.
+                return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (transaction_id, hk, sk)
+            ) WITHOUT ROWID, STRICT;
+
+            -- Stores raw item images for rejected operations requesting all_old.
+            -- Stored as separate rows to avoid JSON encoding expansion and prevent tc_state row size blowup.
+            CREATE TABLE IF NOT EXISTS tc_results (
+                transaction_id  TEXT    NOT NULL,
+                op_index        INTEGER NOT NULL,
+                image_kind      INTEGER NOT NULL,
+                image_version   INTEGER NOT NULL,
+                image_ttl_epoch_utc_seconds INTEGER,
+                image_data      ANY     NOT NULL,
+                PRIMARY KEY (transaction_id, op_index)
             ) WITHOUT ROWID, STRICT;
         `,
 	},
@@ -182,7 +298,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		if (existing === null || targetMs < existing) await this.ctx.storage.setAlarm(targetMs);
 	}
 
-	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse> {
+	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const idempotencyToken = request.clientRequestToken ?? transactionId;
 		const coordinatorDoId = this.ctx.id.toString();
@@ -225,13 +341,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				Date.now(),
 				operationsHash,
 			);
-			for (const op of request.items) {
+			for (let i = 0; i < request.items.length; i++) {
+				const op = request.items[i];
+				const opIndex = op.opIndex ?? i;
 				this.ctx.storage.sql.exec(
-					`INSERT INTO tc_items (transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
+					opIndex,
 					op.operation,
 					op.data ?? null,
 					// data and kind travel together: put carries both; delete/check/update carry neither (NULL kind).
@@ -240,6 +359,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					op.condition ? JSON.stringify(op.condition) : null,
 					op.update ? JSON.stringify(op.update) : null,
 					op.partitionContext.doName,
+					op.returnValuesOnConditionCheckFailure === "all_old" ? 1 : 0,
 				);
 			}
 			for (const [partitionDoName, pCtx] of partitionContextByDoName) {
@@ -257,7 +377,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs());
 	}
 
-	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponse> {
+	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponseEncoded> {
 		const { transaction_id: transactionId } = existingRow;
 		switch (existingRow.state) {
 			case "COMMITTED":
@@ -300,7 +420,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 *   the lock release lags, and `alarm()` drives that too.
 	 * - CREATED / PREPARING: genuinely undecided — those, and only those, ask the caller to retry.
 	 */
-	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponse {
+	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
 		const row = existingRow ?? this.loadStateRow(transactionId)!;
 		switch (row.state) {
 			case "COMMITTED":
@@ -315,15 +435,38 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					`fokos/tc: transaction ${transactionId} ${COMMIT_PENDING_SENTINEL} (state=${row.state}): the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
 				);
 			case "CANCELLING":
-			case "CANCELLED":
+			case "CANCELLED": {
+				const reason: RejectionReasonEncoded = row.rejection_reason_json
+					? parseTagged<RejectionReasonEncoded>(row.rejection_reason_json)
+					: { type: "transient_error" };
+				// A NULL results_json is the same torn-row degradation that makes the reason fall back to
+				// transient_error. It says "no per-operation detail", not "nothing was evaluated".
+				const results: TransactWriteOperationResultEncoded[] = row.results_json
+					? parseTagged<TransactWriteOperationResultEncoded[]>(row.results_json)
+					: [];
+				// results_json is positional to the request and tc_results.op_index is that same request
+				// index, so entry i owns the image row with op_index i. The cap already applied before
+				// the array was stored, so a replay answers with exactly the images the first call did.
+				for (const img of this.loadResultImages(transactionId)) {
+					const res = results[img.op_index];
+					if (res?.outcome !== "rejected" || res.reason.type !== "condition_failed") continue;
+					res.reason.item = {
+						hashKey: res.reason.hashKey,
+						...(res.reason.sortKey !== undefined ? { sortKey: res.reason.sortKey } : {}),
+						data: img.image_data instanceof ArrayBuffer ? new Uint8Array(img.image_data) : img.image_data,
+						kind: DATA_KINDS[img.image_kind],
+						version: img.image_version,
+						...(img.image_ttl_epoch_utc_seconds != null ? { ttlAt: img.image_ttl_epoch_utc_seconds } : {}),
+					};
+				}
 				return {
 					outcome: "cancelled",
 					transactionId,
 					idempotencyToken,
-					// Both writers of CANCELLING set the reason in the same UPDATE, so this is always
-					// present; fall back rather than assert, so a torn row degrades instead of throwing.
-					reason: row.rejection_reason_json ? parseReason(row.rejection_reason_json) : { type: "transient_error" },
+					reason,
+					results,
 				};
+			}
 			case "CREATED":
 			case "PREPARING":
 				// No decision yet — the alarm will drive it. The outcome can still go either way, so
@@ -363,12 +506,146 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		return transitioned ? completedAt : null;
 	}
 
+	/**
+	 * Records one participant's prepare answer, and its images, in the same storage transaction as the
+	 * prepare outcome they belong to. No part of an answer then lives only in memory, so a coordinator
+	 * evicted between a participant's answer and the transaction's decision still reads back every
+	 * outcome, reason, and image that participant reported.
+	 *
+	 * `skipImages` is set once any participant has reported an execution failure. From that moment the
+	 * outcome is known — every operation is not_evaluated and no image is returned — so the later
+	 * answers cost no image writes. The images written before the failure are deleted when CANCELLING
+	 * is written.
+	 */
+	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse, skipImages: boolean): void {
+		this.ctx.storage.transactionSync(() => {
+			this.ctx.storage.sql.exec(
+				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
+				answer.outcome,
+				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
+				transactionId,
+				partitionDoName,
+			);
+			if (skipImages || answer.outcome !== "rejected" || !answer.results) return;
+			for (const res of answer.results) {
+				if (res.outcome !== "rejected" || res.reason.type !== "condition_failed" || !res.reason.item) continue;
+				const img = res.reason.item;
+				// image_data is an ANY column: text and JSON text bind as TEXT, bytes bind as a BLOB, exactly
+				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path.
+				this.ctx.storage.sql.exec(
+					`INSERT OR REPLACE INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+					 VALUES (?, ?, ?, ?, ?, ?)`,
+					transactionId,
+					res.opIndex,
+					DATA_KINDS.indexOf(img.kind),
+					img.version,
+					img.ttlAt ?? null,
+					img.data,
+				);
+			}
+		});
+	}
+
+	/**
+	 * Merges every participant's stored answer into the transaction's outcome and records the durable
+	 * transition to CANCELLING.
+	 *
+	 * Both drivePrepare and runPrepareRecovery call it, so the two writers of CANCELLING cannot merge
+	 * differently: the answers come from storage, never from what the caller still holds in memory.
+	 */
+	private cancelTransactionInStore(transactionId: string): void {
+		this.ctx.storage.transactionSync(() => {
+			const items = this.loadItems(transactionId);
+			const participants = this.loadParticipants(transactionId);
+
+			// An execution failure — clock_skew, or a prepare that threw after its retries — says the
+			// transaction could not run, not that a caller's premise was wrong. It belongs to no operation,
+			// so it outranks every condition rejection and leaves every operation unevaluated.
+			let executionFailureReason: RejectionReasonEncoded | null = null;
+			for (const p of participants) {
+				// Here, and only here, a NULL row is terminal: the transaction is cancelling, so nothing
+				// re-prepares it. It is the prepare that threw after its retries.
+				executionFailureReason = p.prepare_outcome === null ? { type: "transient_error" } : reportedExecutionFailure(p);
+				if (executionFailureReason) break;
+			}
+
+			let finalReason: RejectionReasonEncoded;
+			let finalResults: TransactWriteOperationResultEncoded[];
+			// The operations whose image the cap dropped, so their tc_results rows go once the write wins.
+			let cappedOutOpIndexes: number[] = [];
+
+			if (executionFailureReason) {
+				finalReason = executionFailureReason;
+				finalResults = items.map(() => ({ outcome: "not_evaluated" as const }));
+			} else {
+				// results_json is positional to the request: entry i answers the operation the caller sent at
+				// index i. db.ts assigns op_index from the request array, so a transaction of n operations
+				// fills 0..n-1, and loadFinalResponse joins a stored image to its entry by that same index.
+				// An operation no participant reported stays not_evaluated rather than shifting its neighbours.
+				const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
+				const itemsByPartition = groupByPartition(items);
+				for (const p of participants) {
+					// An accepted participant sends no array: the lock it holds is the proof that its check
+					// pass accepted every operation it owns.
+					let answered: ParticipantOperationResultEncoded[] = [];
+					if (p.prepare_outcome === "accepted") {
+						answered = (itemsByPartition.get(p.partition_do_name) ?? []).map((item) => ({ outcome: "passed", opIndex: item.op_index }));
+					} else if (p.answer_json) {
+						const ans = parseTagged<PrepareResponse>(p.answer_json);
+						if (ans.outcome === "rejected" && ans.results) answered = ans.results;
+					}
+					for (const r of answered) {
+						if (r.opIndex >= 0 && r.opIndex < merged.length) merged[r.opIndex] = r;
+					}
+				}
+
+				// Two participants can each answer under the cap and together exceed it, so the coordinator
+				// caps the whole array once more before it stores one.
+				applyImageCap(merged);
+				cappedOutOpIndexes = merged.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large").map((r) => r.opIndex);
+
+				finalReason = pickWinningReason(merged);
+				// results_json holds outcome codes, reasons (keys only), and itemOmitted. opIndex is implied
+				// by the position, imageBytes was only ever for the cap, and the images live in tc_results.
+				finalResults = merged.map((r) =>
+					r.outcome === "rejected"
+						? {
+								outcome: "rejected" as const,
+								reason: reasonWithoutImage(r.reason),
+								...(r.itemOmitted ? { itemOmitted: r.itemOmitted } : {}),
+							}
+						: { outcome: r.outcome },
+				);
+			}
+
+			const transition = this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ?, results_json = ?
+				 WHERE transaction_id = ? AND state = 'PREPARING'`,
+				stringifyTagged(finalReason),
+				stringifyTagged(finalResults),
+				transactionId,
+			);
+			// Another writer already decided this transaction. Its results_json names the images that are
+			// on disk, so deleting any of them here would strand its answer without one.
+			if (transition.rowsWritten === 0) return;
+
+			this.stripPayload(transactionId);
+			if (executionFailureReason) {
+				this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ?`, transactionId);
+			} else {
+				for (const opIndex of cappedOutOpIndexes) {
+					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ? AND op_index = ?`, transactionId, opIndex);
+				}
+			}
+		});
+	}
+
 	private async drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
 		coordinatorDoId: string,
 		requestBudgetMs?: number,
-	): Promise<InitiateWriteResponse> {
+	): Promise<InitiateWriteResponseEncoded> {
 		this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId);
 
 		const stateRow = this.loadStateRow(transactionId)!;
@@ -376,6 +653,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const participants = this.loadParticipants(transactionId);
 		const itemsByPartition = groupByPartition(items);
 
+		let hasExecutionFailure = false;
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
@@ -388,12 +666,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItems(partitionItems),
 						});
-						this.ctx.storage.sql.exec(
-							`UPDATE tc_participants SET prepare_outcome = ? WHERE transaction_id = ? AND partition_do_name = ?`,
-							r.outcome,
-							transactionId,
-							p.partition_do_name,
-						);
+						if (r.outcome === "rejected" && !r.results) hasExecutionFailure = true;
+						this.storePrepareAnswer(transactionId, p.partition_do_name, r, hasExecutionFailure);
 						return r;
 					},
 					// Backpressure is deterministic for the life of this transaction: the partition is over
@@ -406,16 +680,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}),
 		);
 
-		let firstRejectionReason: RejectionReason | null = null;
-		for (const r of prepareResults) {
-			if (r.status === "rejected") {
-				firstRejectionReason ??= { type: "transient_error" };
-			} else if (r.value.result.outcome === "rejected") {
-				firstRejectionReason ??= r.value.result.reason;
-			}
-		}
+		const allAccepted = prepareResults.every((r) => r.status === "fulfilled" && r.value.result.outcome === "accepted");
 
-		if (!firstRejectionReason) {
+		if (allAccepted) {
 			// All accepted — PREPARED is the point of no return
 			this.ctx.storage.transactionSync(() => {
 				const transition = this.ctx.storage.sql.exec(
@@ -435,14 +702,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			return this.loadFinalResponse(transactionId, idempotencyToken);
 		}
 
-		this.ctx.storage.transactionSync(() => {
-			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ? WHERE transaction_id = ? AND state = 'PREPARING'`,
-				stringifyReason(firstRejectionReason),
-				transactionId,
-			);
-			if (transition.rowsWritten > 0) this.stripPayload(transactionId);
-		});
+		this.cancelTransactionInStore(transactionId);
 		await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		return this.loadFinalResponse(transactionId, idempotencyToken);
 	}
@@ -581,21 +841,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const itemsByPartition = groupByPartition(items);
 		const coordinatorDoId = this.ctx.id.toString();
 
-		const nullParticipants = this.ctx.storage.sql
-			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
-                 FROM tc_participants WHERE transaction_id = ? AND prepare_outcome IS NULL`,
-				transactionId,
-			)
-			.toArray();
+		const existingParticipants = this.loadParticipants(transactionId);
+		// A failure a participant already reported is durable and cannot be re-prepared away, so the
+		// merge below is certain to reach the same conclusion and every image it would store is waste.
+		let hasExecutionFailure = existingParticipants.some((p) => reportedExecutionFailure(p) !== null);
 
-		let firstNewRejectionReason: RejectionReason | null = null;
+		const nullParticipants = existingParticipants.filter((p) => p.prepare_outcome === null);
 
-		const recoveryResults = await Promise.allSettled(
+		await Promise.allSettled(
 			nullParticipants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
-				const result = await tryWhile(
+				await tryWhile(
 					async () => {
 						const r = await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txPrepare(pCtx, {
 							transactionId,
@@ -603,28 +860,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItems(partitionItems),
 						});
-						this.ctx.storage.sql.exec(
-							`UPDATE tc_participants SET prepare_outcome = ? WHERE transaction_id = ? AND partition_do_name = ?`,
-							r.outcome,
-							transactionId,
-							p.partition_do_name,
-						);
+						if (r.outcome === "rejected" && !r.results) hasExecutionFailure = true;
+						this.storePrepareAnswer(transactionId, p.partition_do_name, r, hasExecutionFailure);
 						return r;
 					},
 					// Same as the first prepare pass: an over-size partition will not clear by retrying.
 					(err, nextAttempt) => !isPartitionExceededDatabaseSizeError(err) && nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
-				if (result.outcome === "rejected") {
-					firstNewRejectionReason ??= result.reason;
-				}
 			}),
 		);
-		for (const r of recoveryResults) {
-			if (r.status === "rejected") firstNewRejectionReason ??= { type: "transient_error" };
-		}
 
 		const allParticipants = this.loadParticipants(transactionId);
+		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
+		// nothing, so the transaction stays PREPARING for the alarm to drive with the full retry budget.
+		// Only a real rejection commits the transaction to cancelling; cancelTransactionInStore then
+		// reports a still-NULL participant as the transient_error it is.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
 
@@ -638,16 +889,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			});
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
 		} else if (anyRejected) {
-			const reasonJson = firstNewRejectionReason ? stringifyReason(firstNewRejectionReason) : stringifyReason({ type: "transient_error" });
-			this.ctx.storage.transactionSync(() => {
-				const transition = this.ctx.storage.sql.exec(
-					`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = COALESCE(rejection_reason_json, ?)
-                 WHERE transaction_id = ? AND state = 'PREPARING'`,
-					reasonJson,
-					transactionId,
-				);
-				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
-			});
+			this.cancelTransactionInStore(transactionId);
 			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		}
 		// If some participants still NULL, leave in PREPARING; alarm will retry
@@ -701,14 +943,27 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		const now = Date.now();
 		const cutoff = now - IDEMPOTENCY_WINDOW_MS;
-		this.ctx.storage.sql.exec(
-			`DELETE FROM tc_state WHERE transaction_id IN (
-				SELECT transaction_id FROM tc_state
-				WHERE completed_at < ? ORDER BY completed_at, transaction_id LIMIT ?
-			)`,
-			cutoff,
-			SWEEP_BATCH_ROWS,
-		);
+		const expiredBatch = this.ctx.storage.sql
+			.exec<{
+				transaction_id: string;
+			}>(
+				`SELECT transaction_id FROM tc_state WHERE completed_at < ? ORDER BY completed_at, transaction_id LIMIT ?`,
+				cutoff,
+				SWEEP_BATCH_ROWS,
+			)
+			.toArray();
+		if (expiredBatch.length > 0) {
+			const ids = expiredBatch.map((r) => r.transaction_id);
+			const CHUNK_SIZE = 100;
+			this.ctx.storage.transactionSync(() => {
+				for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+					const chunk = ids.slice(i, i + CHUNK_SIZE);
+					const placeholders = chunk.map(() => "?").join(",");
+					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id IN (${placeholders})`, ...chunk);
+					this.ctx.storage.sql.exec(`DELETE FROM tc_state WHERE transaction_id IN (${placeholders})`, ...chunk);
+				}
+			});
+		}
 
 		const hasExpiredRows =
 			this.ctx.storage.sql
@@ -803,7 +1058,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, results_json, operations_hash
                  FROM tc_state WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -813,7 +1068,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, results_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
 			)
@@ -823,8 +1078,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadItems(transactionId: string): TcItemRow[] {
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name
-                 FROM tc_items WHERE transaction_id = ?`,
+				`SELECT transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure
+                 FROM tc_items WHERE transaction_id = ? ORDER BY op_index`,
 				transactionId,
 			)
 			.toArray();
@@ -839,10 +1094,20 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			.toArray();
 	}
 
+	private loadResultImages(transactionId: string): TcResultRow[] {
+		return this.ctx.storage.sql
+			.exec<TcResultRow>(
+				`SELECT transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data
+                 FROM tc_results WHERE transaction_id = ? ORDER BY op_index`,
+				transactionId,
+			)
+			.toArray();
+	}
+
 	private loadParticipants(transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
+				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json
                  FROM tc_participants WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -901,6 +1166,7 @@ function toTransactionItemKeys(rows: Pick<TcItemRow, "hk" | "sk">[]): Transactio
 
 function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 	return rows.map((row) => ({
+		opIndex: row.op_index,
 		hashKey: keyFromBlob(row.hk),
 		sortKey: keyFromBlob(row.sk), // empty KeyBytes ([]) is the absent sentinel
 		operation: row.operation as TransactionItem["operation"],
@@ -909,5 +1175,6 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		ttlAt: row.ttl_epoch_utc_seconds ?? undefined,
 		condition: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
 		update: row.update_json ? JSON.parse(row.update_json) : undefined,
+		returnValuesOnConditionCheckFailure: row.return_values_on_condition_check_failure === 1 ? "all_old" : undefined,
 	}));
 }

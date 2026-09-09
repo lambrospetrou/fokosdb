@@ -1,12 +1,13 @@
 import type {
 	CommitRequest,
 	CommitResponse,
+	ParticipantOperationResultEncoded,
 	PrepareRequest,
 	PrepareResponse,
 	ReadForTransactionItemResultEncoded,
 	ReadForTransactionRequest,
 	ReadForTransactionResponse,
-	RejectionReason,
+	RejectionReasonEncoded,
 	SingleShotRequest,
 	SingleShotResponse,
 	TransactionItem,
@@ -15,8 +16,9 @@ import type {
 import invariant from "../invariant.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
-import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import { applyImageCap, MAX_ITEM_BYTES, pickWinningReason } from "../transaction-limits.js";
 import type { UpdateProbeResult } from "../expression/runtime.js";
+import type { ConditionCheckImageEncoded } from "../types.js";
 
 // Decode a sort key for a user-facing result: the empty sentinel ([]) maps back to an absent sortKey.
 function decodeSortKey(sk: KeyBytes): string | Uint8Array | undefined {
@@ -75,7 +77,7 @@ export class TransactionParticipant {
 		item: TransactionItem,
 		sk: KeyBytes,
 		rejectionKeys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
-	): { reason: RejectionReason | null; probe: UpdateProbeResult | null } {
+	): { reason: RejectionReasonEncoded | null; probe: UpdateProbeResult | null } {
 		if (item.operation === "put") {
 			// A put always carries both data and kind; assert together so the measure gets a real kind.
 			invariant(
@@ -128,7 +130,9 @@ export class TransactionParticipant {
 		}
 
 		return this.#store.transactionSync<PrepareResponse>(() => {
+			const results: ParticipantOperationResultEncoded[] = [];
 			for (const item of request.items) {
+				const { opIndex } = item;
 				const sk = item.sortKey;
 				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
 
@@ -136,29 +140,52 @@ export class TransactionParticipant {
 
 				if (pendingRow) {
 					if (pendingRow.transaction_id === request.transactionId) {
+						results.push({ outcome: "passed", opIndex });
 						continue; // idempotent re-prepare for this item
 					}
-					return {
+					results.push({
 						outcome: "rejected",
+						opIndex,
 						reason: {
 							type: "pending_conflict",
 							...rejectionKeys,
 							conflictingTransactionId: pendingRow.transaction_id,
 						},
-					};
+					});
+					continue;
 				}
 
 				const conditionResult = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
 				if (conditionResult && !conditionResult.conditionOk) {
-					return {
+					const wantsImage = item.returnValuesOnConditionCheckFailure === "all_old";
+					const image = wantsImage && conditionResult.itemPresent ? this.#store.getItemImage(item.hashKey, sk) : undefined;
+					const itemImage: ConditionCheckImageEncoded | undefined = image?.row
+						? {
+								hashKey: rejectionKeys.hashKey,
+								...(rejectionKeys.sortKey !== undefined ? { sortKey: rejectionKeys.sortKey } : {}),
+								data: image.row.data,
+								kind: image.row.kind,
+								version: image.row.version,
+								...(image.row.ttlAt !== undefined ? { ttlAt: image.row.ttlAt } : {}),
+							}
+						: undefined;
+					results.push({
 						outcome: "rejected",
-						reason: { type: "condition_failed", ...rejectionKeys },
-					};
+						opIndex,
+						reason: {
+							type: "condition_failed",
+							...rejectionKeys,
+							...(itemImage ? { item: itemImage } : {}),
+						},
+						...(image?.row ? { imageBytes: image.row.imageBytes } : {}),
+					});
+					continue;
 				}
 
 				const { reason: writeReason, probe } = this.#precheckWrite(item, sk, rejectionKeys);
 				if (writeReason) {
-					return { outcome: "rejected", reason: writeReason };
+					results.push({ outcome: "rejected", opIndex, reason: writeReason });
+					continue;
 				}
 
 				const itemStamp = conditionResult
@@ -173,10 +200,12 @@ export class TransactionParticipant {
 
 				if (itemStamp) {
 					if (request.transactionTimestamp <= itemStamp.last_transaction_ts) {
-						return {
+						results.push({
 							outcome: "rejected",
+							opIndex,
 							reason: { type: "timestamp_conflict", ...rejectionKeys },
-						};
+						});
+						continue;
 					}
 				} else {
 					// No stamp means no live item, so the deletion watermark is the only ordering signal left.
@@ -185,12 +214,21 @@ export class TransactionParticipant {
 					// applies only to an item that exists — but naming the operations here instead would make a
 					// later change to applicability drop the check in silence.
 					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
-						return {
+						results.push({
 							outcome: "rejected",
+							opIndex,
 							reason: { type: "timestamp_conflict", ...rejectionKeys },
-						};
+						});
+						continue;
 					}
 				}
+
+				results.push({ outcome: "passed", opIndex });
+			}
+
+			if (results.some((r) => r.outcome === "rejected")) {
+				applyImageCap(results);
+				return { outcome: "rejected", reason: pickWinningReason(results), results };
 			}
 
 			// All checks passed — lock every item.
@@ -313,33 +351,65 @@ export class TransactionParticipant {
 		const transactionTimestamp = this.#now();
 
 		return this.#store.transactionSync<SingleShotResponse>(() => {
+			const results: ParticipantOperationResultEncoded[] = [];
 			for (const item of request.items) {
+				const { opIndex } = item;
 				const sk = item.sortKey;
 				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
 
 				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 				if (pendingRow) {
-					return {
+					results.push({
 						outcome: "rejected",
+						opIndex,
 						reason: {
 							type: "pending_conflict",
 							...rejectionKeys,
 							conflictingTransactionId: pendingRow.transaction_id,
 						},
-					};
+					});
+					continue;
 				}
 
-				if (item.condition && !this.#store.evaluateCondition(item.condition, item.hashKey, sk).conditionOk) {
-					return {
+				const conditionRes = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
+				if (conditionRes && !conditionRes.conditionOk) {
+					const wantsImage = item.returnValuesOnConditionCheckFailure === "all_old";
+					const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(item.hashKey, sk) : undefined;
+					const itemImage: ConditionCheckImageEncoded | undefined = image?.row
+						? {
+								hashKey: rejectionKeys.hashKey,
+								...(rejectionKeys.sortKey !== undefined ? { sortKey: rejectionKeys.sortKey } : {}),
+								data: image.row.data,
+								kind: image.row.kind,
+								version: image.row.version,
+								...(image.row.ttlAt !== undefined ? { ttlAt: image.row.ttlAt } : {}),
+							}
+						: undefined;
+					results.push({
 						outcome: "rejected",
-						reason: { type: "condition_failed", ...rejectionKeys },
-					};
+						opIndex,
+						reason: {
+							type: "condition_failed",
+							...rejectionKeys,
+							...(itemImage ? { item: itemImage } : {}),
+						},
+						...(image?.row ? { imageBytes: image.row.imageBytes } : {}),
+					});
+					continue;
 				}
 
 				const { reason: writeReason } = this.#precheckWrite(item, sk, rejectionKeys);
 				if (writeReason) {
-					return { outcome: "rejected", reason: writeReason };
+					results.push({ outcome: "rejected", opIndex, reason: writeReason });
+					continue;
 				}
+
+				results.push({ outcome: "passed", opIndex });
+			}
+
+			if (results.some((r) => r.outcome === "rejected")) {
+				applyImageCap(results);
+				return { outcome: "rejected", reason: pickWinningReason(results), results };
 			}
 
 			// Every item passed, so the whole set applies. Reaching this point inside transactionSync is
