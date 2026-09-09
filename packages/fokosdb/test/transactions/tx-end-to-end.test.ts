@@ -263,10 +263,8 @@ describe("transactions - end-to-end", () => {
 			expect(txOnly.found).toBe(true);
 			invariant(txOnly.found);
 			expect(txOnly.item.data).toBe("tx-only-data");
-		} else {
-			// putItem landed before prepare → transaction detects timestamp_conflict and is cancelled.
-			expect(tx.outcome).toBe("cancelled");
-			invariant(tx.outcome === "cancelled");
+		} else if (tx.outcome === "cancelled") {
+			// putItem landed at or after the transaction's timestamp → timestamp_conflict.
 			expect(tx.reason.type).toBe("timestamp_conflict");
 			// Atomicity: the transaction's private write must not have landed.
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
@@ -276,6 +274,18 @@ describe("transactions - end-to-end", () => {
 			expect(shared.found).toBe(true);
 			invariant(shared.found);
 			expect(shared.item.data).toBe("non-tx-write");
+		} else {
+			// putItem landed strictly before the transaction stamped its own timestamp, so the
+			// transaction orders after it and commits over it. The clock advances with real time here,
+			// so which of the two branches runs depends on how the race lands.
+			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
+			expect(txOnly.found).toBe(true);
+			invariant(txOnly.found);
+			expect(txOnly.item.data).toBe("tx-only-data");
+			const shared = await db.getItem({ hashKey: "iso-shared" });
+			expect(shared.found).toBe(true);
+			invariant(shared.found);
+			expect(shared.item.data).toBe("tx-shared");
 		}
 	});
 
