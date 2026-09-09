@@ -24,6 +24,7 @@ import {
 	ALARM_RECOVERY_BUDGET_MS,
 	applyImageCap,
 	IDEMPOTENCY_WINDOW_MS,
+	MAX_TC_DATABASE_BYTES,
 	pickWinningReason,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
@@ -317,6 +318,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				);
 			}
 			return await this.resumeTransaction(existingRow, idempotencyToken);
+		}
+
+		if (this.ctx.storage.sql.databaseSize > MAX_TC_DATABASE_BYTES) {
+			throw new Error("fokos/tc: transaction coordinator exceeded its storage limit, please retry later");
 		}
 
 		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC

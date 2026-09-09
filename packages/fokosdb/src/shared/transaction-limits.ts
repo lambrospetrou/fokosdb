@@ -39,6 +39,7 @@ export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
+export const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024; // FIXME: 5GB of storage in each transaction coordinator.
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const SWEEP_BATCH_ROWS = 1_000;

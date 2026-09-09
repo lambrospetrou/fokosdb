@@ -5,7 +5,8 @@ import { isTransactionCommitPendingError, isTransactionUndecidedError, Transacti
 import { PartitionDO } from "./do-partition.js";
 import { errExceededDatabaseSize } from "../shared/partition-errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
-import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
+import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
+import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
 	InitiateWriteRequest,
 	InitiateWriteResponse,
@@ -31,6 +32,7 @@ afterEach(() => {
 type CoordinatorInternals = {
 	alarm(): Promise<void>;
 	initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse>;
+	recoverTransaction(transactionId: string): Promise<unknown>;
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponse;
 	cancelTransactionInStore(transactionId: string): void;
 	drivePrepare(
@@ -92,6 +94,7 @@ function insertState(
 		createdAt: number;
 		completedAt?: number | null;
 		reason?: RejectionReason;
+		operationsHash?: string;
 	},
 ): void {
 	state.storage.sql.exec(
@@ -105,7 +108,7 @@ function insertState(
 		options.createdAt,
 		options.completedAt ?? null,
 		options.reason === undefined ? null : JSON.stringify(options.reason),
-		"0000000000000000",
+		options.operationsHash ?? "0000000000000000",
 	);
 }
 
@@ -227,6 +230,51 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 });
 
 describe("TransactionCoordinatorDO - bounded transaction storage", () => {
+	it("refuses a new transaction when the coordinator is above its database size guard", async () => {
+		await withCoordinator(async (tc, state) => {
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+
+			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
+				/transaction coordinator exceeded its storage limit, please retry later/,
+			);
+			expect(countRows(state, "tc_state")).toBe(0);
+		});
+	});
+
+	it("answers a replay when the coordinator is above its database size guard", async () => {
+		await withCoordinator(async (tc, state) => {
+			const items: InitiateWriteRequest["items"] = [];
+			insertState(state, {
+				token: TOKEN,
+				transactionId: TX_ID,
+				state: "COMMITTED",
+				createdAt: BASE_TIME,
+				completedAt: BASE_TIME,
+				operationsHash: hashTransactionOperations(items),
+			});
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+
+			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items })).resolves.toEqual({
+				outcome: "committed",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+			});
+		});
+	});
+
+	it("still drives recovery and runs its alarm above the database size guard", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
+
+			await tc.recoverTransaction(TX_ID);
+			await tc.alarm();
+
+			expect(recover).toHaveBeenCalledTimes(2);
+		});
+	});
+
 	it("creates the completed-at column and partial sweep index", async () => {
 		await withCoordinator((_tc, state) => {
 			const columns = state.storage.sql.exec<{ name: string }>(`PRAGMA table_info(tc_state)`).toArray();
