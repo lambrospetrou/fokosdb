@@ -9,6 +9,7 @@ import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
+import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -134,6 +135,56 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
+	// One participant can own more rejected operations than its own answer may carry, so it fills the
+	// images in request order and marks the rest. Every node on the way back applies this same rule,
+	// which is what keeps each RPC response under the cap.
+	it("fills images in request order up to the cap and marks the rest itemOmitted", async () => {
+		await withParticipant(({ participant, store }) => {
+			// Just under the per-item ceiling: the store measures the whole row, so the data must leave
+			// room for both keys and the fixed per-row overhead.
+			const imageBytes = MAX_ITEM_BYTES - 2048;
+			const data = "x".repeat(imageBytes);
+			const fitting = Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / imageBytes);
+			const itemCount = fitting + 2;
+
+			const keys = Array.from({ length: itemCount }, (_v, i) => kb(`capped-${String(i).padStart(3, "0")}`));
+			for (const hk of keys) {
+				store.upsertItem({ hk, sk: KeyCodec.encodeOptional(undefined), data, kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			}
+
+			const request = prepareReq({
+				items: keys.map((hashKey) => ({
+					hashKey,
+					sortKey: KeyCodec.encodeOptional(undefined),
+					operation: "delete" as const,
+					condition: compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+					returnValuesOnConditionCheckFailure: "all_old" as const,
+				})),
+			});
+
+			const res = participant.prepareLocal(request);
+			invariant(res.outcome === "rejected" && res.results !== undefined, "expected a rejected prepare with per-operation results");
+			expect(res.results).toHaveLength(itemCount);
+
+			let sentBytes = 0;
+			for (const [i, r] of res.results.entries()) {
+				invariant(r.outcome === "rejected" && r.reason.type === "condition_failed", `op ${i} should have failed its condition`);
+				if (i < fitting) {
+					expect(r.itemOmitted).toBeUndefined();
+					expect(r.reason.item?.data).toBe(data);
+					sentBytes += r.imageBytes ?? 0;
+				} else {
+					expect(r.itemOmitted).toBe("response_too_large");
+					expect(r.reason.item).toBeUndefined();
+				}
+			}
+			// The answer stays under the cap, and the dropped images changed no outcome code.
+			expect(sentBytes).toBeLessThanOrEqual(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX);
+			expect(res.results.every((r) => r.outcome === "rejected")).toBe(true);
+			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+		});
+	});
+
 	it("rejects with update_not_applicable when item is missing or not json", async () => {
 		await withParticipant(({ participant, store }) => {
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.field" }, value: { val: "new" } }]);
@@ -142,10 +193,15 @@ describe("TransactionParticipant - prepare", () => {
 			const missingReq = prepareReq({
 				items: [{ hashKey: kb("missing-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
 			});
-			expect(participant.prepareLocal(missingReq)).toMatchObject({
+			const missingRes = participant.prepareLocal(missingReq);
+			expect(missingRes).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "missing-item", sortKey: undefined },
+				reason: { type: "update_not_applicable", hashKey: "missing-item" },
 			});
+			// An absent sort key is left off the reason entirely, never carried as an explicit undefined,
+			// so a reason compares equal whether it reached the caller by RPC or through a JSON column.
+			invariant(missingRes.outcome === "rejected", "expected a rejected prepare");
+			expect(missingRes.reason).not.toHaveProperty("sortKey");
 
 			// Item exists but is kind: "text", not json
 			store.upsertItem({
@@ -161,7 +217,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(textReq)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "text-item", sortKey: undefined },
+				reason: { type: "update_not_applicable", hashKey: "text-item" },
 			});
 		});
 	});
@@ -179,7 +235,7 @@ describe("TransactionParticipant - prepare", () => {
 			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
+				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) },
 			});
 			// The rejection took no lock and wrote nothing.
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
@@ -190,7 +246,7 @@ describe("TransactionParticipant - prepare", () => {
 				participant.executeSingleShot({ items: withOpIndex([{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }]) }),
 			).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey), sortKey: undefined },
+				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) },
 			});
 		});
 	});
@@ -337,7 +393,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(atWatermark)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "absent", sortKey: undefined },
+				reason: { type: "timestamp_conflict", hashKey: "absent" },
 			});
 
 			const aboveWatermark = prepareReq({
@@ -392,7 +448,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "conflicting", sortKey: undefined },
+				reason: { type: "timestamp_conflict", hashKey: "conflicting" },
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 			expect(store.pendingLockFor(kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
@@ -564,7 +620,7 @@ describe("TransactionParticipant - single shot", () => {
 			});
 			expect(res).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "missing-u", sortKey: undefined },
+				reason: { type: "update_not_applicable", hashKey: "missing-u" },
 			});
 		});
 	});

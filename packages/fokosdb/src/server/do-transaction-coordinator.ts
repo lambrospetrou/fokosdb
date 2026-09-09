@@ -346,16 +346,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				Date.now(),
 				operationsHash,
 			);
-			for (let i = 0; i < request.items.length; i++) {
-				const op = request.items[i];
-				const opIndex = op.opIndex ?? i;
+			for (const op of request.items) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 					transactionId,
 					op.hashKey,
 					op.sortKey,
-					opIndex,
+					op.opIndex,
 					op.operation,
 					op.data ?? null,
 					// data and kind travel together: put carries both; delete/check/update carry neither (NULL kind).

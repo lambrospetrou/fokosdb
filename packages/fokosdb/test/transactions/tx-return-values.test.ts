@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { makeDB } from "./tx-helpers.js";
-import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX } from "../../src/shared/transaction-limits.js";
-import type { ParticipantOperationResultEncoded } from "../../src/shared/transaction-types.js";
+import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, type Key } from "./tx-helpers.js";
+import invariant from "../../src/shared/invariant.js";
+import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
+import type { ParticipantOperationResultEncoded, TransactWriteItemsOptions } from "../../src/shared/transaction-types.js";
 
 describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operation results", () => {
 	it("validates returnValuesOnConditionCheckFailure at the boundary", async () => {
@@ -354,6 +355,111 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				expect(op0.reason.item).toBeDefined();
 				expect(op0.reason.item?.data).toEqual(binData);
 				expect(op0.reason.item?.kind).toBe("bytes");
+			}
+		});
+		// Each participant answers under its own cap, so only the coordinator can see that the whole
+		// transaction is over it. It caps the merged array before it stores one, which is what makes a
+		// replay answer with the images the first call returned and not with the ones it dropped.
+		it("caps the merged images, and a replay returns the same array including itemOmitted", async () => {
+			const db = makeDB();
+			const token = `cap-replay-${crypto.randomUUID()}`;
+
+			// Just under the per-item ceiling: the store measures the whole row, so the data must leave
+			// room for both keys and the fixed per-row overhead.
+			const imageBytes = MAX_ITEM_BYTES - 2048;
+			const data = "x".repeat(imageBytes);
+			const fitting = Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / imageBytes);
+			const keys = keysAcrossPartitions(db, fitting + 2, `cap-${crypto.randomUUID()}`);
+
+			for (const k of keys) {
+				await db.putItem({ ...k, data });
+			}
+
+			const request: TransactWriteItemsOptions = {
+				clientRequestToken: token,
+				items: keys.map((k) => ({
+					operation: "delete",
+					...k,
+					condition: { op: "not_exists", args: [{ ref: "hashKey" }] },
+					returnValuesOnConditionCheckFailure: "all_old",
+				})),
+			};
+
+			const res = await db.transactWriteItems(request);
+			invariant(res.outcome === "cancelled", "expected the transaction to cancel");
+			expect(res.results).toHaveLength(keys.length);
+
+			for (const [i, r] of res.results.entries()) {
+				invariant(r.outcome === "rejected" && r.reason.type === "condition_failed", `op ${i} should have failed its condition`);
+				if (i < fitting) {
+					expect(r.itemOmitted).toBeUndefined();
+					expect(r.reason.item?.data).toBe(data);
+				} else {
+					expect(r.itemOmitted).toBe("response_too_large");
+					expect(r.reason.item).toBeUndefined();
+				}
+			}
+
+			// The replay reads the stored array and the surviving images back, so it must be identical —
+			// the images the cap dropped are gone from storage and cannot reappear.
+			const replay = await db.transactWriteItems(request);
+			expect(replay).toEqual(res);
+		});
+	});
+
+	// The outcome codes a caller reads must not depend on which partition owns each operation. Only
+	// the image set may, because every node caps what it sends on its own.
+	describe("partition layout", () => {
+		it("returns the same outcome codes and images whether one partition owns every operation or several do", async () => {
+			const db = makeDB();
+
+			// The same four-operation shape twice: operations 0 and 2 fail their condition and ask for the
+			// old image, operations 1 and 3 pass. Only the keys differ, so only the layout differs.
+			const runOver = async (keys: Key[], token?: string) => {
+				for (const [i, k] of keys.entries()) {
+					await db.putItem({ ...k, data: `stored-${i}` });
+				}
+				const res = await db.transactWriteItems({
+					...(token ? { clientRequestToken: token } : {}),
+					items: keys.map((k, i) => ({
+						operation: "put" as const,
+						...k,
+						data: `new-${i}`,
+						...(i % 2 === 0
+							? {
+									condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] },
+									returnValuesOnConditionCheckFailure: "all_old" as const,
+								}
+							: {}),
+					})),
+				});
+				invariant(res.outcome === "cancelled", "expected the transaction to cancel");
+				return res;
+			};
+
+			const oneKeys = keysInOnePartition(db, 4, `layout-one-${crypto.randomUUID()}`);
+			const manyKeys = keysAcrossPartitions(db, 4, `layout-many-${crypto.randomUUID()}`);
+			expect(countDistinctPartitions(db, oneKeys)).toBe(1);
+			expect(countDistinctPartitions(db, manyKeys)).toBe(4);
+
+			// The spread set carries a token, which is what puts it on the two-phase path; the single
+			// partition set runs the single-shot fast path.
+			const one = await runOver(oneKeys);
+			const many = await runOver(manyKeys, `layout-${crypto.randomUUID()}`);
+
+			const codesOf = (res: Awaited<ReturnType<typeof runOver>>) => res.results.map((r) => r.outcome);
+			expect(codesOf(one)).toEqual(["rejected", "passed", "rejected", "passed"]);
+			expect(codesOf(many)).toEqual(codesOf(one));
+
+			// The same images come back on both layouts, and the reason is the lowest rejected index.
+			const imagesOf = (res: Awaited<ReturnType<typeof runOver>>) =>
+				res.results.map((r) => (r.outcome === "rejected" && r.reason.type === "condition_failed" ? r.reason.item?.data : undefined));
+			expect(imagesOf(one)).toEqual(["stored-0", undefined, "stored-2", undefined]);
+			expect(imagesOf(many)).toEqual(imagesOf(one));
+			expect(one.reason.type).toBe("condition_failed");
+			expect(many.reason.type).toBe(one.reason.type);
+			for (const res of [one, many]) {
+				expect(res.results.every((r) => r.outcome !== "rejected" || r.itemOmitted === undefined)).toBe(true);
 			}
 		});
 	});

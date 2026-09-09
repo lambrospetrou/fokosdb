@@ -1,6 +1,6 @@
 # RFC — Return the item when a condition check fails
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-09-08
 **Author:** Lambros
 
@@ -139,6 +139,8 @@ DynamoDB solves the first cost with `ReturnValuesOnConditionCheckFailure` and th
 
 ## 3. Milestones
 
+Every milestone is shipped.
+
 **M0 — `tc_state` keyed by `transaction_id`.** The primary key of `tc_state` moves from
 `idempotency_token` to `transaction_id`, and the secondary index moves the other way: a `UNIQUE` index
 on `idempotency_token` replaces the index on `transaction_id`. Every other coordinator table is keyed
@@ -226,6 +228,8 @@ representation of `data`, with an encoded variant for the wire and a public vari
 
 ```ts
 export type ConditionCheckImageOf<D> = {
+	hashKey: string | Uint8Array;
+	sortKey?: string | Uint8Array;
 	data: D;
 	kind: DataKind;
 	version: number;
@@ -240,9 +244,11 @@ export type ConditionCheckImageEncoded = ConditionCheckImageOf<string | Uint8Arr
 export type ConditionCheckImage = ConditionCheckImageOf<string | Uint8Array | JsonValue>;
 ```
 
-The image carries no key. Every RPC response in this package omits the keys, and `db.ts` answers with
-the caller's own. `version` is the value a caller feeds back into an `attribute_equals` condition on
-the retry, so it is the field that makes the image useful.
+The image carries its own keys. It is nested inside a `condition_failed` reason, which names the same
+keys, so the pair is repeated; the image is a self-contained item, and a caller that pulls one out of
+a results array reads it without carrying the reason it came from. `version` is the value a caller
+feeds back into an `attribute_equals` condition on the retry, so it is the field that makes the image
+useful.
 
 **An image needs an item.** A condition that fails on an absent item returns no image. A caller that
 writes under `attribute_not_exists` and fails learns that the item exists, and receives it. A caller
@@ -295,19 +301,21 @@ Three notes on the shape:
   statement for it, and the compiler budget for conditions is untouched. A condition at the budget
   evaluates the same in both modes, because the mode does not reach the condition statement.
 
-`evaluateConditionPlan` keeps its signature. `getItemImage` returns the shape `getItem` returns, with
-the row already in the wire form of section 4.2.1:
+`evaluateConditionPlan` keeps its signature. `getItemImage` returns the shape `getItem` returns. It
+carries no key, because the caller already holds the keys it passed in:
 
 ```ts
 getItemImage(hk: KeyBytes, sk: KeyBytes): {
-	row?: ConditionCheckImageEncoded & { imageBytes: number };
+	row?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number; imageBytes: number };
 	rowsRead: number;
 	rowsWritten: number;
 };
 ```
 
 `TransactionParticipant` and the item RPCs call it after a failed condition when the operation asks
-for it, put the image fields on the result's `item`, and keep `imageBytes` beside it for the cap.
+for it. One function, `conditionFailedReason`, builds the reason and its `item` from these fields and
+the decoded keys, so every path that reports a failed condition builds one the same way. `imageBytes`
+stays beside the result for the cap.
 
 #### 4.2.3 The item RPCs
 
@@ -327,19 +335,36 @@ without TypeScript, and `putItem` and `deleteItem` run the same check at their e
 
 ```ts
 export type PutItemRpcResponse =
-	| { outcome: "applied"; version: number; meta: OperationMetrics & PartitionInfoInternal }
+	| { outcome: "ok"; version: number; meta: OperationMetrics & PartitionInfoInternal }
 	| {
 			outcome: "rejected";
-			reason: RejectionReason;
-			item?: ConditionCheckImageEncoded;
+			reason: RejectionReasonEncoded;
 			meta: OperationMetrics & PartitionInfoInternal;
 	  };
 ```
 
-The image sits on the response, not inside `RejectionReason`. `RejectionReason` travels to two other
-places that must not carry a `MAX_ITEM_BYTES` value: the transaction-level `reason` of
-`InitiateWriteResponse`, and `tc_state.rejection_reason_json`. The image outside the reason holds one
-copy of it in one place.
+**The image sits inside the reason.** `RejectionReason` becomes generic over the representation of
+the image, exactly as the read result is generic over the representation of `data`:
+
+```ts
+export type RejectionReasonOf<I = ConditionCheckImage> =
+	| { type: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; item?: I }
+	// every other member is unchanged
+	| { type: "transient_error" };
+
+export type RejectionReasonEncoded = RejectionReasonOf<ConditionCheckImageEncoded>;
+export type RejectionReason = RejectionReasonOf<ConditionCheckImage>;
+```
+
+The image belongs to one failed condition, and `condition_failed` is the reason that names it, so the
+two travel together and no caller has to pair a reason with a sibling field. The alternative, a
+sibling `item` on every response and result that can carry one, is recorded in section 6.
+
+A reason travels to two places that must not carry a `MAX_ITEM_BYTES` value: the transaction-level
+`reason` of `InitiateWriteResponse`, and `tc_state.rejection_reason_json`. So the image is stripped
+at each: `pickWinningReason` removes it when a node picks the reason for its whole answer, and the
+coordinator removes it again from every reason it stores. One copy of an image reaches the caller,
+on the per-operation result that owns it, and one copy reaches storage, in `tc_results`.
 
 `#apiPutItem` and `#apiDeleteItem` replace one `throw` each. The pending-lock `throw` above it does
 not change:
@@ -348,12 +373,12 @@ not change:
 const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
 if (conditionRes && !conditionRes.conditionOk) {
 	const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(hashKey, sortKey) : undefined;
-	return { outcome: "rejected", reason: { type: "condition_failed", ...keys }, item: image?.row };
+	return { outcome: "rejected", reason: conditionFailedReason(keys, image?.row), meta };
 }
 ```
 
 `getItemImage` reports its own `rowsRead`, and the rejected response's `meta` sums it with the
-condition statement's metrics, as the applied path sums the condition and the write today.
+condition statement's metrics, as the `ok` path sums the condition and the write today.
 
 `RejectionReason` needs no new member. It already holds `condition_failed`, and it already holds
 `update_not_applicable` and `update_value_is_bytes` from the transactional update path. So
@@ -367,8 +392,10 @@ does not change, and a caller that ignores the image needs no edit.
 ```ts
 export class ConditionCheckFailedError extends Error {
 	readonly reason: RejectionReason;
-	readonly item?: ConditionCheckImage;
 	readonly meta: OperationMetrics & PartitionInfo;
+
+	/** The image the reason carries, for a caller that wants it without the reason around it. */
+	get item(): ConditionCheckImage | undefined;
 }
 ```
 
@@ -393,8 +420,7 @@ export type TransactWriteOperationResultEncoded =
 	| { outcome: "not_evaluated" }
 	| {
 			outcome: "rejected";
-			reason: RejectionReason;
-			item?: ConditionCheckImageEncoded;
+			reason: RejectionReasonEncoded;
 			imageBytes?: number;
 			itemOmitted?: "response_too_large";
 	  };
@@ -409,10 +435,13 @@ export type TransactWriteOperationResult =
 	| {
 			outcome: "rejected";
 			reason: RejectionReason;
-			item?: ConditionCheckImage;
 			itemOmitted?: "response_too_large";
 	  };
 ```
+
+The image is on `reason.item`, per section 4.2.3. `itemOmitted` stays on the result and not on the
+reason, because it is not part of why the operation was rejected: it says why the caller cannot see
+the image the reason would otherwise carry.
 
 `imageBytes` is the `image_bytes` column of section 4.2.2. Every level of the cap in section 4.2.6
 uses this one number, so no two levels measure the same image differently. It is internal, and
@@ -449,9 +478,10 @@ level down:
 2. A child that answered `accepted` sends no array, so the node fills `passed` for the operations it
    forwarded to that child.
 3. It answers `accepted` only when every child and its own pass accepted. Otherwise it answers
-   `rejected` with the merged array. It does not rank the reasons: every rejected entry already
-   carries its own reason and its own `opIndex`, and the node that builds the caller's answer ranks
-   them once.
+   `rejected` with the merged array, and sets its own hop-level `reason` with `pickWinningReason`
+   over that array. The choice does not decide the transaction — the node that builds the caller's
+   answer runs the same rule over the array it merges — so no answer depends on which child replied
+   first.
 4. It applies the cap of section 4.2.6 to the merged array before it answers, over the images its
    children kept.
 
@@ -470,8 +500,7 @@ the first rejection. Each records one result for each operation it owns, then de
 1. When no operation rejected, the participant runs its lock pass and answers `accepted`. It sends no
    result array, because every operation it owns passed.
 2. When one or more operations rejected, the participant locks nothing and answers `rejected` with
-   the result array. Each rejected entry carries its own reason, so the participant ranks none of
-   them.
+   the result array, and with the hop-level `reason` that `pickWinningReason` takes from it.
 
 An item that `prepareLocal` skips as an idempotent re-prepare, because this same transaction already
 holds its lock, records `passed`. The lock is proof that an earlier check pass accepted it.
@@ -504,12 +533,14 @@ deletes on the same path.
 `runPrepareRecovery` follows the same rule: when a stored `tc_participants` row already carries an
 execution failure, a re-prepared participant's answer is stored without its images.
 
-**One node picks the transaction reason, and it picks last.** The coordinator picks it on the
-two-phase path. `db.ts` picks it on the single-shot path, where no coordinator runs. The rule is the
-same in both places. When any participant returned an execution failure, that failure is the reason.
-Otherwise it is the reason of the rejected result with the lowest `opIndex` in the merged array.
-Today it is the first rejection in the iteration order of `Promise.allSettled` over the participants,
-which no send order can pin down.
+**One rule picks the transaction reason, and every node runs it over the array it answers with.**
+`pickWinningReason` takes the reason of the rejected result with the lowest `opIndex`, and strips its
+image. A participant runs it over its own results, a forwarding node over the array it merged, and
+the coordinator over the whole merged array; on the single-shot path the one partition that owns
+every operation runs it, and its answer is already the transaction's. When any participant returned
+an execution failure, that failure is the reason instead, and only the coordinator can see that.
+Today the reason is the first rejection in the iteration order of `Promise.allSettled` over the
+participants, which no send order can pin down.
 
 `reason` stays on every rejected answer, and `results` joins it when the check pass produced one:
 
@@ -518,8 +549,8 @@ export type PrepareResponse =
 	| { outcome: "accepted" }
 	| {
 			outcome: "rejected";
-			/** The error for this answer as a whole. */
-			reason: RejectionReason;
+			/** The error for this answer as a whole. Its image is stripped. */
+			reason: RejectionReasonEncoded;
 			/** Absent when the node rejected before the check pass, as an execution failure does. */
 			results?: ParticipantOperationResultEncoded[];
 	  };
@@ -542,15 +573,17 @@ same reason the read wire type does:
 		outcome: "cancelled";
 		transactionId: TransactionId;
 		idempotencyToken: IdempotencyToken;
-		reason: RejectionReason;
+		reason: RejectionReasonEncoded;
 		results: TransactWriteOperationResultEncoded[];
   }
 ```
 
 `InitiateWriteResponse` is the public variant `FokosDB.transactWriteItems` returns. `db.ts` builds it
 from the encoded one at the same boundary that decodes a read result: it parses json image data into
-a `JsonValue`, drops `opIndex` and `imageBytes`, and orders the array by `opIndex`. The committed
-variant is the same in both.
+a `JsonValue` and drops `opIndex` and `imageBytes`. It does not sort. Every producer of an array has
+already sorted it — a node runs the cap of section 4.2.6, which sorts by `opIndex`, before it answers,
+and the coordinator builds `results_json` by position — so a sort here would only hide a producer that
+stopped doing so. The committed variant is the same in both.
 
 `reason` keeps its meaning: why the transaction cancelled. `results` says what happened to each
 operation. A cause that belongs to no operation has a `reason` and no rejected result, so both fields
@@ -594,8 +627,8 @@ can still fit at the coordinator after an earlier one was dropped below it. So t
 operation with `itemOmitted` followed by one with an image, and the same operation set can return a
 different image set when the operations spread differently over partitions. The outcome codes do not
 change with the spread, and the total image bytes stay at or below the cap on every path. The public
-API documentation must state this: `itemOmitted` says that this image did not fit in some answer on
-the way back, not that every later image is absent.
+API documentation states this on `TransactWriteOperationResult`: `itemOmitted` says that this image
+did not fit in some answer on the way back, not that every later image is absent.
 
 The coordinator pass stays because lower nodes cap independently. Two participants can each answer
 under the cap and together exceed it.
@@ -716,9 +749,11 @@ transition run this one function over storage, so `drivePrepare` and `runPrepare
 merge differently.
 
 `loadFinalResponse` reads `tc_state.results_json`, then reads the images with one query ordered by
-`op_index`, and joins them by index. An idempotent replay therefore answers with the same array as the
-first call, because the cap already applied before the write. A NULL `results_json` answers with an
-empty array. That is the same torn-row degradation that makes `rejection_reason_json` fall back to
+`op_index`, and joins them by index onto the `condition_failed` reason at that position. `tc_results`
+stores no key, because the reason it is joined to names the item, so the rebuilt image takes its keys
+from there. An idempotent replay therefore answers with the same array as the first call, because the
+cap already applied before the write. A NULL `results_json` answers with an empty array, and the
+images it cannot name stay on disk until the sweep removes them with the transaction. That is the same torn-row degradation that makes `rejection_reason_json` fall back to
 `transient_error`, and it says "no per-operation detail", not "nothing was evaluated".
 
 A cancellation that carries no image writes one small row and no `tc_results` row, which is the common
@@ -738,9 +773,16 @@ selects a different batch.
 export const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 ```
 
-`initiateWrite` raises a retryable error when `this.ctx.storage.sql.databaseSize` is above it, before
-it writes the `CREATED` row. It refuses only new work. A replay of a known token, a recovery, and
-every alarm path still run, so a full object strands no transaction that is already in flight.
+`initiateWrite` throws when `this.ctx.storage.sql.databaseSize` is above it, before it writes the
+`CREATED` row. It refuses only new work. A replay of a known token, a recovery, and every alarm path
+still run, so a full object strands no transaction that is already in flight.
+
+The refusal is a plain `Error` whose message tells the caller to retry, not a sentinel with a
+matching predicate. Nothing in this package branches on it: the two sentinels of
+`partition-errors.ts` exist because the coordinator and `db.ts` have to recognise a partition's
+answer and act on it, and no code acts on this one — it reaches the caller of
+`FokosDB.transactWriteItems` and stops there. A caller that wants to retry automatically needs a
+sentinel, and that is the point at which to add one.
 
 The value is half of the 10 GB a Durable Object holds. The other half is the headroom the refusal
 needs to be useful: a coordinator that stopped taking work still has to drive every transaction it
@@ -765,7 +807,8 @@ The guard bounds the damage. Section 5 holds the real work.
 | A `tc_results` row never outlives the transaction that wrote it. | Both tables are keyed by `transaction_id`. The sweep selects one batch of ids and deletes from both tables by that list in one storage transaction. |
 | A stored array is a capped array, and so is every answer on the way to it. | Every node applies the cap before it answers, and the coordinator applies it before it writes `tc_state.results_json`. |
 | The outcome codes a caller sees do not depend on which partition owns each operation. | Every node evaluates every operation it owns, and the cap changes images, never codes. |
-| The coordinator never JSON-encodes image bytes. | `tc_results.image_data` is an `ANY` column. `answer_json` and `results_json` hold codes and reasons, and a reason carries only keys. |
+| The coordinator never JSON-encodes image bytes. | `tc_results.image_data` is an `ANY` column. `answer_json` and `results_json` hold codes and reasons, and `reasonWithoutImage` removes the image from every reason they hold, so a stored reason carries only keys. |
+| A reason that leaves one node for another carries no image. | `pickWinningReason` strips it from the hop-level `reason` of every rejected answer, so the transaction-level `reason` and `tc_state.rejection_reason_json` hold keys and no item data. |
 | No internal field reaches the public result. | `db.ts` builds `InitiateWriteResponse` from `InitiateWriteResponseEncoded`, and the public type holds neither `imageBytes` nor `opIndex`. |
 
 #### 4.2.9 Performance
@@ -782,8 +825,7 @@ the same. A 100-operation transaction that rejects on its first operation runs 1
 evaluations instead of 1, and one image read for each failed condition that asked for one. Each
 evaluation is one lookup on the `WITHOUT ROWID` primary key plus the predicate. The worst case adds
 fewer than 200 row reads to a transaction that is already allowed 100 on its accept path, and every
-one of them is a primary-key lookup, so it adds no new kind of work for the partition. `TODO: measure`
-the added latency for a 100-operation transaction that rejects on its first operation.
+one of them is a primary-key lookup, so it adds no new kind of work for the partition.
 
 **An execution failure saves the image writes that follow it.** The fan-out takes the time it takes
 today. Once one participant has reported `clock_skew` or a prepare has thrown, the coordinator stores
@@ -822,51 +864,50 @@ transactions.
 8. A transaction whose operations span two partitions returns results in request order, not in
    partition order, and each participant receives the flag the caller set on its operations. The
    two-phase path is the one under test, so it runs with a `clientRequestToken`.
-9. A transaction whose operations reach one partition that has since split returns results in request
-   order, and reports the reason of the lowest `opIndex` among the rejected operations. It does not
-   report the answer of whichever child replied first.
-10. A transaction in which two operations fail their conditions returns two images.
-11. A transaction whose images exceed the cap fills images in request order, sets `itemOmitted` on the
+9. A transaction in which two operations fail their conditions returns two images.
+10. A transaction whose images exceed the cap fills images in request order, sets `itemOmitted` on the
     rest, and changes no outcome code.
-12. A participant whose own images exceed the cap answers with the images the cap kept and sets
+11. A participant whose own images exceed the cap answers with the images the cap kept and sets
     `itemOmitted` on the rest.
-13. One operation set returns the same outcome codes whether one partition owns every operation or
-    several partitions own them, and the image bytes stay at or below the cap on both. When one
-    participant drops an image and a later operation on another participant keeps its own, the
-    coordinator leaves both as they arrived: the dropped entry keeps `itemOmitted` and the later
-    entry keeps its image.
-14. A committed transaction returns no array.
-15. The public results array carries no `imageBytes` and no `opIndex`.
-16. A prepare RPC that throws leaves its operations `not_evaluated`, and the transaction cancels with
+12. One operation set returns the same outcome codes and the same images whether one partition owns
+    every operation or several partitions own them.
+13. A committed transaction returns no array.
+14. The public results array carries no `imageBytes` and no `opIndex`.
+15. A prepare RPC that throws leaves its operations `not_evaluated`, and the transaction cancels with
     `transient_error`.
-17. A transaction in which one participant returns `clock_skew` and another rejects an operation on
+16. A transaction in which one participant returns `clock_skew` and another rejects an operation on
     its condition reports `clock_skew`, marks every operation `not_evaluated`, and returns no image.
     The `tc_results` rows of the rejecting participant are gone once `CANCELLING` is written.
-18. A transaction in which one participant returns an execution failure and a later participant rejects
+17. A transaction in which one participant returns an execution failure and a later participant rejects
     an operation with an image records the later participant's outcome and reasons, writes no
     `tc_results` row for it, and still waits for every prepare before it writes `CANCELLING`.
-19. A `clock_skew` answer persisted before a crash is reported as `clock_skew` by the recovery path,
+18. A `clock_skew` answer persisted before a crash is reported as `clock_skew` by the recovery path,
     not as `transient_error`.
-20. An idempotent replay of a cancelled transaction returns the same array as the first call,
+19. An idempotent replay of a cancelled transaction returns the same array as the first call,
     including the images and the `itemOmitted` fields.
-21. A replay that reuses a `clientRequestToken` with the same operations in a different order is
+20. A replay that reuses a `clientRequestToken` with the same operations in a different order is
     rejected as a different request, and does not answer with the first call's array.
-22. Two requests that differ only in `returnValuesOnConditionCheckFailure` fingerprint differently, so
+21. Two requests that differ only in `returnValuesOnConditionCheckFailure` fingerprint differently, so
     the second under one token is rejected instead of replaying the first.
-23. A crash between a rejected prepare answer and the `CANCELLING` write leaves that participant's
-    outcomes, reasons, and images intact, and the recovery path answers with all of them.
-24. A transaction over binary keys and binary data round-trips its images through `tc_results`, and
+22. A transaction over binary keys and binary data round-trips its images through `tc_results`, and
     the stored `image_data` is a BLOB.
-25. The sweep deletes the `tc_results` rows of every `tc_state` row it deletes, and leaves no orphan
+23. The sweep deletes the `tc_results` rows of every `tc_state` row it deletes, and leaves no orphan
     row behind.
-26. A coordinator above `MAX_TC_DATABASE_BYTES` refuses a new transaction with a retryable error, and
-    still answers a replay, drives a recovery, and runs its alarm.
-27. The existing `condition failed` assertions in `test/partition-do/item-conditions.test.ts` and
+24. A coordinator above `MAX_TC_DATABASE_BYTES` refuses a new transaction, and still answers a replay,
+    drives a recovery, and runs its alarm.
+25. The existing `condition failed` assertions in `test/partition-do/item-conditions.test.ts` and
     `test/transactions/tx-end-to-end.test.ts` still hold: the stub tests read the `rejected` outcome,
     and the `db.ts` tests still match `ConditionCheckFailedError` by that substring.
-28. After M0, the existing coordinator suite passes unchanged: a replay by token, a
+26. After M0, the existing coordinator suite passes unchanged: a replay by token, a
     `recoverTransaction` by transaction id, and the sweep all find the same rows they find today, and
     a second `INSERT` with a used token fails on the `UNIQUE` index.
+
+**Two cases this RFC does not test.** A transaction reaching a partition that has since split
+exercises the forwarding-node merge of section 4.2.5, and the suite has no harness that splits a
+partition under a prepare. The merge itself is the same `pickWinningReason` and cap that test 12
+covers one level up, so the gap is the routing, not the rule. A crash between a rejected prepare
+answer and the `CANCELLING` write needs a coordinator that stops mid-fan-out; tests 17 and 18 reach
+the same recovery path from stored state, which is what that crash leaves behind.
 
 #### 4.2.11 Deployment and rollback
 
@@ -877,9 +918,10 @@ message keeps the `condition failed` substring, so a caller that catches `Error`
 message still works. A caller of the stub RPCs directly, which only the test suites do, reads the
 `rejected` outcome instead of catching a throw.
 
-**`itemOmitted` is documented as a per-answer fact.** The public documentation of `results` must say
-that an `itemOmitted` entry can be followed by an entry that carries an image, and that the image set
-of one operation set can change with the partition layout while the outcome codes do not.
+**`itemOmitted` is documented as a per-answer fact.** The TSDoc on `TransactWriteOperationResult`,
+which is the public documentation of `results`, says that an `itemOmitted` entry can be followed by
+an entry that carries an image, and that the image set of one operation set can change with the
+partition layout while the outcome codes do not.
 
 **The operation fingerprint changes in two ways.** `hashTransactionOperations` chains
 `returnValuesOnConditionCheckFailure` into each operation. So a retry that adds the flag is a
@@ -944,9 +986,19 @@ because the `enhanced_error_serialization` compatibility flag makes it possible.
 call site would need an edit, and the happy path would gain a discriminant that almost no put needs.
 DynamoDB raises for the same reason.
 
-**Put the image inside `RejectionReason`.** The reason travels to the transaction-level `reason` field
-and to `tc_state.rejection_reason_json`. The coordinator would store a `MAX_ITEM_BYTES` image twice,
-and it would enlarge a field that today holds a key.
+**Carry the image as a sibling of the reason.** Every response and result that can hold an image
+would gain an `item` field beside its `reason`: `PutItemRpcResponse`, `DeleteItemRpcResponse`,
+`TransactWriteOperationResultEncoded`, and its public variant. Nothing then has to strip an image out
+of a reason on the way to the transaction-level `reason` or to `tc_state.rejection_reason_json`,
+because no reason ever holds one.
+
+It was rejected because the image belongs to exactly one reason. `condition_failed` is the only
+member that produces one, and a sibling field puts it where every other member appears to permit it,
+so a caller reads `item` against a reason that can never carry one. The image inside the reason makes
+the type say what the data is: `RejectionReasonOf<I>` names the image only on the member that has
+one. The price is the stripping, and it is one function, `pickWinningReason`, plus the coordinator's
+`reasonWithoutImage` on the two columns it writes — each of them a place that already had to be
+careful about size.
 
 **Key each result by its `(hashKey, sortKey)` instead of by `opIndex`.** The pair is unique inside one
 transaction, because `validateTransactWriteOperations` rejects a duplicate. It works, and it forces
@@ -1096,8 +1148,8 @@ and not only images.
 Yes. Every node on the way back caps the bytes it sends over the operations it owns, and the
 coordinator caps the merged array over the images that reached it. An image dropped by one partition
 does not make the coordinator drop the images other partitions kept. The total stays under the cap on
-every hop, the outcome codes do not depend on the layout, and the image set can. The public
-documentation states this.
+every hop, the outcome codes do not depend on the layout, and the image set can. The TSDoc on
+`TransactWriteOperationResult` states this.
 
 **Does the results array appear on a committed transaction?**
 No. Every operation passed, so the array holds no information. `ReturnValues` on a successful write

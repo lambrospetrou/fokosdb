@@ -16,14 +16,8 @@ import type {
 import invariant from "../invariant.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
-import { applyImageCap, MAX_ITEM_BYTES, pickWinningReason } from "../transaction-limits.js";
+import { applyImageCap, conditionFailedReason, decodeItemKeys, MAX_ITEM_BYTES, pickWinningReason } from "../transaction-limits.js";
 import type { UpdateProbeResult } from "../expression/runtime.js";
-import type { ConditionCheckImageEncoded } from "../types.js";
-
-// Decode a sort key for a user-facing result: the empty sentinel ([]) maps back to an absent sortKey.
-function decodeSortKey(sk: KeyBytes): string | Uint8Array | undefined {
-	return sk.length === 0 ? undefined : KeyCodec.decode(sk);
-}
 
 export type TransactionParticipantDeps = {
 	store: PartitionStore;
@@ -54,6 +48,16 @@ export class TransactionParticipant {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
 		this.#onItemUpserted = deps.onItemUpserted;
+	}
+
+	/**
+	 * The old item image for an operation whose condition just failed, or undefined when the caller
+	 * asked for none or the item does not exist. It runs in the same storage transaction as the
+	 * condition, with no `await` between them, so it returns the row the condition compared.
+	 */
+	#imageForFailedCondition(item: TransactionItem, sk: KeyBytes, itemPresent: boolean) {
+		if (item.returnValuesOnConditionCheckFailure !== "all_old" || !itemPresent) return undefined;
+		return this.#store.getItemImage(item.hashKey, sk).row;
 	}
 
 	/**
@@ -134,7 +138,7 @@ export class TransactionParticipant {
 			for (const item of request.items) {
 				const { opIndex } = item;
 				const sk = item.sortKey;
-				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
+				const rejectionKeys = decodeItemKeys(item.hashKey, sk);
 
 				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
@@ -157,27 +161,12 @@ export class TransactionParticipant {
 
 				const conditionResult = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
 				if (conditionResult && !conditionResult.conditionOk) {
-					const wantsImage = item.returnValuesOnConditionCheckFailure === "all_old";
-					const image = wantsImage && conditionResult.itemPresent ? this.#store.getItemImage(item.hashKey, sk) : undefined;
-					const itemImage: ConditionCheckImageEncoded | undefined = image?.row
-						? {
-								hashKey: rejectionKeys.hashKey,
-								...(rejectionKeys.sortKey !== undefined ? { sortKey: rejectionKeys.sortKey } : {}),
-								data: image.row.data,
-								kind: image.row.kind,
-								version: image.row.version,
-								...(image.row.ttlAt !== undefined ? { ttlAt: image.row.ttlAt } : {}),
-							}
-						: undefined;
+					const image = this.#imageForFailedCondition(item, sk, conditionResult.itemPresent);
 					results.push({
 						outcome: "rejected",
 						opIndex,
-						reason: {
-							type: "condition_failed",
-							...rejectionKeys,
-							...(itemImage ? { item: itemImage } : {}),
-						},
-						...(image?.row ? { imageBytes: image.row.imageBytes } : {}),
+						reason: conditionFailedReason(rejectionKeys, image),
+						...(image ? { imageBytes: image.imageBytes } : {}),
 					});
 					continue;
 				}
@@ -355,7 +344,7 @@ export class TransactionParticipant {
 			for (const item of request.items) {
 				const { opIndex } = item;
 				const sk = item.sortKey;
-				const rejectionKeys = { hashKey: KeyCodec.decode(item.hashKey), sortKey: decodeSortKey(sk) };
+				const rejectionKeys = decodeItemKeys(item.hashKey, sk);
 
 				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 				if (pendingRow) {
@@ -373,27 +362,12 @@ export class TransactionParticipant {
 
 				const conditionRes = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
 				if (conditionRes && !conditionRes.conditionOk) {
-					const wantsImage = item.returnValuesOnConditionCheckFailure === "all_old";
-					const image = wantsImage && conditionRes.itemPresent ? this.#store.getItemImage(item.hashKey, sk) : undefined;
-					const itemImage: ConditionCheckImageEncoded | undefined = image?.row
-						? {
-								hashKey: rejectionKeys.hashKey,
-								...(rejectionKeys.sortKey !== undefined ? { sortKey: rejectionKeys.sortKey } : {}),
-								data: image.row.data,
-								kind: image.row.kind,
-								version: image.row.version,
-								...(image.row.ttlAt !== undefined ? { ttlAt: image.row.ttlAt } : {}),
-							}
-						: undefined;
+					const image = this.#imageForFailedCondition(item, sk, conditionRes.itemPresent);
 					results.push({
 						outcome: "rejected",
 						opIndex,
-						reason: {
-							type: "condition_failed",
-							...rejectionKeys,
-							...(itemImage ? { item: itemImage } : {}),
-						},
-						...(image?.row ? { imageBytes: image.row.imageBytes } : {}),
+						reason: conditionFailedReason(rejectionKeys, image),
+						...(image ? { imageBytes: image.imageBytes } : {}),
 					});
 					continue;
 				}

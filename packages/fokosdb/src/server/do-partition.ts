@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { DataKind, OperationMetrics, type ConditionCheckImageEncoded, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
+import { DataKind, OperationMetrics, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
 import type { CompiledConditionPlan } from "../shared/expression/plan.js";
 import type {
 	CancelRequest,
@@ -15,7 +15,6 @@ import type {
 	ReadForTransactionResponse,
 	ReadSnapshotRequest,
 	ReadSnapshotResponse,
-	RejectionReason,
 	RejectionReasonEncoded,
 	SingleShotRequest,
 	SingleShotResponse,
@@ -80,7 +79,13 @@ import {
 import { PageBudget } from "../shared/query/page-budget.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { applyImageCap, IDEMPOTENCY_WINDOW_MS, pickWinningReason } from "../shared/transaction-limits.js";
+import {
+	applyImageCap,
+	conditionFailedReason,
+	decodeItemKeys,
+	IDEMPOTENCY_WINDOW_MS,
+	pickWinningReason,
+} from "../shared/transaction-limits.js";
 import { errExceededDatabaseSize, errSinglePartitionFastPathFallback } from "../shared/partition-errors.js";
 
 export interface PartitionAPI {
@@ -532,64 +537,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				});
 
 				if (localRes.outcome === "rejected") {
-					const { rowsRead, rowsWritten } = localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes;
-					const item: ConditionCheckImageEncoded | undefined = localRes.image?.row
-						? {
-								hashKey: KeyCodec.decode(hashKey),
-								...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
-								data: localRes.image.row.data,
-								kind: localRes.image.row.kind,
-								version: localRes.image.row.version,
-								...(localRes.image.row.ttlAt !== undefined ? { ttlAt: localRes.image.row.ttlAt } : {}),
-							}
-						: undefined;
 					return {
 						outcome: "rejected",
-						reason: {
-							type: "condition_failed",
-							hashKey: KeyCodec.decode(hashKey),
-							...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
-							...(item ? { item } : {}),
-						},
-						meta: {
-							rowsRead,
-							rowsWritten,
-							databaseSize: this.#store.databaseSize,
-							servedByActorId: this.ctx.id.toString(),
-							servedByActorName: pCtx.doName,
-							servedByPartitionId: pCtx.partitionId,
-							forwardCount: 0,
-							hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-							rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-							_internal: {
-								rangeAncestors: this.#_rangeAncestors,
-							},
-						},
+						reason: conditionFailedReason(decodeItemKeys(hashKey, sortKey), localRes.image?.row),
+						meta: this.localMeta(pCtx, localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
 					};
 				}
 
 				const { writeRes, conditionRes } = localRes;
-				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
 
 				await this.checkSplits(pCtx, hashKey, sortKey);
 				return {
 					outcome: "ok",
 					version: writeRes.version,
-					meta: {
-						rowsRead,
-						rowsWritten,
-						databaseSize: this.#store.databaseSize,
-						servedByActorId: this.ctx.id.toString(),
-						servedByActorName: pCtx.doName,
-						servedByPartitionId: pCtx.partitionId,
-						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-						rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-						_internal: {
-							rangeAncestors: this.#_rangeAncestors,
-						},
-					},
+					meta: this.localMeta(pCtx, conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
 				};
 			},
 		});
@@ -632,61 +594,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				});
 
 				if (localRes.outcome === "rejected") {
-					const { rowsRead, rowsWritten } = localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes;
-					const item: ConditionCheckImageEncoded | undefined = localRes.image?.row
-						? {
-								hashKey: KeyCodec.decode(hashKey),
-								...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
-								data: localRes.image.row.data,
-								kind: localRes.image.row.kind,
-								version: localRes.image.row.version,
-								...(localRes.image.row.ttlAt !== undefined ? { ttlAt: localRes.image.row.ttlAt } : {}),
-							}
-						: undefined;
 					return {
 						outcome: "rejected",
-						reason: {
-							type: "condition_failed",
-							hashKey: KeyCodec.decode(hashKey),
-							...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
-							...(item ? { item } : {}),
-						},
-						meta: {
-							rowsRead,
-							rowsWritten,
-							databaseSize: this.#store.databaseSize,
-							servedByActorId: this.ctx.id.toString(),
-							servedByActorName: pCtx.doName,
-							servedByPartitionId: pCtx.partitionId,
-							forwardCount: 0,
-							hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-							rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-							_internal: {
-								rangeAncestors: this.#_rangeAncestors,
-							},
-						},
+						reason: conditionFailedReason(decodeItemKeys(hashKey, sortKey), localRes.image?.row),
+						meta: this.localMeta(pCtx, localRes.image ? sumSqlMetrics(localRes.conditionRes, localRes.image) : localRes.conditionRes),
 					};
 				}
 
 				const { writeRes, conditionRes } = localRes;
-				const { rowsRead, rowsWritten } = conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes;
 				return {
 					outcome: "ok",
 					deleted: writeRes.deleted,
-					meta: {
-						rowsRead,
-						rowsWritten,
-						databaseSize: this.#store.databaseSize,
-						servedByActorId: this.ctx.id.toString(),
-						servedByActorName: pCtx.doName,
-						servedByPartitionId: pCtx.partitionId,
-						forwardCount: 0,
-						hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-						rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-						_internal: {
-							rangeAncestors: this.#_rangeAncestors,
-						},
-					},
+					meta: this.localMeta(pCtx, conditionRes ? sumSqlMetrics(conditionRes, writeRes) : writeRes),
 				};
 			},
 		});
@@ -2057,6 +1976,30 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
 		return this.env[this.pCtx().ns].getByName(childPCtx.doName);
+	}
+
+	/**
+	 * The metrics and routing information for work this node did itself. `forwardCount` is 0 because a
+	 * node that answers locally forwarded nothing; a router builds its own meta with its fan-out count.
+	 */
+	private localMeta(
+		pCtx: PartitionContextResolved,
+		counts: { rowsRead: number; rowsWritten: number },
+	): OperationMetrics & PartitionInfoInternal {
+		return {
+			rowsRead: counts.rowsRead,
+			rowsWritten: counts.rowsWritten,
+			databaseSize: this.#store.databaseSize,
+			servedByActorId: this.ctx.id.toString(),
+			servedByActorName: pCtx.doName,
+			servedByPartitionId: pCtx.partitionId,
+			forwardCount: 0,
+			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
+			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+			_internal: {
+				rangeAncestors: this.#_rangeAncestors,
+			},
+		};
 	}
 
 	private readItemLocally(pCtx: PartitionContextResolved, req: GetItemRpcRequest): GetItemRpcResponse {

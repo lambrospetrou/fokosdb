@@ -12,7 +12,7 @@
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
 import type { ParticipantOperationResultEncoded, RejectionReasonEncoded, TransactionOperationType } from "./transaction-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
-import type { ReturnValuesOnConditionCheckFailure } from "./types.js";
+import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -39,7 +39,16 @@ export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
-export const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024; // FIXME: 5GB of storage in each transaction coordinator.
+/**
+ * The size above which a coordinator refuses to start a new transaction. It is half of the 10 GB a
+ * Durable Object holds, and the other half is headroom the refusal needs to be useful: a coordinator
+ * that stopped taking work must still drive every transaction it already accepted to a terminal
+ * state, and each of those writes state before it sends its outbound RPCs. A guard near the ceiling
+ * would refuse new work and then wedge on the old.
+ *
+ * FIXME: Implement coordinator auto scaling out.
+ */
+export const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const SWEEP_BATCH_ROWS = 1_000;
@@ -278,6 +287,45 @@ export function validateReturnValuesOnConditionCheckFailure(value?: string): voi
 	if (value !== undefined && value !== "none" && value !== "all_old") {
 		throw new Error(`fokos: returnValuesOnConditionCheckFailure must be 'none' or 'all_old' (got '${value}')`);
 	}
+}
+
+/**
+ * The public form of an item's keys, for a result the caller reads. The empty sort-key sentinel maps
+ * back to an absent sortKey, and an absent sortKey is left off the object entirely rather than
+ * carried as an explicit `undefined`, so a result compares equal whichever path produced it.
+ */
+export function decodeItemKeys(hashKey: KeyBytes, sortKey: KeyBytes): { hashKey: string | Uint8Array; sortKey?: string | Uint8Array } {
+	return {
+		hashKey: KeyCodec.decode(hashKey),
+		...(sortKey.length > 0 ? { sortKey: KeyCodec.decode(sortKey) } : {}),
+	};
+}
+
+/**
+ * The `condition_failed` reason, with the old item image when the caller asked for one and the row
+ * exists. Every path that evaluates a condition — the item RPCs, a prepare, and a single-shot
+ * transaction — builds the reason here, so the image carries the same keys as the reason that holds
+ * it and no path can drift.
+ *
+ * `imageRow` is `PartitionStore.getItemImage().row`; its `imageBytes` is cap bookkeeping and belongs
+ * on the result, not on the image, so this takes the image fields one by one.
+ */
+export function conditionFailedReason(
+	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+	imageRow?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number },
+): RejectionReasonEncoded {
+	if (!imageRow) return { type: "condition_failed", ...keys };
+	return {
+		type: "condition_failed",
+		...keys,
+		item: {
+			...keys,
+			data: imageRow.data,
+			kind: imageRow.kind,
+			version: imageRow.version,
+			...(imageRow.ttlAt !== undefined ? { ttlAt: imageRow.ttlAt } : {}),
+		},
+	};
 }
 
 /**

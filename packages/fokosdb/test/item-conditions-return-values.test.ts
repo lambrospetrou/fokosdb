@@ -25,8 +25,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		).rejects.toThrow(/returnValuesOnConditionCheckFailure must be 'none' or 'all_old'/);
 	});
 
-	// Test 1: A conditional putItem that fails returns the stored item, its kind, its version, and its TTL, for each of the three data kinds.
-	describe("Test 1: conditional putItem failure returns stored item across all three data kinds", () => {
+	describe("a failed condition returns the stored item across all three data kinds", () => {
 		it("returns text image on condition failure", async () => {
 			const db = makeDB();
 			const key = { hashKey: `text-${crypto.randomUUID()}` };
@@ -127,8 +126,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		});
 	});
 
-	// Test 2: A conditional putItem that fails on an absent item returns no image.
-	it("Test 2: conditional putItem on absent item returns no image", async () => {
+	it("returns no image when the condition failed because the item is absent", async () => {
 		const db = makeDB();
 		const key = { hashKey: `absent-${crypto.randomUUID()}` };
 
@@ -150,8 +148,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		expect(err.reason).toMatchObject({ type: "condition_failed", hashKey: key.hashKey });
 	});
 
-	// Test 3: A putItem with returnValuesOnConditionCheckFailure: "none" that fails returns no image, and its meta.rowsRead equals the value it reports today. The same call with "all_old" reports one more row read.
-	it("Test 3: putItem with none returns no image, and all_old reports one more rowRead", async () => {
+	// The image is a second statement, so asking for one costs exactly one more row read on the
+	// failure path and nothing at all when the caller does not ask.
+	it("putItem returns no image under none, and reports one more row read under all_old", async () => {
 		const db = makeDB();
 		const key = { hashKey: `rows-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: "stored" });
@@ -189,8 +188,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		expect(errorAllOld!.meta.rowsRead).toBe(rowsReadWithoutImage + 1);
 	});
 
-	// Test 4: A conditional putItem that succeeds reads the same number of rows whether or not the caller asks for an image, and getItemImage is not called.
-	it("Test 4: successful conditional putItem reads same rows regardless of image option", async () => {
+	it("reads the same number of rows on a passing condition whether or not an image was asked for", async () => {
 		const db = makeDB();
 		const key1 = { hashKey: `succ1-${crypto.randomUUID()}` };
 		const key2 = { hashKey: `succ2-${crypto.randomUUID()}` };
@@ -215,8 +213,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		expect(resNone.meta.rowsRead).toBe(resAllOld.meta.rowsRead);
 	});
 
-	// Test 5: deleteItem repeats tests 1 to 3.
-	describe("Test 5: deleteItem repeats tests 1 to 3", () => {
+	describe("deleteItem answers a failed condition exactly as putItem does", () => {
 		it("deleteItem failure returns stored image for each data kind", async () => {
 			const db = makeDB();
 			const keyText = { hashKey: `del-text-${crypto.randomUUID()}` };

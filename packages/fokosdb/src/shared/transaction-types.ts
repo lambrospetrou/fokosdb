@@ -107,7 +107,20 @@ export type TransactWriteOperationResultEncoded =
 /** What a participant answers: the same result, labelled with the index the request gave it. */
 export type ParticipantOperationResultEncoded = TransactWriteOperationResultEncoded & { opIndex: number };
 
-/** Public variant, surfaced by db.ts. */
+/**
+ * What happened to one operation of a cancelled `transactWriteItems`, positional to the request:
+ * `results[i]` answers the operation sent at index `i`.
+ *
+ * `passed` means the operation was acceptable, `not_evaluated` that no participant judged it, and
+ * `rejected` that one failed it — the reason says why, and carries the old item image when the operation
+ * asked for one and the item exists.
+ *
+ * `itemOmitted` says the image did not fit in some answer on the way back, NOT that every later
+ * image is absent: every node caps the image bytes it sends over the operations it owns, so an
+ * entry marked `itemOmitted` can be followed by one that carries an image, and the same operation
+ * set can return a different image set when the operations spread differently over partitions. The
+ * outcome codes never depend on that spread.
+ */
 export type TransactWriteOperationResult =
 	| { outcome: "passed" }
 	| { outcome: "not_evaluated" }
