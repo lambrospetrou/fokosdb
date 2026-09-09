@@ -47,18 +47,19 @@ type CoordinatorInternals = {
 	stripPayload(transactionId: string): void;
 };
 
-function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionReason): void {
+function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionReason, createdAt?: number): void {
 	state.storage.sql.exec(`DELETE FROM tc_state`);
 	state.storage.sql.exec(`DELETE FROM tc_participants`);
 	state.storage.sql.exec(`DELETE FROM tc_items`);
+	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
 		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json, operations_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		TOKEN,
 		TX_ID,
 		tcState,
-		1_000,
-		1_000,
+		now,
+		now,
 		reason === undefined ? null : JSON.stringify(reason),
 		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
 		"0000000000000000",
@@ -846,6 +847,163 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM tc_state WHERE completed_at IS NOT NULL`).toArray()[0].n,
 			).toBe(0);
 			expect(countRows(state, "tc_state")).toBe(2);
+		});
+	});
+});
+
+describe("TransactionCoordinatorDO - bounded preparing hold", () => {
+	it("cancels with transient_error and marks every operation not_evaluated when older than MAX_PREPARING_HOLD_MS and participant throws", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(state, { name: "p1" });
+			const txPrepare = vi.fn(async () => {
+				throw new Error("partition unreachable");
+			});
+			const txCancel = vi.fn(async () => {});
+			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			const row = state.storage.sql
+				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.toArray()[0];
+			expect(row.state).toBe("CANCELLED");
+			expect(row.completed_at).toBeTypeOf("number");
+
+			const response = tc.loadFinalResponse(TX_ID, TOKEN);
+			expect(response.outcome).toBe("cancelled");
+			if (response.outcome === "cancelled") {
+				expect(response.reason).toEqual({ type: "transient_error" });
+				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			}
+		});
+	});
+
+	it("stays in PREPARING and writes no transition when younger than MAX_PREPARING_HOLD_MS", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING", undefined, Date.now() - 10_000);
+			insertParticipant(state, { name: "p1" });
+			const txPrepare = vi.fn(async () => {
+				throw new Error("partition unreachable");
+			});
+			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			const row = state.storage.sql
+				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.toArray()[0];
+			expect(row.state).toBe("PREPARING");
+			expect(row.completed_at).toBeNull();
+			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(/outcome is not yet decided/);
+		});
+	});
+
+	it("commits the transaction when a participant answers accepted on a pass that crosses the bound", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(state, { name: "p1" });
+			const txPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
+			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
+			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			const row = state.storage.sql
+				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.toArray()[0];
+			expect(row.state).toBe("COMMITTED");
+			expect(row.completed_at).toBeTypeOf("number");
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({
+				outcome: "committed",
+				transactionId: TX_ID,
+				idempotencyToken: TOKEN,
+			});
+		});
+	});
+
+	it("leaves a PREPARED transaction in PREPARED when crossing the bound", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARED", undefined, Date.now() - 30_000);
+			insertParticipant(state, { name: "p1", prepare: "accepted" });
+
+			tc.cancelTransactionInStore(TX_ID);
+
+			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
+			expect(row.state).toBe("PREPARED");
+		});
+	});
+
+	it("releases locks of an accepted participant after the bound cancels the transaction", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING", undefined, Date.now() - 30_000);
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1", prepare: "accepted" });
+			insertParticipant(state, { name: "p2" });
+
+			const txPrepare = vi.fn(async () => {
+				throw new Error("p2 unreachable");
+			});
+			const txCancelP1 = vi.fn(async () => {});
+			const txCancelP2 = vi.fn(async () => {});
+			vi.spyOn(PartitionDO, "getByName").mockImplementation(
+				(_ns, name) =>
+					({
+						txPrepare,
+						txCancel: name === "p1" ? txCancelP1 : txCancelP2,
+					}) as unknown as DurableObjectStub<PartitionDO>,
+			);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			expect(txCancelP1).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.objectContaining({
+					transactionId: TX_ID,
+					items: [{ hashKey: kb("hk1"), sortKey: kb("sk1") }],
+				}),
+			);
+			expect(txCancelP2).toHaveBeenCalledWith(
+				expect.anything(),
+				expect.objectContaining({
+					transactionId: TX_ID,
+					items: [{ hashKey: kb("hk2"), sortKey: ABSENT_SK }],
+				}),
+			);
+
+			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
+			expect(row.state).toBe("CANCELLED");
+		});
+	});
+
+	it("deletes the cancelled transaction one IDEMPOTENCY_WINDOW_MS after the bound cancelled it", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING", undefined, Date.now() - 30_000);
+			insertParticipant(state, { name: "p1" });
+			const txPrepare = vi.fn(async () => {
+				throw new Error("p1 unreachable");
+			});
+			const txCancel = vi.fn(async () => {});
+			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN);
+
+			expect(countRows(state, "tc_state")).toBe(1);
+			const row = state.storage.sql
+				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.toArray()[0];
+			expect(row.state).toBe("CANCELLED");
+			expect(row.completed_at).toBeTypeOf("number");
+
+			state.storage.sql.exec(
+				`UPDATE tc_state SET completed_at = ? WHERE transaction_id = ?`,
+				Date.now() - IDEMPOTENCY_WINDOW_MS - 1,
+				TX_ID,
+			);
+			await state.storage.deleteAlarm();
+			await tc.alarm();
+
+			expect(countRows(state, "tc_state")).toBe(0);
 		});
 	});
 });

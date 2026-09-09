@@ -1,6 +1,6 @@
 # RFC — Bound how long a transaction stays in PREPARING
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-09-09
 **Author:** Lambros
 

@@ -167,6 +167,7 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 }
 
 const STALE_THRESHOLD_MS = 5_000;
+const MAX_PREPARING_HOLD_MS = Math.min(5 * STALE_THRESHOLD_MS, IDEMPOTENCY_WINDOW_MS);
 
 /**
  * Wall-clock budget for a participant fan-out that a request waits on, commit and cancel alike.
@@ -877,10 +878,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const allParticipants = this.loadParticipants(transactionId);
 		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
 		// nothing, so the transaction stays PREPARING for the alarm to drive with the full retry budget.
-		// Only a real rejection commits the transaction to cancelling; cancelTransactionInStore then
-		// reports a still-NULL participant as the transient_error it is.
+		// Only a real rejection or exceeding the hold deadline commits the transaction to cancelling;
+		// cancelTransactionInStore then reports a still-NULL participant as the transient_error it is.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
+		const heldTooLong = Date.now() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
 
 		if (allAccepted) {
 			this.ctx.storage.transactionSync(() => {
@@ -891,11 +893,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 			});
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
-		} else if (anyRejected) {
+		} else if (anyRejected || heldTooLong) {
 			this.cancelTransactionInStore(transactionId);
 			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		}
-		// If some participants still NULL, leave in PREPARING; alarm will retry
+		// If some participants still NULL and under the hold deadline, leave in PREPARING; alarm will retry
 	}
 
 	async alarm(): Promise<void> {
