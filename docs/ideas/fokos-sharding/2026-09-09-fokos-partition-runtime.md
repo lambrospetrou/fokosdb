@@ -44,9 +44,13 @@ recorded in `docs/ideas/fokos-sharding/gptsol-existing-behavior.md` and
     - [5.2.23 Deployment and rollback](#5223-deployment-and-rollback)
     - [5.2.24 Testing](#5224-testing)
   - [5.3 Open Questions](#53-open-questions)
-- [6. Alternative Options](#6-alternative-options)
-- [7. Frequently Asked Questions](#7-frequently-asked-questions)
-- [8. References](#8-references)
+- [6. Examples](#6-examples)
+  - [6.1 Point operation on a single key](#61-point-operation-on-a-single-key)
+  - [6.2 Scan across all range partitions for a hash key](#62-scan-across-all-range-partitions-for-a-hash-key)
+  - [6.3 Scan with early exit](#63-scan-with-early-exit)
+- [7. Alternative Options](#7-alternative-options)
+- [8. Frequently Asked Questions](#8-frequently-asked-questions)
+- [9. References](#9-references)
 
 ---
 
@@ -105,14 +109,17 @@ its storage, its RPC surface, and its data semantics.
 - Every invariant in section 17 of `gptsol-existing-behavior.md` holds. Section 5.2.18 lists each one with its
   mechanism.
 - The limitations in section 24 of the same audit that are control-plane defects are fixed, not preserved:
-  acknowledgement crash gap (24.5), non-durable import start (24.6), promotion and split queue window (24.7),
-  acknowledgement membership (24.15), overlapping background passes (24.12).
+  implicit hash ownership (24.3), acknowledgement crash gap (24.5), non-durable import start (24.6), promotion
+  and split queue window (24.7), overlapping background passes (24.12), direct read-through trust (24.13),
+  partial context comparison (24.14), acknowledgement membership (24.15).
 - All RPC methods the host must expose for the runtime are prefixed with `fokos`.
 - FokosDB `PartitionDO` is rewritten as a host of the runtime and passes its existing test suites.
 
 ### Out of scope
 
 - A base Durable Object class. It can come later as sugar over the runtime. Nothing in this design needs it.
+- Compatibility with partitions that the current `PartitionDO` created. Deployments start fresh
+  (section 5.2.23). A converter and a staged dual-write upgrade were considered and dropped as not needed.
 - Changes to the FokosDB public client API or to the transaction coordinator protocol.
 - A pluggable ownership strategy in the public API. The runtime ships the hash tree and the range tree as
   built-in strategies behind one internal contract. Making that contract public is a later decision.
@@ -132,8 +139,10 @@ its storage, its RPC surface, and its data semantics.
   ([Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)). Every KV
   snapshot the runtime writes has a byte budget below that.
 - Each Durable Object has one alarm
-  ([Alarms API](https://developers.cloudflare.com/durable-objects/api/alarms/)). The runtime owns it. The host
-  must delegate `alarm()` and must not call `setAlarm` itself.
+  ([Alarms API](https://developers.cloudflare.com/durable-objects/api/alarms/)). The runtime reaches it through a
+  scheduler adapter. With the default adapter the runtime owns the alarm and the host delegates `alarm()`. A
+  host whose base class already owns the alarm, for example the Agents SDK, supplies an adapter that merges
+  deadlines and calls `runtime.runDueWork()` from the shared handler.
 - Durable Object RPC carries only an error's message across the boundary, not its class or properties. Every
   runtime error is recognizable from its message.
 - The host cannot receive constructor parameters through RPC. Shard group topology and host policy travel with
@@ -200,8 +209,10 @@ Migration is one loop. The target asks the source for a page with an opaque curs
 the source and imports it on the target. The runtime checkpoints the cursor after each import and repeats until
 the host returns no cursor. The host encodes its own phases in the cursor. The runtime never sees a row type.
 
-One scheduler owns the Durable Object alarm. The runtime registers its own jobs. The host registers its jobs, for
-example TTL expiry. Each job runs one bounded, idempotent step and reports when it wants to run next.
+One scheduler drives all background work through the Durable Object alarm, by default directly and otherwise
+through a host adapter that shares the alarm with another owner. The runtime registers its own jobs. The host
+registers its jobs, for example TTL expiry. Each job runs one bounded, idempotent step and reports when it wants
+to run next.
 
 A reader who stops here knows the design: one runtime object, one dispatch call per RPC, one repartition state
 machine, one migration loop, one scheduler, and `fokos`-prefixed RPC methods that the host delegates.
@@ -218,9 +229,10 @@ The runtime is an owned object, not a base class and not a decorator.
 - The host reads `runtime.identity()` and `runtime.lifecycle()` when it needs partition facts.
 - The host signals work with `runtime.requestSplitEvaluation()` and `runtime.requestPromotion(hashKey)`.
 
-The host must not call a private method of another partition, must not resolve a stub for a control-plane
-call, and must not call `setAlarm`. The runtime is the only code that creates stubs for `fokos*` methods. The
-host creates stubs only inside its `forward` callbacks, and only for its own application RPC methods.
+The host must not call a private method of another partition and must not resolve a stub for a control-plane
+call. With the default scheduler the host must not call `setAlarm`. The runtime is the only code that creates
+stubs for `fokos*` methods. The host creates stubs only inside its `forward` callbacks, and only for its own
+application RPC methods.
 
 ```ts
 type MyPolicy = { ns: keyof Env; maxSizeMb: number };
@@ -332,6 +344,13 @@ A target created by `fokosInit` receives its full route context from the source:
 policy therefore flow from the Worker to the roots and from each source to its targets. No partition needs a
 constructor parameter.
 
+The runtime validates topology bounds at bootstrap and on every `fokosInit`, and throws `fokos_invalid_topology`
+otherwise. The bounds come from the partition ID codec: `rootTreesN` is 1 to 65,535 (`u16` root index),
+`hashSplitN` and `rangeSplitN` are 2 to 255 (`u8` child index), `shardGroup` is non-empty and contains no `.`.
+
+The policy compare is structural in this version. A `version` field that the host bumps, with a validation hook
+on change, can be added later without a wire change, because `policy` is already opaque.
+
 `rootTreesN` and `hashSplitN` must never change for an existing shard group. The runtime detects a change only
 when a request reaches a partition that already exists; a root index that did not exist before bootstraps as
 a fresh partition. The Worker must persist its topology choice per shard group. This is the same contract as
@@ -355,7 +374,12 @@ type FokosRuntimeOptions<TPolicy> = {
 		promotionBloom?: { expectedKeys: number; falsePositiveRate: number } | false;
 	};
 	migration?: { pageBudgetBytes?: number; initRetries?: number };
-	scheduler?: { fallbackAlarmMs?: number; fastPathDelayMs?: number };
+	scheduler?: {
+		fallbackAlarmMs?: number;
+		fastPathDelayMs?: number;
+		/** Default: `fokosNativeAlarmScheduler(ctx)`, which owns the Durable Object alarm. Section 5.2.14. */
+		adapter?: FokosScheduler;
+	};
 };
 ```
 
@@ -368,7 +392,7 @@ own stored route context, which the host policy inside it makes sufficient.
 | ----------------------------- | --------------------------------- | -------------------------------------------------------------- |
 | Identity                      | KV `__fokos/identity`             | `FokosPartitionIdentity`                                       |
 | Policy                        | KV `__fokos/policy`               | Last host policy a request carried, opaque                     |
-| Import record                 | KV `__fokos/import`               | Target-side repartition progress and opaque cursor             |
+| Import record                 | KV `__fokos/import`               | Target-side progress, runtime cursor, opaque host cursor       |
 | Job schedule                  | KV `__fokos/jobs`                 | `{ [jobName]: { nextRunAt } }`                                 |
 | Hash topology cache           | KV `__fokos/cache/hash_arena`     | `Uint32Array` arena snapshot, byte-bounded                     |
 | Promotion Bloom cache         | KV `__fokos/cache/promotion_bloom`| Scalable Bloom filter snapshot, byte-bounded                   |
@@ -434,9 +458,13 @@ class FokosPartitionRuntime<TPolicy, TCursor, TPage> implements FokosPartitionRp
 	/** The stored route context of this partition: identity, topology, and policy. */
 	routeContext(): FokosRouteContext<TPolicy>;
 	lifecycle(): FokosLifecycle;
+	/** True when this partition owns the key now. For host jobs that write partitioned data. */
+	owns(key: RouteKey): boolean;
 	requestSplitEvaluation(): void;
-	requestPromotion(hashKey: KeyBytes): FokosRequestPromotionResult;
+	requestPromotion(hashKey: KeyBytes, data?: unknown): FokosRequestPromotionResult;
 	scheduleJob(name: string, runAt: number): void;
+	/** One background pass. Section 5.2.14. `alarm(info)` calls this and nothing else. */
+	runDueWork(info?: AlarmInvocationInfo): Promise<void>;
 }
 ```
 
@@ -444,14 +472,15 @@ class FokosPartitionRuntime<TPolicy, TCursor, TPage> implements FokosPartitionRp
 interface FokosPartitionHooks<TPolicy, TCursor, TPage> {
 	/**
 	 * Called after a local success that signals `evaluateSplit`, and by the background job while a
-	 * split is queued. Returns true when the host wants this partition to split now. Synchronous.
+	 * split is queued. Returns `false`, or `{ data }` when the host wants this partition to split now.
+	 * `data` is opaque and travels in the plan to every later hook. Synchronous.
 	 * The host reads its own metrics and thresholds from `policy`. The runtime does not read SQL size.
 	 */
 	evaluateSplit(input: {
 		identity: FokosPartitionIdentity;
 		policy: TPolicy;
 		trigger: "after_write" | "background";
-	}): boolean;
+	}): false | { data?: unknown };
 
 	/**
 	 * Range partitions only. Returns `childCount - 1` strictly increasing boundaries inside (start, end),
@@ -502,6 +531,21 @@ interface FokosPartitionHooks<TPolicy, TCursor, TPage> {
 	/** Observability and non-atomic follow-up. Runs after the transaction that caused it commits. */
 	onLifecycleEvent?(event: FokosLifecycleEvent): void | Promise<void>;
 
+	/**
+	 * Observation only. Runs once per `dispatch` on this partition, after the result or error is fixed.
+	 * Carries no request or response payload. Cannot change the result. Errors are logged.
+	 */
+	afterRequest?(info: {
+		op: string;
+		handling: "local" | "forwarded" | "read_source" | "rejected" | "failed";
+		elapsedMs: number;
+		servedBy?: FokosPartitionRef;
+		errorCode?: string;
+	}): void;
+
+	/** Runs first in `fokosDestroy`, before the runtime deletes storage. Stops host resources. */
+	beforeDestroy?(): void | Promise<void>;
+
 	/** Host background jobs. Section 5.2.14. */
 	jobs?: FokosJob[];
 
@@ -516,24 +560,32 @@ type FokosSlice =
 	| { kind: "promoted_key"; hashKey: KeyBytes };
 
 type FokosExportRequest<TCursor> = {
-	repartitionId: string;
+	plan: FokosRepartitionPlan;
 	target: FokosPartitionRef;
 	slice: FokosSlice;
-	/** The same ownership function the runtime uses for routing. The host must filter rows with it. */
+	/**
+	 * The same ownership function the runtime uses for routing. The host must filter rows with it.
+	 * For a hash child it returns false for a hash key that has a completed route override: that key
+	 * belongs to a range tree, so the child receives the override pointer but no data copy.
+	 */
 	belongsToTarget(key: RouteKey): boolean;
 	cursor: TCursor | null;
 	budgetBytes: number;
 };
 type FokosExportResult<TCursor, TPage> = { page: TPage; nextCursor: TCursor | null; bytes: number };
-type FokosImportInfo = { repartitionId: string; source: FokosPartitionRef; slice: FokosSlice };
+type FokosImportInfo = { plan: FokosRepartitionPlan; source: FokosPartitionRef; slice: FokosSlice };
 
-type FokosRepartitionPlan = {
+type FokosRepartitionPlan<TPolicy = unknown> = {
 	id: string;
 	kind: "hash_split" | "range_split" | "key_promotion";
 	source: FokosPartitionRef;
 	targets: Array<{ ref: FokosPartitionRef; slice: FokosSlice }>;
 	/** "router": the source owns nothing after cutover. "retains_others": it owns all non-selected keys. */
 	sourceAfterCutover: "router" | "retains_others";
+	/** The host policy at queue time. Every hook that receives the plan reads this copy, not the live value. */
+	policy: TPolicy;
+	/** Opaque host data from `evaluateSplit` or `requestPromotion`. */
+	data?: unknown;
 };
 
 type FokosLifecycleEvent =
@@ -557,9 +609,11 @@ Rules for hooks:
 
 - `evaluateSplit`, `computeRangeBoundaries`, `importPage`, `beforeCutover`, `beforeComplete`, and `admit` are
   synchronous. Four of them run inside a `transactionSync`. An `await` there is a defect.
-- `exportPage`, `finalizeImport`, `cleanupSourceStep`, and `onLifecycleEvent` can be async.
-- A hook that needs the host policy and does not receive it as input calls `runtime.policy()`. The value is the
-  stored policy, which the last request updated.
+- `exportPage`, `finalizeImport`, `cleanupSourceStep`, and `onLifecycleEvent` can be async. None of them
+  writes owned data on a path that a cutover can race, so they take no lease.
+- A hook that receives a `plan` reads `plan.policy`, the snapshot from queue time. A long migration or cleanup
+  therefore sees one policy from start to end. A hook without a plan calls `runtime.policy()`, the live value
+  that the last request updated.
 - A hook must not throw to express a policy result. It returns the result. A thrown error is a defect and the
   runtime logs it, keeps durable state unchanged, and retries on the next background pass.
 - `importPage` must be idempotent. The runtime commits the page and the cursor in one transaction, but the host
@@ -581,7 +635,14 @@ type FokosOperationBase<Req, Res> = {
 	whileMigrating: "retry" | "read_source";
 	/** Opaque to the runtime. Passed to hooks.admit. */
 	admissionTag?: string;
-	local(req: Req): Promise<Res> | Res;
+	/**
+	 * How `local` interacts with a routing cutover. Section 5.2.20. Default "sync".
+	 * "sync":      `local` must return a value, not a thenable. Nothing can interleave, so no guard is needed.
+	 * "lease":     `local` can be async. The runtime holds a shared lease across it; cutover drains holders.
+	 * "unguarded": `local` can be async and the host owns the safety of that choice.
+	 */
+	localConcurrency?: "sync" | "lease" | "unguarded";
+	local(req: Req): Res | Promise<Res>;
 	/**
 	 * `target` is the full route context of the destination. The runtime derives it: the target identity,
 	 * this partition's topology, and this partition's stored policy. The host passes it to its own RPC.
@@ -591,7 +652,10 @@ type FokosOperationBase<Req, Res> = {
 	afterLocalSuccess?(req: Req, res: Res): FokosSignals | void;
 };
 
-type FokosSignals = { evaluateSplit?: boolean; promotionCandidates?: KeyBytes[] };
+type FokosSignals = {
+	evaluateSplit?: boolean;
+	promotionCandidates?: Array<{ hashKey: KeyBytes; data?: unknown }>;
+};
 
 type FokosOperation<Req, Res> =
 	| (FokosOperationBase<Req, Res> & { shape: "point"; key(req: Req): RouteKey })
@@ -616,7 +680,7 @@ type FokosOperation<Req, Res> =
 			/** Fold one child result into the accumulator. `remaining: null` stops the traversal. */
 			fold(acc: Res | null, part: Res, req: Req): { acc: Res; remaining: Req | null };
 		})
-	| { shape: "local"; local(req: unknown): Promise<unknown> | unknown };
+	| { shape: "local"; localConcurrency?: "sync" | "lease" | "unguarded"; local(req: unknown): unknown };
 ```
 
 | Shape          | Owner resolution                              | Behavior                                                                  |
@@ -648,6 +712,7 @@ or more parts and one part per remote target.
 3. **Owner resolution** for every key (section 5.2.7). Group the items by destination.
 4. **Admission.** If a local group exists, call `hooks.admit`. A rejection throws the host error unchanged.
 5. **Execution.** Run the local group and the remote groups per the shape. Remote groups run in parallel.
+   The local call follows the operation's `localConcurrency` mode (section 5.2.20).
 6. **Learning.** For each successful remote envelope, learn the route (section 5.2.9), add one to
    `forwardCount`.
 7. **Signals.** If the local group succeeded and the descriptor has `afterLocalSuccess`, collect signals and
@@ -672,30 +737,35 @@ type FokosOwner =
 
 Resolution order on a hash partition:
 
-1. **Route override.** If `fokos_route_overrides` has the hash key and the repartition state is `cutover` or
+1. **Ownership.** The hash key must hash to `identity.hash.rootIndex` with `rootTreesN`, and at each depth `d`
+   of `identity.hash.path` it must hash to `path[d]` with `hashSplitN`. Otherwise `out_of_range`. This is one
+   hash per level, in memory, and it turns a routing defect into an error instead of a write on the wrong
+   partition (audit 24.3).
+2. **Route override.** If `fokos_route_overrides` has the hash key and the repartition state is `cutover` or
    later, the owner is the promotion target: the range root, or a deeper range slice from the range hierarchy
    cache. This is authoritative.
-2. **Promotion Bloom cache.** If the filter reports a probable promotion by a descendant, the owner is the
+3. **Promotion Bloom cache.** If the filter reports a probable promotion by a descendant, the owner is the
    range root, `speculative: true`. Point and scan shapes use this step. Group and single-owner shapes skip it.
-3. **Topology.** If this partition is a router (`sourceAfterCutover: "router"` on a `cutover` or later
+4. **Topology.** If this partition is a router (`sourceAfterCutover: "router"` on a `cutover` or later
    repartition), pick the child by the hash function at this depth, then apply the hash arena cache to jump
    deeper. Otherwise the owner is local.
 
 Resolution order on a range partition:
 
-1. The hash key must equal `identity.range.hashKey`, and the sort key must be inside `[start, end)`. Otherwise
-   `out_of_range`.
+1. **Ownership.** The hash key must equal `identity.range.hashKey`, and the sort key must be inside
+   `[start, end)`. Otherwise `out_of_range`.
 2. If this partition is a router, pick the child whose interval contains the sort key, then apply the range
    hierarchy cache to jump deeper. Otherwise the owner is local.
 
-A speculative forward that fails with `fokos_not_initialized` or `fokos_not_owner_yet` resolves again with step 2
-disabled. Any other error propagates.
+A speculative forward that fails with `fokos_not_initialized` or `fokos_not_owner_yet` resolves again with the
+Bloom step disabled. Any other error propagates.
 
-`out_of_range` throws `fokos_out_of_range`. It is a routing defect, not backpressure. A hash leaf does not verify
-its hash path; correct parent routing is the contract, as today.
+`out_of_range` throws `fokos_out_of_range`. It is a routing defect, not backpressure. Both partition kinds now
+verify ownership; a caller that reaches the wrong partition gets an error rather than a silent misplacement.
 
-The same `belongsToTarget` predicate that `exportPage` receives is derived from the same function as step 3 for
-hash children and step 2 for range children. One implementation, two callers.
+The `belongsToTarget` predicate that `exportPage` receives is the same function as hash step 4 for hash children
+and range step 2 for range children, with one addition for hash children: a key with a `completed` or `cleaned`
+route override returns `false`, because a range tree owns it. One implementation, two callers.
 
 #### 5.2.8 Response envelope
 
@@ -818,23 +888,30 @@ signal in the request that produced it, after the result is fixed:
 The durable queue write and the `setAlarm` call are awaited. The fast-path timer is not. A failure in this step
 is logged and the request still returns its result.
 
-A hash child inherits promotions. Hash split targets receive, through the host's own page format, whatever the
-host chooses to migrate. The runtime also copies the `fokos_route_overrides` rows whose hash key belongs to a
-target, and the matching completed `key_promotion` rows, as part of `fokosInit`. This keeps the forwarding
-pointer with the new owner without a host hook.
+A hash child inherits promotions. The runtime moves each `fokos_route_overrides` row whose hash key belongs to
+a target, together with its `completed` or `cleaned` `key_promotion` row, through the runtime stream of the
+migration protocol (section 5.2.12). The host's `belongsToTarget` excludes those keys, so the child receives the
+forwarding pointer and no data copy. No host hook is involved.
 
 #### 5.2.12 Migration protocol
 
-One RPC, one loop, one opaque cursor.
+One RPC, one loop per stream, one opaque host cursor. The runtime owns a second, small stream for its own
+rows so that a hash leaf with many promoted keys never produces an unbounded init request.
 
 ```ts
 type FokosPullRequest<TCursor> = {
 	repartitionId: string;
 	target: FokosPartitionRef;
-	cursor: TCursor | null;
+	/** "runtime": route override rows for this target. "host": the host's opaque pages. */
+	stream: "runtime" | "host";
+	cursor: TCursor | FokosRuntimeCursor | null;
 	budgetBytes: number;
 };
-type FokosPullResult<TCursor, TPage> = { page: TPage; nextCursor: TCursor | null; bytes: number };
+type FokosPullResult<TCursor, TPage> = {
+	page: TPage | FokosRuntimePage;
+	nextCursor: TCursor | FokosRuntimeCursor | null;
+	bytes: number;
+};
 ```
 
 Source side, `fokosMigrationPull`:
@@ -843,24 +920,28 @@ Source side, `fokosMigrationPull`:
 2. The target must be a member row, else `fokos_target_unknown`.
 3. The state must be `cutover` or `completed`. State `queued` throws `fokos_not_owner_yet`: targets exist but the
    cutover is not durable, so the source still owns the data and must not export it.
-4. Call `hooks.exportPage` with the slice, the `belongsToTarget` predicate, the cursor, and the budget.
-5. Return the page unchanged.
+4. `stream: "runtime"`: return the next page of override rows whose hash key belongs to the target, ordered by
+   hash key, at most `budgetBytes`. Only a `hash_split` has rows here; other kinds return an empty done page.
+5. `stream: "host"`: call `hooks.exportPage` with the plan, the slice, the `belongsToTarget` predicate, the
+   cursor, and the budget. Return the page unchanged.
 
-Target side, job `target_import`:
+Target side, job `target_import`. The import record holds one cursor per stream.
 
-1. Read the import record and cursor.
-2. `page = source.fokosMigrationPull({ repartitionId, target: self, cursor, budgetBytes })`.
-3. `transactionSync`: `hooks.importPage(page, info)`; write the returned cursor; on the first page set state
-   `importing`.
-4. Repeat while `nextCursor !== null`. The runtime can start the next pull before the current import completes;
-   the cursor it uses is the `nextCursor` of the page it already holds.
-5. `await hooks.finalizeImport(info)`.
-6. `transactionSync`: state `imported`, cursor deleted.
-7. Schedule `target_ack`.
+1. Read the import record.
+2. Runtime stream until done: pull, then `transactionSync`: insert the override and repartition rows, write the
+   runtime cursor, on the first page set state `importing`.
+3. Host stream until done: `page = source.fokosMigrationPull({ ..., stream: "host", cursor })`, then
+   `transactionSync`: `hooks.importPage(page, info)`, write the host cursor, on the first page set state
+   `importing`. The runtime can start the next pull before the current import completes; the cursor it uses is
+   the `nextCursor` of the page it already holds.
+4. `await hooks.finalizeImport(info)`.
+5. `transactionSync`: state `imported`, cursors deleted.
+6. Schedule `target_ack`.
 
 Any error stops the loop, keeps the record as is, and reschedules with backoff. A resume starts strictly after
-the last committed cursor. The host encodes phases inside the cursor and the page. For FokosDB that is
-`items → pending transactions and watermark → promoted keys`. The runtime does not know these names.
+the last committed cursor of the stream that was running. The host encodes phases inside its cursor and page.
+For FokosDB that is `items → pending transactions and watermark`. The runtime does not know these names, and
+FokosDB no longer migrates promoted keys itself.
 
 The default `budgetBytes` is 20 MiB. The host must return a page whose serialized size is at or below the
 budget. The runtime does not measure it. The RPC layer rejects a message above 32 MiB, and the runtime treats
@@ -887,17 +968,33 @@ ordered result rather than a retryable error.
 
 #### 5.2.14 Background scheduler
 
-The runtime owns the alarm and runs named jobs.
+The runtime runs named jobs and reaches the Durable Object alarm through a scheduler adapter.
 
 ```ts
+interface FokosScheduler {
+	/** Make sure the runtime's work pass runs at or before `runAtMs`. Must not move an earlier deadline later. */
+	schedule(runAtMs: number): void | Promise<void>;
+	/** Remove the runtime's deadline only. Must keep deadlines that other owners set. */
+	cancel(): void | Promise<void>;
+}
+
+/** Default. Owns the alarm: `schedule` is `setAlarm`, `cancel` is `deleteAlarm`. */
+function fokosNativeAlarmScheduler(ctx: DurableObjectState): FokosScheduler;
+
 type FokosJob = {
 	name: string;
 	/** False skips the job in this pass. Synchronous. */
 	canRun(): boolean;
-	/** One bounded, idempotent step. */
-	runStep(): Promise<{ nextRunAt: number | null }>;
+	/** Same contract as an operation's `localConcurrency`. Default "sync". Section 5.2.20. */
+	concurrency?: "sync" | "lease" | "unguarded";
+	/** One bounded, idempotent step. Under "sync" it must return a value, not a thenable. */
+	runStep(): { nextRunAt: number | null } | Promise<{ nextRunAt: number | null }>;
 };
 ```
+
+A host job that mutates partitioned data receives an `owns(key: RouteKey): boolean` helper through
+`runtime.owns`. It must check each key before it writes, because a promotion source keeps some keys and
+gives others away. `canRun` alone cannot express that per key.
 
 Built-in jobs run first, in this order: `target_import`, `target_ack`, `source_repartition`, `source_cleanup`.
 Host jobs follow in registration order. FokosDB registers stale-transaction recovery and TTL expiry here and
@@ -908,15 +1005,23 @@ One pass:
 1. For each job with `canRun()`, run `runStep()`. Catch its error, log it, and set its next run to
    `now + fallbackAlarmMs`. One failing job never stops another.
 2. Persist `__fokos/jobs` with every `nextRunAt`.
-3. `setAlarm(min(nextRunAt))` when any job wants to run. Otherwise `deleteAlarm()`.
+3. `scheduler.schedule(min(nextRunAt))` when any job wants to run. Otherwise `scheduler.cancel()`.
 
-The `alarm()` handler never throws. The runtime sets its own retry alarm instead, as the Alarms API guide
-recommends. The fast path is an in-memory timer of `fastPathDelayMs` (default 50 ms) that calls the same pass.
-The runtime keeps one in-flight pass promise. A fast-path request or an alarm that arrives during a pass waits
-for it, then runs one more pass. Two passes never interleave (audit 24.12).
+The pass is `runtime.runDueWork(info?)`. `runtime.alarm(info)` is `runDueWork` plus nothing else; it exists so
+the default integration is one delegation. `runDueWork` never throws. It records a retry deadline through the
+adapter instead, as the Alarms API guide recommends. The fast path is an in-memory timer of `fastPathDelayMs`
+(default 50 ms) that calls the same pass. The runtime keeps one in-flight pass promise. A fast-path request or
+an alarm that arrives during a pass waits for it, then runs one more pass. Two passes never interleave (audit
+24.12).
+
+A host whose base class owns `alarm()` does not delegate it. It supplies an adapter that stores the runtime
+deadline next to the base class deadlines and arms the alarm with the earliest of them. Its shared `alarm()`
+handler calls the base class handler and `runtime.runDueWork()`. The runtime does not depend on which one
+fired the alarm: `runDueWork` runs only jobs whose `nextRunAt` has passed and re-arms through the adapter.
+The Agents SDK adapter is open question 5.3.6.
 
 `runtime.scheduleJob(name, runAt)` lets the host request an earlier run for one of its jobs. It moves
-`nextRunAt` earlier only, persists, and moves the alarm earlier if needed.
+`nextRunAt` earlier only, persists, and calls `scheduler.schedule` if the earliest deadline moved.
 
 Every job, built-in or host, must be idempotent and resumable. A crash in the middle of a step is recovered by
 the next step reading durable state.
@@ -940,8 +1045,9 @@ interface FokosPartitionRpc {
 	fokosExecuteLocal(req: { op: string; request: unknown; caller: FokosPartitionRef }): Promise<FokosEnvelope<unknown>>;
 	/** Identity, lifecycle, outgoing links, cache statistics. Can bootstrap a root when `routeCtx` is given. */
 	fokosStatus(routeCtx?: FokosRouteContext<unknown>): Promise<FokosStatus>;
-	/** Delete the alarm and all storage, then abort the instance. The caller traverses links first. */
+	/** Call `hooks.beforeDestroy`, cancel the schedule, delete all storage, abort. The caller traverses links first. */
 	fokosDestroy(): Promise<void>;
+	/** Default integration only. A host with another alarm owner calls `runtime.runDueWork()` instead. */
 	alarm(info: AlarmInvocationInfo): Promise<void>;
 }
 
@@ -953,7 +1059,6 @@ type FokosInitRequest<TPolicy> = {
 	slice: FokosSlice;
 	rangeDepth?: number;
 	rangeAncestors?: Array<{ depth: number; start: KeyBytes; end: KeyBytes }>;
-	inheritedOverrides?: Array<{ hashKey: KeyBytes; plan: FokosRepartitionPlan }>;
 };
 
 type FokosStatus = {
@@ -1019,6 +1124,8 @@ any `Error`, on either side of the boundary. Hosts and clients match on the code
 | `fokos_repartition_unknown`   | no        | Pull or ack for an unknown repartition.                                    |
 | `fokos_target_unknown`        | no        | Pull, ack, or execute-local from a partition that is not a member.         |
 | `fokos_group_partial_failure` | yes       | `attempt_all` group had at least one failed remote group. Message lists them. |
+| `fokos_local_must_be_sync`    | no        | A `"sync"` operation or job returned a thenable. Host defect.               |
+| `fokos_invalid_topology`      | no        | A topology field is outside the codec bounds (section 5.2.2).               |
 
 Host errors, including admission rejections, pass through unchanged. The runtime never wraps them.
 
@@ -1033,6 +1140,7 @@ Host errors, including admission rejections, pass through unchanged. The runtime
 | Cached routes are hints                                                  | Caches are consulted only after the override table; a bad hint lands on a router or errors  |
 | Direct source reads bypass forwarding                                    | `fokosExecuteLocal` runs `local` without owner resolution                                   |
 | The source owns data until all targets exist and cutover is durable      | `start` writes `cutover` only after every `fokosInit` returned; pulls in `queued` are refused |
+| A local operation that resolved "owner" cannot write after the cutover   | `"sync"` mode has no yield point; `"lease"` mode is drained by the exclusive cutover lease   |
 | Init and ack are idempotent                                              | Both compare against stored rows and return on equality                                     |
 | All targets acknowledge before `completed`                               | `ack` counts member rows; unknown targets are rejected                                      |
 | Behavior is correct in `cutover` and `completed`                         | Owner resolution treats both states the same                                                |
@@ -1083,15 +1191,56 @@ pass. The runtime keeps correctness with three rules:
 Remote fan-out inside a group operation runs with `Promise.all` for `fail_fast` and `Promise.allSettled` for
 `attempt_all`. Migration pulls are sequential per target with one page of prefetch.
 
+**The cutover race.** One interleaving can break ownership: a request resolves "local owner", its `local`
+handler awaits non-storage I/O (`fetch`, an RPC, a timer), a background pass writes the cutover, and the
+handler resumes and writes to the old source. The only yield points inside a Durable Object are such awaits.
+SQLite storage is synchronous, and async KV storage closes the input gate. A `local` handler that never
+awaits between owner resolution and its durable write therefore cannot hit the race.
+
+`ctx.blockConcurrencyWhile` does not close this race at the cutover. It blocks events that the callback did
+not start; it does not wait for an in-flight request, so that request resumes after the cutover and writes to
+the old source. Around each local operation it would work, but it serializes every event on the object,
+resets the object on a thrown error or after 30 seconds, and deadlocks on a self-RPC
+([`blockConcurrencyWhile`](https://developers.cloudflare.com/durable-objects/api/state/#blockconcurrencywhile)).
+The runtime does not use it outside its constructor.
+
+Each operation and each host job declares one of three modes:
+
+| Mode          | Contract on `local` / `runStep`                                           | Runtime action                                                                 |
+| ------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `"sync"`      | Returns a value. A thenable is a defect.                                  | Throws `fokos_local_must_be_sync` when the return is a thenable. No guard.      |
+| `"lease"`     | Can await. Must go through the runtime for every partitioned write.        | Holds a shared lease across the call. Cutover takes the exclusive lease.        |
+| `"unguarded"` | Can await. The host owns the safety of that choice.                       | None.                                                                          |
+
+`"sync"` is the default. It is the FokosDB guideline, and the runtime enforces it: every FokosDB local
+handler becomes a plain function, and an accidental `async` fails on the first call instead of leaving a race.
+A `"sync"` read cannot return the source copy after a target has accepted a write, so the same rule covers
+stale reads.
+
+The lease is an in-memory counter and one promise. Rules:
+
+- Shared acquisition never waits on other shared holders, so re-entrant use is safe. FokosDB stale-transaction
+  recovery runs under a shared lease and calls `dispatch` for commit and cancel, which takes another shared
+  lease.
+- The cutover step of `source_repartition` takes the exclusive lease with writer preference: new shared
+  requests wait once an exclusive request is pending, so a steady request stream cannot starve the cutover.
+  It then runs `beforeCutover` and the cutover `transactionSync`, and releases. The wait is bounded by the
+  longest in-flight `"lease"` operation, which delays cutover only, never a request.
+- The runtime's own jobs never take the shared lease, because `source_repartition` performs the cutover.
+- A restart clears the lease. Durable state is authoritative, so nothing is lost.
+
+`"unguarded"` exists for a host that uses `blockConcurrencyWhile` inside its own handler, or for an operation
+that cannot conflict with ownership. The runtime does not offer a `blockConcurrencyWhile` mode of its own.
+
 #### 5.2.21 Performance
 
 Common path, a point operation served locally: identity and topology compare (in memory, seven scalar
 fields), policy compare (in memory, structural, bounded by the policy size, which for FokosDB is about ten
-fields), lifecycle check (in memory), override lookup (in-memory `Map`, one hash key), topology decision (in
-memory), one envelope allocation. No storage read is added. A storage write happens only when the policy
-changed since the last request. Compared with today, this removes the per-request `PromotionManager.statusFor`
-SQL query on hash partitions. Rows in `fokos_route_overrides` are few per partition; the in-memory mirror costs
-about 100 bytes per promoted key.
+fields), lifecycle check (in memory), ownership check (one hash of the hash key per tree level, in memory),
+override lookup (in-memory `Map`, one hash key), topology decision (in memory), one envelope allocation. No
+storage read is added. A storage write happens only when the policy changed since the last request. Compared
+with today, this removes the per-request `PromotionManager.statusFor` SQL query on hash partitions. Rows in
+`fokos_route_overrides` are few per partition; the in-memory mirror costs about 100 bytes per promoted key.
 
 Forwarded point operation: one extra RPC hop per uncached level. With warm caches a root reaches the serving leaf
 in one hop. Napkin math: a Durable Object RPC in the same colo takes about 1 to 5 ms; across regions about 50 to
@@ -1122,12 +1271,14 @@ Background: one alarm per partition, one pass per alarm. A pass with no due job 
 | `PromotionManager` cutover lock check                           | `beforeCutover` returns `pendingLockCountForHashKey(hk) === 0`                         |
 | `PromotionManager.runGC`                                        | `cleanupSourceStep` for `key_promotion`; undefined result for splits keeps rows today  |
 | `computeRangeSplitBoundaries` in `PartitionStore`               | `computeRangeBoundaries`                                                               |
-| Three migration RPCs and cursors                                | One `exportPage` and `importPage` with a phased cursor `{ phase, inner }`              |
+| Three migration RPCs and cursors                                | One `exportPage` and `importPage` with a phased cursor `{ phase, inner }`; promoted-key rows move in the runtime stream |
+| Hash child migration excludes rows of promoted keys             | `belongsToTarget` returns false for a key with a completed override                    |
 | `promoted_keys` table                                           | `fokos_route_overrides` and repartition rows, owned by the runtime                     |
 | `range_hierarchy` table                                         | `fokos_range_hierarchy`, owned by the runtime                                          |
 | Deletion of parent pending rows at `split_completed`            | `beforeComplete` for `hash_split` and `range_split`                                    |
-| Stale-transaction recovery in `alarm`                           | Host job; `canRun` returns `lifecycle().role === "owner" && import is null or active`   |
-| `TtlExpiry` with its own timer                                  | Host job                                                                               |
+| Stale-transaction recovery in `alarm`                           | Host job, `concurrency: "lease"` (it awaits the coordinator); `canRun` checks role and import state |
+| `TtlExpiry` with its own timer                                  | Host job, `"sync"`, checks `runtime.owns(key)` per row                                 |
+| `async` local closures in `withSplitForwarding` and friends     | Plain synchronous `local` functions under the default `"sync"` mode                    |
 | `meta` and `partitionMetas` with `_internal`                    | `FokosEnvelope.route`; `partitionMetas` stays a FokosDB value inside `value`           |
 | `fokosStaleTransactionMs`, `fokosGetColoInfo`, `fokosTtlConfig` | Unchanged host methods                                                                 |
 | `PartitionContext` with thresholds and `ns`, `nsTx`             | `FokosRouteContext`; `ns`, `nsTx`, and split conditions move into the opaque `policy` |
@@ -1142,13 +1293,15 @@ tree changes.
 The runtime ships as a separate entry of the `fokosdb` package or as its own package (open question 5.3.1).
 FokosDB adopts it in milestone 5 as one change.
 
-Existing partitions store `__partition_context`, `__split_status`, `__split_migration_status`,
-`__split_migration_cursor`, `__topo_cache`, `__partial_range_topology`, and the tables `promoted_keys` and
-`range_hierarchy`. The runtime does not read these. Open question 5.3.2 decides between a one-time converter
-and a fresh start.
+There is no backward compatibility with partitions that the current `PartitionDO` created. The runtime does not
+read `__partition_context`, `__split_status`, `__split_migration_status`, `__split_migration_cursor`,
+`__topo_cache`, `__partial_range_topology`, `promoted_keys`, or `range_hierarchy`, and there is no converter.
+A deployment of the new code starts with fresh Durable Object namespaces or fresh shard groups. This removes
+the legacy importer, the dual-write mirror hook, and the staged deployment that a compatible upgrade would need.
 
-Rollback before milestone 5 is a revert of an unused package. Rollback after milestone 5 is a revert of the
-FokosDB host change; it is safe only when 5.3.2 chose a converter that leaves the old keys in place.
+Rollback before milestone 5 is a revert of an unused package. Rollback after milestone 5 is a revert of the code
+together with a return to the old namespaces; data written to the new namespaces is not readable by the old
+code.
 
 #### 5.2.24 Testing
 
@@ -1162,6 +1315,9 @@ FokosDB host change; it is safe only when 5.3.2 chose a converter that leaves th
 - Integration tests in the Workers runtime drive: hash split with a crash after `fokosInit`; target crash after
   `imported`; ack from a non-member; Bloom false positive on an uninitialized root and on an `awaiting_data`
   root; a promotion queued while a split is `queued`; a `scan` across three range children during import.
+- Concurrency modes: a `"sync"` operation whose handler returns a promise fails with `fokos_local_must_be_sync`;
+  a `"lease"` operation that awaits a `fetch` while `source_repartition` reaches its cutover step completes on the
+  source before the cutover commits, and the next request for the same key routes to the target.
 - The FokosDB suites listed in section 25 of the audit pass without change to their assertions after
   milestone 5. Helpers such as `TestPartition`, `triggerHashSplit`, and `withMigrationHeld` are rewritten over
   the runtime state.
@@ -1174,12 +1330,13 @@ Options: a new entry `fokosdb/partition-runtime` in the existing package, or a s
 package gives a clean dependency check and its own version. A new entry is less publishing work and shares the
 build. The answer changes the build configuration only.
 
-#### 5.3.2 Existing data
+#### 5.3.2 One control RPC or named methods
 
-Options: a one-time converter that the FokosDB host runs on first wake when `__fokos/identity` is absent and
-`__partition_context` is present; or no converter, with existing tables recreated. The converter must map
-`__split_status` and `promoted_keys` into repartition rows and the `migration_*` keys into an import record.
-The answer changes rollback safety (section 5.2.23) and the size of milestone 5.
+Section 5.2.15 defines seven named `fokos*` methods plus `alarm`. The alternative is one `fokosRpc(request)`
+method with a discriminated union of request kinds and a matching response union. One method means one line of
+host boilerplate, one name that cannot collide, and no host change when a control operation is added. Named
+methods give per-method types on the stub, no response matching, and a surface that the stub type documents.
+A future base class hides the difference. The answer changes section 5.2.15 and the host example only.
 
 #### 5.3.3 Bloom step for group operations
 
@@ -1199,9 +1356,166 @@ The hash and range strategies sit behind one internal contract. Publishing that 
 different ownership model. It also freezes an API before a second implementation exists. The answer changes
 nothing for FokosDB.
 
+#### 5.3.6 Agents SDK scheduler adapter
+
+The `FokosScheduler` interface (section 5.2.14) permits an adapter for a base class that owns the alarm. The
+Agents SDK stores its own schedule and arms the alarm itself. The adapter must store the runtime deadline where
+the SDK's alarm handler can see it, arm the earlier of the two, and call `runtime.runDueWork()` from the shared
+handler. Whether the package ships that adapter or documents it as an example is open. `TODO: read the current
+Agents SDK alarm and schedule API before the adapter is designed.`
+
 ---
 
-## 6. Alternative Options
+## 6. Examples
+
+### 6.1 Point operation on a single key
+
+A point operation routes to the single partition that owns `{ hashKey, sortKey }`.
+
+#### Host Durable Object definition
+```ts
+// Inside constructor
+this.fokos = new FokosPartitionRuntime({
+	ctx,
+	namespace: (routeCtx) => env[routeCtx.policy.ns] as DurableObjectNamespace,
+	hooks: myHooks,
+	operations: {
+		findRecord: {
+			shape: "point",
+			whileMigrating: "retry",
+			key: (req: FindReq) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
+			local: (req: FindReq) => this.findRecordLocal(req),
+			forward: (stub, target, req) => stub.findRecord(target, req),
+		},
+	},
+});
+
+// Exposed public RPC method
+async findRecord(
+	routeCtx: FokosRouteContext<MyPolicy>,
+	req: FindReq,
+): Promise<FokosEnvelope<FindRes>> {
+	return this.fokos.dispatch("findRecord", routeCtx, req);
+}
+```
+
+#### Worker invocation
+
+```ts
+const router = new FokosRouter(topology, policy);
+const rootCtx = router.rootContext(req.hashKey);
+const rootStub = env.MY_DO.getByName(rootCtx.doName);
+
+const envelope = await rootStub.findRecord(rootCtx, req);
+const { value, route } = router.unwrap(envelope);
+```
+
+### 6.2 Scan across all range partitions for a hash key
+
+When a hash key is promoted into a range tree, child range partitions tile the interval `[start, end)`.
+A `scan` shape walks every range partition that holds data for that hash key.
+
+#### Host Durable Object definition
+
+```ts
+// Inside constructor
+operations: {
+	inspectHashKey: {
+		shape: "scan",
+		whileMigrating: "read_source",
+		scan: (req: InspectReq) => ({
+			hashKey: req.hashKey,
+			start: null,
+			end: null,
+			descending: false,
+		}),
+		clip: (req, interval) => ({ ...req, start: interval.start, end: interval.end }),
+		local: (req: InspectReq) => this.inspectLocal(req),
+		forward: (stub, target, req) => stub.inspectHashKey(target, req),
+		fold: (acc: InspectRes | null, part: InspectRes, req: InspectReq) => {
+			const merged = { items: [...(acc?.items ?? []), ...part.items] };
+			return { acc: merged, remaining: req };
+		},
+	},
+}
+
+// Exposed public RPC method
+async inspectHashKey(
+	routeCtx: FokosRouteContext<MyPolicy>,
+	req: InspectReq,
+): Promise<FokosEnvelope<InspectRes>> {
+	return this.fokos.dispatch("inspectHashKey", routeCtx, req);
+}
+```
+
+#### Worker invocation
+
+The Worker sends the request to the root partition. The runtime traverses the range tree and collects results:
+```ts
+const router = new FokosRouter(topology, policy);
+const rootCtx = router.rootContext(req.hashKey);
+const rootStub = env.MY_DO.getByName(rootCtx.doName);
+
+const envelope = await rootStub.inspectHashKey(rootCtx, req);
+const { value } = router.unwrap(envelope);
+```
+
+### 6.3 Scan with early exit
+
+A scan can stop traversal when a condition is met. Setting `remaining: null` in `fold` stops the walk immediately.
+
+#### Host Durable Object definition
+
+```ts
+// Inside constructor
+operations: {
+	findFirstMatching: {
+		shape: "scan",
+		whileMigrating: "read_source",
+		scan: (req: MatchReq) => ({
+			hashKey: req.hashKey,
+			start: req.start ?? null,
+			end: null,
+			descending: false,
+		}),
+		clip: (req, interval) => ({ ...req, start: interval.start }),
+		local: (req: MatchReq) => this.matchLocal(req),
+		forward: (stub, target, req) => stub.findFirstMatching(target, req),
+		fold: (acc: MatchRes | null, part: MatchRes, req: MatchReq) => {
+			if (part.foundItem) {
+				return { acc: part, remaining: null };
+			}
+			return { acc: acc ?? part, remaining: req };
+		},
+	},
+}
+
+// Exposed public RPC method
+async findFirstMatching(
+	routeCtx: FokosRouteContext<MyPolicy>,
+	req: MatchReq,
+): Promise<FokosEnvelope<MatchRes>> {
+	return this.fokos.dispatch("findFirstMatching", routeCtx, req);
+}
+```
+
+#### Worker invocation
+
+```ts
+const router = new FokosRouter(topology, policy);
+const rootCtx = router.rootContext(req.hashKey);
+const rootStub = env.MY_DO.getByName(rootCtx.doName);
+
+const envelope = await rootStub.findFirstMatching(rootCtx, {
+	hashKey: req.hashKey,
+	targetValue: "xyz",
+});
+const { value } = router.unwrap(envelope);
+```
+
+---
+
+## 7. Alternative Options
 
 **Base Durable Object class.** A `FokosPartitionDO` base class with protected hooks. Rejected as the primary
 model because many hosts already extend another base class, for example the Agents SDK, and JavaScript has single
@@ -1227,11 +1541,18 @@ makes the mutual exclusion atomic.
 
 ---
 
-## 7. Frequently Asked Questions
+## 8. Frequently Asked Questions
 
 **Why does the host register operations instead of passing closures per call?**
 The runtime must run the host's local handler on a source partition when a target reads through during import.
 It needs the handler by name. A registry also gives one place for the shape, the intent, and the signals.
+
+**Why is `"sync"` the default instead of the lease?**
+A synchronous handler has no yield point, so the race cannot happen and the guard costs nothing. Making the
+strict mode the default turns the FokosDB guideline into a check the runtime performs. A host that needs an
+`await` opts into `"lease"` for that one operation and keeps concurrency everywhere else. A
+`blockConcurrencyWhile` mode is not offered: it would not drain an in-flight request at the cutover, and around
+each local operation it would serialize the whole object and reset it on an error or after 30 seconds.
 
 **Why is `importPage` synchronous?**
 The runtime commits the page and the cursor in one `transactionSync`. SQLite and KV in Durable Objects are
@@ -1268,9 +1589,16 @@ Yes, through `FokosEnvelope.route`. The host's own response type has no routing 
 It omits `computeRangeBoundaries`, sets `promotionBloom: false`, and never returns `promotionCandidates`. Only
 hash splits happen. The `scan` shape is unused.
 
+**Why is `clip` needed in a scan operation, and how does it work?**
+`clip(req: Req, interval: { start: KeyBytes | null; end: KeyBytes | null }): Req` restricts an opaque application request to the interval of one child partition. It is needed because:
+1. **Application requests are opaque:** The runtime manages partition boundaries, but does not know the schema of `Req`.
+2. **Boundary isolation:** When a query covers a range across multiple partitions, each partition must execute only for the slice of keys it owns.
+
+The runtime finds the intersection between the query interval from `scan(req)` and the child partition interval `[start, end)`. It calls `clip(req, intersection)` to produce a child request, and forwards that request to the child partition. The child partition then executes `local` only on its owned keys.
+
 ---
 
-## 8. References
+## 9. References
 
 - `docs/ideas/fokos-sharding/gptsol-existing-behavior.md`
 - `docs/ideas/fokos-sharding/gemini-existing-flows-spec.md`
