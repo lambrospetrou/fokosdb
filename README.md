@@ -4,6 +4,8 @@ FokosDB: A strongly consistent bottomless storage database ontop of Cloudflare D
 
 Read the article introducing FokosDB and explaining the reasoning behind its architecture: <https://www.lambrospetrou.com/articles/fokosdb>
 
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/lambrospetrou/fokosdb)
+
 > [!CAUTION]
 > **Do NOT use this in production, yet.**
 >
