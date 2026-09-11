@@ -1,6 +1,6 @@
 # RFC — Structured errors across the FokosDB library
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-09-10
 **Author:** Lambros
 

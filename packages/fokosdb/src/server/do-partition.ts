@@ -42,6 +42,7 @@ import {
 } from "../shared/partition-topology/split-policy.js";
 import { SplitStatusKVItem } from "../shared/partition-topology/split-state.js";
 import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "../shared/partition-topology/types.js";
+import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
 import { collectBatch } from "../shared/partition/batch-scan.js";
@@ -1831,23 +1832,24 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!entry) {
 			entry = resolveRangePartitionContext(ctx, hashKey, null, null);
 		}
-		const rangeRootStub = PartitionDO.get(this.env[ctx.ns], entry.doId);
-		const result = await forward(rangeRootStub, entry.partitionContext);
+		const { doId, partitionContext: toCtx } = entry;
+		const topology = this.ensureTopology(ctx);
+
 		// Learn the range subtree boundaries from the response so future entries can skip the root chain.
 		// The response meta carries the serving leaf's rangeAncestors (propagated up through each range
-		// router), so this feeds the same range_hierarchy cache that the skip above reads — without this,
+		// router), so this feeds the same range_hierarchy cache that the skip above reads. Without this,
 		// the steady-state promoted-key path (which always enters here) would never populate that cache.
 		// On a hash `fromCtx` → range `toCtx`, recordForwardResult inserts the ancestors and no-ops the
 		// hash-topology update.
-		this.ensureTopology(ctx).recordForwardResult(hashKey, ctx, entry.partitionContext, result.meta);
-		return {
-			...result,
-			meta: {
-				...result.meta,
-				forwardCount: result.meta.forwardCount + 1,
-				...(isHashPartition(ctx) ? { hashDepth: this.depth() } : {}),
-			},
-		} as T;
+		const learn = (meta: PartitionInfoInternal) => topology.recordForwardResult(hashKey, ctx, toCtx, meta);
+		// A hash partition answers with its own hash depth: its caller forwarded to it, and checks that depth.
+		const hashDepth = isHashPartition(ctx) ? this.depth() : undefined;
+		const result = await forward(PartitionDO.get(this.env[ctx.ns], doId), toCtx).catch((e: unknown) => {
+			learnFromErrorMeta(e, learn, hashDepth);
+			throw e;
+		});
+		learn(result.meta);
+		return { ...result, meta: forwardedMeta(result.meta, hashDepth) } as T;
 	}
 
 	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfoInternal }>(
@@ -1907,30 +1909,30 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			case "forward": {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
 				const stub = this.env[ctx.ns].get(doId);
-				const result = await forward(stub, partitionContext);
-				topology.recordForwardResult(hashKey, ctx, partitionContext, result.meta);
+				// The result and the error of the forward both carry the routing meta of the target.
+				const learn = (meta: PartitionInfoInternal) => {
+					topology.recordForwardResult(hashKey, ctx, partitionContext, meta);
 
-				if (isHashPartition(ctx) && PartitionIdHelper.isRangePartition(result.meta.servedByPartitionId)) {
-					const prt = this.getOrCreatePartialRangeTopology();
-					const learnResult = prt.learnPromotedKey(hashKey);
-					if (learnResult === AddResult.Added) {
-						this.persistPartialRangeTopology();
-					} else if (learnResult === AddResult.Full) {
-						console.info({
-							...this.logParams(),
-							message: "fokos/partition: partial range topology bloom filter is full, " + "cannot learn promoted key.",
-							hashKey: KeyCodec.keyForLog(hashKey),
-						});
+					if (isHashPartition(ctx) && PartitionIdHelper.isRangePartition(meta.servedByPartitionId)) {
+						const prt = this.getOrCreatePartialRangeTopology();
+						const learnResult = prt.learnPromotedKey(hashKey);
+						if (learnResult === AddResult.Added) {
+							this.persistPartialRangeTopology();
+						} else if (learnResult === AddResult.Full) {
+							console.info({
+								...this.logParams(),
+								message: "fokos/partition: partial range topology bloom filter is full, " + "cannot learn promoted key.",
+								hashKey: KeyCodec.keyForLog(hashKey),
+							});
+						}
 					}
-				}
-
-				return {
-					...result,
-					meta: {
-						...result.meta,
-						forwardCount: result.meta.forwardCount + 1,
-					},
-				} as T;
+				};
+				const result = await forward(stub, partitionContext).catch((e: unknown) => {
+					learnFromErrorMeta(e, learn);
+					throw e;
+				});
+				learn(result.meta);
+				return { ...result, meta: forwardedMeta(result.meta) } as T;
 			}
 			case "reject_over_size":
 				throw errExceededDatabaseSize(operationName);
@@ -2018,6 +2020,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			rowsRead: counts.rowsRead,
 			rowsWritten: counts.rowsWritten,
 			databaseSize: this.#store.databaseSize,
+			...this.routingMeta(pCtx),
+		};
+	}
+
+	/** The routing part of the meta of this node. `localMeta` adds the metrics of the work, and `#rpc` stamps it on an error. */
+	private routingMeta(pCtx: PartitionContextResolved): PartitionInfoInternal {
+		return {
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
@@ -2377,8 +2386,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return await fn();
 		} catch (e) {
 			// Every error that leaves a partition is a FokosError, so a caller classifies it by its code.
-			throw FokosError.wrap(e);
+			const err = FokosError.wrap(e);
+			this.#stampRoutingMeta(err);
+			throw err;
 		}
+	}
+
+	/**
+	 * Attaches the routing meta of this partition to an error that carries none, as the own data property
+	 * `meta`, so each forwarding level learns from it as it learns from the meta of a result. The node
+	 * that raises the error stamps it, and each forwarding level changes it as it changes a result meta.
+	 * It skips a partition without a context, whose meta would mean nothing. Best effort: a failed stamp
+	 * must never replace the error.
+	 */
+	#stampRoutingMeta(err: FokosError): void {
+		const pCtx = this.#_partitionContext;
+		if (!pCtx || routedError(err)) return;
+		try {
+			stampRoutingMeta(err, this.routingMeta(pCtx));
+		} catch {}
 	}
 
 	private logParams() {

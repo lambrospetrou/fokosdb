@@ -41,8 +41,11 @@ describe("the errors of a partition, through the public API", () => {
 			items: [{ opIndex: 0, hashKey, sortKey, operation: "put", data: "held", kind: "text" }],
 		});
 
+		// The error carries the routing meta of the partition, without its internal routing state, as a result does.
+		const { rowsRead: _r, rowsWritten: _w, databaseSize: _d, ...routingMeta } = (await db.getItem(key)).meta;
 		for (const call of [() => db.putItem({ ...key, data: "blocked" }), () => db.deleteItem(key)]) {
 			const err = await errorOf(call);
+			expect((err as { meta?: unknown }).meta).toEqual(routingMeta);
 			expect(FokosConflictError.is(err)).toBe(true);
 			expect(err).toMatchObject({
 				code: "item_locked_by_transaction",

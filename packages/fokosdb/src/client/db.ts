@@ -72,6 +72,7 @@ import {
 import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
+import { routedError } from "../shared/partition-topology/forward-meta.js";
 import { normalizeSkInterval } from "../shared/query/sk-interval.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
@@ -198,7 +199,12 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
-		throw FokosError.wrap(e);
+		const err = FokosError.wrap(e);
+		// A partition stamps its routing meta on its error. The routing state stops here, as it does on a result.
+		const routed = routedError(err);
+		console.log("BOOM: ", routed);
+		if (routed) Object.assign(routed, { meta: publicMeta(routed.meta) });
+		throw err;
 	}
 }
 
@@ -275,33 +281,33 @@ export class FokosDB {
 
 	// Each public method wraps its body, so every error that leaves FokosDB is a FokosError.
 
-	putItem(opts: PutItemOptions): Promise<PutItemResult> {
-		return withFokosErrors(() => this.#putItem(opts));
+	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
+		return await withFokosErrors(async () => await this.#putItem(opts));
 	}
 
-	getItem(opts: GetItemOptions): Promise<GetItemResult> {
-		return withFokosErrors(() => this.#getItem(opts));
+	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
+		return await withFokosErrors(async () => await this.#getItem(opts));
 	}
 
-	deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
-		return withFokosErrors(() => this.#deleteItem(opts));
+	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
+		return await withFokosErrors(async () => await this.#deleteItem(opts));
 	}
 
-	transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
-		return withFokosErrors(() => this.#transactWriteItems(opts));
+	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+		return await withFokosErrors(async () => await this.#transactWriteItems(opts));
 	}
 
-	transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
-		return withFokosErrors(() => this.#transactGetItems(opts));
+	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
+		return await withFokosErrors(async () => await this.#transactGetItems(opts));
 	}
 
-	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
-		return withFokosErrors(() => this.#queryItems(opts));
+	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+		return await withFokosErrors(async () => await this.#queryItems(opts));
 	}
 
 	/** Stops at the first failure. A partial destroy stays partial, and a later call continues it. */
-	destroy(): Promise<{ ok: true }> {
-		return withFokosErrors(() => this.#destroy());
+	async destroy(): Promise<{ ok: true }> {
+		return await withFokosErrors(async () => await this.#destroy());
 	}
 
 	async #putItem(opts: PutItemOptions): Promise<PutItemResult> {

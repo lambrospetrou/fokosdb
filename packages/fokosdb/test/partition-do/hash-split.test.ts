@@ -395,6 +395,22 @@ describe("PartitionDO - splitting", () => {
 			expect(r2.meta.forwardCount).toBe(1);
 		});
 
+		it("forwards a getItem sent directly to a split child partition to its grandchild in one hop", async ({ expect }) => {
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			await partition.splitHash();
+			const child = await partition.childOwning(hashKey);
+			await child.splitHash();
+
+			// The read enters the tree at a child that is itself a router, not at the root.
+			// `childOwning` takes the context of the child from the split status of the root, and the root
+			// built that context from its own. The child routes with that context, so it must route with its
+			// own partition id: with the id of the root it would pick itself as the next hop and forward the
+			// read to itself without end (infinite loop).
+			const r = await child.get({ hashKey: kb(hashKey), sortKey: kb("sk") });
+			expect(r.meta.hashDepth).toBe(2);
+			expect(r.meta.forwardCount).toBe(1);
+		});
+
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub } = partition;

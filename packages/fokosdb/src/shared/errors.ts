@@ -33,7 +33,7 @@ export type FokosErrorOrigin = "caller" | "service" | "internal";
 export type FokosCodeDef<T extends string = string, C extends string = string> = {
 	readonly tag: T;
 	readonly code: C;
-	/** 6 characters from `a-hjkmnp-z2-9`, unique across every code and fixed for the life of the code. */
+	/** 6 characters from `a-hjkmnp-z2-9`, unique across every code and fixed for the life of the code. `pnpm error-segment` prints an unused one. */
 	readonly segment: string;
 	readonly origin: FokosErrorOrigin;
 	readonly httpStatusHint: number;
