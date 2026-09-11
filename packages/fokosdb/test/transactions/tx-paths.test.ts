@@ -4,6 +4,12 @@ import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordi
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { countDistinctPartitions, keysInOnePartition, makeDB } from "./tx-helpers.js";
+import { FokosRoutingError, ROUTING_CODES } from "../../src/shared/errors.js";
+
+/** The error a partition raises when it cannot execute the whole item set alone. */
+function fastPathNotApplicable(): FokosRoutingError {
+	return new FokosRoutingError(ROUTING_CODES.single_partition_fast_path_not_applicable, { message: "items span more than one partition" });
+}
 
 /**
  * The single-partition fast path answers a transaction from the owning partition in one round trip,
@@ -80,10 +86,10 @@ describe("transactions - single-partition fast path", () => {
 		for (const key of keys) await db.putItem({ ...key, data: `data-${key.hashKey}` });
 
 		// A partition raises this when the items straddle a split or a promotion below it. Standing in
-		// for that setup here keeps the test on what db.ts owns: recognising the sentinel and finishing
-		// the read through the two-phase path. The raise itself is covered in test/partition-do/.
+		// for that setup here keeps the test on what db.ts owns: recognising the code and finishing the
+		// read through the two-phase path. The raise itself is covered in test/partition-do/.
 		const { snapshotCalls, transactionCalls } = countReadPathCalls();
-		snapshotCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (readSnapshot)."));
+		snapshotCalls.mockRejectedValue(fastPathNotApplicable());
 
 		const result = await db.transactGetItems({ items: keys });
 
@@ -102,7 +108,10 @@ describe("transactions - single-partition fast path", () => {
 		const { snapshotCalls, transactionCalls } = countReadPathCalls();
 		snapshotCalls.mockRejectedValue(new Error("Network connection lost."));
 
-		await expect(db.transactGetItems({ items: keys })).rejects.toThrow(/Network connection lost/);
+		// The failure crosses the RPC hop, and db.ts wraps it with the original as the cause.
+		await expect(db.transactGetItems({ items: keys })).rejects.toThrow(
+			expect.objectContaining({ code: "foreign_error", cause: expect.objectContaining({ message: "Network connection lost." }) }),
+		);
 		expect(transactionCalls).not.toHaveBeenCalled();
 	});
 
@@ -187,7 +196,7 @@ describe("transactions - single-partition fast path", () => {
 		// itself is covered in test/partition-do/; what matters here is that db.ts recognises it and
 		// finishes the write on the coordinator path.
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
-		partitionCalls.mockRejectedValue(new Error("fokos/partition: single-partition fast path not applicable (executeSingleShot)."));
+		partitionCalls.mockRejectedValue(fastPathNotApplicable());
 
 		const result = await db.transactWriteItems({
 			items: keys.map((key) => ({ ...key, operation: "put" as const, data: "via-coordinator" })),

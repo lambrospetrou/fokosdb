@@ -10,6 +10,7 @@ import invariant from "../invariant.js";
 import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
+import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -68,7 +69,7 @@ describe("TransactionParticipant - prepare", () => {
 				items: [{ hashKey: kb("hk1"), sortKey: kb("sk1"), operation: "put", data: "v1", kind: "text" }],
 			});
 
-			expect(() => participant.prepareLocal(request)).toThrow(/is required/);
+			expect(() => participant.prepareLocal(request)).toThrow(invariantFailure(/is required/));
 			expect(store.pendingLockFor(kb("hk1"), kb("sk1"))).toBeUndefined();
 		});
 	});
@@ -546,7 +547,7 @@ describe("TransactionParticipant - commit", () => {
 					transactionTimestamp: request.transactionTimestamp,
 					items: [request.items[0]],
 				}),
-			).toThrow(/pending_transactions has 2 items but request has 1/);
+			).toThrow(fokosErrorWith("commit_keyset_mismatch", { pendingItems: 2, requestItems: 1 }));
 		});
 	});
 
@@ -566,7 +567,7 @@ describe("TransactionParticipant - commit", () => {
 					transactionTimestamp: request.transactionTimestamp,
 					items: [request.items[0], { hashKey: kb("c"), sortKey: KeyCodec.encodeOptional(undefined) }],
 				}),
-			).toThrow(/not found in pending_transactions/);
+			).toThrow(fokosErrorWith("commit_keyset_mismatch"));
 		});
 	});
 });

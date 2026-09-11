@@ -5,6 +5,7 @@ import { PartitionDO } from "../../server/do-partition.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { SplitStateMachine } from "./split-state.js";
+import { invariantFailure } from "../../../test/errors-matchers.js";
 
 // Runs `fn` against a SplitStateMachine over REAL Durable Object KV storage (vitest-pool-workers).
 async function withSplitState(fn: (machine: SplitStateMachine, pCtx: PartitionContextResolved) => void | Promise<void>): Promise<void> {
@@ -74,7 +75,7 @@ describe("SplitStateMachine", () => {
 	it("commitSplitStarted requires an existing status and is idempotent once started", async () => {
 		await withSplitState((machine, pCtx) => {
 			const children = makeChildren(pCtx, 2);
-			expect(() => machine.commitSplitStarted(children)).toThrow(/splitStatus must exist/);
+			expect(() => machine.commitSplitStarted(children)).toThrow(invariantFailure(/splitStatus must exist/));
 
 			machine.queueSplit("hash", pCtx);
 			machine.commitSplitStarted(children);
@@ -143,10 +144,12 @@ describe("SplitStateMachine", () => {
 
 	it("rejects acks before split_started and from unknown children (more-acks-than-children invariant)", async () => {
 		await withSplitState((machine, pCtx) => {
-			expect(() => machine.acknowledgeChildMigration("nope")).toThrow(/splitStatus must exist/);
+			expect(() => machine.acknowledgeChildMigration("nope")).toThrow(invariantFailure(/splitStatus must exist/));
 
 			machine.queueSplit("hash", pCtx);
-			expect(() => machine.acknowledgeChildMigration("nope")).toThrow(/cannot acknowledge child migration in status split_queued/);
+			expect(() => machine.acknowledgeChildMigration("nope")).toThrow(
+				invariantFailure(/cannot acknowledge child migration in status split_queued/),
+			);
 
 			const children = makeChildren(pCtx, 2);
 			machine.commitSplitStarted(children);
@@ -154,7 +157,7 @@ describe("SplitStateMachine", () => {
 			// the third distinct ack must trip the more-acks-than-children invariant.
 			machine.acknowledgeChildMigration("unknown-1");
 			machine.acknowledgeChildMigration("unknown-2");
-			expect(() => machine.acknowledgeChildMigration("unknown-3")).toThrow(/more acks/);
+			expect(() => machine.acknowledgeChildMigration("unknown-3")).toThrow(invariantFailure(/more acks/));
 		});
 	});
 });

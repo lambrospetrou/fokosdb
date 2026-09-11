@@ -86,7 +86,17 @@ import {
 	IDEMPOTENCY_WINDOW_MS,
 	pickWinningReason,
 } from "../shared/transaction-limits.js";
-import { errExceededDatabaseSize, errSinglePartitionFastPathFallback } from "../shared/partition-errors.js";
+import {
+	CONFLICT_CODES,
+	FokosConflictError,
+	FokosError,
+	FokosInternalError,
+	FokosRoutingError,
+	FokosUnavailableError,
+	INTERNAL_CODES,
+	ROUTING_CODES,
+	UNAVAILABLE_CODES,
+} from "../shared/errors.js";
 
 export interface PartitionAPI {
 	apiPutItem(ctx: PartitionContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
@@ -353,12 +363,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				storedParent?.primaryDoIdStr !== parentPartitionContext.primaryDoIdStr ||
 				storedSplitType !== splitType
 			) {
-				throw new Error(
-					`fokos: initFromSplit called with conflicting options. ` +
-						`child: ${this.#_partitionContext.primaryDoIdStr} vs ${newPartitionContext.primaryDoIdStr}, ` +
-						`parent: ${storedParent?.primaryDoIdStr} vs ${parentPartitionContext.primaryDoIdStr}, ` +
-						`splitType: ${storedSplitType} vs ${splitType}`,
-				);
+				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+					message: "initFromSplit called with conflicting options",
+					attributes: {
+						child: [this.#_partitionContext.primaryDoIdStr, newPartitionContext.primaryDoIdStr],
+						parent: [storedParent?.primaryDoIdStr, parentPartitionContext.primaryDoIdStr],
+						splitType: [storedSplitType, splitType],
+					},
+				});
 			}
 			// All options match — idempotent retry, nothing to do.
 			return;
@@ -514,9 +526,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					if (pendingRow) {
 						// FIXME: ATC §4 describes optimizations where a non-tx write can proceed using a
 						// higher timestamp to force the pending tx to abort on commit, avoiding this rejection.
-						throw new Error(
-							`fokos/putItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
-						);
+						throw itemLockedError(pendingRow.transaction_id, hashKey, sortKey);
 					}
 
 					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
@@ -577,9 +587,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					const pendingRow = this.#store.pendingLockFor(hashKey, sortKey);
 					if (pendingRow) {
 						// FIXME: ATC §4 optimization — see same comment in putItem.
-						throw new Error(
-							`fokos/deleteItem: item is locked by an in-progress transaction (transactionId=${pendingRow.transaction_id}), retry later.`,
-						);
+						throw itemLockedError(pendingRow.transaction_id, hashKey, sortKey);
 					}
 
 					const conditionRes = req.condition ? this.#store.evaluateCondition(req.condition, hashKey, sortKey) : null;
@@ -1498,7 +1506,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				transactionId: request.transactionId,
 				failureCount: failures.length,
 			});
-			throw new Error(`fokos/partition.cancel: ${failures.length} child txCancel failed for transaction ${request.transactionId}`);
+			throw new FokosInternalError(INTERNAL_CODES.partition_fanout_failed, {
+				message: "some child txCancel failed",
+				cause: failures[0].reason,
+				attributes: { transactionId: request.transactionId, failureCount: failures.length },
+			});
 		}
 
 		return { outcome: "cancelled" };
@@ -1658,7 +1670,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const [entry] = [...forwarded.values()];
 			return { destination: "child", pCtx: entry.pCtx, items: entry.items };
 		}
-		throw errSinglePartitionFastPathFallback(operationName);
+		// It carries zero side effects, so it is safe to raise from any depth of a forwarding chain: it
+		// propagates up through the routers untouched, and db.ts runs the two-phase path instead.
+		throw new FokosRoutingError(ROUTING_CODES.single_partition_fast_path_not_applicable, {
+			message: "items span more than one partition",
+			attributes: { operation: operationName },
+		});
 	}
 
 	/////////////////////////////////////////
@@ -1719,24 +1736,29 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
 		// to the range root and traverses. (A hash DO may still lazy-init, as today.)
 		if (!isInit && !this.#_partitionContext && isRangePartition(pCtx)) {
-			throw new Error(
-				`fokos/partition: range DO "${pCtx.doName}" is not initialized; route via the range root and traverse (phantom-bounce).`,
-			);
+			throw new FokosRoutingError(ROUTING_CODES.range_partition_not_initialized, {
+				message: "range partition is not initialized; route via the range root and traverse",
+				attributes: { doName: pCtx.doName },
+			});
 		}
 		if (this.#_partitionContext) {
 			// rangePartition boundaries are KeyBytes — compare by bytes (null = unbounded), never by reference.
 			const keyEq = (a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean =>
 				a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
 			// We need to check if the provided context matches the stored one to avoid inconsistencies.
-			invariant(
-				areImmutableOptionsEqual(this.#_partitionContext, pCtx) &&
-					this.#_partitionContext.partitionId === pCtx.partitionId &&
-					this.#_partitionContext.doName === pCtx.doName &&
-					keyEq(this.#_partitionContext.rangePartition?.hashKey, pCtx.rangePartition?.hashKey) &&
-					keyEq(this.#_partitionContext.rangePartition?.startBoundary, pCtx.rangePartition?.startBoundary) &&
-					keyEq(this.#_partitionContext.rangePartition?.endBoundary, pCtx.rangePartition?.endBoundary),
-				`fokos/partition.ensurePartitionContext: partition context mismatch`,
-			);
+			if (
+				!areImmutableOptionsEqual(this.#_partitionContext, pCtx) ||
+				this.#_partitionContext.partitionId !== pCtx.partitionId ||
+				this.#_partitionContext.doName !== pCtx.doName ||
+				!keyEq(this.#_partitionContext.rangePartition?.hashKey, pCtx.rangePartition?.hashKey) ||
+				!keyEq(this.#_partitionContext.rangePartition?.startBoundary, pCtx.rangePartition?.startBoundary) ||
+				!keyEq(this.#_partitionContext.rangePartition?.endBoundary, pCtx.rangePartition?.endBoundary)
+			) {
+				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+					message: "partition context mismatch",
+					attributes: { doName: pCtx.doName },
+				});
+			}
 			// Fall through to update to the latest version if there are changes.
 			if (areMutableOptionsEqual(this.#_partitionContext, pCtx)) {
 				return this.#_partitionContext;
@@ -1776,9 +1798,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
-			// TODO This will reach user requests, so refactor the callers to show something nicer.
-			// We can also consider doing a selective migration of the requested keys only.
-			throw new Error(`fokos/partition:${op}: Partition split in progress, please retry later.`);
+			// TODO We can consider doing a selective migration of the requested keys only.
+			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+				message: "partition split in progress, please retry later",
+				attributes: { operation: op },
+			});
 		}
 		return true;
 	}
@@ -1832,7 +1856,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		try {
 			return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 		} catch (e) {
-			if (isPhantomBounceError(e)) {
+			// A range DO that was never initialized bounces the request, and the caller falls back to the range root.
+			if (FokosError.isCode(e, ROUTING_CODES.range_partition_not_initialized)) {
 				return null;
 			}
 			throw e;
@@ -2345,7 +2370,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	async #rpc<T>(_name: string, fn: () => Promise<T>): Promise<T> {
 		// TODO Add observability and canonical logs.
 		this.#ttl.arm();
-		return await fn();
+		try {
+			return await fn();
+		} catch (e) {
+			// Every error that leaves a partition is a FokosError, so a caller classifies it by its code.
+			throw FokosError.wrap(e);
+		}
 	}
 
 	private logParams() {
@@ -2372,17 +2402,31 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 }
 
-function isPhantomBounceError(e: unknown): boolean {
-	return e instanceof Error && e.message.includes("phantom-bounce");
+/** Transient: the partition is healthy but past its cap, and a split will bring it back under. */
+function errExceededDatabaseSize(operationName: string): FokosUnavailableError {
+	return new FokosUnavailableError(UNAVAILABLE_CODES.partition_over_size, {
+		message: "partition exceeded its limits, please retry later",
+		attributes: { operation: operationName },
+	});
 }
 
 /**
  * Never transient: the item reached a partition that can neither own nor route it. Serving it would
- * touch data another partition owns, and no amount of retrying changes the answer. Raised through
- * invariant(), so it needs no sentinel — nothing matches on it, it just has to be unmistakable in a log.
+ * touch data another partition owns, and no amount of retrying changes the answer.
  */
-function errInvalidPartitionRouting(operationName: string): Error {
-	return new Error(`fokos/partition.${operationName}: mis-routed item this node can neither own nor route`);
+function errInvalidPartitionRouting(operationName: string): FokosRoutingError {
+	return new FokosRoutingError(ROUTING_CODES.partition_misrouted, {
+		message: "mis-routed item this node can neither own nor route",
+		attributes: { operation: operationName },
+	});
+}
+
+/** A non-transactional write reached an item that an in-progress transaction holds. */
+function itemLockedError(transactionId: string, hashKey: KeyBytes, sortKey: KeyBytes): FokosConflictError {
+	return new FokosConflictError(CONFLICT_CODES.item_locked_by_transaction, {
+		message: "item is locked by an in-progress transaction, retry later",
+		attributes: { transactionId, ...decodeItemKeys(hashKey, sortKey) },
+	});
 }
 
 function sumSqlMetrics(...results: Array<{ rowsRead: number; rowsWritten: number }>) {

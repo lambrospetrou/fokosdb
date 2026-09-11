@@ -137,6 +137,21 @@ export abstract class FokosError<T extends string = string, C extends string = s
 	}
 
 	/**
+	 * True when `e` is a FokosError with the code `code`, after any number of hops. It narrows `code` to
+	 * that literal.
+	 *
+	 * Pass a code definition from a code table: a misspelt code does not compile, and the check also
+	 * compares the category. A plain string works for a code that arrives as data, but the compiler cannot
+	 * check its spelling, and the check compares the code only. Codes are unique across every package.
+	 */
+	static isCode<T extends string, C extends string>(e: unknown, code: FokosCodeDef<T, C>): e is FokosError<T, C>;
+	static isCode<C extends string>(e: unknown, code: C): e is FokosError<string, C>;
+	static isCode(e: unknown, code: FokosCodeDef | string): boolean {
+		if (!FokosError.is(e)) return false;
+		return typeof code === "string" ? e.code === code : e._tag === code.tag && e.code === code.code;
+	}
+
+	/**
 	 * Returns `e` unchanged when it is a FokosError, with or without its prototype. Wraps any other value
 	 * as `foreign_error` and keeps it as `cause`.
 	 *
@@ -211,6 +226,15 @@ export abstract class FokosError<T extends string = string, C extends string = s
 		Object.assign(err, fields);
 		return err;
 	}
+}
+
+/**
+ * True when the runtime marks `e` as a transient fault that a retry can clear: `retryable` and not
+ * `overloaded`. It reads the markers on a raw runtime error, and in `attributes` after `wrap` moved them.
+ */
+export function isRuntimeRetryableError(e: unknown): boolean {
+	const markers = (FokosError.is(e) ? e.attributes : e) as { retryable?: unknown; overloaded?: unknown } | null | undefined;
+	return markers?.retryable === true && markers.overloaded !== true;
 }
 
 /** An error of a category that another package defines, as `fromWire` builds it. */
@@ -305,6 +329,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	cursor_direction_mismatch: "sfcvks",
 	cursor_fingerprint_mismatch: "t3kbec",
 	num_tx_coordinators_invalid: "uc9fkn",
+	partition_context_options_invalid: "nr8nsg",
 	item_too_large: "ynzx4p",
 	update_not_applicable: "yysds3",
 	update_value_is_bytes: "z9ar7e",
@@ -357,7 +382,6 @@ export const ROUTING_CODES = defineCodes("FokosRoutingError", "internal", 500, {
 export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
 	invariant_failed: "85quf8",
 	partition_context_mismatch: "8hv63q",
-	stored_item_too_large: "cd8y95",
 	item_data_parse_failed: "dx9mht",
 	commit_keyset_mismatch: "e3kh5s",
 	item_not_found_for_update: "h5vq43",

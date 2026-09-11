@@ -6,6 +6,7 @@ import { KeyCodec } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";
+import { invariantFailure } from "../../../test/errors-matchers.js";
 
 const kb = (value: string) => KeyCodec.encode(value);
 const NOW_SECONDS = 100;
@@ -202,7 +203,7 @@ describe("TtlExpiry", () => {
 					config: config({ [name]: value }),
 					canSweep: () => (++checks, true),
 				});
-				await expect(expiry.runCycle()).rejects.toThrow(name);
+				await expect(expiry.runCycle()).rejects.toThrow(invariantFailure(name));
 			}
 			expect(checks).toBe(0);
 			expect(store.getItem(kb("kept"), kb("s")).row).toBeDefined();

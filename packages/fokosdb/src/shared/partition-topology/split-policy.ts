@@ -524,9 +524,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			return null;
 		}
 
-		if (!isRangePartition(this.partitionContext)) {
-			throw new Error("fokos/range.prepareSplit: called on a non-range partition");
-		}
+		invariant(isRangePartition(this.partitionContext), "fokos/range.prepareSplit: called on a non-range partition");
 		const rp = this.partitionContext.rangePartition;
 		invariant(rp, "fokos/range.prepareSplit: missing rangePartition identity");
 		const N = this.partitionContext.rangeSplitN;
@@ -606,11 +604,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 				}
 			}
 		}
-		if (best === null) {
-			// This should never happen: the children tile the whole range, so at least the leftmost
-			// child must have startBoundary <= sk.
-			throw new Error(`fokos/range: no child found for sortKey ${KeyCodec.keyForLog(sk)}`);
-		}
+		// The children tile the whole range, so at least the leftmost child has startBoundary <= sk.
+		invariant(best !== null, () => `fokos/range: no child found for sortKey ${KeyCodec.keyForLog(sk)}`);
 
 		// Skip intermediate router hops: if we have learned (from prior forward results) a deeper slice
 		// that is a strict sub-slice of the immediate child and still contains sk, jump straight to it.

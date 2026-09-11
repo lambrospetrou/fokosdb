@@ -8,6 +8,7 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { PartitionDO } from "../../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../server/do-transaction-coordinator.js";
 import invariant from "../invariant.js";
+import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 
 export type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;
@@ -203,37 +204,63 @@ export class PartitionContextCreator {
 		if (!opts.rangeAncestorsConfig) {
 			opts.rangeAncestorsConfig = { fromRoot: 0, fromLeaf: 3 };
 		}
+		const invalid = (option: string, value: unknown, message: string) =>
+			new FokosValidationError(VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 		if (opts.rootTreesN < 1 || opts.rootTreesN > 65000) {
-			throw new Error("fokos: rootTreesN must be between 1 and 65000");
+			throw invalid("rootTreesN", opts.rootTreesN, "rootTreesN must be between 1 and 65000");
 		}
 
-		invariant(opts.hashSplitN, "fokos: hashSplitN must be provided if hashSplitConditions is provided");
+		if (!opts.hashSplitN) {
+			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be provided if hashSplitConditions is provided");
+		}
 		if (opts.hashSplitN < 2 || opts.hashSplitN > 255) {
-			throw new Error("fokos: hashSplitN must be between 2 and 255");
+			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be between 2 and 255");
 		}
 		if (opts.hashSplitConditions.maxSizeMb && opts.hashSplitConditions.maxSizeMb <= 0) {
-			throw new Error("fokos: hashSplitConditions.maxSizeMb must be greater than 0");
+			throw invalid(
+				"hashSplitConditions.maxSizeMb",
+				opts.hashSplitConditions.maxSizeMb,
+				"hashSplitConditions.maxSizeMb must be greater than 0",
+			);
 		}
 		if (opts.hashSplitConditions.maxItems && opts.hashSplitConditions.maxItems < 1) {
-			throw new Error("fokos: hashSplitConditions.maxItems must be at least 1");
+			throw invalid("hashSplitConditions.maxItems", opts.hashSplitConditions.maxItems, "hashSplitConditions.maxItems must be at least 1");
 		}
 
-		invariant(opts.rangeSplitN, "fokos: rangeSplitN must be provided if rangeSplitConditions is provided");
+		if (!opts.rangeSplitN) {
+			throw invalid("rangeSplitN", opts.rangeSplitN, "rangeSplitN must be provided if rangeSplitConditions is provided");
+		}
 		if (opts.rangeSplitN < 2 || opts.rangeSplitN > 255) {
-			throw new Error("fokos: rangeSplitN must be between 2 and 255");
+			throw invalid("rangeSplitN", opts.rangeSplitN, "rangeSplitN must be between 2 and 255");
 		}
 		if (opts.rangeSplitConditions.maxSizeMb && opts.rangeSplitConditions.maxSizeMb <= 0) {
-			throw new Error("fokos: rangeSplitConditions.maxSizeMb must be greater than 0");
+			throw invalid(
+				"rangeSplitConditions.maxSizeMb",
+				opts.rangeSplitConditions.maxSizeMb,
+				"rangeSplitConditions.maxSizeMb must be greater than 0",
+			);
 		}
 		if (opts.rangeSplitConditions.maxItems && opts.rangeSplitConditions.maxItems < 1) {
-			throw new Error("fokos: rangeSplitConditions.maxItems must be at least 1");
+			throw invalid(
+				"rangeSplitConditions.maxItems",
+				opts.rangeSplitConditions.maxItems,
+				"rangeSplitConditions.maxItems must be at least 1",
+			);
 		}
 
 		if (opts.rangeAncestorsConfig.fromRoot < 0 || opts.rangeAncestorsConfig.fromRoot > 10) {
-			throw new Error("fokos: rangeAncestorsConfig.fromRoot must be between 0 and 10");
+			throw invalid(
+				"rangeAncestorsConfig.fromRoot",
+				opts.rangeAncestorsConfig.fromRoot,
+				"rangeAncestorsConfig.fromRoot must be between 0 and 10",
+			);
 		}
 		if (opts.rangeAncestorsConfig.fromLeaf < 0 || opts.rangeAncestorsConfig.fromLeaf > 10) {
-			throw new Error("fokos: rangeAncestorsConfig.fromLeaf must be between 0 and 10");
+			throw invalid(
+				"rangeAncestorsConfig.fromLeaf",
+				opts.rangeAncestorsConfig.fromLeaf,
+				"rangeAncestorsConfig.fromLeaf must be between 0 and 10",
+			);
 		}
 
 		const context: PartitionContext = {

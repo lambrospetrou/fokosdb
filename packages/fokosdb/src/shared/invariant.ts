@@ -1,9 +1,9 @@
-// Adapted from https://github.com/alexreardon/tiny-invariant/blob/master/src/tiny-invariant.ts to keep the messages.
+// Adapted from https://github.com/alexreardon/tiny-invariant/blob/master/src/tiny-invariant.ts.
 
-const prefix: string = "invariant_failed";
+import { FokosInternalError, INTERNAL_CODES } from "./errors.js";
 
 /**
- * 💥 `invariant` will `throw` an `Error` if the `condition` is [falsey](https://github.com/getify/You-Dont-Know-JS/blob/bdbe570600d4e1107d0b131787903ca1c9ec8140/up%20%26%20going/ch2.md#truthy--falsy)
+ * 💥 `invariant` will `throw` a `FokosInternalError` with the code `invariant_failed` if the `condition` is [falsey](https://github.com/getify/You-Dont-Know-JS/blob/bdbe570600d4e1107d0b131787903ca1c9ec8140/up%20%26%20going/ch2.md#truthy--falsy)
  *
  * ```ts
  * const value: Person | null = { name: 'Alex' };
@@ -24,7 +24,10 @@ export default function invariant(
 	}
 	// Condition not passed
 
-	const provided: string | undefined = typeof message === "function" ? message() : message;
-	const value: string = provided ? `${prefix}: ${provided}` : prefix;
-	throw new Error(value);
+	// The text can hold dynamic detail and internal names, so it goes to the attributes and the message stays fixed.
+	const detail: string | undefined = typeof message === "function" ? message() : message;
+	throw new FokosInternalError(INTERNAL_CODES.invariant_failed, {
+		message: "an internal invariant failed",
+		attributes: detail === undefined ? {} : { detail },
+	});
 }

@@ -5,7 +5,7 @@ import { expect, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
-import { isPartitionExceededDatabaseSizeError } from "../../src/shared/partition-errors.js";
+import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
 import { isHashPartition, isRangePartition } from "../../src/shared/partition-topology/partition-context.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
@@ -163,7 +163,7 @@ export class TestPartition {
 				// A size rejection is normal once a split is already queued — a prior write crossed the
 				// threshold. Any other error, or a rejection with no split queued (e.g. mutual exclusion
 				// with a queued promotion), is a real failure.
-				if (!isPartitionExceededDatabaseSizeError(e)) throw e;
+				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) throw e;
 				if (!(await writer.status(this.ctx)).splitStatus) throw e;
 			}
 			const state = await writer.status(this.ctx);

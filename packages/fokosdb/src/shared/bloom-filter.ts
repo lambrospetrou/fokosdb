@@ -1,4 +1,5 @@
 import { hash32 } from "./hash-primitives.js";
+import invariant from "./invariant.js";
 
 /**
  * Layered Bloom Filter
@@ -130,9 +131,10 @@ export class BloomFilter {
 		const errorRate = options.errorRate ?? DEFAULT_ERROR_RATE;
 		const initialCapacityN = options.initialCapacityN ?? DEFAULT_INITIAL_CAPACITY;
 		const firstBytes = layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
-		if (firstBytes > options.maxSizeBytes) {
-			throw new Error(`maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`);
-		}
+		invariant(
+			firstBytes <= options.maxSizeBytes,
+			() => `maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`,
+		);
 		const first = buildLayer(0, errorRate, initialCapacityN);
 		return new BloomFilter([first], errorRate, options.maxSizeBytes, initialCapacityN);
 	}

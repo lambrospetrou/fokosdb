@@ -5,6 +5,7 @@ import { InitFromSplitOptions, PartitionDO } from "../../src/server/do-partition
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
+import { fokosErrorWith } from "../errors-matchers.js";
 import {
 	assertSplitTreeComplete,
 	drainUntil,
@@ -563,7 +564,7 @@ describe("PartitionDO - splitting", () => {
 							data: "new-value",
 							kind: "text",
 						}),
-					).rejects.toThrow("split in progress");
+					).rejects.toThrow(fokosErrorWith("partition_migrating", { operation: "putItem" }));
 				});
 			});
 			expect((await (await partition.childOwning("key1")).status()).migrationStatus).toBe("migration_completed");

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "../../src/shared/partition-errors.js";
+import { FokosError, ROUTING_CODES, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
@@ -126,7 +126,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 			);
 		expect(String(error)).toMatch(/partition exceeded its limits/);
 		expect(String(error)).not.toMatch(/mis-routed/);
-		expect(isPartitionExceededDatabaseSizeError(error)).toBe(true);
+		expect(FokosError.isCode(error, UNAVAILABLE_CODES.partition_over_size)).toBe(true);
 	});
 
 	// Commit is non-growing (prepare already persisted the payload) and its outcome is already
@@ -263,7 +263,7 @@ describe("PartitionDO — single-shot transaction", () => {
 				() => null,
 				(e: unknown) => e,
 			);
-		expect(isPartitionExceededDatabaseSizeError(error)).toBe(true);
+		expect(FokosError.isCode(error, UNAVAILABLE_CODES.partition_over_size)).toBe(true);
 	});
 
 	it("queues a split once its writes push the partition over the threshold", async () => {
@@ -437,7 +437,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 					() => null,
 					(e: unknown) => e,
 				);
-			expect(isSinglePartitionFastPathFallbackError(error)).toBe(true);
+			expect(FokosError.isCode(error, ROUTING_CODES.single_partition_fast_path_not_applicable)).toBe(true);
 		});
 	});
 });

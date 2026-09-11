@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isTransactionCommitPendingError, isTransactionUndecidedError, TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { PartitionDO } from "./do-partition.js";
-import { errExceededDatabaseSize } from "../shared/partition-errors.js";
+import { FokosUnavailableError, UNAVAILABLE_CODES } from "../shared/errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
@@ -183,8 +183,7 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 			}
 			expect(isTransactionCommitPendingError(err)).toBe(true);
 			expect(isTransactionUndecidedError(err)).toBe(false);
-			expect(String(err)).toMatch(/commit is pending/);
-			expect(String(err)).toMatch(new RegExp(`state=${tcState}`));
+			expect(err).toMatchObject({ code: "transaction_commit_pending", attributes: { transactionId: TX_ID, state: tcState } });
 		});
 	});
 
@@ -373,7 +372,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			insertParticipant(state, { prepare: "accepted", name: "p1" });
 			insertParticipant(state, { name: "p2" });
 			const txPrepare = vi.fn(async () => {
-				throw errExceededDatabaseSize("txPrepare");
+				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_over_size, {
+					message: "partition exceeded its limits, please retry later",
+				});
 			});
 			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
 

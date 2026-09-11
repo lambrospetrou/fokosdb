@@ -1,4 +1,5 @@
 import type { PartitionStore } from "./partition-store.js";
+import invariant from "../invariant.js";
 
 export type TtlSweepConfig = {
 	/** Maximum rows deleted by one storage transaction. */
@@ -128,13 +129,9 @@ export class TtlExpiry {
 
 function validateConfig(config: TtlSweepConfig): void {
 	for (const name of ["chunkSize", "maxRowsBeforeSleep", "maxBytesBeforeSleep", "maxRowsPerCycle"] as const) {
-		if (!Number.isInteger(config[name]) || config[name] <= 0) {
-			throw new Error(`fokos/ttl-expiry: ${name} must be an integer greater than zero`);
-		}
+		invariant(Number.isInteger(config[name]) && config[name] > 0, `ttl-expiry: ${name} must be an integer greater than zero`);
 	}
 	for (const name of ["sleepMs", "initialDelayMs"] as const) {
-		if (!Number.isInteger(config[name]) || config[name] < 0) {
-			throw new Error(`fokos/ttl-expiry: ${name} must be an integer greater than or equal to zero`);
-		}
+		invariant(Number.isInteger(config[name]) && config[name] >= 0, `ttl-expiry: ${name} must be an integer greater than or equal to zero`);
 	}
 }

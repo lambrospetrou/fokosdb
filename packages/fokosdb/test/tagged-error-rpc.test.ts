@@ -1,6 +1,13 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { FOKOS_CODE_TABLES, FOKOS_ERROR_CATEGORIES, FokosConflictError, FokosError, FokosValidationError } from "../src/shared/errors.js";
+import {
+	CONFLICT_CODES,
+	FOKOS_CODE_TABLES,
+	FOKOS_ERROR_CATEGORIES,
+	FokosConflictError,
+	FokosError,
+	FokosValidationError,
+} from "../src/shared/errors.js";
 import { isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
 import { CODE_DEFS } from "./worker-entry.js";
 
@@ -71,6 +78,8 @@ describe("a FokosError across an RPC hop", () => {
 		expect(isFokosAnyError(err)).toBe(true);
 		expect(FokosConflictError.is(err)).toBe(true);
 		expect(FokosValidationError.is(err)).toBe(false);
+		expect(FokosError.isCode(err, CONFLICT_CODES.item_locked_by_transaction)).toBe(true);
+		expect(FokosError.isCode(err, "item_locked_by_transaction")).toBe(true);
 	});
 
 	it("is returned unchanged by wrap, so its error_id survives", async () => {

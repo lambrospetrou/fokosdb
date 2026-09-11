@@ -7,9 +7,16 @@
  */
 export const DESTROY_ABORT_SENTINEL = "__special_destroy_sentinel";
 
-/** True for the error `ctx.abort(DESTROY_ABORT_SENTINEL)` raises on the caller side. */
+/**
+ * True for the error `ctx.abort(DESTROY_ABORT_SENTINEL)` raises on the caller side. The runtime builds
+ * that error, so it can carry no code and the match is on its text. A wrapper keeps it as `cause`, so the
+ * match also walks the cause chain.
+ */
 export function isDestroyAbortError(e: unknown): boolean {
-	return String(e).includes(DESTROY_ABORT_SENTINEL);
+	for (let current = e, depth = 0; current != null && depth < 8; current = (current as { cause?: unknown }).cause, depth++) {
+		if (String(current).includes(DESTROY_ABORT_SENTINEL)) return true;
+	}
+	return false;
 }
 
 export type ColoInfo = {

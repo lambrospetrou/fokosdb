@@ -57,3 +57,21 @@ describe("areMutableOptionsEqual — rangeAncestorsConfig", () => {
 		expect(areMutableOptionsEqual(withConfig({ fromRoot: 2, fromLeaf: 2 }), withConfig({ fromRoot: 2, fromLeaf: 3 }))).toBe(false);
 	});
 });
+
+describe("PartitionContextCreator.create option errors", () => {
+	it.each([
+		["rootTreesN", { rootTreesN: 0 }, 0],
+		["hashSplitN", { hashSplitN: 1 }, 1],
+		["hashSplitConditions.maxItems", { hashSplitConditions: { maxSizeMb: 100, maxItems: -1 } }, -1],
+		["rangeAncestorsConfig.fromLeaf", { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 11 } }, 11],
+	])("reports an invalid %s as partition_context_options_invalid", (option, overrides, value) => {
+		expect(() => PartitionContextCreator.create(makeOpts(overrides))).toThrow(
+			expect.objectContaining({
+				_tag: "FokosValidationError",
+				code: "partition_context_options_invalid",
+				origin: "caller",
+				attributes: { option, value },
+			}),
+		);
+	});
+});

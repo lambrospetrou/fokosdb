@@ -12,7 +12,9 @@ import {
 	type ConditionEvaluationResult,
 	type UpdateProbeResult,
 } from "../expression/runtime.js";
-import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import { MAX_ITEM_BYTES, decodeItemKeys } from "../transaction-limits.js";
+import { FokosInternalError, FokosValidationError, INTERNAL_CODES, VALIDATION_CODES } from "../errors.js";
+import { withExpressionErrors } from "../errors-operations.js";
 import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
 
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
@@ -80,7 +82,10 @@ class StatementTail {
  * unreachable state deserves.
  */
 function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
-	throw new Error(`fokos/partition: stored item exceeds ${MAX_ITEM_BYTES / 1024} KB (${KeyCodec.pairForLog(hk, sk)})`);
+	throw new FokosValidationError(VALIDATION_CODES.item_too_large, {
+		message: `stored item exceeds ${MAX_ITEM_BYTES / 1024} KB`,
+		attributes: decodeItemKeys(hk, sk),
+	});
 }
 
 /**
@@ -458,11 +463,11 @@ export class PartitionStore {
 	}
 
 	evaluateCondition(plan: CompiledConditionPlan, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
-		return evaluateConditionPlan(this.#storage, plan, hk, sk);
+		return withExpressionErrors(() => evaluateConditionPlan(this.#storage, plan, hk, sk));
 	}
 
 	probeUpdate(plan: CompiledUpdatePlan, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
-		return probeUpdatePlan(this.#storage, plan, hk, sk);
+		return withExpressionErrors(() => probeUpdatePlan(this.#storage, plan, hk, sk));
 	}
 
 	/**
@@ -1059,7 +1064,10 @@ export class PartitionStore {
 		// so the size guard below can report the one cause that is left.
 		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
 		if (oldEst === 0) {
-			throw new Error(`fokos/partition: item not found (${KeyCodec.pairForLog(opts.hk, opts.sk)})`);
+			throw new FokosInternalError(INTERNAL_CODES.item_not_found_for_update, {
+				message: "item not found",
+				attributes: decodeItemKeys(opts.hk, opts.sk),
+			});
 		}
 		const docExpr = opts.plan.documentSql;
 		const hkParam = "?1";

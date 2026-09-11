@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AddResult, BloomFilter } from "./bloom-filter.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -316,6 +317,6 @@ describe("BloomFilter — maxSizeBytes enforcement", () => {
 	});
 
 	it("throws when maxSizeBytes is too small for the very first layer", () => {
-		expect(() => BloomFilter.create({ maxSizeBytes: 1, errorRate: 0.01 })).toThrow(/too small/);
+		expect(() => BloomFilter.create({ maxSizeBytes: 1, errorRate: 0.01 })).toThrow(invariantFailure(/too small/));
 	});
 });

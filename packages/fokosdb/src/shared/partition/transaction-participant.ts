@@ -14,6 +14,7 @@ import type {
 	TransactionItemKey,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
+import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
 import { applyImageCap, conditionFailedReason, decodeItemKeys, MAX_ITEM_BYTES, pickWinningReason } from "../transaction-limits.js";
@@ -271,15 +272,17 @@ export class TransactionParticipant {
 			const pendingKeySet = new Set(pendingRows.map((r) => KeyCodec.pairKey(r.hk, r.sk)));
 			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
 			if (pendingKeySet.size !== requestKeySet.size) {
-				throw new Error(
-					`fokos/partition.commit: pending_transactions has ${pendingKeySet.size} items but request has ${requestKeySet.size} for transaction ${request.transactionId}`,
-				);
+				throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
+					message: "pending_transactions and the commit request hold a different number of items",
+					attributes: { transactionId: request.transactionId, pendingItems: pendingKeySet.size, requestItems: requestKeySet.size },
+				});
 			}
 			for (const key of requestKeySet) {
 				if (!pendingKeySet.has(key)) {
-					throw new Error(
-						`fokos/partition.commit: request item ${key} not found in pending_transactions for transaction ${request.transactionId}`,
-					);
+					throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
+						message: "a commit request item is not found in pending_transactions",
+						attributes: { transactionId: request.transactionId, key: String(key) },
+					});
 				}
 			}
 

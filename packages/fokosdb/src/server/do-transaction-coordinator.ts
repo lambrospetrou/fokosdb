@@ -17,7 +17,17 @@ import type {
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-types.js";
 import { PartitionDO } from "./do-partition.js";
-import { isPartitionExceededDatabaseSizeError } from "../shared/partition-errors.js";
+import {
+	FokosError,
+	FokosInternalError,
+	FokosTransactionPendingError,
+	FokosUnavailableError,
+	FokosValidationError,
+	INTERNAL_CODES,
+	TRANSACTION_PENDING_CODES,
+	UNAVAILABLE_CODES,
+	VALIDATION_CODES,
+} from "../shared/errors.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import {
@@ -314,15 +324,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				// Answering with the stored outcome here would report "committed" for operations that
 				// were never executed, so this must fail loudly. DynamoDB calls it
 				// IdempotentParameterMismatch.
-				throw new Error(
-					`fokos: transactWriteItems clientRequestToken was already used for a different set of operations [${idempotencyToken}]`,
-				);
+				throw new FokosValidationError(VALIDATION_CODES.idempotent_parameter_mismatch, {
+					message: "transactWriteItems clientRequestToken was already used for a different set of operations",
+					attributes: { clientRequestToken: idempotencyToken },
+				});
 			}
 			return await this.resumeTransaction(existingRow, idempotencyToken);
 		}
 
 		if (this.ctx.storage.sql.databaseSize > MAX_TC_DATABASE_BYTES) {
-			throw new Error("fokos/tc: transaction coordinator exceeded its storage limit, please retry later");
+			throw new FokosUnavailableError(UNAVAILABLE_CODES.coordinator_over_size, {
+				message: "transaction coordinator exceeded its storage limit, please retry later",
+			});
 		}
 
 		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC
@@ -435,9 +448,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			case "COMMITTING":
 				// The outcome is decided and final, but not every participant has applied it yet, so
 				// this is not a terminal answer for the caller: retry with the same token.
-				throw new Error(
-					`fokos/tc: transaction ${transactionId} ${COMMIT_PENDING_SENTINEL} (state=${row.state}): the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
-				);
+				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_commit_pending, {
+					message: `transaction ${COMMIT_PENDING_SENTINEL}: the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
+					attributes: { transactionId, state: row.state },
+				});
 			case "CANCELLING":
 			case "CANCELLED": {
 				const reason: RejectionReasonEncoded = row.rejection_reason_json
@@ -475,10 +489,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			case "PREPARING":
 				// No decision yet — the alarm will drive it. The outcome can still go either way, so
 				// this answer promises nothing and only asks the caller to retry.
-				throw new Error(`fokos/tc: transaction ${transactionId} ${UNDECIDED_SENTINEL} (state=${row.state}), retry later`);
+				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
+					message: `transaction ${UNDECIDED_SENTINEL}, retry later`,
+					attributes: { transactionId, state: row.state },
+				});
 			default: {
 				const _exhaustive: never = row.state;
-				throw new Error(`fokos/tc: unexpected transaction state ${_exhaustive}`);
+				throw new FokosInternalError(INTERNAL_CODES.unexpected_transaction_state, {
+					message: "unexpected transaction state",
+					attributes: { transactionId, state: _exhaustive },
+				});
 			}
 		}
 	}
@@ -677,7 +697,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					// Backpressure is deterministic for the life of this transaction: the partition is over
 					// its cap, and a split will not land inside a retry budget of a few seconds. Retrying
 					// only adds latency before the same cancellation.
-					(err, nextAttempt) => !isPartitionExceededDatabaseSizeError(err) && nextAttempt <= 3,
+					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 3,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 				return { partitionDoName: p.partition_do_name, result };
@@ -869,7 +889,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						return r;
 					},
 					// Same as the first prepare pass: an over-size partition will not clear by retrying.
-					(err, nextAttempt) => !isPartitionExceededDatabaseSizeError(err) && nextAttempt <= 5,
+					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 			}),

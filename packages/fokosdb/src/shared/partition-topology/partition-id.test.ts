@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { PartitionContextCreator, type PartitionContext } from "./partition-context.js";
 import { KeyCodec } from "./key-codec.js";
 import { PartitionIdHelper } from "./partition-id.js";
+import { invariantFailure } from "../../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
@@ -71,9 +72,11 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 
 	it("encode throws with nothing to encode and when appending to a range ID", () => {
 		const base = makeBase();
-		expect(() => new PartitionIdHelper(base).encode(false)).toThrow(/no bytes or appended hash indexes/);
+		expect(() => new PartitionIdHelper(base).encode(false)).toThrow(invariantFailure(/no bytes or appended hash indexes/));
 		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
-		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(/cannot append hash indexes/);
+		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(
+			invariantFailure(/cannot append hash indexes/),
+		);
 	});
 
 	it("calculateHashChildPartitionIds produces hashSplitN distinct children one level deeper", () => {
@@ -124,9 +127,9 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 	it("hash-only readers reject range IDs", () => {
 		const base = makeBase();
 		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
-		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(/expected hash schema/);
-		expect(() => PartitionIdHelper.depth(bytes)).toThrow(/expected hash schema/);
-		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow(/expected hash schema/);
+		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));
+		expect(() => PartitionIdHelper.depth(bytes)).toThrow(invariantFailure(/expected hash schema/));
+		expect(() => PartitionIdHelper.lastChildIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));
 	});
 });
 

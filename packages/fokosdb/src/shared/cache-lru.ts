@@ -1,3 +1,5 @@
+import invariant from "./invariant.js";
+
 /**
  * A simple LRU cache implementation.
  *
@@ -10,7 +12,7 @@ export class LRUCache<K, V> {
 	private map = new Map<K, V>();
 
 	constructor(capacity: number) {
-		if (capacity < 1) throw new Error("LRUCache capacity must be >= 1");
+		invariant(capacity >= 1, "LRUCache capacity must be >= 1");
 		this.capacity = capacity;
 	}
 

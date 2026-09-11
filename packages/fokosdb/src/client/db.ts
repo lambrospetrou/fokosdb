@@ -1,7 +1,6 @@
 import { env } from "cloudflare:workers";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
-import { isErrorRetryable } from "durable-utils/do-utils";
 import {
 	DataKind,
 	DeleteItemOptions,
@@ -20,7 +19,6 @@ import {
 	QueryItemsOptions,
 	QueryItemsResult,
 } from "../shared/types.js";
-import { isPartitionExceededDatabaseSizeError, isSinglePartitionFastPathFallbackError } from "../shared/partition-errors.js";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
 import { partitionStub, partitionStubByName } from "../shared/do-stubs.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
@@ -50,7 +48,17 @@ import {
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 } from "../shared/transaction-limits.js";
-import { CONDITION_CHECK_CODES, FokosInternalError, FokosValidationError, INTERNAL_CODES, VALIDATION_CODES } from "../shared/errors.js";
+import {
+	CONDITION_CHECK_CODES,
+	FokosError,
+	FokosInternalError,
+	FokosValidationError,
+	INTERNAL_CODES,
+	ROUTING_CODES,
+	UNAVAILABLE_CODES,
+	VALIDATION_CODES,
+	isRuntimeRetryableError,
+} from "../shared/errors.js";
 import { FokosItemConditionCheckError, withExpressionErrors } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
@@ -158,6 +166,15 @@ function decodeOperationResult(res: TransactWriteOperationResultEncoded): Transa
 	};
 }
 
+/** Runs the body of a public method, and raises any error from it as a FokosError. */
+async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
+	try {
+		return await fn();
+	} catch (e) {
+		throw FokosError.wrap(e);
+	}
+}
+
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
 	if (ttlAt === undefined) return;
 	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
@@ -229,7 +246,38 @@ export class FokosDB {
 		return { ...this.#options };
 	}
 
-	async putItem(opts: PutItemOptions): Promise<PutItemResult> {
+	// Each public method wraps its body, so every error that leaves FokosDB is a FokosError.
+
+	putItem(opts: PutItemOptions): Promise<PutItemResult> {
+		return withFokosErrors(() => this.#putItem(opts));
+	}
+
+	getItem(opts: GetItemOptions): Promise<GetItemResult> {
+		return withFokosErrors(() => this.#getItem(opts));
+	}
+
+	deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
+		return withFokosErrors(() => this.#deleteItem(opts));
+	}
+
+	transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+		return withFokosErrors(() => this.#transactWriteItems(opts));
+	}
+
+	transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
+		return withFokosErrors(() => this.#transactGetItems(opts));
+	}
+
+	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+		return withFokosErrors(() => this.#queryItems(opts));
+	}
+
+	/** Stops at the first failure. A partial destroy stays partial, and a later call continues it. */
+	destroy(): Promise<{ ok: true }> {
+		return withFokosErrors(() => this.#destroy());
+	}
+
+	async #putItem(opts: PutItemOptions): Promise<PutItemResult> {
 		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
@@ -257,7 +305,7 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
 
-	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
+	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
@@ -276,7 +324,7 @@ export class FokosDB {
 		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: publicMeta(res.meta) };
 	}
 
-	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
+	async #deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
 		const hashKey = encodeHashKey(opts.hashKey);
@@ -295,7 +343,7 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}
 
-	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
 		if (opts.clientRequestToken !== undefined) validateClientRequestToken(opts.clientRequestToken);
 
 		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
@@ -376,10 +424,10 @@ export class FokosDB {
 		} catch (err) {
 			// The fallback is the ONE error that means "run the coordinator path instead". It carries no
 			// side effects, so nothing was written and nothing has to be undone.
-			if (isSinglePartitionFastPathFallbackError(err)) return null;
+			if (FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) return null;
 			// A partition past its size cap is healthy, just full. The coordinator answers a prepare that
 			// throws this with a cancelled transaction, and this path must answer identically.
-			if (isPartitionExceededDatabaseSizeError(err)) {
+			if (FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size)) {
 				return {
 					outcome: "cancelled",
 					transactionId,
@@ -403,7 +451,7 @@ export class FokosDB {
 		};
 	}
 
-	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
+	async #transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
 		validateTransactGetItemCount(opts.items.length);
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
@@ -450,13 +498,13 @@ export class FokosDB {
 		try {
 			return await tryWhile(
 				async () => await stub.txReadSnapshot(target, request),
-				(err: unknown, nextAttempt: number) => isErrorRetryable(err) && nextAttempt <= 3,
+				(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
 			);
 		} catch (err) {
 			// The fallback is the ONE error that means "run the two-phase path instead". It carries no
 			// side effects, so nothing was read and nothing has to be undone. Every other error — a
 			// transport failure included — is the caller's, exactly as on the two-phase path.
-			if (!isSinglePartitionFastPathFallbackError(err)) throw err;
+			if (!FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) throw err;
 			return null;
 		}
 	}
@@ -566,7 +614,7 @@ export class FokosDB {
 		return { outcome: "committed", items };
 	}
 
-	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+	async #queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
 		if (opts.queries.length === 0) {
 			throw new FokosValidationError(VALIDATION_CODES.query_queries_empty, { message: "queries must not be empty" });
 		}
@@ -717,7 +765,7 @@ export class FokosDB {
 		return { items, count: items.length, cursor, meta, partitionMetas };
 	}
 
-	async destroy(): Promise<{ ok: true }> {
+	async #destroy(): Promise<{ ok: true }> {
 		const ns = this.#options.topology.partitionContext().ns;
 
 		// Coordinators first, partitions second. A transaction still in flight is driven BY a coordinator,

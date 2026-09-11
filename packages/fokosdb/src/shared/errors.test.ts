@@ -13,6 +13,7 @@ import {
 	VALIDATION_CODES,
 	defineCodes,
 	defineErrorGuard,
+	isRuntimeRetryableError,
 	type FokosCodeDef,
 	type FokosErrorOptions,
 } from "./errors.js";
@@ -161,6 +162,37 @@ describe("FokosError.is", () => {
 		expect(FokosError.is(Object.assign(new Error("x"), { _tag: "FokosConflictError", code: "x" }))).toBe(false);
 		expect(FokosError.is(FokosError.toWire(errorOf(CONFLICT_CODES.read_conflict)))).toBe(false);
 		for (const value of [null, undefined, "FokosConflictError", 42]) expect(FokosError.is(value)).toBe(false);
+	});
+});
+
+describe("FokosError.isCode", () => {
+	it("holds for the code of a definition, and narrows the code to its literal", () => {
+		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		expect(FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)).toBe(true);
+		if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) throw new Error("unreachable");
+		const code: "partition_migrating" = e.code;
+		const tag: "FokosUnavailableError" = e._tag;
+		expect([code, tag]).toEqual(["partition_migrating", "FokosUnavailableError"]);
+	});
+
+	it("holds for a plain string, which compares the code only, and narrows the code as well", () => {
+		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		expect(FokosError.isCode(e, "partition_migrating")).toBe(true);
+		if (!FokosError.isCode(e, "partition_migrating")) throw new Error("unreachable");
+		const code: "partition_migrating" = e.code;
+		expect(code).toBe("partition_migrating");
+	});
+
+	it("does not hold for another code, a code of the same name in another category, or a value that is not a FokosError", () => {
+		const e = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		const [sameNameOtherCategory] = Object.values(defineCodes("FokosRoutingError", "internal", 500, { partition_migrating: "zzzzzz" }));
+		expect(FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)).toBe(false);
+		expect(FokosError.isCode(e, "partition_over_size")).toBe(false);
+		expect(FokosError.isCode(e, sameNameOtherCategory)).toBe(false);
+		for (const value of [new Error("partition_migrating"), { code: "partition_migrating" }, undefined, null]) {
+			expect(FokosError.isCode(value, UNAVAILABLE_CODES.partition_migrating)).toBe(false);
+			expect(FokosError.isCode(value, "partition_migrating")).toBe(false);
+		}
 	});
 });
 
@@ -324,5 +356,20 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 		expect(back).toBeInstanceOf(FOKOS_ERROR_CATEGORIES.get("FokosTransactionPendingError")!);
 		expect(contractOf(back)).toEqual(contractOf(e));
 		expect(back.cause).toBe(e.cause);
+	});
+});
+
+describe("isRuntimeRetryableError", () => {
+	it("reads the runtime markers on a raw error, and in the attributes after wrap", () => {
+		const transient = Object.assign(new Error("transient"), { retryable: true });
+		const overloaded = Object.assign(new Error("overloaded"), { retryable: true, overloaded: true });
+		expect([isRuntimeRetryableError(transient), isRuntimeRetryableError(FokosError.wrap(transient))]).toEqual([true, true]);
+		expect([isRuntimeRetryableError(overloaded), isRuntimeRetryableError(FokosError.wrap(overloaded))]).toEqual([false, false]);
+	});
+
+	it("does not hold for an error without the marker, or for a value that is not an object", () => {
+		for (const e of [new Error("x"), errorOf(UNAVAILABLE_CODES.partition_migrating), undefined, null, "retryable"]) {
+			expect(isRuntimeRetryableError(e)).toBe(false);
+		}
 	});
 });

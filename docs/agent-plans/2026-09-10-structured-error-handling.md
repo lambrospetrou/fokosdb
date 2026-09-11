@@ -97,8 +97,8 @@ flows and the 11 findings this RFC closes.
 3. The category and the code must be contractual. The message must not be contractual.
 4. Classification must never depend on `instanceof`.
 5. The five message-substring predicates must be removed. A code check replaces each one; the
-   phantom-bounce catch in `maybeForwardToRangeRootPartition` reads `code ===
-   "range_partition_not_initialized"`.
+   phantom-bounce catch in `maybeForwardToRangeRootPartition` reads
+   `FokosError.isCode(e, ROUTING_CODES.range_partition_not_initialized)`.
 6. A cancelled `transactWriteItems` must report each operation as plain data, not as nested error
    objects. A rejected entry keeps its `RejectionReason` record, whose `code` discriminant holds the
    code of section 7.1.
@@ -436,9 +436,22 @@ FokosConflictError.is(e)
 // 3. Every error of this library. A switch on `_tag` then narrows `code` to the codes of the category.
 isFokosAnyError(e)
 
-// 4. One code.
-e.code === "item_locked_by_transaction"
+// 4. One code. It narrows `code` to the literal.
+FokosError.isCode(e, CONFLICT_CODES.item_locked_by_transaction)
+FokosError.isCode(e, "item_locked_by_transaction")
 ```
+
+`FokosError.isCode` takes a code definition or a plain string. With a definition from a code table, a
+misspelt code does not compile and the check also compares the category. A plain string serves a code
+that arrives as data: the compiler cannot check its spelling, and the check compares the code only,
+which is enough because codes are unique across every package. The library uses the definition form.
+
+| Guard | The question it answers | Typical use |
+| --- | --- | --- |
+| `FokosError.is(e)` | Is it any FokosError, of any package? | Generic handling: `httpStatusHint` to an HTTP status, `error_id` to a log, `origin` to an alarm |
+| `FokosConflictError.is(e)` | Is it this category? | A coarse decision, for example to retry any conflict |
+| `isFokosAnyError(e)` and a switch on `_tag` | Which error of this library is it? | Exhaustive handling, with `code` narrowed for each category |
+| `FokosError.isCode(e, CODES.x)` | Is it exactly this one failure? | Control flow on one condition: the fast-path fallback, the over-size retry skip, the phantom bounce |
 
 `defineErrorGuard` makes the guard of a union from its code tables. The guard holds only for a code of
 those tables with the category of its definition. So the union type it narrows to is true even when an
@@ -935,6 +948,7 @@ defaults that section 4.2.1 describes.
 | `cursor_direction_mismatch` | Validation | `sfcvks` | c | 400 |
 | `cursor_fingerprint_mismatch` | Validation | `t3kbec` | c | 400 |
 | `num_tx_coordinators_invalid` | Validation | `uc9fkn` | c | 400 |
+| `partition_context_options_invalid` | Validation | `nr8nsg` | c | 400 |
 | `expression_invalid` | Expression | `ucjjtz` | c | 400 |
 | `condition_failed` | ConditionCheck | `usbs9w` | c | 409 |
 | `item_locked_by_transaction` | Conflict | `vnfeg6` | c | 409 |
@@ -958,7 +972,6 @@ defaults that section 4.2.1 describes.
 | `single_partition_fast_path_not_applicable` | Routing | `7647dt` | i | 500 |
 | `invariant_failed` | Internal | `85quf8` | i | 500 |
 | `partition_context_mismatch` | Internal | `8hv63q` | i | 500 |
-| `stored_item_too_large` | Internal | `cd8y95` | i | 500 |
 | `item_data_parse_failed` | Internal | `dx9mht` | i | 500 |
 | `commit_keyset_mismatch` | Internal | `e3kh5s` | i | 500 |
 | `item_not_found_for_update` | Internal | `h5vq43` | i | 500 |
@@ -970,6 +983,17 @@ A throw that has no code of its own maps to the nearest existing one: the `initF
 uses `partition_context_mismatch`, and a stored row that cannot be read back uses
 `unexpected_transaction_state`. `txCancel`'s fan-out failure reports `partition_fanout_failed` with
 the first child error as `cause`.
+
+`invariant()` raises `invariant_failed` with the fixed message `an internal invariant failed`. The text
+of the call site can hold dynamic detail and internal names, so it goes to `attributes.detail`.
+
+The store raises `item_too_large` when the stored row of a `putItem` is over the cap, because the
+client check counts the data only and the store also counts both keys and the row overhead. It is the
+same code a transaction reports for the same fact. On the transactional paths the check pass rejects
+the item first, so the store never raises it there.
+
+`PartitionContextCreator.create` raises `partition_context_options_invalid` for a topology option of
+the consumer that is not valid, with the option name and the value in `attributes`.
 
 ### 7.2 The findings this RFC closes
 
