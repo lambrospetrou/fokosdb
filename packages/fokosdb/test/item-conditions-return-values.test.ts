@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FokosItemConditionCheckError } from "../src/shared/errors-operations.js";
+import { FokosConditionCheckError } from "../src/shared/errors-operations.js";
 import { makeDB } from "./transactions/tx-helpers.js";
 
 describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () => {
@@ -45,11 +45,11 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				caughtError = e;
 			}
 
-			expect(FokosItemConditionCheckError.is(caughtError)).toBe(true);
-			const err = caughtError as FokosItemConditionCheckError;
+			expect(FokosConditionCheckError.is(caughtError)).toBe(true);
+			const err = caughtError as FokosConditionCheckError;
 			expect(err.message).toContain("condition failed");
 			expect(err.reason).toMatchObject({
-				type: "condition_failed",
+				code: "condition_failed",
 				hashKey: key.hashKey,
 				item: {
 					hashKey: key.hashKey,
@@ -83,8 +83,8 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				caughtError = e;
 			}
 
-			expect(FokosItemConditionCheckError.is(caughtError)).toBe(true);
-			const err = caughtError as FokosItemConditionCheckError;
+			expect(FokosConditionCheckError.is(caughtError)).toBe(true);
+			const err = caughtError as FokosConditionCheckError;
 			expect(err.reason.item).toEqual({
 				hashKey: key.hashKey,
 				data: originalBytes,
@@ -113,8 +113,8 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				caughtError = e;
 			}
 
-			expect(FokosItemConditionCheckError.is(caughtError)).toBe(true);
-			const err = caughtError as FokosItemConditionCheckError;
+			expect(FokosConditionCheckError.is(caughtError)).toBe(true);
+			const err = caughtError as FokosConditionCheckError;
 			expect(err.reason.item).toEqual({
 				hashKey: key.hashKey,
 				sortKey: key.sortKey,
@@ -141,10 +141,10 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			caughtError = e;
 		}
 
-		expect(FokosItemConditionCheckError.is(caughtError)).toBe(true);
-		const err = caughtError as FokosItemConditionCheckError;
+		expect(FokosConditionCheckError.is(caughtError)).toBe(true);
+		const err = caughtError as FokosConditionCheckError;
 		expect(err.reason.item).toBeUndefined();
-		expect(err.reason).toMatchObject({ type: "condition_failed", hashKey: key.hashKey });
+		expect(err.reason).toMatchObject({ code: "condition_failed", hashKey: key.hashKey });
 	});
 
 	// The image is a second statement, so asking for one costs exactly one more row read on the
@@ -154,7 +154,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		const key = { hashKey: `rows-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: "stored" });
 
-		let errorNone: FokosItemConditionCheckError | undefined;
+		let errorNone: FokosConditionCheckError | undefined;
 		try {
 			await db.putItem({
 				...key,
@@ -163,14 +163,14 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				returnValuesOnConditionCheckFailure: "none",
 			});
 		} catch (e) {
-			errorNone = e as FokosItemConditionCheckError;
+			errorNone = e as FokosConditionCheckError;
 		}
 
-		expect(FokosItemConditionCheckError.is(errorNone)).toBe(true);
+		expect(FokosConditionCheckError.is(errorNone)).toBe(true);
 		expect(errorNone!.reason.item).toBeUndefined();
 		const rowsReadWithoutImage = errorNone!.meta.rowsRead;
 
-		let errorAllOld: FokosItemConditionCheckError | undefined;
+		let errorAllOld: FokosConditionCheckError | undefined;
 		try {
 			await db.putItem({
 				...key,
@@ -179,10 +179,10 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				returnValuesOnConditionCheckFailure: "all_old",
 			});
 		} catch (e) {
-			errorAllOld = e as FokosItemConditionCheckError;
+			errorAllOld = e as FokosConditionCheckError;
 		}
 
-		expect(FokosItemConditionCheckError.is(errorAllOld)).toBe(true);
+		expect(FokosConditionCheckError.is(errorAllOld)).toBe(true);
 		expect(errorAllOld!.reason.item).toBeDefined();
 		expect(errorAllOld!.meta.rowsRead).toBe(rowsReadWithoutImage + 1);
 	});
@@ -219,7 +219,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			const ttl = 12345;
 			await db.putItem({ ...keyText, data: "text item", ttlAt: ttl });
 
-			let errText: FokosItemConditionCheckError | undefined;
+			let errText: FokosConditionCheckError | undefined;
 			try {
 				await db.deleteItem({
 					...keyText,
@@ -227,9 +227,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
-				errText = e as FokosItemConditionCheckError;
+				errText = e as FokosConditionCheckError;
 			}
-			expect(FokosItemConditionCheckError.is(errText)).toBe(true);
+			expect(FokosConditionCheckError.is(errText)).toBe(true);
 			expect(errText!.reason.item).toEqual({
 				hashKey: keyText.hashKey,
 				data: "text item",
@@ -242,7 +242,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			const bytesData = new Uint8Array([5, 6, 7]);
 			await db.putItem({ ...keyBytes, data: bytesData });
 
-			let errBytes: FokosItemConditionCheckError | undefined;
+			let errBytes: FokosConditionCheckError | undefined;
 			try {
 				await db.deleteItem({
 					...keyBytes,
@@ -250,9 +250,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
-				errBytes = e as FokosItemConditionCheckError;
+				errBytes = e as FokosConditionCheckError;
 			}
-			expect(FokosItemConditionCheckError.is(errBytes)).toBe(true);
+			expect(FokosConditionCheckError.is(errBytes)).toBe(true);
 			expect(errBytes!.reason.item).toEqual({
 				hashKey: keyBytes.hashKey,
 				data: bytesData,
@@ -264,7 +264,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			const jsonData = { key: "v", num: 100 };
 			await db.putItem({ ...keyJson, data: jsonData });
 
-			let errJson: FokosItemConditionCheckError | undefined;
+			let errJson: FokosConditionCheckError | undefined;
 			try {
 				await db.deleteItem({
 					...keyJson,
@@ -272,9 +272,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
-				errJson = e as FokosItemConditionCheckError;
+				errJson = e as FokosConditionCheckError;
 			}
-			expect(FokosItemConditionCheckError.is(errJson)).toBe(true);
+			expect(FokosConditionCheckError.is(errJson)).toBe(true);
 			expect(errJson!.reason.item).toEqual({
 				hashKey: keyJson.hashKey,
 				sortKey: keyJson.sortKey,
@@ -299,8 +299,8 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				caughtError = e;
 			}
 
-			expect(FokosItemConditionCheckError.is(caughtError)).toBe(true);
-			const err = caughtError as FokosItemConditionCheckError;
+			expect(FokosConditionCheckError.is(caughtError)).toBe(true);
+			const err = caughtError as FokosConditionCheckError;
 			expect(err.reason.item).toBeUndefined();
 		});
 
@@ -309,7 +309,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 			const key = { hashKey: `del-rows-${crypto.randomUUID()}` };
 			await db.putItem({ ...key, data: "stored" });
 
-			let errorNone: FokosItemConditionCheckError | undefined;
+			let errorNone: FokosConditionCheckError | undefined;
 			try {
 				await db.deleteItem({
 					...key,
@@ -317,13 +317,13 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 					returnValuesOnConditionCheckFailure: "none",
 				});
 			} catch (e) {
-				errorNone = e as FokosItemConditionCheckError;
+				errorNone = e as FokosConditionCheckError;
 			}
-			expect(FokosItemConditionCheckError.is(errorNone)).toBe(true);
+			expect(FokosConditionCheckError.is(errorNone)).toBe(true);
 			expect(errorNone!.reason.item).toBeUndefined();
 			const rowsWithoutImage = errorNone!.meta.rowsRead;
 
-			let errorAllOld: FokosItemConditionCheckError | undefined;
+			let errorAllOld: FokosConditionCheckError | undefined;
 			try {
 				await db.deleteItem({
 					...key,
@@ -331,9 +331,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 					returnValuesOnConditionCheckFailure: "all_old",
 				});
 			} catch (e) {
-				errorAllOld = e as FokosItemConditionCheckError;
+				errorAllOld = e as FokosConditionCheckError;
 			}
-			expect(FokosItemConditionCheckError.is(errorAllOld)).toBe(true);
+			expect(FokosConditionCheckError.is(errorAllOld)).toBe(true);
 			expect(errorAllOld!.reason.item).toBeDefined();
 			expect(errorAllOld!.meta.rowsRead).toBe(rowsWithoutImage + 1);
 		});

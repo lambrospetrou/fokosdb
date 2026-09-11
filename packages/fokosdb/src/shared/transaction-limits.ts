@@ -354,9 +354,9 @@ export function conditionFailedReason(
 	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
 	imageRow?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number },
 ): RejectionReasonEncoded {
-	if (!imageRow) return { type: "condition_failed", ...keys };
+	if (!imageRow) return { code: "condition_failed", ...keys };
 	return {
-		type: "condition_failed",
+		code: "condition_failed",
 		...keys,
 		item: {
 			...keys,
@@ -389,30 +389,11 @@ export function applyImageCap(
 		if (r.outcome !== "rejected" || r.itemOmitted || r.imageBytes === undefined) continue;
 		if (exceeded || runningBytes + r.imageBytes > cap) {
 			exceeded = true;
-			if (r.reason.type === "condition_failed") delete r.reason.item;
+			if (r.reason.code === "condition_failed") delete r.reason.item;
 			r.itemOmitted = "response_too_large";
 		} else {
 			runningBytes += r.imageBytes;
 		}
 	}
 	return results;
-}
-
-/**
- * The rejection reason one node reports for its whole answer: the rejected result with the lowest
- * request index, so the answer never depends on which child replied first.
- *
- * The image is stripped. A reason travels to the transaction-level `reason` and to
- * `tc_state.rejection_reason_json`, and neither may carry up to MAX_ITEM_BYTES of item data. The
- * image stays on the per-operation result that owns it.
- */
-export function pickWinningReason(results: ParticipantOperationResultEncoded[]): RejectionReasonEncoded {
-	let winner: (ParticipantOperationResultEncoded & { outcome: "rejected" }) | undefined;
-	for (const r of results) {
-		if (r.outcome === "rejected" && (winner === undefined || r.opIndex < winner.opIndex)) winner = r;
-	}
-	if (!winner) return { type: "transient_error" };
-	const reason: RejectionReasonEncoded = { ...winner.reason };
-	if (reason.type === "condition_failed") delete reason.item;
-	return reason;
 }

@@ -199,6 +199,7 @@ export type {
 	TransactWriteItem,
 	TransactWriteItemsOptions,
 	TransactWriteOperationResult,
+	RejectionReason,
 	TransactGetItemsOptions,
 } from "./transaction-types.js";
 

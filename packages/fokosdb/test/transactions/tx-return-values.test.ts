@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, type Key } from "./tx-helpers.js";
+import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, type Key, writeOutcome } from "./tx-helpers.js";
 import invariant from "../../src/shared/invariant.js";
 import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import type { ParticipantOperationResultEncoded, TransactWriteItemsOptions } from "../../src/shared/transaction-types.js";
@@ -8,36 +8,40 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 	it("validates returnValuesOnConditionCheckFailure at the boundary", async () => {
 		const db = makeDB();
 		await expect(
-			db.transactWriteItems({
-				items: [
-					{
-						operation: "put",
-						hashKey: "val-test-1",
-						data: "hello",
-						// @ts-expect-error runtime validation
-						returnValuesOnConditionCheckFailure: "invalid",
-					},
-				],
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{
+							operation: "put",
+							hashKey: "val-test-1",
+							data: "hello",
+							// @ts-expect-error runtime validation
+							returnValuesOnConditionCheckFailure: "invalid",
+						},
+					],
+				}),
+			),
 		).rejects.toThrow(/returnValuesOnConditionCheckFailure must be 'none' or 'all_old'/);
 	});
 
 	it("committed transaction does not return a results array", async () => {
 		const db = makeDB();
-		const res = await db.transactWriteItems({
-			items: [
-				{
-					operation: "put",
-					hashKey: "tx-commit-1",
-					data: "v1",
-				},
-				{
-					operation: "put",
-					hashKey: "tx-commit-2",
-					data: "v2",
-				},
-			],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						operation: "put",
+						hashKey: "tx-commit-1",
+						data: "v1",
+					},
+					{
+						operation: "put",
+						hashKey: "tx-commit-2",
+						data: "v2",
+					},
+				],
+			}),
+		);
 		expect(res.outcome).toBe("committed");
 		expect("results" in res).toBe(false);
 	});
@@ -50,42 +54,42 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			await db.putItem({ hashKey: hk, sortKey: "item-1", data: "initial-1" });
 			await db.putItem({ hashKey: hk, sortKey: "item-2", data: "initial-2" });
 
-			const res = await db.transactWriteItems({
-				items: [
-					{
-						operation: "put",
-						hashKey: hk,
-						sortKey: "item-1",
-						data: "updated-1",
-					},
-					{
-						operation: "put",
-						hashKey: hk,
-						sortKey: "item-2",
-						data: "updated-2",
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-				],
-			});
+			const res = await writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{
+							operation: "put",
+							hashKey: hk,
+							sortKey: "item-1",
+							data: "updated-1",
+						},
+						{
+							operation: "put",
+							hashKey: hk,
+							sortKey: "item-2",
+							data: "updated-2",
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+					],
+				}),
+			);
 
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
 
-			expect(res.reason).toMatchObject({
-				type: "condition_failed",
+			expect(res.firstRejection!).toMatchObject({
+				code: "condition_failed",
 				hashKey: hk,
 				sortKey: "item-2",
 			});
-			// Top-level reason has no item
-			expect((res.reason as { item?: unknown }).item).toBeUndefined();
 
 			expect(res.results).toHaveLength(2);
 			expect(res.results[0]).toEqual({ outcome: "passed" });
 			expect(res.results[1]).toMatchObject({
 				outcome: "rejected",
 				reason: {
-					type: "condition_failed",
+					code: "condition_failed",
 					hashKey: hk,
 					sortKey: "item-2",
 					item: {
@@ -110,18 +114,20 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 
 			await db.putItem({ hashKey: hk, sortKey: "s1", data: "data-1" });
 
-			const res = await db.transactWriteItems({
-				items: [
-					{
-						operation: "put",
-						hashKey: hk,
-						sortKey: "s1",
-						data: "data-2",
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "none",
-					},
-				],
-			});
+			const res = await writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{
+							operation: "put",
+							hashKey: hk,
+							sortKey: "s1",
+							data: "data-2",
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "none",
+						},
+					],
+				}),
+			);
 
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
@@ -129,7 +135,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(res.results[0]).toMatchObject({
 				outcome: "rejected",
 				reason: {
-					type: "condition_failed",
+					code: "condition_failed",
 					hashKey: hk,
 					sortKey: "s1",
 				},
@@ -152,40 +158,41 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			await db.putItem({ ...k2, data: { count: 42 }, ttlAt });
 			await db.putItem({ ...k3, data: "init-3" });
 
-			const res = await db.transactWriteItems({
-				clientRequestToken: token,
-				items: [
-					{
-						operation: "put",
-						...k1,
-						data: "new-1",
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-					{
-						operation: "put",
-						...k2,
-						data: { count: 43 },
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-					{
-						operation: "put",
-						...k3,
-						data: "new-3",
-					},
-				],
-			});
+			const res = await writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [
+						{
+							operation: "put",
+							...k1,
+							data: "new-1",
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+						{
+							operation: "put",
+							...k2,
+							data: { count: 43 },
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+						{
+							operation: "put",
+							...k3,
+							data: "new-3",
+						},
+					],
+				}),
+			);
 
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
 
-			// Top-level reason is the first rejected operation in request order (op 0)
-			expect(res.reason).toMatchObject({
-				type: "condition_failed",
+			// The first rejection in request order is op 0.
+			expect(res.firstRejection!).toMatchObject({
+				code: "condition_failed",
 				hashKey: k1.hashKey,
 			});
-			expect((res.reason as { item?: unknown }).item).toBeUndefined();
 
 			// 3 results in request order
 			expect(res.results).toHaveLength(3);
@@ -194,7 +201,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(res.results[0]).toMatchObject({
 				outcome: "rejected",
 				reason: {
-					type: "condition_failed",
+					code: "condition_failed",
 					hashKey: k1.hashKey,
 					item: {
 						hashKey: k1.hashKey,
@@ -209,7 +216,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(res.results[1]).toMatchObject({
 				outcome: "rejected",
 				reason: {
-					type: "condition_failed",
+					code: "condition_failed",
 					hashKey: k2.hashKey,
 					item: {
 						hashKey: k2.hashKey,
@@ -231,30 +238,32 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			}
 
 			// Idempotent replay under the same token returns identical results
-			const replay = await db.transactWriteItems({
-				clientRequestToken: token,
-				items: [
-					{
-						operation: "put",
-						...k1,
-						data: "new-1",
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-					{
-						operation: "put",
-						...k2,
-						data: { count: 43 },
-						condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-					{
-						operation: "put",
-						...k3,
-						data: "new-3",
-					},
-				],
-			});
+			const replay = await writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [
+						{
+							operation: "put",
+							...k1,
+							data: "new-1",
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+						{
+							operation: "put",
+							...k2,
+							data: { count: 43 },
+							condition: { op: "eq", args: [{ ref: "v" }, { val: 999 }] },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+						{
+							operation: "put",
+							...k3,
+							data: "new-3",
+						},
+					],
+				}),
+			);
 			expect(replay).toEqual(res);
 		});
 
@@ -268,17 +277,21 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			const op1 = { operation: "put" as const, ...k1, data: "v1" };
 			const op2 = { operation: "put" as const, ...k2, data: "v2" };
 
-			await db.transactWriteItems({
-				clientRequestToken: token,
-				items: [op1, op2],
-			});
+			await writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [op1, op2],
+				}),
+			);
 
 			// Same operations reversed under the same token must be rejected
 			await expect(
-				db.transactWriteItems({
-					clientRequestToken: token,
-					items: [op2, op1],
-				}),
+				writeOutcome(
+					db.transactWriteItems({
+						clientRequestToken: token,
+						items: [op2, op1],
+					}),
+				),
 			).rejects.toThrow(/clientRequestToken was already used for a different set of operations/);
 		});
 
@@ -299,17 +312,21 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			};
 			const op2 = { operation: "put" as const, ...k2, data: "v2" };
 
-			await db.transactWriteItems({
-				clientRequestToken: token,
-				items: [op1, op2],
-			});
+			await writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [op1, op2],
+				}),
+			);
 
 			// Reusing token with returnValuesOnConditionCheckFailure added must be rejected
 			await expect(
-				db.transactWriteItems({
-					clientRequestToken: token,
-					items: [{ ...op1, returnValuesOnConditionCheckFailure: "all_old" }, op2],
-				}),
+				writeOutcome(
+					db.transactWriteItems({
+						clientRequestToken: token,
+						items: [{ ...op1, returnValuesOnConditionCheckFailure: "all_old" }, op2],
+					}),
+				),
 			).rejects.toThrow(/clientRequestToken was already used for a different set of operations/);
 		});
 
@@ -323,24 +340,26 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 
 			await db.putItem({ hashKey: binHk, sortKey: binSk, data: binData });
 
-			const res = await db.transactWriteItems({
-				clientRequestToken: token,
-				items: [
-					{
-						operation: "put",
-						hashKey: binHk,
-						sortKey: binSk,
-						data: new Uint8Array([0x00]),
-						condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] as const },
-						returnValuesOnConditionCheckFailure: "all_old",
-					},
-					{
-						operation: "put",
-						hashKey: `other-${crypto.randomUUID()}`,
-						data: "hello",
-					},
-				],
-			});
+			const res = await writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [
+						{
+							operation: "put",
+							hashKey: binHk,
+							sortKey: binSk,
+							data: new Uint8Array([0x00]),
+							condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] as const },
+							returnValuesOnConditionCheckFailure: "all_old",
+						},
+						{
+							operation: "put",
+							hashKey: `other-${crypto.randomUUID()}`,
+							data: "hello",
+						},
+					],
+				}),
+			);
 
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
@@ -348,8 +367,8 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(res.results).toHaveLength(2);
 			const op0 = res.results[0];
 			expect(op0.outcome).toBe("rejected");
-			if (op0.outcome === "rejected" && op0.reason.type === "condition_failed") {
-				expect(op0.reason.type).toBe("condition_failed");
+			if (op0.outcome === "rejected" && op0.reason.code === "condition_failed") {
+				expect(op0.reason.code).toBe("condition_failed");
 				expect(op0.reason.hashKey).toEqual(binHk);
 				expect(op0.reason.sortKey).toEqual(binSk);
 				expect(op0.reason.item).toBeDefined();
@@ -385,12 +404,12 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				})),
 			};
 
-			const res = await db.transactWriteItems(request);
+			const res = await writeOutcome(db.transactWriteItems(request));
 			invariant(res.outcome === "cancelled", "expected the transaction to cancel");
 			expect(res.results).toHaveLength(keys.length);
 
 			for (const [i, r] of res.results.entries()) {
-				invariant(r.outcome === "rejected" && r.reason.type === "condition_failed", `op ${i} should have failed its condition`);
+				invariant(r.outcome === "rejected" && r.reason.code === "condition_failed", `op ${i} should have failed its condition`);
 				if (i < fitting) {
 					expect(r.itemOmitted).toBeUndefined();
 					expect(r.reason.item?.data).toBe(data);
@@ -402,7 +421,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 
 			// The replay reads the stored array and the surviving images back, so it must be identical —
 			// the images the cap dropped are gone from storage and cannot reappear.
-			const replay = await db.transactWriteItems(request);
+			const replay = await writeOutcome(db.transactWriteItems(request));
 			expect(replay).toEqual(res);
 		});
 	});
@@ -419,20 +438,22 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				for (const [i, k] of keys.entries()) {
 					await db.putItem({ ...k, data: `stored-${i}` });
 				}
-				const res = await db.transactWriteItems({
-					...(token ? { clientRequestToken: token } : {}),
-					items: keys.map((k, i) => ({
-						operation: "put" as const,
-						...k,
-						data: `new-${i}`,
-						...(i % 2 === 0
-							? {
-									condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] },
-									returnValuesOnConditionCheckFailure: "all_old" as const,
-								}
-							: {}),
-					})),
-				});
+				const res = await writeOutcome(
+					db.transactWriteItems({
+						...(token ? { clientRequestToken: token } : {}),
+						items: keys.map((k, i) => ({
+							operation: "put" as const,
+							...k,
+							data: `new-${i}`,
+							...(i % 2 === 0
+								? {
+										condition: { op: "eq" as const, args: [{ ref: "v" as const }, { val: 999 }] },
+										returnValuesOnConditionCheckFailure: "all_old" as const,
+									}
+								: {}),
+						})),
+					}),
+				);
 				invariant(res.outcome === "cancelled", "expected the transaction to cancel");
 				return res;
 			};
@@ -451,13 +472,13 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(codesOf(one)).toEqual(["rejected", "passed", "rejected", "passed"]);
 			expect(codesOf(many)).toEqual(codesOf(one));
 
-			// The same images come back on both layouts, and the reason is the lowest rejected index.
+			// The same images come back on both layouts, and so does the first rejection.
 			const imagesOf = (res: Awaited<ReturnType<typeof runOver>>) =>
-				res.results.map((r) => (r.outcome === "rejected" && r.reason.type === "condition_failed" ? r.reason.item?.data : undefined));
+				res.results.map((r) => (r.outcome === "rejected" && r.reason.code === "condition_failed" ? r.reason.item?.data : undefined));
 			expect(imagesOf(one)).toEqual(["stored-0", undefined, "stored-2", undefined]);
 			expect(imagesOf(many)).toEqual(imagesOf(one));
-			expect(one.reason.type).toBe("condition_failed");
-			expect(many.reason.type).toBe(one.reason.type);
+			expect(one.firstRejection!.code).toBe("condition_failed");
+			expect(many.firstRejection!.code).toBe(one.firstRejection!.code);
 			for (const res of [one, many]) {
 				expect(res.results.every((r) => r.outcome !== "rejected" || r.itemOmitted === undefined)).toBe(true);
 			}
@@ -471,7 +492,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					opIndex: 0,
 					outcome: "rejected",
 					reason: {
-						type: "condition_failed",
+						code: "condition_failed",
 						hashKey: "k0",
 						item: { hashKey: "k0", data: "data-0", kind: "text", version: 1 },
 					},
@@ -481,7 +502,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					opIndex: 1,
 					outcome: "rejected",
 					reason: {
-						type: "condition_failed",
+						code: "condition_failed",
 						hashKey: "k1",
 						item: { hashKey: "k1", data: "data-1", kind: "text", version: 1 },
 					},
@@ -495,7 +516,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					opIndex: 3,
 					outcome: "rejected",
 					reason: {
-						type: "condition_failed",
+						code: "condition_failed",
 						hashKey: "k3",
 						item: { hashKey: "k3", data: "data-3", kind: "text", version: 1 },
 					},
@@ -507,13 +528,13 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			applyImageCap(items, 100);
 
 			expect(items[0].outcome).toBe("rejected");
-			if (items[0].outcome === "rejected" && items[0].reason.type === "condition_failed") {
+			if (items[0].outcome === "rejected" && items[0].reason.code === "condition_failed") {
 				expect(items[0].reason.item).toBeDefined();
 				expect(items[0].itemOmitted).toBeUndefined();
 			}
 
 			expect(items[1].outcome).toBe("rejected");
-			if (items[1].outcome === "rejected" && items[1].reason.type === "condition_failed") {
+			if (items[1].outcome === "rejected" && items[1].reason.code === "condition_failed") {
 				expect(items[1].reason.item).toBeUndefined();
 				expect(items[1].itemOmitted).toBe("response_too_large");
 			}
@@ -521,7 +542,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(items[2].outcome).toBe("passed");
 
 			expect(items[3].outcome).toBe("rejected");
-			if (items[3].outcome === "rejected" && items[3].reason.type === "condition_failed") {
+			if (items[3].outcome === "rejected" && items[3].reason.code === "condition_failed") {
 				expect(items[3].reason.item).toBeUndefined();
 				expect(items[3].itemOmitted).toBe("response_too_large");
 			}
@@ -533,7 +554,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					opIndex: 0,
 					outcome: "rejected",
 					reason: {
-						type: "condition_failed",
+						code: "condition_failed",
 						hashKey: "k0",
 					},
 					itemOmitted: "response_too_large",
@@ -543,7 +564,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					opIndex: 1,
 					outcome: "rejected",
 					reason: {
-						type: "condition_failed",
+						code: "condition_failed",
 						hashKey: "k1",
 						item: { hashKey: "k1", data: "data-1", kind: "text", version: 1 },
 					},
@@ -558,7 +579,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				expect(items[0].itemOmitted).toBe("response_too_large");
 			}
 			// Item 1 has 50 bytes, fits under 80, so it keeps its image
-			if (items[1].outcome === "rejected" && items[1].reason.type === "condition_failed") {
+			if (items[1].outcome === "rejected" && items[1].reason.code === "condition_failed") {
 				expect(items[1].reason.item).toBeDefined();
 				expect(items[1].itemOmitted).toBeUndefined();
 			}

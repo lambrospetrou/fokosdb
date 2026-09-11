@@ -8,8 +8,41 @@ import { FokosDB } from "../../src/client/db.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
+import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
+import type { InitiateWriteResponse, RejectionReason, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
 
 export type Key = { hashKey: string; sortKey: string };
+
+/** The outcome of a transaction write: the committed result, or the fields of the cancel it raised. */
+export type WriteOutcome =
+	| InitiateWriteResponse
+	| {
+			outcome: "cancelled";
+			transactionId: string;
+			idempotencyToken: string;
+			results: TransactWriteOperationResult[];
+			/** The reason of the first rejected entry, in request order. */
+			firstRejection: RejectionReason | undefined;
+	  };
+
+/**
+ * Awaits a transaction write that can commit or cancel. A cancelled `transactWriteItems` raises
+ * FokosTransactionCancelledError, and a test that checks either outcome reads it back as a value here.
+ */
+export async function writeOutcome(write: Promise<InitiateWriteResponse>): Promise<WriteOutcome> {
+	try {
+		return await write;
+	} catch (e) {
+		if (!FokosTransactionCancelledError.is(e)) throw e;
+		return {
+			outcome: "cancelled",
+			transactionId: e.attributes.transactionId as string,
+			idempotencyToken: e.attributes.idempotencyToken as string,
+			results: e.results,
+			firstRejection: e.results.flatMap((r) => (r.outcome === "rejected" ? [r.reason] : []))[0],
+		};
+	}
+}
 
 export type MakeDBOptions = {
 	singlePartitionFastPath?: boolean;

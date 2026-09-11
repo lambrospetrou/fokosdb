@@ -11,6 +11,7 @@ import type {
 } from "./types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
+import type { FokosErrorCode } from "./errors-operations.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
 
@@ -70,30 +71,55 @@ export type PrepareRequest = {
 // Result/OUT type: keys are decoded to the public form (string for UTF-8, Uint8Array for binary) by
 // the producing participant, so rejections are user-readable and JSON-serializable for the TC.
 export type RejectionReasonOf<I = ConditionCheckImage> =
-	| { type: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; item?: I }
-	| { type: "timestamp_conflict"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { code: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; item?: I }
+	| { code: "timestamp_conflict"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	| {
-			type: "pending_conflict";
+			code: "pending_conflict";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
 			conflictingTransactionId: TransactionId;
 	  }
-	| { type: "clock_skew"; serverTimestampMs: number; transactionTimestampMs: number }
-	| { type: "update_not_applicable"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	/** The transaction timestamp is too far ahead of the clock of the partition that owns the operation. */
+	| {
+			code: "clock_skew";
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			serverTimestampMs: number;
+			transactionTimestampMs: number;
+	  }
+	| { code: "update_not_applicable"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	/**
 	 * A `set` value evaluated to bytes for this item, and a JSON document cannot hold bytes. It is one
 	 * cause of an inapplicable update, reported on its own because the caller can act on it: a key
 	 * reference is a valid update value for a text key and not for a binary one, and a SQLite function
 	 * can return a blob for one item and text for the next.
 	 */
-	| { type: "update_value_is_bytes"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
-	| { type: "item_too_large"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
-	| { type: "transient_error" };
+	| { code: "update_value_is_bytes"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { code: "item_too_large"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	/**
+	 * The partition that owns the operation could not run it: the error it raised, or no answer at all.
+	 * Every operation of that partition carries the same code and the same `error_id`, which names the
+	 * error in the logs.
+	 */
+	| { code: ExecutionFailureCode; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; error_id: string };
+
+/** The codes of the rejections that say a premise of an operation did not hold. */
+export type PremiseRejectionCode =
+	| "condition_failed"
+	| "timestamp_conflict"
+	| "pending_conflict"
+	| "clock_skew"
+	| "update_not_applicable"
+	| "update_value_is_bytes"
+	| "item_too_large";
+
+/** The codes of the errors that stop the partition of an operation from running it. */
+export type ExecutionFailureCode = Exclude<FokosErrorCode, PremiseRejectionCode>;
 
 export type RejectionReasonEncoded = RejectionReasonOf<ConditionCheckImageEncoded>;
 export type RejectionReason = RejectionReasonOf<ConditionCheckImage>;
 /** The reason `putItem` and `deleteItem` carry when their condition fails. */
-export type ConditionFailedReason = Extract<RejectionReason, { type: "condition_failed" }>;
+export type ConditionFailedReason = Extract<RejectionReason, { code: "condition_failed" }>;
 
 /** Wire variant. `imageBytes` is coordinator bookkeeping, which db.ts strips. */
 export type TransactWriteOperationResultEncoded =
@@ -136,8 +162,8 @@ export type PrepareResponse =
 	| { outcome: "accepted" }
 	| {
 			outcome: "rejected";
-			reason: RejectionReasonEncoded;
-			results?: ParticipantOperationResultEncoded[];
+			/** One result for each operation that the participant answers for. */
+			results: ParticipantOperationResultEncoded[];
 	  };
 
 // ─── PartitionDO — Commit ─────────────────────────────────────────────────────
@@ -266,12 +292,9 @@ export type SingleShotResponse =
 	| { outcome: "committed" }
 	| {
 			outcome: "rejected";
-			reason: RejectionReasonEncoded;
 			/**
-			 * One result for each operation of the request. Required, unlike the `results` of a
-			 * PrepareResponse: an absent array there means an execution failure, and this path has none.
-			 * One DO evaluates the whole set, so every rejection comes from its check pass, which answers
-			 * for every operation it looked at.
+			 * One result for each operation of the request. One DO evaluates the whole set, so every
+			 * rejection comes from its check pass, which answers for every operation it looked at.
 			 */
 			results: ParticipantOperationResultEncoded[];
 	  };
@@ -404,26 +427,19 @@ export type InitiateWriteResponseEncoded =
 			outcome: "cancelled";
 			transactionId: TransactionId;
 			idempotencyToken: IdempotencyToken;
-			reason: RejectionReasonEncoded;
+			/** One result for each operation, in request order. Each rejected entry carries its own reason. */
 			results: TransactWriteOperationResultEncoded[];
 	  };
 
 /**
- * Result of TC.initiateWrite, and the public result of FokosDB.transactWriteItems.
+ * The public result of FokosDB.transactWriteItems. A cancelled transaction raises
+ * `FokosTransactionCancelledError` instead.
  */
-export type InitiateWriteResponse =
-	| {
-			outcome: "committed";
-			transactionId: TransactionId;
-			idempotencyToken: IdempotencyToken;
-	  }
-	| {
-			outcome: "cancelled";
-			transactionId: TransactionId;
-			idempotencyToken: IdempotencyToken;
-			reason: RejectionReason;
-			results: TransactWriteOperationResult[];
-	  };
+export type InitiateWriteResponse = {
+	outcome: "committed";
+	transactionId: TransactionId;
+	idempotencyToken: IdempotencyToken;
+};
 
 // Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).
 export type TCReadItem = {
@@ -441,12 +457,9 @@ export type InitiateReadRequest = {
  * On "committed", `items` is positionally matched to the request: `items[i]` answers
  * `request.items[i]`, one entry per requested key, duplicates included.
  */
-export type InitiateReadResponseEncoded =
-	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
-	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
+export type InitiateReadResponseEncoded = { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] };
 
 // Public variant surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts
-// boundary. Same positional guarantee as InitiateReadResponseEncoded.
-export type InitiateReadResponse =
-	| { outcome: "committed"; items: ReadForTransactionItemResult[] }
-	| { outcome: "aborted"; reason: "read_conflict" | "pending_write" | "transient_error" };
+// boundary. Same positional guarantee as InitiateReadResponseEncoded. A read that cannot answer raises
+// a FokosError instead, for example `FokosConflictError` with `read_conflict` or `pending_write`.
+export type InitiateReadResponse = { outcome: "committed"; items: ReadForTransactionItemResult[] };

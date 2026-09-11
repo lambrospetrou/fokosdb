@@ -1,18 +1,18 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isTransactionCommitPendingError, isTransactionUndecidedError, TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import { PartitionDO } from "./do-partition.js";
-import { FokosUnavailableError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
 	InitiateWriteRequest,
-	InitiateWriteResponse,
+	InitiateWriteResponseEncoded,
 	PrepareResponse,
-	RejectionReason,
 	TCState,
+	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-types.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -31,36 +31,36 @@ afterEach(() => {
 // retry budgets. Direct calls keep the tests deterministic and isolate each storage transition.
 type CoordinatorInternals = {
 	alarm(): Promise<void>;
-	initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponse>;
+	initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
 	recoverTransaction(transactionId: string): Promise<unknown>;
-	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponse;
+	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string): void;
 	drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
 		coordinatorDoId: string,
 		commitRequestBudgetMs?: number,
-	): Promise<InitiateWriteResponse>;
+	): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<void>;
 	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void>;
 	runCancel(transactionId: string, idempotencyToken: string): Promise<void>;
 	stripPayload(transactionId: string): void;
 };
 
-function seed(state: DurableObjectState, tcState: TCState, reason?: RejectionReason, createdAt?: number): void {
+function seed(state: DurableObjectState, tcState: TCState, results?: TransactWriteOperationResultEncoded[], createdAt?: number): void {
 	state.storage.sql.exec(`DELETE FROM tc_state`);
 	state.storage.sql.exec(`DELETE FROM tc_participants`);
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, rejection_reason_json, operations_hash)
+		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 		TOKEN,
 		TX_ID,
 		tcState,
 		now,
 		now,
-		reason === undefined ? null : JSON.stringify(reason),
+		results === undefined ? null : JSON.stringify(results),
 		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
 		"0000000000000000",
 	);
@@ -94,13 +94,13 @@ function insertState(
 		state: TCState;
 		createdAt: number;
 		completedAt?: number | null;
-		reason?: RejectionReason;
+		results?: TransactWriteOperationResultEncoded[];
 		operationsHash?: string;
 	},
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_state
-			(idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, rejection_reason_json, operations_hash)
+			(idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		options.token,
 		options.transactionId,
@@ -108,25 +108,26 @@ function insertState(
 		options.createdAt,
 		options.createdAt,
 		options.completedAt ?? null,
-		options.reason === undefined ? null : JSON.stringify(options.reason),
+		options.results === undefined ? null : JSON.stringify(options.results),
 		options.operationsHash ?? "0000000000000000",
 	);
 }
 
 function insertParticipant(
 	state: DurableObjectState,
-	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareResponse },
+	outcome: { prepare?: string; commit?: string; cancel?: string; name?: string; answer?: PrepareResponse; error?: FokosErrorWire },
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
-			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json)
-		 VALUES (?, ?, '{}', ?, ?, ?, ?)`,
+			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+		 VALUES (?, ?, '{}', ?, ?, ?, ?, ?)`,
 		TX_ID,
 		outcome.name ?? "p1",
 		outcome.prepare ?? null,
 		outcome.commit ?? null,
 		outcome.cancel ?? null,
 		outcome.answer === undefined ? null : JSON.stringify(outcome.answer),
+		outcome.error === undefined ? null : JSON.stringify(outcome.error),
 	);
 }
 
@@ -181,34 +182,31 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 			} catch (e) {
 				err = e;
 			}
-			expect(isTransactionCommitPendingError(err)).toBe(true);
-			expect(isTransactionUndecidedError(err)).toBe(false);
+			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
+			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(false);
 			expect(err).toMatchObject({ code: "transaction_commit_pending", attributes: { transactionId: TX_ID, state: tcState } });
 		});
 	});
 
 	// A cancelled transaction applied nothing anywhere, so outstanding cancel cleanup cannot change
 	// what the caller observes.
-	it.each(["CANCELLING", "CANCELLED"] as const)("reports cancelled with its reason in state %s", async (tcState) => {
+	it.each(["CANCELLING", "CANCELLED"] as const)("reports cancelled with its results in state %s", async (tcState) => {
 		await withCoordinator((tc, state) => {
-			const reason: RejectionReason = { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" };
-			seed(state, tcState, reason);
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
-				outcome: "cancelled",
-				transactionId: TX_ID,
-				idempotencyToken: TOKEN,
-				reason,
-			});
+			const results: TransactWriteOperationResultEncoded[] = [
+				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" } },
+				{ outcome: "passed" },
+			];
+			seed(state, tcState, results);
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual({ outcome: "cancelled", transactionId: TX_ID, idempotencyToken: TOKEN, results });
 		});
 	});
 
-	it("falls back to transient_error when a CANCELLING row has no recorded reason", async () => {
+	it("raises unexpected_transaction_state when a CANCELLING row has no stored results", async () => {
 		await withCoordinator((tc, state) => {
 			seed(state, "CANCELLING");
-			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
-				outcome: "cancelled",
-				reason: { type: "transient_error" },
-			});
+			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(
+				expect.objectContaining({ code: "unexpected_transaction_state", attributes: expect.objectContaining({ state: "CANCELLING" }) }),
+			);
 		});
 	});
 
@@ -222,8 +220,8 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 			} catch (e) {
 				err = e;
 			}
-			expect(isTransactionUndecidedError(err)).toBe(true);
-			expect(isTransactionCommitPendingError(err)).toBe(false);
+			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(true);
+			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(false);
 			expect(String(err)).toMatch(/outcome is not yet decided/);
 		});
 	});
@@ -387,25 +385,24 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	// An execution failure says the transaction could not run, not that a caller's premise was wrong.
-	// It belongs to no operation, so it outranks a condition rejection another participant reported,
-	// and the images that rejection collected are not the caller's answer.
-	it("reports an execution failure over a condition rejection and drops the images with it", async () => {
+	// Every participant answers for its own operations, so the clock_skew of one partition does not hide
+	// the condition rejection of another, and that rejection keeps its image.
+	it("reports each participant's answer for its own operations, and keeps the image of a rejection", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", sortKey: "sk1", serverTimestampMs: 10, transactionTimestampMs: 99 };
 			insertParticipant(state, {
 				name: "p1",
 				prepare: "rejected",
-				answer: { outcome: "rejected", reason: { type: "clock_skew", serverTimestampMs: 10, transactionTimestampMs: 99 } },
+				answer: { outcome: "rejected", results: [{ opIndex: 0, outcome: "rejected", reason: clockSkew }] },
 			});
 			insertParticipant(state, {
 				name: "p2",
 				prepare: "rejected",
 				answer: {
 					outcome: "rejected",
-					reason: { type: "condition_failed", hashKey: "hk2" },
-					results: [{ opIndex: 1, outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" }, imageBytes: 6 }],
+					results: [{ opIndex: 1, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" }, imageBytes: 6 }],
 				},
 			});
 			insertImage(state, TX_ID, 1, "image-1");
@@ -415,16 +412,21 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
-				expect(response.reason).toEqual({ type: "clock_skew", serverTimestampMs: 10, transactionTimestampMs: 99 });
-				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+				expect(response.results).toEqual([
+					{ outcome: "rejected", reason: clockSkew },
+					{
+						outcome: "rejected",
+						reason: { code: "condition_failed", hashKey: "hk2", item: { hashKey: "hk2", data: "image-1", kind: "text", version: 1 } },
+					},
+				]);
 			}
-			expect(countRows(state, "tc_results")).toBe(0);
+			expect(countRows(state, "tc_results")).toBe(1);
 		});
 	});
 
-	// A prepare that throws after its retries leaves its operations with no result at all. The caller
-	// must still receive one entry for each operation it sent, and a retryable reason to act on.
-	it("leaves the operations of a thrown prepare not_evaluated and cancels with transient_error", async () => {
+	// A prepare that throws after its retries has no answer. Its operations report the stored cause, and
+	// the operations of the other participant keep what that participant answered.
+	it("reports the stored cause of a thrown prepare on its own operations, and keeps the other answer", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
@@ -435,13 +437,12 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			});
 			const rejectingPrepare = vi.fn(async () => ({
 				outcome: "rejected" as const,
-				reason: { type: "condition_failed" as const, hashKey: "hk2" },
 				results: [
 					{
 						opIndex: 1,
 						outcome: "rejected" as const,
 						reason: {
-							type: "condition_failed" as const,
+							code: "condition_failed" as const,
 							hashKey: "hk2",
 							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
 						},
@@ -458,11 +459,19 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
-				expect(response.reason).toEqual({ type: "transient_error" });
-				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+				// The raw error of the prepare is stored as the foreign_error that wraps it.
+				expect(response.results).toEqual([
+					{
+						outcome: "rejected",
+						reason: { code: "foreign_error", hashKey: "hk1", sortKey: "sk1", error_id: expect.stringMatching(/^e_jvufz5_/) },
+					},
+					{
+						outcome: "rejected",
+						reason: { code: "condition_failed", hashKey: "hk2", item: { hashKey: "hk2", data: "image-1", kind: "text", version: 1 } },
+					},
+				]);
 			}
-			// The rejecting participant's image is not the caller's answer, so none survives the decision.
-			expect(countRows(state, "tc_results")).toBe(0);
+			expect(countRows(state, "tc_results")).toBe(1);
 		});
 	});
 
@@ -479,13 +488,12 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const acceptingPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
 			const rejectingPrepare = vi.fn(async () => ({
 				outcome: "rejected" as const,
-				reason: { type: "condition_failed" as const, hashKey: "hk2" },
 				results: [
 					{
 						opIndex: 1,
 						outcome: "rejected" as const,
 						reason: {
-							type: "condition_failed" as const,
+							code: "condition_failed" as const,
 							hashKey: "hk2",
 							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
 						},
@@ -506,22 +514,29 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				expect(response.results[0]).toEqual({ outcome: "passed" });
 				expect(response.results[1]).toMatchObject({
 					outcome: "rejected",
-					reason: { type: "condition_failed", hashKey: "hk2", item: { data: "image-1", version: 1 } },
+					reason: { code: "condition_failed", hashKey: "hk2", item: { data: "image-1", version: 1 } },
 				});
 			}
 		});
 	});
 
 	// The answer is written with the prepare outcome it belongs to, so a coordinator evicted between a
-	// participant's answer and the decision still reports what that participant actually said. Without
-	// the stored answer the recovery path could only report transient_error.
-	it("recovers a persisted clock_skew as clock_skew, not as transient_error", async () => {
+	// participant's answer and the decision still reports what that participant actually said.
+	it("recovers a persisted clock_skew as clock_skew", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
+			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", serverTimestampMs: 5, transactionTimestampMs: 500 };
 			insertParticipant(state, {
 				name: "p1",
 				prepare: "rejected",
-				answer: { outcome: "rejected", reason: { type: "clock_skew", serverTimestampMs: 5, transactionTimestampMs: 500 } },
+				answer: {
+					outcome: "rejected",
+					results: [0, 1].map((opIndex) => ({
+						opIndex,
+						outcome: "rejected" as const,
+						reason: { ...clockSkew, hashKey: `hk${opIndex + 1}` },
+					})),
+				},
 			});
 			insertParticipant(state, { name: "p2", prepare: "accepted" });
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
@@ -531,7 +546,10 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
-				expect(response.reason).toEqual({ type: "clock_skew", serverTimestampMs: 5, transactionTimestampMs: 500 });
+				expect(response.results).toEqual([
+					{ outcome: "rejected", reason: { ...clockSkew, hashKey: "hk1" } },
+					{ outcome: "rejected", reason: { ...clockSkew, hashKey: "hk2" } },
+				]);
 			}
 		});
 	});
@@ -581,8 +599,10 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 
 	it("sets completed_at, deletes per-transaction rows, and keeps the cancelled replay", async () => {
 		await withCoordinator(async (tc, state) => {
-			const reason: RejectionReason = { type: "condition_failed", hashKey: "hk1" };
-			seed(state, "CANCELLING", reason);
+			const results: TransactWriteOperationResultEncoded[] = [
+				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } },
+			];
+			seed(state, "CANCELLING", results);
 			insertParticipant(state, { prepare: "rejected", cancel: "cancelled" });
 
 			await tc.runCancel(TX_ID, TOKEN);
@@ -600,7 +620,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				outcome: "cancelled",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
-				reason,
+				results,
 			});
 		});
 	});
@@ -615,13 +635,13 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				TX_ID,
 				JSON.stringify({
 					outcome: "rejected",
-					reason: { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
+					reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
 					// A participant answers for every operation it owns, not only the ones it rejected.
 					results: [
 						{
 							opIndex: 0,
 							outcome: "rejected",
-							reason: { type: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
+							reason: { code: "condition_failed", hashKey: "hk1", sortKey: "sk1" },
 							imageBytes: 50_000,
 						},
 						{ opIndex: 1, outcome: "passed" },
@@ -638,16 +658,11 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			tc.cancelTransactionInStore(TX_ID);
 
 			const stateRow = state.storage.sql
-				.exec<{
-					results_json: string;
-					rejection_reason_json: string;
-				}>(`SELECT results_json, rejection_reason_json FROM tc_state WHERE transaction_id = ?`, TX_ID)
+				.exec<{ results_json: string }>(`SELECT results_json FROM tc_state WHERE transaction_id = ?`, TX_ID)
 				.toArray()[0];
 
 			expect(stateRow.results_json).not.toContain(largeData);
 			expect(stateRow.results_json).not.toContain('"item"');
-			expect(stateRow.rejection_reason_json).not.toContain(largeData);
-			expect(stateRow.rejection_reason_json).not.toContain('"item"');
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
@@ -655,7 +670,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				expect(response.results).toHaveLength(2);
 				expect(response.results[1]).toEqual({ outcome: "passed" });
 				expect(response.results[0].outcome).toBe("rejected");
-				if (response.results[0].outcome === "rejected" && response.results[0].reason.type === "condition_failed") {
+				if (response.results[0].outcome === "rejected" && response.results[0].reason.code === "condition_failed") {
 					expect(response.results[0].reason.item?.data).toBe(largeData);
 				}
 			}
@@ -673,8 +688,8 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				TX_ID,
 				JSON.stringify({
 					outcome: "rejected",
-					reason: { type: "condition_failed", hashKey: "hk2" },
-					results: [{ opIndex: 1, outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" } }],
+					reason: { code: "condition_failed", hashKey: "hk2" },
+					results: [{ opIndex: 1, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" } }],
 				}),
 			);
 
@@ -685,7 +700,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			if (response.outcome === "cancelled") {
 				expect(response.results).toHaveLength(2);
 				expect(response.results[0]).toEqual({ outcome: "not_evaluated" });
-				expect(response.results[1]).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "hk2" } });
+				expect(response.results[1]).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" } });
 			}
 		});
 	});
@@ -853,7 +868,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 });
 
 describe("TransactionCoordinatorDO - bounded preparing hold", () => {
-	it("cancels with transient_error and marks every operation not_evaluated when older than MAX_PREPARING_HOLD_MS and participant throws", async () => {
+	it("cancels with the stored cause and marks every operation not_evaluated when older than MAX_PREPARING_HOLD_MS and participant throws", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING", undefined, Date.now() - 30_000);
 			insertParticipant(state, { name: "p1" });
@@ -874,8 +889,21 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
-				expect(response.reason).toEqual({ type: "transient_error" });
-				expect(response.results).toEqual([{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+				// p1 owns both operations, so both report its one error.
+				expect(response.results).toMatchObject([
+					{ outcome: "rejected", reason: { code: "foreign_error", hashKey: "hk1", sortKey: "sk1" } },
+					{ outcome: "rejected", reason: { code: "foreign_error", hashKey: "hk2" } },
+				]);
+				const [first, second] = response.results;
+				if (
+					first.outcome !== "rejected" ||
+					second.outcome !== "rejected" ||
+					!("error_id" in first.reason) ||
+					!("error_id" in second.reason)
+				) {
+					throw new Error("unreachable");
+				}
+				expect(first.reason.error_id).toBe(second.reason.error_id);
 			}
 		});
 	});
@@ -1036,6 +1064,87 @@ describe("TransactionCoordinatorDO - destroyCoordinator", () => {
 			expect(tableNames(state)).toEqual([]);
 			// A surviving alarm would fire after the wipe and try to drive transactions whose rows are gone.
 			expect(await state.storage.getAlarm()).toBeNull();
+		});
+	});
+});
+
+describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () => {
+	function unavailableWire(code: "partition_migrating" | "partition_over_size"): FokosErrorWire {
+		return FokosError.toWire(new FokosUnavailableError(UNAVAILABLE_CODES[code], { message: "refused" }));
+	}
+
+	function cancelWith(state: DurableObjectState, tc: CoordinatorInternals) {
+		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+		tc.cancelTransactionInStore(TX_ID);
+		const response = tc.loadFinalResponse(TX_ID, TOKEN);
+		if (response.outcome !== "cancelled") throw new Error("the transaction did not cancel");
+		return response;
+	}
+
+	it("reports the stored error of a participant whose prepare threw on its operations, and keeps the other answer", async () => {
+		await withCoordinator((tc, state) => {
+			seed(state, "PREPARING");
+			const stored = unavailableWire("partition_migrating");
+			insertParticipant(state, { name: "p1", error: stored });
+			insertParticipant(state, { name: "p2", prepare: "accepted" });
+
+			// The same event: the error_id the partition minted survives the storage and the cancel.
+			expect(cancelWith(state, tc).results).toEqual([
+				{ outcome: "rejected", reason: { code: "partition_migrating", hashKey: "hk1", sortKey: "sk1", error_id: stored.error_id } },
+				{ outcome: "passed" },
+			]);
+		});
+	});
+
+	it("reports prepare_unanswered for a participant with no answer and no stored error", async () => {
+		await withCoordinator((tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { name: "p1" });
+			insertParticipant(state, { name: "p2", prepare: "accepted" });
+
+			expect(cancelWith(state, tc).results).toEqual([
+				{
+					outcome: "rejected",
+					reason: { code: "prepare_unanswered", hashKey: "hk1", sortKey: "sk1", error_id: expect.stringMatching(/^e_mpncbz_/) },
+				},
+				{ outcome: "passed" },
+			]);
+		});
+	});
+
+	it("reports the stored error of each failed participant on its own operations", async () => {
+		await withCoordinator((tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { name: "p2", error: unavailableWire("partition_over_size") });
+			insertParticipant(state, { name: "p1", error: unavailableWire("partition_migrating") });
+
+			expect(cancelWith(state, tc).results).toMatchObject([
+				{ outcome: "rejected", reason: { code: "partition_migrating", hashKey: "hk1" } },
+				{ outcome: "rejected", reason: { code: "partition_over_size", hashKey: "hk2" } },
+			]);
+		});
+	});
+
+	it("uses a later answer of a participant in place of the error it stored", async () => {
+		await withCoordinator((tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, {
+				name: "p1",
+				prepare: "rejected",
+				error: unavailableWire("partition_migrating"),
+				answer: {
+					outcome: "rejected",
+					results: [{ opIndex: 0, outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } }],
+				},
+			});
+			insertParticipant(state, { name: "p2", prepare: "accepted" });
+
+			const response = cancelWith(state, tc);
+
+			expect(response.results).toEqual([
+				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk1" } },
+				{ outcome: "passed" },
+			]);
 		});
 	});
 });

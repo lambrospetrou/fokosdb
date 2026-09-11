@@ -2,13 +2,9 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import {
-	TX_FANOUT_REQUEST_BUDGET_MS,
-	TransactionCoordinatorDO,
-	isTransactionCommitPendingError,
-	isTransactionUndecidedError,
-} from "../../src/server/do-transaction-coordinator.js";
-import { keysAcrossPartitions, makeDB, partitionNameOf } from "./tx-helpers.js";
+import { TX_FANOUT_REQUEST_BUDGET_MS, TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import { keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
+import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 
 /**
  * The commit fan-out carries keys only, and the `committed` answer waits for every participant: a
@@ -48,7 +44,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data }));
 
 		const commitSpy = vi.spyOn(PartitionDO.prototype, "txCommit");
-		const result = await db.transactWriteItems({ items });
+		const result = await writeOutcome(db.transactWriteItems({ items }));
 
 		expect(result.outcome).toBe("committed");
 		// One commit RPC per participant, and every wire item is a bare key: the payload each
@@ -79,14 +75,14 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		});
 
 		const start = Date.now();
-		const err = await db.transactWriteItems({ items, clientRequestToken: token }).then(
+		const err = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token })).then(
 			() => null,
 			(e: unknown) => e,
 		);
 		// PREPARED is final, so this transaction commits — but the unreachable participant has not
 		// applied it yet, and the caller must not be told "committed".
-		expect(isTransactionCommitPendingError(err)).toBe(true);
-		expect(isTransactionUndecidedError(err)).toBe(false);
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(false);
 		// Within the request budget plus at most one in-flight attempt — the deadline is checked
 		// after each backoff, so a sleep already running when it passes still finishes. Never the
 		// alarm's full retry budget (10 attempts, 13 s of backoff ceiling).
@@ -95,7 +91,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		// The replay has to finish its fan-out inside the budget, so give it the shipped one.
 		budget.mockRestore();
 		spy.mockRestore();
-		const replay = await db.transactWriteItems({ items, clientRequestToken: token });
+		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 		// Read-your-writes: every written key, on every participant, returns the new value.
 		for (const key of keys) {
@@ -121,16 +117,16 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			return orig.call(this, pCtx, request);
 		});
 
-		const err = await db.transactWriteItems({ items, clientRequestToken: token }).then(
+		const err = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token })).then(
 			() => null,
 			(e: unknown) => e,
 		);
-		expect(isTransactionCommitPendingError(err)).toBe(true);
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 
 		childrenMigrating = false;
 		budget.mockRestore();
 		spy.mockRestore();
-		const replay = await db.transactWriteItems({ items, clientRequestToken: token });
+		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 		for (const key of keys) {
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: `data-${key.hashKey}` } });
@@ -163,10 +159,10 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		});
 
 		const start = Date.now();
-		const result = await db.transactWriteItems({ items, clientRequestToken: token });
+		const result = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		// The answer follows the decision: a cancelled transaction applied nothing anywhere, so it
 		// is final even though the unreachable participant still holds its lock.
-		expect(result).toMatchObject({ outcome: "cancelled", reason: { type: "condition_failed" } });
+		expect(result).toMatchObject({ outcome: "cancelled", firstRejection: { code: "condition_failed" } });
 		// The cancel fan-out is bounded exactly as the commit fan-out is: the unreachable
 		// participant costs the caller the budget, not the whole retry ladder.
 		expect(Date.now() - start).toBeLessThan(SHORT_BUDGET_MS + 3_000);
@@ -211,13 +207,13 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		});
 
 		const start = Date.now();
-		const err = await db.transactWriteItems({ items }).then(
+		const err = await writeOutcome(db.transactWriteItems({ items })).then(
 			() => null,
 			(e: unknown) => e,
 		);
 		const elapsed = Date.now() - start;
 
-		expect(isTransactionCommitPendingError(err)).toBe(true);
+		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 		// The caller waited the budget out — the deadline is only reached by the clock running.
 		expect(elapsed).toBeGreaterThanOrEqual(TX_FANOUT_REQUEST_BUDGET_MS);
 		// And stopped there, plus at most the one backoff already in flight.

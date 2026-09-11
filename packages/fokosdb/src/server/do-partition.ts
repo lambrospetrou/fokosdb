@@ -79,13 +79,7 @@ import {
 import { PageBudget } from "../shared/query/page-budget.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import {
-	applyImageCap,
-	conditionFailedReason,
-	decodeItemKeys,
-	IDEMPOTENCY_WINDOW_MS,
-	pickWinningReason,
-} from "../shared/transaction-limits.js";
+import { applyImageCap, conditionFailedReason, decodeItemKeys, IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
 import {
 	CONFLICT_CODES,
 	FokosConflictError,
@@ -1402,13 +1396,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				for (const item of tasks[i].items) {
 					mergedResults.push({ outcome: "passed", opIndex: item.opIndex });
 				}
-			} else if (resp.results) {
+			} else {
 				mergedResults.push(...resp.results);
 			}
 		}
 
 		applyImageCap(mergedResults);
-		return { outcome: "rejected", reason: pickWinningReason(mergedResults), results: mergedResults };
+		return { outcome: "rejected", results: mergedResults };
 	}
 
 	private async prepareLocal(request: PrepareRequest): Promise<PrepareResponse> {
@@ -1637,9 +1631,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 
 		// ONCE per transaction, not once per item.
-		// Called bare, as apiPutItem calls it: everything it touches is local to this DO, and the apply
-		// that just ran is proof that this storage works, so a throw here is a defect worth surfacing.
-		await this.checkSplitsNoKey(pCtx);
+		// A throw here is absorbed, as txCommit absorbs it: the items are already applied, and db.ts reads
+		// any error of this path as "nothing applied", so it must not throw after the apply commits.
+		try {
+			await this.checkSplitsNoKey(pCtx);
+		} catch (error) {
+			console.error({
+				...this.logParams(),
+				message: "fokos/partition.executeSingleShot: split check failed after the transaction applied.",
+				error: String(error),
+				errorProps: error,
+			});
+		}
 
 		return response;
 	}

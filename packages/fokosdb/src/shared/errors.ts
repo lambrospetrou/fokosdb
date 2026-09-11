@@ -1,5 +1,5 @@
 /**
- * The structured errors of FokosDB: the machinery, the nine categories, and the codes of each category.
+ * The structured errors of FokosDB: the machinery, the generic categories, and the codes of each one.
  *
  * Every error the library raises extends `FokosError` and belongs to one category. A category is the
  * value of `name` and of `_tag`. The code is the fine-grained identifier of one failure. The category
@@ -20,7 +20,8 @@
  * - A guard from `defineErrorGuard` holds for the codes of one union, and a switch on `_tag` then
  *   narrows `code` to the codes of that category.
  *
- * This module imports nothing, so any package can reuse it.
+ * This module imports nothing, so any package can reuse it. A category whose fields depend on the
+ * types of the library, such as `FokosConditionCheckError`, lives in `errors-operations.ts`.
  */
 
 export type FokosErrorOrigin = "caller" | "service" | "internal";
@@ -252,16 +253,8 @@ export class FokosExpressionError<C extends string = string> extends FokosError<
 	static readonly tag = "FokosExpressionError";
 }
 
-export class FokosConditionCheckError<C extends string = string> extends FokosError<"FokosConditionCheckError", C> {
-	static readonly tag = "FokosConditionCheckError";
-}
-
 export class FokosConflictError<C extends string = string> extends FokosError<"FokosConflictError", C> {
 	static readonly tag = "FokosConflictError";
-}
-
-export class FokosTransactionCancelledError<C extends string = string> extends FokosError<"FokosTransactionCancelledError", C> {
-	static readonly tag = "FokosTransactionCancelledError";
 }
 
 export class FokosUnavailableError<C extends string = string> extends FokosError<"FokosUnavailableError", C> {
@@ -285,9 +278,7 @@ export const FOKOS_ERROR_CATEGORIES: ReadonlyMap<string, new (code: FokosCodeDef
 	[
 		FokosValidationError,
 		FokosExpressionError,
-		FokosConditionCheckError,
 		FokosConflictError,
-		FokosTransactionCancelledError,
 		FokosUnavailableError,
 		FokosTransactionPendingError,
 		FokosRoutingError,
@@ -339,10 +330,6 @@ export const EXPRESSION_CODES = defineCodes("FokosExpressionError", "caller", 40
 	expression_invalid: "ucjjtz",
 });
 
-export const CONDITION_CHECK_CODES = defineCodes("FokosConditionCheckError", "caller", 409, {
-	condition_failed: "usbs9w",
-});
-
 export const CONFLICT_CODES = {
 	...defineCodes("FokosConflictError", "caller", 409, {
 		item_locked_by_transaction: "vnfeg6",
@@ -356,10 +343,6 @@ export const CONFLICT_CODES = {
 		clock_skew: "xy3rrw",
 	}),
 };
-
-export const TRANSACTION_CANCELLED_CODES = defineCodes("FokosTransactionCancelledError", "caller", 409, {
-	transaction_cancelled: "zd7rzd",
-});
 
 export const TRANSACTION_PENDING_CODES = defineCodes("FokosTransactionPendingError", "service", 503, {
 	transaction_undecided: "28ahbe",
@@ -394,9 +377,7 @@ export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500,
 export const FOKOS_CODE_TABLES = [
 	VALIDATION_CODES,
 	EXPRESSION_CODES,
-	CONDITION_CHECK_CODES,
 	CONFLICT_CODES,
-	TRANSACTION_CANCELLED_CODES,
 	TRANSACTION_PENDING_CODES,
 	UNAVAILABLE_CODES,
 	ROUTING_CODES,

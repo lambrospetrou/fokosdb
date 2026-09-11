@@ -230,11 +230,15 @@ Each error then carries the same routing meta, and each forwarding level reads i
 
 Two modules hold the errors:
 
-- `packages/fokosdb/src/shared/errors.ts` holds the machinery, the nine category classes, and one
-  code table for each category (section 4.2.2). It imports nothing, so another package can reuse it.
+- `packages/fokosdb/src/shared/errors.ts` holds the machinery, the seven generic category classes,
+  and one code table for each of them (section 4.2.2). It imports nothing, so another package can reuse
+  it.
 - `packages/fokosdb/src/shared/errors-operations.ts` holds what depends on the types of the library:
-  the subclasses that carry fields of the data model, `withExpressionErrors` (section 4.2.7), the union
-  `FokosAnyError` of every error the library raises, and its guard `isFokosAnyError` (section 4.2.4).
+  the two categories whose fields hold types of the data model, `FokosConditionCheckError` (`reason`,
+  `meta`) and `FokosTransactionCancelledError` (`reason`, `results`), with their code tables;
+  `withExpressionErrors` (section 4.2.7); the union `FokosAnyError` of every error the library raises;
+  and its guard `isFokosAnyError` (section 4.2.4). It extends `errors.ts` in the same way that another
+  package does.
 
 `FokosError` extends `Error` and declares the contractual fields. Each category extends `FokosError`
 and declares its tag once, as a static. The constructor takes a code definition (section 4.2.2) and
@@ -308,10 +312,10 @@ cause would store as `{}`.
 The static `tag` of a category is what lets the one static `is` serve every category:
 `FokosConflictError.is(e)` compares `_tag` with `FokosConflictError.tag`.
 
-A subclass of a category can add own data fields. It keeps the `name` and the `_tag` of its category.
-`FokosItemConditionCheckError extends FokosConditionCheckError<"condition_failed">` adds `reason` and
-`meta` for `putItem` and `deleteItem`. Its guard, `FokosItemConditionCheckError.is(e)`, holds for the
-whole category, so only the raiser of that category may use the subclass.
+A category can declare own data fields beside the base ones, with a constructor that assigns them.
+`FokosConditionCheckError` and `FokosTransactionCancelledError` do so. `FOKOS_ERROR_CATEGORIES` in
+`errors.ts` does not list them, so `FokosError.fromWire` builds an error of either one as the generic
+class that keeps its tag and all its fields.
 
 | Category (`name` and `_tag`) | `type` | Typical origin | Typical `httpStatusHint` |
 | --- | --- | --- | --- |
@@ -415,9 +419,9 @@ the library raises in it:
 /** Every error the library raises. `_tag` and `code` are literals, so a switch narrows and stays exhaustive. */
 export type FokosAnyError =
     | FokosValidationError<FokosCodesOf<typeof VALIDATION_CODES>>
-    | FokosItemConditionCheckError
+    | FokosConditionCheckError<FokosCodesOf<typeof CONDITION_CHECK_CODES>>
     | /* ... */ FokosInternalError<FokosCodesOf<typeof INTERNAL_CODES>>;
-export const isFokosAnyError = defineErrorGuard<FokosAnyError>(...FOKOS_CODE_TABLES);
+export const isFokosAnyError = defineErrorGuard<FokosAnyError>(...FOKOS_LIBRARY_CODE_TABLES);
 ```
 
 `FokosError` and `FokosAnyError` are not the same thing, and both are needed. `FokosError` is the base
@@ -501,27 +505,43 @@ A participant answers about N operations at once. It reports `passed`, `not_eval
 for each one. A throw carries one answer, so it cannot report the other N-1 operations.
 
 So `PrepareResponse` and `SingleShotResponse` keep their returned union. `db.ts` converts a
-`cancelled` outcome to a thrown `FokosTransactionCancelledError`, which carries the `results` array
-and the `reason` record as own data properties. This is the only deviation from "everything except a
-happy-path answer throws".
+`cancelled` outcome to a thrown `FokosTransactionCancelledError`, which carries the `results` array as
+an own data property. This is the only deviation from "everything except a happy-path answer throws".
+
+The model follows DynamoDB's `TransactionCanceledException`: one exception, and one reason for each
+operation, in request order. There is no reason for the whole transaction. A failure that stops a
+partition from running its operations is reported on each operation of that partition, as DynamoDB
+reports `ThrottlingError` on each affected item.
 
 A returned union also removes a dependency. The results array crosses a hop as a return value, which
 structured clone has always carried. It does not depend on `enhanced_error_serialization`.
 
 A `results` entry is a verdict, not an exception: the operation did not fail in isolation, the
-transaction cancelled, and the entry records which premise did not hold. It keeps the plain shape it
-has today — a rejected entry carries its `RejectionReason` record:
+transaction cancelled, and the entry records why. It keeps the plain shape it has today — a rejected
+entry carries its `RejectionReason` record:
 
 ```ts
 type TransactWriteOperationResult =
-    | { outcome: "passed" }
-    | { outcome: "not_evaluated" }
+    | { outcome: "passed" }        // DynamoDB "None": the premise of this operation held
+    | { outcome: "not_evaluated" } // no participant judged it
     | {
           outcome: "rejected";
           reason: RejectionReason;
           itemOmitted?: "response_too_large";
       };
+
+type RejectionReason =
+    // A premise of the operation did not hold.
+    | { code: "condition_failed"; hashKey; sortKey?; item? }
+    | { code: "clock_skew"; hashKey; sortKey?; serverTimestampMs; transactionTimestampMs }
+    | { code: "timestamp_conflict" | "pending_conflict" | "update_not_applicable" | /* ... */; hashKey; sortKey? }
+    // The partition that owns the operation could not run it. Every operation of that partition
+    // carries the same code and the same error_id, which names the error in the logs.
+    | { code: ExecutionFailureCode; hashKey; sortKey?; error_id: string };
 ```
+
+Every `code` is a literal, so a check on `reason.code` narrows the record. `ExecutionFailureCode` is
+every code of the library except the seven premise codes.
 
 This is the shape DynamoDB uses for `TransactionCanceledException.CancellationReasons`: plain
 `{ Code, Message, Item }` structs, not nested exceptions. `RejectionReason` keeps its shape, with its
@@ -552,8 +572,8 @@ failure. A row marked "no" for one path is a failure that path cannot have.
 | The input is not valid: keys, data, `ttlAt`, token, item count, duplicate keys, payload size, operation fields | yes | yes | `FokosValidationError` | The code from section 7.1, for example `transact_duplicate_key` |
 | An expression does not compile | yes | yes | `FokosExpressionError` | `expression_invalid` |
 | The premise of an operation does not hold | yes | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each rejected `results` entry holds its `RejectionReason`: `condition_failed`, `timestamp_conflict`, `pending_conflict`, `update_not_applicable`, `update_value_is_bytes`, or `item_too_large` |
-| The transaction timestamp is too far ahead of the partition clock | no. The partition takes its own timestamp | yes | `FokosTransactionCancelledError` | `transaction_cancelled`, with `reason.code` `clock_skew`. Every `results` entry is `not_evaluated` |
-| A partition refuses the work before it applies anything: migration, over-size, mis-route, a range DO that is not initialized, a context mismatch, an expression fault at evaluation, a failed invariant | yes | yes | `FokosTransactionCancelledError` | `transaction_cancelled`, with `reason` the wire record of the raised error, for example `reason.code` `partition_migrating`. Every `results` entry is `not_evaluated` |
+| The transaction timestamp is too far ahead of the partition clock | no. The partition takes its own timestamp | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each operation of that partition is rejected with `reason.code` `clock_skew` |
+| A partition refuses the work before it applies anything: migration, over-size, mis-route, a range DO that is not initialized, a context mismatch, an expression fault at evaluation, a failed invariant | yes | yes | `FokosTransactionCancelledError` | `transaction_cancelled`. Each operation of that partition is rejected with the code of the raised error, for example `partition_migrating`, and its `error_id`. The operations of the other partitions keep their own answers |
 | The outcome is unknown: a transport or runtime fault on a hop where the reply can be lost after the apply | any hop | the hop from `db.ts` to the coordinator | `FokosInternalError` | `foreign_error` |
 | The decision is not final yet | no | yes | `FokosTransactionPendingError` | `transaction_undecided` or `transaction_commit_pending` |
 | The token was used for another set of operations | no. The fast path takes no token | yes | `FokosValidationError` | `idempotent_parameter_mismatch` |
@@ -562,7 +582,8 @@ failure. A row marked "no" for one path is a failure that path cannot have.
 
 On the fast path, `db.ts` converts a thrown error into `FokosTransactionCancelledError` when
 `FokosError.is(err)` holds and its code is neither `foreign_error` nor
-`single_partition_fast_path_not_applicable`. Two rules make this safe:
+`single_partition_fast_path_not_applicable`. One partition owns every operation of this path, so
+every operation is rejected with the code and the `error_id` of that error. Two rules make this safe:
 
 1. `txExecuteSingleShot` does not throw after its apply commits. Today it calls `checkSplitsNoKey`
    after the apply, bare. It now logs a failed split check and returns `committed`, as `txCommit`
@@ -607,20 +628,21 @@ must merge the same stored answers:
    `prepare_outcome` is NULL. A later answer therefore replaces the stored error.
 3. A NULL participant with no `error_json` exists only when the coordinator stopped between the throw
    and the write. It reports `prepare_unanswered`.
-4. The merge reads the participants in `partition_do_name` order. The first failed participant in
-   that order gives the reason, so both writers of `CANCELLING` pick the same reason.
+4. Each operation of a participant that did not answer is rejected with the code and the `error_id`
+   of that error: a transport fault reports `foreign_error`, an over-size partition reports
+   `partition_over_size`. A rejected participant whose stored answer cannot be read back reports
+   `unexpected_transaction_state` on its operations. Every other operation keeps the answer of its own
+   participant, the images of a failed condition included.
 
-The cancelled answer's `reason` reports the cause. `reason` stays a `RejectionReason` record for a
-rejection, and it holds the wire record of the stored error for an execution failure — a transport
-fault reports `foreign_error`, an over-size partition reports `partition_over_size`. Both shapes carry
-`code`, so `reason.code` reads uniformly. A stored row that cannot be read back reports
-`unexpected_transaction_state`.
+The error record stays inside the coordinator. The cancelled answer holds only the `results` array,
+and a `CANCELLING` or `CANCELLED` row without stored results raises `unexpected_transaction_state`.
 
-`db.ts` throws `FokosTransactionCancelledError` for every cancelled outcome — one type for a
-rejection and for an execution failure. Its `origin` and `httpStatusHint` come from the reason: the
-stored error's own fields for an execution failure, and the defaults of the code definition of `reason.code`
-for a `RejectionReason` record. The definition of `transaction_cancelled` is the fallback when neither
-applies.
+`db.ts` throws `FokosTransactionCancelledError` for every cancelled outcome. Its `origin` and
+`httpStatusHint` come from the codes of the rejected entries. The first origin in the order `caller`,
+`internal`, `service` wins, with the hint of the first entry of that origin in request order: a
+premise that must change comes before a defect, and only a cancel whose every failure clears on its
+own is a service condition. The definition of `transaction_cancelled` is the fallback when no entry
+is rejected.
 
 #### 4.2.7 `ExpressionError`
 

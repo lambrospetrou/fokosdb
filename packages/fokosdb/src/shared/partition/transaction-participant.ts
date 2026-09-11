@@ -17,7 +17,7 @@ import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
-import { applyImageCap, conditionFailedReason, decodeItemKeys, MAX_ITEM_BYTES, pickWinningReason } from "../transaction-limits.js";
+import { applyImageCap, conditionFailedReason, decodeItemKeys, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import type { UpdateProbeResult } from "../expression/runtime.js";
 
 export type TransactionParticipantDeps = {
@@ -90,7 +90,7 @@ export class TransactionParticipant {
 				() => `fokos/partition.precheck: "put" item has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
 			);
 			const bytes = this.#store.measureItemBytes({ hk: item.hashKey, sk, data: item.data, kind: item.kind });
-			return { reason: bytes > MAX_ITEM_BYTES ? { type: "item_too_large", ...rejectionKeys } : null, probe: null };
+			return { reason: bytes > MAX_ITEM_BYTES ? { code: "item_too_large", ...rejectionKeys } : null, probe: null };
 		}
 
 		if (item.operation === "update") {
@@ -100,12 +100,12 @@ export class TransactionParticipant {
 				// A value that evaluated to bytes is the one cause the probe separates out, because the
 				// caller can act on it. Every other cause — a missing item, a non-json item, a missing
 				// target path — is reported as one answer, as DynamoDB reports its own.
-				const type = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
-				return { reason: { type, ...rejectionKeys }, probe };
+				const code = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
+				return { reason: { code, ...rejectionKeys }, probe };
 			}
 			// An applicable update always measured its result; the probe returns NULL only when it is not.
 			invariant(probe.newSize !== null, "fokos/partition.precheck: applicable update reported no size");
-			return { reason: probe.newSize > MAX_ITEM_BYTES ? { type: "item_too_large", ...rejectionKeys } : null, probe };
+			return { reason: probe.newSize > MAX_ITEM_BYTES ? { code: "item_too_large", ...rejectionKeys } : null, probe };
 		}
 
 		// delete and check write no data, so neither has a size to test.
@@ -123,14 +123,20 @@ export class TransactionParticipant {
 
 		const now = this.#now();
 
+		// The clock of this partition rejects the whole request, so every operation it owns reports it.
 		if (request.transactionTimestamp > now + TransactionParticipant.MAX_CLOCK_SKEW_MS) {
 			return {
 				outcome: "rejected",
-				reason: {
-					type: "clock_skew",
-					serverTimestampMs: now,
-					transactionTimestampMs: request.transactionTimestamp,
-				},
+				results: request.items.map((item) => ({
+					outcome: "rejected",
+					opIndex: item.opIndex,
+					reason: {
+						code: "clock_skew",
+						...decodeItemKeys(item.hashKey, item.sortKey),
+						serverTimestampMs: now,
+						transactionTimestampMs: request.transactionTimestamp,
+					},
+				})),
 			};
 		}
 
@@ -152,7 +158,7 @@ export class TransactionParticipant {
 						outcome: "rejected",
 						opIndex,
 						reason: {
-							type: "pending_conflict",
+							code: "pending_conflict",
 							...rejectionKeys,
 							conflictingTransactionId: pendingRow.transaction_id,
 						},
@@ -193,7 +199,7 @@ export class TransactionParticipant {
 						results.push({
 							outcome: "rejected",
 							opIndex,
-							reason: { type: "timestamp_conflict", ...rejectionKeys },
+							reason: { code: "timestamp_conflict", ...rejectionKeys },
 						});
 						continue;
 					}
@@ -207,7 +213,7 @@ export class TransactionParticipant {
 						results.push({
 							outcome: "rejected",
 							opIndex,
-							reason: { type: "timestamp_conflict", ...rejectionKeys },
+							reason: { code: "timestamp_conflict", ...rejectionKeys },
 						});
 						continue;
 					}
@@ -218,7 +224,7 @@ export class TransactionParticipant {
 
 			if (results.some((r) => r.outcome === "rejected")) {
 				applyImageCap(results);
-				return { outcome: "rejected", reason: pickWinningReason(results), results };
+				return { outcome: "rejected", results };
 			}
 
 			// All checks passed — lock every item.
@@ -355,7 +361,7 @@ export class TransactionParticipant {
 						outcome: "rejected",
 						opIndex,
 						reason: {
-							type: "pending_conflict",
+							code: "pending_conflict",
 							...rejectionKeys,
 							conflictingTransactionId: pendingRow.transaction_id,
 						},
@@ -386,7 +392,7 @@ export class TransactionParticipant {
 
 			if (results.some((r) => r.outcome === "rejected")) {
 				applyImageCap(results);
-				return { outcome: "rejected", reason: pickWinningReason(results), results };
+				return { outcome: "rejected", results };
 			}
 
 			// Every item passed, so the whole set applies. Reaching this point inside transactionSync is

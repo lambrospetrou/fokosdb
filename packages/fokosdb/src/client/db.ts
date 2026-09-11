@@ -24,8 +24,10 @@ import { partitionStub, partitionStubByName } from "../shared/do-stubs.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
 import type {
+	ExecutionFailureCode,
 	InitiateReadResponseEncoded,
 	ReadForTransactionItemResultEncoded,
+	ReadSnapshotResponse,
 	RejectionReason,
 	RejectionReasonEncoded,
 	SingleShotResponse,
@@ -47,19 +49,26 @@ import {
 	validateTransactGetItemCount,
 	validateTransactWriteOperations,
 	validateClientRequestToken,
+	decodeItemKeys,
 } from "../shared/transaction-limits.js";
 import {
-	CONDITION_CHECK_CODES,
+	CONFLICT_CODES,
+	FokosConflictError,
 	FokosError,
 	FokosInternalError,
 	FokosValidationError,
 	INTERNAL_CODES,
 	ROUTING_CODES,
-	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
 	isRuntimeRetryableError,
 } from "../shared/errors.js";
-import { FokosItemConditionCheckError, withExpressionErrors } from "../shared/errors-operations.js";
+import {
+	CONDITION_CHECK_CODES,
+	FokosConditionCheckError,
+	FokosTransactionCancelledError,
+	TRANSACTION_CANCELLED_CODES,
+	withExpressionErrors,
+} from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
@@ -129,7 +138,7 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 }
 
 function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason {
-	if (reason.type === "condition_failed" && reason.item) {
+	if (reason.code === "condition_failed" && reason.item) {
 		return {
 			...reason,
 			item: {
@@ -145,14 +154,27 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 function conditionCheckError(
 	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
 	res: { reason: RejectionReasonEncoded; meta: OperationMetrics & PartitionInfoInternal },
-): FokosItemConditionCheckError {
+): FokosConditionCheckError {
 	const reason = decodeRejectionReason(res.reason);
-	invariant(reason.type === "condition_failed", "an item RPC rejects only a failed condition");
-	return new FokosItemConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
+	invariant(reason.code === "condition_failed", "an item RPC rejects only a failed condition");
+	return new FokosConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
 		message: "condition failed",
 		attributes: { hashKey: keys.hashKey, sortKey: keys.sortKey },
 		reason,
 		meta: publicMeta(res.meta),
+	});
+}
+
+/** The error `transactWriteItems` raises for a cancelled transaction, on either path. */
+function transactionCancelledError(fields: {
+	transactionId: string;
+	idempotencyToken: string;
+	results: TransactWriteOperationResultEncoded[];
+}): FokosTransactionCancelledError {
+	return new FokosTransactionCancelledError(TRANSACTION_CANCELLED_CODES.transaction_cancelled, {
+		message: "transaction cancelled",
+		attributes: { transactionId: fields.transactionId, idempotencyToken: fields.idempotencyToken },
+		results: fields.results.map(decodeOperationResult),
 	});
 }
 
@@ -167,6 +189,11 @@ function decodeOperationResult(res: TransactWriteOperationResultEncoded): Transa
 }
 
 /** Runs the body of a public method, and raises any error from it as a FokosError. */
+/** `transactGetItems` raises it when a requested item holds a pending write of an in-progress transaction. */
+function pendingWriteError(): FokosConflictError {
+	return new FokosConflictError(CONFLICT_CODES.pending_write, { message: "an item has a pending write of an in-progress transaction" });
+}
+
 async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
@@ -389,13 +416,7 @@ export class FokosDB {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
 		});
 		if (encoded.outcome === "committed") return encoded;
-		return {
-			outcome: "cancelled",
-			transactionId: encoded.transactionId,
-			idempotencyToken: encoded.idempotencyToken,
-			reason: decodeRejectionReason(encoded.reason),
-			results: encoded.results.map(decodeOperationResult),
-		};
+		throw transactionCancelledError(encoded);
 	}
 
 	/**
@@ -425,16 +446,19 @@ export class FokosDB {
 			// The fallback is the ONE error that means "run the coordinator path instead". It carries no
 			// side effects, so nothing was written and nothing has to be undone.
 			if (FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) return null;
-			// A partition past its size cap is healthy, just full. The coordinator answers a prepare that
-			// throws this with a cancelled transaction, and this path must answer identically.
-			if (FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size)) {
-				return {
-					outcome: "cancelled",
+			// The partition does not throw after its apply commits, so an error that partition code raised
+			// means nothing applied: the transaction cancelled, and that one partition owns every operation,
+			// as the coordinator reports the same refusal of a prepare. A foreign error can be a reply lost
+			// after the apply, so its outcome is unknown.
+			if (FokosError.is(err) && !FokosError.isCode(err, INTERNAL_CODES.foreign_error)) {
+				throw transactionCancelledError({
 					transactionId,
 					idempotencyToken: transactionId,
-					reason: { type: "transient_error" },
-					results: items.map(() => ({ outcome: "not_evaluated" })),
-				};
+					results: items.map((item) => ({
+						outcome: "rejected",
+						reason: { code: err.code as ExecutionFailureCode, ...decodeItemKeys(item.hashKey, item.sortKey), error_id: err.error_id },
+					})),
+				});
 			}
 			throw err;
 		}
@@ -442,13 +466,7 @@ export class FokosDB {
 		if (response.outcome === "committed") {
 			return { outcome: "committed", transactionId, idempotencyToken: transactionId };
 		}
-		return {
-			outcome: "cancelled",
-			transactionId,
-			idempotencyToken: transactionId,
-			reason: decodeRejectionReason(response.reason),
-			results: response.results.map(decodeOperationResult),
-		};
+		throw transactionCancelledError({ transactionId, idempotencyToken: transactionId, ...response });
 	}
 
 	async #transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
@@ -469,8 +487,7 @@ export class FokosDB {
 		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
 		// queryItems), parse json text once into a JsonValue, and drop the read-transaction bookkeeping
 		// (lastCommittedTs / hasPendingWrite) so callers never depend on it. Those two are meaningless in
-		// a "committed" outcome regardless — the driver aborts when any item has a pending write.
-		if (response.outcome !== "committed") return response;
+		// a "committed" outcome regardless — the driver raises an error when any item has a pending write.
 		return {
 			...response,
 			items: response.items.map(({ lastCommittedTs: _lastCommittedTs, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item }) => {
@@ -495,8 +512,9 @@ export class FokosDB {
 
 		const stub = partitionStubByName(env[target.ns], target.doName);
 		const request = { items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) };
+		let response: ReadSnapshotResponse;
 		try {
-			return await tryWhile(
+			response = await tryWhile(
 				async () => await stub.txReadSnapshot(target, request),
 				(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
 			);
@@ -507,6 +525,8 @@ export class FokosDB {
 			if (!FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) throw err;
 			return null;
 		}
+		if (response.outcome === "aborted") throw pendingWriteError();
+		return response;
 	}
 
 	async #readTransaction(requestedItems: TCReadItem[]): Promise<InitiateReadResponseEncoded> {
@@ -542,13 +562,12 @@ export class FokosDB {
 
 		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase1Settled) {
-			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
+			// A read applies nothing, so the error of a failed phase call is the answer, as the partition raised it.
+			if (r.status === "rejected") throw r.reason;
 			phase1Flat.push(...r.value.items);
 		}
 
-		if (phase1Flat.some((item) => item.hasPendingWrite)) {
-			return { outcome: "aborted", reason: "pending_write" };
-		}
+		if (phase1Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
 
 		// Phase 2 — verify no concurrent mutations
 		const phase2Settled = await Promise.allSettled(
@@ -567,13 +586,11 @@ export class FokosDB {
 
 		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase2Settled) {
-			if (r.status === "rejected") return { outcome: "aborted", reason: "transient_error" };
+			if (r.status === "rejected") throw r.reason;
 			phase2Flat.push(...r.value.items);
 		}
 
-		if (phase2Flat.some((item) => item.hasPendingWrite)) {
-			return { outcome: "aborted", reason: "pending_write" };
-		}
+		if (phase2Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
 
 		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
 		// flattens the replies, so result order is not request order. KeyCodec.pairKey is the ONE identity
@@ -605,9 +622,14 @@ export class FokosDB {
 			const p1 = phase1ByKey.get(key);
 			const p2 = phase2ByKey.get(key);
 			// A requested key with no reply means a participant dropped it — never expected, and not
-			// something to answer with a short array, so it fails the read like any other read failure.
-			if (!p1 || !p2) return { outcome: "aborted", reason: "transient_error" };
-			if (!sameCommittedState(p1, p2)) return { outcome: "aborted", reason: "read_conflict" };
+			// something to answer with a short array.
+			invariant(p1 && p2, "a participant of a read transaction dropped a requested key");
+			if (!sameCommittedState(p1, p2)) {
+				throw new FokosConflictError(CONFLICT_CODES.read_conflict, {
+					message: "a write changed an item between the two phases of the read",
+					attributes: decodeItemKeys(requested.hashKey, requested.sortKey),
+				});
+			}
 			items.push(p1);
 		}
 

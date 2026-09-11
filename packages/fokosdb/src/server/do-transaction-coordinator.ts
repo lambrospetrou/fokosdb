@@ -5,6 +5,7 @@ import type { PartitionContextResolved } from "../shared/partition-topology/part
 import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type {
+	ExecutionFailureCode,
 	InitiateWriteRequest,
 	InitiateWriteResponseEncoded,
 	ParticipantOperationResultEncoded,
@@ -27,15 +28,17 @@ import {
 	TRANSACTION_PENDING_CODES,
 	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
+	type FokosErrorWire,
 } from "../shared/errors.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
+import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
 import {
 	ALARM_RECOVERY_BUDGET_MS,
 	applyImageCap,
+	decodeItemKeys,
 	IDEMPOTENCY_WINDOW_MS,
 	MAX_TC_DATABASE_BYTES,
-	pickWinningReason,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
 
@@ -46,12 +49,6 @@ type TcStateRow = {
 	transaction_ts: number;
 	created_at: number;
 	completed_at: number | null;
-	/**
-	 * Top-level rejection reason for the cancelled transaction (RejectionReasonEncoded).
-	 * Carries keys only; item images are omitted to protect row size.
-	 * Binary keys are tagged with $u8 to survive JSON serialization.
-	 */
-	rejection_reason_json: string | null;
 	/**
 	 * Per-operation outcome array (TransactWriteOperationResultEncoded[]), ordered by request opIndex.
 	 * Stores outcome codes, reasons (keys only), and itemOmitted markers.
@@ -78,6 +75,8 @@ type TcParticipantRow = {
 	 * NULL for an accepted participant.
 	 */
 	answer_json: string | null;
+	/** The FokosErrorWire of a prepare that threw after its retries, read only while prepare_outcome is NULL. */
+	error_json: string | null;
 };
 
 type TcItemRow = {
@@ -126,7 +125,7 @@ function parseTagged<T>(json: string): T {
 }
 
 function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEncoded {
-	if (reason.type !== "condition_failed" || reason.item === undefined) return reason;
+	if (reason.code !== "condition_failed" || reason.item === undefined) return reason;
 	const stripped = { ...reason };
 	delete stripped.item;
 	return stripped;
@@ -143,32 +142,8 @@ function stripImagesFromPrepareResponse(r: PrepareResponse): PrepareResponse {
 	if (r.outcome === "accepted") return r;
 	return {
 		outcome: "rejected",
-		reason: reasonWithoutImage(r.reason),
-		...(r.results
-			? {
-					results: r.results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res)),
-				}
-			: {}),
+		results: r.results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res)),
 	};
-}
-
-/**
- * The execution failure a stored answer REPORTS, or null when it reports none.
- *
- * A NULL prepare_outcome is deliberately not one. That participant has not answered yet, and
- * recovery can still re-prepare it into an acceptance, which leaves the transaction on the merge
- * path. Suppressing an image on the strength of a NULL row would then hand the caller a rejected
- * operation with no item and no itemOmitted, which reads as "the item does not exist".
- *
- * So a caller that decides whether to STORE images uses this alone, and only the merge — which runs
- * when no row can change again — adds the NULL case on top.
- */
-function reportedExecutionFailure(p: TcParticipantRow): RejectionReasonEncoded | null {
-	if (p.prepare_outcome !== "rejected") return null;
-	const ans = p.answer_json ? parseTagged<PrepareResponse>(p.answer_json) : null;
-	// A rejection that carries per-operation results is a check-pass rejection, not a failure to run.
-	if (ans && ans.outcome === "rejected" && ans.results) return null;
-	return (ans && ans.outcome === "rejected" ? ans.reason : null) ?? { type: "transient_error" };
 }
 
 // tc_items hk/sk are BLOB; materialize a read column as KeyBytes (trusted re-brand, no copy of bytes).
@@ -202,8 +177,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_ts          INTEGER NOT NULL,
                 created_at              INTEGER NOT NULL,
                 completed_at            INTEGER,
-                -- Top-level RejectionReasonEncoded for the transaction. Keys only, no item images.
-                rejection_reason_json   TEXT,
                 -- Positional TransactWriteOperationResultEncoded array. Item images are omitted
                 -- and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
                 results_json            TEXT,
@@ -226,6 +199,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 cancel_outcome          TEXT,
                 -- Serialized PrepareResponse with item images stripped (imageBytes kept for capping).
                 answer_json             TEXT,
+                -- The FokosErrorWire of the error of the last prepare attempt that threw. It is written only
+                -- while prepare_outcome is NULL, so a later answer replaces it.
+                error_json              TEXT,
                 PRIMARY KEY (transaction_id, partition_do_name)
             ) WITHOUT ROWID, STRICT;
 
@@ -449,25 +425,23 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				// The outcome is decided and final, but not every participant has applied it yet, so
 				// this is not a terminal answer for the caller: retry with the same token.
 				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_commit_pending, {
-					message: `transaction ${COMMIT_PENDING_SENTINEL}: the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
+					message: `transaction commit is pending: the decision is durable and the transaction will commit, but not every participant has applied it yet — retry with the same clientRequestToken`,
 					attributes: { transactionId, state: row.state },
 				});
 			case "CANCELLING":
 			case "CANCELLED": {
-				const reason: RejectionReasonEncoded = row.rejection_reason_json
-					? parseTagged<RejectionReasonEncoded>(row.rejection_reason_json)
-					: { type: "transient_error" };
-				// A NULL results_json is the same torn-row degradation that makes the reason fall back to
-				// transient_error. It says "no per-operation detail", not "nothing was evaluated".
-				const results: TransactWriteOperationResultEncoded[] = row.results_json
-					? parseTagged<TransactWriteOperationResultEncoded[]>(row.results_json)
-					: [];
+				// CANCELLING writes results_json in the same statement as the state, so a row without it is torn
+				// and holds no answer to give.
+				if (!row.results_json) {
+					throw unexpectedTransactionStateError("a cancelled transaction has no stored results", { transactionId, state: row.state });
+				}
+				const results = parseTagged<TransactWriteOperationResultEncoded[]>(row.results_json);
 				// results_json is positional to the request and tc_results.op_index is that same request
 				// index, so entry i owns the image row with op_index i. The cap already applied before
 				// the array was stored, so a replay answers with exactly the images the first call did.
 				for (const img of this.loadResultImages(transactionId)) {
 					const res = results[img.op_index];
-					if (res?.outcome !== "rejected" || res.reason.type !== "condition_failed") continue;
+					if (res?.outcome !== "rejected" || res.reason.code !== "condition_failed") continue;
 					res.reason.item = {
 						hashKey: res.reason.hashKey,
 						...(res.reason.sortKey !== undefined ? { sortKey: res.reason.sortKey } : {}),
@@ -477,20 +451,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						...(img.image_ttl_epoch_utc_seconds != null ? { ttlAt: img.image_ttl_epoch_utc_seconds } : {}),
 					};
 				}
-				return {
-					outcome: "cancelled",
-					transactionId,
-					idempotencyToken,
-					reason,
-					results,
-				};
+				return { outcome: "cancelled", transactionId, idempotencyToken, results };
 			}
 			case "CREATED":
 			case "PREPARING":
 				// No decision yet — the alarm will drive it. The outcome can still go either way, so
 				// this answer promises nothing and only asks the caller to retry.
 				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
-					message: `transaction ${UNDECIDED_SENTINEL}, retry later`,
+					message: "transaction outcome is not yet decided, retry later",
 					attributes: { transactionId, state: row.state },
 				});
 			default: {
@@ -535,13 +503,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 * prepare outcome they belong to. No part of an answer then lives only in memory, so a coordinator
 	 * evicted between a participant's answer and the transaction's decision still reads back every
 	 * outcome, reason, and image that participant reported.
-	 *
-	 * `skipImages` is set once any participant has reported an execution failure. From that moment the
-	 * outcome is known — every operation is not_evaluated and no image is returned — so the later
-	 * answers cost no image writes. The images written before the failure are deleted when CANCELLING
-	 * is written.
 	 */
-	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse, skipImages: boolean): void {
+	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void {
 		this.ctx.storage.transactionSync(() => {
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
@@ -550,9 +513,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				transactionId,
 				partitionDoName,
 			);
-			if (skipImages || answer.outcome !== "rejected" || !answer.results) return;
+			if (answer.outcome !== "rejected") return;
 			for (const res of answer.results) {
-				if (res.outcome !== "rejected" || res.reason.type !== "condition_failed" || !res.reason.item) continue;
+				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item) continue;
 				const img = res.reason.item;
 				// image_data is an ANY column: text and JSON text bind as TEXT, bytes bind as a BLOB, exactly
 				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path.
@@ -571,6 +534,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	/**
+	 * Records why a participant's prepare threw after its retries, so the cancel reports the cause. A
+	 * participant that has answered keeps its answer, and recovery can still re-prepare one that has not.
+	 */
+	private storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void {
+		this.ctx.storage.sql.exec(
+			`UPDATE tc_participants SET error_json = ? WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
+			stringifyTagged(FokosError.toWire(err)),
+			transactionId,
+			partitionDoName,
+		);
+	}
+
+	/**
 	 * Merges every participant's stored answer into the transaction's outcome and records the durable
 	 * transition to CANCELLING.
 	 *
@@ -580,72 +556,63 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private cancelTransactionInStore(transactionId: string): void {
 		this.ctx.storage.transactionSync(() => {
 			const items = this.loadItems(transactionId);
-			const participants = this.loadParticipants(transactionId);
+			const itemsByPartition = groupByPartition(items);
 
-			// An execution failure — clock_skew, or a prepare that threw after its retries — says the
-			// transaction could not run, not that a caller's premise was wrong. It belongs to no operation,
-			// so it outranks every condition rejection and leaves every operation unevaluated.
-			let executionFailureReason: RejectionReasonEncoded | null = null;
-			for (const p of participants) {
-				// Here, and only here, a NULL row is terminal: the transaction is cancelling, so nothing
-				// re-prepares it. It is the prepare that threw after its retries.
-				executionFailureReason = p.prepare_outcome === null ? { type: "transient_error" } : reportedExecutionFailure(p);
-				if (executionFailureReason) break;
-			}
-
-			let finalReason: RejectionReasonEncoded;
-			let finalResults: TransactWriteOperationResultEncoded[];
-			// The operations whose image the cap dropped, so their tc_results rows go once the write wins.
-			let cappedOutOpIndexes: number[] = [];
-
-			if (executionFailureReason) {
-				finalReason = executionFailureReason;
-				finalResults = items.map(() => ({ outcome: "not_evaluated" as const }));
-			} else {
-				// results_json is positional to the request: entry i answers the operation the caller sent at
-				// index i. db.ts assigns op_index from the request array, so a transaction of n operations
-				// fills 0..n-1, and loadFinalResponse joins a stored image to its entry by that same index.
-				// An operation no participant reported stays not_evaluated rather than shifting its neighbours.
-				const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
-				const itemsByPartition = groupByPartition(items);
-				for (const p of participants) {
+			// results_json is positional to the request: entry i answers the operation the caller sent at
+			// index i. db.ts assigns op_index from the request array, so a transaction of n operations
+			// fills 0..n-1, and loadFinalResponse joins a stored image to its entry by that same index.
+			// An operation no participant reported stays not_evaluated rather than shifting its neighbours.
+			const merged: ParticipantOperationResultEncoded[] = items.map((_item, i) => ({ outcome: "not_evaluated", opIndex: i }));
+			for (const p of this.loadParticipants(transactionId)) {
+				const owned = itemsByPartition.get(p.partition_do_name) ?? [];
+				const answer = p.prepare_outcome === "rejected" && p.answer_json ? parseTagged<PrepareResponse>(p.answer_json) : null;
+				let answered: ParticipantOperationResultEncoded[];
+				if (p.prepare_outcome === "accepted") {
 					// An accepted participant sends no array: the lock it holds is the proof that its check
 					// pass accepted every operation it owns.
-					let answered: ParticipantOperationResultEncoded[] = [];
-					if (p.prepare_outcome === "accepted") {
-						answered = (itemsByPartition.get(p.partition_do_name) ?? []).map((item) => ({ outcome: "passed", opIndex: item.op_index }));
-					} else if (p.answer_json) {
-						const ans = parseTagged<PrepareResponse>(p.answer_json);
-						if (ans.outcome === "rejected" && ans.results) answered = ans.results;
-					}
-					for (const r of answered) {
-						if (r.opIndex >= 0 && r.opIndex < merged.length) merged[r.opIndex] = r;
-					}
+					answered = owned.map((item) => ({ outcome: "passed", opIndex: item.op_index }));
+				} else if (answer?.outcome === "rejected") {
+					answered = answer.results;
+				} else {
+					// The participant could not run its operations, so each of them reports why.
+					const failure = this.participantFailure(p);
+					answered = owned.map((item) => ({
+						outcome: "rejected",
+						opIndex: item.op_index,
+						reason: {
+							code: failure.code as ExecutionFailureCode,
+							...decodeItemKeys(keyFromBlob(item.hk), keyFromBlob(item.sk)),
+							error_id: failure.error_id,
+						},
+					}));
 				}
-
-				// Two participants can each answer under the cap and together exceed it, so the coordinator
-				// caps the whole array once more before it stores one.
-				applyImageCap(merged);
-				cappedOutOpIndexes = merged.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large").map((r) => r.opIndex);
-
-				finalReason = pickWinningReason(merged);
-				// results_json holds outcome codes, reasons (keys only), and itemOmitted. opIndex is implied
-				// by the position, imageBytes was only ever for the cap, and the images live in tc_results.
-				finalResults = merged.map((r) =>
-					r.outcome === "rejected"
-						? {
-								outcome: "rejected" as const,
-								reason: reasonWithoutImage(r.reason),
-								...(r.itemOmitted ? { itemOmitted: r.itemOmitted } : {}),
-							}
-						: { outcome: r.outcome },
-				);
+				for (const r of answered) {
+					if (r.opIndex >= 0 && r.opIndex < merged.length) merged[r.opIndex] = r;
+				}
 			}
 
+			// Two participants can each answer under the cap and together exceed it, so the coordinator
+			// caps the whole array once more before it stores one.
+			applyImageCap(merged);
+			// The operations whose image the cap dropped, so their tc_results rows go once the write wins.
+			const cappedOutOpIndexes = merged
+				.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large")
+				.map((r) => r.opIndex);
+
+			// results_json holds outcome codes, reasons (keys only), and itemOmitted. opIndex is implied
+			// by the position, imageBytes was only ever for the cap, and the images live in tc_results.
+			const finalResults: TransactWriteOperationResultEncoded[] = merged.map((r) =>
+				r.outcome === "rejected"
+					? {
+							outcome: "rejected" as const,
+							reason: reasonWithoutImage(r.reason),
+							...(r.itemOmitted ? { itemOmitted: r.itemOmitted } : {}),
+						}
+					: { outcome: r.outcome },
+			);
+
 			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'CANCELLING', rejection_reason_json = ?, results_json = ?
-				 WHERE transaction_id = ? AND state = 'PREPARING'`,
-				stringifyTagged(finalReason),
+				`UPDATE tc_state SET state = 'CANCELLING', results_json = ? WHERE transaction_id = ? AND state = 'PREPARING'`,
 				stringifyTagged(finalResults),
 				transactionId,
 			);
@@ -654,14 +621,29 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			if (transition.rowsWritten === 0) return;
 
 			this.stripPayload(transactionId);
-			if (executionFailureReason) {
-				this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ?`, transactionId);
-			} else {
-				for (const opIndex of cappedOutOpIndexes) {
-					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ? AND op_index = ?`, transactionId, opIndex);
-				}
+			for (const opIndex of cappedOutOpIndexes) {
+				this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ? AND op_index = ?`, transactionId, opIndex);
 			}
 		});
+	}
+
+	/**
+	 * Why a participant could not run its operations, read only once the transaction is cancelling, when
+	 * nothing re-prepares it. A NULL row is the prepare that threw after its retries, and error_json holds
+	 * why; with no error, the coordinator stopped between the throw and the write. A rejected row whose
+	 * answer cannot be read back reports unexpected_transaction_state.
+	 */
+	private participantFailure(p: TcParticipantRow): FokosErrorWire {
+		if (p.prepare_outcome === "rejected") {
+			return FokosError.toWire(unexpectedTransactionStateError("a rejected prepare answer cannot be read back"));
+		}
+		if (p.error_json) return parseTagged<FokosErrorWire>(p.error_json);
+		return FokosError.toWire(
+			new FokosUnavailableError(UNAVAILABLE_CODES.prepare_unanswered, {
+				message: "a participant did not answer the prepare",
+				attributes: { partitionDoName: p.partition_do_name },
+			}),
+		);
 	}
 
 	private async drivePrepare(
@@ -677,7 +659,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const participants = this.loadParticipants(transactionId);
 		const itemsByPartition = groupByPartition(items);
 
-		let hasExecutionFailure = false;
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
@@ -690,8 +671,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItems(partitionItems),
 						});
-						if (r.outcome === "rejected" && !r.results) hasExecutionFailure = true;
-						this.storePrepareAnswer(transactionId, p.partition_do_name, r, hasExecutionFailure);
+						this.storePrepareAnswer(transactionId, p.partition_do_name, r);
 						return r;
 					},
 					// Backpressure is deterministic for the life of this transaction: the partition is over
@@ -699,7 +679,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					// only adds latency before the same cancellation.
 					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 3,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				);
+				).catch((err: unknown) => {
+					this.storePrepareError(transactionId, p.partition_do_name, err);
+					throw err;
+				});
 				return { partitionDoName: p.partition_do_name, result };
 			}),
 		);
@@ -866,9 +849,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const coordinatorDoId = this.ctx.id.toString();
 
 		const existingParticipants = this.loadParticipants(transactionId);
-		// A failure a participant already reported is durable and cannot be re-prepared away, so the
-		// merge below is certain to reach the same conclusion and every image it would store is waste.
-		let hasExecutionFailure = existingParticipants.some((p) => reportedExecutionFailure(p) !== null);
 
 		const nullParticipants = existingParticipants.filter((p) => p.prepare_outcome === null);
 
@@ -884,14 +864,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItems(partitionItems),
 						});
-						if (r.outcome === "rejected" && !r.results) hasExecutionFailure = true;
-						this.storePrepareAnswer(transactionId, p.partition_do_name, r, hasExecutionFailure);
+						this.storePrepareAnswer(transactionId, p.partition_do_name, r);
 						return r;
 					},
 					// Same as the first prepare pass: an over-size partition will not clear by retrying.
 					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				);
+				).catch((err: unknown) => {
+					this.storePrepareError(transactionId, p.partition_do_name, err);
+					throw err;
+				});
 			}),
 		);
 
@@ -899,7 +881,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
 		// nothing, so the transaction stays PREPARING for the alarm to drive with the full retry budget.
 		// Only a real rejection or exceeding the hold deadline commits the transaction to cancelling;
-		// cancelTransactionInStore then reports a still-NULL participant as the transient_error it is.
+		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
 		const heldTooLong = Date.now() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
@@ -1083,7 +1065,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
                  FROM tc_state WHERE transaction_id = ?`,
 				transactionId,
 			)
@@ -1093,7 +1075,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
 		return this.ctx.storage.sql
 			.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, rejection_reason_json, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
 			)
@@ -1132,37 +1114,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private loadParticipants(transactionId: string): TcParticipantRow[] {
 		return this.ctx.storage.sql
 			.exec<TcParticipantRow>(
-				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json
-                 FROM tc_participants WHERE transaction_id = ?`,
+				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json
+                 FROM tc_participants WHERE transaction_id = ? ORDER BY partition_do_name`,
 				transactionId,
 			)
 			.toArray();
 	}
-}
-
-// Recognised by message substring for the same reason as the partition's over-size sentinel: DO RPC
-// carries only an error's message across the boundary, so a dedicated error class would not survive
-// the hop. Each throw site interpolates its sentinel into the message, so the predicate and the
-// message cannot drift apart. The two sentinels must not contain each other.
-const UNDECIDED_SENTINEL = "outcome is not yet decided";
-const COMMIT_PENDING_SENTINEL = "commit is pending";
-
-/**
- * True for the retryable error a caller receives while a transaction is still CREATED or PREPARING:
- * the outcome can still be either committed or cancelled.
- */
-export function isTransactionUndecidedError(e: unknown): boolean {
-	return e instanceof Error && e.message.includes(UNDECIDED_SENTINEL);
-}
-
-/**
- * True for the retryable error a caller receives while a transaction is PREPARED or COMMITTING: the
- * decision is durable, so the transaction will commit, but not every participant has applied it yet.
- * Kept distinct from undecided because the two promise different things to a caller with no token —
- * an undecided transaction can still cancel, a commit-pending one cannot.
- */
-export function isTransactionCommitPendingError(e: unknown): boolean {
-	return e instanceof Error && e.message.includes(COMMIT_PENDING_SENTINEL);
 }
 
 function deserializePartitionContext(json: string): PartitionContextResolved {

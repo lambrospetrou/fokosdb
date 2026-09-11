@@ -12,6 +12,11 @@ import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 
+/** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
+function aRejection(reason: Record<string, unknown>) {
+	return expect.arrayContaining([expect.objectContaining({ outcome: "rejected", reason: expect.objectContaining(reason) })]);
+}
+
 const kb = (s: string) => KeyCodec.encode(s);
 
 const BASE_NOW = 1_000_000;
@@ -101,12 +106,12 @@ describe("TransactionParticipant - prepare", () => {
 			const second = prepareReq({ items: [{ hashKey: kb("hk"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" }] });
 			expect(participant.prepareLocal(second)).toMatchObject({
 				outcome: "rejected",
-				reason: {
-					type: "pending_conflict",
+				results: aRejection({
+					code: "pending_conflict",
 					hashKey: "hk",
 					sortKey: "sk",
 					conflictingTransactionId: first.transactionId,
-				},
+				}),
 			});
 			expect(store.pendingTxCountFor(second.transactionId)).toBe(0);
 		});
@@ -130,7 +135,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "condition_failed", hashKey: "hk", sortKey: "sk" },
+				results: aRejection({ code: "condition_failed", hashKey: "hk", sortKey: "sk" }),
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 		});
@@ -169,7 +174,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			let sentBytes = 0;
 			for (const [i, r] of res.results.entries()) {
-				invariant(r.outcome === "rejected" && r.reason.type === "condition_failed", `op ${i} should have failed its condition`);
+				invariant(r.outcome === "rejected" && r.reason.code === "condition_failed", `op ${i} should have failed its condition`);
 				if (i < fitting) {
 					expect(r.itemOmitted).toBeUndefined();
 					expect(r.reason.item?.data).toBe(data);
@@ -197,12 +202,12 @@ describe("TransactionParticipant - prepare", () => {
 			const missingRes = participant.prepareLocal(missingReq);
 			expect(missingRes).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "missing-item" },
+				results: aRejection({ code: "update_not_applicable", hashKey: "missing-item" }),
 			});
 			// An absent sort key is left off the reason entirely, never carried as an explicit undefined,
 			// so a reason compares equal whether it reached the caller by RPC or through a JSON column.
-			invariant(missingRes.outcome === "rejected", "expected a rejected prepare");
-			expect(missingRes.reason).not.toHaveProperty("sortKey");
+			invariant(missingRes.outcome === "rejected" && missingRes.results[0].outcome === "rejected", "expected a rejected prepare");
+			expect(missingRes.results[0].reason).not.toHaveProperty("sortKey");
 
 			// Item exists but is kind: "text", not json
 			store.upsertItem({
@@ -218,7 +223,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(textReq)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "text-item" },
+				results: aRejection({ code: "update_not_applicable", hashKey: "text-item" }),
 			});
 		});
 	});
@@ -236,7 +241,7 @@ describe("TransactionParticipant - prepare", () => {
 			const request = prepareReq({ items: [{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) },
+				results: aRejection({ code: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) }),
 			});
 			// The rejection took no lock and wrote nothing.
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
@@ -247,7 +252,7 @@ describe("TransactionParticipant - prepare", () => {
 				participant.executeSingleShot({ items: withOpIndex([{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }]) }),
 			).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) },
+				results: aRejection({ code: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) }),
 			});
 		});
 	});
@@ -336,7 +341,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(atTs)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "hk", sortKey: "sk" },
+				results: aRejection({ code: "timestamp_conflict", hashKey: "hk", sortKey: "sk" }),
 			});
 
 			const aboveTs = prepareReq({
@@ -377,7 +382,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(superseded)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "hk", sortKey: "sk" },
+				results: aRejection({ code: "timestamp_conflict", hashKey: "hk", sortKey: "sk" }),
 			});
 			expect(store.getItem(kb("hk"), kb("sk")).row?.data).toBe("from-put");
 		});
@@ -394,7 +399,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(atWatermark)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "absent" },
+				results: aRejection({ code: "timestamp_conflict", hashKey: "absent" }),
 			});
 
 			const aboveWatermark = prepareReq({
@@ -405,19 +410,22 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
-	it("rejects with clock_skew when the transaction timestamp is too far ahead of the injected clock", async () => {
+	it("rejects every operation with clock_skew when the transaction timestamp is too far ahead of the injected clock", async () => {
 		await withParticipant(({ participant, clock }) => {
 			const skewed = prepareReq({
 				transactionTimestamp: clock.now + TransactionParticipant.MAX_CLOCK_SKEW_MS + 1,
-				items: [{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" }],
+				items: [
+					{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" },
+					{ hashKey: kb("hk2"), sortKey: kb("sk2"), operation: "delete" },
+				],
 			});
+			const clockSkew = { code: "clock_skew", serverTimestampMs: clock.now, transactionTimestampMs: skewed.transactionTimestamp } as const;
 			expect(participant.prepareLocal(skewed)).toEqual({
 				outcome: "rejected",
-				reason: {
-					type: "clock_skew",
-					serverTimestampMs: clock.now,
-					transactionTimestampMs: skewed.transactionTimestamp,
-				},
+				results: [
+					{ outcome: "rejected", opIndex: 0, reason: { ...clockSkew, hashKey: "hk" } },
+					{ outcome: "rejected", opIndex: 1, reason: { ...clockSkew, hashKey: "hk2", sortKey: "sk2" } },
+				],
 			});
 
 			// Exactly at the skew bound is allowed.
@@ -449,7 +457,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(participant.prepareLocal(request)).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "timestamp_conflict", hashKey: "conflicting" },
+				results: aRejection({ code: "timestamp_conflict", hashKey: "conflicting" }),
 			});
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 			expect(store.pendingLockFor(kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
@@ -621,7 +629,7 @@ describe("TransactionParticipant - single shot", () => {
 			});
 			expect(res).toMatchObject({
 				outcome: "rejected",
-				reason: { type: "update_not_applicable", hashKey: "missing-u" },
+				results: aRejection({ code: "update_not_applicable", hashKey: "missing-u" }),
 			});
 		});
 	});

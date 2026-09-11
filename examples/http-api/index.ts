@@ -268,7 +268,6 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 }
 
 function serializeTransactGetItemsResult(result: InitiateReadResponse) {
-	if (result.outcome !== "committed") return result;
 	return {
 		...result,
 		items: result.items.map((item) => {

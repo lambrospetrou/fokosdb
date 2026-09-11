@@ -4,7 +4,7 @@ import type { UpdateExpression } from "../../src/shared/types.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import { UPDATE_FIXED_BINDING_COUNT, UPDATE_MAX_TRAILING_BINDING_COUNT } from "../../src/shared/expression/plan.js";
-import { makeDB } from "./tx-helpers.js";
+import { makeDB, writeOutcome } from "./tx-helpers.js";
 
 /**
  * A compiled plan is a fragment, not a statement: the keys are bound before it and each statement
@@ -34,7 +34,7 @@ describe("transactions - an update plan at the binding limit", () => {
 		await db.putItem({ ...key, data: {} });
 
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
-		const res = await db.transactWriteItems({ items: [{ ...key, operation: "update", update: widestUpdate(), ttlAt }] });
+		const res = await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "update", update: widestUpdate(), ttlAt }] }));
 
 		expect(res.outcome).toBe("committed");
 		const got = await db.getItem(key);
@@ -61,9 +61,11 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			{ action: "set", target: { ref: "data", path: "$.c" }, value: { ref: "data", path: "$.b" } },
 		];
 
-		const res = await db.transactWriteItems({
-			items: [{ ...key, operation: "update", update }],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...key, operation: "update", update }],
+			}),
+		);
 		expect(res.outcome).toBe("committed");
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
@@ -85,9 +87,11 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			{ action: "remove", target: { ref: "data", path: "$.r[2]" } },
 		];
 
-		const res = await db.transactWriteItems({
-			items: [{ ...key, operation: "update", update }],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...key, operation: "update", update }],
+			}),
+		);
 		expect(res.outcome).toBe("committed");
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
@@ -110,28 +114,34 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 
 		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
 
-		const missingRes = await db.transactWriteItems({
-			items: [{ ...missingKey, operation: "update", update }],
-		});
+		const missingRes = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...missingKey, operation: "update", update }],
+			}),
+		);
 		expect(missingRes).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: missingKey.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: missingKey.hashKey },
 		});
 
-		const textRes = await db.transactWriteItems({
-			items: [{ ...textKey, operation: "update", update }],
-		});
+		const textRes = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...textKey, operation: "update", update }],
+			}),
+		);
 		expect(textRes).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: textKey.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: textKey.hashKey },
 		});
 
-		const bytesRes = await db.transactWriteItems({
-			items: [{ ...bytesKey, operation: "update", update }],
-		});
+		const bytesRes = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...bytesKey, operation: "update", update }],
+			}),
+		);
 		expect(bytesRes).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: bytesKey.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: bytesKey.hashKey },
 		});
 	});
 
@@ -141,48 +151,54 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		await db.putItem({ ...key, data: { a: 1, list: [1, 2] } });
 
 		// set on a missing parent
-		const res1 = await db.transactWriteItems({
-			items: [
-				{
-					...key,
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 10 } }],
-				},
-			],
-		});
+		const res1 = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 10 } }],
+					},
+				],
+			}),
+		);
 		expect(res1).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
 		});
 
 		// set on an index past end
-		const res2 = await db.transactWriteItems({
-			items: [
-				{
-					...key,
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.list[5]" }, value: { val: 10 } }],
-				},
-			],
-		});
+		const res2 = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.list[5]" }, value: { val: 10 } }],
+					},
+				],
+			}),
+		);
 		expect(res2).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
 		});
 
 		// set on scalar parent
-		const res3 = await db.transactWriteItems({
-			items: [
-				{
-					...key,
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.a.child" }, value: { val: 10 } }],
-				},
-			],
-		});
+		const res3 = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.a.child" }, value: { val: 10 } }],
+					},
+				],
+			}),
+		);
 		expect(res3).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
 		});
 	});
 
@@ -193,45 +209,49 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 
 		// An update never invents a value: a value that reads an absent path rejects the operation
 		// instead of storing a null.
-		const missingOperand = await db.transactWriteItems({
-			items: [
-				{
-					...key,
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.absent" } }],
-				},
-			],
-		});
+		const missingOperand = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.absent" } }],
+					},
+				],
+			}),
+		);
 		expect(missingOperand).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
 		});
 
 		// JSON holds no Infinity and no NaN, so an arithmetic result that is not finite rejects too.
-		const overflow = await db.transactWriteItems({
-			items: [
-				{
-					...key,
-					operation: "update",
-					update: [
-						{
-							action: "set",
-							target: { ref: "data", path: "$.big" },
-							value: {
-								fn: "*",
-								args: [
-									{ ref: "data", path: "$.big" },
-									{ ref: "data", path: "$.big" },
-								],
+		const overflow = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [
+							{
+								action: "set",
+								target: { ref: "data", path: "$.big" },
+								value: {
+									fn: "*",
+									args: [
+										{ ref: "data", path: "$.big" },
+										{ ref: "data", path: "$.big" },
+									],
+								},
 							},
-						},
-					],
-				},
-			],
-		});
+						],
+					},
+				],
+			}),
+		);
 		expect(overflow).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "update_not_applicable", hashKey: key.hashKey },
+			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
 		});
 
 		// Neither rejection wrote anything.
@@ -245,9 +265,11 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 
 		const update: UpdateExpression = [{ action: "remove", target: { ref: "data", path: "$.absent" } }];
 
-		const res = await db.transactWriteItems({
-			items: [{ ...key, operation: "update", update }],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...key, operation: "update", update }],
+			}),
+		);
 		expect(res.outcome).toBe("committed");
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
@@ -268,31 +290,35 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		await db.putItem({ ...key2, data: { count: 1 }, ttlAt: 12345 });
 
 		// Omit ttlAt: TTL preserved
-		await db.transactWriteItems({
-			items: [
-				{
-					...key1,
-					operation: "update",
-					update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
-				},
-			],
-		});
+		await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key1,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
+					},
+				],
+			}),
+		);
 		await expect(db.getItem(key1)).resolves.toMatchObject({
 			found: true,
 			item: { ttlAt: 12345 },
 		});
 
 		// Provide ttlAt: TTL replaced
-		await db.transactWriteItems({
-			items: [
-				{
-					...key2,
-					operation: "update",
-					ttlAt: 99999,
-					update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
-				},
-			],
-		});
+		await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key2,
+						operation: "update",
+						ttlAt: 99999,
+						update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
+					},
+				],
+			}),
+		);
 		await expect(db.getItem(key2)).resolves.toMatchObject({
 			found: true,
 			item: { ttlAt: 99999 },
@@ -308,12 +334,14 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			{ action: "set", target: { ref: "data", path: "$.str" }, value: { val: "x".repeat(MAX_ITEM_BYTES + 10) } },
 		];
 
-		const res = await db.transactWriteItems({
-			items: [{ ...key, operation: "update", update }],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...key, operation: "update", update }],
+			}),
+		);
 		expect(res).toMatchObject({
 			outcome: "cancelled",
-			reason: { type: "item_too_large", hashKey: key.hashKey },
+			firstRejection: { code: "item_too_large", hashKey: key.hashKey },
 		});
 	});
 
@@ -327,25 +355,31 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		const update2: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.counter" }, value: { val: 2 } }];
 
 		// First execution
-		const res1 = await db.transactWriteItems({
-			clientRequestToken: token,
-			items: [{ ...key, operation: "update", update: update1 }],
-		});
+		const res1 = await writeOutcome(
+			db.transactWriteItems({
+				clientRequestToken: token,
+				items: [{ ...key, operation: "update", update: update1 }],
+			}),
+		);
 		expect(res1.outcome).toBe("committed");
 
 		// Idempotent retry with identical token and operation returns same outcome
-		const res2 = await db.transactWriteItems({
-			clientRequestToken: token,
-			items: [{ ...key, operation: "update", update: update1 }],
-		});
+		const res2 = await writeOutcome(
+			db.transactWriteItems({
+				clientRequestToken: token,
+				items: [{ ...key, operation: "update", update: update1 }],
+			}),
+		);
 		expect(res2).toEqual(res1);
 
 		// Reusing token with different update is rejected
 		await expect(
-			db.transactWriteItems({
-				clientRequestToken: token,
-				items: [{ ...key, operation: "update", update: update2 }],
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					clientRequestToken: token,
+					items: [{ ...key, operation: "update", update: update2 }],
+				}),
+			),
 		).rejects.toThrow();
 	});
 
@@ -368,14 +402,16 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			},
 		];
 
-		const res = await db.transactWriteItems({
-			items: [
-				{ ...kPut, operation: "put", data: { created: true } },
-				{ ...kUpdate, operation: "update", update },
-				{ ...kDel, operation: "delete" },
-				{ ...kCheck, operation: "check", condition: { op: "eq", args: [{ ref: "data", path: "$.verified" }, { val: true }] } },
-			],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...kPut, operation: "put", data: { created: true } },
+					{ ...kUpdate, operation: "update", update },
+					{ ...kDel, operation: "delete" },
+					{ ...kCheck, operation: "check", condition: { op: "eq", args: [{ ref: "data", path: "$.verified" }, { val: true }] } },
+				],
+			}),
+		);
 		expect(res.outcome).toBe("committed");
 
 		await expect(db.getItem(kPut)).resolves.toMatchObject({ found: true, item: { data: { created: true } } });

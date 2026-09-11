@@ -9,6 +9,11 @@ import invariant from "../../src/shared/invariant.js";
 import { compiledCondition, kb, makeStub, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
+/** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
+function aRejection(reason: Record<string, unknown>) {
+	return expect.arrayContaining([expect.objectContaining({ outcome: "rejected", reason: expect.objectContaining(reason) })]);
+}
+
 describe("PartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
@@ -212,7 +217,10 @@ describe("PartitionDO — single-shot transaction", () => {
 			]),
 		});
 
-		expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" } });
+		expect(res).toMatchObject({
+			outcome: "rejected",
+			results: aRejection({ code: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" }),
+		});
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "v1", version: 1 },
@@ -242,7 +250,7 @@ describe("PartitionDO — single-shot transaction", () => {
 		// The two-phase transaction may still commit, so this one loses rather than overwriting it.
 		expect(res).toMatchObject({
 			outcome: "rejected",
-			reason: { type: "pending_conflict", hashKey: "shot-locked", conflictingTransactionId: transactionId },
+			results: aRejection({ code: "pending_conflict", hashKey: "shot-locked", conflictingTransactionId: transactionId }),
 		});
 		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-free"), sortKey: kb("sk") })).toMatchObject({ found: false });
 		// Only the two-phase lock, and this path added none of its own.

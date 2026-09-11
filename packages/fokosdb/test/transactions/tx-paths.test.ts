@@ -3,8 +3,9 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
-import { countDistinctPartitions, keysInOnePartition, makeDB } from "./tx-helpers.js";
+import { countDistinctPartitions, keysInOnePartition, makeDB, writeOutcome } from "./tx-helpers.js";
 import { FokosRoutingError, ROUTING_CODES } from "../../src/shared/errors.js";
+import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 
 /** The error a partition raises when it cannot execute the whole item set alone. */
 function fastPathNotApplicable(): FokosRoutingError {
@@ -122,13 +123,15 @@ describe("transactions - single-partition fast path", () => {
 		await db.putItem({ ...keys[2], data: "to-check" });
 
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
-		const result = await db.transactWriteItems({
-			items: [
-				{ ...keys[0], operation: "put", data: "written" },
-				{ ...keys[1], operation: "delete" },
-				{ ...keys[2], operation: "check", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
-			],
-		});
+		const result = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...keys[0], operation: "put", data: "written" },
+					{ ...keys[1], operation: "delete" },
+					{ ...keys[2], operation: "check", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
+				],
+			}),
+		);
 
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
 		expect(coordinatorCalls).not.toHaveBeenCalled();
@@ -145,15 +148,17 @@ describe("transactions - single-partition fast path", () => {
 		const keys = keysInOnePartition(db, 2, "fast-condition");
 
 		const { partitionCalls } = countWritePathCalls();
-		const result = await db.transactWriteItems({
-			items: [
-				{ ...keys[0], operation: "put", data: "never" },
-				{ ...keys[1], operation: "put", data: "never", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
-			],
-		});
+		const result = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...keys[0], operation: "put", data: "never" },
+					{ ...keys[1], operation: "put", data: "never", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
+				],
+			}),
+		);
 
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
-		expect(result).toMatchObject({ outcome: "cancelled", reason: { type: "condition_failed", hashKey: keys[1].hashKey } });
+		expect(result).toMatchObject({ outcome: "cancelled", firstRejection: { code: "condition_failed", hashKey: keys[1].hashKey } });
 		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: false });
 	});
 
@@ -164,8 +169,8 @@ describe("transactions - single-partition fast path", () => {
 		const clientRequestToken = `fast-token-${crypto.randomUUID()}`;
 
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
-		const first = await db.transactWriteItems({ items, clientRequestToken });
-		const replay = await db.transactWriteItems({ items, clientRequestToken });
+		const first = await writeOutcome(db.transactWriteItems({ items, clientRequestToken }));
+		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken }));
 
 		// A partition keeps no record of finished transactions, so only the coordinator's ledger can
 		// answer the replay — which is why a token holds a transaction on that path.
@@ -175,17 +180,28 @@ describe("transactions - single-partition fast path", () => {
 		expect(replay).toEqual(first);
 	});
 
-	it("reports a write past the size cap as cancelled with transient_error, on both paths", async () => {
+	it("reports a write past the size cap as a cancel with partition_over_size on its operation, on both paths", async () => {
 		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 		// written and every write is refused for size.
 		const overSize = { maxSizeMb: 0.000_001 };
 		const items = [{ hashKey: "over-size", operation: "put" as const, data: "d" }];
 
-		const fast = await makeDB(overSize).transactWriteItems({ items });
-		const slow = await makeDB({ ...overSize, singlePartitionFastPath: false }).transactWriteItems({ items });
-
-		expect(fast).toMatchObject({ outcome: "cancelled", reason: { type: "transient_error" } });
-		expect(slow).toMatchObject({ outcome: "cancelled", reason: { type: "transient_error" } });
+		for (const db of [makeDB(overSize), makeDB({ ...overSize, singlePartitionFastPath: false })]) {
+			const err = await db.transactWriteItems({ items }).catch((e: unknown) => e);
+			expect(FokosTransactionCancelledError.is(err)).toBe(true);
+			// The only failure is a full partition, which clears on its own, so the cancel is a service condition.
+			expect(err).toMatchObject({
+				code: "transaction_cancelled",
+				origin: "service",
+				httpStatusHint: 503,
+				results: [
+					{
+						outcome: "rejected",
+						reason: { code: "partition_over_size", hashKey: "over-size", error_id: expect.stringMatching(/^e_49j6ez_/) },
+					},
+				],
+			});
+		}
 	});
 
 	it("runs the coordinator path for a write when the partition cannot execute the whole set", async () => {
@@ -198,9 +214,11 @@ describe("transactions - single-partition fast path", () => {
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
 		partitionCalls.mockRejectedValue(fastPathNotApplicable());
 
-		const result = await db.transactWriteItems({
-			items: keys.map((key) => ({ ...key, operation: "put" as const, data: "via-coordinator" })),
-		});
+		const result = await writeOutcome(
+			db.transactWriteItems({
+				items: keys.map((key) => ({ ...key, operation: "put" as const, data: "via-coordinator" })),
+			}),
+		);
 
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
 		expect(coordinatorCalls).toHaveBeenCalledTimes(1);
@@ -228,14 +246,16 @@ describe("transactions - the item size limit is enforced before any write", () =
 		const fits = { hashKey: `fits-${crypto.randomUUID()}` };
 		const over = { hashKey: `over-${crypto.randomUUID()}` };
 
-		const res = await db.transactWriteItems({
-			items: [
-				{ ...fits, operation: "put", data: "written-first" },
-				{ ...over, operation: "put", data: overRow() },
-			],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...fits, operation: "put", data: "written-first" },
+					{ ...over, operation: "put", data: overRow() },
+				],
+			}),
+		);
 
-		expect(res).toMatchObject({ outcome: "cancelled", reason: { type: "item_too_large", hashKey: over.hashKey } });
+		expect(res).toMatchObject({ outcome: "cancelled", firstRejection: { code: "item_too_large", hashKey: over.hashKey } });
 		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
 		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
 	});
@@ -247,14 +267,16 @@ describe("transactions - the item size limit is enforced before any write", () =
 		const fits = { hashKey, sortKey: "fits" };
 		const over = { hashKey, sortKey: "over" };
 
-		const res = await db.transactWriteItems({
-			items: [
-				{ ...fits, operation: "put", data: "written-first" },
-				{ ...over, operation: "put", data: overRow() },
-			],
-		});
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...fits, operation: "put", data: "written-first" },
+					{ ...over, operation: "put", data: overRow() },
+				],
+			}),
+		);
 
-		expect(res).toMatchObject({ outcome: "cancelled", reason: { type: "item_too_large", hashKey, sortKey: "over" } });
+		expect(res).toMatchObject({ outcome: "cancelled", firstRejection: { code: "item_too_large", hashKey, sortKey: "over" } });
 		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
 		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
 	});
@@ -272,9 +294,13 @@ describe("transactions - the item size limit is enforced before any write", () =
 			const key = { hashKey: `escape-${crypto.randomUUID()}` };
 			await db.putItem({ ...key, data: { k: "small" } });
 
-			const res = await db.transactWriteItems({
-				items: [{ ...key, operation: "update", update: [{ action: "set", target: { ref: "data", path: "$.k" }, value: { val: value } }] }],
-			});
+			const res = await writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{ ...key, operation: "update", update: [{ action: "set", target: { ref: "data", path: "$.k" }, value: { val: value } }] },
+					],
+				}),
+			);
 
 			expect(res.outcome).toBe("committed");
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { version: 2, data: { k: value } } });

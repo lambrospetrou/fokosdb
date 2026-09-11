@@ -6,7 +6,8 @@ import { FokosDB } from "../../src/client/db.js";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
-import { countDistinctPartitions, keysAcrossPartitions, makeDB, partitionNameOf } from "./tx-helpers.js";
+import { fokosErrorWith } from "../errors-matchers.js";
+import { countDistinctPartitions, keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
 
 const passingConditions: readonly ConditionExpression[] = [
 	{ op: "eq", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
@@ -115,7 +116,7 @@ describe("transactions - end-to-end", () => {
 			};
 		});
 
-		const txResult = await db.transactWriteItems({ items: operations });
+		const txResult = await writeOutcome(db.transactWriteItems({ items: operations }));
 
 		expect(txResult.outcome).toBe("committed");
 		expect(txResult).toMatchObject({
@@ -156,28 +157,27 @@ describe("transactions - end-to-end", () => {
 
 		// Transaction: update all 5 items + a 6th "check" on a non-existent item
 		// with item_exists condition — this MUST fail and roll back everything.
-		const txResult = await db.transactWriteItems({
-			items: [
-				...Array.from({ length: 5 }, (_, i) => ({
-					hashKey: `atom-${i}`,
-					operation: "put" as const,
-					data: `should-not-appear-${i}`,
-				})),
-				{
-					hashKey: "atom-nonexistent",
-					operation: "check" as const,
-					condition: { op: "exists" as const, args: [{ ref: "hashKey" as const }] },
-				},
-			],
-		});
+		const txResult = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					...Array.from({ length: 5 }, (_, i) => ({
+						hashKey: `atom-${i}`,
+						operation: "put" as const,
+						data: `should-not-appear-${i}`,
+					})),
+					{
+						hashKey: "atom-nonexistent",
+						operation: "check" as const,
+						condition: { op: "exists" as const, args: [{ ref: "hashKey" as const }] },
+					},
+				],
+			}),
+		);
 
 		expect(txResult.outcome).toBe("cancelled");
 		invariant(txResult.outcome === "cancelled");
-		// condition_failed is the expected reason, but timestamp_conflict is also
-		// valid if another partition rejects before the condition-failing partition.
-		expect(txResult.reason).toMatchObject({
-			type: expect.stringMatching(/condition_failed/),
-		});
+		// Every operation keeps the answer of its own partition, so the check reports its failed condition.
+		expect(txResult.results.at(-1)).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 
 		// All 5 original items must be untouched — still version 1, original data.
 		for (let i = 0; i < 5; i++) {
@@ -207,14 +207,16 @@ describe("transactions - end-to-end", () => {
 		// Transaction: put all 10 items, but with item_not_exists condition on the
 		// first one (which already exists). The condition check will fail, so none
 		// of the 10 puts should be applied.
-		const txResult = await db.transactWriteItems({
-			items: keys.map((k, i) => ({
-				...k,
-				operation: "put" as const,
-				data: `should-not-appear`,
-				condition: i === 0 ? ({ op: "not_exists", args: [{ ref: "hashKey" }] } as const) : undefined,
-			})),
-		});
+		const txResult = await writeOutcome(
+			db.transactWriteItems({
+				items: keys.map((k, i) => ({
+					...k,
+					operation: "put" as const,
+					data: `should-not-appear`,
+					condition: i === 0 ? ({ op: "not_exists", args: [{ ref: "hashKey" }] } as const) : undefined,
+				})),
+			}),
+		);
 
 		expect(txResult.outcome).toBe("cancelled");
 
@@ -237,13 +239,15 @@ describe("transactions - end-to-end", () => {
 
 		const [putResult, txResult] = await Promise.allSettled([
 			db.putItem({ hashKey: "iso-shared", data: "non-tx-write" }),
-			db.transactWriteItems({
-				items: [
-					{ hashKey: "iso-shared", operation: "put", data: "tx-shared" },
-					// A second key only the transaction writes — must not appear if the transaction is cancelled.
-					{ hashKey: "iso-tx-only", operation: "put", data: "tx-only-data" },
-				],
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{ hashKey: "iso-shared", operation: "put", data: "tx-shared" },
+						// A second key only the transaction writes — must not appear if the transaction is cancelled.
+						{ hashKey: "iso-tx-only", operation: "put", data: "tx-only-data" },
+					],
+				}),
+			),
 		]);
 
 		// The transaction coordinator never throws — it returns a result.
@@ -265,7 +269,7 @@ describe("transactions - end-to-end", () => {
 			expect(txOnly.item.data).toBe("tx-only-data");
 		} else if (tx.outcome === "cancelled") {
 			// putItem landed at or after the transaction's timestamp → timestamp_conflict.
-			expect(tx.reason.type).toBe("timestamp_conflict");
+			expect(tx.results[0]).toMatchObject({ outcome: "rejected", reason: { code: "timestamp_conflict" } });
 			// Atomicity: the transaction's private write must not have landed.
 			const txOnly = await db.getItem({ hashKey: "iso-tx-only" });
 			expect(txOnly.found).toBe(false);
@@ -295,18 +299,22 @@ describe("transactions - end-to-end", () => {
 		// No seeds — items are created by the transactions. This isolates the test
 		// to pure pending-lock contention without timestamp races from prior writes.
 		const [r1, r2] = await Promise.allSettled([
-			db.transactWriteItems({
-				items: [
-					{ hashKey: "c-shared", operation: "put", data: "tx1-shared" },
-					{ hashKey: "c-only-a", operation: "put", data: "tx1-a" },
-				],
-			}),
-			db.transactWriteItems({
-				items: [
-					{ hashKey: "c-shared", operation: "put", data: "tx2-shared" },
-					{ hashKey: "c-only-b", operation: "put", data: "tx2-b" },
-				],
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{ hashKey: "c-shared", operation: "put", data: "tx1-shared" },
+						{ hashKey: "c-only-a", operation: "put", data: "tx1-a" },
+					],
+				}),
+			),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{ hashKey: "c-shared", operation: "put", data: "tx2-shared" },
+						{ hashKey: "c-only-b", operation: "put", data: "tx2-b" },
+					],
+				}),
+			),
 		]);
 
 		expect(r1.status).toBe("fulfilled");
@@ -319,7 +327,9 @@ describe("transactions - end-to-end", () => {
 
 		for (const tx of [tx1, tx2]) {
 			if (tx?.outcome === "cancelled") {
-				expect(["pending_conflict", "timestamp_conflict"]).toContain(tx.reason.type);
+				// The shared key is the first operation of both transactions.
+				const shared = tx.results[0];
+				expect(["pending_conflict", "timestamp_conflict"]).toContain(shared.outcome === "rejected" ? shared.reason.code : shared.outcome);
 			}
 		}
 
@@ -369,9 +379,11 @@ describe("transactions - end-to-end", () => {
 		const [r1, r2] = await Promise.allSettled([
 			tryWhile(
 				async () => {
-					const result = await db.transactWriteItems({
-						items: [{ hashKey: "ser-key", operation: "put", data: "tx1" }],
-					});
+					const result = await writeOutcome(
+						db.transactWriteItems({
+							items: [{ hashKey: "ser-key", operation: "put", data: "tx1" }],
+						}),
+					);
 					if (result.outcome !== "committed") throw result;
 					return result;
 				},
@@ -383,9 +395,11 @@ describe("transactions - end-to-end", () => {
 			),
 			tryWhile(
 				async () => {
-					const result = await db.transactWriteItems({
-						items: [{ hashKey: "ser-key", operation: "put", data: "tx2" }],
-					});
+					const result = await writeOutcome(
+						db.transactWriteItems({
+							items: [{ hashKey: "ser-key", operation: "put", data: "tx2" }],
+						}),
+					);
 					if (result.outcome !== "committed") throw result;
 					return result;
 				},
@@ -431,7 +445,8 @@ describe("transactions - end-to-end", () => {
 	it("serializability: concurrent single-partition transactions both commit with no retry", async () => {
 		const db = makeDB();
 
-		const write = async (data: string) => await db.transactWriteItems({ items: [{ hashKey: "ser-fast-key", operation: "put", data }] });
+		const write = async (data: string) =>
+			await writeOutcome(db.transactWriteItems({ items: [{ hashKey: "ser-fast-key", operation: "put", data }] }));
 		const [tx1, tx2] = await Promise.all([write("tx1"), write("tx2")]);
 
 		// The partition takes no lock for either, so neither can conflict with the other: they serialize
@@ -551,7 +566,7 @@ describe("transactions - end-to-end", () => {
 			vi.restoreAllMocks();
 		});
 
-		it("aborts after phase one when a participant reports a pending write", async () => {
+		it("raises pending_write after phase one when a participant reports a pending write", async () => {
 			const db = makeDB();
 			const keys = keysAcrossPartitions(db, 2, "read-pending");
 			const pendingPartition = partitionNameOf(db, keys[0]);
@@ -566,11 +581,11 @@ describe("transactions - end-to-end", () => {
 				return { items: response.items.map((item) => ({ ...item, hasPendingWrite: true })) };
 			});
 
-			await expect(db.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "pending_write" });
+			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("pending_write"));
 			expect(spy).toHaveBeenCalledTimes(2);
 		});
 
-		it("aborts when committed item state changes between the two phases", async () => {
+		it("raises read_conflict when committed item state changes between the two phases", async () => {
 			const db = makeDB();
 			const keys = keysAcrossPartitions(db, 2, "read-conflict");
 			for (const key of keys) await db.putItem({ ...key, data: "value" });
@@ -591,7 +606,7 @@ describe("transactions - end-to-end", () => {
 				return { items: response.items.map((item) => ({ ...item, lastCommittedTs: item.lastCommittedTs + 1 })) };
 			});
 
-			await expect(db.transactGetItems({ items: keys })).resolves.toEqual({ outcome: "aborted", reason: "read_conflict" });
+			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));
 			expect(spy).toHaveBeenCalledTimes(4);
 			expect(transactionIds.size).toBe(1);
 		});
@@ -605,7 +620,7 @@ describe("transactions - end-to-end", () => {
 		const key = { hashKey: `ttl-${crypto.randomUUID()}` };
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 
-		expect(await db.transactWriteItems({ items: [{ ...key, operation: "put", data: "value", ttlAt }] })).toMatchObject({
+		expect(await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "put", data: "value", ttlAt }] }))).toMatchObject({
 			outcome: "committed",
 		});
 		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "value", ttlAt } });
@@ -620,11 +635,11 @@ describe("transactions - end-to-end", () => {
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 		const operation = { ...key, operation: "put" as const, data: "value", ttlAt };
 
-		const first = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
-		expect(await db.transactWriteItems({ items: [operation], clientRequestToken: token })).toEqual(first);
-		await expect(db.transactWriteItems({ items: [{ ...operation, ttlAt: ttlAt + 1 }], clientRequestToken: token })).rejects.toThrow(
-			/was already used for a different set of operations/,
-		);
+		const first = await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }));
+		expect(await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }))).toEqual(first);
+		await expect(
+			writeOutcome(db.transactWriteItems({ items: [{ ...operation, ttlAt: ttlAt + 1 }], clientRequestToken: token })),
+		).rejects.toThrow(/was already used for a different set of operations/);
 		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt, version: 1 } });
 	});
 
@@ -637,10 +652,10 @@ describe("transactions - end-to-end", () => {
 			{ hashKey: "idemp-2", operation: "put" as const, data: "tx-data" },
 		];
 
-		const result1 = await db.transactWriteItems({ items: operations, clientRequestToken: token });
+		const result1 = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
 		expect(result1.outcome).toBe("committed");
 
-		const result2 = await db.transactWriteItems({ items: operations, clientRequestToken: token });
+		const result2 = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
 		expect(result2.outcome).toBe("committed");
 		invariant(result1.outcome === "committed" && result2.outcome === "committed");
 		expect(result2.transactionId).toBe(result1.transactionId);
@@ -666,8 +681,8 @@ describe("transactions - end-to-end", () => {
 			condition: { op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "active" }] } as const,
 		};
 
-		const first = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
-		const replay = await db.transactWriteItems({ items: [operation], clientRequestToken: token });
+		const first = await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }));
+		const replay = await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }));
 
 		expect(replay).toEqual(first);
 		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "updated" }, version: 2 } });
@@ -681,23 +696,27 @@ describe("transactions - end-to-end", () => {
 
 		const token = `idemp-mismatch-${crypto.randomUUID()}`;
 		const operations = [{ hashKey: "mismatch-1", operation: "put" as const, data: "original" }];
-		const first = await db.transactWriteItems({ items: operations, clientRequestToken: token });
+		const first = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
 		expect(first.outcome).toBe("committed");
 
 		// Same key, different payload — the case that silently lost the write.
 		await expect(
-			db.transactWriteItems({
-				items: [{ hashKey: "mismatch-1", operation: "put" as const, data: "different" }],
-				clientRequestToken: token,
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [{ hashKey: "mismatch-1", operation: "put" as const, data: "different" }],
+					clientRequestToken: token,
+				}),
+			),
 		).rejects.toThrow(/was already used for a different set of operations/);
 
 		// A different operation SET is rejected too, not just a different payload.
 		await expect(
-			db.transactWriteItems({
-				items: [...operations, { hashKey: "mismatch-2", operation: "put" as const, data: "original" }],
-				clientRequestToken: token,
-			}),
+			writeOutcome(
+				db.transactWriteItems({
+					items: [...operations, { hashKey: "mismatch-2", operation: "put" as const, data: "original" }],
+					clientRequestToken: token,
+				}),
+			),
 		).rejects.toThrow(/was already used for a different set of operations/);
 
 		// The stored transaction is untouched: still the original value, still version 1.
@@ -707,7 +726,7 @@ describe("transactions - end-to-end", () => {
 		expect(item.item.version).toBe(1);
 
 		// The legitimate replay still works — the guard rejects different work, not retries.
-		const replay = await db.transactWriteItems({ items: operations, clientRequestToken: token });
+		const replay = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 	});
 
@@ -720,15 +739,17 @@ describe("transactions - end-to-end", () => {
 
 		vi.advanceTimersByTime(1);
 
-		const txResult = await db.transactWriteItems({
-			items: [
-				{ hashKey: "del-0", operation: "delete" },
-				{ hashKey: "del-1", operation: "delete" },
-				{ hashKey: "del-2", operation: "put", data: "updated" },
-				{ hashKey: "del-3", operation: "put", data: "updated" },
-				{ hashKey: "del-4", operation: "delete" },
-			],
-		});
+		const txResult = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ hashKey: "del-0", operation: "delete" },
+					{ hashKey: "del-1", operation: "delete" },
+					{ hashKey: "del-2", operation: "put", data: "updated" },
+					{ hashKey: "del-3", operation: "put", data: "updated" },
+					{ hashKey: "del-4", operation: "delete" },
+				],
+			}),
+		);
 
 		expect(txResult.outcome).toBe("committed");
 
@@ -757,16 +778,18 @@ describe("transactions - end-to-end", () => {
 		vi.advanceTimersByTime(1);
 
 		// Transaction: put on one item + delete on a non-existent item with item_exists condition.
-		const txResult = await db.transactWriteItems({
-			items: [
-				{ hashKey: "rollback-put", operation: "put", data: "should-not-appear" },
-				{
-					hashKey: "rollback-missing",
-					operation: "delete",
-					condition: { op: "exists", args: [{ ref: "hashKey" }] },
-				},
-			],
-		});
+		const txResult = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ hashKey: "rollback-put", operation: "put", data: "should-not-appear" },
+					{
+						hashKey: "rollback-missing",
+						operation: "delete",
+						condition: { op: "exists", args: [{ ref: "hashKey" }] },
+					},
+				],
+			}),
+		);
 
 		expect(txResult.outcome).toBe("cancelled");
 
@@ -798,17 +821,19 @@ describe("transactions - end-to-end", () => {
 		const db = makeDB({ tableName: dbName, transactionCoordinatorNs: spyTCNs, numTxCoordinators: 3 });
 
 		for (let i = 0; i < 10; i++) {
-			const result = await db.transactWriteItems({
-				items: [
-					{
-						hashKey: `dist-hk-${i}`,
-						sortKey: `dist-sk-${i}`,
-						operation: "put",
-						data: `dist-data-${i}`,
-					},
-				],
-				clientRequestToken: `tcdist-token-${i}`,
-			});
+			const result = await writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{
+							hashKey: `dist-hk-${i}`,
+							sortKey: `dist-sk-${i}`,
+							operation: "put",
+							data: `dist-data-${i}`,
+						},
+					],
+					clientRequestToken: `tcdist-token-${i}`,
+				}),
+			);
 			expect(result.outcome).toBe("committed");
 		}
 
@@ -844,12 +869,12 @@ describe("transactions - end-to-end", () => {
 		expect(token).not.toBe("");
 		const operation = { hashKey: "pool-replay", operation: "put" as const, data: "value" };
 
-		const first = await db2.transactWriteItems({ items: [operation], clientRequestToken: token });
-		const replay = await db2.transactWriteItems({ items: [operation], clientRequestToken: token });
+		const first = await writeOutcome(db2.transactWriteItems({ items: [operation], clientRequestToken: token }));
+		const replay = await writeOutcome(db2.transactWriteItems({ items: [operation], clientRequestToken: token }));
 		expect(replay).toEqual(first);
 
 		vi.advanceTimersByTime(1);
-		const rerouted = await db3.transactWriteItems({ items: [operation], clientRequestToken: token });
+		const rerouted = await writeOutcome(db3.transactWriteItems({ items: [operation], clientRequestToken: token }));
 		expect(rerouted.outcome).toBe("committed");
 		expect(rerouted.transactionId).not.toBe(first.transactionId);
 		await expect(db3.getItem({ hashKey: operation.hashKey })).resolves.toMatchObject({ found: true, item: { version: 2 } });

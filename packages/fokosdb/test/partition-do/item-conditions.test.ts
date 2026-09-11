@@ -34,7 +34,7 @@ describe("PartitionDO - conditional putItem", () => {
 					condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -54,7 +54,7 @@ describe("PartitionDO - conditional putItem", () => {
 					condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb() });
@@ -92,7 +92,7 @@ describe("PartitionDO - conditional putItem", () => {
 					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -110,7 +110,7 @@ describe("PartitionDO - conditional putItem", () => {
 					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 		});
 
@@ -183,7 +183,7 @@ describe("PartitionDO - conditional putItem", () => {
 					}),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -211,7 +211,7 @@ describe("PartitionDO - conditional putItem", () => {
 					}),
 					kind: "text",
 				});
-				expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+				expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 			});
 
 			const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -259,7 +259,7 @@ describe("PartitionDO - deleteItem", () => {
 						sortKey: kb("sk"),
 						condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 
 				const get = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -275,7 +275,7 @@ describe("PartitionDO - deleteItem", () => {
 						sortKey: kb(),
 						condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 			});
 		});
@@ -306,7 +306,7 @@ describe("PartitionDO - deleteItem", () => {
 						sortKey: kb("sk"),
 						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
@@ -324,7 +324,7 @@ describe("PartitionDO - deleteItem", () => {
 						sortKey: kb("sk"),
 						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 			});
 		});
@@ -366,7 +366,7 @@ describe("PartitionDO - deleteItem", () => {
 							],
 						}),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 			});
 
@@ -389,7 +389,7 @@ describe("PartitionDO - deleteItem", () => {
 							],
 						}),
 					});
-					expect(res).toMatchObject({ outcome: "rejected", reason: { type: "condition_failed" } });
+					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 				});
 
 				expect(await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({

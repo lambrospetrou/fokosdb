@@ -97,9 +97,7 @@ describe("the category classes", () => {
 		expect(types).toEqual([
 			"validation_error",
 			"expression_error",
-			"condition_check_error",
 			"conflict_error",
-			"transaction_cancelled_error",
 			"unavailable_error",
 			"transaction_pending_error",
 			"routing_error",
