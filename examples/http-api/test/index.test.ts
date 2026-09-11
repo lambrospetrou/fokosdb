@@ -46,4 +46,40 @@ describe("http-api example worker", () => {
 		const res = await rpc(`t-${crypto.randomUUID()}`, "putItem", { hashKey: 42 });
 		expect(res.status).toBe(400);
 	});
+
+	it("answers a FokosError with its status hint, its category, its code and its error_id", async () => {
+		const res = await rpc(`t-${crypto.randomUUID()}`, "putItem", { hashKey: "", data: "v" });
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({
+			error: "FokosValidationError",
+			code: "hash_key_empty",
+			error_id: expect.stringMatching(/^e_2fzzq9_[0-9a-f]{32}$/),
+		});
+	});
+
+	it("reports a failed condition as 409, not as a server error", async () => {
+		const condition = { op: "exists", args: [{ ref: "hashKey" }] };
+		const res = await rpc(`t-${crypto.randomUUID()}`, "putItem", { hashKey: "absent", data: "v", condition });
+		expect(res.status).toBe(409);
+		expect(await res.json()).toMatchObject({ error: "FokosConditionCheckError", code: "condition_failed" });
+	});
+
+	it("reports a cancelled transaction as 409, with the result of each operation", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		const res = await rpc(table, "transactWriteItems", {
+			items: [
+				{ operation: "put", hashKey: "tx-1", data: "v" },
+				{ operation: "check", hashKey: "tx-absent", condition: { op: "exists", args: [{ ref: "hashKey" }] } },
+			],
+		});
+		expect(res.status).toBe(409);
+		expect(await res.json()).toMatchObject({
+			error: "FokosTransactionCancelledError",
+			code: "transaction_cancelled",
+			error_id: expect.stringMatching(/^e_zd7rzd_/),
+			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", hashKey: "tx-absent" } }],
+		});
+		// A cancelled transaction applied nothing.
+		expect(await (await rpc(table, "getItem", { hashKey: "tx-1" })).json()).toMatchObject({ found: false });
+	});
 });

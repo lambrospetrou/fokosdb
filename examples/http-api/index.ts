@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
+import type { ContentfulStatusCode } from "hono/utils/http-status";
 import * as v from "valibot";
 import {
-	ExpressionError,
 	FokosDB,
+	FokosError,
+	FokosTransactionCancelledError,
 	PartitionContextCreator,
 	PartitionTopologyRouterImpl,
 	type ConditionExpression,
@@ -14,6 +16,7 @@ import {
 	type JsonValue,
 	type QueryItemsResult,
 	type SplitConditions,
+	type TransactWriteOperationResult,
 	type UpdateAction,
 	type UpdateExpression,
 	type UpdateTarget,
@@ -278,6 +281,16 @@ function serializeTransactGetItemsResult(result: InitiateReadResponse) {
 	};
 }
 
+// The results of a cancelled transaction. A rejected entry can carry the old item image, whose data
+// takes the same encodeData step that a read takes.
+function serializeTransactWriteResults(results: TransactWriteOperationResult[]) {
+	return results.map((result) => {
+		if (result.outcome !== "rejected" || result.reason.code !== "condition_failed" || !result.reason.item) return result;
+		const { data, ...item } = result.reason.item;
+		return { ...result, reason: { ...result.reason, item: { ...item, ...encodeData(data) } } };
+	});
+}
+
 // ── Routes ────────────────────────────────────────────────────────────────────
 
 type HonoVariables = { dbItemMeta?: object };
@@ -290,8 +303,21 @@ api.onError((err, c) => {
 	if (err instanceof HTTPException) {
 		return err.getResponse();
 	}
-	if (err instanceof ExpressionError) {
-		return c.json({ error: err.message, code: err.code }, 400);
+	// Every error that FokosDB raises carries its category, its code, its error_id and an HTTP status hint.
+	if (FokosError.is(err)) {
+		if (err.origin === "internal") {
+			console.error({ message: "FokosDB internal error", error: String(err), errorProps: err });
+		}
+		return c.json(
+			{
+				error: err._tag,
+				code: err.code,
+				error_id: err.error_id,
+				message: err.message,
+				...(FokosTransactionCancelledError.is(err) ? { results: serializeTransactWriteResults(err.results) } : {}),
+			},
+			err.httpStatusHint as ContentfulStatusCode,
+		);
 	}
 	console.error({
 		message: "Unexpected error in catch-all",
