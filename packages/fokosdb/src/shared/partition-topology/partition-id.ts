@@ -51,6 +51,16 @@ function rangePartitionDoName(tableName: string, hashKey: KeyBytes, startBoundar
 	return `${tableName}.r.${hk}.${start}.${end}`;
 }
 
+/**
+ * `ctx` without `_partitionIdBytes`. A context for another partition must not copy them: they cache the
+ * id of `ctx`, and the routing code reads them in place of `partitionId`, so the new context would
+ * route as `ctx`.
+ */
+function withoutIdBytes<C extends PartitionContext>(ctx: C): C {
+	const { _partitionIdBytes: _dropped, ...rest } = ctx as C & { _partitionIdBytes?: Uint8Array };
+	return rest as C;
+}
+
 // Resolves a PartitionContextResolved for a range-structure DO (root or child).
 // Same return shape as pickPartition / pickChildPartition so callers can use the result uniformly.
 export function resolveRangePartitionContext(
@@ -64,7 +74,7 @@ export function resolveRangePartitionContext(
 	return {
 		doId,
 		partitionContext: {
-			...base,
+			...withoutIdBytes(base),
 			doName: doName!,
 			primaryDoIdStr: doId.toString(),
 			partitionId: opaque,
@@ -84,7 +94,7 @@ export function resolveHashChildPartitionContexts(parentContext: PartitionContex
 	return childIds.map(({ doName, partitionIdOpaque }) => {
 		const childDoId = env[parentContext.ns].idFromName(doName);
 		return {
-			...parentContext,
+			...withoutIdBytes(parentContext),
 			doName,
 			primaryDoIdStr: childDoId.toString(),
 			partitionId: partitionIdOpaque,
@@ -105,7 +115,7 @@ export function resolveDescendantHashPartitionContext(
 	return {
 		doId,
 		partitionContext: {
-			...partitionContext,
+			...withoutIdBytes(partitionContext),
 			doName,
 			primaryDoIdStr: doId.toString(),
 			partitionId: opaque,

@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { PartitionContextCreator, type PartitionContext } from "./partition-context.js";
 import { KeyCodec } from "./key-codec.js";
-import { PartitionIdHelper } from "./partition-id.js";
+import {
+	PartitionIdHelper,
+	resolveDescendantHashPartitionContext,
+	resolveHashChildPartitionContexts,
+	resolveRangePartitionContext,
+} from "./partition-id.js";
+import { PartitionTopologyRouterImpl } from "./router.js";
 import { invariantFailure } from "../../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
@@ -328,5 +334,24 @@ describe("rangePartitionDoName", () => {
 		expect(rangeName).toBe("iddb.r.0.~min.~max");
 		// Hash root 0 is "iddb.h.0" — no collision.
 		expect(rangeName).not.toBe("iddb.h.0");
+	});
+});
+
+describe("the contexts built from a live partition context", () => {
+	it("do not copy its cached _partitionIdBytes, which would route the new partition as the source", () => {
+		const root = new PartitionTopologyRouterImpl(makeBase()).pickPartition(kb("hk")).partitionContext;
+		const bytes = Uint8Array.fromHex(root.partitionId);
+		const live = { ...root, _partitionIdBytes: bytes };
+
+		const built = [
+			...resolveHashChildPartitionContexts(live),
+			resolveDescendantHashPartitionContext(live, live, bytes, [1, 2]).partitionContext,
+			resolveRangePartitionContext(live, kb("hk"), null, null).partitionContext,
+		];
+
+		for (const ctx of built) {
+			expect(ctx.partitionId).not.toBe(root.partitionId);
+			expect(Object.hasOwn(ctx, "_partitionIdBytes"), ctx.doName).toBe(false);
+		}
 	});
 });
