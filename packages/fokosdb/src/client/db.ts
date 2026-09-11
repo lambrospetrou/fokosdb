@@ -50,7 +50,8 @@ import {
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 } from "../shared/transaction-limits.js";
-import { FokosConditionCheckError, FokosInternalError, FokosValidationError, withExpressionErrors } from "../shared/errors.js";
+import { CONDITION_CHECK_CODES, FokosInternalError, FokosValidationError, INTERNAL_CODES, VALIDATION_CODES } from "../shared/errors.js";
+import { FokosItemConditionCheckError, withExpressionErrors } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
@@ -74,8 +75,7 @@ function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemD
 	// Accepting a primitive silently would make the declared type a lie, and taking it back later would be
 	// breaking — whereas relaxing this check later is not.
 	if (data === null || typeof data !== "object") {
-		throw new FokosValidationError({
-			code: "item_data_wrong_type",
+		throw new FokosValidationError(VALIDATION_CODES.item_data_wrong_type, {
 			message: "data must be an object, array, string or Uint8Array",
 			attributes: { type: data === null ? "null" : typeof data },
 		});
@@ -85,13 +85,15 @@ function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemD
 		text = JSON.stringify(data);
 	} catch (err) {
 		// A circular reference or a BigInt. Only JSON.stringify knows which, so the cause keeps its error.
-		throw new FokosValidationError({ code: "item_data_not_json_serializable", message: "data is not JSON-serializable", cause: err });
+		throw new FokosValidationError(VALIDATION_CODES.item_data_not_json_serializable, {
+			message: "data is not JSON-serializable",
+			cause: err,
+		});
 	}
 	// The guard above rules out every value that JSON.stringify drops, with one exception: a `toJSON`
 	// that itself returns undefined (or a function, or a symbol) makes the WHOLE document undefined.
 	if (text === undefined) {
-		throw new FokosValidationError({
-			code: "item_data_not_json_serializable",
+		throw new FokosValidationError(VALIDATION_CODES.item_data_not_json_serializable, {
 			message: "data is not JSON-serializable (its toJSON() returned undefined)",
 		});
 	}
@@ -111,8 +113,7 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 			error: String(err),
 			errorProps: err,
 		});
-		throw new FokosInternalError({
-			code: "item_data_parse_failed",
+		throw new FokosInternalError(INTERNAL_CODES.item_data_parse_failed, {
 			message: "failed to parse json item data returned by the store",
 			cause: err,
 		});
@@ -136,11 +137,10 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 function conditionCheckError(
 	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
 	res: { reason: RejectionReasonEncoded; meta: OperationMetrics & PartitionInfoInternal },
-): FokosConditionCheckError {
+): FokosItemConditionCheckError {
 	const reason = decodeRejectionReason(res.reason);
 	invariant(reason.type === "condition_failed", "an item RPC rejects only a failed condition");
-	return new FokosConditionCheckError({
-		code: "condition_failed",
+	return new FokosItemConditionCheckError(CONDITION_CHECK_CODES.condition_failed, {
 		message: "condition failed",
 		attributes: { hashKey: keys.hashKey, sortKey: keys.sortKey },
 		reason,
@@ -161,8 +161,7 @@ function decodeOperationResult(res: TransactWriteOperationResultEncoded): Transa
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
 	if (ttlAt === undefined) return;
 	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
-		throw new FokosValidationError({
-			code: "ttl_at_invalid",
+		throw new FokosValidationError(VALIDATION_CODES.ttl_at_invalid, {
 			message: "ttlAt must be an integer greater than zero",
 			attributes: { api: where, ttlAt },
 		});
@@ -215,8 +214,7 @@ export class FokosDB {
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
 		if (!Number.isInteger(this.#options.numTxCoordinators) || this.#options.numTxCoordinators <= 0) {
-			throw new FokosValidationError({
-				code: "num_tx_coordinators_invalid",
+			throw new FokosValidationError(VALIDATION_CODES.num_tx_coordinators_invalid, {
 				message: "numTxCoordinators must be an integer greater or equal to 1",
 				attributes: { numTxCoordinators: this.#options.numTxCoordinators },
 			});
@@ -570,18 +568,16 @@ export class FokosDB {
 
 	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
 		if (opts.queries.length === 0) {
-			throw new FokosValidationError({ code: "query_queries_empty", message: "queries must not be empty" });
+			throw new FokosValidationError(VALIDATION_CODES.query_queries_empty, { message: "queries must not be empty" });
 		}
 		if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit <= 0)) {
-			throw new FokosValidationError({
-				code: "query_limit_invalid",
+			throw new FokosValidationError(VALIDATION_CODES.query_limit_invalid, {
 				message: "limit must be a positive integer when provided",
 				attributes: { limit: opts.limit },
 			});
 		}
 		if (opts.maxPageBytes !== undefined && (!Number.isSafeInteger(opts.maxPageBytes) || opts.maxPageBytes <= 0)) {
-			throw new FokosValidationError({
-				code: "query_max_page_bytes_invalid",
+			throw new FokosValidationError(VALIDATION_CODES.query_max_page_bytes_invalid, {
 				message: "maxPageBytes must be a positive integer when provided",
 				attributes: { maxPageBytes: opts.maxPageBytes },
 			});
@@ -611,21 +607,18 @@ export class FokosDB {
 		if (opts.cursor !== undefined) {
 			const decoded = decodeCursor(opts.cursor);
 			if (decoded.queryIdx >= normalizedQueries.length) {
-				throw new FokosValidationError({
-					code: "cursor_query_index_out_of_range",
+				throw new FokosValidationError(VALIDATION_CODES.cursor_query_index_out_of_range, {
 					message: "cursor queryIdx out of range",
 					attributes: { queryIdx: decoded.queryIdx, queries: normalizedQueries.length },
 				});
 			}
 			if (decoded.direction !== normalizedQueries[decoded.queryIdx].cursorDirection) {
-				throw new FokosValidationError({
-					code: "cursor_direction_mismatch",
+				throw new FokosValidationError(VALIDATION_CODES.cursor_direction_mismatch, {
 					message: "cursor direction mismatch — scanIndexForward differs from the page that issued this cursor",
 				});
 			}
 			if (decoded.fingerprint !== fingerprint) {
-				throw new FokosValidationError({
-					code: "cursor_fingerprint_mismatch",
+				throw new FokosValidationError(VALIDATION_CODES.cursor_fingerprint_mismatch, {
 					message: "cursor fingerprint mismatch — re-send the same request",
 				});
 			}

@@ -1,11 +1,6 @@
 import { describe, expect, it } from "vitest";
-import {
-	FokosConditionCheckError,
-	FokosError,
-	FokosExpressionError,
-	type FokosAnyError,
-	type FokosErrorCode,
-} from "../src/shared/errors.js";
+import { FokosConditionCheckError, FokosError, FokosExpressionError } from "../src/shared/errors.js";
+import { FokosItemConditionCheckError, isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
 import { CURSOR_VERSION, encodeCursor } from "../src/shared/query/cursor.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../src/shared/transaction-limits.js";
 import type { ConditionExpression } from "../src/shared/types.js";
@@ -20,7 +15,7 @@ async function errorOf(call: () => unknown): Promise<FokosAnyError> {
 	try {
 		await call();
 	} catch (e) {
-		expect(FokosError.is(e), String(e)).toBe(true);
+		expect(isFokosAnyError(e), String(e)).toBe(true);
 		return e as FokosAnyError;
 	}
 	throw new Error("the call did not throw");
@@ -171,8 +166,8 @@ describe("a failed condition of putItem and deleteItem", () => {
 				: db.deleteItem({ ...key, condition, returnValuesOnConditionCheckFailure: "all_old" }),
 		);
 
-		expect(FokosConditionCheckError.is(err)).toBe(true);
-		const conditionErr = err as FokosConditionCheckError;
+		expect(FokosItemConditionCheckError.is(err)).toBe(true);
+		const conditionErr = err as FokosItemConditionCheckError;
 		expect([conditionErr.code, conditionErr.origin, conditionErr.httpStatusHint]).toEqual(["condition_failed", "caller", 409]);
 		expect(conditionErr.attributes).toEqual(key);
 		expect(conditionErr.reason).toEqual({ type: "condition_failed", ...key, item: { ...key, data: "stored", kind: "text", version: 1 } });
@@ -186,11 +181,14 @@ describe("a failed condition of putItem and deleteItem", () => {
 		const key = { hashKey: `cond-wire-${crypto.randomUUID()}` };
 		const err = (await errorOf(() =>
 			db.deleteItem({ ...key, condition: { op: "exists", args: [{ ref: "hashKey" }] } }),
-		)) as FokosConditionCheckError;
+		)) as FokosItemConditionCheckError;
 		const copy = Object.assign(new Error(err.message), { ...err });
 
-		const back = FokosError.fromWire(copy as FokosAnyError) as FokosConditionCheckError;
+		// fromWire builds the class of the category, and the subclass guard still holds on it.
+		const back = FokosError.fromWire(copy as FokosAnyError);
 		expect(back).toBeInstanceOf(FokosConditionCheckError);
+		expect(FokosItemConditionCheckError.is(back)).toBe(true);
+		if (!FokosItemConditionCheckError.is(back)) throw new Error("unreachable");
 		expect([back.error_id, back.reason, back.meta]).toEqual([err.error_id, err.reason, err.meta]);
 	});
 });

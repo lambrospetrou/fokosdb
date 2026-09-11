@@ -31,4 +31,6 @@ export {
 	FokosRoutingError,
 	FokosInternalError,
 } from "../shared/errors.js";
-export type { FokosAnyError, FokosErrorCode, FokosErrorCodeOf, FokosErrorOrigin, FokosErrorTag, FokosErrorWire } from "../shared/errors.js";
+export type { FokosErrorOrigin, FokosErrorWire } from "../shared/errors.js";
+export { FokosItemConditionCheckError, isFokosAnyError } from "../shared/errors-operations.js";
+export type { FokosAnyError, FokosErrorCode } from "../shared/errors-operations.js";

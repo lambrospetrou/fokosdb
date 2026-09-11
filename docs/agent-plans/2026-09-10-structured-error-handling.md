@@ -101,7 +101,7 @@ flows and the 11 findings this RFC closes.
    "range_partition_not_initialized"`.
 6. A cancelled `transactWriteItems` must report each operation as plain data, not as nested error
    objects. A rejected entry keeps its `RejectionReason` record, whose `code` discriminant holds the
-   registry code.
+   code of section 7.1.
 7. A failed prepare must keep the cause of the failure. It must not report `transient_error` alone.
 8. A partition must stamp its routing meta on an error. Each level that learns from the meta of a
    successful response must learn from the stamped meta in the same way, with the same meta changes
@@ -147,7 +147,7 @@ flows and the 11 findings this RFC closes.
 
 The candidates below follow the structure of section 4, and each one delivers on its own.
 
-1. The base class, the category classes, and the code registry.
+1. The base class, the category classes, and the code tables.
 2. The item operations: `putItem`, `getItem`, `deleteItem`, `queryItems`, and the validation helpers.
 3. The partition internals: the wrap in `#rpc`, and the removal of the three partition-side message
    predicates.
@@ -228,31 +228,43 @@ Each error then carries the same routing meta, and each forwarding level reads i
 
 #### 4.2.1 The base class and the category classes
 
-`packages/fokosdb/src/shared/errors.ts` holds every class. One file, so the registry of codes and the
-classes cannot drift apart.
+Two modules hold the errors:
+
+- `packages/fokosdb/src/shared/errors.ts` holds the machinery, the nine category classes, and one
+  code table for each category (section 4.2.2). It imports nothing, so another package can reuse it.
+- `packages/fokosdb/src/shared/errors-operations.ts` holds what depends on the types of the library:
+  the subclasses that carry fields of the data model, `withExpressionErrors` (section 4.2.7), the union
+  `FokosAnyError` of every error the library raises, and its guard `isFokosAnyError` (section 4.2.4).
 
 `FokosError` extends `Error` and declares the contractual fields. Each category extends `FokosError`
-and declares its tag once, as a static. The constructor assigns every field as an own property, so
-every field crosses a hop.
+and declares its tag once, as a static. The constructor takes a code definition (section 4.2.2) and
+assigns every field as an own property, so every field crosses a hop.
 
 ```ts
-export abstract class FokosError extends Error {
-    readonly _tag: string;
+/** `T` is the category and `C` is the union of the codes the error can carry. */
+export abstract class FokosError<T extends string = string, C extends string = string> extends Error {
+    readonly _tag: T;
     readonly type: string;
-    readonly code: string;
+    readonly code: C;
     readonly error_id: string;
     readonly origin: "caller" | "service" | "internal";
     readonly httpStatusHint: number;
     readonly attributes: Record<string, unknown>;
 
-    /** True after any number of hops. It reads own properties only. See section 4.2.4. */
-    static is(e: unknown): e is FokosAnyError;
+    constructor(code: FokosCodeDef<T, C>, options: { message: string; attributes?; cause?; origin?; httpStatusHint?; error_id? });
+
+    /**
+     * True after any number of hops for an error of any category, including one that another package
+     * defines. On a category class it holds for that category only. It reads own properties only.
+     * See section 4.2.4.
+     */
+    static is<K>(this: K, e: unknown): e is InstanceType<K>;
 
     /**
      * Returns `e` unchanged when it is a FokosError, with or without its prototype. Wraps any other
      * value as `foreign_error` and keeps it as `cause`. See section 4.2.10.
      */
-    static wrap(e: unknown): FokosAnyError;
+    static wrap(e: unknown): FokosError;
 
     /**
      * The plain record for storage. It accepts a class instance, an error that crossed a hop, or a
@@ -260,8 +272,16 @@ export abstract class FokosError extends Error {
      */
     static toWire(e: unknown): FokosErrorWire;
 
-    /** Builds the class in the calling isolate from a wire record or from an error that crossed a hop. */
-    static fromWire(w: FokosErrorWire | FokosAnyError): FokosAnyError;
+    /**
+     * Builds the class in the calling isolate from a wire record or from an error that crossed a hop.
+     * A category that the module does not define keeps its tag and its fields.
+     */
+    static fromWire(w: FokosErrorWire | FokosError): FokosError;
+}
+
+/** Each category class. `C` is open, so another package can raise its own codes in the category. */
+export class FokosConflictError<C extends string = string> extends FokosError<"FokosConflictError", C> {
+    static readonly tag = "FokosConflictError";
 }
 
 type FokosErrorWire = {
@@ -285,8 +305,13 @@ that crossed a hop has no prototype, and a helper that is a prototype member wou
 parts are plain data, so the record survives JSON storage and any RPC hop. An `Error` object as a
 cause would store as `{}`.
 
-A static `tag` on each category is what lets one generic guard replace one guard per category. The
-base class assigns `_tag` from it, so the string appears once.
+The static `tag` of a category is what lets the one static `is` serve every category:
+`FokosConflictError.is(e)` compares `_tag` with `FokosConflictError.tag`.
+
+A subclass of a category can add own data fields. It keeps the `name` and the `_tag` of its category.
+`FokosItemConditionCheckError extends FokosConditionCheckError<"condition_failed">` adds `reason` and
+`meta` for `putItem` and `deleteItem`. Its guard, `FokosItemConditionCheckError.is(e)`, holds for the
+whole category, so only the raiser of that category may use the subclass.
 
 | Category (`name` and `_tag`) | `type` | Typical origin | Typical `httpStatusHint` |
 | --- | --- | --- | --- |
@@ -300,12 +325,12 @@ base class assigns `_tag` from it, so the string appears once.
 | `FokosRoutingError` | `routing_error` | internal | 500 |
 | `FokosInternalError` | `internal_error` | internal | 500 |
 
-The registry declares the default origin and `httpStatusHint` of each code. The instance fields are
-the source of truth: a constructor takes the registry values unless the call site passes others. Two
-call sites pass others. `wrap` does so for a foreign error that carries the runtime `retryable`
-marker (section 4.2.10). `FokosTransactionCancelledError` takes the fields of its reason (section
-4.2.6). A consumer must read the fields on the error, not the registry. The table above gives the
-common value for each category.
+The code definition declares the default origin and `httpStatusHint` of each code. The instance
+fields are the source of truth: a constructor takes the defaults of the definition unless the call
+site passes others. Two call sites pass others. `wrap` does so for a foreign error that carries the
+runtime `retryable` marker (section 4.2.10). `FokosTransactionCancelledError` takes the fields of its
+reason (section 4.2.6). A consumer must read the fields on the error, not the code tables. The table
+above gives the common value for each category.
 
 `origin` says where the fault sits, and it has three values. Each one names a party, so the three stay
 on one dimension:
@@ -324,16 +349,27 @@ when it does not.
 The code says how the library detected the fault, so `origin` must not repeat it. The code
 `invariant_failed` already names a broken assertion, and `origin` stays `internal` for it.
 
-#### 4.2.2 The code registry and `error_id`
+#### 4.2.2 The code definitions and `error_id`
 
-The registry maps each code to its category, its default origin, its default `httpStatusHint`,
-and its 6-character segment. Section 7.1 holds the starting registry.
+A code is a value. A code definition carries the code, its category, its default origin, its default
+`httpStatusHint`, and its 6-character segment. `defineCodes(tag, origin, httpStatusHint, segments)`
+makes the definitions of one category, and a call site passes one of them to the constructor as its
+first argument:
+
+```ts
+export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 400, { hash_key_empty: "2fzzq9", ... });
+throw new FokosValidationError(VALIDATION_CODES.hash_key_empty, { message: "hashKey must not be empty" });
+```
+
+The constructor refuses a definition of another category at compile time, and it takes the code as a
+literal type. No central table limits which codes exist, so another package defines its own codes
+in the same way (section 4.2.4). Section 7.1 holds the starting codes.
 
 The `error_id` has the form `e_<segment>_<suffix>`.
 
 - `<segment>` is 6 characters, fixed for the life of the code. An author assigns it by hand. The only
-  rule is that it must be unique in the registry. A test asserts that every segment in the registry
-  is unique.
+  rule is that it must be unique across every code. A test asserts that every segment and every code
+  of the code tables is unique.
 - `<suffix>` is `crypto.randomUUID().replaceAll("-", "")`, which gives 32 hexadecimal characters. The
   source already uses this form for `transactionId`.
 
@@ -372,38 +408,41 @@ A hop drops the prototype, so a guard must read own properties only.
 `packages/fokosdb/test/tagged-error-rpc.test.ts` measures this over a real Durable Object RPC call:
 `name`, `_tag`, `cause` and every payload field arrive, and every prototype member is gone.
 
-One type carries the classification.
+One union type carries the classification of the library. It lists each category with the codes that
+the library raises in it:
 
 ```ts
-/** The union of the nine categories. `_tag` is a literal here, so a switch narrows and stays exhaustive. */
-export type FokosAnyError = FokosValidationError | FokosConflictError | /* ... */ FokosInternalError;
+/** Every error the library raises. `_tag` and `code` are literals, so a switch narrows and stays exhaustive. */
+export type FokosAnyError =
+    | FokosValidationError<FokosCodesOf<typeof VALIDATION_CODES>>
+    | FokosItemConditionCheckError
+    | /* ... */ FokosInternalError<FokosCodesOf<typeof INTERNAL_CODES>>;
+export const isFokosAnyError = defineErrorGuard<FokosAnyError>(...FOKOS_CODE_TABLES);
 ```
 
 `FokosError` and `FokosAnyError` are not the same thing, and both are needed. `FokosError` is the base
-class that a category extends. `FokosAnyError` is the union that a caller narrows, because `_tag` on
-the base is `string` and `_tag` on the union is a literal.
+class that a category extends. `FokosAnyError` is the union that a caller narrows, because `_tag` and
+`code` on the base are `string` and on the union they are literals.
 
-The library gives three ways to classify an error, and none of them uses `instanceof`:
+The library gives four ways to classify an error, and none of them uses `instanceof`:
 
 ```ts
-// 1. Any error this library raises, after any number of hops.
+// 1. Any FokosError, of any package, after any number of hops. `_tag` and `code` stay `string`.
 FokosError.is(e)
 
-// 2. One category. The static tag makes one generic guard enough for all nine.
-isFokosErrorOf(e, FokosConflictError)
+// 2. One category. The static tag makes the one static `is` enough for all nine.
+FokosConflictError.is(e)
 
-// 3. One code.
+// 3. Every error of this library. A switch on `_tag` then narrows `code` to the codes of the category.
+isFokosAnyError(e)
+
+// 4. One code.
 e.code === "item_locked_by_transaction"
 ```
 
-```ts
-export function isFokosErrorOf<C extends { tag: string; prototype: FokosAnyError }>(
-    e: unknown,
-    cls: C,
-): e is C["prototype"] {
-    return FokosError.is(e) && e._tag === cls.tag;
-}
-```
+`defineErrorGuard` makes the guard of a union from its code tables. The guard holds only for a code of
+those tables with the category of its definition. So the union type it narrows to is true even when an
+error of another package carries a category of this library.
 
 A guard narrows to the class type. The classes hold data only, so the class type describes an error
 that crossed a hop exactly: the compiler cannot offer a member that the hop removed.
@@ -416,13 +455,32 @@ prototype, and `instanceof` fails there.
 Often no guard is needed. `_tag` is a literal discriminant, so a switch narrows on its own:
 
 ```ts
-if (FokosError.is(e)) {
+if (isFokosAnyError(e)) {
     switch (e._tag) {
         case "FokosConflictError": return retry();
         case "FokosValidationError": return badRequest(e.code);
     }
 }
 ```
+
+**Extension by another package.** A package that reuses `errors.ts`, for example a future sharding
+package, extends the system in three ways, and no module registers anything at runtime:
+
+1. It defines its own codes with `defineCodes`, in a category of `errors.ts` or in its own category.
+2. It defines its own category as a subclass of `FokosError` with a static `tag`.
+3. It declares the union of every error it raises, the unions of the packages it depends on included,
+   and makes its guard with `defineErrorGuard`. Each entry point exports its union and its guard.
+
+```ts
+export const SHARD_CODES = defineCodes("FokosUnavailableError", "service", 503, { shard_migrating: "k3m9xz" });
+export type ShardAnyError = FokosAnyError | FokosUnavailableError<"shard_migrating"> | FokosShardError<"shard_moved">;
+export const isShardAnyError = defineErrorGuard<ShardAnyError>(...FOKOS_CODE_TABLES, SHARD_CODES, SHARD_OWN_CODES);
+```
+
+`isFokosAnyError` does not hold for an error of the sharding package, so a caller that knows only this
+library does not misread it. That caller still reads `origin` and `httpStatusHint` through
+`FokosError.is`. Category names and codes must be unique across packages. One test in the repository
+asserts it over every code table.
 
 #### 4.2.5 The transaction exception to the rule
 
@@ -454,7 +512,7 @@ type TransactWriteOperationResult =
 
 This is the shape DynamoDB uses for `TransactionCanceledException.CancellationReasons`: plain
 `{ Code, Message, Item }` structs, not nested exceptions. `RejectionReason` keeps its shape, with its
-discriminant renamed from `type` to `code`: the `reason.code` values are the registry codes —
+discriminant renamed from `type` to `code`: the `reason.code` values are the codes of section 7.1 —
 `condition_failed`, `item_too_large`, and the rest keep one spelling on an item RPC and inside a
 cancelled transaction. Plain data crosses any number of hops unchanged — a consumer's Worker can
 rethrow the cancelled error and `results` arrives intact. A nested `Error` instance would lose its
@@ -547,8 +605,8 @@ fault reports `foreign_error`, an over-size partition reports `partition_over_si
 
 `db.ts` throws `FokosTransactionCancelledError` for every cancelled outcome — one type for a
 rejection and for an execution failure. Its `origin` and `httpStatusHint` come from the reason: the
-stored error's own fields for an execution failure, and the registry defaults of `reason.code` for a
-`RejectionReason` record. The registry row for `transaction_cancelled` is the fallback when neither
+stored error's own fields for an execution failure, and the defaults of the code definition of `reason.code`
+for a `RejectionReason` record. The definition of `transaction_cancelled` is the fallback when neither
 applies.
 
 #### 4.2.7 `ExpressionError`
@@ -562,7 +620,7 @@ the original error and copies its `ExpressionErrorCode` into an attribute.
 
 `client/index.ts` keeps its `ExpressionError` export for typing the `cause`, but a consumer that
 catches `ExpressionError` today does not catch the wrapper: `e instanceof ExpressionError` is false
-on it. The match moves to `e.code === "expression_invalid"` or `isFokosErrorOf`. This is a stated
+on it. The match moves to `e.code === "expression_invalid"` or `FokosExpressionError.is`. This is a stated
 break — the same one `transactWriteItems` takes when `cancelled` becomes a throw, and the one
 `ConditionCheckFailedError` takes when `FokosConditionCheckError` replaces it.
 
@@ -648,7 +706,7 @@ its body, so every error that leaves `db.ts` is a `FokosError`.
 
 The runtime marks a fault it considers transient with a `retryable` own property, and `wrap` honours
 it: when `e` carries `retryable: true`, the wrapped error gets `origin: "service"` and
-`httpStatusHint: 503` in place of the registry values for `foreign_error`. A platform fault that
+`httpStatusHint: 503` in place of the defaults of `foreign_error`. A platform fault that
 clears on its own is a service condition, not a defect, and the `internal` alarm stays silent for it.
 A foreign error without the marker keeps `foreign_error`/`internal`. The `retryable`, `overloaded`,
 and `remote` markers get no top-level fields — they stay inside `attributes`. The helper
@@ -702,7 +760,7 @@ These answers are not failures, and they must stay values:
 
 #### 4.2.15 Testing
 
-1. A test asserts that every 6-character segment in the registry is unique.
+1. A test asserts that every 6-character segment and every code in the code tables is unique.
 2. A test asserts that every category, code, origin, and `httpStatusHint` crosses an RPC hop as an
    own property.
    A test asserts that `FokosError.toWire` and `FokosError.fromWire` round-trip every category without
@@ -842,7 +900,7 @@ property, so both paths feed `recordForwardResult`.
 
 ## 7. Appendix
 
-### 7.1 The starting code registry
+### 7.1 The starting codes
 
 The origin is `c` for caller, `s` for service, and `i` for internal. The origin and the hint are the
 defaults that section 4.2.1 describes.

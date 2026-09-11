@@ -1,10 +1,10 @@
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { hash64 } from "../hash-primitives.js";
 import type { SkInterval } from "./sk-interval.js";
-import { FokosValidationError } from "../errors.js";
+import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 
 function cursorMalformed(message: string, cause?: unknown): FokosValidationError {
-	return new FokosValidationError({ code: "cursor_malformed", message, cause });
+	return new FokosValidationError(VALIDATION_CODES.cursor_malformed, { message, cause });
 }
 
 export const CURSOR_VERSION = 1;
@@ -52,7 +52,10 @@ export function decodeCursor(s: string): DecodedCursor {
 	}
 	if (typeof wire !== "object" || wire === null) throw cursorMalformed("cursor is not valid base64url-encoded JSON");
 	if (wire.v !== CURSOR_VERSION) {
-		throw new FokosValidationError({ code: "cursor_version_unknown", message: "unknown cursor version", attributes: { version: wire.v } });
+		throw new FokosValidationError(VALIDATION_CODES.cursor_version_unknown, {
+			message: "unknown cursor version",
+			attributes: { version: wire.v },
+		});
 	}
 	if (wire.d !== "fwd" && wire.d !== "rev") throw cursorMalformed("cursor has invalid direction");
 	if (!Number.isSafeInteger(wire.qi) || wire.qi < 0) throw cursorMalformed("cursor has invalid queryIdx");

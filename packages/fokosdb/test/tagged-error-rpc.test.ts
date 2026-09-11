@@ -1,14 +1,8 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import {
-	FOKOS_ERROR_CATEGORIES,
-	FOKOS_ERROR_REGISTRY,
-	FokosConflictError,
-	FokosError,
-	FokosValidationError,
-	type FokosAnyError,
-	type FokosErrorCode,
-} from "../src/shared/errors.js";
+import { FOKOS_CODE_TABLES, FOKOS_ERROR_CATEGORIES, FokosConflictError, FokosError, FokosValidationError } from "../src/shared/errors.js";
+import { isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
+import { CODE_DEFS } from "./worker-entry.js";
 
 /**
  * What a FokosError keeps when it crosses a Workers RPC boundary.
@@ -33,15 +27,13 @@ async function catchOverRpc(name: string, call: (stub: ReturnType<typeof probeSt
 }
 
 /** One code of each category. */
-const ONE_CODE_PER_CATEGORY = [...FOKOS_ERROR_CATEGORIES.keys()].map(
-	(tag) => (Object.keys(FOKOS_ERROR_REGISTRY) as FokosErrorCode[]).find((code) => FOKOS_ERROR_REGISTRY[code].tag === tag)!,
-);
+const ONE_CODE_PER_CATEGORY = FOKOS_CODE_TABLES.map((table) => Object.keys(table)[0] as FokosErrorCode);
 
 describe("a FokosError across an RPC hop", () => {
 	it("keeps the category, the code, the error_id, the origin, the hint and the attributes of every category", async () => {
 		for (const code of ONE_CODE_PER_CATEGORY) {
 			const err = await catchOverRpc(`fields-${code}`, (s) => s.raise(code, { hashKey: "hk", keyBytes: new Uint8Array([1, 2]) }));
-			const { tag, segment, origin, httpStatusHint } = FOKOS_ERROR_REGISTRY[code];
+			const { tag, segment, origin, httpStatusHint } = CODE_DEFS[code];
 
 			expect(err).toBeInstanceOf(Error);
 			for (const key of ["name", "_tag", "type", "code", "error_id", "origin", "httpStatusHint", "attributes"]) {
@@ -76,6 +68,7 @@ describe("a FokosError across an RPC hop", () => {
 		const err = await catchOverRpc("guards", (s) => s.raise("item_locked_by_transaction", {}));
 
 		expect(FokosError.is(err)).toBe(true);
+		expect(isFokosAnyError(err)).toBe(true);
 		expect(FokosConflictError.is(err)).toBe(true);
 		expect(FokosValidationError.is(err)).toBe(false);
 	});
