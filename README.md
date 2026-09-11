@@ -59,7 +59,8 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Garbage collect the transactions data from the tx coordinators. Only delete a transaction that is already COMMITTED or CANCELLED, since partitions read a missing transaction as cancelled.
+- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level (`docs/agent-plans/2026-09-05-item-order-timestamps-and-read-revisions.md`).
+- Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Garbage collect the items table after splits and hash key promotions.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
@@ -67,9 +68,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Maybe put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
-- Create RpcTargets for the partition DOs and LRU cache them in the Worker to skip the getActor calls and go directly to the partition DOs.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
-- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level. Use the transaction ID as tie breaker, since it is stable no matter which coordinator stamps or resumes the transaction.
 - Count item data sizes in UTF-8 bytes, to match the `octet_length` the store uses. The current UTF-16 count under-counts non-ASCII data by up to 3x, so the item and transaction size caps admit more than they intend.
 - Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
@@ -77,20 +76,20 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Proper structured errors thrown to differentiate user vs server errors. Pick ONE failure model: a failed condition throws in `putItem` but is a returned `cancelled` value in `transactWriteItems`. Report one cancellation reason per operation, in request order.
-- Expose an RPC/API to trigger a manual split.
+- Fix update in transactions to be an upsert, create the item if not existing and if the condition (exists) passes.
+- queryItems: count only operation, filter + projections.
+- Add global eventual indexes (DynamoDB GSIs).
+- Add FokosStd class with helper methods (e.g. paginator for queryItems).
+- Batch item operations (non-transactions).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
-- Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
 - Add jurisdictions support.
+- Expose an RPC/API to trigger a manual split.
+- Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
 - Allow custom split conditions in user-provided function of the partition DO class, and also for custom item selection per child partition.
 - Implement projections, filter expression, and update expressions as described in `docs/agent-plans/2026-08-29-typed-expression-engine-spec.md`. Condition expressions are fully implemented.
 - Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
-- Add FokosStd class with helper methods (e.g. paginator for queryItems).
-- Batch item operations (non-transactions).
-- Refactor do-partition tests from scratch now that everything is implemented and clean them up without internal knowledge.
-- Add global eventual indexes (DynamoDB GSIs).
 - Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion.
