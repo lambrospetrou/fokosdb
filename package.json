@@ -9,7 +9,8 @@
 		"dev": "pnpm build && pnpm --filter \"./examples/*\" -r dev",
 		"test": "pnpm build && pnpm --filter \"fokosdb\" test && pnpm --filter \"./examples/*\" -r test",
 		"lint:pkg": "pnpm --filter \"fokosdb\" lint:pkg",
-		"cf-typegen": "pnpm -r cf-typegen"
+		"cf-typegen": "pnpm -r cf-typegen",
+		"error-segment": "bash tools/new-error-segment.sh"
 	},
 	"devDependencies": {
 		"pkg-pr-new": "^0.0.88",
