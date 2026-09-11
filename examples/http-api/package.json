@@ -26,6 +26,6 @@
 		"dotenv-cli": "^11.0.0",
 		"typescript": "^5.9.3",
 		"vitest": "^4.1.7",
-		"wrangler": "^4.94.0"
+		"wrangler": "^4.131.0"
 	}
 }
