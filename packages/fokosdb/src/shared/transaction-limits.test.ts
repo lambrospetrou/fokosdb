@@ -12,6 +12,7 @@ import {
 } from "./transaction-limits.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./expression/compiler.js";
+import { fokosErrorWith } from "../../test/errors-matchers.js";
 
 const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops);
 const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
@@ -23,12 +24,14 @@ function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x
 describe("validateClientRequestToken", () => {
 	it("accepts exactly 64 UTF-8 bytes and rejects one more", () => {
 		expect(() => validateClientRequestToken("é".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES / 2))).not.toThrow();
-		expect(() => validateClientRequestToken(`${"é".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES / 2)}x`)).toThrow(/exceeds 64 bytes/);
+		expect(() => validateClientRequestToken(`${"é".repeat(MAX_CLIENT_REQUEST_TOKEN_BYTES / 2)}x`)).toThrow(
+			fokosErrorWith("client_request_token_invalid", { limitBytes: 64 }),
+		);
 	});
 
 	it("rejects an empty or whitespace-only token", () => {
-		expect(() => validateClientRequestToken("")).toThrow(/non-empty/);
-		expect(() => validateClientRequestToken(" \t ")).toThrow(/non-empty/);
+		expect(() => validateClientRequestToken("")).toThrow(fokosErrorWith("client_request_token_invalid"));
+		expect(() => validateClientRequestToken(" \t ")).toThrow(fokosErrorWith("client_request_token_invalid"));
 	});
 });
 
@@ -40,22 +43,22 @@ describe("validateItemKeys", () => {
 	});
 
 	it("rejects a NUL character anywhere in the hashKey", () => {
-		expect(() => validateItemKeys("\0hk")).toThrow(/hashKey must not contain the NUL/);
-		expect(() => validateItemKeys("h\0k")).toThrow(/hashKey must not contain the NUL/);
-		expect(() => validateItemKeys("hk\0")).toThrow(/hashKey must not contain the NUL/);
+		expect(() => validateItemKeys("\0hk")).toThrow(fokosErrorWith("key_contains_nul", { key: "hashKey" }));
+		expect(() => validateItemKeys("h\0k")).toThrow(fokosErrorWith("key_contains_nul", { key: "hashKey" }));
+		expect(() => validateItemKeys("hk\0")).toThrow(fokosErrorWith("key_contains_nul", { key: "hashKey" }));
 	});
 
 	it("rejects a NUL character anywhere in the sortKey", () => {
-		expect(() => validateItemKeys("hk", "\0sk")).toThrow(/sortKey must not contain the NUL/);
-		expect(() => validateItemKeys("hk", "s\0k")).toThrow(/sortKey must not contain the NUL/);
-		expect(() => validateItemKeys("hk", "sk\0")).toThrow(/sortKey must not contain the NUL/);
+		expect(() => validateItemKeys("hk", "\0sk")).toThrow(fokosErrorWith("key_contains_nul", { key: "sortKey" }));
+		expect(() => validateItemKeys("hk", "s\0k")).toThrow(fokosErrorWith("key_contains_nul", { key: "sortKey" }));
+		expect(() => validateItemKeys("hk", "sk\0")).toThrow(fokosErrorWith("key_contains_nul", { key: "sortKey" }));
 	});
 });
 
 describe("validateTransactWriteOperations", () => {
 	it("rejects NUL characters in operation keys", () => {
-		expect(() => validate([putOp("h\0k")])).toThrow(/hashKey must not contain the NUL/);
-		expect(() => validate([putOp("hk", "s\0k")])).toThrow(/sortKey must not contain the NUL/);
+		expect(() => validate([putOp("h\0k")])).toThrow(fokosErrorWith("key_contains_nul", { key: "hashKey" }));
+		expect(() => validate([putOp("hk", "s\0k")])).toThrow(fokosErrorWith("key_contains_nul", { key: "sortKey" }));
 	});
 
 	it("accepts a typical valid operation set", () => {
@@ -70,21 +73,21 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("rejects an empty operation set", () => {
-		expect(() => validate([])).toThrow(/at least 1 item/);
+		expect(() => validate([])).toThrow(fokosErrorWith("transact_items_empty"));
 	});
 
 	it("accepts exactly the max item count and rejects one more", () => {
 		const ops = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => putOp(`hk-${i}`));
 		expect(() => validate(ops)).not.toThrow();
-		expect(() => validate([...ops, putOp("one-too-many")])).toThrow(/at most 100 items/);
+		expect(() => validate([...ops, putOp("one-too-many")])).toThrow(fokosErrorWith("transact_items_too_many", { limit: 100 }));
 	});
 
 	it("rejects duplicate (hashKey, sortKey) pairs", () => {
-		expect(() => validate([putOp("a", "s"), putOp("a", "s")])).toThrow(/duplicate key/);
+		expect(() => validate([putOp("a", "s"), putOp("a", "s")])).toThrow(fokosErrorWith("transact_duplicate_key"));
 	});
 
 	it("treats a missing sortKey as the empty sortKey for duplicate detection", () => {
-		expect(() => validate([putOp("a"), putOp("a")])).toThrow(/duplicate key/);
+		expect(() => validate([putOp("a"), putOp("a")])).toThrow(fokosErrorWith("transact_duplicate_key"));
 	});
 
 	it("does not confuse a string sortKey with the binary sortKey that stringifies the same", () => {
@@ -113,7 +116,9 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("rejects a put without data", () => {
-		expect(() => validate([{ hashKey: "a", operation: "put" }])).toThrow(/"put" operation requires data/);
+		expect(() => validate([{ hashKey: "a", operation: "put" }])).toThrow(
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "put" }),
+		);
 	});
 
 	it("allows delete and check without data", () => {
@@ -126,16 +131,22 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("rejects data on a delete or a check", () => {
-		expect(() => validate([{ hashKey: "a", operation: "delete", data: "x" }])).toThrow(/"delete" operation must not carry data/);
+		expect(() => validate([{ hashKey: "a", operation: "delete", data: "x" }])).toThrow(
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "delete" }),
+		);
 		expect(() => validate([{ hashKey: "a", operation: "check", condition: itemExists, data: "x" }])).toThrow(
-			/"check" operation must not carry data/,
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "check" }),
 		);
 		// An empty string is still a data field.
-		expect(() => validate([{ hashKey: "a", operation: "delete", data: "" }])).toThrow(/"delete" operation must not carry data/);
+		expect(() => validate([{ hashKey: "a", operation: "delete", data: "" }])).toThrow(
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "delete" }),
+		);
 	});
 
 	it("rejects a check without a condition", () => {
-		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(/"check" operation requires a condition/);
+		expect(() => validate([{ hashKey: "a", operation: "check" }])).toThrow(
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "check" }),
+		);
 	});
 
 	it("accepts a valid update operation with an update plan and no data", () => {
@@ -144,29 +155,31 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("rejects an update operation without an update plan", () => {
-		expect(() => validate([{ hashKey: "a", operation: "update" }])).toThrow(/"update" operation requires an update plan/);
+		expect(() => validate([{ hashKey: "a", operation: "update" }])).toThrow(
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "update" }),
+		);
 	});
 
 	it("rejects an update operation carrying data", () => {
 		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
 		expect(() => validate([{ hashKey: "a", operation: "update", update: updatePlan, data: "forbidden" }])).toThrow(
-			/"update" operation must not carry data/,
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "update" }),
 		);
 	});
 
 	it("rejects a non-update operation carrying an update plan", () => {
 		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
 		expect(() => validate([{ hashKey: "a", operation: "put", data: "x", update: updatePlan }])).toThrow(
-			/"put" operation must not carry an update plan/,
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "put" }),
 		);
 		expect(() => validate([{ hashKey: "b", operation: "delete", update: updatePlan }])).toThrow(
-			/"delete" operation must not carry an update plan/,
+			fokosErrorWith("transact_operation_fields_invalid", { operation: "delete" }),
 		);
 	});
 
 	it("accepts an item at the per-item byte limit and rejects one over it", () => {
 		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_ITEM_BYTES))])).not.toThrow();
-		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_ITEM_BYTES + 1))])).toThrow(/item data exceeds 400 KB/);
+		expect(() => validate([putOp("a", undefined, new Uint8Array(MAX_ITEM_BYTES + 1))])).toThrow(fokosErrorWith("item_data_too_large"));
 	});
 
 	// A string counts its UTF-16 length, a lower bound on the UTF-8 bytes it stores. So the check only
@@ -174,7 +187,7 @@ describe("validateTransactWriteOperations", () => {
 	// text above U+07FF slips through until the exact accounting in itemDataBytes' FIXME lands.
 	it("counts a string by its length, so it rejects only what is certainly over", () => {
 		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_ITEM_BYTES))])).not.toThrow();
-		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_ITEM_BYTES + 1))])).toThrow(/item data exceeds 400 KB/);
+		expect(() => validate([putOp("a", undefined, "x".repeat(MAX_ITEM_BYTES + 1))])).toThrow(fokosErrorWith("item_data_too_large"));
 		// Three UTF-8 bytes per code unit, but only `length` is counted, so this is currently accepted.
 		expect(() => validate([putOp("a", undefined, "日".repeat(MAX_ITEM_BYTES))])).not.toThrow();
 	});
@@ -186,7 +199,7 @@ describe("validateTransactWriteOperations", () => {
 		const atLimit = Math.floor(MAX_PAYLOAD_BYTES_PER_TX / MAX_ITEM_BYTES); // 10 items → 4000 KB, under 4 MB
 		const ops = Array.from({ length: atLimit }, (_, i) => putOp(`hk-${i}`, undefined, maxItem));
 		expect(() => validate(ops)).not.toThrow();
-		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(/total payload exceeds 4 MB/);
+		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(fokosErrorWith("transact_payload_too_large"));
 	});
 
 	it("includes serialized condition plans in the transaction payload", () => {
@@ -196,19 +209,19 @@ describe("validateTransactWriteOperations", () => {
 			operation: "check",
 			condition,
 		}));
-		expect(() => validate(ops)).toThrow(/total payload exceeds 4 MB/);
+		expect(() => validate(ops)).toThrow(fokosErrorWith("transact_payload_too_large"));
 	});
 });
 
 describe("validateTransactGetItemCount", () => {
 	it("rejects an empty item set", () => {
-		expect(() => validateTransactGetItemCount(0)).toThrow(/at least 1 item/);
+		expect(() => validateTransactGetItemCount(0)).toThrow(fokosErrorWith("transact_items_empty"));
 	});
 
 	// The read fans out to every partition holding a key, twice (two-phase read), so it carries the
 	// same cap as the write path.
 	it("accepts exactly the max item count and rejects one more", () => {
 		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX)).not.toThrow();
-		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX + 1)).toThrow(/at most 100 items/);
+		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX + 1)).toThrow(fokosErrorWith("transact_items_too_many", { limit: 100 }));
 	});
 });

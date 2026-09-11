@@ -125,15 +125,16 @@ describe("the validation codes of the item operations", () => {
 		const err = await errorOf(() =>
 			db.transactWriteItems({
 				items: [
-					{ operation: "put", hashKey: "a", data: "x" },
-					{ operation: "put", hashKey: "h", sortKey: "s", data: "x" },
-					{ operation: "delete", hashKey: "h", sortKey: "s" },
+					{ operation: "put", hashKey: "other-hash-key", data: "x" },
+					{ operation: "put", hashKey: "dup-hash-key", sortKey: "dup-sort-key", data: "x" },
+					{ operation: "delete", hashKey: "dup-hash-key", sortKey: "dup-sort-key" },
 				],
 			}),
 		);
 		expect(err.code).toBe("transact_duplicate_key");
-		expect(err.attributes).toEqual({ opIndex: 2, hashKey: "h", sortKey: "s" });
-		expect(err.message).toBe("fokos/transact_duplicate_key: transactWriteItems duplicate key");
+		expect(err.attributes).toEqual({ opIndex: 2, hashKey: "dup-hash-key", sortKey: "dup-sort-key" });
+		expect(err.message.startsWith("fokos/transact_duplicate_key: ")).toBe(true);
+		for (const detail of ["dup-hash-key", "dup-sort-key", "opIndex"]) expect(err.message).not.toContain(detail);
 	});
 });
 

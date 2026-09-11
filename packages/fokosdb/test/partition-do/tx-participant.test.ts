@@ -129,8 +129,6 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 				() => null,
 				(e: unknown) => e,
 			);
-		expect(String(error)).toMatch(/partition exceeded its limits/);
-		expect(String(error)).not.toMatch(/mis-routed/);
 		expect(FokosError.isCode(error, UNAVAILABLE_CODES.partition_over_size)).toBe(true);
 	});
 

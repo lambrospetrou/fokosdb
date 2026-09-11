@@ -8,6 +8,7 @@ import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
+import { fokosErrorWith } from "../../../test/errors-matchers.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
@@ -457,7 +458,7 @@ describe("PartitionStore - items", () => {
 					plan,
 					lastTransactionTs: 1,
 				}),
-			).toThrow(/not found/);
+			).toThrow(fokosErrorWith("item_not_found_for_update"));
 		});
 	});
 
@@ -535,7 +536,9 @@ describe("PartitionStore - items", () => {
 			// A migration copies rows that were accepted under the limit of their time, so the ingest
 			// path carries no size guard. A guard there would drop an item when the limit falls.
 			const oversized = "x".repeat(MAX_ITEM_BYTES + 1);
-			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, lastTransactionTs: 1 })).toThrow(/exceeds/);
+			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, lastTransactionTs: 1 })).toThrow(
+				fokosErrorWith("item_too_large"),
+			);
 
 			store.insertItemIfAbsent({ hk, sk, data: oversized, kind: "text", ttl_epoch_utc_seconds: null, v: 7, last_transaction_ts: 1 });
 			expect(store.getItem(hk, sk).row).toMatchObject({ v: 7, data: oversized });

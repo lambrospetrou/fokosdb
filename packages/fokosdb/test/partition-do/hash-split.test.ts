@@ -142,7 +142,7 @@ describe("PartitionDO - splitting", () => {
 					newPartitionContext: otherCtx,
 					splitType: "hash",
 				}),
-			).rejects.toThrow("conflicting options");
+			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 
@@ -171,7 +171,7 @@ describe("PartitionDO - splitting", () => {
 					newPartitionContext: childCtx,
 					splitType: "hash",
 				}),
-			).rejects.toThrow("conflicting options");
+			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 
@@ -199,7 +199,7 @@ describe("PartitionDO - splitting", () => {
 					newPartitionContext: childCtx,
 					splitType: "range",
 				}),
-			).rejects.toThrow("conflicting options");
+			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 
@@ -306,7 +306,7 @@ describe("PartitionDO - splitting", () => {
 						written = true;
 						break;
 					} catch (e: unknown) {
-						expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
+						expect(["partition_migrating", "partition_over_size"]).toContain((e as { code?: string }).code);
 						await partition.awaitTreeSettled();
 					}
 				}

@@ -5,6 +5,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { TX_FANOUT_REQUEST_BUDGET_MS, TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
+import { fokosErrorWith } from "../errors-matchers.js";
 
 /**
  * The commit fan-out carries keys only, and the `committed` answer waits for every participant: a
@@ -162,14 +163,14 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		const result = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		// The answer follows the decision: a cancelled transaction applied nothing anywhere, so it
 		// is final even though the unreachable participant still holds its lock.
-		expect(result).toMatchObject({ outcome: "cancelled", firstRejection: { code: "condition_failed" } });
+		expect(result).toMatchObject({ outcome: "cancelled", results: [{}, { outcome: "rejected", reason: { code: "condition_failed" } }] });
 		// The cancel fan-out is bounded exactly as the commit fan-out is: the unreachable
 		// participant costs the caller the budget, not the whole retry ladder.
 		expect(Date.now() - start).toBeLessThan(SHORT_BUDGET_MS + 3_000);
 		// The lock is still held — the cancel could not reach that participant — and a held lock
 		// makes every non-transactional write to the key throw. Reads still answer committed state,
 		// which proves the cancelled put applied nothing.
-		await expect(db.putItem({ ...lockedKey, data: "blocked" })).rejects.toThrow(/item is locked by an in-progress transaction/);
+		await expect(db.putItem({ ...lockedKey, data: "blocked" })).rejects.toThrow(fokosErrorWith("item_locked_by_transaction"));
 		await expect(db.getItem(lockedKey)).resolves.toMatchObject({ found: false });
 
 		spy.mockRestore();

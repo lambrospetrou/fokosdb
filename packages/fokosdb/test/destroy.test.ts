@@ -49,7 +49,7 @@ describe.skip("FokosDB.destroy()", () => {
 					doNamesSet.add(meta.servedByActorName);
 					break;
 				} catch (e: unknown) {
-					expect(String(e)).toMatch(/split in progress|partition exceeded its limits/);
+					expect(["partition_migrating", "partition_over_size"]).toContain((e as { code?: string }).code);
 				}
 			}
 			allKeys.push(hk);

@@ -292,7 +292,7 @@ describe("FokosError.wrap", () => {
 		expect([e.code, e.origin, e.httpStatusHint]).toEqual(["foreign_error", "internal", 500]);
 		expect(e.cause).toBe(foreign);
 		expect(e.attributes).toEqual({ remote: true, detail: { n: 1 } });
-		expect(e.message).toBe("fokos/foreign_error: unexpected error occurred");
+		expect(e.message.startsWith("fokos/foreign_error: ")).toBe(true);
 	});
 
 	it("drops the properties that cannot cross an RPC hop and keeps the rest", () => {

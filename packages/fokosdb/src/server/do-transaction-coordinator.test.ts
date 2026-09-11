@@ -14,6 +14,7 @@ import type {
 	TCState,
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-types.js";
+import { fokosErrorWith } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -222,7 +223,7 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 			}
 			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(true);
 			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(false);
-			expect(String(err)).toMatch(/outcome is not yet decided/);
+			expect(err).toMatchObject({ attributes: { transactionId: TX_ID, state: tcState } });
 		});
 	});
 });
@@ -232,9 +233,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
 
-			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
-				/transaction coordinator exceeded its storage limit, please retry later/,
-			);
+			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items: [] })).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
 	});
@@ -319,7 +318,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
 			vi.spyOn(tc, "runCommit").mockResolvedValue();
 
-			await expect(tc.drivePrepare(TX_ID, TOKEN, "coordinator-id", 0)).rejects.toThrow(/commit is pending/);
+			await expect(tc.drivePrepare(TX_ID, TOKEN, "coordinator-id", 0)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
 
 			const stateRow = state.storage.sql
 				.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN)
@@ -381,7 +380,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(
 				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
 			).toBe("PREPARING");
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(/outcome is not yet decided/);
+			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
 		});
 	});
 
@@ -924,7 +923,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				.toArray()[0];
 			expect(row.state).toBe("PREPARING");
 			expect(row.completed_at).toBeNull();
-			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(/outcome is not yet decided/);
+			expect(() => tc.loadFinalResponse(TX_ID, TOKEN)).toThrow(fokosErrorWith("transaction_undecided"));
 		});
 	});
 

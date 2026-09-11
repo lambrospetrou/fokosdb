@@ -9,7 +9,7 @@ import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import type { InitiateWriteResponse, RejectionReason, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
+import type { InitiateWriteResponse, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
 
 export type Key = { hashKey: string; sortKey: string };
 
@@ -21,8 +21,6 @@ export type WriteOutcome =
 			transactionId: string;
 			idempotencyToken: string;
 			results: TransactWriteOperationResult[];
-			/** The reason of the first rejected entry, in request order. */
-			firstRejection: RejectionReason | undefined;
 	  };
 
 /**
@@ -39,7 +37,6 @@ export async function writeOutcome(write: Promise<InitiateWriteResponse>): Promi
 			transactionId: e.attributes.transactionId as string,
 			idempotencyToken: e.attributes.idempotencyToken as string,
 			results: e.results,
-			firstRejection: e.results.flatMap((r) => (r.outcome === "rejected" ? [r.reason] : []))[0],
 		};
 	}
 }

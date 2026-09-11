@@ -3,6 +3,7 @@ import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, make
 import invariant from "../../src/shared/invariant.js";
 import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import type { ParticipantOperationResultEncoded, TransactWriteItemsOptions } from "../../src/shared/transaction-types.js";
+import { fokosErrorWith } from "../errors-matchers.js";
 
 describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operation results", () => {
 	it("validates returnValuesOnConditionCheckFailure at the boundary", async () => {
@@ -21,7 +22,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 					],
 				}),
 			),
-		).rejects.toThrow(/returnValuesOnConditionCheckFailure must be 'none' or 'all_old'/);
+		).rejects.toThrow(fokosErrorWith("return_values_option_invalid"));
 	});
 
 	it("committed transaction does not return a results array", async () => {
@@ -77,12 +78,6 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
-
-			expect(res.firstRejection!).toMatchObject({
-				code: "condition_failed",
-				hashKey: hk,
-				sortKey: "item-2",
-			});
 
 			expect(res.results).toHaveLength(2);
 			expect(res.results[0]).toEqual({ outcome: "passed" });
@@ -188,12 +183,6 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(res.outcome).toBe("cancelled");
 			if (res.outcome !== "cancelled") return;
 
-			// The first rejection in request order is op 0.
-			expect(res.firstRejection!).toMatchObject({
-				code: "condition_failed",
-				hashKey: k1.hashKey,
-			});
-
 			// 3 results in request order
 			expect(res.results).toHaveLength(3);
 
@@ -292,7 +281,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 						items: [op2, op1],
 					}),
 				),
-			).rejects.toThrow(/clientRequestToken was already used for a different set of operations/);
+			).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
 		});
 
 		it("rejects token reuse when returnValuesOnConditionCheckFailure changes", async () => {
@@ -327,7 +316,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 						items: [{ ...op1, returnValuesOnConditionCheckFailure: "all_old" }, op2],
 					}),
 				),
-			).rejects.toThrow(/clientRequestToken was already used for a different set of operations/);
+			).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
 		});
 
 		it("round-trips binary keys and binary data through coordinator results", async () => {
@@ -472,13 +461,15 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			expect(codesOf(one)).toEqual(["rejected", "passed", "rejected", "passed"]);
 			expect(codesOf(many)).toEqual(codesOf(one));
 
-			// The same images come back on both layouts, and so does the first rejection.
+			// The same images and the same reasons come back on both layouts.
 			const imagesOf = (res: Awaited<ReturnType<typeof runOver>>) =>
 				res.results.map((r) => (r.outcome === "rejected" && r.reason.code === "condition_failed" ? r.reason.item?.data : undefined));
 			expect(imagesOf(one)).toEqual(["stored-0", undefined, "stored-2", undefined]);
 			expect(imagesOf(many)).toEqual(imagesOf(one));
-			expect(one.firstRejection!.code).toBe("condition_failed");
-			expect(many.firstRejection!.code).toBe(one.firstRejection!.code);
+			const reasonCodesOf = (res: Awaited<ReturnType<typeof runOver>>) =>
+				res.results.map((r) => (r.outcome === "rejected" ? r.reason.code : undefined));
+			expect(reasonCodesOf(one)).toEqual(["condition_failed", undefined, "condition_failed", undefined]);
+			expect(reasonCodesOf(many)).toEqual(reasonCodesOf(one));
 			for (const res of [one, many]) {
 				expect(res.results.every((r) => r.outcome !== "rejected" || r.itemOmitted === undefined)).toBe(true);
 			}

@@ -121,7 +121,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(missingRes).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: missingKey.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: missingKey.hashKey } }],
 		});
 
 		const textRes = await writeOutcome(
@@ -131,7 +131,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(textRes).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: textKey.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: textKey.hashKey } }],
 		});
 
 		const bytesRes = await writeOutcome(
@@ -141,7 +141,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(bytesRes).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: bytesKey.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: bytesKey.hashKey } }],
 		});
 	});
 
@@ -164,7 +164,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(res1).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
 
 		// set on an index past end
@@ -181,7 +181,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(res2).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
 
 		// set on scalar parent
@@ -198,7 +198,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(res3).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
 	});
 
@@ -222,7 +222,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(missingOperand).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
 
 		// JSON holds no Infinity and no NaN, so an arithmetic result that is not finite rejects too.
@@ -251,7 +251,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(overflow).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "update_not_applicable", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
 		});
 
 		// Neither rejection wrote anything.
@@ -341,7 +341,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		expect(res).toMatchObject({
 			outcome: "cancelled",
-			firstRejection: { code: "item_too_large", hashKey: key.hashKey },
+			results: [{ outcome: "rejected", reason: { code: "item_too_large", hashKey: key.hashKey } }],
 		});
 	});
 

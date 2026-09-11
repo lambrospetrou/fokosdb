@@ -8,6 +8,7 @@ import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
+import { fokosErrorWith } from "../../test/errors-matchers.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -47,7 +48,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("uses and validates an explicit numTxCoordinators value", () => {
 			expect(makeDBFor(ns, { rootTreesN: 3, numTxCoordinators: 5 }).options().numTxCoordinators).toBe(5);
 			for (const numTxCoordinators of [0, -1, 1.5]) {
-				expect(() => makeDBFor(ns, { numTxCoordinators })).toThrow(/numTxCoordinators must be an integer greater or equal to 1/);
+				expect(() => makeDBFor(ns, { numTxCoordinators })).toThrow(fokosErrorWith("num_tx_coordinators_invalid"));
 			}
 		});
 
@@ -91,9 +92,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {
 			const db = makeDB();
-			await expect(db.putItem({ hashKey: "invalid-ttl", data: "v", ttlAt })).rejects.toThrow(/ttlAt/);
+			await expect(db.putItem({ hashKey: "invalid-ttl", data: "v", ttlAt })).rejects.toThrow(fokosErrorWith("ttl_at_invalid"));
 			await expect(db.transactWriteItems({ items: [{ hashKey: "invalid-ttl-tx", operation: "put", data: "v", ttlAt }] })).rejects.toThrow(
-				/ttlAt/,
+				fokosErrorWith("ttl_at_invalid"),
 			);
 		});
 
@@ -249,7 +250,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			expect(first.cursor).toBeDefined();
 
 			// Same cursor, different queries[] → fingerprint mismatch.
-			await expect(db.queryItems({ queries: [{ hashKey: "bob" }], cursor: first.cursor })).rejects.toThrow(/fingerprint mismatch/);
+			await expect(db.queryItems({ queries: [{ hashKey: "bob" }], cursor: first.cursor })).rejects.toThrow(
+				fokosErrorWith("cursor_fingerprint_mismatch"),
+			);
 		});
 
 		it("rejects a cursor whose direction differs from the resumed request", async () => {
@@ -260,18 +263,20 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			expect(first.cursor).toBeDefined();
 
 			await expect(db.queryItems({ queries: [{ hashKey: "alice", scanIndexForward: false }], cursor: first.cursor })).rejects.toThrow(
-				/direction mismatch/,
+				fokosErrorWith("cursor_direction_mismatch"),
 			);
 		});
 
 		it("rejects a malformed cursor", async () => {
 			const db = makeDB();
-			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: "not-a-real-cursor!!" })).rejects.toThrow(/cursor/);
+			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: "not-a-real-cursor!!" })).rejects.toThrow(
+				fokosErrorWith("cursor_malformed"),
+			);
 		});
 
 		it("errors on an empty queries list", async () => {
 			const db = makeDB();
-			await expect(db.queryItems({ queries: [] })).rejects.toThrow(/must not be empty/);
+			await expect(db.queryItems({ queries: [] })).rejects.toThrow(fokosErrorWith("query_queries_empty"));
 		});
 	});
 
@@ -440,7 +445,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const circular: Record<string, unknown> = {};
 			circular.self = circular;
 			// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
-			await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(/not JSON-serializable/);
+			await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(
+				fokosErrorWith("item_data_not_json_serializable"),
+			);
 		});
 
 		// `JsonComposite` accepts arrays and objects only. TypeScript says so; these pin that the
@@ -453,7 +460,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			["a function", () => {}],
 		])("rejects %s as top-level data, in putItem and transactWriteItems alike", async (_name, data) => {
 			const db = makeDB();
-			const expected = /data must be an object, array, string or Uint8Array/;
+			const expected = fokosErrorWith("item_data_wrong_type");
 
 			await expect(db.putItem({ hashKey: "k", sortKey: "prim", data: data as never })).rejects.toThrow(expected);
 			await expect(
@@ -467,7 +474,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			const data = { toJSON: () => undefined };
 			await expect(db.putItem({ hashKey: "k", sortKey: "tojson", data: data as never })).rejects.toThrow(
-				/not JSON-serializable \(its toJSON\(\) returned undefined\)/,
+				fokosErrorWith("item_data_not_json_serializable"),
 			);
 		});
 	});
@@ -516,7 +523,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 						items: [{ hashKey: "token-limit", operation: "put", data: "value" }],
 						clientRequestToken: `${"é".repeat(32)}x`,
 					}),
-				).rejects.toThrow(/clientRequestToken exceeds 64 bytes/);
+				).rejects.toThrow(fokosErrorWith("client_request_token_invalid", { limitBytes: 64 }));
 				expect(initiateWrite).not.toHaveBeenCalled();
 			} finally {
 				initiateWrite.mockRestore();
@@ -527,16 +534,18 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			const tooBig = new Uint8Array(MAX_ITEM_BYTES + 1);
 
-			await expect(db.putItem({ hashKey: "big", data: tooBig })).rejects.toThrow(/item data exceeds 400 KB/);
+			await expect(db.putItem({ hashKey: "big", data: tooBig })).rejects.toThrow(fokosErrorWith("item_data_too_large"));
 			await expect(db.transactWriteItems({ items: [{ hashKey: "big", operation: "put", data: tooBig }] })).rejects.toThrow(
-				/item data exceeds 400 KB/,
+				fokosErrorWith("item_data_too_large"),
 			);
 
 			// Between the two ceilings: under the client's data check, over the store's row measure. The
 			// non-transactional putItem is the only caller with no earlier pass, so the store's guard is
 			// its answer, and it must leave the item absent.
 			const overRow = new Uint8Array(MAX_ITEM_BYTES);
-			await expect(db.putItem({ hashKey: "over-row", data: overRow })).rejects.toThrow(/stored item exceeds 400 KB/);
+			await expect(db.putItem({ hashKey: "over-row", data: overRow })).rejects.toThrow(
+				fokosErrorWith("item_too_large", { hashKey: "over-row" }),
+			);
 			await expect(db.getItem({ hashKey: "over-row" })).resolves.toMatchObject({ found: false });
 
 			// Exactly at the limit is accepted by both.
@@ -553,8 +562,8 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("caps the transactGetItems item count like the write path", async () => {
 			const db = makeDB();
 			const items = Array.from({ length: MAX_ITEMS_PER_TX + 1 }, (_, i) => ({ hashKey: `k-${i}` }));
-			await expect(db.transactGetItems({ items })).rejects.toThrow(/at most 100 items/);
-			await expect(db.transactGetItems({ items: [] })).rejects.toThrow(/at least 1 item/);
+			await expect(db.transactGetItems({ items })).rejects.toThrow(fokosErrorWith("transact_items_too_many", { limit: 100 }));
+			await expect(db.transactGetItems({ items: [] })).rejects.toThrow(fokosErrorWith("transact_items_empty"));
 		});
 
 		it("rejects in queryItems the hash keys that putItem rejects", async () => {
@@ -575,7 +584,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				{ op: "between", lower: "a", upper: bad },
 				{ op: "range", lower: { value: bad, inclusive: true } },
 			] as const) {
-				await expect(db.queryItems({ queries: [{ hashKey: "hk", sortKeyCondition }] })).rejects.toThrow(/sortKey must not contain the NUL/);
+				await expect(db.queryItems({ queries: [{ hashKey: "hk", sortKeyCondition }] })).rejects.toThrow(
+					fokosErrorWith("key_contains_nul", { key: "sortKey" }),
+				);
 			}
 		});
 

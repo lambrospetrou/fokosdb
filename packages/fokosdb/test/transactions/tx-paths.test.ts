@@ -158,7 +158,10 @@ describe("transactions - single-partition fast path", () => {
 		);
 
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
-		expect(result).toMatchObject({ outcome: "cancelled", firstRejection: { code: "condition_failed", hashKey: keys[1].hashKey } });
+		expect(result).toMatchObject({
+			outcome: "cancelled",
+			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "condition_failed", hashKey: keys[1].hashKey } }],
+		});
 		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: false });
 	});
 
@@ -255,7 +258,10 @@ describe("transactions - the item size limit is enforced before any write", () =
 			}),
 		);
 
-		expect(res).toMatchObject({ outcome: "cancelled", firstRejection: { code: "item_too_large", hashKey: over.hashKey } });
+		expect(res).toMatchObject({
+			outcome: "cancelled",
+			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "item_too_large", hashKey: over.hashKey } }],
+		});
 		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
 		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
 	});
@@ -276,7 +282,10 @@ describe("transactions - the item size limit is enforced before any write", () =
 			}),
 		);
 
-		expect(res).toMatchObject({ outcome: "cancelled", firstRejection: { code: "item_too_large", hashKey, sortKey: "over" } });
+		expect(res).toMatchObject({
+			outcome: "cancelled",
+			results: [{ outcome: "passed" }, { outcome: "rejected", reason: { code: "item_too_large", hashKey, sortKey: "over" } }],
+		});
 		await expect(db.getItem(fits)).resolves.toMatchObject({ found: false });
 		await expect(db.getItem(over)).resolves.toMatchObject({ found: false });
 	});

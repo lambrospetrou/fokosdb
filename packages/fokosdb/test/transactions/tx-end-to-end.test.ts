@@ -59,8 +59,8 @@ describe("write conditions", () => {
 			args: [{ ref: "data", path: "$.status" }, { val: "disabled" }],
 		} as const satisfies ConditionExpression;
 
-		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(/condition failed/);
-		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(/condition failed/);
+		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
+		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version: 1 } });
 	});
 });
@@ -639,7 +639,7 @@ describe("transactions - end-to-end", () => {
 		expect(await writeOutcome(db.transactWriteItems({ items: [operation], clientRequestToken: token }))).toEqual(first);
 		await expect(
 			writeOutcome(db.transactWriteItems({ items: [{ ...operation, ttlAt: ttlAt + 1 }], clientRequestToken: token })),
-		).rejects.toThrow(/was already used for a different set of operations/);
+		).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
 		expect(await db.getItem(key)).toMatchObject({ found: true, item: { ttlAt, version: 1 } });
 	});
 
@@ -707,7 +707,7 @@ describe("transactions - end-to-end", () => {
 					clientRequestToken: token,
 				}),
 			),
-		).rejects.toThrow(/was already used for a different set of operations/);
+		).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
 
 		// A different operation SET is rejected too, not just a different payload.
 		await expect(
@@ -717,7 +717,7 @@ describe("transactions - end-to-end", () => {
 					clientRequestToken: token,
 				}),
 			),
-		).rejects.toThrow(/was already used for a different set of operations/);
+		).rejects.toThrow(fokosErrorWith("idempotent_parameter_mismatch"));
 
 		// The stored transaction is untouched: still the original value, still version 1.
 		const item = await db.getItem({ hashKey: "mismatch-1" });

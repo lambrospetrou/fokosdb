@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { FokosConditionCheckError } from "../src/shared/errors-operations.js";
 import { makeDB } from "./transactions/tx-helpers.js";
+import { fokosErrorWith } from "./errors-matchers.js";
 
 describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () => {
 	it("rejects invalid returnValuesOnConditionCheckFailure value at client boundary", async () => {
@@ -14,7 +15,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				// @ts-expect-error test runtime validation of invalid value
 				returnValuesOnConditionCheckFailure: "invalid_option",
 			}),
-		).rejects.toThrow(/returnValuesOnConditionCheckFailure must be 'none' or 'all_old'/);
+		).rejects.toThrow(fokosErrorWith("return_values_option_invalid"));
 
 		await expect(
 			db.deleteItem({
@@ -22,7 +23,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 				// @ts-expect-error test runtime validation of invalid value
 				returnValuesOnConditionCheckFailure: "invalid_option",
 			}),
-		).rejects.toThrow(/returnValuesOnConditionCheckFailure must be 'none' or 'all_old'/);
+		).rejects.toThrow(fokosErrorWith("return_values_option_invalid"));
 	});
 
 	describe("a failed condition returns the stored item across all three data kinds", () => {
@@ -47,7 +48,7 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 
 			expect(FokosConditionCheckError.is(caughtError)).toBe(true);
 			const err = caughtError as FokosConditionCheckError;
-			expect(err.message).toContain("condition failed");
+			expect(err.code).toBe("condition_failed");
 			expect(err.reason).toMatchObject({
 				code: "condition_failed",
 				hashKey: key.hashKey,
