@@ -7,30 +7,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { PartitionDO } from "../src/server/do-partition.js";
-
-/**
- * A minimal tagged error with the shape the error handling design uses: the tag and every field are
- * own properties, assigned in the constructor, and the only prototype member holds no data.
- */
-export class ProbeError extends Error {
-	static readonly tag = "ProbeError";
-	readonly _tag: string;
-	readonly code: string;
-	readonly errorId: string;
-
-	constructor(fields: { message: string; code: string; errorId: string; cause?: unknown }) {
-		super(fields.message, fields.cause === undefined ? undefined : { cause: fields.cause });
-		Object.setPrototypeOf(this, new.target.prototype);
-		this.name = ProbeError.tag;
-		this._tag = ProbeError.tag;
-		this.code = fields.code;
-		this.errorId = fields.errorId;
-	}
-
-	toWire(): { name: string; code: string; errorId: string } {
-		return { name: this.name, code: this.code, errorId: this.errorId };
-	}
-}
+import { FOKOS_ERROR_CATEGORIES, FOKOS_ERROR_REGISTRY, FokosError, FokosInternalError, type FokosErrorCode } from "../src/shared/errors.js";
 
 export { PartitionDO } from "../src/server/do-partition.js";
 export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
@@ -46,15 +23,30 @@ export default {
 } satisfies ExportedHandler<Env>;
 
 /**
- * Probe used by `test/tagged-error-rpc.test.ts`. It raises a `TaggedError` so the test can observe
- * what a Workers RPC hop keeps and what it drops. It stores nothing.
+ * Probe used by `test/tagged-error-rpc.test.ts`. It raises errors so the test can observe what a
+ * Workers RPC hop keeps and what it drops. It stores nothing.
  */
-export class ErrorProbeDO extends DurableObject {
-	async raiseTagged(): Promise<never> {
-		throw new ProbeError({ message: "probe failed", code: "probe_code", errorId: "e_abc123_deadbeef" });
+export class ErrorProbeDO extends DurableObject<Env> {
+	async raise(code: FokosErrorCode, attributes: Record<string, unknown>): Promise<never> {
+		const Category = FOKOS_ERROR_CATEGORIES.get(FOKOS_ERROR_REGISTRY[code].tag)!;
+		throw new Category({ code, message: "probe failed", attributes });
 	}
 
-	async raiseWithNestedCause(): Promise<never> {
-		throw new ProbeError({ message: "outer", code: "outer_code", errorId: "e_zzz999_cafe", cause: new Error("inner") });
+	async raiseWithCause(): Promise<never> {
+		throw new FokosInternalError({ code: "partition_fanout_failed", message: "outer", cause: new Error("inner") });
+	}
+
+	async raiseForeign(): Promise<never> {
+		throw Object.assign(new Error("platform fault"), { retryable: true, overloaded: false });
+	}
+
+	/** A second hop: calls another probe and rethrows what it receives, the way a forwarding partition does. */
+	async relay(target: string, code: FokosErrorCode): Promise<never> {
+		try {
+			await this.env.ERROR_PROBE_DO.getByName(target).raise(code, {});
+		} catch (e) {
+			throw FokosError.wrap(e);
+		}
+		throw new Error("the probe did not throw");
 	}
 }

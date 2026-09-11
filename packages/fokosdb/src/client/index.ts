@@ -20,3 +20,17 @@ export { ExpressionError } from "../shared/expression/errors.js";
 export { compileConditionExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
 
 export { ConditionCheckFailedError } from "../shared/partition-errors.js";
+
+export {
+	FokosError,
+	FokosValidationError,
+	FokosExpressionError,
+	FokosConditionCheckError,
+	FokosConflictError,
+	FokosTransactionCancelledError,
+	FokosUnavailableError,
+	FokosTransactionPendingError,
+	FokosRoutingError,
+	FokosInternalError,
+} from "../shared/errors.js";
+export type { FokosAnyError, FokosErrorCode, FokosErrorCodeOf, FokosErrorOrigin, FokosErrorTag, FokosErrorWire } from "../shared/errors.js";
