@@ -92,6 +92,8 @@ export type RejectionReasonOf<I = ConditionCheckImage> =
 
 export type RejectionReasonEncoded = RejectionReasonOf<ConditionCheckImageEncoded>;
 export type RejectionReason = RejectionReasonOf<ConditionCheckImage>;
+/** The reason `putItem` and `deleteItem` carry when their condition fails. */
+export type ConditionFailedReason = Extract<RejectionReason, { type: "condition_failed" }>;
 
 /** Wire variant. `imageBytes` is coordinator bookkeeping, which db.ts strips. */
 export type TransactWriteOperationResultEncoded =

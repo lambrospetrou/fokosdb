@@ -13,6 +13,7 @@ import {
 	InitiateWriteResponse,
 	JsonComposite,
 	JsonValue,
+	OperationMetrics,
 	PutItemOptions,
 	PutItemResult,
 	QueryItemsMeta,
@@ -26,7 +27,6 @@ import type { TransactionCoordinatorDO } from "../server/do-transaction-coordina
 import type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
 import type {
 	InitiateReadResponseEncoded,
-	InitiateWriteResponseEncoded,
 	ReadForTransactionItemResultEncoded,
 	RejectionReason,
 	RejectionReasonEncoded,
@@ -50,7 +50,8 @@ import {
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 } from "../shared/transaction-limits.js";
-import { ConditionCheckFailedError } from "../shared/partition-errors.js";
+import { FokosConditionCheckError, FokosInternalError, FokosValidationError, withExpressionErrors } from "../shared/errors.js";
+import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
 import { normalizeSkInterval } from "../shared/query/sk-interval.js";
@@ -73,19 +74,26 @@ function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemD
 	// Accepting a primitive silently would make the declared type a lie, and taking it back later would be
 	// breaking — whereas relaxing this check later is not.
 	if (data === null || typeof data !== "object") {
-		throw new Error(`fokos: data must be an object, array, string or Uint8Array (got ${data === null ? "null" : typeof data})`);
+		throw new FokosValidationError({
+			code: "item_data_wrong_type",
+			message: "data must be an object, array, string or Uint8Array",
+			attributes: { type: data === null ? "null" : typeof data },
+		});
 	}
 	let text: string;
 	try {
 		text = JSON.stringify(data);
 	} catch (err) {
-		// A circular reference or a BigInt. Only JSON.stringify knows which, so quote it.
-		throw new Error(`fokos: data is not JSON-serializable (${String(err)})`, { cause: err });
+		// A circular reference or a BigInt. Only JSON.stringify knows which, so the cause keeps its error.
+		throw new FokosValidationError({ code: "item_data_not_json_serializable", message: "data is not JSON-serializable", cause: err });
 	}
 	// The guard above rules out every value that JSON.stringify drops, with one exception: a `toJSON`
 	// that itself returns undefined (or a function, or a symbol) makes the WHOLE document undefined.
 	if (text === undefined) {
-		throw new Error("fokos: data is not JSON-serializable (its toJSON() returned undefined)");
+		throw new FokosValidationError({
+			code: "item_data_not_json_serializable",
+			message: "data is not JSON-serializable (its toJSON() returned undefined)",
+		});
 	}
 	return { kind: "json", data: text };
 }
@@ -103,7 +111,11 @@ function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): 
 			error: String(err),
 			errorProps: err,
 		});
-		throw new Error("fokos: failed to parse json item data returned by the store", { cause: err });
+		throw new FokosInternalError({
+			code: "item_data_parse_failed",
+			message: "failed to parse json item data returned by the store",
+			cause: err,
+		});
 	}
 }
 
@@ -120,6 +132,22 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 	return reason as RejectionReason;
 }
 
+/** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
+function conditionCheckError(
+	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+	res: { reason: RejectionReasonEncoded; meta: OperationMetrics & PartitionInfoInternal },
+): FokosConditionCheckError {
+	const reason = decodeRejectionReason(res.reason);
+	invariant(reason.type === "condition_failed", "an item RPC rejects only a failed condition");
+	return new FokosConditionCheckError({
+		code: "condition_failed",
+		message: "condition failed",
+		attributes: { hashKey: keys.hashKey, sortKey: keys.sortKey },
+		reason,
+		meta: publicMeta(res.meta),
+	});
+}
+
 function decodeOperationResult(res: TransactWriteOperationResultEncoded): TransactWriteOperationResult {
 	if (res.outcome === "passed") return { outcome: "passed" };
 	if (res.outcome === "not_evaluated") return { outcome: "not_evaluated" };
@@ -132,8 +160,13 @@ function decodeOperationResult(res: TransactWriteOperationResultEncoded): Transa
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
 	if (ttlAt === undefined) return;
-	if (!Number.isInteger(ttlAt)) throw new Error(`fokos: ${where} ttlAt must be an integer`);
-	if (ttlAt <= 0) throw new Error(`fokos: ${where} ttlAt must be greater than zero`);
+	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
+		throw new FokosValidationError({
+			code: "ttl_at_invalid",
+			message: "ttlAt must be an integer greater than zero",
+			attributes: { api: where, ttlAt },
+		});
+	}
 }
 
 export type FokosDBOptions = {
@@ -182,7 +215,11 @@ export class FokosDB {
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
 		if (!Number.isInteger(this.#options.numTxCoordinators) || this.#options.numTxCoordinators <= 0) {
-			throw new Error("fokosdb: numTxCoordinators must be an integer greater or equal to 1");
+			throw new FokosValidationError({
+				code: "num_tx_coordinators_invalid",
+				message: "numTxCoordinators must be an integer greater or equal to 1",
+				attributes: { numTxCoordinators: this.#options.numTxCoordinators },
+			});
 		}
 		this.#staticShardedTCs = new StaticShardedDO(this.#options.transactionCoordinatorNs, {
 			numShards: this.#options.numTxCoordinators,
@@ -202,7 +239,7 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const encoded = encodeItemData(opts.data);
-		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
+		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
@@ -217,9 +254,7 @@ export class FokosDB {
 			condition,
 			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 		});
-		if (res.outcome === "rejected") {
-			throw new ConditionCheckFailedError(decodeRejectionReason(res.reason), publicMeta(res.meta));
-		}
+		if (res.outcome === "rejected") throw conditionCheckError(opts, res);
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
@@ -248,7 +283,7 @@ export class FokosDB {
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
-		const condition = opts.condition ? compileConditionExpression(opts.condition) : undefined;
+		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
 		const res = await stub.apiDeleteItem(partitionContext, {
@@ -257,9 +292,7 @@ export class FokosDB {
 			condition,
 			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 		});
-		if (res.outcome === "rejected") {
-			throw new ConditionCheckFailedError(decodeRejectionReason(res.reason), publicMeta(res.meta));
-		}
+		if (res.outcome === "rejected") throw conditionCheckError(opts, res);
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}
@@ -270,10 +303,10 @@ export class FokosDB {
 		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
 		// field set on a non-put by a non-TypeScript caller stays present so validation rejects it.
 		const prepared = opts.items.map((item) => {
-			const condition = item.condition ? compileConditionExpression(item.condition) : undefined;
+			const condition = item.condition ? withExpressionErrors(() => compileConditionExpression(item.condition!)) : undefined;
 			if (item.operation === "update") {
 				validateTtlAt(item.ttlAt, "transactWriteItems");
-				const update = compileUpdateExpression(item.update);
+				const update = withExpressionErrors(() => compileUpdateExpression(item.update));
 				return { ...item, update, condition };
 			}
 			if (item.operation !== "put") return { ...item, condition };
@@ -537,13 +570,21 @@ export class FokosDB {
 
 	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
 		if (opts.queries.length === 0) {
-			throw new Error("fokos/queryItems: queries must not be empty");
+			throw new FokosValidationError({ code: "query_queries_empty", message: "queries must not be empty" });
 		}
 		if (opts.limit !== undefined && (!Number.isSafeInteger(opts.limit) || opts.limit <= 0)) {
-			throw new Error("fokos/queryItems: limit must be a positive integer when provided");
+			throw new FokosValidationError({
+				code: "query_limit_invalid",
+				message: "limit must be a positive integer when provided",
+				attributes: { limit: opts.limit },
+			});
 		}
 		if (opts.maxPageBytes !== undefined && (!Number.isSafeInteger(opts.maxPageBytes) || opts.maxPageBytes <= 0)) {
-			throw new Error("fokos/queryItems: maxPageBytes must be a positive integer when provided");
+			throw new FokosValidationError({
+				code: "query_max_page_bytes_invalid",
+				message: "maxPageBytes must be a positive integer when provided",
+				attributes: { maxPageBytes: opts.maxPageBytes },
+			});
 		}
 
 		const normalizedQueries = opts.queries.map((q) => {
@@ -569,10 +610,25 @@ export class FokosDB {
 		let startInner: DecodedCursor["inner"] = null;
 		if (opts.cursor !== undefined) {
 			const decoded = decodeCursor(opts.cursor);
-			if (decoded.queryIdx >= normalizedQueries.length) throw new Error("fokos/queryItems: cursor queryIdx out of range");
-			if (decoded.direction !== normalizedQueries[decoded.queryIdx].cursorDirection)
-				throw new Error("fokos/queryItems: cursor direction mismatch — scanIndexForward differs from the page that issued this cursor");
-			if (decoded.fingerprint !== fingerprint) throw new Error("fokos/queryItems: cursor fingerprint mismatch — re-send the same request");
+			if (decoded.queryIdx >= normalizedQueries.length) {
+				throw new FokosValidationError({
+					code: "cursor_query_index_out_of_range",
+					message: "cursor queryIdx out of range",
+					attributes: { queryIdx: decoded.queryIdx, queries: normalizedQueries.length },
+				});
+			}
+			if (decoded.direction !== normalizedQueries[decoded.queryIdx].cursorDirection) {
+				throw new FokosValidationError({
+					code: "cursor_direction_mismatch",
+					message: "cursor direction mismatch — scanIndexForward differs from the page that issued this cursor",
+				});
+			}
+			if (decoded.fingerprint !== fingerprint) {
+				throw new FokosValidationError({
+					code: "cursor_fingerprint_mismatch",
+					message: "cursor fingerprint mismatch — re-send the same request",
+				});
+			}
 			startQueryIdx = decoded.queryIdx;
 			startInner = decoded.inner;
 		}

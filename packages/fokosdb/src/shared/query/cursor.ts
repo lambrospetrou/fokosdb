@@ -1,6 +1,11 @@
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { hash64 } from "../hash-primitives.js";
 import type { SkInterval } from "./sk-interval.js";
+import { FokosValidationError } from "../errors.js";
+
+function cursorMalformed(message: string, cause?: unknown): FokosValidationError {
+	return new FokosValidationError({ code: "cursor_malformed", message, cause });
+}
 
 export const CURSOR_VERSION = 1;
 
@@ -42,17 +47,20 @@ export function decodeCursor(s: string): DecodedCursor {
 	let wire: CursorWire;
 	try {
 		wire = JSON.parse(new TextDecoder().decode(Uint8Array.fromBase64(s, { alphabet: "base64url" })));
-	} catch {
-		throw new Error("fokos/queryItems: cursor is not valid base64url-encoded JSON");
+	} catch (e) {
+		throw cursorMalformed("cursor is not valid base64url-encoded JSON", e);
 	}
-	if (wire.v !== CURSOR_VERSION) throw new Error(`fokos/queryItems: unknown cursor version ${wire.v}`);
-	if (wire.d !== "fwd" && wire.d !== "rev") throw new Error("fokos/queryItems: cursor has invalid direction");
-	if (!Number.isSafeInteger(wire.qi) || wire.qi < 0) throw new Error("fokos/queryItems: cursor has invalid queryIdx");
+	if (typeof wire !== "object" || wire === null) throw cursorMalformed("cursor is not valid base64url-encoded JSON");
+	if (wire.v !== CURSOR_VERSION) {
+		throw new FokosValidationError({ code: "cursor_version_unknown", message: "unknown cursor version", attributes: { version: wire.v } });
+	}
+	if (wire.d !== "fwd" && wire.d !== "rev") throw cursorMalformed("cursor has invalid direction");
+	if (!Number.isSafeInteger(wire.qi) || wire.qi < 0) throw cursorMalformed("cursor has invalid queryIdx");
 	let fingerprint: bigint;
 	try {
 		fingerprint = BigInt(wire.fp);
-	} catch {
-		throw new Error("fokos/queryItems: cursor has invalid fingerprint");
+	} catch (e) {
+		throw cursorMalformed("cursor has invalid fingerprint", e);
 	}
 	let inner: DecodedCursor["inner"] = null;
 	if (wire.inner !== null) {
@@ -62,8 +70,8 @@ export function decodeCursor(s: string): DecodedCursor {
 				sortKey: KeyCodec.asKeyBytes(Uint8Array.fromBase64(wire.inner.sk, { alphabet: "base64url" })),
 				inclusive: !!wire.inner.incl,
 			};
-		} catch {
-			throw new Error("fokos/queryItems: cursor has invalid inner resume position");
+		} catch (e) {
+			throw cursorMalformed("cursor has invalid inner resume position", e);
 		}
 	}
 	return { version: wire.v, direction: wire.d, fingerprint, queryIdx: wire.qi, inner };

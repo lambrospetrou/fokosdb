@@ -15,6 +15,7 @@
  */
 
 import { hash64 } from "../hash-primitives.js";
+import { FokosValidationError } from "../errors.js";
 
 declare const KEY_BRAND: unique symbol;
 export type KeyBytes = Uint8Array & { readonly [KEY_BRAND]: true };
@@ -50,16 +51,19 @@ function asKeyBytes(bytes: Uint8Array): KeyBytes {
 function encode(key: string | Uint8Array): KeyBytes {
 	if (typeof key === "string") {
 		if (key.length === 0) {
-			throw new Error("fokos/KeyCodec.encode: empty string key is not allowed");
+			throw new FokosValidationError({ code: "key_encode_empty", message: "a key must not be an empty string" });
 		}
 		// isWellFormed() is false iff the string contains a lone surrogate (invalid UTF-16).
 		if (key.isWellFormed?.() === false) {
-			throw new Error("fokos/KeyCodec.encode: key string contains a lone surrogate (not well-formed UTF-16)");
+			throw new FokosValidationError({
+				code: "key_not_well_formed_utf16",
+				message: "key string contains a lone surrogate (not well-formed UTF-16)",
+			});
 		}
 		return asKeyBytes(textEncoder.encode(key));
 	}
 	if (key.byteLength === 0) {
-		throw new Error("fokos/KeyCodec.encode: empty binary key is not allowed");
+		throw new FokosValidationError({ code: "key_encode_empty", message: "a key must not be an empty binary value" });
 	}
 	const out = new Uint8Array(key.byteLength + 1);
 	out[0] = BINARY_TAG;

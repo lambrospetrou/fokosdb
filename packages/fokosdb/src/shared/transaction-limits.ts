@@ -14,6 +14,7 @@ import type { ParticipantOperationResultEncoded, RejectionReasonEncoded, Transac
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
+import { FokosValidationError } from "./errors.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
 // DynamoDB uses 2KB for hashKey and 1KB for sortKey.
@@ -58,11 +59,18 @@ const textEncoder = new TextEncoder();
 
 export function validateClientRequestToken(token: string): void {
 	if (token.trim().length === 0) {
-		throw new Error("fokosdb: clientRequestToken must be a non-empty string when provided");
+		throw new FokosValidationError({
+			code: "client_request_token_invalid",
+			message: "clientRequestToken must be a non-empty string when provided",
+		});
 	}
 	const bytes = textEncoder.encode(token).byteLength;
 	if (bytes > MAX_CLIENT_REQUEST_TOKEN_BYTES) {
-		throw new Error(`fokosdb: clientRequestToken exceeds ${MAX_CLIENT_REQUEST_TOKEN_BYTES} bytes when UTF-8 encoded (got ${bytes})`);
+		throw new FokosValidationError({
+			code: "client_request_token_invalid",
+			message: `clientRequestToken exceeds ${MAX_CLIENT_REQUEST_TOKEN_BYTES} bytes when UTF-8 encoded`,
+			attributes: { limitBytes: MAX_CLIENT_REQUEST_TOKEN_BYTES, bytes },
+		});
 	}
 }
 
@@ -88,7 +96,11 @@ export function itemDataBytes(data: Uint8Array | string): number {
 export function validateItemDataSize(data: Uint8Array | string, where: string): void {
 	const bytes = itemDataBytes(data);
 	if (bytes > MAX_ITEM_BYTES) {
-		throw new Error(`fokos: ${where} item data exceeds ${MAX_ITEM_BYTES / 1024} KB (got ${bytes})`);
+		throw new FokosValidationError({
+			code: "item_data_too_large",
+			message: `item data exceeds ${MAX_ITEM_BYTES / 1024} KB`,
+			attributes: { api: where, limitBytes: MAX_ITEM_BYTES, bytes },
+		});
 	}
 }
 
@@ -123,10 +135,18 @@ function isEmptyKey(k: string | Uint8Array): boolean {
 export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint8Array): void {
 	if (typeof k !== "string") return;
 	if (k.includes("\0")) {
-		throw new Error(`fokos: ${name} must not contain the NUL (\\0) character`);
+		throw new FokosValidationError({
+			code: "key_contains_nul",
+			message: `${name} must not contain the NUL (\\0) character`,
+			attributes: { key: name },
+		});
 	}
 	if (k.isWellFormed?.() === false) {
-		throw new Error(`fokos: ${name} string contains a lone surrogate (not well-formed UTF-16)`);
+		throw new FokosValidationError({
+			code: "key_not_well_formed_utf16",
+			message: `${name} string contains a lone surrogate (not well-formed UTF-16)`,
+			attributes: { key: name },
+		});
 	}
 }
 
@@ -137,10 +157,10 @@ export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint
  */
 export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string | Uint8Array): void {
 	if (isEmptyKey(hashKey)) {
-		throw new Error("fokos: hashKey must not be empty");
+		throw new FokosValidationError({ code: "hash_key_empty", message: "hashKey must not be empty" });
 	}
 	if (sortKey !== undefined && isEmptyKey(sortKey)) {
-		throw new Error("fokos: sortKey must not be empty (omit it for a single-key item)");
+		throw new FokosValidationError({ code: "sort_key_empty", message: "sortKey must not be empty (omit it for a hash-key only item)" });
 	}
 	validateKeyContent("hashKey", hashKey);
 	if (sortKey !== undefined) {
@@ -152,7 +172,11 @@ export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string 
 export function encodeHashKey(k: string | Uint8Array): KeyBytes {
 	const bytes = KeyCodec.encode(k);
 	if (bytes.byteLength > MAX_HASH_KEY_BYTES) {
-		throw new Error(`fokos: hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+		throw new FokosValidationError({
+			code: "hash_key_too_large",
+			message: `hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded`,
+			attributes: { limitBytes: MAX_HASH_KEY_BYTES, bytes: bytes.byteLength },
+		});
 	}
 	return bytes;
 }
@@ -162,7 +186,11 @@ export function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
 	if (k === undefined) return KeyCodec.encodeOptional(undefined);
 	const bytes = KeyCodec.encode(k);
 	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
-		throw new Error(`fokos: sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded (got ${bytes.byteLength})`);
+		throw new FokosValidationError({
+			code: "sort_key_too_large",
+			message: `sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded`,
+			attributes: { limitBytes: MAX_SORT_KEY_BYTES, bytes: bytes.byteLength },
+		});
 	}
 	return bytes;
 }
@@ -190,34 +218,41 @@ export function validateTransactWriteOperations(
 	ops: readonly TransactWriteOperationLike[],
 ): Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> {
 	if (ops.length === 0) {
-		throw new Error("fokos: transactWriteItems requires at least 1 item");
+		throw new FokosValidationError({ code: "transact_items_empty", message: "transactWriteItems requires at least 1 item" });
 	}
 	if (ops.length > MAX_ITEMS_PER_TX) {
-		throw new Error(`fokos: transactWriteItems supports at most ${MAX_ITEMS_PER_TX} items`);
+		throw new FokosValidationError({
+			code: "transact_items_too_many",
+			message: `transactWriteItems supports at most ${MAX_ITEMS_PER_TX} items`,
+			attributes: { limit: MAX_ITEMS_PER_TX, count: ops.length },
+		});
 	}
 	const seen = new Set<bigint>();
 	const encodedKeys: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> = [];
 	let totalBytes = 0;
-	for (const op of ops) {
+	for (const [opIndex, op] of ops.entries()) {
 		validateItemKeys(op.hashKey, op.sortKey);
 		const hashKey = encodeHashKey(op.hashKey);
 		const sortKey = encodeSortKey(op.sortKey);
-		const at = KeyCodec.pairForLog(hashKey, sortKey);
+		const invalidFields = (message: string) =>
+			new FokosValidationError({
+				code: "transact_operation_fields_invalid",
+				message,
+				attributes: { opIndex, operation: op.operation, hashKey: op.hashKey, sortKey: op.sortKey },
+			});
 		if (op.operation === "put") {
-			if (op.data == null) {
-				throw new Error(`fokos: transactWriteItems "put" operation requires data (${at})`);
-			}
+			if (op.data == null) throw invalidFields(`transactWriteItems "put" operation requires data`);
 		} else if (op.data != null) {
-			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry data (${at})`);
+			throw invalidFields(`transactWriteItems "${op.operation}" operation must not carry data`);
 		}
 		if (op.operation === "check" && !op.condition) {
-			throw new Error(`fokos: transactWriteItems "check" operation requires a condition (${at})`);
+			throw invalidFields(`transactWriteItems "check" operation requires a condition`);
 		}
 		if (op.operation === "update" && !op.update) {
-			throw new Error(`fokos: transactWriteItems "update" operation requires an update plan (${at})`);
+			throw invalidFields(`transactWriteItems "update" operation requires an update plan`);
 		}
 		if (op.operation !== "update" && op.update) {
-			throw new Error(`fokos: transactWriteItems "${op.operation}" operation must not carry an update plan (${at})`);
+			throw invalidFields(`transactWriteItems "${op.operation}" operation must not carry an update plan`);
 		}
 		validateReturnValuesOnConditionCheckFailure(op.returnValuesOnConditionCheckFailure);
 		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
@@ -229,7 +264,11 @@ export function validateTransactWriteOperations(
 		// duplicate. Identity must be taken over the canonical bytes.
 		const identity = KeyCodec.pairKey(hashKey, sortKey);
 		if (seen.has(identity)) {
-			throw new Error(`fokos: transactWriteItems duplicate key (${at})`);
+			throw new FokosValidationError({
+				code: "transact_duplicate_key",
+				message: "transactWriteItems duplicate key",
+				attributes: { opIndex, hashKey: op.hashKey, sortKey: op.sortKey },
+			});
 		}
 		seen.add(identity);
 		if (op.data !== undefined) {
@@ -241,7 +280,11 @@ export function validateTransactWriteOperations(
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {
-		throw new Error(`fokos: transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB`);
+		throw new FokosValidationError({
+			code: "transact_payload_too_large",
+			message: `transactWriteItems total payload exceeds ${MAX_PAYLOAD_BYTES_PER_TX / (1024 * 1024)} MB`,
+			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX, bytes: totalBytes },
+		});
 	}
 	return encodedKeys;
 }
@@ -256,10 +299,14 @@ export function validateTransactWriteOperations(
  */
 export function validateTransactGetItemCount(itemCount: number): void {
 	if (itemCount === 0) {
-		throw new Error("fokos: transactGetItems requires at least 1 item");
+		throw new FokosValidationError({ code: "transact_items_empty", message: "transactGetItems requires at least 1 item" });
 	}
 	if (itemCount > MAX_ITEMS_PER_TX) {
-		throw new Error(`fokos: transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`);
+		throw new FokosValidationError({
+			code: "transact_items_too_many",
+			message: `transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`,
+			attributes: { limit: MAX_ITEMS_PER_TX, count: itemCount },
+		});
 	}
 }
 
@@ -285,7 +332,11 @@ export function singlePartitionTarget<T extends { partitionContext: PartitionCon
 
 export function validateReturnValuesOnConditionCheckFailure(value?: string): void {
 	if (value !== undefined && value !== "none" && value !== "all_old") {
-		throw new Error(`fokos: returnValuesOnConditionCheckFailure must be 'none' or 'all_old' (got '${value}')`);
+		throw new FokosValidationError({
+			code: "return_values_option_invalid",
+			message: "returnValuesOnConditionCheckFailure must be 'none' or 'all_old'",
+			attributes: { value },
+		});
 	}
 }
 

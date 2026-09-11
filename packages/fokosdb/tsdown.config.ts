@@ -16,7 +16,7 @@ const CLIENT_ALLOWED_EXTERNALS = [/^cloudflare:workers$/, /^xxhash-wasm$/, /^dur
  * code, so writing down why something works competes with the budget meant to catch a Durable Object
  * class reaching the client — and that mistake is tens of kB minified, which this still catches.
  */
-const CLIENT_MAX_BYTES = 72 * 1024;
+const CLIENT_MAX_BYTES = 80 * 1024;
 
 export default defineConfig({
 	entry: {

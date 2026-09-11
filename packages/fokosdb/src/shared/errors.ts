@@ -14,6 +14,10 @@
  * The classes live under `shared/` because the client raises and matches on them too.
  */
 
+import type { ExpressionError } from "./expression/errors.js";
+import type { ConditionFailedReason } from "./transaction-types.js";
+import type { OperationMetrics, PartitionInfo } from "./types.js";
+
 export type FokosErrorOrigin = "caller" | "service" | "internal";
 
 export type FokosErrorInit<C extends string = FokosErrorCode> = {
@@ -160,7 +164,30 @@ export abstract class FokosError<T extends string = string, C extends string = F
 		});
 		// The message already carries its `fokos/<code>: ` prefix.
 		err.message = w.message;
+		// A category can hold own fields beyond the base ones, such as `reason` and `meta`. An error that
+		// crossed a hop still has them, so they move to the new instance. A wire record has none.
+		const { name: _name, message: _message, stack: _stack, cause: _cause, ...fields } = w as Record<string, unknown>;
+		Object.assign(err, fields);
 		return err;
+	}
+}
+
+/**
+ * Runs `fn`, and raises an `ExpressionError` from it as a `FokosExpressionError`. The original error is
+ * the `cause`, and its `ExpressionErrorCode` is `attributes.expressionCode`.
+ */
+export function withExpressionErrors<T>(fn: () => T): T {
+	try {
+		return fn();
+	} catch (e) {
+		const expressionError = e as Partial<ExpressionError> | null;
+		if (expressionError?.name !== "ExpressionError") throw e;
+		throw new FokosExpressionError({
+			code: "expression_invalid",
+			message: "expression is not valid",
+			cause: e,
+			attributes: { expressionCode: expressionError.code },
+		});
 	}
 }
 
@@ -176,6 +203,24 @@ export class FokosExpressionError extends FokosError<"FokosExpressionError", Fok
 
 export class FokosConditionCheckError extends FokosError<"FokosConditionCheckError", FokosErrorCodeOf<"FokosConditionCheckError">> {
 	static readonly tag: FokosConditionCheckError["_tag"] = "FokosConditionCheckError";
+	/**
+	 * The same record that a rejected transaction result holds. `reason.item` is the old item image when
+	 * the caller asked for one and the item exists.
+	 */
+	readonly reason: ConditionFailedReason;
+	/** The metrics and the partition info of the request that evaluated the condition. */
+	readonly meta: OperationMetrics & PartitionInfo;
+
+	constructor(
+		init: FokosErrorInit<FokosErrorCodeOf<"FokosConditionCheckError">> & {
+			reason: ConditionFailedReason;
+			meta: OperationMetrics & PartitionInfo;
+		},
+	) {
+		super(init);
+		this.reason = init.reason;
+		this.meta = init.meta;
+	}
 }
 
 export class FokosConflictError extends FokosError<"FokosConflictError", FokosErrorCodeOf<"FokosConflictError">> {
