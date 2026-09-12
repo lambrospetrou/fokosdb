@@ -235,10 +235,10 @@ export type QueryItemsMeta = {
 	partitionsVisited: number;
 };
 
+// Public result surfaced by FokosDB.queryItems. The keys are decoded back to the caller's own form and
+// db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which
+// carries raw key bytes and the stored data representation.
 export type QueryItemsResult = {
-	// FIXME: `data` is the raw stored representation (string | Uint8Array) — the HTTP layer
-	// re-encodes it via `encodeData`. Consider aligning this type with the wire format or
-	// introducing a separate HTTP response type.
 	items: Array<{
 		hashKey: string | Uint8Array;
 		sortKey?: string | Uint8Array;
