@@ -17,8 +17,7 @@ import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
-// DynamoDB uses 2KB for hashKey and 1KB for sortKey.
-// We start stricter and we can raise later.
+// DynamoDB uses 2KB for hashKey and 1KB for sortKey. These limits are stricter and can go up later.
 export const MAX_HASH_KEY_BYTES = 1024;
 export const MAX_SORT_KEY_BYTES = 512;
 

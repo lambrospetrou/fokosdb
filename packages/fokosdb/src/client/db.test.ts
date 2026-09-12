@@ -450,9 +450,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			);
 		});
 
-		// `JsonComposite` accepts arrays and objects only. TypeScript says so; these pin that the
-		// runtime agrees, which is what a JS caller actually meets — a primitive used to be stored
-		// silently as json, making the declared type a lie.
+		// `JsonComposite` accepts arrays and objects only. TypeScript says so, and these pin that the
+		// runtime agrees, which is what a JS caller meets. A primitive stored silently as json would make
+		// the declared type a lie.
 		it.each([
 			["a number", 5],
 			["a boolean", true],

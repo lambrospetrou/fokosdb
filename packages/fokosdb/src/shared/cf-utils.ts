@@ -29,7 +29,7 @@ export type ColoInfo = {
 // across every Durable Object instance that runs in the same V8 isolate, so once
 // this is populated it is reused by all co-located DOs.
 //
-// We deliberately cache the *resolved value*, not the in-flight promise: a pending
+// This caches the *resolved value* deliberately, and not the in-flight promise: a pending
 // `fetch()` promise is bound to the I/O context of the request/DO that started it,
 // and awaiting it from another DO throws "Cannot perform I/O on behalf of a
 // different request". A plain resolved object has no I/O context, so it is safe to

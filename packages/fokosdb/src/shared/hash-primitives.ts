@@ -16,9 +16,9 @@ export const GOLDEN_RATIO_BIGINT = BigInt(0x9e3779b1);
 const SEED_DEPTH_PRIME = 0x85ebca77;
 
 /**
- * Per-depth hash seed (SPEC sharp-edge #1: depth-seeded hashing). We hash the SAME key bytes at every
- * tree level but vary the xxHash seed by depth, so each level is an independent hash stream — the
- * per-level decorrelation we want, with zero per-level allocation (no input concat/temp buffer).
+ * Per-depth hash seed (see docs/ideas/key-ordering-utf8-convergence.md). Every tree level hashes the
+ * SAME key bytes and varies the xxHash seed by depth, so each level is an independent hash stream.
+ * This decorrelates the levels and allocates nothing per level (no input concat, no temp buffer).
  *
  * `seedForDepth(0) === GOLDEN_RATIO`, so root selection (depth 0) and child selection share one rule.
  * Computed in defined 32-bit space (`Math.imul` = true 32-bit multiply, `>>> 0` = unsigned) to avoid

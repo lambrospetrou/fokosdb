@@ -515,7 +515,7 @@ describe("PartitionDO - splitting", () => {
 				}
 				expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" not found in any child`).toBeDefined();
 			}
-			// This might be flaky - but ideally we should have items across more than 1 children.
+			// The split spreads the items over more than one child. A very skewed hash can make this flaky.
 			expect(foundIds.size).toBeGreaterThan(1);
 		});
 

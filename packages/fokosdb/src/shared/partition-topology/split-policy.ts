@@ -205,16 +205,18 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	shouldAllow(_hashKey: KeyBytes, _sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision {
-		// If the split has started but not completed, we should reject requests to the partition to avoid data loss or returning wrong data.
-		// TODO - Keep this in memory to avoid reading it all the time from storage.
+		// After the split starts, the children own the keys. This partition must not serve them itself,
+		// or it returns stale data, so every request forwards.
+		// TODO: Keep this in memory instead of a storage read on every request.
 		const splitStatus = this.#splitState.splitStatus();
 		if (splitStatus && splitStatus.status !== "split_queued") {
 			return "forward";
 		}
 
 		const dbSize = this.#storage.sql.databaseSize;
-		// We allow up to 10% over the max size before we start rejecting requests to avoid flapping around the threshold,
-		// and to allow the requests to complete and trigger the split.
+		// The partition accepts up to 10% above the maximum size before it rejects a write. The margin
+		// stops the decision from flapping at the threshold, and it lets the requests that trigger the
+		// split complete.
 		// Writes only — see OperationIntent for why no other intent can grow the partition.
 		if (
 			intent === "write" &&
@@ -224,7 +226,6 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 			return "reject_over_size";
 		}
 
-		// All good!
 		return "ok";
 	}
 
@@ -462,7 +463,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		const end = this.partitionContext.rangePartition!.endBoundary;
 		const inRange = KeyCodec.compare(sk, start) >= 0 && (end === null || KeyCodec.compare(sk, end) < 0);
 		if (!inRange) {
-			// Out of owned range — routing bug; should not happen via correct routing.
+			// Out of the owned range. Correct routing never reaches this, so it is a routing defect.
 			return "reject_out_of_range";
 		}
 

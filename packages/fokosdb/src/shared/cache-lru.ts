@@ -34,7 +34,7 @@ export class LRUCache<K, V> {
 	}
 
 	set(key: K, value: V): void {
-		// If the key already exists, delete it so that we can re-insert it at the end.
+		// Delete a key that already exists, so that the re-insert puts it at the end.
 		this.map.delete(key);
 		this.map.set(key, value);
 		if (this.map.size > this.capacity) {

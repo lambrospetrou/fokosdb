@@ -197,9 +197,8 @@ describe("PartitionDO — range split", () => {
 			// child.queryItems() → child detects it's still migrating → parent.queryItemsDirect() → …
 			// (infinite loop until the subrequest depth limit is hit).
 			//
-			// The fix makes queryItemsDirect always call queryItemsLocal, bypassing child routing.
-			// We verify this by asserting forwardCount=0: the old code would produce forwardCount=N
-			// (from walkRangeChildren) whether or not children have migrated.
+			// queryItemsDirect always calls queryItemsLocal and bypasses the child routing. forwardCount=0
+			// asserts that: a walk of the children would report one forward per child, migrated or not.
 			const N = 2;
 			const { root, sks } = await makeRangeRoot(N);
 
@@ -232,9 +231,9 @@ describe("PartitionDO — range split", () => {
 			await root.awaitSplitCompleted();
 		});
 
-		// A cursor promises more rows. Both budget exits used to emit one even when the walk had already
-		// covered every child that could contribute, costing the client a round trip that returns nothing.
-		// `db.ts:queryItems` never had this: it emits a cursor only when a later sub-query remains.
+		// A cursor promises more rows, so neither budget exit emits one after the walk covers every child
+		// that can contribute. A cursor there costs the client a round trip that returns nothing.
+		// `db.ts:queryItems` follows the same rule: it emits a cursor only when a later sub-query remains.
 		it("emits no cursor when the byte budget lands on zero at the last leaf", async () => {
 			const N = 4;
 			const { root, sks } = await buildSplitTree(N);

@@ -327,7 +327,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.#ttl.arm(this.fokosTtlConfig().initialDelayMs);
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
-		// We swallow errors — this must never affect the DO's lifecycle.
+		// It swallows the errors, because telemetry must never affect the lifecycle of the DO.
 		setTimeout(() => {
 			void this.fokosGetColoInfo()
 				.then((info) => {
@@ -396,9 +396,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 			this.depth(); // populate #_depth
 
-			// FIXME - 	Improve the state machine of the migration process so that each child partition can immediately start migration
-			// 	       	since now the parent has to be the one triggering the migration by calling triggerMigration() after initFromSplit.
-			//          This is OK but if any other flow runs the background job in the child partition, the migration job will also run.
+			// FIXME: Let a child start its own migration. Today the parent must trigger it with
+			// triggerMigration() after initFromSplit. A child that runs its background job for any other
+			// reason also starts the migration job.
 			// Fallback: alarm fires if the DO is evicted before setTimeout runs.
 			// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 			// Fast path: begin migration in this request's event loop turn.
@@ -474,7 +474,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	async #status(pCtx?: PartitionContextLivePartition) {
-		// The pCtx is only provided during tests, since any other use-case in production should initialize the DO already as part of the public API.
+		// Only a test passes pCtx. In production the public API initializes the DO before this call.
 		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
 		return {
 			depth: this.depth(),
@@ -896,7 +896,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (isRangePartition(childPartitionContext)) {
 			const hk = childPartitionContext.rangePartition.hashKey;
 			if (isHashPartition(pCtx)) {
-				// I am a hash DO; authorize via promoted_keys[hk] === 'promoting'.
+				// This is a hash DO: authorize through promoted_keys[hk] === 'promoting'.
 				const status = this.#promotion.statusFor(hk);
 				invariant(
 					status === "promoting",
@@ -904,7 +904,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				);
 				return this.migrationGetItemsBatchForRange(hk, null, null, opts.cursor);
 			}
-			// Range-split: I am a range DO becoming a router; authorize the child and stream its [start, end) slice.
+			// Range split: this range DO becomes a router. Authorize the child and stream its [start, end) slice.
 			const topology = this.ensureTopology(pCtx);
 			const splitStatus = topology.splitStatus();
 			invariant(
@@ -933,7 +933,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
 		invariant(isKnownChild, `fokos/partition.migrationGetItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
 
-		// Workers RPC has a 32MB limit, and each DO is 128MB memory, so we try to be lean around 20MB here.
+		// Workers RPC caps a message at 32MB and a DO has 128MB of memory, so this batch stays near 20MB.
 		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
 		const PAGE_SIZE = 1000;
 
@@ -1186,9 +1186,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	/**
 	 * Orchestrates the split fan-out: the policy decides (prepareSplit), the DO performs the RPCs
-	 * (boundary rule: only DO classes and FokosDB hold stubs). Failure ordering matches the old
-	 * topology startSplit exactly — if any child init fails we abort BEFORE the split_started KV
-	 * transition, so the retry path is unchanged.
+	 * (boundary rule: only DO classes and FokosDB hold stubs). The failure order matters: when the
+	 * initialization of a child fails, the DO aborts BEFORE the split_started KV transition, which
+	 * keeps the retry path open.
 	 */
 	private async runSplit(topology: PartitionTopologySplitter): Promise<void> {
 		const splitStatus = topology.splitStatus();
@@ -1259,10 +1259,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			}
 		});
 
-		// If any of the initializations fail we abort for now, and retry later.
-		// Ideally even partial initializations should be handled gracefully, but for now we can just rely on retries to get to a consistent state.
-		// The partition DOs should be the source of truth for everything so until the split initialization succeeds, this parent DO is the owner.
-		// FIXME Improve this by allowing some child partitions to not be initialized, which will need a topology router functionality to ask the parent for the context again, which is doable!
+		// The split aborts when the initialization of any child fails, and a later cycle retries it.
+		// The partition DOs are the source of truth, so this parent stays the owner of the data until
+		// every child is initialized.
+		// FIXME: Accept a partial initialization. This needs a router that can ask the parent for the
+		// context of a child again.
 		try {
 			await Promise.all(promises);
 		} catch (error) {
@@ -1273,8 +1274,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				parentPartitionContext: pCtxForLog(this.pCtx()),
 			});
 
-			// By throwing here we stop the split process. The next request will call `queueSplit()` again
-			// setting a new alarm, which will retry the split process and hopefully succeed if the errors were transient.
+			// The throw stops the split. The next request calls `queueSplit()` again and sets a new alarm,
+			// which retries the split and succeeds if the errors were transient.
 			throw error;
 		}
 
@@ -1285,7 +1286,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Kick off migration on each child immediately so it doesn't wait for the first user request.
 		// Fire-and-forget: failures are logged but do not fail the split — the child will
 		// start migrating on its first incoming request if this doesn't reach it.
-		// We do not use this.ctx.waitUntil(...) since it causes vitest errors with tangling log messages.
+		// It does not use this.ctx.waitUntil(...), because that causes vitest errors with dangling log messages.
 		await Promise.allSettled(
 			childInits.map(async (childInitOptions) => {
 				try {
@@ -1327,8 +1328,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 
 		await this.ctx.blockConcurrencyWhile(async () => {
-			// Hack to clear all timeouts.
-			// setTimeout returns a numeric ID which increments with each call, so we can get the highest ID and clear all timeouts up to that ID.
+			// Clears all the timeouts: setTimeout returns a numeric ID that increments on each call, so the
+			// newest ID gives the upper bound to clear from.
 			const highestId = setTimeout(() => {
 				for (let i = Number(highestId); i >= 0; i--) {
 					clearTimeout(i);
@@ -1480,7 +1481,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 		// reject while this partition is migrating - it will recover it on its own.
 		await this.ensureMigration("cancel");
-		// First, so the local lock is released even if a child cancel fails and we throw below.
+		// First, so that the local lock is released even when a child cancel fails and throws below.
 		this.#participant.cancelLocal(request.transactionId);
 
 		// Cancel only DELETEs pending rows, so size backpressure must not wedge it — same reasoning as
@@ -1706,8 +1707,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	// The depth of this partition in the topology tree.
-	// 0 = root, 1 = first-level child, etc.
-	// For range partitions, 0 is the root range partition, 1 is the first-level child, etc.
+	// A hash partition: 0 is the root, 1 is a first-level child, and so on.
+	// A range partition: 0 is the root range partition, 1 is a first-level child, and so on.
 	#_depth: number | undefined = undefined;
 
 	private depth(): number {
@@ -1749,7 +1750,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// rangePartition boundaries are KeyBytes — compare by bytes (null = unbounded), never by reference.
 			const keyEq = (a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean =>
 				a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
-			// We need to check if the provided context matches the stored one to avoid inconsistencies.
+			// The given context must match the stored one, or the partition serves data it does not own.
 			if (
 				!areImmutableOptionsEqual(this.#_partitionContext, pCtx) ||
 				this.#_partitionContext.partitionId !== pCtx.partitionId ||
@@ -1802,7 +1803,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}
 		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
-			// TODO We can consider doing a selective migration of the requested keys only.
+			// TODO: Migrate only the requested keys.
 			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
 				message: "partition split in progress, please retry later",
 				attributes: { operation: op },
@@ -1887,7 +1888,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		} = opts;
 
 		if (isHashPartition(ctx)) {
-			// Step 1: Authoritative promotion check for keys we promoted or inherited.
+			// Step 1: Authoritative promotion check for the keys this partition promoted or inherited.
 			const promotedStatus = this.#promotion.statusFor(hashKey);
 			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
 				return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
@@ -2106,20 +2107,20 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			return;
 		}
 		if (ops.forceSchedule && this.#_backgroundWorkScheduledAt === targetTime) {
-			// This means a background work is already scheduled for the same target time, so we can skip scheduling another one.
-			// Avoid lots of timers set for the same time which can cause a thundering herd problem and unnecessary resource usage.
+			// A background run is already scheduled for the same target time, so this call adds nothing.
+			// Many timers on the same instant cause a thundering herd and waste resources.
 			return;
 		}
 		this.#_backgroundWorkScheduledAt = targetTime;
 		setTimeout(() => {
-			// FIXME We reset the timestamp for the timer after 1 second to avoid many concurrent runs
-			// when the background work takes longer than the delayMs (which is always), to avoid overhead and extra memory usage!
-			// We should consider using a more robust scheduling mechanism that allows N overlaps to avoid a stuck background job from progressing.
+			// FIXME: The schedule timestamp resets after 1 second. The background work always takes longer
+			// than delayMs, and this keeps the concurrent runs, the overhead, and the memory down. A
+			// scheduler that allows N overlaps would stop one stuck job from blocking the progress.
 			void Promise.race([
 				this.runBackgroundWork(),
 				new Promise((resolve) =>
 					setTimeout(() => {
-						// Only reset the schedule if it's the same one we set to avoid racing with a newly scheduled background work.
+						// Reset the schedule only when it is still this one, so a newer schedule is not lost.
 						if (this.#_backgroundWorkScheduledAt === targetTime) {
 							this.#_backgroundWorkScheduledAt = null;
 							// console.debug({
@@ -2138,9 +2139,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		invariant(this.#_partitionContext, "fokos/partition.runBackgroundWork: partition context not initialized");
 		/**
 		 * INVARIANTS FOR ALL BACKGROUND JOBS:
-		 * - They should be idempotent and safe to run concurrently (e.g. if the alarm fires again while a previous run is still ongoing) to avoid issues with retries and overlapping runs.
-		 * - They should be crash-safe, meaning that if they crash they should not cause the rest jobs to not run and they should be able to resume or retry their work without causing inconsistencies or data loss.
-		 * - If they encounter an error, they should log it and reschedule the next run for some time in the future ensuring progress is made eventually.
+		 * - A job must be idempotent and safe to run concurrently, because the alarm can fire again while
+		 *   a run is still in progress.
+		 * - A job must be crash-safe: a crash must let the other jobs run, and the job must resume or
+		 *   retry its own work with no data loss and no inconsistency.
+		 * - On an error, a job must log it and schedule the next run, so that the work still progresses.
 		 */
 		try {
 			////////////////////////////////////////////////////////
@@ -2281,7 +2284,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			///////////////////////////////////////////////////////////////////////////
 			// ── Jobs: Promotion drive and GC (hash partitions only, not routers)
 			//
-			// FIXME: We have to interleave the key promotion and transactions above, or some form of cooperative scheduling, to avoid starvation.
+			// FIXME: Interleave the key promotion with the transactions above, or schedule them cooperatively, to avoid starvation.
 			//
 			const pCtx = this.pCtx();
 			if (isHashPartition(pCtx)) {
@@ -2300,7 +2303,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			});
 		} finally {
 			/////////////////////////////////////////////////
-			// Check if any job needs to set the next alarm!
+			// Find the jobs that need the next alarm.
 			/////////////////////////////////////////////////
 
 			let nextAlarmMs: number | null = null;
@@ -2348,10 +2351,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (!this.#_partialRangeTopology) {
 			this.#_partialRangeTopology = PartialRangeTopology.create({
 				errorRate: 0.01,
-				// I want this to not be more than about 1MB, but we give 1.5MB for extra buffer.
-				// It has to be less than 2MB to fit into the SQLite row size limit (2MB) for the serialized bloom filter.
+				// The target is about 1MB, with 1.5MB as the cap for extra headroom. The serialized bloom
+				// filter is one SQLite row, so it must stay below the 2MB row size limit.
 				//
-				// Here's the growth until we cross 1 MB:
+				// The growth up to 1 MB:
 				//    node ./tools/bloom-filter-sizing.js 300000 2MB
 				//
 				// Initial capacity: 300,000 items | Max size: 1.00 MB | Error rate: 0.01
@@ -2363,7 +2366,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				// 2         1,200,000         0.1250%     1.99 MB         3.28 MB  10
 				//
 				maxSizeBytes: 1.5 * 1024 * 1024,
-				// WARNING: This cannot change after the first addition of something in the bloom filter!
+				// WARNING: This must not change after the first key enters the bloom filter.
 				initialCapacityN: 300_000,
 			});
 		}
@@ -2411,7 +2414,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const info = {
 			...this.#_coloInfo,
 			actorId: this.ctx.id.toString(),
-			// This might truncated to 1024 bytes in Cloudflare Workers, but the full one should be inside partitionContext.doName.
+			// Cloudflare Workers can truncate this to 1024 bytes. partitionContext.doName holds the full name.
 			actorName: this.ctx.id.name,
 			databaseSize: this.#store.databaseSize,
 			depth: this.#_depth,

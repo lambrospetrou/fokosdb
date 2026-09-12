@@ -30,7 +30,7 @@ function makeDB(tableName: string) {
 	});
 }
 
-// FIXME Skipped because when calling destroy() the vitest integration is broken and stays hang forever even though the test completes.
+// FIXME: Skipped because the vitest integration hangs forever after a destroy() call, even though the test completes.
 describe.skip("FokosDB.destroy()", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
 		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;

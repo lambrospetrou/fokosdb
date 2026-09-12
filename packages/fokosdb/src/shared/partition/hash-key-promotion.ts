@@ -31,17 +31,18 @@ export type PromotionManagerDeps = {
  * Hash DOs only: range DOs never have promoted_keys rows.
  */
 export class PromotionManager {
-	// TODO: Do we want the cache here or inside the PartitionStore, to avoid having to keep it in sync with the store?
+	// TODO: Move this cache into the PartitionStore, so that nothing has to keep the two in sync.
 	//
 	// In-memory cache of promoted_keys (promoted only). Filled on-demand on reads.
 	//
 	// Keyed by a stable identity of the hashKey (a Uint8Array can't be a Map key); the KeyBytes is kept in
 	// the value so callers get the real key back.
 	//
-	// We can use key.toHex()/toBase64() as the stable identity, but that allocates a string per request on the hot routing path (statusFor()/has()).
-	// We can use KeyCodec.mapKey(hashKey) to get a stable number identity for the key, which avoids the string allocation and is faster to compare.
+	// key.toHex()/toBase64() gives a stable identity, but it allocates a string per request on the hot
+	// routing path (statusFor()/has()). KeyCodec.mapKey(hashKey) gives a stable number identity
+	// instead, which allocates nothing and compares faster.
 	//
-	// For full correctness we could simply just scrap the in-memory cache and only rely on the store but that would lead to extra rows read charges.
+	// The store alone is enough for correctness, but a read of it on each request costs extra billed rows.
 	// #cachePromoted = new LRUCache<bigint, { hk: KeyBytes }>(1_000);
 
 	constructor(private readonly deps: PromotionManagerDeps) {}
@@ -62,7 +63,7 @@ export class PromotionManager {
 
 	/** Whether the key is tracked at any lifecycle stage (queued, promoting, or promoted). */
 	hasStatus(hashKey: KeyBytes): boolean {
-		// TODO Read from cache!
+		// TODO: Answer from the cache.
 		return this.statusFor(hashKey) !== undefined;
 	}
 

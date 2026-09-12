@@ -145,8 +145,8 @@ function keyForLog(k: KeyBytes): string {
 	if (k.length === 0) return "<empty>";
 	if (k[0] === BINARY_TAG) return `b64:${k.toBase64({ alphabet: "base64url" })}`;
 	try {
-		// fatal:true throws on invalid UTF-8 so we fall back to hex rather than emitting U+FFFD garbage.
-		// TODO: Do we need the stringification here or just return whatever decode() returns?
+		// fatal:true throws on invalid UTF-8, so the catch falls back to base64 and no U+FFFD reaches a log.
+		// TODO: Return the decoded string directly, if the quoting adds nothing for the reader.
 		return JSON.stringify(new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(k));
 	} catch {
 		return `b64:${k.toBase64({ alphabet: "base64url" })}`;

@@ -72,7 +72,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		doName: string;
 		partitionIdOpaque: string;
 	} {
-		// First find the hash partition!
+		// The hash partition comes first.
 		// Root tree index first. Keys arrive already-encoded (db.ts encodes at entry).
 		let hIdxs: number[] = [hashRootIndex(hashKey, this.basePartitionContext.rootTreesN)];
 

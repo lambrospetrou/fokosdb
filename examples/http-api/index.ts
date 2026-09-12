@@ -404,8 +404,8 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 		return result.output as v.InferOutput<S>;
 	}
 
-	// TODO The following creates a new FokosDB instance (and therefore reconstructs the partition topology) on every request, which is inefficient.
-	// We should cache these instances keyed by tableName + partitionOptions.
+	// TODO: This builds a new FokosDB instance on every request, which rebuilds the partition topology
+	// every time. Cache the instances by tableName + partitionOptions.
 	switch (rpcAction) {
 		case "putItem": {
 			const { partitionOptions, ...opts } = parseBody(PutItemBodySchema);

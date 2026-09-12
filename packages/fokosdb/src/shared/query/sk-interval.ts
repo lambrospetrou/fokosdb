@@ -53,8 +53,8 @@ export function clipToChildRange(interval: SkInterval, childStart: KeyBytes | nu
 }
 
 /**
- * Check whether a child range has been fully passed by the cursor in the given scan direction.
- * Returns true if the child should be skipped.
+ * Says if the cursor has already passed the whole child range in the scan direction.
+ * True means the scan skips the child.
  *
  * asc: skip if childEnd <= cursor.sk (every key in the child is at or before the resume point).
  * desc: skip if childStart >= cursor.sk (desc cursors resume strictly below cursor.sk, so a
@@ -73,9 +73,9 @@ export function isChildFullyBeforeCursor(
 }
 
 /**
- * Check whether a cursor position falls within a child's [childStart, childEnd) range.
- * If true, the child should receive the cursor for a resumed scan; otherwise the child
- * starts a fresh scan from the interval's bound.
+ * Says if the cursor position falls in the child's [childStart, childEnd) range.
+ * True means the child receives the cursor and resumes the scan. False means the child starts a new
+ * scan from the bound of the interval.
  */
 export function cursorFallsInChild(childStart: KeyBytes, childEnd: KeyBytes | null, cursor: ScanCursor): boolean {
 	return KeyCodec.compare(cursor.sk, childStart) >= 0 && (childEnd === null || KeyCodec.compare(cursor.sk, childEnd) < 0);

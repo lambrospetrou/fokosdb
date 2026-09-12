@@ -169,7 +169,7 @@ export abstract class FokosError<T extends string = string, C extends string = s
 			for (const [key, value] of Object.entries(e)) {
 				// Keep only values that can cross an RPC hop. One value that cannot makes the runtime drop
 				// every field of the error, `code` and `error_id` included.
-				// If we are creating so many errors and this becomes a performance bottleneck, we might need a more efficient cloning strategy.
+				// TODO: A cheaper clone, if the error rate ever makes this a bottleneck.
 				try {
 					attributes[key] = structuredClone(value);
 				} catch {}

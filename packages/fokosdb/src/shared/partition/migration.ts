@@ -103,13 +103,13 @@ export class SplitMigration {
 				for (const item of items) {
 					// INSERT OR IGNORE rather than OR REPLACE: all writes to this partition are rejected
 					// with 503 while migration_migrating, so no user write can have arrived yet.
-					// IGNORE is safer for retries — if a batch was already written before a crash we
+					// IGNORE is safer for retries — when a crash followed a written batch, the insert
 					// skip re-inserting those items rather than overwriting them unnecessarily.
 					store.insertItemIfAbsent(item);
 				}
 			}
 
-			// Checkpoint cursor after each batch so we can resume if interrupted.
+			// Checkpoint the cursor after each batch, so an interrupted migration resumes from it.
 			cursor = nextCursor;
 			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
 

@@ -260,7 +260,8 @@ export class PartitionIdHelper {
 	}
 
 	/**
-	 * Refactor maybe to have different classes for hash and range partition IDs, to avoid the need for schema checks in these helper methods.
+	 * TODO: Split the hash and the range partition IDs into two classes, so that these helpers need no
+	 * schema check.
 	 */
 	static calculateHashChildPartitionIds(parentContext: PartitionContextResolved): {
 		doName: string;

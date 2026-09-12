@@ -25,9 +25,8 @@ export type SplitStatusKVItem =
 
 /**
  * The KV-backed split lifecycle state machine (split_queued → split_started → split_completed
- * plus child-migration ack bookkeeping). One shared implementation — previously duplicated
- * ~verbatim between the hash and range topology impls. Both split policies hold an instance;
- * the machine performs no RPC and reads no partition tables, only its own KV key.
+ * plus child-migration ack bookkeeping). The hash and the range split policies share one instance
+ * each of this machine. It performs no RPC and reads no partition table, only its own KV key.
  */
 export class SplitStateMachine {
 	constructor(

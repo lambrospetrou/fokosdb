@@ -412,8 +412,8 @@ export class FokosDB {
 			if (fastPathResult) return fastPathResult;
 		}
 
-		// TODO: We need to catch DO errors and retry with a different idempotency token to route
-		// to a different TC if the chosen one is overloaded or has failed. Tricky to do for writes though...
+		// TODO: Catch the DO errors and retry with a different idempotency token, which routes to another
+		// TC when the chosen one is overloaded or down. A write makes this hard.
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
 
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other

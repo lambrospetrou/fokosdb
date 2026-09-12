@@ -90,16 +90,16 @@ function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 
 /**
  * PartitionStore owns ALL SQL on the partition's tables: items, pending_transactions,
- * deletion_metadata, key_size_estimates, and promoted_keys — plus the schema migrations and the
- * row-size estimators. No other class touches these tables.
+ * deletion_metadata, key_size_estimates, promoted_keys, and range_hierarchy — plus the schema
+ * migrations and the row-size estimators. No other class touches these tables.
  *
- * Design rules (see docs/agent-plans/adr-lib-layering-refactor.md):
+ * Design rules:
  * - Single-purpose methods named for intent; raw SQL is fine because it lives only here.
- * - Multi-statement atomicity is composed by the CALLER via `transactionSync` — the store does
- *   not decide transaction boundaries (mirrors the DO's existing transactionSync blocks).
+ * - The CALLER composes multi-statement atomicity with `transactionSync`. The store does not decide
+ *   the transaction boundaries.
  * - Row-reading methods return already-converted data (`string | Uint8Array`, never ArrayBuffer).
- * - Methods used to build RPC `meta` return `{ rowsRead, rowsWritten }` for exactly the
- *   statements the DO counted before the extraction (see each method's doc).
+ * - A method that feeds the RPC `meta` returns `{ rowsRead, rowsWritten }` for the statements named
+ *   in its own doc, and for no others.
  */
 
 // ---------------------------------------------------------------------------
@@ -261,8 +261,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 2,
 		description: "Add last_transaction_ts to items and create transaction support tables",
-		// pending_transactions is a rowid table on purpose. Do NOT add WITHOUT ROWID back — it was
-		// WITHOUT ROWID until 2026-08-16, for the same reason `items` was, and it has the same defect:
+		// pending_transactions is a rowid table on purpose. Do NOT add WITHOUT ROWID back: it has the
+		// same defect here as in `items`.
 		// WITHOUT ROWID stores rows in an index B-tree with a ~1002-byte inline payload limit on a 4 KiB
 		// page, so every row whose `data` exceeds that takes a private overflow page it cannot share.
 		// Measured on Durable Object storage, 2000 rows of 1500-byte data against 3.00 MB logical:
@@ -278,12 +278,12 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// committing ONE transaction is O(all pending rows in the partition). Measured over 20k pending
 		// rows: 147 page reads drop to 3, and listPendingTxItems drops from 2859 to 8.
 		//
-		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid change. While the
-		// table was WITHOUT ROWID, SQLite appended the primary key to every index entry, so a key of
-		// `transaction_id` alone happened to cover listPendingTxKeys for free. A rowid table appends
-		// only the rowid, so the narrow key would have sent listPendingTxKeys — a commit-and-abort path —
-		// back to a table fetch per row, and SQLite also stopped choosing pending_transactions_created_at
-		// for listStalePendingTx, scanning this index instead. Spelling (hk, sk) out restores both plans.
+		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid table. A rowid table
+		// appends only the rowid to an index entry, so a key of `transaction_id` alone would send
+		// listPendingTxKeys — a commit-and-abort path — back to one table fetch per row, and SQLite would
+		// also stop choosing pending_transactions_created_at for listStalePendingTx and scan this index
+		// instead. The explicit (hk, sk) keeps both plans. (A WITHOUT ROWID table appends the whole
+		// primary key instead, which is what covered these queries for free before.)
 		sql: `
             CREATE TABLE IF NOT EXISTS pending_transactions (
                 hk                    BLOB    NOT NULL,
@@ -489,8 +489,8 @@ export class PartitionStore {
 	 * silently regressing both write paths. A query-plan test asserts the pin still works AND that it
 	 * is still needed, so it can be removed if SQLite ever picks the covering index unaided.
 	 *
-	 * Folding into the DELETE with `DELETE ... RETURNING` measured that reports the returned row
-	 * as an extra read, so it costs the same on a hit and one more on a miss.
+	 * A fold into the DELETE with `DELETE ... RETURNING` measured the returned row as an extra read, so
+	 * it costs the same on a hit and one more on a miss.
 	 *
 	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
 	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
@@ -608,10 +608,10 @@ export class PartitionStore {
 
 	/**
 	 * Deletes an item, keeping the deletion watermark and key-size estimate consistent.
-	 * `bumpWatermarkAlways` preserves the transactional-delete behavior (watermark and estimate
-	 * are updated even when the row was already absent); the non-transactional path updates them
-	 * only when a row was actually deleted.
-	 * Metrics cover ONLY the DELETE statement (matching the DO's previous meta math).
+	 * `bumpWatermarkAlways` gives the transactional-delete behavior: it updates the watermark and the
+	 * estimate even when the row was already absent. The non-transactional path updates them only when
+	 * the statement deleted a row.
+	 * The metrics cover the DELETE statement ONLY.
 	 */
 	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; watermarkTs: number; bumpWatermarkAlways?: boolean }): {
 		deleted: boolean;
@@ -681,10 +681,10 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Migration ingestion: INSERT OR IGNORE rather than OR REPLACE — all writes to a migrating
-	 * partition are rejected with 503 while migration_migrating, so no user write can have
-	 * arrived yet. IGNORE is safer for retries: if a batch was already written before a crash we
-	 * skip re-inserting those items rather than overwriting them unnecessarily.
+	 * Migration ingestion: INSERT OR IGNORE rather than OR REPLACE. A migrating partition refuses every
+	 * write with 503 while it is migration_migrating, so no user write can have arrived yet. IGNORE is
+	 * the safer form on a retry: when a crash followed a written batch, the retry keeps those rows
+	 * instead of writing them again.
 	 */
 	insertItemIfAbsent(item: MigratedItem): void {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
@@ -789,9 +789,9 @@ export class PartitionStore {
 					// Byte-space separator: the boundary's UTF-8 position matches the SQL scans that migrate the data.
 					// The crossing row (sk) falls into the upper child; prev is its predecessor.
 					boundaries.push(KeyCodec.shortestSeparator(prev, sk));
-					// Relative bump (acc + step, not threshold += step): if one oversized row pushes acc past
-					// several thresholds at once, we still emit only one boundary and re-anchor here, so no two
-					// boundaries land on the same adjacent-key pair. Also guarantees ≥ 1 row per child.
+					// Relative bump (acc + step, not threshold += step): when one oversized row pushes acc past
+					// several thresholds at once, the scan still emits one boundary and re-anchors here, so no
+					// two boundaries land on the same adjacent-key pair. It also gives each child ≥ 1 row.
 					threshold = acc + step;
 					if (boundaries.length === N - 1) break;
 				}
@@ -1546,8 +1546,8 @@ export class PartitionStore {
 	}
 
 	insertRangePartitionBoundary(hk: KeyBytes, startBoundary: KeyBytes, endBoundary: KeyBytes, depth: number): void {
-		// FIXME: Add a limit on the storage we use for this table, or a TTL, or a cleanup policy.
-		// The range router can learn many boundaries over time, and we don't want to keep them or grow forever.
+		// FIXME: Bound this table with a size limit, a TTL, or a cleanup policy. A range router learns
+		// more boundaries over time, and nothing removes them.
 		//
 		// We use INSERT OR IGNORE here to avoid causing writes for the same boundaries.
 		// This is called on every forwarded request so we need to avoid unnecessary writes.

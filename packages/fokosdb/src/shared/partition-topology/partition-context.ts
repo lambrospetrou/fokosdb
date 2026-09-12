@@ -124,7 +124,7 @@ export function isHashPartition(
 	return !ctx.rangePartition;
 }
 
-// TODO: Can I make this a type guard that narrows to PartitionContextLivePartition?
+// TODO: Narrow to PartitionContextLivePartition with this type guard.
 export function isRangePartition(ctx: PartitionContextResolved | PartitionContextLivePartition): ctx is (
 	| PartitionContextResolved
 	| PartitionContextLivePartition
