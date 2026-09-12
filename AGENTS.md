@@ -9,17 +9,7 @@ FokosDB is a globally strongly-consistent key-value database built on Cloudflare
 
 ## Commands
 
-This is a pnpm workspace. Run these from the repo root.
-
-| Command              | Purpose                                                 |
-| -------------------- | ------------------------------------------------------- |
-| `pnpm build`         | Build the library into `packages/fokosdb/dist`          |
-| `pnpm test`          | Build, then run the library and example suites          |
-| `pnpm dev`           | Build, then run the example workers locally             |
-| `pnpm check`         | Typecheck every package and check formatting            |
-| `pnpm lint:pkg`      | `publint` on the packaged library                       |
-| `pnpm cf-typegen`    | Generate TypeScript types for every wrangler project    |
-| `pnpm error-segment` | Print an unused `error_id` segment for a new error code |
+This is a pnpm workspace. The `scripts` in the root `package.json` are the entry points. Run them from the repo root.
 
 The examples import the library's built `dist/`, not its sources, so a source change needs a `pnpm build` before an example picks it up. `pnpm test` and `pnpm dev` already do this.
 
