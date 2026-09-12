@@ -161,17 +161,17 @@ export type PartitionInfo = {
 	forwardCount: number;
 
 	/**
-	 * The depth of the hash partition in the partition topology tree. Root partitions have depth 0, their children have depth 1, and so on.
-	 * Will be zero for range partitions since they don't have a depth in the hash partition tree,
-	 * but can be useful for debugging and monitoring the partition topology.
+	 * The depth of the hash partition in the topology tree. A root partition has depth 0, its children
+	 * have depth 1, and so on. It is 0 for a range partition, which has no depth in the hash tree.
 	 *
-	 * ONLY FOR DEBUGGING PURPOSES: This is not a stable API and may change in future versions. Clients should not rely on this value for any logic.
+	 * FOR DEBUGGING ONLY: this is not a stable API. A client must not use the value in its logic.
 	 */
 	hashDepth: number;
 	/**
-	 * This range partition's own depth (root = 0). Always 0 for hash partitions (mirrors hashDepth's 0-for-range convention).
+	 * The depth of the range partition in its own tree. A root has depth 0. It is 0 for a hash
+	 * partition, which mirrors the convention of hashDepth.
 	 *
-	 * ONLY FOR DEBUGGING PURPOSES: This is not a stable API and may change in future versions. Clients should not rely on this value for any logic.
+	 * FOR DEBUGGING ONLY: this is not a stable API. A client must not use the value in its logic.
 	 */
 	rangeDepth: number;
 };

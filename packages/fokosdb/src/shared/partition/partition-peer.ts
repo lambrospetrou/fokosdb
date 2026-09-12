@@ -33,9 +33,9 @@ export type GetPromotedKeysBatchResult = {
  * A `DurableObjectStub<PartitionDO>` satisfies this structurally — no wrapper class. Components
  * needing only a subset take a `Pick<PartitionPeer, ...>`. Tests pass an in-memory fake.
  *
- * Deliberately NOT unified with the TC's own `PartitionDOStub` type
- * (prepare/commit/cancel/readForTransaction): that is the 2PC surface, a different concern — the
- * TC must not be coupled to partition/ internals.
+ * Deliberately NOT unified with `PartitionDOStub` in do-partition.ts: that type is the surface one
+ * partition calls on another to forward a request, a different concern — it must not carry the
+ * migration internals.
  */
 export interface PartitionPeer {
 	migrationGetItemsBatch(opts: {

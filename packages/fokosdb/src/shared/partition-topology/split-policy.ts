@@ -40,10 +40,9 @@ export type SplitDecisionInputs = {
 
 export type PrepareSplitParams = {
 	/**
-	 * The depth of the partition that is preparing to split.
-	 * This is used to determine the depth of the child partitions that will be created as a result of the split.
-	 * 0 = root partition, 1 = first-level child, etc.
-	 * 0 can refer to the root range partition and the root hash partition.
+	 * The depth of the partition that prepares the split. It gives the depth of the new children.
+	 * A root partition has depth 0, a first-level child has depth 1, and so on. Depth 0 applies to the
+	 * root hash partition and to the root range partition.
 	 */
 	parentDepth: number;
 
@@ -98,7 +97,7 @@ export type OperationIntent = "read" | "write" | "delete" | "ignore_size_reject"
 export type RoutingDecision = "ok" | "forward" | "reject_over_size" | "reject_out_of_range";
 
 /**
- * The split policy of a partition: pure decisions (shouldAllow / shouldSplit / prepareSplit /
+ * The split policy of a partition: the decisions (shouldAllow / maybeQueueSplit / prepareSplit /
  * pickChildPartition) plus delegation to its KV-backed SplitStateMachine.
  *
  * Boundary rule: policies decide; only DO classes (and FokosDB) hold stubs and make RPCs.
@@ -111,26 +110,18 @@ export interface PartitionTopologySplitter {
 	splitStatus(): SplitStatusKVItem | undefined;
 
 	/**
-	 * Called before every operation to check if the partition can accept the request based on the provided context, storage, and keys.
-	 * This can be used to implement backpressure or to prevent writes to certain partitions based on custom logic.
+	 * Says where the keys must be handled. The DO calls it before every operation, so it must stay
+	 * fast. It is also where backpressure applies.
 	 *
-	 * `intent` gates "reject_over_size" only: an over-size partition still serves every non-growing
-	 * intent. "forward" and "reject_out_of_range" do not depend on it — they are about correctness,
-	 * not load.
-	 *
-	 * This should be extremely fast since it's called in every request!
+	 * `intent` gates "reject_over_size" only: an over-size partition still serves every intent that
+	 * does not grow it. "forward" and "reject_out_of_range" are about correctness, not load, so they
+	 * do not depend on it.
 	 */
 	shouldAllow(hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision;
 
 	/**
-	 * Determines whether a partition should be split based on the provided context, storage, and keys.
-	 * This method is called after every write operation to check if the partition needs to be split.
-	 *
-	 * This should be extremely fast since it's called in every request!
-	 *
-	 * Basic checks according to the conditions and potentially do more expensive things in a periodic check.
-	 *
-	 * Automatically queues a split if the conditions are met, so the caller doesn't need to worry about it.
+	 * Decides if the partition must split, and queues the split when the conditions hold. The DO calls
+	 * it after every write operation, so it must stay fast.
 	 */
 	maybeQueueSplit(hashKey: KeyBytes, sortKey: KeyBytes | undefined, inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
 	maybeQueueSplitNoKey(inputs: SplitDecisionInputs): Promise<SplitStatusKVItem | undefined>;
@@ -150,8 +141,8 @@ export interface PartitionTopologySplitter {
 	commitSplitStarted(children: PartitionContextResolved[]): void;
 
 	/**
-	 * Used only internally by the Partition DOs to determine which of their children should received a request based on the provided context and keys.
-	 * Used during the lazy split migration of data to avoid blocking wholesale migration of the data before requests can be handled.
+	 * Picks the child partition that owns the keys. A parent uses it during a lazy split migration, so
+	 * it can serve requests while the data moves.
 	 */
 	pickChildPartition(
 		partitionContext: PartitionContextResolved,
@@ -176,7 +167,7 @@ export interface PartitionTopologySplitter {
 	acknowledgeChildMigration(childDoName: string): void;
 }
 
-// Fraction of rangeSplitConditions.maxSizeMb a single key must reach before it is a promotion candidate.
+// The fraction of hashSplitConditions.maxSizeMb that one key must reach to become a promotion candidate.
 export const RANGE_PROMOTION_FRACTION = 0.25;
 
 /**

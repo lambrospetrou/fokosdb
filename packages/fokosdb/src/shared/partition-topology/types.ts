@@ -1,5 +1,5 @@
-// Primitive types shared across partition-topology modules.
-// This file must not import from partition-topology.ts to avoid circular dependencies.
+// Primitive types shared across the partition-topology modules.
+// This file must not import from those modules, because that makes a circular dependency.
 
 import type { KeyBytes } from "./key-codec.js";
 import type { PartitionInfo } from "../types.js";

@@ -8,16 +8,12 @@ import { assertExists } from "../tsutils.js";
 export interface PartitionTopologyRouter {
 	partitionContext(): PartitionContext;
 
-	/**
-	 * Used by the FokosDB clients and anyone that wants to route a hashKey/sortKey to the appropriate partition.
-	 * @param hashKey
-	 * @param sortKey
-	 */
+	/** Routes a hashKey/sortKey pair to the partition that owns it. */
 	pickPartition(hashKey: KeyBytes, sortKey?: KeyBytes): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
 
 	/**
-	 * Returns a PartitionContextResolved for every root partition in the topology.
-	 * Used as the starting points for full-tree traversal (e.g. destroy).
+	 * Returns a PartitionContextResolved for every root partition. A full-tree traversal, such as
+	 * destroy, starts from these.
 	 */
 	rootPartitionContexts(): PartitionContextResolved[];
 

@@ -1,10 +1,9 @@
 import type { PartitionNodeId, SplitType } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-// Type-only import: erased at emit, so it creates NO runtime module cycle with do-partition.ts
-// (the value-level cycle is what the layering refactor eliminated). It exists solely so the
-// namespace-key filter below can match by class identity — structural alternatives collapse to
-// `any` when TypeScript resolves them mid-cycle from do-partition.ts itself.
+// Type-only import: the emit erases it, so it makes NO runtime module cycle with do-partition.ts.
+// The namespace-key filter below needs it to match by class identity. A structural alternative
+// collapses to `any` when TypeScript resolves it mid-cycle from do-partition.ts itself.
 import type { PartitionDO } from "../../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../server/do-transaction-coordinator.js";
 import invariant from "../invariant.js";
@@ -19,8 +18,8 @@ export type TransactionCoordinatorNamespaceKey = {
 }[keyof Env];
 
 /**
- * PartitionContext includes any information that the DOs need at runtime to perform their operations and is sent in every request.
- * If there was a way for the user to specify parameters for the partition DOs at initialization time, we wouldn't need this, but here we are.
+ * Everything a DO needs at runtime. Every request carries it, because a DO takes no parameters at
+ * initialization time.
  *
  * FIXME: Type this properly.
  */
@@ -29,10 +28,9 @@ export type PartitionContext = {
 
 	tableName: string;
 
-	// TODO: Think where to put these since they are needed by the PartitionDO and the client as well.
-	// Wrangler ENV vars work too, but I prefer it in the code somewhere.
-	// Having them in the PartitionContext makes it easier to pass them around and use them in the PartitionDO and the client,
-	// but it's adding extra bytes to every single request.
+	// TODO: Find a better home for these. The PartitionDO and the client both need them. The context
+	// carries them to both, but it adds bytes to every request. Wrangler environment variables are the
+	// alternative.
 	ns: PartitionNamespaceKey;
 	nsTx: TransactionCoordinatorNamespaceKey;
 
@@ -58,12 +56,12 @@ export type PartitionContextResolved = PartitionContext & {
 	// Future proofing if we want to use DO read replication.
 	primaryDoIdStr: string;
 
-	// Opaque ID used internally to identify the partition.
-	// Hex-encoded bytes: schema byte determines format.
-	//   SCHEMA_HASH_V1 (0x00): [schemaVersion u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
-	//   SCHEMA_RANGE_V1 (0x01): see PartitionIdHelper wire format.
-	// schemaVersion=0 is the hash format. depth counts only sub-tree levels (root partitions have depth=0).
-	// TODO: Future optimization would be convert this into a bits array as well, but for now it's OK.
+	// Opaque ID that identifies the partition internally. Hex-encoded bytes, where the first byte gives
+	// the format:
+	//   SCHEMA_HASH_V1 (0x00): [schema u8, rootIdx u16 (2 bytes big-endian), depth u8, hashIdx_1 u8, ..., hashIdx_depth u8].
+	//   SCHEMA_RANGE_V1 (0x01): see the wire format in PartitionIdHelper.
+	// `depth` counts sub-tree levels only, so a root partition has depth 0.
+	// TODO: Store this as a bit array.
 	partitionId: PartitionNodeId;
 
 	// Present only on range-structure DOs. Immutable identity.
@@ -91,13 +89,11 @@ export function assertCtxHasIdBytes(
 }
 
 export type SplitConditions = {
-	/**
-	 * The maximum size of the partition in megabytes before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.
-	 */
+	/** The size in megabytes that makes the partition split. */
 	maxSizeMb?: number;
 	/**
-	 * The maximum number of items in the partition before it should be split. This is an optional condition that can be used in conjunction with `splitN` or on its own.
-	 * FIXME: Not fully implemented, either remove or implement.
+	 * The number of items that makes the partition split.
+	 * FIXME: Nothing reads this value. Remove it, or make the split policy use it.
 	 */
 	maxItems?: number;
 };

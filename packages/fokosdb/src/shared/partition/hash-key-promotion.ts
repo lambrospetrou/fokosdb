@@ -7,7 +7,7 @@ import type { SplitStatusKVItem } from "../partition-topology/split-state.js";
 import type { PartitionPeer } from "./partition-peer.js";
 import type { PartitionStore, PromotedKeyStatus } from "./partition-store.js";
 
-/** The subset of the peer surface promotion needs from a range root (phase 3's gateway interface). */
+/** The part of the peer surface that promotion needs from a range root. */
 export type PromotionPeer = Pick<PartitionPeer, "internalInitFromSplit" | "internalTriggerMigration">;
 
 export type PromotionManagerDeps = {

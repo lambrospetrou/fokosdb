@@ -8,8 +8,8 @@
  * - The first matched row is always included even if it alone exceeds the byte budget,
  *   so a single oversized row cannot stall progress.
  * - Scanning stops when a fetched page is shorter than `pageSize` (the table is exhausted).
- * - `nextCursor` is non-null only when the byte budget stopped the scan; a null `nextCursor`
- *   means the scan is complete.
+ * - `nextCursor` is non-null when the byte budget or the item cap stopped the scan. A null
+ *   `nextCursor` means the scan reached the end of the table.
  */
 export type CollectBatchOptions<TRow, TCursor> = {
 	/** Fetches the next page of rows strictly after `cursor` (null = from the start). */
