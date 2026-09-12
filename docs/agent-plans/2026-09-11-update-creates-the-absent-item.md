@@ -1,6 +1,6 @@
 # RFC — An update in transactWriteItems creates the absent item
 
-**State:** Draft
+**State:** Completed
 **Date:** 2026-09-11
 **Author:** Lambros
 
@@ -113,8 +113,9 @@ is an upsert. Once prepare writes a pending row for an absent item, commit creat
 | M2 | `PartitionStore` writes both update statements as upserts. |
 | M3 | The participant, the error table and the comments follow. Tests and documents follow. |
 
-Each milestone is a complete change. M1 alone changes no behaviour, because the store still refuses
-an absent row.
+The three landed as ONE change. M1 is not safe on its own: once the probe reports an absent item as
+applicable, prepare accepts it and `insertPendingUpdateLock` still writes no lock, so `commitLocal`
+finds an empty key set and reports success for a write it never applied.
 
 ---
 
@@ -159,6 +160,9 @@ must leave that branch, because only `data` changes.
 
 `v`, `ttlAt`, `hashKey` and `sortKey` keep their current answer, which is `missing` for an absent
 row. Section 6.2 holds the option to resolve the two key references from the bound keys.
+
+The predicate carries its own parentheses. It is a term of larger expressions, and the update form
+is an `OR`, which `a OR b AND c` would otherwise bind the wrong way.
 
 The consequence for a caller is exact and testable:
 
@@ -249,7 +253,9 @@ The rest follows without a change:
 
 `INTERNAL_CODES.item_not_found_for_update` loses its only raise site. Remove the code from
 `packages/fokosdb/src/shared/errors.ts` and from the table in
-`docs/agent-plans/2026-09-10-structured-error-handling.md`. Do not reuse its `error_id` segment.
+`docs/agent-plans/2026-09-10-structured-error-handling.md`. `tools/new-error-segment.sh` tests a
+candidate segment against the source, so a removed segment returns to the pool; the code never
+shipped, so nothing outside this repository can hold it.
 
 `update_not_applicable` keeps its meaning, with one cause fewer.
 

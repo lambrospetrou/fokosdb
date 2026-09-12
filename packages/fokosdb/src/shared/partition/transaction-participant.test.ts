@@ -191,25 +191,12 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
-	it("rejects with update_not_applicable when item is missing or not json", async () => {
+	it("rejects with update_not_applicable when the item is not json", async () => {
 		await withParticipant(({ participant, store }) => {
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.field" }, value: { val: "new" } }]);
 
-			// Missing item
-			const missingReq = prepareReq({
-				items: [{ hashKey: kb("missing-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
-			});
-			const missingRes = participant.prepareLocal(missingReq);
-			expect(missingRes).toMatchObject({
-				outcome: "rejected",
-				results: aRejection({ code: "update_not_applicable", hashKey: "missing-item" }),
-			});
-			// An absent sort key is left off the reason entirely, never carried as an explicit undefined,
-			// so a reason compares equal whether it reached the caller by RPC or through a JSON column.
-			invariant(missingRes.outcome === "rejected" && missingRes.results[0].outcome === "rejected", "expected a rejected prepare");
-			expect(missingRes.results[0].reason).not.toHaveProperty("sortKey");
-
-			// Item exists but is kind: "text", not json
+			// The item exists but is kind: "text", not json. An absent item is NOT this case: it has the
+			// empty document as its pre-image, so the update creates it.
 			store.upsertItem({
 				hk: kb("text-item"),
 				sk: KeyCodec.encodeOptional(undefined),
@@ -221,10 +208,69 @@ describe("TransactionParticipant - prepare", () => {
 			const textReq = prepareReq({
 				items: [{ hashKey: kb("text-item"), sortKey: KeyCodec.encodeOptional(undefined), operation: "update", update: updatePlan }],
 			});
-			expect(participant.prepareLocal(textReq)).toMatchObject({
+			const textRes = participant.prepareLocal(textReq);
+			expect(textRes).toMatchObject({
 				outcome: "rejected",
 				results: aRejection({ code: "update_not_applicable", hashKey: "text-item" }),
 			});
+			// An absent sort key is left off the reason entirely, never carried as an explicit undefined,
+			// so a reason compares equal whether it reached the caller by RPC or through a JSON column.
+			invariant(textRes.outcome === "rejected" && textRes.results[0].outcome === "rejected", "expected a rejected prepare");
+			expect(textRes.results[0].reason).not.toHaveProperty("sortKey");
+		});
+	});
+
+	// An update of an absent item creates it, as DynamoDB does. Prepare must write a lock for a key
+	// with no row: without one, commit would find an empty key set and report success for a write it
+	// never applied.
+	it("locks an absent item for an update, and commit creates it", async () => {
+		await withParticipant(({ participant, store, upserts }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			const plan = compileUpdateExpression([
+				{
+					action: "set",
+					target: { ref: "data", path: "$.n" },
+					value: { fn: "+", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.n" }, { val: 0 }] }, { val: 1 }] },
+				},
+			]);
+
+			const request = prepareReq({ items: [{ hashKey: kb("fresh"), sortKey: sk, operation: "update", update: plan, ttlAt: 555 }] });
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(store.pendingTxCountFor(request.transactionId)).toBe(1);
+			// Nothing is written before commit.
+			expect(store.getItem(kb("fresh"), sk).row).toBeUndefined();
+
+			expect(
+				participant.commitLocal({
+					transactionId: request.transactionId,
+					transactionTimestamp: request.transactionTimestamp,
+					items: [{ hashKey: kb("fresh"), sortKey: sk }],
+				}),
+			).toEqual({ outcome: "committed" });
+
+			const created = store.getItem(kb("fresh"), sk).row;
+			expect(created).toMatchObject({ v: 1, ttl_epoch_utc_seconds: 555, last_transaction_ts: request.transactionTimestamp });
+			expect(JSON.parse(created?.data as string)).toEqual({ n: 1 });
+			// The created item is a new row for its key, so the size accounting must hear about it.
+			expect(upserts).toEqual([{ hashKey: kb("fresh"), keyEstBytes: expect.any(Number) }]);
+		});
+	});
+
+	it("rejects an update of an absent item when its condition needs the item", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+			const condition = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
+
+			const request = prepareReq({
+				items: [{ hashKey: kb("guarded"), sortKey: sk, operation: "update", update: plan, condition }],
+			});
+			expect(participant.prepareLocal(request)).toMatchObject({
+				outcome: "rejected",
+				results: aRejection({ code: "condition_failed", hashKey: "guarded" }),
+			});
+			expect(store.getItem(kb("guarded"), sk).row).toBeUndefined();
+			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 		});
 	});
 
@@ -619,18 +665,37 @@ describe("TransactionParticipant - single shot", () => {
 		});
 	});
 
-	it("rejects single-shot update with update_not_applicable when item is missing", async () => {
-		await withParticipant(({ participant }) => {
+	it("creates the item when a single-shot update finds none", async () => {
+		await withParticipant(({ participant, store, upserts }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
 
 			const res = participant.executeSingleShot({
-				items: withOpIndex([{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan }]),
+				items: withOpIndex([{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan, ttlAt: 42 }]),
+			});
+			expect(res).toEqual({ outcome: "committed" });
+
+			const created = store.getItem(kb("missing-u"), sortKey).row;
+			expect(created).toMatchObject({ v: 1, ttl_epoch_utc_seconds: 42 });
+			expect(JSON.parse(created?.data as string)).toEqual({ a: 1 });
+			expect(upserts).toEqual([{ hashKey: kb("missing-u"), keyEstBytes: expect.any(Number) }]);
+		});
+	});
+
+	it("rejects a single-shot update of an absent item whose target has no parent", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			// The empty pre-image has no `$.a`, so `$.a.b` has no parent to write into.
+			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a.b" }, value: { val: 1 } }]);
+
+			const res = participant.executeSingleShot({
+				items: withOpIndex([{ hashKey: kb("no-parent"), sortKey, operation: "update", update: updatePlan }]),
 			});
 			expect(res).toMatchObject({
 				outcome: "rejected",
-				results: aRejection({ code: "update_not_applicable", hashKey: "missing-u" }),
+				results: aRejection({ code: "update_not_applicable", hashKey: "no-parent" }),
 			});
+			expect(store.getItem(kb("no-parent"), sortKey).row).toBeUndefined();
 		});
 	});
 });

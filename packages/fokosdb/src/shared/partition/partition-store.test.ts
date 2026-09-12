@@ -447,18 +447,38 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	it("updateItemSingleShot distinguishes a missing item from an oversized result", async () => {
-		await withStore((store) => {
+	it("updateItemSingleShot creates the absent item, then increments the version it created", async () => {
+		await withStore((store, state) => {
 			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
 			const plan = compileUpdateExpression(update);
-			expect(() =>
-				store.updateItemSingleShot({
-					hk: kb("missing-hk"),
-					sk: kb("missing-sk"),
-					plan,
-					lastTransactionTs: 1,
-				}),
-			).toThrow(fokosErrorWith("item_not_found_for_update"));
+			const hk = kb("created-hk");
+			const sk = kb("created-sk");
+
+			const first = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 5 });
+			expect(first.version).toBe(1);
+			const created = store.getItem(hk, sk).row;
+			expect(created).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: null, last_transaction_ts: 5 });
+			expect(JSON.parse(created?.data as string)).toEqual({ x: 1 });
+			// The created row is measured and accounted for exactly as an upsert of the same document is.
+			expect(kseBytes(state, "created-hk")).toBe(first.keyEstBytes);
+
+			// The second call finds the row it created and takes the conflict branch.
+			const second = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 6 });
+			expect(second.version).toBe(2);
+			expect(kseBytes(state, "created-hk")).toBe(second.keyEstBytes);
+		});
+	});
+
+	it("updateItemSingleShot reports an oversized result, and writes nothing", async () => {
+		await withStore((store) => {
+			const hk = kb("too-big");
+			const sk = kb("s");
+			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "a".repeat(MAX_ITEM_BYTES) } },
+			];
+			const plan = compileUpdateExpression(update);
+			expect(() => store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
+			expect(store.getItem(hk, sk).row).toBeUndefined();
 		});
 	});
 

@@ -124,12 +124,13 @@ export function composeUpdateProbeStatement(plan: CompiledUpdatePlan): string {
 	const hkParam = "?1";
 	const skParam = "?2";
 	// value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
-	// bytes for this item instead of only that the update did not apply. It runs on a json row only:
-	// the fragment can read a JSON path, and json_type over a text or bytes row raises.
+	// bytes for this item instead of only that the update did not apply. It runs over a JSON pre-image
+	// only: the fragment can read a JSON path, and json_type over a text or bytes row raises. An absent
+	// row has a JSON pre-image, because an update creates the item.
 	return `WITH requested(requested_hk, requested_sk) AS (VALUES (${hkParam}, ${skParam}))
 SELECT i.hk IS NOT NULL AS item_present,
        (${plan.applicableSql}) AS applicable,
-       CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
+       CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
        CASE WHEN (${plan.applicableSql}) = 1 THEN (${estRowBytesExpr(plan.documentSql, hkParam, skParam)}) ELSE NULL END AS new_size,
        i.last_transaction_ts
 FROM requested

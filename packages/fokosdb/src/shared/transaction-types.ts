@@ -369,6 +369,11 @@ export type TransactWriteItem =
 			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
 	| {
+			/**
+			 * Applies the actions to the item's JSON `data`. Creates the item when it is absent, with the
+			 * empty document as the pre-image: add a condition, such as `exists` over `hashKey`, when the
+			 * operation must instead fail on an absent item.
+			 */
 			operation: "update";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;

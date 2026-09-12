@@ -98,8 +98,8 @@ export class TransactionParticipant {
 			const probe = this.#store.probeUpdate(item.update, item.hashKey, sk);
 			if (!probe.applicable) {
 				// A value that evaluated to bytes is the one cause the probe separates out, because the
-				// caller can act on it. Every other cause — a missing item, a non-json item, a missing
-				// target path — is reported as one answer, as DynamoDB reports its own.
+				// caller can act on it. Every other cause — a non-json item, a missing target path, a
+				// missing operand — is reported as one answer, as DynamoDB reports its own.
 				const code = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
 				return { reason: { code, ...rejectionKeys }, probe };
 			}
@@ -205,10 +205,8 @@ export class TransactionParticipant {
 					}
 				} else {
 					// No stamp means no live item, so the deletion watermark is the only ordering signal left.
-					// This holds for every operation, including a check, which writes nothing but still orders
-					// itself against later transactions. An update never reaches it today, because an update
-					// applies only to an item that exists — but naming the operations here instead would make a
-					// later change to applicability drop the check in silence.
+					// This holds for every operation: a check, which writes nothing but still orders itself
+					// against later transactions, and an update of an absent item, which creates it.
 					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
 						results.push({
 							outcome: "rejected",

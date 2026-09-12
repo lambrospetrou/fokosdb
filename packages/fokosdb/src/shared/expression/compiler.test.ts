@@ -211,13 +211,17 @@ describe("update SQLite compiler", () => {
 		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
 	});
 
-	it("nests document expressions with accumulator starting at i.data", () => {
+	// The accumulator starts at the pre-image, which is the stored document, or the empty document
+	// when the row is absent — an update of an absent item creates it.
+	it("nests document expressions with accumulator starting at the pre-image", () => {
 		const update: UpdateExpression = [
 			{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } },
 			{ action: "remove", target: { ref: "data", path: "$.b" } },
 		];
 		const plan = compileUpdateExpression(update);
-		expect(plan.documentSql).toMatch(/^jsonb_remove\(jsonb_set\(i\.data, \?\d+, (?:json_quote\()?\?\d+\)?\), \?\d+\)$/);
+		expect(plan.documentSql).toMatch(
+			/^jsonb_remove\(jsonb_set\(COALESCE\(i\.data, jsonb\('\{\}'\)\), \?\d+, (?:json_quote\()?\?\d+\)?\), \?\d+\)$/,
+		);
 	});
 
 	it("renders boolean and null literals accurately for JSONB document", () => {
@@ -250,9 +254,9 @@ describe("update SQLite compiler", () => {
 			{ action: "set", target: { ref: "data", path: "$.scores[0]" }, value: { val: 100 } },
 		];
 		const plan = compileUpdateExpression(update);
-		expect(plan.applicableSql).toContain("i.hk IS NOT NULL");
-		expect(plan.applicableSql).toContain("i.data_kind = 2");
-		expect(plan.applicableSql).toContain("json_type(i.data, ?");
+		// An absent row passes the kind guard, because the empty pre-image is a JSON document.
+		expect(plan.applicableSql).toContain("(i.hk IS NULL OR i.data_kind = 2)");
+		expect(plan.applicableSql).toContain("json_type(COALESCE(i.data, jsonb('{}')), ?");
 		expect(plan.applicableSql).toContain("= 'object'");
 		expect(plan.applicableSql).toContain("= 'array'");
 		expect(plan.applicableSql).toContain("IS NOT NULL");

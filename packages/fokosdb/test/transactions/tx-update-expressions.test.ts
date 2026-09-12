@@ -1,10 +1,10 @@
 import { describe, it, expect } from "vitest";
 import invariant from "../../src/shared/invariant.js";
-import type { UpdateExpression } from "../../src/shared/types.js";
+import type { ConditionExpression, UpdateExpression } from "../../src/shared/types.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import { UPDATE_FIXED_BINDING_COUNT, UPDATE_MAX_TRAILING_BINDING_COUNT } from "../../src/shared/expression/plan.js";
-import { makeDB, writeOutcome } from "./tx-helpers.js";
+import { keysAcrossPartitions, makeDB, writeOutcome } from "./tx-helpers.js";
 
 /**
  * A compiled plan is a fragment, not a statement: the keys are bound before it and each statement
@@ -103,9 +103,8 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 	});
 
-	it("rejects update with update_not_applicable when item is missing, text, or bytes", async () => {
+	it("rejects update with update_not_applicable when the item is text or bytes", async () => {
 		const db = makeDB({ singlePartitionFastPath });
-		const missingKey = { hashKey: `missing-${crypto.randomUUID()}` };
 		const textKey = { hashKey: `text-${crypto.randomUUID()}` };
 		const bytesKey = { hashKey: `bytes-${crypto.randomUUID()}` };
 
@@ -113,16 +112,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		await db.putItem({ ...bytesKey, data: new Uint8Array([1, 2, 3]) });
 
 		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
-
-		const missingRes = await writeOutcome(
-			db.transactWriteItems({
-				items: [{ ...missingKey, operation: "update", update }],
-			}),
-		);
-		expect(missingRes).toMatchObject({
-			outcome: "cancelled",
-			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: missingKey.hashKey } }],
-		});
 
 		const textRes = await writeOutcome(
 			db.transactWriteItems({
@@ -143,6 +132,135 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 			outcome: "cancelled",
 			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: bytesKey.hashKey } }],
 		});
+	});
+
+	it("creates the item when it is absent, with the empty document as the pre-image", async () => {
+		const db = makeDB({ singlePartitionFastPath });
+		const key = { hashKey: `create-${crypto.randomUUID()}` };
+		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+
+		// The counter idiom, on the first call, when no item exists yet.
+		const update: UpdateExpression = [
+			{
+				action: "set",
+				target: { ref: "data", path: "$.visits" },
+				value: { fn: "+", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.visits" }, { val: 0 }] }, { val: 1 }] },
+			},
+		];
+
+		expect(await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "update", update, ttlAt }] }))).toMatchObject({
+			outcome: "committed",
+		});
+		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, data: { visits: 1 }, ttlAt } });
+
+		// The second call finds the item the first one created, so the same expression increments it.
+		expect(await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "update", update }] }))).toMatchObject({
+			outcome: "committed",
+		});
+		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 2, data: { visits: 2 } } });
+	});
+
+	it("creates an absent item and updates an existing one in the same transaction", async () => {
+		const db = makeDB({ singlePartitionFastPath });
+		const [existing, absent] = keysAcrossPartitions(db, 2, `mixed-${crypto.randomUUID()}`);
+		await db.putItem({ ...existing, data: { n: 1 } });
+
+		const update: UpdateExpression = [
+			{
+				action: "set",
+				target: { ref: "data", path: "$.n" },
+				value: { fn: "+", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.n" }, { val: 0 }] }, { val: 10 }] },
+			},
+		];
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{ ...existing, operation: "update", update },
+					{ ...absent, operation: "update", update },
+				],
+			}),
+		);
+
+		expect(res).toMatchObject({ outcome: "committed" });
+		expect(await db.getItem(existing)).toMatchObject({ found: true, item: { version: 2, data: { n: 11 } } });
+		expect(await db.getItem(absent)).toMatchObject({ found: true, item: { version: 1, data: { n: 10 } } });
+	});
+
+	// A condition is how a caller keeps an update from creating the item. It is evaluated against the
+	// stored pre-image, and an absent item has no hash key, no sort key, no version and no data there,
+	// so every guard that needs the item fails and the transaction cancels. The keys of the REQUEST do
+	// not answer these guards: the item they name does not exist yet.
+	const guardsThatNeedTheItem: ReadonlyArray<[name: string, condition: ConditionExpression]> = [
+		["exists on the hash key", { op: "exists", args: [{ ref: "hashKey" }] }],
+		["exists on the sort key", { op: "exists", args: [{ ref: "sortKey" }] }],
+		[
+			"exists on both keys",
+			{
+				op: "and",
+				args: [
+					{ op: "exists", args: [{ ref: "hashKey" }] },
+					{ op: "exists", args: [{ ref: "sortKey" }] },
+				],
+			},
+		],
+		["a version guard", { op: "eq", args: [{ ref: "v" }, { val: 1 }] }],
+		["exists on a data path", { op: "exists", args: [{ ref: "data", path: "$.x" }] }],
+	];
+
+	it.each(guardsThatNeedTheItem)("cancels an update of an absent item under %s, and creates nothing", async (_name, condition) => {
+		const db = makeDB({ singlePartitionFastPath });
+		// The request names a sort key, so the sort-key guard fails on the stored pre-image and not on a
+		// key the caller left out.
+		const key = { hashKey: `guarded-${crypto.randomUUID()}`, sortKey: "sk" };
+		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
+
+		const res = await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "update", update, condition }] }));
+
+		expect(res).toMatchObject({
+			outcome: "cancelled",
+			results: [{ outcome: "rejected", reason: { code: "condition_failed", hashKey: key.hashKey } }],
+		});
+		// Nothing at all was written: not the item, and not an empty document.
+		expect(await db.getItem(key)).toMatchObject({ found: false });
+	});
+
+	// The contrast that makes the cases above meaningful: the condition is what stops the creation, so
+	// a condition that an absent item passes lets the same update create it.
+	it("creates the absent item when its condition passes on the absent pre-image", async () => {
+		const db = makeDB({ singlePartitionFastPath });
+		const key = { hashKey: `unguarded-${crypto.randomUUID()}`, sortKey: "sk" };
+		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
+
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [{ ...key, operation: "update", update, condition: { op: "not_exists", args: [{ ref: "hashKey" }] } }],
+			}),
+		);
+
+		expect(res).toMatchObject({ outcome: "committed" });
+		expect(await db.getItem(key)).toMatchObject({ found: true, item: { version: 1, data: { x: 1 } } });
+	});
+
+	it("rejects a create whose set target has no parent in the empty document", async () => {
+		const db = makeDB({ singlePartitionFastPath });
+		const key = { hashKey: `no-parent-${crypto.randomUUID()}` };
+
+		const res = await writeOutcome(
+			db.transactWriteItems({
+				items: [
+					{
+						...key,
+						operation: "update",
+						update: [{ action: "set", target: { ref: "data", path: "$.a.b" }, value: { val: 1 } }],
+					},
+				],
+			}),
+		);
+		expect(res).toMatchObject({
+			outcome: "cancelled",
+			results: [{ outcome: "rejected", reason: { code: "update_not_applicable", hashKey: key.hashKey } }],
+		});
+		expect(await db.getItem(key)).toMatchObject({ found: false });
 	});
 
 	it("rejects update with update_not_applicable on missing parent or index past end", async () => {
@@ -286,8 +404,14 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		const key1 = { hashKey: `ttl-preserve-${crypto.randomUUID()}` };
 		const key2 = { hashKey: `ttl-replace-${crypto.randomUUID()}` };
 
-		await db.putItem({ ...key1, data: { count: 1 }, ttlAt: 12345 });
-		await db.putItem({ ...key2, data: { count: 1 }, ttlAt: 12345 });
+		// Both instants are in the FUTURE. A past instant makes the item expired from the moment it is
+		// written, and the background sweep then deletes it as soon as the transaction releases its
+		// lock — which reads back as a missing item rather than as the TTL this test compares.
+		const seededTtl = Math.floor(Date.now() / 1000) + 3600;
+		const replacedTtl = seededTtl + 3600;
+
+		await db.putItem({ ...key1, data: { count: 1 }, ttlAt: seededTtl });
+		await db.putItem({ ...key2, data: { count: 1 }, ttlAt: seededTtl });
 
 		// Omit ttlAt: TTL preserved
 		await writeOutcome(
@@ -303,7 +427,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		await expect(db.getItem(key1)).resolves.toMatchObject({
 			found: true,
-			item: { ttlAt: 12345 },
+			item: { ttlAt: seededTtl },
 		});
 
 		// Provide ttlAt: TTL replaced
@@ -313,7 +437,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 					{
 						...key2,
 						operation: "update",
-						ttlAt: 99999,
+						ttlAt: replacedTtl,
 						update: [{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }],
 					},
 				],
@@ -321,7 +445,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		);
 		await expect(db.getItem(key2)).resolves.toMatchObject({
 			found: true,
-			item: { ttlAt: 99999 },
+			item: { ttlAt: replacedTtl },
 		});
 	});
 

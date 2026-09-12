@@ -60,6 +60,26 @@ type CompileContext = {
 	completeData: boolean;
 	paths: Set<string>;
 	expressionContext: ExpressionContext;
+	preImage: PreImage;
+};
+
+/**
+ * The SQL that every renderer reads the item through, so that one definition decides what an absent
+ * row means for a whole expression.
+ *
+ * A condition and an update disagree on that answer, and both answers are correct for their caller.
+ * A condition reports the item as it is stored, so an absent row makes every reference `missing` and
+ * `not_exists` passes. An update of an absent row creates the item, so it reads the empty document
+ * instead and its actions write into it.
+ */
+type PreImage = {
+	/** The item document the expression reads, and that an update writes into. */
+	data: string;
+	/** True when the pre-image is a JSON document that a path can address. Parenthesized: it is a
+	 * term of larger predicates, and `a OR b` would otherwise bind past its own operands. */
+	isJson: string;
+	/** True when the whole `data` value exists. */
+	dataPresent: string;
 };
 
 type ValueMode = "logical" | "key" | "sqlite" | "json";
@@ -69,6 +89,26 @@ type ValueMode = "logical" | "key" | "sqlite" | "json";
 const BYTES_KIND = DATA_KINDS.indexOf("bytes");
 const TEXT_KIND = DATA_KINDS.indexOf("text");
 const JSON_KIND = DATA_KINDS.indexOf("json");
+/** The stored row, and nothing when the row is absent. What a condition compares against. */
+const STORED_PRE_IMAGE: PreImage = {
+	data: "i.data",
+	isJson: `(i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND})`,
+	dataPresent: "i.hk IS NOT NULL",
+};
+
+/**
+ * The stored row, or the empty document when the row is absent. What an update applies to.
+ *
+ * `items.data` is NOT NULL, so a NULL here means one thing only: the row is absent. Every statement
+ * that runs an update plan must therefore reach an absent row through a LEFT JOIN, and never simply
+ * select no row.
+ */
+const UPDATE_PRE_IMAGE: PreImage = {
+	data: `COALESCE(i.data, jsonb('{}'))`,
+	isJson: `(i.hk IS NULL OR i.data_kind = ${JSON_KIND})`,
+	dataPresent: "1",
+};
+
 const EQUALITY_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "text", "bytes"];
 const ORDERED_TYPE_NAMES: readonly string[] = ["number", "text", "bytes"];
 const PREFIX_TYPE_NAMES: readonly string[] = ["text", "bytes"];
@@ -88,6 +128,7 @@ export function compileConditionExpression(
 		completeData: false,
 		paths: new Set(),
 		expressionContext: "condition",
+		preImage: STORED_PRE_IMAGE,
 	};
 	const sql = compactParameters(compileCondition(condition, context), context);
 	if (!utf8WithinLimit(composeConditionStatement(sql), EXPRESSION_LIMITS.compiledSqlBytes)) {
@@ -122,9 +163,10 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		completeData: false,
 		paths: new Set(),
 		expressionContext: "update-value",
+		preImage: UPDATE_PRE_IMAGE,
 	};
 
-	let accumulator = "i.data";
+	let accumulator = context.preImage.data;
 	for (const action of orderedActions) {
 		context.paths.add(action.target.path);
 		const pathParam = bindPath(action.target.path, context);
@@ -137,7 +179,7 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	}
 	const rawDocumentSql = accumulator;
 
-	const applicableTerms: string[] = ["(i.hk IS NOT NULL)", `(i.data_kind = ${JSON_KIND})`];
+	const applicableTerms: string[] = [context.preImage.isJson];
 	const valueTypeTerms: string[] = [];
 
 	for (const action of orderedActions) {
@@ -259,15 +301,15 @@ function targetGuardSql(target: UpdateTarget, context: CompileContext): string {
 	if (last.kind === "member") {
 		const parentPath = parentJsonPath(target.path);
 		const parentParam = bindPath(parentPath, context);
-		return `(json_type(i.data, ${parentParam}) = 'object')`;
+		return `(json_type(${context.preImage.data}, ${parentParam}) = 'object')`;
 	}
 	if (last.kind === "append") {
 		const parentPath = parentJsonPath(target.path);
 		const parentParam = bindPath(parentPath, context);
-		return `(json_type(i.data, ${parentParam}) = 'array')`;
+		return `(json_type(${context.preImage.data}, ${parentParam}) = 'array')`;
 	}
 	const targetParam = bindPath(target.path, context);
-	return `(json_type(i.data, ${targetParam}) IS NOT NULL)`;
+	return `(json_type(${context.preImage.data}, ${targetParam}) IS NOT NULL)`;
 }
 
 function renderUpdateValue(value: ExpressionValue, context: CompileContext): string {
@@ -587,14 +629,15 @@ function renderSize(value: ExpressionValue, context: CompileContext): string {
 
 function referencePresent(reference: ExpressionReference, context: CompileContext): string {
 	switch (reference.ref) {
+		case "data":
+			if (reference.path !== undefined) {
+				recordDataReference(reference, context);
+				return `CASE WHEN ${context.preImage.isJson} THEN json_type(${context.preImage.data}, ${bindPath(reference.path, context)}) IS NOT NULL ELSE 0 END`;
+			}
+			context.completeData = true;
+			return `(${context.preImage.dataPresent})`;
 		case "hashKey":
 		case "v":
-		case "data":
-			if (reference.ref === "data" && reference.path !== undefined) {
-				recordDataReference(reference, context);
-				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_type(i.data, ${bindPath(reference.path, context)}) IS NOT NULL ELSE 0 END`;
-			}
-			if (reference.ref === "data") context.completeData = true;
 			return "(i.hk IS NOT NULL)";
 		case "sortKey":
 			return `(i.hk IS NOT NULL AND length(i.sk) > 0)`;
@@ -617,10 +660,10 @@ function referenceType(reference: ExpressionReference, context: CompileContext):
 			if (reference.path !== undefined) {
 				recordDataReference(reference, context);
 				const path = bindPath(reference.path, context);
-				return `CASE WHEN i.hk IS NULL OR i.data_kind <> ${JSON_KIND} THEN 'missing' ELSE ${jsonTypeSql(`json_type(i.data, ${path})`)} END`;
+				return `CASE WHEN ${context.preImage.isJson} THEN ${jsonTypeSql(`json_type(${context.preImage.data}, ${path})`)} ELSE 'missing' END`;
 			}
 			context.completeData = true;
-			return `CASE WHEN i.hk IS NULL THEN 'missing' WHEN i.data_kind = ${BYTES_KIND} THEN 'bytes' WHEN i.data_kind = ${TEXT_KIND} THEN 'text' WHEN i.data_kind = ${JSON_KIND} THEN ${jsonTypeSql("json_type(i.data)")} ELSE 'missing' END`;
+			return `CASE WHEN ${context.preImage.isJson} THEN ${jsonTypeSql(`json_type(${context.preImage.data})`)} WHEN i.data_kind = ${BYTES_KIND} THEN 'bytes' WHEN i.data_kind = ${TEXT_KIND} THEN 'text' ELSE 'missing' END`;
 	}
 }
 
@@ -634,20 +677,22 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 			return "i.v";
 		case "ttlAt":
 			return "i.ttl_epoch_utc_seconds";
-		case "data":
+		case "data": {
+			const data = context.preImage.data;
 			if (reference.path !== undefined) {
 				recordDataReference(reference, context);
 				const path = bindPath(reference.path, context);
 				if (mode === "json") {
-					return `CASE json_type(i.data, ${path}) WHEN 'true' THEN jsonb('true') WHEN 'false' THEN jsonb('false') ELSE json_extract(i.data, ${path}) END`;
+					return `CASE json_type(${data}, ${path}) WHEN 'true' THEN jsonb('true') WHEN 'false' THEN jsonb('false') ELSE json_extract(${data}, ${path}) END`;
 				}
-				return `CASE WHEN i.hk IS NOT NULL AND i.data_kind = ${JSON_KIND} THEN json_extract(i.data, ${path}) END`;
+				return `CASE WHEN ${context.preImage.isJson} THEN json_extract(${data}, ${path}) END`;
 			}
 			context.completeData = true;
-			// The stored JSONB is already the document form, so both modes bind the column verbatim: a
-			// SQLite function reads it as JSON, and jsonb_set stores it as a nested value.
-			if (mode === "sqlite" || mode === "json") return "i.data";
-			return `CASE WHEN i.data_kind = ${JSON_KIND} AND json_type(i.data) IN ('array', 'object') THEN i.data WHEN i.data_kind = ${JSON_KIND} THEN json_extract(i.data, '$') ELSE i.data END`;
+			// The stored JSONB is already the document form, so both modes read it verbatim: a SQLite
+			// function reads it as JSON, and jsonb_set stores it as a nested value.
+			if (mode === "sqlite" || mode === "json") return data;
+			return `CASE WHEN ${context.preImage.isJson} AND json_type(${data}) IN ('array', 'object') THEN ${data} WHEN ${context.preImage.isJson} THEN json_extract(${data}, '$') ELSE ${data} END`;
+		}
 	}
 }
 

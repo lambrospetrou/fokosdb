@@ -19,6 +19,14 @@
 
 ---
 
+**Superseded in part.** Requirement 5 of section 2.1, the first two rows of the applicability table
+of section 4.2.7, and the first FAQ entry said that an update applies only to an item that exists.
+`docs/agent-plans/2026-09-11-update-creates-the-absent-item.md` changed that: an update of an absent
+item creates it, with the empty document as the pre-image. Every other rule in this document still
+holds. The text below is marked where it changed.
+
+---
+
 ## 1. Overview and Context
 
 ### 1.1 The problem
@@ -80,8 +88,8 @@ That spec lists update expressions as future work and states the required behavi
 3. Every value of every action reads the pre-image. An action never reads the result of an earlier action in
    the same update.
 4. An update never invents a value. A missing operand rejects the operation.
-5. An update applies only to an item that exists and has `data_kind = json`. Any other state rejects the
-   operation.
+5. An update applies only to an item that has `data_kind = json`. Any other state rejects the operation.
+   (Superseded: an update of an ABSENT item creates it, with the empty document as the pre-image.)
 6. A `set` applies only when its target resolves against the pre-image. Any other target rejects the operation.
    A `remove` of a missing path is a no-op.
 7. The result of an update must stay an `array` or an `object`.
@@ -271,7 +279,7 @@ item inside the same storage transaction.
 
 An update is strict. It never invents a value:
 
-- The item must exist, and its `data_kind` must be `json`.
+- The `data_kind` of the item must be `json`. (Superseded: an absent item is created.)
 - The target of a `set` must resolve against the pre-image. A `remove` of a missing path is a no-op.
 - An operand that evaluates to `missing` rejects the operation, except inside `if_not_exists`.
 - The result must stay an `array` or an `object`, and must fit in `MAX_ITEM_BYTES`.
@@ -494,8 +502,7 @@ An update applies only when every test passes:
 
 | Test | SQL form |
 | --- | --- |
-| The item exists | `i.hk IS NOT NULL` |
-| The data is JSON | `i.data_kind = <json code>` |
+| The pre-image is JSON | `i.hk IS NULL OR i.data_kind = <json code>` (superseded: this row replaced two, `The item exists` as `i.hk IS NOT NULL` and `The data is JSON` as `i.data_kind = <json code>`) |
 | The target of each `set` is valid | The rules below this table |
 | No operand is missing | The presence expression of each value, from `renderPresent` |
 | No value is bytes | `<the type expression of each value> <> 'bytes'`, the `valueTypeSql` of the plan |
@@ -1046,8 +1053,8 @@ worth more than brevity here.
 ## 7. Frequently Asked Questions
 
 **Does an update create the item when it is absent?**
-No. DynamoDB `UpdateItem` upserts. This engine rejects, because `data` can hold `text` or `bytes`, so a path
-write on an absent item has no defined meaning. A caller that wants create-or-update uses `put` with a condition.
+Superseded: yes, as DynamoDB `UpdateItem` does. This document first said no. The pre-image of an absent item is
+the empty document, and a caller that needs the item to exist says so with a condition.
 
 **Why does an update need a JSON item?**
 A path addresses a JSON document. A `text` item and a `bytes` item have no paths. A change of kind is a `put`.

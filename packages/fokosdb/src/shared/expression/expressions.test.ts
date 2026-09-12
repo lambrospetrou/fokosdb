@@ -667,13 +667,18 @@ function accountWithout(key: keyof typeof account): Record<string, JsonValue> {
 	return rest;
 }
 
-/** Seeds one item, applies the update through the single-shot write path, and reads the item back. */
-async function applyUpdate(before: JsonValue, update: UpdateExpression): Promise<JsonValue> {
+/**
+ * Seeds one item, applies the update through the single-shot write path, and reads the item back.
+ * `before` of `undefined` seeds no item, which is how an update that creates one is shown.
+ */
+async function applyUpdate(before: JsonValue | undefined, update: UpdateExpression): Promise<JsonValue> {
 	const hk = KeyCodec.encode(updateHashKey);
 	const sk = KeyCodec.encode(`update#${crypto.randomUUID()}`);
 	return await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+		if (before !== undefined) {
+			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+		}
 		store.updateItemSingleShot({ hk, sk, plan: compileUpdateExpression(update), lastTransactionTs: 2 });
 		return JSON.parse(store.getItem(hk, sk).row?.data as string) as JsonValue;
 	});
@@ -683,14 +688,16 @@ type UpdateShowcaseCase = {
 	name: string;
 	/** The document before the update. Defaults to the account above. */
 	before?: JsonValue;
+	/** True when no item exists before the update, so the update creates one. */
+	absent?: boolean;
 	update: UpdateExpression;
 	/** The complete document the update stores. */
 	after: JsonValue;
 };
 
 function updateShowcase(cases: readonly UpdateShowcaseCase[]): void {
-	it.each(cases)("$name", async ({ before = account, update, after }) => {
-		expect(await applyUpdate(before, update)).toEqual(after);
+	it.each(cases)("$name", async ({ before = account, absent = false, update, after }) => {
+		expect(await applyUpdate(absent ? undefined : before, update)).toEqual(after);
 	});
 }
 
@@ -760,6 +767,56 @@ describe("expression showcase: update actions", () => {
 				profile: { name: "ada", country: "de", tier: "gold" },
 				tags: ["beta", "eu", "vip"],
 			},
+		},
+	]);
+});
+
+/**
+ * An update of an item that does not exist creates it, as DynamoDB does. The pre-image is then the
+ * empty document, so the actions write into `{}` and every other rule stays the same: a `set` still
+ * needs its parent, and a value still rejects a missing operand unless `if_not_exists` supplies one.
+ * A caller that needs the item to exist adds a condition, which the write path evaluates before the
+ * update — the transaction suite holds those cases, because a condition is part of the write path
+ * and not of the expression engine.
+ */
+describe("expression showcase: update creates an absent item", () => {
+	updateShowcase([
+		{
+			name: "set over no item creates it from the empty document",
+			absent: true,
+			update: [{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "new" } }],
+			after: { status: "new" },
+		},
+		{
+			name: "the counter form starts at its default when there is no item",
+			absent: true,
+			update: [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.visits" },
+					value: {
+						fn: "+",
+						args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.visits" }, { val: 0 }] }, { val: 1 }],
+					},
+				},
+			],
+			after: { visits: 1 },
+		},
+		{
+			name: "many actions build a complete document over the empty one",
+			absent: true,
+			update: [
+				{ action: "set", target: { ref: "data", path: "$.name" }, value: { val: "ada" } },
+				{ action: "set", target: { ref: "data", path: "$.active" }, value: { val: true } },
+				{ action: "remove", target: { ref: "data", path: "$.absent" } },
+			],
+			after: { name: "ada", active: true },
+		},
+		{
+			name: "remove over no item creates the empty document",
+			absent: true,
+			update: [{ action: "remove", target: { ref: "data", path: "$.anything" } }],
+			after: {},
 		},
 	]);
 });

@@ -76,7 +76,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Fix update in transactions to be an upsert, create the item if not existing and if the condition (exists) passes.
 - queryItems: count only operation, filter + projections.
 - Add global eventual indexes (DynamoDB GSIs).
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).

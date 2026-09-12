@@ -996,7 +996,6 @@ defaults that section 4.2.1 describes.
 | `partition_context_mismatch` | Internal | `8hv63q` | i | 500 |
 | `item_data_parse_failed` | Internal | `dx9mht` | i | 500 |
 | `commit_keyset_mismatch` | Internal | `e3kh5s` | i | 500 |
-| `item_not_found_for_update` | Internal | `h5vq43` | i | 500 |
 | `unexpected_transaction_state` | Internal | `j6uhd6` | i | 500 |
 | `partition_fanout_failed` | Internal | `f3aqhc` | i | 500 |
 | `foreign_error` | Internal | `jvufz5` | i | 500 |

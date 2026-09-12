@@ -13,7 +13,7 @@ import {
 	type UpdateProbeResult,
 } from "../expression/runtime.js";
 import { MAX_ITEM_BYTES, decodeItemKeys } from "../transaction-limits.js";
-import { FokosInternalError, FokosValidationError, INTERNAL_CODES, VALIDATION_CODES } from "../errors.js";
+import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
 import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
 
@@ -1006,6 +1006,11 @@ export class PartitionStore {
 	 * Locks an item and materializes the complete new document into its pending row, so that commit
 	 * applies a payload that is already a plain put.
 	 *
+	 * The source is a LEFT JOIN, not a plain scan of `items`: an update of an absent item creates it,
+	 * so the statement must write a lock for a key that has no row yet. A prepare that accepted an
+	 * item and wrote no lock would make commit find an empty key set and report success for a write
+	 * it never applied.
+	 *
 	 * The row stores the raw JSONB blob, NOT `json(...)` text. A JSONB-to-text-to-JSONB round trip is
 	 * not size-stable: `jsonb_set` keeps a string element unescaped, while re-parsing the rendered
 	 * text bakes the escapes into the blob, so `{"k":"he said \"hi\""}` grows by 4 bytes. Storing the
@@ -1044,14 +1049,19 @@ export class PartitionStore {
 			       ${ttlExpr},
 			       NULL,
 			       ${opts.plan.documentSql}
-			FROM items AS i
-			WHERE i.hk = ?1 AND i.sk = ?2`,
+			FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
 		return { rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
 	}
 
-	/** Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge. */
+	/**
+	 * Applies an update in one statement, and creates the item when it is absent — the same answer
+	 * DynamoDB gives, with the empty document as the pre-image the actions write into. A caller that
+	 * needs the item to exist says so with a condition, which prepare evaluates before this runs.
+	 *
+	 * Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge.
+	 */
 	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: CompiledUpdatePlan; ttlAt?: number; lastTransactionTs: number }): {
 		version: number;
 		keyEstBytes: number;
@@ -1060,33 +1070,39 @@ export class PartitionStore {
 	} {
 		validateUpdatePlan(opts.plan);
 		// Zero means the row is absent, never a row of zero size: est_row_bytes always carries both keys
-		// and EST_ROW_BYTES_K. Answering here separates the two causes of an UPDATE that writes no row,
-		// so the size guard below can report the one cause that is left.
+		// and EST_ROW_BYTES_K. It is also the right old value for the key_size_estimates delta of an
+		// item this statement creates. The size guard is then the only cause of a statement that writes
+		// no row, which is what lets it report that one cause.
 		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
-		if (oldEst === 0) {
-			throw new FokosInternalError(INTERNAL_CODES.item_not_found_for_update, {
-				message: "item not found",
-				attributes: decodeItemKeys(opts.hk, opts.sk),
-			});
-		}
 		const docExpr = opts.plan.documentSql;
 		const hkParam = "?1";
 		const skParam = "?2";
 		const tail = new StatementTail(opts.plan);
 		const lastTsParam = tail.param(opts.lastTransactionTs);
-		// The TTL column is only assigned when the operation sets one; otherwise the statement leaves it
-		// alone, so the TTL of the pre-image survives without a run-time test. The value still binds.
-		const ttlAssignment = opts.ttlAt === undefined ? "" : `, ttl_epoch_utc_seconds = ${tail.param(opts.ttlAt)}`;
+		// The TTL of the pre-image survives unless the operation sets one: the insert then carries the
+		// joined row's TTL, which is NULL for an item this statement creates, and the conflict branch
+		// assigns that same value back. WHICH branch applies is known here, so the statement carries the
+		// branch it needs instead of testing a flag at run time. The value still binds.
+		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
 		const limitParam = tail.param(MAX_ITEM_BYTES);
 
+		// The source is a LEFT JOIN over items, so the document expression reads the stored row when
+		// there is one and the empty pre-image when there is not, and one statement covers both. The
+		// WHERE clause holds the size guard: when it removes the source row, neither branch runs and the
+		// statement returns nothing.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`UPDATE items AS i
-			    SET data = ${docExpr},
-			        est_row_bytes = ${estRowBytesExpr(docExpr, hkParam, skParam)},
-			        v = v + 1,
-			        last_transaction_ts = MAX(last_transaction_ts, ${lastTsParam})${ttlAssignment}
-			  WHERE i.hk = ${hkParam} AND i.sk = ${skParam}
-			    AND ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
+			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
+			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, 1, ${lastTsParam},
+			        ${estRowBytesExpr(docExpr, hkParam, skParam)}, ${docExpr}
+			   FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ${hkParam} AND i.sk = ${skParam}
+			  WHERE ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
+			 ON CONFLICT(hk, sk) DO UPDATE SET
+			   data = excluded.data,
+			   data_kind = excluded.data_kind,
+			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+			   est_row_bytes = excluded.est_row_bytes,
+			   v = v + 1,
+			   last_transaction_ts = MAX(last_transaction_ts, excluded.last_transaction_ts)
 			 RETURNING v, est_row_bytes`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
