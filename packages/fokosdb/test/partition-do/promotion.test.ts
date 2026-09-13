@@ -180,3 +180,35 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		});
 	});
 });
+
+describe("PartitionDO — debugForcePromoteKey", () => {
+	it("forwards to the owning child on a split parent", async () => {
+		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await root.splitHash();
+
+		const res = await root.stub.debugForcePromoteKey(root.ctx, kb("alice"));
+		expect(res.queued).toBe(true);
+		// The forward queues on the child; an early background cycle may already have advanced it.
+		expect(["queued", "promoting", "promoted"]).toContain(res.status);
+
+		// The router queued nothing locally; the owning child holds the entry.
+		expect(await root.promotedKeyStatus("alice")).toBeUndefined();
+		const owner = await root.childOwning("alice");
+		expect(await owner.promotedKeyStatus("alice")).toBeDefined();
+
+		await owner.awaitPromoted("alice");
+	}, 30_000);
+
+	it("returns the existing status without queueing again", async () => {
+		const partition = makePartition();
+
+		const first = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		expect(first.queued).toBe(true);
+
+		const second = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		expect(second.queued).toBe(false);
+		expect(second.status).toBeDefined();
+
+		await partition.awaitPromoted("alice");
+	}, 30_000);
+});

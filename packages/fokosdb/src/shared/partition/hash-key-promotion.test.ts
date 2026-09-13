@@ -115,17 +115,30 @@ describe("PromotionManager — drive and cutover", () => {
 		});
 	});
 
-	it("skips promotion entirely while a hash split is queued or started (mutual exclusion)", async () => {
+	it("skips promotion entirely while a hash split record exists — queued, started, or completed (mutual exclusion)", async () => {
 		await withPromotionEnv(async (penv) => {
 			const { manager, pCtx, calls } = penv;
 			manager.maybeQueuePromotion(pCtx, kb("alice"), THRESHOLD_BYTES);
 			const splitQueued: SplitStatusKVItem = { status: "split_queued", splitType: "hash", createdAt: 0, partitionContext: pCtx };
+			// A completed split made this partition a router that owns no rows: a promotion from it
+			// would migrate a stale snapshot and shadow the live data in the child.
+			const splitCompleted: SplitStatusKVItem = {
+				status: "split_completed",
+				splitType: "hash",
+				createdAt: 0,
+				partitionContext: pCtx,
+				childPartitionContexts: [],
+				migratedChildDoNames: [],
+				history: [],
+			};
 
-			await manager.drive(pCtx, () => splitQueued);
+			for (const splitStatus of [splitQueued, splitCompleted]) {
+				await manager.drive(pCtx, () => splitStatus);
 
-			expect(calls.inits).toHaveLength(0);
-			expect(calls.triggers).toBe(0);
-			expect(manager.statusFor(kb("alice"))).toBe("queued");
+				expect(calls.inits).toHaveLength(0);
+				expect(calls.triggers).toBe(0);
+				expect(manager.statusFor(kb("alice"))).toBe("queued");
+			}
 		});
 	});
 

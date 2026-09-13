@@ -1594,11 +1594,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 * key reaches "promoted" through exactly the path a size-triggered promotion takes.
 	 *
 	 * Idempotent: a key that already has a promotion entry comes back with `queued: false`.
+	 *
+	 * Only the partition that owns the key's rows may queue it. A split parent forwards to the child
+	 * that owns the key, because a promotion from a router would migrate a stale snapshot and then
+	 * shadow the live rows in the child. A partition with a queued split rejects the call: the split
+	 * runs regardless of in-flight promotions, and the queued entry would outlive it on the router.
 	 */
 	async debugForcePromoteKey(pCtx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse> {
 		return await this.#rpc("debugForcePromoteKey", async () => {
 			this.ensurePartitionContext(pCtx);
 			await this.ensureMigration("debugForcePromoteKey");
+			const status = this.#promotion.statusFor(hashKey);
+			if (status !== undefined) return { queued: false, status };
+			if (this.ensureTopology(this.pCtx()).splitStatus()?.status === "split_queued") {
+				throw errExceededDatabaseSize("debugForcePromoteKey");
+			}
+			const route = this.routeSingleDestination([{ hashKey }], "ignore_size_reject", "debugForcePromoteKey");
+			if (route.destination === "child") {
+				return await this.getChildStub(route.pCtx).debugForcePromoteKey(route.pCtx, hashKey);
+			}
 			const queued = await this.#promotion.queuePromotion(this.pCtx(), hashKey);
 			return { queued, status: this.#promotion.statusFor(hashKey) };
 		});

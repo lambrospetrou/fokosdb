@@ -144,10 +144,11 @@ export class PromotionManager {
 		hashKey: KeyBytes,
 		getSplitStatus: () => SplitStatusKVItem | undefined,
 	): Promise<void> {
-		// Mutual exclusion: skip if a hash split is already in progress. The status is provided by
-		// the DO — promotion does not read split-policy KV directly.
-		const splitStatus = getSplitStatus();
-		if (splitStatus?.status === "split_queued" || splitStatus?.status === "split_started") return;
+		// Mutual exclusion: skip when this partition has any split record. A queued or started split
+		// is in progress, and a completed split made this partition a router that owns no rows: a
+		// promotion from it would migrate a stale snapshot and shadow the live data in the child. The
+		// status is provided by the DO — promotion does not read split-policy KV directly.
+		if (getSplitStatus()) return;
 
 		// A. Build identity for the range root (idFromName resolution — allowed everywhere).
 		const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, hashKey, null, null);
