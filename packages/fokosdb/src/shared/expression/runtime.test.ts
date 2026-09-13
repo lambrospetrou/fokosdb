@@ -37,7 +37,7 @@ function putFixture(storage: DurableObjectStorage, hashKey: KeyBytes, sortKey: K
 		data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
 		kind: item.kind,
 		ttlAt: item.ttlAt ?? null,
-		lastTransactionTs: 1,
+		txOrderTs: 1,
 	});
 }
 

@@ -67,7 +67,7 @@ async function withRangeTopology(
 function fillRows(store: PartitionStore, count: number): void {
 	const data = "x".repeat(24 * 1024);
 	for (let i = 0; i < count; i++) {
-		store.upsertItem({ hk: kb("alice"), sk: kb(`sk${String(i).padStart(3, "0")}`), data, kind: "text", ttlAt: null, lastTransactionTs: 0 });
+		store.upsertItem({ hk: kb("alice"), sk: kb(`sk${String(i).padStart(3, "0")}`), data, kind: "text", ttlAt: null, txOrderTs: 0 });
 	}
 }
 

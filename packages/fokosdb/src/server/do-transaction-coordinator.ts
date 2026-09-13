@@ -39,6 +39,7 @@ import {
 	decodeItemKeys,
 	IDEMPOTENCY_WINDOW_MS,
 	MAX_TC_DATABASE_BYTES,
+	txOrderTimestampNow,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
 
@@ -317,8 +318,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC
 		// receives already-validated, already-encoded operations.
 
-		// TODO: append DO shard suffix for tie-breaking when TC pooling is introduced
-		const transactionTs = Date.now();
+		// The low three decimal digits stay zero; a later change can allocate them to tie-breaking.
+		const transactionTs = txOrderTimestampNow();
 
 		// Collect one partitionContext per distinct partition (doName → context).
 		const partitionContextByDoName = new Map<string, PartitionContextResolved>();

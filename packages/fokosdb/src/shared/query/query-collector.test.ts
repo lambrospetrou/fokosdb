@@ -15,7 +15,7 @@ function row(sk: string, estRowBytes: number, item?: Partial<MigratedItem>): Que
 		item:
 			item === undefined
 				? null
-				: { hk, sk: skBytes, data: "x", kind: "text", ttl_epoch_utc_seconds: null, v: 1, last_transaction_ts: 0, ...item },
+				: { hk, sk: skBytes, data: "x", kind: "text", ttl_epoch_utc_seconds: null, v: 1, last_read_ts: 0, last_write_ts: 0, ...item },
 	};
 }
 

@@ -10,11 +10,17 @@
  */
 
 import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
-import type { ParticipantOperationResultEncoded, RejectionReasonEncoded, TransactionOperationType } from "./transaction-types.js";
+import type {
+	ParticipantOperationResultEncoded,
+	RejectionReasonEncoded,
+	TransactionOperationType,
+	TransactionTimestamp,
+} from "./transaction-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
+import invariant from "./invariant.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
 // DynamoDB uses 2KB for hashKey and 1KB for sortKey. These limits are stricter and can go up later.
@@ -53,6 +59,23 @@ export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const SWEEP_BATCH_ROWS = 1_000;
 export const ALARM_RECOVERY_BUDGET_MS = 30_000;
+
+/**
+ * Transaction order timestamps are integers in microsecond-shaped units: one millisecond is this many units.
+ * We will use this sub-ms space for coordinator tie-breaking and other fine-grained ordering needs.
+ **/
+export const TX_ORDER_TS_UNITS_PER_MS = 1_000;
+
+/**
+ * The only producer of a transaction order timestamp. The low three decimal digits are zero; they are reserved
+ * for coordinator tie-breaking. `Date.now() * 1_000` stays a safe integer until the year 2255, so the
+ * assertion guards a broken clock, not normal operation.
+ */
+export function txOrderTimestampNow(): TransactionTimestamp {
+	const ts = Date.now() * TX_ORDER_TS_UNITS_PER_MS;
+	invariant(Number.isSafeInteger(ts), "transaction order timestamp is not a safe integer");
+	return ts;
+}
 
 const textEncoder = new TextEncoder();
 

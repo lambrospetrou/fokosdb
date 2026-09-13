@@ -390,7 +390,13 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", sortKey: "sk1", serverTimestampMs: 10, transactionTimestampMs: 99 };
+			const clockSkew = {
+				code: "clock_skew" as const,
+				hashKey: "hk1",
+				sortKey: "sk1",
+				serverTimestampMicros: 10,
+				transactionTimestampMicros: 99,
+			};
 			insertParticipant(state, {
 				name: "p1",
 				prepare: "rejected",
@@ -524,7 +530,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 	it("recovers a persisted clock_skew as clock_skew", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
-			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", serverTimestampMs: 5, transactionTimestampMs: 500 };
+			const clockSkew = { code: "clock_skew" as const, hashKey: "hk1", serverTimestampMicros: 5, transactionTimestampMicros: 500 };
 			insertParticipant(state, {
 				name: "p1",
 				prepare: "rejected",

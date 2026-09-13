@@ -195,9 +195,9 @@ describe("PromotionManager — GC", () => {
 				gcBatchLimit: 2,
 			});
 			for (const sk of ["1", "2", "3"]) {
-				store.upsertItem({ hk: kb("alice"), sk: kb(sk), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 0 });
+				store.upsertItem({ hk: kb("alice"), sk: kb(sk), data: "x", kind: "text", ttlAt: null, txOrderTs: 0 });
 			}
-			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", kind: "text", ttlAt: null, lastTransactionTs: 0 });
+			store.upsertItem({ hk: kb("bob"), sk: kb("1"), data: "y", kind: "text", ttlAt: null, txOrderTs: 0 });
 			insertLock(store, kb("alice"), "tx1");
 			store.insertPromotedKey(kb("alice"), "promoted", 1);
 

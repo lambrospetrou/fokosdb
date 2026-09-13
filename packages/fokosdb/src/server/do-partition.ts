@@ -81,7 +81,13 @@ import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { collectQueryPage } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { applyImageCap, conditionFailedReason, decodeItemKeys, IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
+import {
+	applyImageCap,
+	conditionFailedReason,
+	decodeItemKeys,
+	IDEMPOTENCY_WINDOW_MS,
+	txOrderTimestampNow,
+} from "../shared/transaction-limits.js";
 import {
 	CONFLICT_CODES,
 	FokosConflictError,
@@ -548,7 +554,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						data: req.data,
 						kind: req.kind,
 						ttlAt: req.ttlAt ?? null,
-						lastTransactionTs: Date.now(),
+						txOrderTs: txOrderTimestampNow(),
 					});
 					return { outcome: "ok" as const, writeRes, conditionRes };
 				});
@@ -603,8 +609,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 						return { outcome: "rejected" as const, conditionRes, image };
 					}
 
-					// Keep deletion watermark consistent with transactional deletes.
-					const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, watermarkTs: Date.now() });
+					// Keep the deletion transaction order watermark consistent with transactional deletes.
+					const writeRes = this.#store.deleteItem({ hk: hashKey, sk: sortKey, txOrderTs: txOrderTimestampNow() });
 					return { outcome: "ok" as const, writeRes, conditionRes };
 				});
 
@@ -1044,7 +1050,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		cursor: PendingTransactionCursor | null;
 	}): Promise<GetPartitionTransactionMetadataResult> {
 		const pCtx = this.pCtx();
-		const maxDeletedTs = this.#store.getMaxDeletedTs();
+		const { maxDeleteTxOrderTs, deleteRevision } = this.#store.getDeletionMetadata();
 
 		// Range-child migration (promotion or range-split).
 		const childPartitionContext = opts.childPartitionContext;
@@ -1052,14 +1058,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const hk = childPartitionContext.rangePartition.hashKey;
 			if (isHashPartition(pCtx)) {
 				// Hash DO serving a promotion: lock-free cutover guarantees no pending_transactions for this key.
-				// Return only the deletion watermark so the range root can sync it.
+				// Return only the deletion metadata so the range root can sync it.
 				const status = this.#promotion.statusFor(hk);
 				invariant(
 					status === "promoting",
 					() =>
 						`fokos/partition.migrationGetPartitionTransactionMetadata: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
 				);
-				return { maxDeletedTs, pendingTransactions: [], nextCursor: null };
+				return { maxDeleteTxOrderTs, deleteRevision, pendingTransactions: [], nextCursor: null };
 			}
 			// Range-split: stream the child's pending locks (sk ∈ [start, end)) so commit/cancel can follow.
 			const topology = this.ensureTopology(pCtx);
@@ -1088,7 +1094,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				startCursor: opts.cursor,
 			});
 			return {
-				maxDeletedTs,
+				maxDeleteTxOrderTs,
+				deleteRevision,
 				pendingTransactions: rows,
 				nextCursor,
 			};
@@ -1123,7 +1130,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 
 		return {
-			maxDeletedTs,
+			maxDeleteTxOrderTs,
+			deleteRevision,
 			pendingTransactions: rows,
 			nextCursor,
 		};
@@ -1566,7 +1574,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				request.outcome === "commit"
 					? await this.txCommit(pCtx, {
 							transactionId: request.transactionId,
-							transactionTimestamp: pendingRows[0]?.transaction_ts ?? Date.now(),
+							transactionTimestamp: pendingRows[0]?.transaction_ts ?? txOrderTimestampNow(),
 							items,
 						})
 					: await this.txCancel(pCtx, { transactionId: request.transactionId, items });

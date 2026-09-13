@@ -15,7 +15,7 @@ import { DATA_KINDS, type DataKind } from "../types.js";
 export const JSON_KIND_CODE = DATA_KINDS.indexOf("json");
 
 // Fixed per-row overhead added to est_row_bytes. See the "items" migration for what K covers in PartitionStore.
-export const EST_ROW_BYTES_K = 100;
+export const EST_ROW_BYTES_K = 108;
 
 /**
  * The ONLY definition of the est_row_bytes formula. `dataExpr` must be the same SQL that produces the

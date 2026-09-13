@@ -71,7 +71,7 @@ describe("the categories of errors-operations", () => {
 
 describe("FokosTransactionCancelledError", () => {
 	it("is a service condition only when every rejected entry has a service code", () => {
-		const clockSkew = rejected({ code: "clock_skew", hashKey: "hk", serverTimestampMs: 1, transactionTimestampMs: 2 });
+		const clockSkew = rejected({ code: "clock_skew", hashKey: "hk", serverTimestampMicros: 1, transactionTimestampMicros: 2 });
 		expect(cancelled([migrating, clockSkew, { outcome: "passed" }])).toMatchObject({ origin: "service", httpStatusHint: 503 });
 	});
 

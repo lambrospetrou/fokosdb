@@ -1,6 +1,6 @@
 # RFC — Item order timestamps and transactional-read revisions
 
-**State:** Draft
+**State:** Completed on 2026-09-13.
 **Date:** 2026-09-05
 **Author:** Lambros
 
@@ -57,7 +57,7 @@ zero for every timestamp this change creates. They are reserved for a later coor
 
 The deletion metadata stores two values with different purposes:
 
-- `max_delete_order_ts` preserves the current absent-item prepare rule.
+- `max_delete_tx_order_ts` preserves the current absent-item prepare rule.
 - `delete_revision` changes when a user delete removes at least one item row.
 
 Each transactional-read result carries the owner partition's `delete_revision`. The client compares it across the
@@ -70,7 +70,7 @@ The design keeps the two-phase read protocol writeless. Normal reads and transac
 
 ### 1.3 Glossary
 
-**Order timestamp:** An integer in microsecond-shaped units. The value is `Date.now() * TIMESTAMP_UNITS_PER_MS`
+**Order timestamp:** An integer in microsecond-shaped units. The value is `Date.now() * TX_ORDER_TS_UNITS_PER_MS`
 for a partition-local operation. A two-phase transaction receives the value from its coordinator.
 
 **Base timestamp:** The order timestamp that a writer stamps on an item. The coordinator transaction timestamp for
@@ -97,7 +97,7 @@ one item row.
 - A put, update, or delete must compare its transaction timestamp with `last_read_ts`.
 - Content mutations must keep their current prepare outcomes at millisecond granularity.
 - The current absent-item prepare rule must remain unchanged apart from the timestamp unit and column name.
-- The deletion metadata must rename `max_deleted_ts` to `max_delete_order_ts`.
+- The deletion metadata must rename `max_deleted_ts` to `max_delete_tx_order_ts`.
 - The deletion metadata must add `delete_revision`.
 - A user delete that removes a row must advance `delete_revision`.
 - A delete that finds no row must not advance `delete_revision`.
@@ -113,7 +113,7 @@ one item row.
 - The change must not add the Thomas Write Rule or discard an old write at commit.
 - The change must not permit multiple prepared write transactions on one item.
 - The change must not add `max_absent_read_ts` or another watermark for a `check` on an absent item.
-- The change must not propagate a removed row's read timestamp into `max_delete_order_ts`.
+- The change must not propagate a removed row's read timestamp into `max_delete_tx_order_ts`.
 - The change must not add timestamp tests to the single-partition write fast path.
 - The change must not make `getItem`, `queryItems`, or `transactGetItems` write a read timestamp.
 - The change must not replace the two-phase transactional-read protocol with a one-phase protocol.
@@ -128,7 +128,7 @@ one item row.
 
 - Every stored order timestamp must be a JavaScript safe integer. One shared helper creates every order
   timestamp and asserts `Number.isSafeInteger` on it (section 4.2.1).
-- The code must use `TIMESTAMP_UNITS_PER_MS = 1_000`.
+- The code must use `TX_ORDER_TS_UNITS_PER_MS = 1_000`.
 - The code must not use nanosecond epoch values in a JavaScript `number`.
 - `data` must remain the last column of `items`.
 - Neither item timestamp must join `idx_items_scan`.
@@ -148,7 +148,7 @@ one item row.
 
 One change to the whole tree. It delivers a working system at every commit boundary that the review pauses on.
 
-- Add the shared `TIMESTAMP_UNITS_PER_MS` constant and the `orderTimestampNow()` helper. Move every
+- Add the shared `TX_ORDER_TS_UNITS_PER_MS` constant and the `txOrderTimestampNow()` helper. Both live in `shared/transaction-limits.ts`. Move every
   order-timestamp producer to the helper: the coordinator's `tc_state.transaction_ts`, the single-shot path,
   `apiPutItem`, `apiDeleteItem`, and the `Date.now()` fallback in `debugForceResolveTransaction`. Move the TTL
   sweep watermark to the new unit. Update the `TransactionTimestamp` type comment.
@@ -235,10 +235,10 @@ A pending or committed `check` changes none of these signals.
 Add one shared constant and one shared helper in `shared/`:
 
 ```ts
-const TIMESTAMP_UNITS_PER_MS = 1_000;
+const TX_ORDER_TS_UNITS_PER_MS = 1_000;
 
-function orderTimestampNow(): TransactionTimestamp {
-    const ts = Date.now() * TIMESTAMP_UNITS_PER_MS;
+function txOrderTimestampNow(): TransactionTimestamp {
+    const ts = Date.now() * TX_ORDER_TS_UNITS_PER_MS;
     invariant(Number.isSafeInteger(ts), "order timestamp is not a safe integer");
     return ts;
 }
@@ -278,12 +278,12 @@ commit after a newer one without lowering the watermark and without adding to it
 The clock-skew test must compare physical milliseconds:
 
 ```text
-FLOOR(transaction_timestamp / TIMESTAMP_UNITS_PER_MS) <= Date.now() + MAX_CLOCK_SKEW_MS
+FLOOR(transaction_timestamp / TX_ORDER_TS_UNITS_PER_MS) <= Date.now() + MAX_CLOCK_SKEW_MS
 ```
 
 The `clock_skew` rejection renames `serverTimestampMs` and `transactionTimestampMs` to `serverTimestampMicros`
 and `transactionTimestampMicros`. Both carry values in the order unit: `serverTimestampMicros` is the partition
-wall clock times `TIMESTAMP_UNITS_PER_MS`, and `transactionTimestampMicros` is the transaction timestamp. This
+wall clock times `TX_ORDER_TS_UNITS_PER_MS`, and `transactionTimestampMicros` is the transaction timestamp. This
 is a breaking change to the public rejection shape and is accepted.
 
 The following values remain in their current units:
@@ -296,7 +296,7 @@ The following values remain in their current units:
 A TTL expiry timestamp converts to the order unit with:
 
 ```text
-ttl_expiry_order_ts = ttl_epoch_utc_seconds * 1_000 * TIMESTAMP_UNITS_PER_MS
+ttl_expiry_order_ts = ttl_epoch_utc_seconds * 1_000 * TX_ORDER_TS_UNITS_PER_MS
 ```
 
 #### 4.2.2 Schema
@@ -326,12 +326,12 @@ The deletion metadata becomes:
 ```sql
 CREATE TABLE IF NOT EXISTS deletion_metadata (
     id                    INTEGER PRIMARY KEY CHECK (id = 1),
-    max_delete_order_ts   INTEGER NOT NULL DEFAULT 0,
+    max_delete_tx_order_ts   INTEGER NOT NULL DEFAULT 0,
     delete_revision       INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 ```
 
-`max_delete_order_ts` and `delete_revision` use different update rules. Section 4.2.5 defines those rules.
+`max_delete_tx_order_ts` and `delete_revision` use different update rules. Section 4.2.5 defines those rules.
 
 The change edits the existing initial migrations in place. Section 4.2.11 gives the deployment rule.
 
@@ -387,7 +387,7 @@ both. The write guard therefore does not need a second comparison against `last_
 When the item is absent, prepare must retain the current rule:
 
 ```text
-transaction_timestamp <= max_delete_order_ts
+transaction_timestamp <= max_delete_tx_order_ts
 ```
 
 A `check` on an absent item must not add another watermark. Locks continue to provide serializability for this
@@ -398,12 +398,12 @@ another write transaction and against a non-transactional writer.
 
 #### 4.2.5 Delete ordering and delete revision
 
-`max_delete_order_ts` replaces `max_deleted_ts` without changing its meaning.
+`max_delete_tx_order_ts` replaces `max_deleted_ts` without changing its meaning.
 
-The store updates `max_delete_order_ts` with:
+The store updates `max_delete_tx_order_ts` with:
 
 ```text
-max_delete_order_ts = MAX(max_delete_order_ts, candidate_order_timestamp)
+max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, candidate_order_timestamp)
 ```
 
 The candidate remains specific to each path:
@@ -520,7 +520,7 @@ version returns to its first value.
 The TTL sweep is physical reclamation, not a logical mutation. The logical deletion of an expired item happens at
 its expiry instant, which is a function of the row's own data. The TTL contract already permits a reader to see
 an expired item until the sweep removes it. The sweep therefore uses its expiry timestamp for
-`max_delete_order_ts`, as it does today, and does not touch `delete_revision`.
+`max_delete_tx_order_ts`, as it does today, and does not touch `delete_revision`.
 
 The two sequences above with a TTL removal in place of the user delete:
 
@@ -532,7 +532,7 @@ The two sequences above with a TTL removal in place of the user delete:
   original create, with a sweep chunk between them. The sweep timer starts at least 500 ms after the RPC that arms
   it, so this needs a create, a sweep, and a recreate inside one millisecond. This is a documented limit.
 
-A delete of an absent item can advance `max_delete_order_ts` without advancing `delete_revision`. The delete
+A delete of an absent item can advance `max_delete_tx_order_ts` without advancing `delete_revision`. The delete
 orders a write transaction but does not change readable item state.
 
 #### 4.2.9 Split and promotion migration
@@ -544,7 +544,7 @@ orders a write transaction but does not change readable item state.
 
 ```ts
 {
-    maxDeleteOrderTs: number;
+    maxDeleteTxOrderTs: number;
     deleteRevision: number;
     pendingTransactions: PendingTransactionRow[];
     nextCursor: PendingTransactionCursor | null;
@@ -554,7 +554,7 @@ orders a write transaction but does not change readable item state.
 Each child must merge the metadata with `MAX`:
 
 ```text
-child.max_delete_order_ts = MAX(child value, parent value)
+child.max_delete_tx_order_ts = MAX(child value, parent value)
 child.delete_revision     = MAX(child value, parent value)
 ```
 
@@ -596,7 +596,7 @@ of the row. Both must grow by one column so that `key_size_estimates`, the split
 the migration batch byte budget do not drift low.
 
 Row writes. A put, update, or `check` continues to update one item row. An actual delete already updates the
-deletion metadata row; updating `max_delete_order_ts` and `delete_revision` in one statement keeps that at one
+deletion metadata row; updating `max_delete_tx_order_ts` and `delete_revision` in one statement keeps that at one
 row write.
 
 Row reads. Each two-phase transactional-read RPC adds one deletion metadata row read per local owner partition. A
@@ -636,12 +636,12 @@ The store tests must prove:
 - An out-of-order `check` does not decrease `last_read_ts`.
 - `last_read_ts >= last_write_ts` after every writer, including a `check` on a row a lagging clock wrote.
 - A real user delete increments `delete_revision` once and updates both metadata fields in one statement.
-- A TTL batch does not change `delete_revision` and advances `max_delete_order_ts` to the largest expiry in
+- A TTL batch does not change `delete_revision` and advances `max_delete_tx_order_ts` to the largest expiry in
   the order unit.
 - An absent delete does not increment `delete_revision`.
-- A transactional absent delete still advances `max_delete_order_ts`.
+- A transactional absent delete still advances `max_delete_tx_order_ts`.
 - Promotion cleanup changes neither deletion metadata value.
-- Every created order timestamp is a safe integer and a multiple of `TIMESTAMP_UNITS_PER_MS`.
+- Every created order timestamp is a safe integer and a multiple of `TX_ORDER_TS_UNITS_PER_MS`.
 
 The participant tests must prove:
 
@@ -701,7 +701,7 @@ cause `read_conflict` without a content change.
 
 ### 5.2 Use one delete timestamp for ordering and revision
 
-Make `max_delete_order_ts` advance after every delete and return it as the absent-item revision.
+Make `max_delete_tx_order_ts` advance after every delete and return it as the absent-item revision.
 
 This option removes `delete_revision`. It also raises the prepare watermark when a delete candidate is below the
 current maximum. A transaction against any absent item can then fail inside the new logical interval.
@@ -748,7 +748,7 @@ writes. The current two-phase protocol avoids that write cost and remains in sco
 Stamp a write to an existing item with `MAX(base_timestamp, last_write_ts + 1)` so that two writes in one
 millisecond receive different `last_write_ts` values.
 
-The increment changes no decision. A coordinator timestamp is a multiple of `TIMESTAMP_UNITS_PER_MS`, so
+The increment changes no decision. A coordinator timestamp is a multiple of `TX_ORDER_TS_UNITS_PER_MS`, so
 `T * 1000 <= S * 1000 + k` with `0 <= k <= 999` is true exactly when `T <= S`; the logical part never changes a
 prepare outcome. The two-phase read already detects every same-millisecond write through `v`, and every delete
 and recreate through `delete_revision`.
@@ -831,7 +831,7 @@ partition revision proves that a user row removal occurred during the read.
 `v` changes on every write to a live row, including two writes in one millisecond, which share a timestamp.
 `delete_revision` covers the one case where `v` repeats. The timestamp adds no signal.
 
-### Why is `delete_revision` separate from `max_delete_order_ts`?
+### Why is `delete_revision` separate from `max_delete_tx_order_ts`?
 
 The order timestamp can stay unchanged when an older deletion occurs. The revision must change after every user
 row removal. An absent transactional delete advances the order timestamp but does not change readable state.

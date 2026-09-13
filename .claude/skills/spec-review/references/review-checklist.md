@@ -155,5 +155,5 @@ The failure modes this codebase repeats. Check each spec against all of them.
     into `items` is wrong.
 11. **Durable Object limits.** 10 GB per object, one thread, an alarm at a time.
     Check the current Cloudflare limits page; do not trust memory.
-12. **Internal columns are not public.** `last_transaction_ts`, `data_kind`, and
+12. **Internal columns are not public.** `last_read_ts`, `last_write_ts`, `data_kind`, and
     `est_row_bytes` must not become part of a public interface.

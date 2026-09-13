@@ -74,16 +74,67 @@ describe("SplitMigration — hash child", () => {
 
 		await withMigrationEnv(async (menv) => {
 			// The first row is already present locally (written by a previous, partially-crashed run
-			// whose cursor checkpoint did NOT land) with a higher version.
-			menv.store.insertItemIfAbsent(item("a", "1", "already-written", 7));
+			// whose cursor checkpoint did NOT land) with a higher version and its own timestamps.
+			menv.store.insertItemIfAbsent({ ...item("a", "1", "already-written", 7), last_read_ts: 333, last_write_ts: 111 });
 
-			const { peer } = makeFakePeer({ items: pagedItemBatches([item("a", "1"), item("a", "2")], 10) });
+			const { peer } = makeFakePeer({
+				items: pagedItemBatches(
+					[
+						{ ...item("a", "1"), last_read_ts: 999, last_write_ts: 999 },
+						{ ...item("a", "2"), last_read_ts: 444, last_write_ts: 222 },
+					],
+					10,
+				),
+			});
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			const rows = menv.store.queryItemsPage(null, 100);
 			expect(rows).toHaveLength(2);
-			// The pre-existing row was NOT overwritten.
-			expect(rows[0]).toMatchObject({ hk: kb("a"), sk: kb("1"), data: "already-written", v: 7 });
+			// The pre-existing row was NOT overwritten — not its data, its version, or its timestamps.
+			expect(rows[0]).toMatchObject({ hk: kb("a"), sk: kb("1"), data: "already-written", v: 7, last_read_ts: 333, last_write_ts: 111 });
+			// A row served only once carries the timestamps the parent served.
+			expect(rows[1]).toMatchObject({ hk: kb("a"), sk: kb("2"), last_read_ts: 444, last_write_ts: 222 });
+		});
+	});
+
+	it("merges retried deletion-metadata pages idempotently, so a replayed page does not advance either value", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+		const lock = {
+			hk: kb("a"),
+			sk: kb("1"),
+			transaction_id: "tx1",
+			transaction_ts: 123,
+			operation: "put",
+			data: "d",
+			kind: "text" as const,
+			conditions_json: null,
+			ttl_epoch_utc_seconds: null,
+			coordinator_do_id: "tc-1",
+			created_at: 1000,
+			guarded_at: null,
+		};
+
+		await withMigrationEnv(async (menv) => {
+			const { peer, calls } = makeFakePeer({
+				// Two pages carry the same partition-wide values, as a retried or resumed migration can
+				// serve them twice.
+				txBatches: [
+					{
+						maxDeleteTxOrderTs: 4567,
+						deleteRevision: 9,
+						pendingTransactions: [lock],
+						nextCursor: { hk: kb("a"), sk: kb("1"), transaction_id: "tx1" },
+					},
+					{ maxDeleteTxOrderTs: 4567, deleteRevision: 9, pendingTransactions: [], nextCursor: null },
+				],
+			});
+			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
+
+			expect(calls.txCalls).toBe(2);
+			// Merged with MAX, so the revision is still 9 — not 18.
+			expect(menv.store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 4567, deleteRevision: 9 });
 		});
 	});
 
@@ -109,7 +160,7 @@ describe("SplitMigration — hash child", () => {
 
 		await withMigrationEnv(async (menv) => {
 			const { peer } = makeFakePeer({
-				txBatches: [{ maxDeletedTs: 4567, pendingTransactions: [lock], nextCursor: null }],
+				txBatches: [{ maxDeleteTxOrderTs: 4567, deleteRevision: 9, pendingTransactions: [lock], nextCursor: null }],
 			});
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
@@ -119,7 +170,8 @@ describe("SplitMigration — hash child", () => {
 				ttl_epoch_utc_seconds: 777,
 				guarded_at: 987,
 			});
-			expect(menv.store.getMaxDeletedTs()).toBe(4567);
+			expect(menv.store.getMaxDeleteTxOrderTs()).toBe(4567);
+			expect(menv.store.getDeletionMetadata().deleteRevision).toBe(9);
 		});
 	});
 
@@ -277,7 +329,7 @@ function rangeCtx(base: PartitionContext, hashKey: string, start: string | null,
 }
 
 function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): MigratedItem {
-	return { hk: kb(hk), sk: kb(sk), data, kind: "text", ttl_epoch_utc_seconds: null, v, last_transaction_ts: 0 };
+	return { hk: kb(hk), sk: kb(sk), data, kind: "text", ttl_epoch_utc_seconds: null, v, last_read_ts: 0, last_write_ts: 0 };
 }
 
 // Serves `all` (already in (hk, sk) order) in pages of `batchSize`, honoring the resume cursor —
@@ -330,7 +382,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 		},
 		async migrationGetPartitionTransactionMetadata() {
 			calls.txCalls++;
-			return opts.txBatches?.[txIdx++] ?? { maxDeletedTs: 0, pendingTransactions: [], nextCursor: null };
+			return opts.txBatches?.[txIdx++] ?? { maxDeleteTxOrderTs: 0, deleteRevision: 0, pendingTransactions: [], nextCursor: null };
 		},
 		async migrationGetPromotedKeysBatch() {
 			calls.pkCalls++;

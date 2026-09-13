@@ -19,7 +19,8 @@ import { utf8WithinLimit } from "./utf8.js";
 export type ConditionEvaluationResult = {
 	itemPresent: boolean;
 	conditionOk: boolean;
-	lastTransactionTs: number | null;
+	lastReadTs: number | null;
+	lastWriteTs: number | null;
 	rowsRead: number;
 	rowsWritten: number;
 };
@@ -30,7 +31,8 @@ export type UpdateProbeResult = {
 	/** False when a `set` value evaluated to bytes for this item, which a JSON document cannot hold. */
 	valueTypeOk: boolean;
 	newSize: number | null;
-	lastTransactionTs: number | null;
+	lastReadTs: number | null;
+	lastWriteTs: number | null;
 	rowsRead: number;
 	rowsWritten: number;
 };
@@ -63,17 +65,18 @@ export function evaluateConditionPlan(
 		throw new ExpressionError("sql_limit", "condition plan has an invalid complete binding count");
 	}
 	try {
-		const cursor = storage.sql.exec<{ item_present: number; condition_ok: number; last_transaction_ts: number | null }>(
-			statement,
-			hashKey,
-			sortKey,
-			...materializeExpressionBindings(plan.bindings),
-		);
+		const cursor = storage.sql.exec<{
+			item_present: number;
+			condition_ok: number;
+			last_read_ts: number | null;
+			last_write_ts: number | null;
+		}>(statement, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,
 			conditionOk: row.condition_ok === 1,
-			lastTransactionTs: row.last_transaction_ts,
+			lastReadTs: row.last_read_ts,
+			lastWriteTs: row.last_write_ts,
 			rowsRead: cursor.rowsRead,
 			rowsWritten: cursor.rowsWritten,
 		};
@@ -132,7 +135,8 @@ SELECT i.hk IS NOT NULL AS item_present,
        (${plan.applicableSql}) AS applicable,
        CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
        CASE WHEN (${plan.applicableSql}) = 1 THEN (${estRowBytesExpr(plan.documentSql, hkParam, skParam)}) ELSE NULL END AS new_size,
-       i.last_transaction_ts
+       i.last_read_ts,
+       i.last_write_ts
 FROM requested
 LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
 }
@@ -151,7 +155,8 @@ export function probeUpdatePlan(
 			applicable: number;
 			value_type_ok: number;
 			new_size: number | null;
-			last_transaction_ts: number | null;
+			last_read_ts: number | null;
+			last_write_ts: number | null;
 		}>(statement, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings));
 		const row = cursor.one();
 		return {
@@ -159,7 +164,8 @@ export function probeUpdatePlan(
 			applicable: row.applicable === 1,
 			valueTypeOk: row.value_type_ok === 1,
 			newSize: row.new_size,
-			lastTransactionTs: row.last_transaction_ts,
+			lastReadTs: row.last_read_ts,
+			lastWriteTs: row.last_write_ts,
 			rowsRead: cursor.rowsRead,
 			rowsWritten: cursor.rowsWritten,
 		};

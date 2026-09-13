@@ -486,7 +486,7 @@ describe("transactions - end-to-end", () => {
 			// the value a caller feeds back into an attribute_equals condition.
 			expect(item.version).toBe(1);
 			// The 2PC bookkeeping is stripped at the public boundary.
-			expect(item).not.toHaveProperty("lastCommittedTs");
+			expect(item).not.toHaveProperty("deleteRevision");
 			expect(item).not.toHaveProperty("hasPendingWrite");
 		}
 	});
@@ -603,7 +603,7 @@ describe("transactions - end-to-end", () => {
 				callsByPartition.set(pCtx.doName, call);
 				const response = await original.call(this, pCtx, request);
 				if (pCtx.doName !== changingPartition || call !== 2) return response;
-				return { items: response.items.map((item) => ({ ...item, lastCommittedTs: item.lastCommittedTs + 1 })) };
+				return { items: response.items.map((item) => ({ ...item, deleteRevision: item.deleteRevision + 1 })) };
 			});
 
 			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));

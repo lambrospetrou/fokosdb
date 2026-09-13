@@ -99,7 +99,7 @@ beforeAll(async () => {
 				data: item.kind === "json" ? JSON.stringify(item.data) : (item.data as string | Uint8Array),
 				kind: item.kind,
 				ttlAt: item.ttl ?? null,
-				lastTransactionTs: 1,
+				txOrderTs: 1,
 			});
 		}
 	});
@@ -677,9 +677,9 @@ async function applyUpdate(before: JsonValue | undefined, update: UpdateExpressi
 	return await runInDurableObject(partition, (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		if (before !== undefined) {
-			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, txOrderTs: 1 });
 		}
-		store.updateItemSingleShot({ hk, sk, plan: compileUpdateExpression(update), lastTransactionTs: 2 });
+		store.updateItemSingleShot({ hk, sk, plan: compileUpdateExpression(update), txOrderTs: 2 });
 		return JSON.parse(store.getItem(hk, sk).row?.data as string) as JsonValue;
 	});
 }

@@ -21,7 +21,8 @@ export type TransactionId = string;
 /** External idempotency key. = clientRequestToken when provided, else transactionId. */
 export type IdempotencyToken = string;
 
-export type TransactionTimestamp = number; // Date.now() ms
+// Transaction order timestamp: Date.now() * TX_ORDER_TS_UNITS_PER_MS (see txOrderTimestampNow in shared/transaction-limits.ts).
+export type TransactionTimestamp = number;
 
 // ─── PartitionDO — Prepare ────────────────────────────────────────────────────
 
@@ -84,8 +85,9 @@ export type RejectionReasonOf<I = ConditionCheckImage> =
 			code: "clock_skew";
 			hashKey: string | Uint8Array;
 			sortKey?: string | Uint8Array;
-			serverTimestampMs: number;
-			transactionTimestampMs: number;
+			/** Both timestamps are in the transaction order unit: the partition wall clock and the transaction timestamp. */
+			serverTimestampMicros: number;
+			transactionTimestampMicros: number;
 	  }
 	| { code: "update_not_applicable"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
 	/**
@@ -234,11 +236,10 @@ type ReadForTransactionItemValueOf<D> =
  * contract ("encode at entry, decode at exit, compare bytes in between"), the driver compares bytes
  * and never decodes. `db.ts` decodes at the public exit.
  *
- * `lastCommittedTs` / `hasPendingWrite` are read-driver bookkeeping and are stripped by `db.ts`.
- * `lastCommittedTs` is NOT the conflict datum on its own — it is wall-clock milliseconds, so two
- * writes inside one millisecond are indistinguishable. The item's `version` (`v`) is the monotonic
- * per-item counter that decides a conflict; the timestamp is a second signal that catches a
- * delete+recreate landing back on the same version.
+ * `deleteRevision` / `hasPendingWrite` are read-driver bookkeeping and are stripped by `db.ts`.
+ * `version` detects every write to a live row, because `v = v + 1` runs on every upsert.
+ * `deleteRevision` is the owner partition's user-delete counter; it detects a delete and recreate
+ * that returns `v` to its first value, and an absent-create-delete sequence.
  *
  * json data is JSON text here, and the type is free of the recursive JsonValue so the Workers-RPC type
  * machinery does not instantiate infinitely deep.
@@ -246,7 +247,7 @@ type ReadForTransactionItemValueOf<D> =
 export type ReadForTransactionItemResultEncoded = ReadForTransactionItemValueOf<string | Uint8Array> & {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
-	lastCommittedTs: TransactionTimestamp;
+	deleteRevision: number;
 	hasPendingWrite: boolean;
 };
 

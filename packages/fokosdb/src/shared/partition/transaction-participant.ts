@@ -12,18 +12,47 @@ import type {
 	SingleShotResponse,
 	TransactionItem,
 	TransactionItemKey,
+	TransactionTimestamp,
 } from "../transaction-types.js";
 import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
-import { applyImageCap, conditionFailedReason, decodeItemKeys, MAX_ITEM_BYTES } from "../transaction-limits.js";
+import {
+	applyImageCap,
+	conditionFailedReason,
+	decodeItemKeys,
+	MAX_ITEM_BYTES,
+	txOrderTimestampNow,
+	TX_ORDER_TS_UNITS_PER_MS,
+} from "../transaction-limits.js";
 import type { UpdateProbeResult } from "../expression/runtime.js";
+
+// A pending check cannot change the item, so a transactional read may serialize on either side of it.
+// Allowlist the read-only operations: an operation the code does not know counts as a pending write.
+const READ_ONLY_PENDING_OPERATIONS: ReadonlySet<string> = new Set(["check"]);
+
+type ItemStamp = { last_read_ts: number; last_write_ts: number };
+
+/**
+ * The item timestamps of the row that a condition or an update probe read, or undefined when it
+ * found no row. Both columns are NOT NULL, so a live row always carries both values.
+ */
+function itemStampOf(read: { itemPresent: boolean; lastReadTs: number | null; lastWriteTs: number | null }): ItemStamp | undefined {
+	if (!read.itemPresent) return undefined;
+	invariant(read.lastReadTs !== null && read.lastWriteTs !== null, "fokos/partition.prepare: a live row has no item timestamps");
+	return { last_read_ts: read.lastReadTs, last_write_ts: read.lastWriteTs };
+}
 
 export type TransactionParticipantDeps = {
 	store: PartitionStore;
-	/** Injectable clock for skew/staleness tests; defaults to Date.now. */
+	/** Injectable wall clock (epoch milliseconds) for skew/staleness tests; defaults to Date.now. */
 	now?: () => number;
+	/**
+	 * The transaction order timestamp of a single-shot transaction. Injectable so tests can pin it;
+	 * defaults to txOrderTimestampNow.
+	 */
+	txOrderTimestamp?: () => TransactionTimestamp;
 	/**
 	 * Called after a committed "put" lands, with the key's updated size estimate — the DO wires
 	 * this to the promotion manager's queue check so the participant stays promotion-agnostic.
@@ -43,11 +72,13 @@ export class TransactionParticipant {
 
 	#store: PartitionStore;
 	#now: () => number;
+	#txOrderTimestamp: () => TransactionTimestamp;
 	#onItemUpserted?: (hashKey: KeyBytes, keyEstBytes: number) => void;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
+		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
 		this.#onItemUpserted = deps.onItemUpserted;
 	}
 
@@ -75,7 +106,7 @@ export class TransactionParticipant {
 	 * `measureItemBytes` evaluates the put's own data expression, and the update probe evaluates the
 	 * document expression that both the pending row and the single-shot UPDATE store verbatim.
 	 *
-	 * Returns the update probe as well, because prepare reuses its `last_transaction_ts` instead of
+	 * Returns the update probe as well, because prepare reuses its item timestamps instead of
 	 * reading the row a second time.
 	 */
 	#precheckWrite(
@@ -124,7 +155,8 @@ export class TransactionParticipant {
 		const now = this.#now();
 
 		// The clock of this partition rejects the whole request, so every operation it owns reports it.
-		if (request.transactionTimestamp > now + TransactionParticipant.MAX_CLOCK_SKEW_MS) {
+		// The transaction order timestamp carries sub-millisecond digits, so the comparison is on physical milliseconds.
+		if (Math.floor(request.transactionTimestamp / TX_ORDER_TS_UNITS_PER_MS) > now + TransactionParticipant.MAX_CLOCK_SKEW_MS) {
 			return {
 				outcome: "rejected",
 				results: request.items.map((item) => ({
@@ -133,8 +165,8 @@ export class TransactionParticipant {
 					reason: {
 						code: "clock_skew",
 						...decodeItemKeys(item.hashKey, item.sortKey),
-						serverTimestampMs: now,
-						transactionTimestampMs: request.transactionTimestamp,
+						serverTimestampMicros: now * TX_ORDER_TS_UNITS_PER_MS,
+						transactionTimestampMicros: request.transactionTimestamp,
 					},
 				})),
 			};
@@ -184,18 +216,18 @@ export class TransactionParticipant {
 					continue;
 				}
 
-				const itemStamp = conditionResult
-					? conditionResult.itemPresent
-						? { last_transaction_ts: conditionResult.lastTransactionTs! }
-						: undefined
-					: probe
-						? probe.itemPresent
-							? { last_transaction_ts: probe.lastTransactionTs! }
-							: undefined
-						: this.#store.getItemStamp(item.hashKey, sk).row;
+				// The condition or the update probe already read the row, so its timestamps come from that
+				// read. Only an operation that did neither reads the item here.
+				const itemRead = conditionResult ?? probe;
+				const itemStamp = itemRead ? itemStampOf(itemRead) : this.#store.getItemStamp(item.hashKey, sk).row;
 
 				if (itemStamp) {
-					if (request.transactionTimestamp <= itemStamp.last_transaction_ts) {
+					// A check reads the item and does not change it, so only a newer write orders against
+					// it. A content mutation must stay above every earlier read and write.
+					// The last_read_ts is always greater than or equal to the last_write_ts of any previous write,
+					// so using it as the watermark for updates ensures proper ordering against all prior operations.
+					const watermark = item.operation === "check" ? itemStamp.last_write_ts : itemStamp.last_read_ts;
+					if (request.transactionTimestamp <= watermark) {
 						results.push({
 							outcome: "rejected",
 							opIndex,
@@ -207,7 +239,7 @@ export class TransactionParticipant {
 					// No stamp means no live item, so the deletion watermark is the only ordering signal left.
 					// This holds for every operation: a check, which writes nothing but still orders itself
 					// against later transactions, and an update of an absent item, which creates it.
-					if (request.transactionTimestamp <= this.#store.getMaxDeletedTs()) {
+					if (request.transactionTimestamp <= this.#store.getMaxDeleteTxOrderTs()) {
 						results.push({
 							outcome: "rejected",
 							opIndex,
@@ -320,13 +352,13 @@ export class TransactionParticipant {
 					data: pendingRow.data,
 					kind: pendingRow.kind,
 					ttlAt: pendingRow.ttl_epoch_utc_seconds,
-					lastTransactionTs: transactionTimestamp,
+					txOrderTs: transactionTimestamp,
 				});
 				this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
 			} else if (pendingRow.operation === "delete") {
-				this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
+				this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
 			} else if (pendingRow.operation === "check") {
-				this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
+				this.#store.bumpItemReadTs(item.hashKey, sk, transactionTimestamp);
 			}
 		}
 	}
@@ -344,7 +376,7 @@ export class TransactionParticipant {
 	 * per-item monotonicity in SQL, so a stamp from a lagging clock is absorbed, not applied.
 	 */
 	executeSingleShot(request: SingleShotRequest): SingleShotResponse {
-		const transactionTimestamp = this.#now();
+		const transactionTimestamp = this.#txOrderTimestamp();
 
 		return this.#store.transactionSync<SingleShotResponse>(() => {
 			const results: ParticipantOperationResultEncoded[] = [];
@@ -415,7 +447,7 @@ export class TransactionParticipant {
 						// For kind=json -> data is raw JSON text; upsertItem re-encodes it to JSONB.
 						kind: item.kind,
 						ttlAt: item.ttlAt ?? null,
-						lastTransactionTs: transactionTimestamp,
+						txOrderTs: transactionTimestamp,
 					});
 					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
 				} else if (item.operation === "update") {
@@ -425,15 +457,15 @@ export class TransactionParticipant {
 						sk,
 						plan: item.update,
 						ttlAt: item.ttlAt,
-						lastTransactionTs: transactionTimestamp,
+						txOrderTs: transactionTimestamp,
 					});
 					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
 				} else if (item.operation === "delete") {
-					this.#store.deleteItem({ hk: item.hashKey, sk, watermarkTs: transactionTimestamp, bumpWatermarkAlways: true });
+					this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
 				} else {
-					// A check writes nothing, but it still orders this transaction against later ones:
-					// transactGetItems uses last_transaction_ts as its second conflict signal.
-					this.#store.bumpItemLastTransactionTs(item.hashKey, sk, transactionTimestamp);
+					// A check writes nothing, but it still orders this transaction against later writes
+					// through the item's read watermark.
+					this.#store.bumpItemReadTs(item.hashKey, sk, transactionTimestamp);
 				}
 			}
 
@@ -452,14 +484,19 @@ export class TransactionParticipant {
 	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionResponse {
 		const results: ReadForTransactionItemResultEncoded[] = [];
 
+		let deleteRevision: number | undefined;
+		// One deletion-metadata read per RPC, shared by every item of the request.
+		// In the future we could shard deletion revision to reduce contention by having X buckets,
+		// and hash each hash key to determine which bucket to check.
+		const deleteRevisionFor = (hk: KeyBytes) => (deleteRevision ??= this.#store.deleteRevisionFor(hk));
+
 		for (const item of request.items) {
 			const sk = item.sortKey;
 
 			const itemRow = this.#store.getItem(item.hashKey, sk).row;
 			const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
-			const hasPendingWrite = pendingRow != null;
-			const lastCommittedTs = itemRow?.last_transaction_ts ?? 0;
+			const hasPendingWrite = pendingRow != null && !READ_ONLY_PENDING_OPERATIONS.has(pendingRow.operation);
 			// Echo the requested keys as canonical KeyBytes: the TC pairs phase 1 with phase 2 by bytes,
 			// and db.ts decodes once at the public exit.
 			const hashKey = item.hashKey;
@@ -477,7 +514,7 @@ export class TransactionParticipant {
 					// caller can feed it straight back into an attribute_equals condition.
 					version: itemRow.v,
 					ttlAt: itemRow.ttl_epoch_utc_seconds ?? undefined,
-					lastCommittedTs,
+					deleteRevision: deleteRevisionFor(item.hashKey),
 					hasPendingWrite,
 				});
 			} else {
@@ -485,7 +522,7 @@ export class TransactionParticipant {
 					found: false,
 					hashKey,
 					sortKey,
-					lastCommittedTs,
+					deleteRevision: deleteRevisionFor(item.hashKey),
 					hasPendingWrite,
 				});
 			}

@@ -5,8 +5,10 @@ import { PartitionDO } from "../../server/do-partition.js";
 import { compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
+import invariant from "../invariant.js";
 import { estimateItemBytes, PartitionStore, queryScanStatement, type ScanCursor } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
+import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
 
@@ -44,7 +46,7 @@ describe("PartitionStore - items", () => {
 				data: "v1",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 1,
+				txOrderTs: 1,
 			});
 			expect(first.version).toBe(1);
 			const second = store.upsertItem({
@@ -53,7 +55,7 @@ describe("PartitionStore - items", () => {
 				data: "v2",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 2,
+				txOrderTs: 2,
 			});
 			expect(second.version).toBe(2);
 			const third = store.upsertItem({
@@ -62,16 +64,16 @@ describe("PartitionStore - items", () => {
 				data: "v3",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 3,
+				txOrderTs: 3,
 			});
 			expect(third.version).toBe(3);
 		});
 	});
 
-	it("upsertItem never lowers last_transaction_ts, but still applies the write", async () => {
+	it("upsertItem never lowers the item timestamps, but still applies the write", async () => {
 		await withStore((store) => {
 			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "from-tx", kind: "text", ttlAt: null, lastTransactionTs: 5_000 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "from-tx", kind: "text", ttlAt: null, txOrderTs: 5_000 });
 
 			// A non-transactional put stamps the partition's own (lower) clock.
 			const second = store.upsertItem({
@@ -80,28 +82,28 @@ describe("PartitionStore - items", () => {
 				data: "from-put",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 1_000,
+				txOrderTs: 1_000,
 			});
 
-			// The write lands in full — only the timestamp is held at the high-water mark.
+			// The write lands in full — only the timestamps are held at the high-water mark.
 			expect(second.version).toBe(2);
-			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ data: "from-put", last_transaction_ts: 5_000 });
+			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ data: "from-put", last_read_ts: 5_000, last_write_ts: 5_000 });
 
-			// A later timestamp still moves it forward.
-			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "newer", kind: "text", ttlAt: null, lastTransactionTs: 9_000 });
-			expect(store.getItem(kb("hk"), kb("sk")).row?.last_transaction_ts).toBe(9_000);
+			// A later timestamp still moves them forward.
+			store.upsertItem({ hk: kb("hk"), sk: kb("sk"), data: "newer", kind: "text", ttlAt: null, txOrderTs: 9_000 });
+			expect(store.getItem(kb("hk"), kb("sk")).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
 		});
 	});
 
-	it("getItem returns converted data, ttl, version, and last_transaction_ts", async () => {
+	it("getItem returns converted data, ttl, version, and item timestamps", async () => {
 		await withStore((store) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "hello", kind: "text", ttlAt: 1234, lastTransactionTs: 42 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "hello", kind: "text", ttlAt: 1234, txOrderTs: 42 });
 			const str = store.getItem(kb("hk"), kb("s"));
-			expect(str.row).toEqual({ data: "hello", kind: "text", ttl_epoch_utc_seconds: 1234, v: 1, last_transaction_ts: 42 });
+			expect(str.row).toEqual({ data: "hello", kind: "text", ttl_epoch_utc_seconds: 1234, v: 1, last_read_ts: 42, last_write_ts: 42 });
 			expect(str.rowsRead).toBe(1);
 
 			const bin = new Uint8Array([1, 2, 3]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, lastTransactionTs: 0 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
 			const got = store.getItem(kb("hk"), kb("b"));
 			expect(got.row?.data).toBeInstanceOf(Uint8Array);
 			expect(got.row?.data).toEqual(bin);
@@ -114,7 +116,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const unicodeText = "hello € and Ω";
 			const expectedTextBytes = new TextEncoder().encode(unicodeText).byteLength;
-			store.upsertItem({ hk: kb("hk"), sk: kb("text"), data: unicodeText, kind: "text", ttlAt: 1234, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("text"), data: unicodeText, kind: "text", ttlAt: 1234, txOrderTs: 1 });
 			const textRes = store.getItemImage(kb("hk"), kb("text"));
 			expect(textRes.row).toEqual({
 				data: unicodeText,
@@ -126,7 +128,7 @@ describe("PartitionStore - items", () => {
 			expect(textRes.rowsRead).toBe(1);
 
 			const bin = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("bytes"), data: bin, kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("bytes"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 1 });
 			const bytesRes = store.getItemImage(kb("hk"), kb("bytes"));
 			expect(bytesRes.row).toEqual({
 				data: bin,
@@ -137,7 +139,7 @@ describe("PartitionStore - items", () => {
 
 			const jsonText = JSON.stringify({ key: "value", num: 42 });
 			const expectedJsonBytes = new TextEncoder().encode(jsonText).byteLength;
-			store.upsertItem({ hk: kb("hk"), sk: kb("json"), data: jsonText, kind: "json", ttlAt: 5678, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("json"), data: jsonText, kind: "json", ttlAt: 5678, txOrderTs: 1 });
 			const jsonRes = store.getItemImage(kb("hk"), kb("json"));
 			expect(jsonRes.row).toEqual({
 				data: jsonText,
@@ -160,14 +162,14 @@ describe("PartitionStore - items", () => {
 				data: "aaaa",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 1,
+				txOrderTs: 1,
 			});
 			expect(r1.keyEstBytes).toBe(est1);
 			expect(kseBytes(state, "hk")).toBe(est1);
 
 			// Second sort key accumulates on the same hash key.
 			const est2 = expectedRowBytes("bb", kb("hk"), kb("s2"));
-			const r2 = store.upsertItem({ hk: kb("hk"), sk: kb("s2"), data: "bb", kind: "text", ttlAt: null, lastTransactionTs: 2 });
+			const r2 = store.upsertItem({ hk: kb("hk"), sk: kb("s2"), data: "bb", kind: "text", ttlAt: null, txOrderTs: 2 });
 			expect(r2.keyEstBytes).toBe(est1 + est2);
 
 			// Overwrite replaces the old row's contribution, not adds to it.
@@ -178,12 +180,12 @@ describe("PartitionStore - items", () => {
 				data: "aaaaaaaa",
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 3,
+				txOrderTs: 3,
 			});
 			expect(r3.keyEstBytes).toBe(est1b + est2);
 
 			// Delete removes its contribution.
-			const del = store.deleteItem({ hk: kb("hk"), sk: kb("s1"), watermarkTs: 10 });
+			const del = store.deleteItem({ hk: kb("hk"), sk: kb("s1"), txOrderTs: 10 });
 			expect(del.deleted).toBe(true);
 			expect(kseBytes(state, "hk")).toBe(est2);
 		});
@@ -191,8 +193,8 @@ describe("PartitionStore - items", () => {
 
 	it("rebuildKeySizeEstimates recomputes estimates from the rows", async () => {
 		await withStore((store, state) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("s2"), data: "yyyy", kind: "text", ttlAt: null, lastTransactionTs: 2 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("s2"), data: "yyyy", kind: "text", ttlAt: null, txOrderTs: 2 });
 			// Corrupt the summary, then rebuild.
 			state.storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = 0 WHERE hk = ?`, kb("hk"));
 			store.rebuildKeySizeEstimates();
@@ -202,10 +204,10 @@ describe("PartitionStore - items", () => {
 
 	it("rebuildKeySizeEstimates drops the estimate of a key that has no rows left", async () => {
 		await withStore((store, state) => {
-			store.upsertItem({ hk: kb("keeps"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("keeps"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, txOrderTs: 1 });
 			// A key whose rows are all gone. The estimate survives the deletes (deleteItem only
 			// decrements it), so only the rebuild can remove the row.
-			store.upsertItem({ hk: kb("empties"), sk: kb("s1"), data: "yyyy", kind: "text", ttlAt: null, lastTransactionTs: 2 });
+			store.upsertItem({ hk: kb("empties"), sk: kb("s1"), data: "yyyy", kind: "text", ttlAt: null, txOrderTs: 2 });
 			state.storage.sql.exec(`DELETE FROM items WHERE hk = ?`, kb("empties"));
 			expect(kseBytes(state, "empties")).toBeGreaterThan(0);
 
@@ -220,7 +222,7 @@ describe("PartitionStore - items", () => {
 	// materialise every hk in the table, doubling the work the refresh already did.
 	it("the rebuild prune seeks items rather than scanning it", async () => {
 		await withStore((store, state) => {
-			store.upsertItem({ hk: kb("hk"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("s1"), data: "xx", kind: "text", ttlAt: null, txOrderTs: 1 });
 			const plan = state.storage.sql
 				.exec<{ detail: string }>(
 					`EXPLAIN QUERY PLAN DELETE FROM key_size_estimates
@@ -241,7 +243,7 @@ describe("PartitionStore - items", () => {
 				["a", "2"],
 				["b", "1"],
 			] as const) {
-				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			const page1 = store.queryItemsPage(null, 2);
 			expect(page1.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([
@@ -265,7 +267,7 @@ describe("PartitionStore - items", () => {
 				[kb("c"), kb("q")],
 			];
 			for (const [hk, sk] of keys) {
-				store.upsertItem({ hk, sk, data: "d", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				store.upsertItem({ hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			// Walk the whole table one row at a time, the way migration does.
 			const seen: string[] = [];
@@ -308,7 +310,7 @@ describe("PartitionStore - items", () => {
 	it("stores json as JSONB, persists data_kind, and decodes to JSON text on read", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ a: 1, b: ["x", true, null] });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// getItem decodes JSONB → JSON text and surfaces the kind.
 			const got = store.getItem(kb("hk"), kb("j"));
@@ -343,17 +345,17 @@ describe("PartitionStore - items", () => {
 				EST_ROW_BYTES_K;
 
 			const multibyte = "héllo—✓"; // multi-byte UTF-8: octet_length > .length
-			store.upsertItem({ hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("t"), data: multibyte, kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(readEst("t")).toBe(octetLen("t", multibyte));
 
 			const bytes = new Uint8Array([1, 2, 3, 4, 5]);
-			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bytes, kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bytes, kind: "bytes", ttlAt: null, txOrderTs: 1 });
 			expect(readEst("b")).toBe(octetLen("b", bytes));
 
 			// For json, the stored JSONB blob size is what octet_length(data) measures — read it from SQL
 			// rather than the input text (the two differ), then confirm the constant folds in.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 			const jsonBlobLen = state.storage.sql
 				.exec<{ n: number }>(`SELECT octet_length(data) AS n FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j"))
 				.toArray()[0].n;
@@ -369,7 +371,7 @@ describe("PartitionStore - items", () => {
 
 			// The migration writer carries the formula independently of upsertItem — both must agree.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 			const migrated = store.queryItemsPage(null, 10)[0];
 			store.insertItemIfAbsent({ ...migrated, sk: kb("j2") });
 			// Same row under a longer sk: the only difference must be octet_length(sk).
@@ -383,7 +385,8 @@ describe("PartitionStore - items", () => {
 				kind: "bytes",
 				ttl_epoch_utc_seconds: null,
 				v: 1,
-				last_transaction_ts: 1,
+				last_read_ts: 1,
+				last_write_ts: 1,
 			});
 			expect(readEst("b")).toBe(bytes.byteLength + kb("hk").byteLength + kb("b").byteLength + EST_ROW_BYTES_K);
 		});
@@ -432,9 +435,9 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
-			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const storedEst = (sk: string) =>
 				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
@@ -466,9 +469,9 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			const jsonText = JSON.stringify({ a: 1 });
-			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk: kb("t"), data: "hello", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			const scan = (select: "count" | "projection") => [
 				...store.scanQueryPage({
@@ -502,7 +505,7 @@ describe("PartitionStore - items", () => {
 				const hk = kb("hk");
 				const EMPTY = KeyCodec.encodeOptional(undefined);
 				for (const sk of [EMPTY, kb("a"), kb("b"), kb("c"), kb("d")]) {
-					store.upsertItem({ hk, sk, data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+					store.upsertItem({ hk, sk, data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 				}
 				const sksOf = (opts: {
 					lower?: KeyBytes;
@@ -546,7 +549,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			for (let i = 0; i < 10; i++) {
-				store.upsertItem({ hk, sk: kb(String(i).padStart(2, "0")), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				store.upsertItem({ hk, sk: kb(String(i).padStart(2, "0")), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			const bounds = {
 				hk,
@@ -599,9 +602,17 @@ describe("PartitionStore - items", () => {
 	});
 
 	it("estimateItemBytes grows with text, bytes, and JSON text payloads", () => {
-		const base = { hk: kb("hk"), sk: kb("sk"), kind: "text" as const, ttl_epoch_utc_seconds: null, v: 1, last_transaction_ts: 0 };
+		const base = {
+			hk: kb("hk"),
+			sk: kb("sk"),
+			kind: "text" as const,
+			ttl_epoch_utc_seconds: null,
+			v: 1,
+			last_read_ts: 0,
+			last_write_ts: 0,
+		};
 		const expected = (data: string | Uint8Array) =>
-			kb("hk").byteLength + kb("sk").byteLength + (typeof data === "string" ? data.length * 2 : data.byteLength) + 8 + 64;
+			kb("hk").byteLength + kb("sk").byteLength + (typeof data === "string" ? data.length * 2 : data.byteLength) + 16 + 64;
 		const jsonText = JSON.stringify({ a: 1 });
 		expect(estimateItemBytes({ ...base, data: "hello" })).toBe(expected("hello"));
 		expect(estimateItemBytes({ ...base, data: new Uint8Array([1, 2, 3]), kind: "bytes" })).toBe(expected(new Uint8Array([1, 2, 3])));
@@ -612,7 +623,7 @@ describe("PartitionStore - items", () => {
 	it("migration reads json verbatim (raw JSONB) and re-inserts it queryable by jsonb_extract", async () => {
 		await withStore((store, state) => {
 			const jsonText = JSON.stringify({ status: "ok", count: 7 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// Migration-style read: no json() decode, so json data is the raw JSONB blob.
 			const migrated = store.queryItemsPage(null, 10)[0];
@@ -635,18 +646,89 @@ describe("PartitionStore - items", () => {
 			const hk = kb("created-hk");
 			const sk = kb("created-sk");
 
-			const first = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 5 });
+			const first = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 5 });
 			expect(first.version).toBe(1);
 			const created = store.getItem(hk, sk).row;
-			expect(created).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: null, last_transaction_ts: 5 });
+			expect(created).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: null, last_read_ts: 5, last_write_ts: 5 });
 			expect(JSON.parse(created?.data as string)).toEqual({ x: 1 });
 			// The created row is measured and accounted for exactly as an upsert of the same document is.
 			expect(kseBytes(state, "created-hk")).toBe(first.keyEstBytes);
 
 			// The second call finds the row it created and takes the conflict branch.
-			const second = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 6 });
+			const second = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 6 });
 			expect(second.version).toBe(2);
 			expect(kseBytes(state, "created-hk")).toBe(second.keyEstBytes);
+		});
+	});
+
+	it("updateItemSingleShot never lowers the item timestamps, but still applies the write", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			const sk = kb("sk");
+			const plan = (x: number) => compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: x } }]);
+
+			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 5_000 });
+
+			// A single-shot update stamps the partition's own (lower) clock.
+			const second = store.updateItemSingleShot({ hk, sk, plan: plan(2), txOrderTs: 1_000 });
+
+			// The write lands in full — only the timestamps are held at the high-water mark.
+			expect(second.version).toBe(2);
+			const afterLag = store.getItem(hk, sk).row;
+			expect(afterLag).toMatchObject({ last_read_ts: 5_000, last_write_ts: 5_000 });
+			expect(JSON.parse(afterLag?.data as string)).toEqual({ x: 2 });
+
+			// A later timestamp still moves them forward.
+			store.updateItemSingleShot({ hk, sk, plan: plan(3), txOrderTs: 9_000 });
+			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 9_000, last_write_ts: 9_000 });
+		});
+	});
+
+	it("bumpItemReadTs advances only the read watermark and never lowers it", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			const sk = kb("sk");
+			store.upsertItem({ hk, sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 100 });
+
+			store.bumpItemReadTs(hk, sk, 200);
+			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
+
+			// An out-of-order check must not move the watermark back.
+			store.bumpItemReadTs(hk, sk, 150);
+			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 200, last_write_ts: 100 });
+
+			store.bumpItemReadTs(hk, sk, 300);
+			expect(store.getItem(hk, sk).row).toMatchObject({ last_read_ts: 300, last_write_ts: 100 });
+		});
+	});
+
+	it("keeps last_read_ts at or above last_write_ts after every writer, including a write behind a check", async () => {
+		await withStore((store) => {
+			const hk = kb("hk");
+			const sk = kb("sk");
+			const timestamps = () => {
+				const row = store.getItem(hk, sk).row;
+				invariant(row, "the item must exist");
+				expect(row.last_read_ts).toBeGreaterThanOrEqual(row.last_write_ts);
+				return row;
+			};
+
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 500 });
+			expect(timestamps()).toMatchObject({ last_read_ts: 500, last_write_ts: 500 });
+
+			// A committed check orders the item ahead of the write that created it.
+			store.bumpItemReadTs(hk, sk, 700);
+			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 500 });
+
+			// A put stamped by a lagging clock lands below the read watermark.
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 600 });
+			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 600 });
+
+			// A single-shot update stamped between the two watermarks lands between them too.
+			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
+			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 650 });
+			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 650 });
 		});
 	});
 
@@ -658,7 +740,7 @@ describe("PartitionStore - items", () => {
 				{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "a".repeat(MAX_ITEM_BYTES) } },
 			];
 			const plan = compileUpdateExpression(update);
-			expect(() => store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
+			expect(() => store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
 			expect(store.getItem(hk, sk).row).toBeUndefined();
 		});
 	});
@@ -667,13 +749,13 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("my-hash-key");
 			const sk = kb("my-sort-key");
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.hk" }, value: { ref: "hashKey" } },
 				{ action: "set", target: { ref: "data", path: "$.sk" }, value: { ref: "sortKey" } },
 			];
 			const plan = compileUpdateExpression(update);
-			store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 2 });
+			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
 			const { row } = store.getItem(hk, sk);
 			expect(row).toBeDefined();
 			const data = JSON.parse(row!.data as string);
@@ -685,7 +767,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb(new Uint8Array([1, 2, 3]));
 			const sk = kb(new Uint8Array([4, 5, 6]));
-			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
 			// A function around the reference must not escape the test: SQLite carries the untagged key
 			// bytes through, and the result is still a blob that a JSON document cannot hold.
 			const values = [
@@ -709,13 +791,13 @@ describe("PartitionStore - items", () => {
 		await withStore((store, state) => {
 			const hk = kb("hk");
 			const sk = kb("s1");
-			store.upsertItem({ hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const before = kseBytes(state, "hk");
 
 			const plan = compileUpdateExpression([
 				{ action: "set", target: { ref: "data", path: "$.note" }, value: { val: "a considerably longer note than the first one" } },
 			]);
-			const res = store.updateItemSingleShot({ hk, sk, plan, lastTransactionTs: 2 });
+			const res = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
 
 			// The size the update stored is measured over the document the update wrote, and the key's
 			// estimate carries exactly that row. An update grows an item without carrying its bytes, so
@@ -737,11 +819,20 @@ describe("PartitionStore - items", () => {
 			// A migration copies rows that were accepted under the limit of their time, so the ingest
 			// path carries no size guard. A guard there would drop an item when the limit falls.
 			const oversized = "x".repeat(MAX_ITEM_BYTES + 1);
-			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, lastTransactionTs: 1 })).toThrow(
+			expect(() => store.upsertItem({ hk, sk, data: oversized, kind: "text", ttlAt: null, txOrderTs: 1 })).toThrow(
 				fokosErrorWith("item_too_large"),
 			);
 
-			store.insertItemIfAbsent({ hk, sk, data: oversized, kind: "text", ttl_epoch_utc_seconds: null, v: 7, last_transaction_ts: 1 });
+			store.insertItemIfAbsent({
+				hk,
+				sk,
+				data: oversized,
+				kind: "text",
+				ttl_epoch_utc_seconds: null,
+				v: 7,
+				last_read_ts: 1,
+				last_write_ts: 1,
+			});
 			expect(store.getItem(hk, sk).row).toMatchObject({ v: 7, data: oversized });
 		});
 	});
@@ -750,7 +841,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("text-key");
 			const sk = kb("text-sort");
-			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			// A missing target parent is inapplicable, but the values are fine, so the cause is not the
 			// value type. Only that distinction lets a caller tell a fixable value from a stale item.
 			const missingParent = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } }]);
@@ -767,7 +858,7 @@ describe("PartitionStore - items", () => {
 
 describe("PartitionStore - TTL deletion", () => {
 	function put(store: PartitionStore, hk: string, sk: string, ttlAt: number | null, data = "d"): number {
-		store.upsertItem({ hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt, lastTransactionTs: 1 });
+		store.upsertItem({ hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt, txOrderTs: 1 });
 		return expectedRowBytes(data, kb(hk), kb(sk));
 	}
 
@@ -842,16 +933,19 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(kb("a"), kb("next")).row).toBeDefined();
 			expect(kseBytes(state, "a")).toBe(nextBytes + nullBytes + futureBytes);
 			expect(kseBytes(state, "b")).toBe(0);
-			expect(store.getMaxDeletedTs()).toBe(20_000);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(20 * 1000 * TX_ORDER_TS_UNITS_PER_MS);
+			// The sweep advances the transaction order watermark to the largest expiry it reclaimed,
+			// but it is not a user delete: the revision stays at zero.
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 20 * 1000 * TX_ORDER_TS_UNITS_PER_MS, deleteRevision: 0 });
 
-			store.bumpMaxDeletedTs(200_000);
+			store.bumpMaxDeleteTxOrderTs(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 			const second = store.deleteExpiredItems(100, 2);
 			expect(second).toEqual({ deletedRows: 2, deletedBytes: nextBytes + exactBytes });
 			expect(store.getItem(kb("a"), kb("next")).row).toBeUndefined();
 			expect(store.getItem(kb("c"), kb("exact")).row).toBeUndefined();
 			expect(kseBytes(state, "a")).toBe(nullBytes + futureBytes);
 			expect(kseBytes(state, "c")).toBe(0);
-			expect(store.getMaxDeletedTs()).toBe(200_000);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 
 			for (const [hk, bytes] of [
 				["locked", lockedBytes],
@@ -865,39 +959,112 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
 			expect(store.deleteExpiredItems(100, 2)).toEqual({ deletedRows: 0, deletedBytes: 0 });
+			expect(store.getDeletionMetadata().deleteRevision).toBe(0);
 		});
 	});
 });
 
 describe("PartitionStore - deletion watermark", () => {
-	it("bumpMaxDeletedTs is monotonic", async () => {
+	it("bumpMaxDeleteTxOrderTs is monotonic", async () => {
 		await withStore((store) => {
-			expect(store.getMaxDeletedTs()).toBe(0);
-			store.bumpMaxDeletedTs(100);
-			expect(store.getMaxDeletedTs()).toBe(100);
-			store.bumpMaxDeletedTs(50);
-			expect(store.getMaxDeletedTs()).toBe(100);
-			store.bumpMaxDeletedTs(150);
-			expect(store.getMaxDeletedTs()).toBe(150);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(0);
+			store.bumpMaxDeleteTxOrderTs(100);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(100);
+			store.bumpMaxDeleteTxOrderTs(50);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(100);
+			store.bumpMaxDeleteTxOrderTs(150);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(150);
 		});
 	});
 
-	it("deleteItem bumps the watermark only when a row was deleted, unless bumpWatermarkAlways", async () => {
+	it("deleteItem bumps the watermark only when a row was deleted, unless bumpTxOrderTsAlways", async () => {
 		await withStore((store) => {
 			// Absent row, default behavior: no bump.
-			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), watermarkTs: 100 });
+			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100 });
 			expect(miss.deleted).toBe(false);
-			expect(store.getMaxDeletedTs()).toBe(0);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(0);
+			expect(store.deleteRevisionFor(kb("hk"))).toBe(0);
 
-			// Absent row, transactional behavior: bump regardless.
-			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), watermarkTs: 100, bumpWatermarkAlways: true });
-			expect(store.getMaxDeletedTs()).toBe(100);
+			// Absent row, transactional behavior: bump the watermark regardless, without a revision.
+			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100, bumpTxOrderTsAlways: true });
+			expect(store.getMaxDeleteTxOrderTs()).toBe(100);
+			expect(store.deleteRevisionFor(kb("hk"))).toBe(0);
 
-			// Present row: bump.
-			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), watermarkTs: 200 });
+			// Present row: bump both.
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
 			expect(hit.deleted).toBe(true);
-			expect(store.getMaxDeletedTs()).toBe(200);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(200);
+			expect(store.deleteRevisionFor(kb("hk"))).toBe(1);
+		});
+	});
+
+	it("a real user delete updates both deletion-metadata fields in one statement", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `store-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			// Records every statement the store issues. The migrations already ran in the PartitionDO
+			// constructor, so the wrapped storage never sees a migration statement.
+			const statements: string[] = [];
+			const recordingStorage = {
+				sql: {
+					exec: (sql: string, ...params: unknown[]) => {
+						statements.push(sql);
+						return state.storage.sql.exec(sql, ...params);
+					},
+					get databaseSize() {
+						return state.storage.sql.databaseSize;
+					},
+				},
+				transactionSync: <T>(fn: () => T): T => state.storage.transactionSync(fn),
+			} as unknown as DurableObjectStorage;
+			const store = new PartitionStore(recordingStorage);
+			const metadataStatements = () => statements.filter((sql) => sql.includes("deletion_metadata"));
+
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+
+			statements.length = 0;
+			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
+			expect(hit.deleted).toBe(true);
+			const hitWrites = metadataStatements();
+			expect(hitWrites).toHaveLength(1);
+			expect(hitWrites[0]).toContain("max_delete_tx_order_ts");
+			expect(hitWrites[0]).toContain("delete_revision");
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 200, deleteRevision: 1 });
+
+			// The transactional absent delete advances the watermark only, in one statement.
+			statements.length = 0;
+			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 300, bumpTxOrderTsAlways: true });
+			expect(miss.deleted).toBe(false);
+			const missWrites = metadataStatements();
+			expect(missWrites).toHaveLength(1);
+			expect(missWrites[0]).not.toContain("delete_revision");
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, deleteRevision: 1 });
+
+			// The non-transactional absent delete writes no metadata at all.
+			statements.length = 0;
+			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 400 });
+			expect(metadataStatements()).toHaveLength(0);
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, deleteRevision: 1 });
+		});
+	});
+
+	it("promotion cleanup changes neither deletion-metadata value", async () => {
+		await withStore((store) => {
+			store.upsertItem({ hk: kb("alice"), sk: kb("s1"), data: "a1", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("alice"), sk: kb("s2"), data: "a2", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("bob"), sk: kb("s"), data: "b", kind: "text", ttlAt: null, txOrderTs: 1 });
+
+			// A real user delete first, so both metadata fields are non-zero.
+			store.deleteItem({ hk: kb("bob"), sk: kb("s"), txOrderTs: 555 });
+			const before = store.getDeletionMetadata();
+			expect(before).toEqual({ maxDeleteTxOrderTs: 555, deleteRevision: 1 });
+
+			// The cleanup a promotion runs over the hash key it is moving.
+			store.deleteItemsBatchForHashKey(kb("alice"), 1000);
+			store.deleteKeySizeEstimate(kb("alice"));
+
+			expect(store.hasItemsForHashKey(kb("alice"))).toBe(false);
+			expect(store.getDeletionMetadata()).toEqual(before);
 		});
 	});
 });
@@ -1102,7 +1269,7 @@ describe("PartitionStore - promoted keys", () => {
 describe("PartitionStore - computeRangeSplitBoundaries", () => {
 	function put(store: PartitionStore, hk: string, ...sks: string[]) {
 		for (const sk of sks) {
-			store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 		}
 	}
 
@@ -1202,7 +1369,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 					data: new Uint8Array(0),
 					kind: "bytes",
 					ttlAt: null,
-					lastTransactionTs: 0,
+					txOrderTs: 0,
 				});
 			}
 			// N=2 → 1 boundary between the 3 items in byte order: uFFFF < emoji < binary
@@ -1238,7 +1405,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// 40 equal-size rows → with N=4 each child should get ~10; byte-balance ≈ count-balance here.
 			const keys = Array.from({ length: 40 }, (_, i) => `k${String(i).padStart(3, "0")}`);
 			for (const sk of keys) {
-				store.upsertItem({ hk: kb("hk"), sk: kb(sk), data: "payload", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				store.upsertItem({ hk: kb("hk"), sk: kb(sk), data: "payload", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 4);
 			expect(boundaries).not.toBeNull();
@@ -1264,7 +1431,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// keyed to sort last. With N=2, step = B/2 < heavy weight, so the light rows all fall below
 			// the threshold and the heavy row alone tips it over → boundary lands between them.
 			for (let i = 0; i < 10; i++) {
-				store.upsertItem({ hk: kb("hk"), sk: kb(`k${i}`), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+				store.upsertItem({ hk: kb("hk"), sk: kb(`k${i}`), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
 			store.upsertItem({
 				hk: kb("hk"),
@@ -1272,7 +1439,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 				data: "H".repeat(5000),
 				kind: "text",
 				ttlAt: null,
-				lastTransactionTs: 1,
+				txOrderTs: 1,
 			});
 			const boundaries = store.computeRangeSplitBoundaries(kb("hk"), null, null, 2);
 			expect(boundaries).not.toBeNull();
@@ -1288,9 +1455,9 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			// A single dominant row between two light rows. With N=3 the heavy row crosses the first
 			// threshold and the relative bump pushes the next threshold past the remaining bytes, so only
 			// one boundary is emitted (< N-1) → null, and the split retries on a later cycle.
-			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, lastTransactionTs: 1 });
-			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, lastTransactionTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toBeNull();
 		});
 	});

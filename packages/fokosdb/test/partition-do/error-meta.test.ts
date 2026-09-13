@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../../src/shared/partition-topology/types.js";
+import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition, makePartition } from "./partition-harness.js";
@@ -19,7 +20,7 @@ async function lockItem(node: TestPartition, keys: ItemKeys): Promise<() => Prom
 	const transactionId = crypto.randomUUID();
 	const res = await node.stub.txPrepare(node.ctx, {
 		transactionId,
-		transactionTimestamp: Date.now(),
+		transactionTimestamp: txOrderTimestampNow(),
 		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
 		items: withOpIndex([{ ...keys, operation: "put", data: "pending", kind: "text" }]),
 	});

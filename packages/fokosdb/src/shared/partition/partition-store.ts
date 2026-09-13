@@ -12,7 +12,7 @@ import {
 	type ConditionEvaluationResult,
 	type UpdateProbeResult,
 } from "../expression/runtime.js";
-import { MAX_ITEM_BYTES, decodeItemKeys } from "../transaction-limits.js";
+import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS, decodeItemKeys } from "../transaction-limits.js";
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
 import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
@@ -116,7 +116,8 @@ export type MigratedItem = {
 	kind: DataKind;
 	ttl_epoch_utc_seconds: number | null;
 	v: number;
-	last_transaction_ts: number;
+	last_read_ts: number;
+	last_write_ts: number;
 };
 
 export type PendingTransactionRow = {
@@ -199,7 +200,7 @@ function codeFromNullableKind(kind: DataKind | null): number | null {
 
 export function estimateItemBytes(item: MigratedItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.byteLength + item.sk.byteLength + dataSize + 8 + 64;
+	return item.hk.byteLength + item.sk.byteLength + dataSize + 16 + 64;
 }
 
 export function estimatePendingTxBytes(row: PendingTransactionRow): number {
@@ -269,7 +270,7 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 	const sql =
 		opts.select === "count"
 			? `SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan WHERE ${conds.join(" AND ")} ${order}`
-			: `SELECT hk, sk, est_row_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
+			: `SELECT hk, sk, est_row_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
 	return { sql, params: [...params, opts.limit] };
 }
 
@@ -299,7 +300,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// and JS never estimates it.
 		//
 		// octet_length covers the variable part (data + keys); K covers the fixed per-row remainder: the
-		// four wide integer columns, the data_kind enum, the B-tree record header, the rowid, and the two
+		// five wide integer columns, the data_kind enum, the B-tree record header, the rowid, and the two
 		// index entries each row carries (the PK autoindex + idx_items_scan).
 		// K is a rough size-accounting knob (feeds promotion/split), not a precise figure.
 		//
@@ -315,7 +316,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 data_kind             INTEGER NOT NULL DEFAULT 0,
                 v                     INTEGER NOT NULL,
-                last_transaction_ts   INTEGER NOT NULL DEFAULT 0,
+                last_read_ts          INTEGER NOT NULL DEFAULT 0,
+                last_write_ts         INTEGER NOT NULL DEFAULT 0,
 				ttl_epoch_utc_seconds INTEGER,
                 est_row_bytes         INTEGER NOT NULL,
 				data                  ANY     NOT NULL,
@@ -329,7 +331,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 	{
 		idMonotonicInc: 2,
-		description: "Add last_transaction_ts to items and create transaction support tables",
+		description: "Create transaction support tables",
 		// pending_transactions is a rowid table on purpose. Do NOT add WITHOUT ROWID back: it has the
 		// same defect here as in `items`.
 		// WITHOUT ROWID stores rows in an index B-tree with a ~1002-byte inline payload limit on a 4 KiB
@@ -374,10 +376,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id ON pending_transactions (transaction_id, hk, sk);
 
             CREATE TABLE IF NOT EXISTS deletion_metadata (
-                id              INTEGER PRIMARY KEY CHECK (id = 1),
-                max_deleted_ts  INTEGER NOT NULL DEFAULT 0
+                id                     INTEGER PRIMARY KEY CHECK (id = 1),
+                max_delete_tx_order_ts INTEGER NOT NULL DEFAULT 0,
+                delete_revision        INTEGER NOT NULL DEFAULT 0
             ) STRICT;
-            INSERT OR IGNORE INTO deletion_metadata (id, max_deleted_ts) VALUES (1, 0);`,
+            INSERT OR IGNORE INTO deletion_metadata (id, max_delete_tx_order_ts, delete_revision) VALUES (1, 0, 0);`,
 	},
 	{
 		idMonotonicInc: 3,
@@ -457,7 +460,14 @@ export class PartitionStore {
 		hk: KeyBytes,
 		sk: KeyBytes,
 	): {
-		row?: { data: string | Uint8Array; kind: DataKind; ttl_epoch_utc_seconds: number | null; v: number; last_transaction_ts: number };
+		row?: {
+			data: string | Uint8Array;
+			kind: DataKind;
+			ttl_epoch_utc_seconds: number | null;
+			v: number;
+			last_read_ts: number;
+			last_write_ts: number;
+		};
 		rowsRead: number;
 		rowsWritten: number;
 	} {
@@ -466,9 +476,10 @@ export class PartitionStore {
 			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
-			last_transaction_ts: number;
+			last_read_ts: number;
+			last_write_ts: number;
 		}>(
-			`SELECT ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+			`SELECT ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
 			hk,
 			sk,
 		);
@@ -521,9 +532,16 @@ export class PartitionStore {
 	}
 
 	/** Lightweight existence and timestamp read for an unconditional transaction prepare. */
-	getItemStamp(hk: KeyBytes, sk: KeyBytes): { row?: { last_transaction_ts: number }; rowsRead: number; rowsWritten: number } {
-		const res = this.#storage.sql.exec<{ last_transaction_ts: number }>(
-			`SELECT last_transaction_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+	getItemStamp(
+		hk: KeyBytes,
+		sk: KeyBytes,
+	): {
+		row?: { last_read_ts: number; last_write_ts: number };
+		rowsRead: number;
+		rowsWritten: number;
+	} {
+		const res = this.#storage.sql.exec<{ last_read_ts: number; last_write_ts: number }>(
+			`SELECT last_read_ts, last_write_ts FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
 			hk,
 			sk,
 		);
@@ -605,7 +623,8 @@ export class PartitionStore {
 		data: string | Uint8Array;
 		kind: DataKind;
 		ttlAt: number | null;
-		lastTransactionTs: number;
+		/** The transaction order timestamp a content mutation stamps on the item: both watermarks advance to it. */
+		txOrderTs: number;
 	}): {
 		version: number;
 		keyEstBytes: number;
@@ -617,23 +636,25 @@ export class PartitionStore {
 		// data binds last (?6) because est_row_bytes must measure this same expression.
 		const dataExpr = itemDataExpr(opts.kind, opts.data, "?6");
 
-		// INVARIANT: last_transaction_ts is monotonic per item — it must never move backwards.
+		// INVARIANT: last_read_ts and last_write_ts are monotonic per item — neither must ever move
+		// backwards.
 		//
-		// `prepare` accepts a transaction only when its timestamp is above this value
+		// `prepare` accepts a transaction only when its timestamp is above the item's read watermark
 		// (transaction-participant.ts), so a lower value here would let an already-superseded
 		// transaction commit over newer data. The two writers disagree on whose clock they read: a
-		// non-transactional put stamps `Date.now()` on this partition's clock, while a committed
-		// transaction stamps its coordinator's, which prepare accepts up to MAX_CLOCK_SKEW_MS ahead.
-		// MAX is what reconciles them.
+		// non-transactional put stamps this partition's clock, while a committed transaction stamps
+		// its coordinator's, which prepare accepts up to MAX_CLOCK_SKEW_MS ahead. MAX is what
+		// reconciles them.
 		//
 		// MAX also cannot drift ahead of the wall clock: it only ever keeps the larger of two values
-		// that already exist. Do NOT turn it into an increment (`MAX(last_transaction_ts + 1, ?)`) —
-		// that would run the timestamp forward under sustained writes.
+		// that already exist. Do NOT turn it into an increment (`MAX(last_write_ts + 1, ?)`) —
+		// that would run the timestamps forward under sustained writes.
 		//
-		// bumpItemLastTransactionTs applies the same rule for the transactional "check" operation.
+		// bumpItemReadTs applies the same rule to the read watermark alone, for the transactional
+		// "check" operation.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
-			 SELECT ?1, ?2, ?3, ?4, 1, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
+			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+			 SELECT ?1, ?2, ?3, ?4, 1, ?5, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
 			 WHERE ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
@@ -641,13 +662,14 @@ export class PartitionStore {
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   est_row_bytes = excluded.est_row_bytes,
 			   v = v + 1,
-			   last_transaction_ts = MAX(last_transaction_ts, excluded.last_transaction_ts)
+			   last_read_ts = MAX(last_read_ts, excluded.last_read_ts),
+			   last_write_ts = MAX(last_write_ts, excluded.last_write_ts)
 			 RETURNING v, est_row_bytes`,
 			opts.hk,
 			opts.sk,
 			DATA_KINDS.indexOf(opts.kind),
 			opts.ttlAt,
-			opts.lastTransactionTs,
+			opts.txOrderTs,
 			opts.data,
 			MAX_ITEM_BYTES,
 		);
@@ -676,13 +698,14 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Deletes an item, keeping the deletion watermark and key-size estimate consistent.
-	 * `bumpWatermarkAlways` gives the transactional-delete behavior: it updates the watermark and the
-	 * estimate even when the row was already absent. The non-transactional path updates them only when
-	 * the statement deleted a row.
+	 * Deletes an item, keeping the deletion metadata and key-size estimate consistent.
+	 * `bumpTxOrderTsAlways` gives the transactional-delete behavior: it advances the transaction order watermark and
+	 * the estimate even when the row was already absent. The non-transactional path updates them only
+	 * when the statement deleted a row. `delete_revision` advances only when a row was removed;
+	 * `max_delete_tx_order_ts` also advances for an absent row when `bumpTxOrderTsAlways`.
 	 * The metrics cover the DELETE statement ONLY.
 	 */
-	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; watermarkTs: number; bumpWatermarkAlways?: boolean }): {
+	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; txOrderTs: number; bumpTxOrderTsAlways?: boolean }): {
 		deleted: boolean;
 		rowsRead: number;
 		rowsWritten: number;
@@ -691,8 +714,15 @@ export class PartitionStore {
 
 		const writeRes = this.#storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hk, opts.sk);
 		const deleted = writeRes.rowsWritten > 0;
-		if (deleted || opts.bumpWatermarkAlways) {
-			this.bumpMaxDeletedTs(opts.watermarkTs);
+		if (deleted) {
+			this.#storage.sql.exec(
+				`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?), delete_revision = delete_revision + 1 WHERE id = 1`,
+				opts.txOrderTs,
+			);
+		} else if (opts.bumpTxOrderTsAlways) {
+			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
+		}
+		if (deleted || opts.bumpTxOrderTsAlways) {
 			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, delEst, opts.hk);
 		}
 		return { deleted, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
@@ -738,15 +768,19 @@ export class PartitionStore {
 			for (const { hk, bytes } of bytesByHashKey.values()) {
 				this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, bytes, hk);
 			}
-			if (rows.length > 0) this.bumpMaxDeletedTs(maxExpirySeconds * 1000);
+			// The sweep reclaims rows whose logical deletion happened at expiry, so it advances the
+			// transaction order watermark only and never touches delete_revision.
+			if (rows.length > 0) {
+				this.bumpMaxDeleteTxOrderTs(maxExpirySeconds * 1000 * TX_ORDER_TS_UNITS_PER_MS);
+			}
 
 			return { deletedRows: rows.length, deletedBytes };
 		});
 	}
 
-	/** The transactional "check" operation: bumps the item's timestamp without changing data. */
-	bumpItemLastTransactionTs(hk: KeyBytes, sk: KeyBytes, ts: number): void {
-		this.#storage.sql.exec(`UPDATE items SET last_transaction_ts = MAX(last_transaction_ts, ?) WHERE hk = ? AND sk = ?`, ts, hk, sk);
+	/** The transactional "check" operation: advances only the item's read watermark. */
+	bumpItemReadTs(hk: KeyBytes, sk: KeyBytes, ts: number): void {
+		this.#storage.sql.exec(`UPDATE items SET last_read_ts = MAX(last_read_ts, ?) WHERE hk = ? AND sk = ?`, ts, hk, sk);
 	}
 
 	/**
@@ -757,17 +791,18 @@ export class PartitionStore {
 	 */
 	insertItemIfAbsent(item: MigratedItem): void {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
-		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?7) so est_row_bytes can
+		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?8) so est_row_bytes can
 		// measure the same parameter.
 		this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ${estRowBytesExpr("?7", "?1", "?2")}, ?7)`,
+			`INSERT OR IGNORE INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ${estRowBytesExpr("?8", "?1", "?2")}, ?8)`,
 			item.hk,
 			item.sk,
 			DATA_KINDS.indexOf(item.kind),
 			item.ttl_epoch_utc_seconds ?? null,
 			item.v,
-			item.last_transaction_ts,
+			item.last_read_ts,
+			item.last_write_ts,
 			item.data,
 		);
 	}
@@ -920,18 +955,19 @@ export class PartitionStore {
 			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
-			last_transaction_ts: number;
+			last_read_ts: number;
+			last_write_ts: number;
 		};
 
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ORDER BY hk, sk LIMIT ?`,
 				limit,
 			);
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
+				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.sk,
 				limit,
@@ -986,14 +1022,15 @@ export class PartitionStore {
 			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
-			last_transaction_ts: number;
+			last_read_ts: number;
+			last_write_ts: number;
 		};
 		const dataProjection = opts.decodeJson ? DATA_SELECT_DECODED : "data";
 		const { conds, params } = rangeScanConditions(opts);
 
 		const page = this.#storage.sql
 			.exec<Row>(
-				`SELECT hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
+				`SELECT hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
 				...params,
 				opts.limit,
 			)
@@ -1025,7 +1062,8 @@ export class PartitionStore {
 			data_kind: number;
 			ttl_epoch_utc_seconds: number | null;
 			v: number;
-			last_transaction_ts: number;
+			last_read_ts: number;
+			last_write_ts: number;
 		}>(sql, ...params);
 		const select = opts.select;
 		function* rows(): Generator<QueryScanRow> {
@@ -1041,7 +1079,8 @@ export class PartitionStore {
 								kind: kindFromCode(row.data_kind),
 								ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
 								v: row.v,
-								last_transaction_ts: row.last_transaction_ts,
+								last_read_ts: row.last_read_ts,
+								last_write_ts: row.last_write_ts,
 							};
 				yield { sk, estRowBytes: row.est_row_bytes, item };
 			}
@@ -1051,9 +1090,12 @@ export class PartitionStore {
 
 	// ─── pending_transactions ───────────────────────────────────────────────
 
-	pendingLockFor(hk: KeyBytes, sk: KeyBytes): { transaction_id: string } | undefined {
+	pendingLockFor(hk: KeyBytes, sk: KeyBytes): { transaction_id: string; operation: string } | undefined {
 		return this.#storage.sql
-			.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
+			.exec<{
+				transaction_id: string;
+				operation: string;
+			}>(`SELECT transaction_id, operation FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
 			.toArray()[0];
 	}
 
@@ -1141,7 +1183,7 @@ export class PartitionStore {
 	 *
 	 * Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge.
 	 */
-	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: CompiledUpdatePlan; ttlAt?: number; lastTransactionTs: number }): {
+	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: CompiledUpdatePlan; ttlAt?: number; txOrderTs: number }): {
 		version: number;
 		keyEstBytes: number;
 		rowsRead: number;
@@ -1157,7 +1199,7 @@ export class PartitionStore {
 		const hkParam = "?1";
 		const skParam = "?2";
 		const tail = new StatementTail(opts.plan);
-		const lastTsParam = tail.param(opts.lastTransactionTs);
+		const txOrderTsParam = tail.param(opts.txOrderTs);
 		// The TTL of the pre-image survives unless the operation sets one: the insert then carries the
 		// joined row's TTL, which is NULL for an item this statement creates, and the conflict branch
 		// assigns that same value back. WHICH branch applies is known here, so the statement carries the
@@ -1170,8 +1212,8 @@ export class PartitionStore {
 		// WHERE clause holds the size guard: when it removes the source row, neither branch runs and the
 		// statement returns nothing.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_transaction_ts, est_row_bytes, data)
-			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, 1, ${lastTsParam},
+			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, 1, ${txOrderTsParam}, ${txOrderTsParam},
 			        ${estRowBytesExpr(docExpr, hkParam, skParam)}, ${docExpr}
 			   FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ${hkParam} AND i.sk = ${skParam}
 			  WHERE ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
@@ -1181,7 +1223,8 @@ export class PartitionStore {
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   est_row_bytes = excluded.est_row_bytes,
 			   v = v + 1,
-			   last_transaction_ts = MAX(last_transaction_ts, excluded.last_transaction_ts)
+			   last_read_ts = MAX(last_read_ts, excluded.last_read_ts),
+			   last_write_ts = MAX(last_write_ts, excluded.last_write_ts)
 			 RETURNING v, est_row_bytes`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
@@ -1428,16 +1471,48 @@ export class PartitionStore {
 
 	// ─── deletion_metadata ──────────────────────────────────────────────────
 
-	getMaxDeletedTs(): number {
+	getMaxDeleteTxOrderTs(): number {
 		return (
-			this.#storage.sql.exec<{ max_deleted_ts: number }>(`SELECT max_deleted_ts FROM deletion_metadata WHERE id = 1`).toArray()[0]
-				?.max_deleted_ts ?? 0
+			this.#storage.sql
+				.exec<{ max_delete_tx_order_ts: number }>(`SELECT max_delete_tx_order_ts FROM deletion_metadata WHERE id = 1`)
+				.toArray()[0]?.max_delete_tx_order_ts ?? 0
 		);
 	}
 
-	/** The single definition of the deletion-watermark update (monotonic MAX). */
-	bumpMaxDeletedTs(ts: number): void {
-		this.#storage.sql.exec(`UPDATE deletion_metadata SET max_deleted_ts = MAX(max_deleted_ts, ?) WHERE id = 1`, ts);
+	/** The single definition of the deletion transaction-order-watermark update (monotonic MAX). */
+	bumpMaxDeleteTxOrderTs(ts: number): void {
+		this.#storage.sql.exec(`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?) WHERE id = 1`, ts);
+	}
+
+	/**
+	 * The delete revision a transactional read reports for `hk`. The hash key parameter is not used yet,
+	 * but it will be used when we have per-bucket revision; today one partition-wide counter serves every key.
+	 */
+	deleteRevisionFor(_hk: KeyBytes): number {
+		return (
+			this.#storage.sql.exec<{ delete_revision: number }>(`SELECT delete_revision FROM deletion_metadata WHERE id = 1`).toArray()[0]
+				?.delete_revision ?? 0
+		);
+	}
+
+	/** Both deletion-metadata values in one read: the migration metadata RPC serves them together. */
+	getDeletionMetadata(): { maxDeleteTxOrderTs: number; deleteRevision: number } {
+		const row = this.#storage.sql
+			.exec<{
+				max_delete_tx_order_ts: number;
+				delete_revision: number;
+			}>(`SELECT max_delete_tx_order_ts, delete_revision FROM deletion_metadata WHERE id = 1`)
+			.toArray()[0];
+		return { maxDeleteTxOrderTs: row?.max_delete_tx_order_ts ?? 0, deleteRevision: row?.delete_revision ?? 0 };
+	}
+
+	/** Migration ingest: idempotent, merges both values with MAX. */
+	mergeDeletionMetadata(meta: { maxDeleteTxOrderTs: number; deleteRevision: number }): void {
+		this.#storage.sql.exec(
+			`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?), delete_revision = MAX(delete_revision, ?) WHERE id = 1`,
+			meta.maxDeleteTxOrderTs,
+			meta.deleteRevision,
+		);
 	}
 
 	// ─── key_size_estimates ─────────────────────────────────────────────────

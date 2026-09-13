@@ -15,7 +15,8 @@ export type GetItemsBatchResult = {
 };
 
 export type GetPartitionTransactionMetadataResult = {
-	maxDeletedTs: number;
+	maxDeleteTxOrderTs: number;
+	deleteRevision: number;
 	pendingTransactions: PendingTransactionRow[];
 	nextCursor: PendingTransactionCursor | null;
 };

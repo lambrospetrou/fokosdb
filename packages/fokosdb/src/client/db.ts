@@ -501,11 +501,11 @@ export class FokosDB {
 		// The public boundary — the single exit where the internal representation becomes the public one:
 		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
 		// queryItems), parse json text once into a JsonValue, and drop the read-transaction bookkeeping
-		// (lastCommittedTs / hasPendingWrite) so callers never depend on it. Those two are meaningless in
+		// (deleteRevision / hasPendingWrite) so callers never depend on it. Those two are meaningless in
 		// a "committed" outcome regardless — the driver raises an error when any item has a pending write.
 		return {
 			...response,
-			items: response.items.map(({ lastCommittedTs: _lastCommittedTs, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item }) => {
+			items: response.items.map(({ deleteRevision: _deleteRevision, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item }) => {
 				const keys = {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
@@ -616,13 +616,14 @@ export class FokosDB {
 		// Did both phases observe the same committed state? `version` (the item's `v`) is the primary
 		// datum: a monotonic per-item counter, so unlike a wall-clock timestamp it cannot miss two writes
 		// landing inside the same millisecond. This mirrors the LSN comparison the DynamoDB paper uses
-		// for its read transactions. `lastCommittedTs` is a second signal that catches a delete+recreate
-		// landing back on the same version, whenever the timestamps differ. An item absent in both phases
-		// compares equal and is not a conflict.
+		// for its read transactions. `deleteRevision` is the owner partition's user-delete counter: it
+		// catches a delete-and-recreate that lands back on the same version, and an absent-create-delete
+		// sequence. An unrelated user delete in the same partition is a conservative conflict. An item
+		// absent in both phases compares equal and is not a conflict. Item timestamps are not compared.
 		const sameCommittedState = (a: ReadForTransactionItemResultEncoded, b: ReadForTransactionItemResultEncoded): boolean => {
 			if (a.found !== b.found) return false;
 			if (a.found && b.found && a.version !== b.version) return false;
-			return a.lastCommittedTs === b.lastCommittedTs;
+			return a.deleteRevision === b.deleteRevision;
 		};
 
 		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so

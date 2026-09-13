@@ -117,19 +117,21 @@ export class SplitMigration {
 		}
 		invariant(cursor === null, "fokos/partition.runHashChildMigration: loop exited with non-null cursor — data may be incomplete");
 
-		// Migrate transaction metadata: pending locks and deletion high-water mark.
+		// Migrate transaction metadata: pending locks, the deletion transaction order watermark, and the delete revision.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata({
-				childPartitionContext: pCtx,
-				cursor: txCursor,
-			});
+			const { maxDeleteTxOrderTs, deleteRevision, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata(
+				{
+					childPartitionContext: pCtx,
+					cursor: txCursor,
+				},
+			);
 
 			store.transactionSync(() => {
 				for (const row of pendingTransactions) {
 					store.insertPendingLock(row);
 				}
-				store.bumpMaxDeletedTs(maxDeletedTs);
+				store.mergeDeletionMetadata({ maxDeleteTxOrderTs, deleteRevision });
 			});
 
 			if (!nextCursor) break;
@@ -206,21 +208,23 @@ export class SplitMigration {
 		}
 		invariant(cursor === null, "fokos/partition.runRangeChildMigration: loop exited with non-null cursor");
 
-		// Migrate transaction metadata: pending locks and the deletion high-water mark.
-		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the watermark;
+		// Migrate transaction metadata: pending locks, the deletion transaction order watermark, and the delete revision.
+		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the metadata;
 		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
 		let txCursor: PendingTransactionCursor | null = null;
 		while (true) {
-			const { maxDeletedTs, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata({
-				childPartitionContext: pCtx,
-				cursor: txCursor,
-			});
+			const { maxDeleteTxOrderTs, deleteRevision, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata(
+				{
+					childPartitionContext: pCtx,
+					cursor: txCursor,
+				},
+			);
 
 			store.transactionSync(() => {
 				for (const row of pendingTransactions) {
 					store.insertPendingLock(row);
 				}
-				store.bumpMaxDeletedTs(maxDeletedTs);
+				store.mergeDeletionMetadata({ maxDeleteTxOrderTs, deleteRevision });
 			});
 
 			if (!nextCursor) break;

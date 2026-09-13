@@ -45,7 +45,7 @@ describe("PartitionDO — range split", () => {
 					data: "x",
 					kind: "text",
 					ttlAt: null,
-					lastTransactionTs: 0,
+					txOrderTs: 0,
 				});
 			}
 		};
@@ -109,7 +109,7 @@ describe("PartitionDO — range split", () => {
 						data: new Uint8Array(100 * 1024),
 						kind: "bytes",
 						ttlAt: null,
-						lastTransactionTs: 0,
+						txOrderTs: 0,
 					});
 				}
 
@@ -164,7 +164,7 @@ describe("PartitionDO — range split", () => {
 						data: new Uint8Array(dataBytes),
 						kind: "bytes",
 						ttlAt: null,
-						lastTransactionTs: 0,
+						txOrderTs: 0,
 					});
 				}
 

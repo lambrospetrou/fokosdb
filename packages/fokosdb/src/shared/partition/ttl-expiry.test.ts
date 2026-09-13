@@ -31,7 +31,7 @@ function config(overrides: Partial<TtlSweepConfig> = {}): TtlSweepConfig {
 }
 
 function putExpired(store: PartitionStore, hk: string, ttlAt: number, data = "d"): number {
-	store.upsertItem({ hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, lastTransactionTs: 1 });
+	store.upsertItem({ hk: kb(hk), sk: kb("s"), data, kind: "text", ttlAt, txOrderTs: 1 });
 	return new TextEncoder().encode(data).length + kb(hk).byteLength + kb("s").byteLength + EST_ROW_BYTES_K;
 }
 

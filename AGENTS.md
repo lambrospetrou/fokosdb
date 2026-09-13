@@ -93,7 +93,7 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 - TC state machine: `CREATED → PREPARING → PREPARED → COMMITTING → COMMITTED` (or `→ CANCELLING → CANCELLED`)
 - Every state transition writes to SQLite **before** sending outbound RPCs (write-ahead).
 - `PREPARED` is the point of no return — a PREPARED transaction MUST eventually commit.
-- Conflict detection: `last_transaction_ts` column on items; `max_deleted_ts` in `deletion_metadata` for items that were deleted.
+- Conflict detection: `last_read_ts` and `last_write_ts` columns on items (a `check` compares with `last_write_ts` and advances only `last_read_ts`; a put, update, or delete compares with `last_read_ts` and advances both); `max_delete_tx_order_ts` in `deletion_metadata` for items that were deleted. Every transaction order timestamp is `Date.now() * TX_ORDER_TS_UNITS_PER_MS` from `txOrderTimestampNow()`.
 - Non-transactional writes (`putItem`/`deleteItem`) are **rejected** (not delayed) if a pending transaction holds the item's lock.
 - TC recovery: PartitionDO alarms poke stale TCs via `recoverTransaction()`; TC alarm retries stale in-flight transactions.
 - TC storage: payload is stripped at `PREPARED` or `CANCELLING`; item and participant rows are deleted only at the terminal transition.
@@ -101,7 +101,7 @@ Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USEN
 
 **Read transactions (`transactGetItems`)**:
 
-- Two-phase double-read: read once, check no pending writes, read again, compare `lastCommittedTs`. If anything changed → abort.
+- Two-phase double-read: read once, check no pending content mutation (a pending `check` does not count), read again, compare `found`, `version`, and the partition's `deleteRevision` (a counter that every user delete of a row advances; the TTL sweep does not). If anything changed → abort with `read_conflict`. An unrelated user delete in the same partition is a conservative `read_conflict`.
 - The Worker drives both phases directly. No coordinator or durable read state exists. If the Worker stops mid-read, the client retries.
 
 **Key invariants**:
