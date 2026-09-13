@@ -59,7 +59,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Optimize the transaction timestamp/numbering to reduce conflicts at the millisecond level (`docs/agent-plans/2026-09-05-item-order-timestamps-and-read-revisions.md`).
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Garbage collect the items table after splits and hash key promotions.
@@ -78,8 +77,8 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 - queryItems: filter + projections.
 - Add global eventual indexes (DynamoDB GSIs).
-- Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Batch item operations (non-transactions).
+- Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Add jurisdictions support.
