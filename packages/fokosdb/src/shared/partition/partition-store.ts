@@ -108,7 +108,7 @@ function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 
 // hk/sk are canonical KeyBytes everywhere in the store: they bind to SQLite BLOB columns and compare
 // by memcmp (the same total order as KeyCodec.compare). The ONLY producer of KeyBytes is KeyCodec.
-export type MigratedItem = {
+export type StoredItem = {
 	hk: KeyBytes;
 	sk: KeyBytes;
 	// Public reads decode json to JSON text; migration reads carry the raw JSONB blob (Uint8Array).
@@ -119,6 +119,41 @@ export type MigratedItem = {
 	last_read_ts: number;
 	last_write_ts: number;
 };
+
+/**
+ * The brand of ItemLinkId. It exists only for the TypeScript type checker.
+ *
+ * `declare const` tells TypeScript that a constant with this name exists, but it does not create one.
+ * The compiled JavaScript does not contain it. The type `unique symbol` makes the property key
+ * different from all other keys. This file does not export the constant, so no other module can use
+ * the key. KeyBytes in key-codec.ts uses the same method.
+ */
+declare const ITEM_LINK_ID_BRAND: unique symbol;
+
+/**
+ * The value of the `items.item_id` column. It links an item to its rows in other tables.
+ *
+ * ItemLinkId is a branded type:
+ * - At run time, the value is a normal JavaScript number.
+ * - At compile time, the type also has the property `[ITEM_LINK_ID_BRAND]`. No real value has this
+ *   property. Thus, TypeScript does not accept a plain `number` where the code needs an ItemLinkId.
+ * - The brand does not change the value. Workers RPC sends the number, and the MigratedItem type at
+ *   the receiver gives the brand back.
+ *
+ * Rules:
+ * - Only PartitionStore creates an ItemLinkId. It reads the value from the `items` table, and the row
+ *   type of the query gives the value the brand.
+ * - Other code only moves the value. The migration is the only user: the parent reads a MigratedItem,
+ *   RPC sends it to the child, and the child gives it to insertItemIfAbsent.
+ * - Do NOT cast a number to ItemLinkId (`as ItemLinkId`) outside PartitionStore. Tests that stand in
+ *   for a parent partition are the only exception.
+ * - Do NOT use the value to identify an item outside PartitionStore. The brand cannot stop code that
+ *   reads the value as a number, so code review must enforce this rule.
+ */
+export type ItemLinkId = number & { readonly [ITEM_LINK_ID_BRAND]: true };
+
+/** A stored item as migration copies it: the item and its link id. Query results never carry the id. */
+export type MigratedItem = StoredItem & { item_id: ItemLinkId };
 
 export type PendingTransactionRow = {
 	hk: KeyBytes;
@@ -152,7 +187,7 @@ export type RangeScanBounds = {
 };
 
 /** One row of a queryItems leaf scan. Count rows carry `item: null`. */
-export type QueryScanRow = { sk: KeyBytes; estRowBytes: number; item: MigratedItem | null };
+export type QueryScanRow = { sk: KeyBytes; estRowBytes: number; item: StoredItem | null };
 
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
@@ -198,7 +233,7 @@ function codeFromNullableKind(kind: DataKind | null): number | null {
 	return code;
 }
 
-export function estimateItemBytes(item: MigratedItem): number {
+export function estimateItemBytes(item: StoredItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
 	return item.hk.byteLength + item.sk.byteLength + dataSize + 16 + 64;
 }
@@ -282,36 +317,67 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 1,
 		description: "Create items table",
-		// `data` is ANY so SQLite retains the physical storage class: TEXT for text, BLOB for bytes, and
-		// BLOB for json (SQLite's JSONB binary form). `data_kind` is the discriminant that tells the three
-		// apart (JSONB and bytes are both blobs).
+		// Column `data`:
+		// - The type is ANY, so SQLite keeps the storage class of each value: TEXT for text, BLOB for bytes,
+		//   and BLOB for json (the SQLite JSONB binary format).
+		// - JSONB and bytes are both BLOB values. `data_kind` tells the three kinds apart.
+		// - `data` is the last column. SQLite reads a record from the start until it has all the columns
+		//   that the query needs. Thus, a query that reads only metadata columns does not read the
+		//   overflow pages of a large `data` value.
 		//
-		// This is a rowid table on purpose. Do NOT add WITHOUT ROWID back. WITHOUT ROWID stores rows in an
-		// index B-tree, whose inline payload limit is ~1002 bytes on a 4 KiB page. Every item above that
-		// limit then takes a private overflow page it cannot share. Measured on Durable Object storage:
-		// 1000-byte data costs 4683 physical bytes per row (4.7x), and 2000-byte data costs 2.3x.
-		// `PRIMARY KEY (hk, sk)` still enforces uniqueness through sqlite_autoindex_items_1. hk/sk keep
-		// their explicit NOT NULL because a rowid table does NOT imply it from the primary key.
+		// Table type:
+		// - This is a rowid table. Do NOT change it to WITHOUT ROWID.
+		// - A WITHOUT ROWID table keeps its rows in an index B-tree. On a 4 KiB page, the inline payload
+		//   limit of an index B-tree is approximately 1002 bytes. Each row above that limit gets its own
+		//   overflow page, and no other row can use the free space on that page.
+		// - Measured on Durable Object storage: 1000-byte data used 4683 physical bytes per row (4.7x), and
+		//   2000-byte data used 2.3x.
 		//
-		// `est_row_bytes` is the true encoded byte size (octet_length: UTF-8 bytes for TEXT, blob bytes for
-		// BLOB/JSONB). It is a plain column, NOT a generated column: SQLite refuses to treat an index that
-		// holds a generated column as covering, which would send the est_row_bytes scans back to every wide
-		// item row. Both writers build it with estRowBytesExpr, so SQLite still measures the stored value
-		// and JS never estimates it.
+		// Item key:
+		// - `UNIQUE (hk, sk)` makes sure that each item key occurs only one time. SQLite creates the index
+		//   sqlite_autoindex_items_1 for this constraint.
+		// - hk and sk have an explicit NOT NULL, because a UNIQUE constraint does not make a column NOT NULL.
 		//
-		// octet_length covers the variable part (data + keys); K covers the fixed per-row remainder: the
-		// five wide integer columns, the data_kind enum, the B-tree record header, the rowid, and the two
-		// index entries each row carries (the PK autoindex + idx_items_scan).
-		// K is a rough size-accounting knob (feeds promotion/split), not a precise figure.
+		// Column `item_id`:
+		// - `item_id` links an item to its rows in other tables. Only PartitionStore uses it (see ItemLinkId).
+		// - A table that links to an item must name its link column `item_id` too.
+		// - `item_id` is the INTEGER PRIMARY KEY, so it is the rowid of the row. SQLite does not store the
+		//   value a second time. The cost is one byte in the record header.
+		// - SQLite gives a new row the value MAX(item_id) + 1. Thus, new rows go to the end of the table
+		//   B-tree.
+		// - Do NOT use a random or hash value for `item_id`. Such values put rows at random positions in the
+		//   B-tree. Inserts then become slower, and the pages contain more empty space.
+		// - VACUUM does not change an explicit INTEGER PRIMARY KEY. SQLite does not give this guarantee for
+		//   an implicit rowid.
+		// - Migration copies `item_id` without change. A child partition receives items only from its
+		//   parent, and the ids in the parent are unique. Thus, the ids in the child are also unique. After
+		//   the migration, a new item in the child gets an id that is higher than all copied ids.
+		// - The value is unique only in this partition and in the partitions that copy from it. Do NOT send
+		//   `item_id` through the API, in cursors, or in transaction rows.
+		// - When SQLite deletes the row with the highest id, it can give that id to the next new row. Thus,
+		//   each operation that deletes an item must also delete the rows linked to its id, in the same
+		//   storage transaction.
 		//
-		// SQLite reads pages for each row until it satisfies the columns needed for the query.
-		// Moving the "data" column to the end of the table definition keeps the hot-path SELECTs
-		// from reading the potentially large data column (overflow pages) when they only need the small metadata columns.
+		// Column `est_row_bytes`:
+		// - The value is the encoded size from octet_length: UTF-8 bytes for TEXT, and blob bytes for BLOB
+		//   and JSONB.
+		// - It is a normal column, NOT a generated column. SQLite does not use an index that contains a
+		//   generated column as a covering index. The est_row_bytes scans would then read each full row.
+		// - Both writers calculate the value with estRowBytesExpr. Thus, SQLite measures the stored value,
+		//   and JavaScript does not estimate it.
+		// - octet_length gives the variable part of the row (data and keys). The constant K gives the fixed
+		//   part: the five integer columns, the data_kind value, the record header, the rowid, and the two
+		//   index entries of each row (sqlite_autoindex_items_1 and idx_items_scan).
+		// - K is an approximate value for size accounting (promotion and split). It is not an exact value.
 		//
-		// idx_items_scan makes the est_row_bytes scans (computeRangeSplitBoundaries, rebuildKeySizeEstimates)
-		// index-only, so they never touch the wide item rows.
+		// Index `idx_items_scan`:
+		// - The index contains (hk, sk, est_row_bytes). Thus, the est_row_bytes scans
+		//   (computeRangeSplitBoundaries, rebuildKeySizeEstimates) read only the index, and never read the
+		//   item rows.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
+                item_id               INTEGER PRIMARY KEY,
+
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 data_kind             INTEGER NOT NULL DEFAULT 0,
@@ -322,7 +388,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 est_row_bytes         INTEGER NOT NULL,
 				data                  ANY     NOT NULL,
 
-                PRIMARY KEY (hk, sk)
+                UNIQUE (hk, sk)
             ) STRICT;
 
             CREATE INDEX IF NOT EXISTS idx_items_scan ON items (hk, sk, est_row_bytes);
@@ -737,8 +803,8 @@ export class PartitionStore {
 			const rows = this.#storage.sql
 				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number }>(
 					`DELETE FROM items
-					 WHERE rowid IN (
-					     SELECT i.rowid FROM items i INDEXED BY idx_items_ttl
+					 WHERE item_id IN (
+					     SELECT i.item_id FROM items i INDEXED BY idx_items_ttl
 					      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 					        AND i.ttl_epoch_utc_seconds <= ?1
 					        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
@@ -784,18 +850,24 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Migration ingestion: INSERT OR IGNORE rather than OR REPLACE. A migrating partition refuses every
-	 * write with 503 while it is migration_migrating, so no user write can have arrived yet. IGNORE is
-	 * the safer form on a retry: when a crash followed a written batch, the retry keeps those rows
-	 * instead of writing them again.
+	 * Migration ingestion: keeps an existing row rather than replacing it. A migrating partition refuses
+	 * every write with 503 while it is migration_migrating, so no user write can have arrived yet.
+	 * Keeping the row is the safer form on a retry: when a crash followed a written batch, the retry
+	 * keeps those rows instead of writing them again.
+	 *
+	 * The conflict target MUST stay `(hk, sk)`. Do NOT use `INSERT OR IGNORE`: it also ignores a conflict
+	 * on `item_id`, which would drop a copied item without an error. With the explicit target, a retried
+	 * row is skipped, and an `item_id` that another item already holds fails the statement.
 	 */
 	insertItemIfAbsent(item: MigratedItem): void {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
-		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?8) so est_row_bytes can
+		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?9) so est_row_bytes can
 		// measure the same parameter.
 		this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ${estRowBytesExpr("?8", "?1", "?2")}, ?8)`,
+			`INSERT INTO items (item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${estRowBytesExpr("?9", "?2", "?3")}, ?9)
+			 ON CONFLICT (hk, sk) DO NOTHING`,
+			item.item_id,
 			item.hk,
 			item.sk,
 			DATA_KINDS.indexOf(item.kind),
@@ -949,6 +1021,7 @@ export class PartitionStore {
 	 */
 	queryItemsPage(cursor: ScanCursor | null, limit: number): MigratedItem[] {
 		type Row = {
+			item_id: ItemLinkId;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
@@ -962,12 +1035,12 @@ export class PartitionStore {
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ORDER BY hk, sk LIMIT ?`,
+				`SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ORDER BY hk, sk LIMIT ?`,
 				limit,
 			);
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
+				`SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
 				cursor.hk,
 				cursor.sk,
 				limit,
@@ -1016,6 +1089,7 @@ export class PartitionStore {
 		decodeJson: boolean;
 	}): MigratedItem[] {
 		type Row = {
+			item_id: ItemLinkId;
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			data: string | ArrayBuffer;
@@ -1030,7 +1104,7 @@ export class PartitionStore {
 
 		const page = this.#storage.sql
 			.exec<Row>(
-				`SELECT hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
+				`SELECT item_id, hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
 				...params,
 				opts.limit,
 			)
@@ -1069,7 +1143,7 @@ export class PartitionStore {
 		function* rows(): Generator<QueryScanRow> {
 			for (const row of cursor) {
 				const sk = fromSqlKey(row.sk);
-				const item: MigratedItem | null =
+				const item: StoredItem | null =
 					select === "count"
 						? null
 						: {

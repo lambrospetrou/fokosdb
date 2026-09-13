@@ -6,13 +6,16 @@ import { compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
-import { estimateItemBytes, PartitionStore, queryScanStatement, type ScanCursor } from "./partition-store.js";
+import { estimateItemBytes, PartitionStore, queryScanStatement, type ItemLinkId, type ScanCursor } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith } from "../../../test/errors-matchers.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
+
+// Only the store creates link ids; a test stands in for the parent partition that read one.
+const linkId = (n: number) => n as ItemLinkId;
 
 // Mirrors items.est_row_bytes: octet_length(data)+octet_length(hk)+octet_length(sk)+K. octet_length is
 // UTF-8 bytes for text and byteLength for blobs; keys are already canonical bytes. est_row_bytes is a
@@ -373,12 +376,13 @@ describe("PartitionStore - items", () => {
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 			const migrated = store.queryItemsPage(null, 10)[0];
-			store.insertItemIfAbsent({ ...migrated, sk: kb("j2") });
+			store.insertItemIfAbsent({ ...migrated, item_id: linkId(migrated.item_id + 1), sk: kb("j2") });
 			// Same row under a longer sk: the only difference must be octet_length(sk).
 			expect(readEst("j2")).toBe(readEst("j")! - kb("j").byteLength + kb("j2").byteLength);
 
 			const bytes = new Uint8Array([1, 2, 3, 4, 5]);
 			store.insertItemIfAbsent({
+				item_id: linkId(100),
 				hk: kb("hk"),
 				sk: kb("b"),
 				data: bytes,
@@ -495,6 +499,8 @@ describe("PartitionStore - items", () => {
 			expect(items.get("b")?.data).toEqual(new Uint8Array([1, 2, 3]));
 			// The public-read projection decodes JSONB back to JSON text.
 			expect(items.get("j")).toMatchObject({ data: jsonText, kind: "json" });
+			// The items.item_id link key stays inside the store: a query result never carries it.
+			for (const r of projRows) expect(r.item).not.toHaveProperty("item_id");
 		});
 	});
 
@@ -631,7 +637,7 @@ describe("PartitionStore - items", () => {
 			expect(migrated.data).toBeInstanceOf(Uint8Array);
 
 			// Re-insert verbatim under a new key and confirm the JSONB is still path-queryable.
-			store.insertItemIfAbsent({ ...migrated, sk: kb("j2") });
+			store.insertItemIfAbsent({ ...migrated, item_id: linkId(migrated.item_id + 1), sk: kb("j2") });
 			const count = state.storage.sql
 				.exec<{ c: number }>(`SELECT jsonb_extract(data, '$.count') AS c FROM items WHERE hk = ? AND sk = ?`, kb("hk"), kb("j2"))
 				.toArray()[0].c;
@@ -824,6 +830,7 @@ describe("PartitionStore - items", () => {
 			);
 
 			store.insertItemIfAbsent({
+				item_id: linkId(1),
 				hk,
 				sk,
 				data: oversized,
@@ -834,6 +841,48 @@ describe("PartitionStore - items", () => {
 				last_write_ts: 1,
 			});
 			expect(store.getItem(hk, sk).row).toMatchObject({ v: 7, data: oversized });
+		});
+	});
+
+	it("insertItemIfAbsent keeps the copied id, skips a retried key, and fails on an id another item holds", async () => {
+		await withStore((store) => {
+			const copied = (id: number, sk: string, data: string) => ({
+				item_id: linkId(id),
+				hk: kb("hk"),
+				sk: kb(sk),
+				data,
+				kind: "text" as const,
+				ttl_epoch_utc_seconds: null,
+				v: 1,
+				last_read_ts: 1,
+				last_write_ts: 1,
+			});
+			const rows = () => store.queryItemsPage(null, 10).map((r) => ({ item_id: r.item_id, data: r.data }));
+
+			store.insertItemIfAbsent(copied(1000, "a", "first"));
+			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
+
+			// A retried batch serves the same key again: the stored row stays.
+			store.insertItemIfAbsent(copied(1000, "a", "retry"));
+			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
+
+			// A different item with an id that is already taken must fail, not disappear.
+			expect(() => store.insertItemIfAbsent(copied(1000, "b", "other"))).toThrow(/UNIQUE constraint failed: items\.item_id/);
+			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
+
+			// A local write after the copy takes an id above every copied id.
+			store.upsertItem({ hk: kb("hk"), sk: kb("c"), data: "local", kind: "text", ttlAt: null, txOrderTs: 2 });
+			expect(rows()).toEqual([
+				{ item_id: 1000, data: "first" },
+				{ item_id: 1001, data: "local" },
+			]);
+
+			// An overwrite keeps the id of the item.
+			store.upsertItem({ hk: kb("hk"), sk: kb("a"), data: "overwritten", kind: "text", ttlAt: null, txOrderTs: 3 });
+			expect(rows()).toEqual([
+				{ item_id: 1000, data: "overwritten" },
+				{ item_id: 1001, data: "local" },
+			]);
 		});
 	});
 
@@ -868,8 +917,8 @@ describe("PartitionStore - TTL deletion", () => {
 				state.storage.sql
 					.exec<{ detail: string }>(
 						`EXPLAIN QUERY PLAN DELETE FROM items
-						 WHERE rowid IN (
-						     SELECT i.rowid FROM items i${indexHint}
+						 WHERE item_id IN (
+						     SELECT i.item_id FROM items i${indexHint}
 						      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 						        AND i.ttl_epoch_utc_seconds <= ?1
 						        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)

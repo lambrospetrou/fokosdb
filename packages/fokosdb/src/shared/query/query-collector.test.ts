@@ -1,13 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../partition-topology/key-codec.js";
-import type { MigratedItem, QueryScanRow } from "../partition/partition-store.js";
+import type { QueryScanRow, StoredItem } from "../partition/partition-store.js";
 import type { QueryPageBudgetState } from "./page-budget.js";
 import { collectQueryPage } from "./query-collector.js";
 
 const hk = KeyCodec.encode("hk");
 
 // A scan row. `item` is present on projection rows only.
-function row(sk: string, estRowBytes: number, item?: Partial<MigratedItem>): QueryScanRow {
+function row(sk: string, estRowBytes: number, item?: Partial<StoredItem>): QueryScanRow {
 	const skBytes = KeyCodec.encode(sk);
 	return {
 		sk: skBytes,

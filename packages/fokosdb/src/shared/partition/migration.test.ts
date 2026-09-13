@@ -11,7 +11,14 @@ import type {
 	GetPromotedKeysBatchResult,
 	PartitionPeer,
 } from "./partition-peer.js";
-import { PartitionStore, type MigratedItem, type ScanCursor, type PromotedKeyStatus } from "./partition-store.js";
+import {
+	PartitionStore,
+	type ItemLinkId,
+	type MigratedItem,
+	type ScanCursor,
+	type PromotedKeyStatus,
+	type StoredItem,
+} from "./partition-store.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { compileConditionExpression } from "../expression/compiler.js";
 
@@ -27,11 +34,11 @@ describe("SplitMigration — hash child", () => {
 		const all = [item("a", "1"), item("a", "2"), item("b", "1"), item("b", "2"), item("c", "1")];
 
 		await withMigrationEnv(async (menv) => {
-			const { peer, calls } = makeFakePeer({ items: pagedItemBatches(all, 2) });
+			const { peer, calls, parentItems } = makeFakePeer({ items: all, itemBatchSize: 2 });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
-			// All items ingested exactly once, in resumable batches.
-			expect(menv.store.queryItemsPage(null, 100)).toHaveLength(all.length);
+			// All items ingested exactly once, in resumable batches, each with the id the parent served.
+			expect(menv.store.queryItemsPage(null, 100).map((r) => r.item_id)).toEqual(parentItems.map((i) => i.item_id));
 			expect(calls.itemCursors).toEqual([null, { hk: kb("a"), sk: kb("2") }, { hk: kb("b"), sk: kb("2") }]);
 
 			// Completion: status transitioned, cursor checkpoint removed, parent acked with this child's doName.
@@ -50,7 +57,7 @@ describe("SplitMigration — hash child", () => {
 
 		await withMigrationEnv(async (menv) => {
 			// Run 1: crashes on the second batch — after batch 1's cursor checkpoint landed.
-			const run1 = makeFakePeer({ items: pagedItemBatches(all, 2), failItemsCall: 2 });
+			const run1 = makeFakePeer({ items: all, itemBatchSize: 2, failItemsCall: 2 });
 			await expect(menv.makeMigration(run1.peer).runMigration(pCtx, parentCtx)).rejects.toThrow(/simulated parent crash/);
 			expect(menv.status()).toBe("migration_migrating");
 			expect(menv.cursor()).toEqual({ hk: kb("a"), sk: kb("2") });
@@ -58,7 +65,7 @@ describe("SplitMigration — hash child", () => {
 
 			// Run 2 (fresh driver, same storage): resumes strictly after the checkpoint — batch 1 is
 			// NOT re-fetched — and completes.
-			const run2 = makeFakePeer({ items: pagedItemBatches(all, 2) });
+			const run2 = makeFakePeer({ items: all, itemBatchSize: 2 });
 			await menv.makeMigration(run2.peer).runMigration(pCtx, parentCtx);
 			expect(run2.calls.itemCursors[0]).toEqual({ hk: kb("a"), sk: kb("2") });
 			expect(menv.store.queryItemsPage(null, 100)).toHaveLength(all.length);
@@ -67,25 +74,22 @@ describe("SplitMigration — hash child", () => {
 		});
 	});
 
-	it("re-ingesting an already-written batch is idempotent (INSERT OR IGNORE keeps the original rows)", async () => {
+	it("re-ingesting an already-written batch is idempotent (the original rows are kept)", async () => {
 		const base = makeBase();
 		const pCtx = hashCtx(base, [0, 1]);
 		const parentCtx = hashCtx(base, [0]);
 
 		await withMigrationEnv(async (menv) => {
-			// The first row is already present locally (written by a previous, partially-crashed run
-			// whose cursor checkpoint did NOT land) with a higher version and its own timestamps.
-			menv.store.insertItemIfAbsent({ ...item("a", "1", "already-written", 7), last_read_ts: 333, last_write_ts: 111 });
-
-			const { peer } = makeFakePeer({
-				items: pagedItemBatches(
-					[
-						{ ...item("a", "1"), last_read_ts: 999, last_write_ts: 999 },
-						{ ...item("a", "2"), last_read_ts: 444, last_write_ts: 222 },
-					],
-					10,
-				),
+			const { peer, parentItems } = makeFakePeer({
+				items: [
+					{ ...item("a", "1"), last_read_ts: 999, last_write_ts: 999 },
+					{ ...item("a", "2"), last_read_ts: 444, last_write_ts: 222 },
+				],
 			});
+			// The first row is already present locally (written by a previous, partially-crashed run
+			// whose cursor checkpoint did NOT land) with a higher version and its own timestamps. That
+			// run copied the same parent item, so the local row has the same link id.
+			menv.store.insertItemIfAbsent({ ...parentItems[0], data: "already-written", v: 7, last_read_ts: 333, last_write_ts: 111 });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			const rows = menv.store.queryItemsPage(null, 100);
@@ -199,7 +203,7 @@ describe("SplitMigration — range child ack routing", () => {
 		const parentCtx = hashCtx(base, [0]); // hash DO parent ⇒ promotion
 
 		await withMigrationEnv(async (menv) => {
-			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("big-key", "1")], 10) });
+			const { peer, calls } = makeFakePeer({ items: [item("big-key", "1")] });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			expect(calls.promotionAcks).toEqual([kb("big-key")]);
@@ -216,7 +220,7 @@ describe("SplitMigration — range child ack routing", () => {
 		const parentCtx = rangeCtx(base, "big-key", null, null); // range DO parent ⇒ range split
 
 		await withMigrationEnv(async (menv) => {
-			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("big-key", "a")], 10) });
+			const { peer, calls } = makeFakePeer({ items: [item("big-key", "a")] });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			expect(calls.childAcks).toEqual([pCtx.doName]);
@@ -234,7 +238,7 @@ describe("SplitMigration — status gate", () => {
 
 		await withMigrationEnv(async (menv) => {
 			menv.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("a", "1")], 10) });
+			const { peer, calls } = makeFakePeer({ items: [item("a", "1")] });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			expect(calls.itemCursors).toEqual([]);
@@ -251,7 +255,7 @@ describe("SplitMigration — status gate", () => {
 		await withMigrationEnv(async (menv) => {
 			menv.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
 			menv.storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
-			const { peer, calls } = makeFakePeer({ items: pagedItemBatches([item("a", "1")], 10) });
+			const { peer, calls } = makeFakePeer({ items: [item("a", "1")] });
 			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
 
 			// Skips data copy and only retries parent acknowledgement.
@@ -269,7 +273,7 @@ describe("SplitMigration — status gate", () => {
 		const all = [item("a", "1")];
 
 		await withMigrationEnv(async (menv) => {
-			const peerFailing = makeFakePeer({ items: pagedItemBatches(all, 10), failChildAck: true });
+			const peerFailing = makeFakePeer({ items: all, failChildAck: true });
 			await expect(menv.makeMigration(peerFailing.peer).runMigration(pCtx, parentCtx)).rejects.toThrow(/simulated ack failure/);
 
 			// Data is already copied and status is completed, but ack is pending.
@@ -328,30 +332,15 @@ function rangeCtx(base: PartitionContext, hashKey: string, start: string | null,
 	};
 }
 
-function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): MigratedItem {
+function item(hk: string, sk: string, data = `data-${hk}-${sk}`, v = 1): StoredItem {
 	return { hk: kb(hk), sk: kb(sk), data, kind: "text", ttl_epoch_utc_seconds: null, v, last_read_ts: 0, last_write_ts: 0 };
 }
 
-// Serves `all` (already in (hk, sk) order) in pages of `batchSize`, honoring the resume cursor —
-// mirrors the parent's real batch-serving contract (nextCursor non-null only when more remains).
-function pagedItemBatches(all: MigratedItem[], batchSize: number) {
-	return (cursor: ScanCursor | null): GetItemsBatchResult => {
-		const start =
-			cursor === null
-				? 0
-				: all.findIndex(
-						(i) =>
-							KeyCodec.compare(i.hk, cursor.hk) > 0 || (KeyCodec.compare(i.hk, cursor.hk) === 0 && KeyCodec.compare(i.sk, cursor.sk) > 0),
-					);
-		const items = start === -1 ? [] : all.slice(start, start + batchSize);
-		const hasMore = start !== -1 && start + batchSize < all.length;
-		const last = items[items.length - 1];
-		return { items, nextCursor: hasMore && last ? { hk: last.hk, sk: last.sk } : null };
-	};
-}
-
 type FakePeerOptions = {
-	items?: (cursor: ScanCursor | null) => GetItemsBatchResult;
+	/** The items of the fake parent, in (hk, sk) order. */
+	items?: StoredItem[];
+	/** The maximum number of items in one getItemsBatch page. */
+	itemBatchSize?: number;
 	txBatches?: GetPartitionTransactionMetadataResult[];
 	pkBatches?: GetPromotedKeysBatchResult[];
 	/** 1-based getItemsBatch call number that throws once (simulated crash mid-migration). */
@@ -360,6 +349,14 @@ type FakePeerOptions = {
 };
 
 function makeFakePeer(opts: FakePeerOptions = {}) {
+	// The fake parent gives each item a link id, as the store of a real parent does. The id is the
+	// position of the item in `items`, plus 1. Thus:
+	// - Different items get different ids.
+	// - An item gets the same id in each page and each retry, and in each fake peer that uses the same
+	//   `items`.
+	// Tests get the ids from `parentItems` only. No test creates an id.
+	const parentItems: MigratedItem[] = (opts.items ?? []).map((item, i) => ({ ...item, item_id: (i + 1) as ItemLinkId }));
+	const itemBatchSize = opts.itemBatchSize ?? 10;
 	const calls = {
 		itemCursors: [] as (ScanCursor | null)[],
 		txCalls: 0,
@@ -378,7 +375,7 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 				failItemsCall = 0; // fail once, then recover
 				throw new Error("simulated parent crash");
 			}
-			return opts.items?.(cursor) ?? { items: [], nextCursor: null };
+			return itemBatch(cursor);
 		},
 		async migrationGetPartitionTransactionMetadata() {
 			calls.txCalls++;
@@ -401,7 +398,24 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 		async internalInitFromSplit() {},
 		async internalTriggerMigration() {},
 	};
-	return { peer, calls };
+
+	// Serves `parentItems` in pages of `itemBatchSize`, strictly after the resume cursor, like the batch
+	// contract of a real parent: nextCursor is not null only when more items remain.
+	function itemBatch(cursor: ScanCursor | null): GetItemsBatchResult {
+		const start =
+			cursor === null
+				? 0
+				: parentItems.findIndex(
+						(i) =>
+							KeyCodec.compare(i.hk, cursor.hk) > 0 || (KeyCodec.compare(i.hk, cursor.hk) === 0 && KeyCodec.compare(i.sk, cursor.sk) > 0),
+					);
+		const items = start === -1 ? [] : parentItems.slice(start, start + itemBatchSize);
+		const hasMore = start !== -1 && start + itemBatchSize < parentItems.length;
+		const last = items[items.length - 1];
+		return { items, nextCursor: hasMore && last ? { hk: last.hk, sk: last.sk } : null };
+	}
+
+	return { peer, calls, parentItems };
 }
 
 type MigrationEnv = {

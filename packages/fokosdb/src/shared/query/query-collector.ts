@@ -1,11 +1,11 @@
 import type { KeyBytes } from "../partition-topology/key-codec.js";
-import type { MigratedItem, QueryScanRow, ScanCursor } from "../partition/partition-store.js";
+import type { QueryScanRow, ScanCursor, StoredItem } from "../partition/partition-store.js";
 import type { QuerySelect } from "../types.js";
 import type { QueryPageBudgetState } from "./page-budget.js";
 import invariant from "../invariant.js";
 
 export type QueryCollectionState = {
-	items: MigratedItem[];
+	items: StoredItem[];
 	count: number;
 	scannedCount: number;
 	evaluatedBytes: number;
@@ -34,7 +34,7 @@ export function collectQueryPage(opts: {
 		QueryPageBudgetState,
 		"remainingEvaluatedItems" | "remainingEvaluatedBytes" | "remainingResponseBytes" | "allowOversizedFirstItem"
 	>;
-	estimateResponseBytes: (item: MigratedItem) => number;
+	estimateResponseBytes: (item: StoredItem) => number;
 }): QueryCollectionState {
 	const { rows, hashKey, select, budget, estimateResponseBytes } = opts;
 
@@ -65,7 +65,7 @@ export function collectQueryPage(opts: {
 			break;
 		}
 
-		let item: MigratedItem | null = null;
+		let item: StoredItem | null = null;
 		let itemBytes = 0;
 		if (select === "projection") {
 			invariant(row.item, "fokos/query-collector: projection scan row has no item");

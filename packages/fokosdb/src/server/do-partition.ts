@@ -51,6 +51,7 @@ import {
 	estimatePendingTxBytes,
 	PartitionStore,
 	type MigratedItem,
+	type StoredItem,
 	type ScanCursor,
 	type PendingTransactionCursor,
 	type PendingTransactionRow,
@@ -182,7 +183,7 @@ export type QueryItemsRpcRequest = {
 };
 
 export type QueryItemsRpcResponse = {
-	items: MigratedItem[];
+	items: StoredItem[];
 	/** Matched items in this response. */
 	count: number;
 	/** Evaluated items in this response. */
@@ -802,7 +803,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { interval, cursor, direction } = req;
 		const budget = new QueryPageBudget(req);
 
-		const allItems: MigratedItem[] = [];
+		const allItems: StoredItem[] = [];
 		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
 		// contribute nothing of their own; they're captured numerically via `forwardCount`.
 		const leafMetas: Array<OperationMetrics & PartitionInfoInternal> = [];
