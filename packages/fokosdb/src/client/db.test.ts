@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
+import { FokosStd } from "./fokos-std.js";
 import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import { PartitionDO } from "../server/do-partition.js";
 import {
@@ -502,6 +503,64 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				queries: [{ hashKey: "k", sortKeyCondition: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
 			});
 			expect(sksOf(res)).toEqual(["abc", "ab", "a"]);
+		});
+	});
+
+	describe("FokosDB.queryItems — negative prefix match with FokosStd.notBeginsWith", () => {
+		// The complement of a prefix is two ranges, one sub-query each. The fixture covers every
+		// boundary: an item with no sort key (sorts first), the bare prefix, keys under the prefix, the
+		// successor key itself, a later string key, and a binary key (sorts after every string).
+		const BIN = new Uint8Array([1]);
+		const EXPECTED_ASC = [undefined, "a", "order$", "p", BIN];
+
+		async function populate() {
+			const db = makeDB();
+			await db.putItem({ hashKey: "k", data: "x" });
+			for (const sk of ["a", "order#", "order#1", "order$", "p"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+			await db.putItem({ hashKey: "k", sortKey: BIN, data: "x" });
+			return db;
+		}
+
+		it("returns every item whose sort key does not begin with the prefix, in sort order", async () => {
+			const db = await populate();
+			const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#") });
+			expect(sksOf(res)).toEqual(EXPECTED_ASC);
+			expect(res.count).toBe(EXPECTED_ASC.length);
+		});
+
+		it("keeps the order reversed with scanIndexForward=false", async () => {
+			const db = await populate();
+			const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#", { scanIndexForward: false }) });
+			expect(sksOf(res)).toEqual([...EXPECTED_ASC].reverse());
+		});
+
+		it("pages across the boundary between the two ranges without a gap or a duplicate", async () => {
+			const db = await populate();
+			const queries = FokosStd.notBeginsWith("k", "order#");
+			const seen: Array<string | Uint8Array | undefined> = [];
+			let cursor: string | undefined;
+			let pages = 0;
+			for (;;) {
+				const res = await db.queryItems({ queries, limit: 2, cursor });
+				seen.push(...sksOf(res));
+				pages++;
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+				expect(pages).toBeLessThan(50);
+			}
+			expect(seen).toEqual(EXPECTED_ASC);
+			expect(pages).toBeGreaterThan(1);
+		});
+
+		it("mixes with other sub-queries and count mode", async () => {
+			const db = await populate();
+			await db.putItem({ hashKey: "other", sortKey: "z", data: "x" });
+			const res = await db.queryItems({
+				queries: [...FokosStd.notBeginsWith("k", "order#"), { hashKey: "other" }],
+				select: "count",
+			});
+			expect(res.items).toEqual([]);
+			expect(res.count).toBe(EXPECTED_ASC.length + 1);
 		});
 	});
 

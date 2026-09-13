@@ -7,6 +7,7 @@
  */
 export { FokosDB } from "./db.js";
 export type { FokosDBOptions } from "./db.js";
+export { FokosStd } from "./fokos-std.js";
 
 export * from "../shared/types.js";
 

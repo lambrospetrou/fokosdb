@@ -102,20 +102,59 @@ function compare(a: KeyBytes, b: KeyBytes): number {
 }
 
 /**
- * Prefix upper bound in byte space: the least key that is a strict upper bound of every key having
- * `prefix` as a prefix. Increment the last byte `< 0xFF` and drop everything after it. Returns `null`
- * (unbounded) when no such byte exists — i.e. `prefix` is empty or all `0xFF`. Used for `beginsWith`
- * / prefix upper bounds.
+ * Increments the last byte below 0xFF and drops the bytes after it. Returns `null` when every byte
+ * is 0xFF (or the input is empty): no byte string of this form is above the input.
  */
-function successor(prefix: KeyBytes): KeyBytes | null {
-	for (let i = prefix.length - 1; i >= 0; i--) {
-		if (prefix[i] < 0xff) {
-			const out = prefix.slice(0, i + 1);
+function incrementLastByte(bytes: Uint8Array): Uint8Array | null {
+	for (let i = bytes.length - 1; i >= 0; i--) {
+		if (bytes[i] < 0xff) {
+			const out = bytes.slice(0, i + 1);
 			out[i] += 1;
-			return asKeyBytes(out);
+			return out;
 		}
 	}
 	return null;
+}
+
+/**
+ * Prefix upper bound in byte space: the least key that is a strict upper bound of every key having
+ * `prefix` as a prefix. Returns `null` (unbounded) when no such key exists — i.e. `prefix` is empty
+ * or all `0xFF`. Used for `beginsWith` / prefix upper bounds.
+ */
+function successor(prefix: KeyBytes): KeyBytes | null {
+	const out = incrementLastByte(prefix);
+	return out === null ? null : asKeyBytes(out);
+}
+
+/**
+ * Prefix upper bound in the public key space: the least public key that sorts after every key that
+ * begins with `prefix`, in the same key type as `prefix`. The byte `successor` of a string prefix is
+ * often not valid UTF-8, so it cannot be a string bound, and a binary bound sorts after every string.
+ * This variant keeps the result in the type of the input so a caller can pass it back as a query bound.
+ *
+ * A string gets its last code point incremented. UTF-8 bytes sort in code-point order, so this is
+ * the least valid string above the prefix, and no stored string key exists between it and the byte
+ * successor. The surrogate range is skipped, and a last code point of U+10FFFF is dropped so the one
+ * before it carries. Bytes get the same increment as `successor`, applied to the untagged public bytes.
+ *
+ * Returns `undefined` when no such key exists: an empty prefix, a string of only U+10FFFF, or bytes
+ * of only 0xFF. A range that starts after such a prefix has no upper bound.
+ */
+function publicSuccessor(prefix: string | Uint8Array): string | Uint8Array | undefined {
+	if (typeof prefix !== "string") {
+		// `prefix` is untagged public bytes, not encoded KeyBytes, so it does not go through `successor`.
+		// The result is the same key: the increment touches only the last byte below 0xFF, and the 0xFF
+		// tag that `encode` adds in front is never that byte.
+		return incrementLastByte(prefix) ?? undefined;
+	}
+	const codePoints = Array.from(prefix, (c) => c.codePointAt(0)!);
+	for (let i = codePoints.length - 1; i >= 0; i--) {
+		if (codePoints[i] >= 0x10ffff) continue;
+		let next = codePoints[i] + 1;
+		if (next >= 0xd800 && next <= 0xdfff) next = 0xe000;
+		return String.fromCodePoint(...codePoints.slice(0, i), next);
+	}
+	return undefined;
 }
 
 /**
@@ -185,6 +224,7 @@ export const KeyCodec = {
 	decode,
 	compare,
 	successor,
+	publicSuccessor,
 	shortestSeparator,
 	asKeyBytes,
 	keyForLog,
