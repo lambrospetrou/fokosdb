@@ -59,6 +59,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
+- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Garbage collect the items table after splits and hash key promotions.
@@ -69,8 +70,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Maybe put enough info in the transaction sent to each partition so that they can communicate with the involved partitions to learn the outcome of the transaction.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
 - Count item data sizes in UTF-8 bytes, to match the `octet_length` the store uses. The current UTF-16 count under-counts non-ASCII data by up to 3x, so the item and transaction size caps admit more than they intend.
-- Implement the timestamp ordering optimizations for transactions based on Section 4 of the ATC 2023 paper "Distributed Transactions at Scale in Amazon DynamoDB".
-- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Extend the split/migration flow to also allow writes while migration in-progress (probably will need some kind of logical replication of writes after the migration started `_fokos_replication_log`). Not needed once we use DO Snapshot API.
 
 ### Features
