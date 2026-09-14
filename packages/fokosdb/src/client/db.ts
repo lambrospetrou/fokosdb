@@ -15,8 +15,11 @@ import {
 	OperationMetrics,
 	PutItemOptions,
 	PutItemResult,
+	ProjectedItem,
 	QueryItemsMeta,
 	QueryItemsOptions,
+	QueryItemsProjectedOptions,
+	QueryItemsProjectedResult,
 	QueryItemsResult,
 	QuerySelect,
 } from "../shared/types.js";
@@ -75,7 +78,7 @@ import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
 import { routedError } from "../shared/partition-topology/forward-meta.js";
 import { normalizeSkInterval } from "../shared/query/sk-interval.js";
-import type { ScanCursor } from "../shared/partition/partition-store.js";
+import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import {
 	DEFAULT_EVALUATED_ITEMS_PER_PAGE,
@@ -86,7 +89,8 @@ import {
 	MAX_RESPONSE_BYTES_PER_PAGE,
 	QueryPageBudget,
 } from "../shared/query/page-budget.js";
-import { compileConditionExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
+import { compileConditionExpression, compileQueryExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
+import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
 import { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
@@ -310,7 +314,9 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#transactGetItems(opts));
 	}
 
-	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+	async queryItems(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult>;
+	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
+	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult | QueryItemsProjectedResult> {
 		return await withFokosErrors(async () => await this.#queryItems(opts));
 	}
 
@@ -652,7 +658,7 @@ export class FokosDB {
 		return { outcome: "committed", items };
 	}
 
-	async #queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult> {
+	async #queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult | QueryItemsProjectedResult> {
 		if (opts.queries.length === 0) {
 			throw new FokosValidationError(VALIDATION_CODES.query_queries_empty, { message: "queries must not be empty" });
 		}
@@ -675,6 +681,16 @@ export class FokosDB {
 				attributes: { select: opts.select },
 			});
 		}
+		// Count mode returns no item, so a projection has no meaning there.
+		if (select === "count" && opts.projection !== undefined) {
+			throw new FokosValidationError(VALIDATION_CODES.query_projection_with_count, {
+				message: 'a projection is not valid with select "count"',
+			});
+		}
+		const plan =
+			opts.filter === undefined && opts.projection === undefined
+				? null
+				: withExpressionErrors(() => compileQueryExpression({ filter: opts.filter, projection: opts.projection }));
 
 		const normalizedQueries = opts.queries.map((q) => {
 			const direction = (q.scanIndexForward ?? true) ? ("asc" as const) : ("desc" as const);
@@ -689,7 +705,7 @@ export class FokosDB {
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};
 		});
-		const fingerprint = computeCursorFingerprint(normalizedQueries);
+		const fingerprint = computeCursorFingerprint(normalizedQueries, plan?.filterIdentity ?? null, plan?.projectionIdentity ?? null);
 
 		const budget = new QueryPageBudget({
 			remainingEvaluatedItems: Math.min(opts.limit ?? DEFAULT_EVALUATED_ITEMS_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE),
@@ -723,7 +739,7 @@ export class FokosDB {
 			startInner = decoded.inner;
 		}
 
-		const items: QueryItemsResult["items"] = [];
+		const items: Array<QueryItemsResult["items"][number] | ProjectedItem> = [];
 		const partitionMetas: QueryItemsResult["partitionMetas"] = [];
 		let count = 0;
 		let scannedCount = 0;
@@ -754,22 +770,30 @@ export class FokosDB {
 				allowOversizedFirstItem: budget.allowOversizedFirstItem,
 				cursor: rpcCursor,
 				select,
+				plan,
 			});
 
 			count += rpcResult.count;
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				for (const item of rpcResult.items) {
-					items.push({
-						hashKey: KeyCodec.decode(item.hk),
-						sortKey: item.sk.byteLength === 0 ? undefined : KeyCodec.decode(item.sk),
-						// json data arrives as JSON text — parse it once here to the public JsonValue.
-						data: decodeItemData(item.kind, item.data),
-						kind: item.kind,
-						ttlAt: item.ttl_epoch_utc_seconds ?? undefined,
-						version: item.v,
-					});
+				if (plan?.projection) {
+					for (const item of rpcResult.items) {
+						items.push(projectedItemFromWireRow(plan.projection.names, item as ProjectedWireRow));
+					}
+				} else {
+					for (const item of rpcResult.items) {
+						const stored = item as StoredItem;
+						items.push({
+							hashKey: KeyCodec.decode(stored.hk),
+							sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
+							// json data arrives as JSON text — parse it once here to the public JsonValue.
+							data: decodeItemData(stored.kind, stored.data),
+							kind: stored.kind,
+							ttlAt: stored.ttl_epoch_utc_seconds ?? undefined,
+							version: stored.v,
+						});
+					}
 				}
 			}
 			partitionMetas.push(...rpcResult.partitionMetas.map(publicMeta));
@@ -822,7 +846,7 @@ export class FokosDB {
 			partitionsVisited: partitionMetas.length,
 		};
 
-		return { items, count, scannedCount, cursor, meta, partitionMetas };
+		return { items, count, scannedCount, cursor, meta, partitionMetas } as QueryItemsResult | QueryItemsProjectedResult;
 	}
 
 	async #destroy(): Promise<{ ok: true }> {

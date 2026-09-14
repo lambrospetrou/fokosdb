@@ -236,6 +236,14 @@ function buildSqliteOperations(): OperationDefinition[] {
 		if (!arity) continue;
 		const valueArgsFrom = SQLITE_VALUE_PASSTHROUGH.get(name);
 
+		// SQLite's iif takes exactly three arguments; the two-argument form of the expression means a
+		// NULL else-branch, so it is spelled with an explicit NULL.
+		const argumentList = (args: readonly ExpressionValue[], renderers: OperationRenderers, jsonFrom?: number): string => {
+			const rendered = args.map((arg, i) => renderers.renderValue(arg, jsonFrom !== undefined && i >= jsonFrom ? "json" : "sqlite"));
+			if (name === "iif" && rendered.length === 2) rendered.push("NULL");
+			return rendered.join(", ");
+		};
+
 		operations.push({
 			name: `sqlite.${name}`,
 			contexts: EXPRESSION_CONTEXT_ALL,
@@ -257,20 +265,39 @@ function buildSqliteOperations(): OperationDefinition[] {
 				}
 				return { types: dynamicTypes ?? nullTypes };
 			},
-			renderValue: (args, renderers) => `${name}(${args.map((arg) => renderers.renderValue(arg, "sqlite")).join(", ")})`,
+			renderValue: (args, renderers) => `${name}(${argumentList(args, renderers)})`,
 			renderJsonValue:
-				valueArgsFrom === undefined
-					? undefined
-					: (args, renderers) =>
-							`${name}(${args.map((arg, i) => renderers.renderValue(arg, i < valueArgsFrom ? "sqlite" : "json")).join(", ")})`,
+				valueArgsFrom === undefined ? undefined : (args, renderers) => `${name}(${argumentList(args, renderers, valueArgsFrom)})`,
 			renderPresent: () => "1",
 			renderType: (args, renderers) => {
+				if (valueArgsFrom !== undefined) return renderPassthroughType(name, args, renderers);
 				const call = `${name}(${args.map((arg) => renderers.renderValue(arg, "sqlite")).join(", ")})`;
 				return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
 			},
 		});
 	}
 	return operations;
+}
+
+// The type of a pass-through is the type of the argument it returns, `null` when that argument is NULL.
+function renderPassthroughType(name: string, args: readonly ExpressionValue[], renderers: OperationRenderers): string {
+	if (name === "nullif") {
+		const call = `nullif(${renderers.renderValue(args[0], "sqlite")}, ${renderers.renderValue(args[1], "sqlite")})`;
+		return `CASE WHEN ${call} IS NULL THEN 'null' ELSE ${renderers.renderType(args[0])} END`;
+	}
+	if (name === "iif") {
+		return `CASE WHEN ${renderers.renderValue(args[0], "sqlite")} THEN ${nullOrType(args[1], renderers)} ELSE ${args[2] === undefined ? "'null'" : nullOrType(args[2], renderers)} END`;
+	}
+	const branches = args.map((arg) => `WHEN ${renderers.renderValue(arg, "sqlite")} IS NOT NULL THEN ${renderers.renderType(arg)}`);
+	return `CASE ${branches.join(" ")} ELSE 'null' END`;
+}
+
+// A literal needs no NULL test: it is never NULL, and a `{ val: null }` literal already types
+// `'null'`. Every other value can be NULL under a constant type, `size` of a number for one.
+function nullOrType(arg: ExpressionValue, renderers: OperationRenderers): string {
+	const type = renderers.renderType(arg);
+	if ("val" in arg || "b64" in arg) return type;
+	return `CASE WHEN ${renderers.renderValue(arg, "sqlite")} IS NULL THEN 'null' ELSE ${type} END`;
 }
 
 // SQLite evaluates 1e999 as +Infinity. In SQLite, `abs(x) < 1e999` evaluates to 1 for finite

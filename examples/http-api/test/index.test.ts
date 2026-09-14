@@ -58,6 +58,76 @@ describe("http-api example worker", () => {
 		expect(body.items[0]).toMatchObject({ sortKey: "s1", data: "v-s1", dataEncoding: "utf8" });
 	});
 
+	it("queryItems returns projected records and serializes a bytes cell", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const sk of ["s1", "s2", "s3"]) {
+			const put = await rpc(table, "putItem", { hashKey: "qi", sortKey: sk, data: `v-${sk}` });
+			expect(put.status).toBe(200);
+		}
+
+		const res = await rpc(table, "queryItems", {
+			queries: [{ hashKey: "qi" }],
+			projection: [{ expr: { ref: "sortKey" }, as: "id" }, { expr: { ref: "data" } }, { expr: { b64: "AQID" }, as: "bin" }],
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { items: Array<Record<string, unknown>>; count: number };
+		expect(body.count).toBe(3);
+		expect(body.items).toHaveLength(3);
+		expect(body.items[0]).toEqual({ id: "s1", data: "v-s1", bin: { b64: "AQID" } });
+	});
+
+	it("queryItems accepts a filter, in projection and in count mode", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const sk of ["s1", "s2", "s3"]) {
+			const put = await rpc(table, "putItem", { hashKey: "qi", sortKey: sk, data: `v-${sk}` });
+			expect(put.status).toBe(200);
+		}
+		const filter = { op: "gte", args: [{ ref: "sortKey" }, { val: "s2" }] };
+
+		const res = await rpc(table, "queryItems", { queries: [{ hashKey: "qi" }], filter });
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { items: Array<{ sortKey: string }>; count: number; scannedCount: number };
+		expect(body.items.map((i) => i.sortKey)).toEqual(["s2", "s3"]);
+		expect(body.count).toBe(2);
+		expect(body.scannedCount).toBe(3);
+
+		const count = await rpc(table, "queryItems", { queries: [{ hashKey: "qi" }], select: "count", filter });
+		expect(count.status).toBe(200);
+		const countBody = (await count.json()) as { items: unknown[]; count: number; scannedCount: number };
+		expect(countBody.items).toEqual([]);
+		expect(countBody.count).toBe(2);
+		expect(countBody.scannedCount).toBe(3);
+	});
+
+	it("queryItems combines a filter with a projection", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const sk of ["s1", "s2", "s3"]) {
+			const put = await rpc(table, "putItem", { hashKey: "qi", sortKey: sk, data: `v-${sk}` });
+			expect(put.status).toBe(200);
+		}
+
+		const res = await rpc(table, "queryItems", {
+			queries: [{ hashKey: "qi" }],
+			filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "s2" }] },
+			projection: [{ expr: { ref: "sortKey" }, as: "id" }],
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { items: Array<Record<string, unknown>>; count: number; scannedCount: number };
+		expect(body.items).toEqual([{ id: "s2" }, { id: "s3" }]);
+		expect(body.count).toBe(2);
+		expect(body.scannedCount).toBe(3);
+	});
+
+	it("rejects a projection on a count query as 400", async () => {
+		const res = await rpc(`t-${crypto.randomUUID()}`, "queryItems", {
+			queries: [{ hashKey: "qi" }],
+			select: "count",
+			projection: [{ expr: { ref: "sortKey" } }],
+		});
+		expect(res.status).toBe(400);
+		expect(await res.json()).toMatchObject({ error: "FokosValidationError", code: "query_projection_with_count" });
+	});
+
 	it("queryItems returns a count page with no items", async () => {
 		const table = `t-${crypto.randomUUID()}`;
 		for (const sk of ["s1", "s2", "s3"]) {

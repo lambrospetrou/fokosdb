@@ -1,11 +1,12 @@
 import type { KeyBytes } from "../partition-topology/key-codec.js";
+import type { ProjectedWireRow } from "../expression/projection.js";
 import type { QueryScanRow, ScanCursor, StoredItem } from "../partition/partition-store.js";
 import type { QuerySelect } from "../types.js";
 import type { QueryPageBudgetState } from "./page-budget.js";
 import invariant from "../invariant.js";
 
 export type QueryCollectionState = {
-	items: StoredItem[];
+	items: Array<StoredItem | ProjectedWireRow>;
 	count: number;
 	scannedCount: number;
 	evaluatedBytes: number;
@@ -21,10 +22,12 @@ export type QueryCollectionState = {
  *
  * Every row that the stream yields counts in `rowsReturned` first. A candidate then enters the page
  * only when the evaluated-item budget has room and its stored size fits the evaluated-byte budget;
- * in projection mode its response estimate must also fit the response budget, unless
+ * a matched candidate in projection mode must also fit the response budget, unless
  * `allowOversizedFirstItem` still holds. A candidate that a budget rejects stops the page with an
  * inclusive `nextCursor` at that candidate, so the next page evaluates it. `nextCursor` stays null
- * when the stream drains. The stream is not consumed past the rejected candidate.
+ * when the stream drains. The stream is not consumed past the rejected candidate. A candidate the
+ * plan's filter rejected (`matched: false`) consumes both evaluated budgets, advances the cursor,
+ * and consumes zero response bytes.
  */
 export function collectQueryPage(opts: {
 	rows: Iterable<QueryScanRow>;
@@ -34,7 +37,7 @@ export function collectQueryPage(opts: {
 		QueryPageBudgetState,
 		"remainingEvaluatedItems" | "remainingEvaluatedBytes" | "remainingResponseBytes" | "allowOversizedFirstItem"
 	>;
-	estimateResponseBytes: (item: StoredItem) => number;
+	estimateResponseBytes: (item: StoredItem | ProjectedWireRow) => number;
 }): QueryCollectionState {
 	const { rows, hashKey, select, budget, estimateResponseBytes } = opts;
 
@@ -65,13 +68,13 @@ export function collectQueryPage(opts: {
 			break;
 		}
 
-		let item: StoredItem | null = null;
-		let itemBytes = 0;
-		if (select === "projection") {
-			invariant(row.item, "fokos/query-collector: projection scan row has no item");
-			item = row.item;
-			itemBytes = estimateResponseBytes(item);
-			if (itemBytes > remainingResponseBytes && !state.allowOversizedFirstItem) {
+		let materialized: StoredItem | ProjectedWireRow | null = null;
+		let materializedBytes = 0;
+		if (row.matched && select === "projection") {
+			materialized = row.projected ?? row.item;
+			invariant(materialized !== null, "fokos/query-collector: projection scan row has no item");
+			materializedBytes = estimateResponseBytes(materialized);
+			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) {
 				stopBefore(row.sk);
 				break;
 			}
@@ -82,12 +85,13 @@ export function collectQueryPage(opts: {
 		remainingItems--;
 		remainingEvaluatedBytes -= row.estRowBytes;
 		state.lastEvaluatedCursor = { hk: hashKey, sk: row.sk };
-		// No filter exists, so every evaluated candidate matches.
-		state.count++;
-		if (item !== null) {
-			state.items.push(item);
-			state.responseBytes += itemBytes;
-			remainingResponseBytes -= itemBytes;
+		if (row.matched) {
+			state.count++;
+		}
+		if (materialized !== null) {
+			state.items.push(materialized);
+			state.responseBytes += materializedBytes;
+			remainingResponseBytes -= materializedBytes;
 			state.allowOversizedFirstItem = false;
 		}
 	}

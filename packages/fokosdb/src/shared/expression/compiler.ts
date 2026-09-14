@@ -17,7 +17,10 @@
  *    result, and parameter descriptors. An update plan has a `documentSql` fragment that builds the
  *    new JSONB document, an `applicableSql` guard that decides whether the update may run at all, a
  *    `valueTypeSql` fragment that names one cause of an inapplicable update, and parameter
- *    descriptors.
+ *    descriptors. A projection plan has one value fragment and one type fragment per entry, and a
+ *    query plan pairs a filter fragment with projection fragments. These two plans bind their
+ *    descriptors through the pool layout: one JSON array parameter that each fragment reads with
+ *    `json_extract(?P, '$[i]')`.
  *
  * At run time the caller binds the compiled parameters and executes the SQL. The plan is built once
  * and can be reused for many items because the per-item values are supplied through the bound
@@ -25,9 +28,10 @@
  */
 
 import type { JsonPrimitive } from "../json-types.js";
+import { materializeExpressionBindings } from "./bindings.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
-import { canonicalConditionIdentity, canonicalUpdateIdentity } from "./identity.js";
+import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity } from "./identity.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
 	type ExpressionContext,
@@ -39,23 +43,50 @@ import {
 import { parentJsonPath, validateWriteJsonPath } from "./path.js";
 import {
 	composeConditionStatement,
+	composeProjectionStatement,
+	composeQueryStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
+	POOL_PARAM,
+	PROJECTION_FIXED_BINDING_COUNT,
+	PROJECTION_PLAN_VERSION,
+	QUERY_MAX_TRAILING_BINDING_COUNT,
+	QUERY_PLAN_VERSION,
+	QUERY_WIDEST_SCAN_CONDITIONS,
 	UPDATE_FIXED_BINDING_COUNT,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
 	UPDATE_PLAN_VERSION,
 	type CompiledConditionPlan,
+	type CompiledProjectionPlan,
+	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
 	type ExpressionBindingDescriptor,
+	type ExpressionBindingLayout,
 } from "./plan.js";
-import { validateConditionExpression, validateUpdateExpression } from "./semantic.js";
+import {
+	EXPRESSION_REQUIRED_COLUMNS,
+	validateConditionExpression,
+	validateProjectionExpression,
+	validateUpdateExpression,
+} from "./semantic.js";
 import { DATA_KINDS } from "../types.js";
-import type { ConditionExpression, ExpressionReference, ExpressionValue, UpdateAction, UpdateExpression, UpdateTarget } from "./types.js";
+import type {
+	ConditionExpression,
+	ExpressionReference,
+	ExpressionValue,
+	ProjectionExpression,
+	UpdateAction,
+	UpdateExpression,
+	UpdateTarget,
+} from "./types.js";
 import { utf8WithinLimit } from "./utf8.js";
 
 type CompileContext = {
 	bindings: ExpressionBindingDescriptor[];
 	bindingIndexByKey: Map<string, number>;
+	bindingLayout: ExpressionBindingLayout;
+	/** The statement parameter that carries the pool array under the "pool" layout; unused otherwise. */
+	poolParam: number;
 	paramOffset: number;
 	completeData: boolean;
 	paths: Set<string>;
@@ -124,6 +155,8 @@ export function compileConditionExpression(
 	const context: CompileContext = {
 		bindings: [],
 		bindingIndexByKey: new Map(),
+		bindingLayout: "direct",
+		poolParam: 0,
 		paramOffset: fixedBindingCount,
 		completeData: false,
 		paths: new Set(),
@@ -158,6 +191,8 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	const context: CompileContext = {
 		bindings: [],
 		bindingIndexByKey: new Map(),
+		bindingLayout: "direct",
+		poolParam: 0,
 		// The keys take ?1 and ?2 in every statement that runs this plan, as they do for a condition.
 		paramOffset: UPDATE_FIXED_BINDING_COUNT,
 		completeData: false,
@@ -242,6 +277,146 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		},
 		identity: canonicalUpdateIdentity(update),
 	};
+}
+
+export function compileProjectionExpression(projection: readonly ProjectionExpression[]): CompiledProjectionPlan {
+	const analysis = validateProjectionExpression(projection);
+	const context: CompileContext = {
+		bindings: [],
+		bindingIndexByKey: new Map(),
+		bindingLayout: "pool",
+		poolParam: POOL_PARAM,
+		paramOffset: 0,
+		completeData: false,
+		paths: new Set(),
+		expressionContext: "projection",
+		preImage: STORED_PRE_IMAGE,
+	};
+	const fragments = compactPlanParameters(
+		[
+			...projection.map((entry) => renderProjectionValue(entry.expr, context)),
+			...projection.map((entry) => renderProjectionType(entry.expr, context)),
+		],
+		context,
+	);
+	const valueSql = fragments.slice(0, projection.length);
+	const typeSql = fragments.slice(projection.length);
+	assertPoolWithinLimit(context);
+	if (!utf8WithinLimit(composeProjectionStatement({ valueSql, typeSql }), EXPRESSION_LIMITS.compiledSqlBytes)) {
+		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	}
+	// The pool ?1 is bound always — the text "[]" when the plan has no descriptor — because Workers
+	// SQLite requires the bound value count to equal the statement's parameter count, and the
+	// statement's ?2 and ?3 keep ?1 in that count.
+	const completeBindingCount = POOL_PARAM + PROJECTION_FIXED_BINDING_COUNT;
+	return {
+		version: PROJECTION_PLAN_VERSION,
+		kind: "projection",
+		bindingLayout: "pool",
+		names: analysis.names,
+		valueSql,
+		typeSql,
+		bindings: context.bindings,
+		bindingCount: context.bindings.length,
+		completeBindingCount,
+		requiredColumns: analysis.requiredColumns,
+		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
+		identity: canonicalProjectionIdentity(projection),
+	};
+}
+
+export function compileQueryExpression(input: {
+	filter?: ConditionExpression;
+	projection?: readonly ProjectionExpression[];
+}): CompiledQueryPlan {
+	const { filter, projection } = input;
+	if (filter === undefined && projection === undefined) {
+		throw new ExpressionError("invalid_ast", "a query plan needs a filter or a projection");
+	}
+	const filterAnalysis = filter === undefined ? undefined : validateConditionExpression(filter, "filter");
+	const projectionAnalysis = projection === undefined ? undefined : validateProjectionExpression(projection);
+	// Filter and projection share one context, so a path or a literal both use binds once.
+	const context: CompileContext = {
+		bindings: [],
+		bindingIndexByKey: new Map(),
+		bindingLayout: "pool",
+		poolParam: POOL_PARAM,
+		paramOffset: 0,
+		completeData: false,
+		paths: new Set(),
+		expressionContext: "filter",
+		preImage: STORED_PRE_IMAGE,
+	};
+	const rawFilterSql = filter === undefined ? null : compileCondition(filter, context);
+	context.expressionContext = "projection";
+	const rawValueSql = projection?.map((entry) => renderProjectionValue(entry.expr, context)) ?? [];
+	const rawTypeSql = projection?.map((entry) => renderProjectionType(entry.expr, context)) ?? [];
+	const fragments = compactPlanParameters([...(rawFilterSql === null ? [] : [rawFilterSql]), ...rawValueSql, ...rawTypeSql], context);
+	const filterSql = rawFilterSql === null ? null : fragments[0];
+	const projectionOffset = rawFilterSql === null ? 0 : 1;
+	const valueSql = fragments.slice(projectionOffset, projectionOffset + rawValueSql.length);
+	const typeSql = fragments.slice(projectionOffset + rawValueSql.length);
+	assertPoolWithinLimit(context);
+	const projectionFragments = projection === undefined ? null : { names: projectionAnalysis!.names, valueSql, typeSql };
+	const widest = composeQueryStatement(
+		{ filterSql, projection: projectionFragments },
+		{ select: "projection", direction: "desc", scanConditions: QUERY_WIDEST_SCAN_CONDITIONS },
+	);
+	if (!utf8WithinLimit(widest, EXPRESSION_LIMITS.compiledSqlBytes)) {
+		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	}
+	return {
+		version: QUERY_PLAN_VERSION,
+		kind: "query",
+		bindingLayout: "pool",
+		filterSql,
+		projection: projectionFragments,
+		bindings: context.bindings,
+		bindingCount: context.bindings.length,
+		// Every pool plan owns ?1 and binds it always — the text "[]" when the plan has no
+		// descriptor — because Workers SQLite requires the bound value count to equal the
+		// statement's parameter count; the scan parameters are numbered explicitly from ?2.
+		completeBindingCount: POOL_PARAM + QUERY_MAX_TRAILING_BINDING_COUNT,
+		requiredColumns: EXPRESSION_REQUIRED_COLUMNS.filter(
+			(column) =>
+				filterAnalysis?.requiredColumns.includes(column) === true || projectionAnalysis?.requiredColumns.includes(column) === true,
+		),
+		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
+		filterIdentity: filter === undefined ? null : canonicalConditionIdentity(filter),
+		projectionIdentity: projection === undefined ? null : canonicalProjectionIdentity(projection),
+	};
+}
+
+/**
+ * The value fragment of one projection entry. A whole `data` reference is special: the stored JSONB
+ * blob is not the public form, so an array or an object leaves as JSON text and a root scalar leaves
+ * as the SQL scalar, which keeps its type column true. Everything else renders as a logical value.
+ */
+function renderProjectionValue(value: ExpressionValue, context: CompileContext): string {
+	if ("ref" in value && value.ref === "data" && value.path === undefined) {
+		context.completeData = true;
+		const { data, isJson } = context.preImage;
+		return `CASE WHEN ${isJson} AND json_type(${data}) IN ('array', 'object') THEN json(${data}) WHEN ${isJson} THEN json_extract(${data}, '$') ELSE ${data} END`;
+	}
+	return renderValue(value, "logical", context);
+}
+
+/**
+ * The type fragment of one projection entry: the native type name when the value is present, else
+ * 'missing'. A value that is always present folds the CASE away.
+ */
+function renderProjectionType(value: ExpressionValue, context: CompileContext): string {
+	const present = renderPresent(value, context);
+	const type = renderType(value, context);
+	if (present === "1") return type;
+	return `CASE WHEN (${present}) THEN ${type} ELSE 'missing' END`;
+}
+
+function assertPoolWithinLimit(context: CompileContext): void {
+	const poolText = materializeExpressionBindings(context.bindings, "pool")[0] as string;
+	if (!utf8WithinLimit(poolText, EXPRESSION_LIMITS.canonicalPayloadBytes)) {
+		throw new ExpressionError("sql_limit", "pooled bindings exceed the payload limit");
+	}
 }
 
 function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAction[] {
@@ -352,6 +527,9 @@ function compactParameters(sql: string, context: CompileContext): string {
 }
 
 function compactPlanParameters(sqlList: string[], context: CompileContext): string[] {
+	if (context.bindingLayout === "pool") {
+		return compactPoolParameters(sqlList, context);
+	}
 	const used = new Set<number>();
 	for (const sql of sqlList) {
 		for (const match of sql.matchAll(/\?(\d+)/g)) used.add(Number(match[1]));
@@ -365,6 +543,30 @@ function compactPlanParameters(sqlList: string[], context: CompileContext): stri
 	}
 	context.bindings = survivors;
 	return sqlList.map((sql) => sql.replace(/\?(\d+)/g, (_, digits: string) => `?${remap.get(Number(digits))}`));
+}
+
+/**
+ * The pool-layout variant of compaction: the surviving descriptors keep their original order and
+ * their `$[i]` indexes renumber densely from 0. The pool array must be dense because the runtime
+ * builds it from the surviving descriptors, so element i of the bound array is descriptor i.
+ */
+function compactPoolParameters(sqlList: string[], context: CompileContext): string[] {
+	const elementPattern = new RegExp(String.raw`\?${context.poolParam}, '\$\[(\d+)\]'`, "g");
+	const used = new Set<number>();
+	for (const sql of sqlList) {
+		for (const match of sql.matchAll(elementPattern)) used.add(Number(match[1]));
+	}
+	if (used.size === context.bindings.length) return sqlList;
+	const remap = new Map<number, number>();
+	const survivors: ExpressionBindingDescriptor[] = [];
+	for (const index of [...used].sort((a, b) => a - b)) {
+		survivors.push(context.bindings[index]);
+		remap.set(index, survivors.length - 1);
+	}
+	context.bindings = survivors;
+	return sqlList.map((sql) =>
+		sql.replace(elementPattern, (_, digits: string) => `?${context.poolParam}, '$[${remap.get(Number(digits))}]'`),
+	);
 }
 
 function compileCondition(condition: ConditionExpression, context: CompileContext): string {
@@ -700,8 +902,10 @@ function keyType(column: string, present: string): string {
 	return `CASE WHEN ${present} THEN CASE WHEN substr(${column}, 1, 1) = x'ff' THEN 'bytes' ELSE 'text' END ELSE 'missing' END`;
 }
 
+// An absent sort key is stored as the empty key. It is a missing value, so its logical value is NULL
+// and a function argument sees it as NULL. The hash key is never empty, so the branch is inert for it.
 function logicalKeyValue(column: string): string {
-	return `CASE WHEN substr(${column}, 1, 1) = x'ff' THEN substr(${column}, 2) ELSE CAST(${column} AS TEXT) END`;
+	return `CASE WHEN length(${column}) = 0 THEN NULL WHEN substr(${column}, 1, 1) = x'ff' THEN substr(${column}, 2) ELSE CAST(${column} AS TEXT) END`;
 }
 
 function jsonTypeSql(jsonType: string): string {
@@ -753,8 +957,10 @@ function bindPath(path: string, context: CompileContext): string {
 }
 
 /**
- * Registers one binding and returns its numbered SQLite parameter (`?N`), so a fragment rendered
- * many times reuses one binding. `N` counts from after the fixed statement bindings.
+ * Registers one binding and returns its SQL reference, so a fragment rendered many times reuses one
+ * binding. Under the "direct" layout that is the numbered parameter `?N`, counting from after the
+ * fixed statement bindings. Under the "pool" layout it is a `json_extract` of element `i` of the
+ * pool parameter, wrapped in `unhex` for the descriptors that carry hex-encoded bytes.
  */
 function bindDescriptor(descriptor: ExpressionBindingDescriptor, context: CompileContext): string {
 	// The kind names contain no ":" and the value is JSON text, so this key cannot collide.
@@ -764,6 +970,18 @@ function bindDescriptor(descriptor: ExpressionBindingDescriptor, context: Compil
 		index = context.bindings.length;
 		context.bindings.push(descriptor);
 		context.bindingIndexByKey.set(key, index);
+	}
+	if (context.bindingLayout === "pool") {
+		const element = `json_extract(?${context.poolParam}, '$[${index}]')`;
+		switch (descriptor.kind) {
+			case "val":
+			case "path":
+				return element;
+			case "keyText":
+			case "keyB64":
+			case "b64":
+				return `unhex(${element})`;
+		}
 	}
 	return `?${context.paramOffset + index + 1}`;
 }

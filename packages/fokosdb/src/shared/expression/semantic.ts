@@ -29,6 +29,7 @@ import {
 } from "./operation-registry.js";
 import { type PathSegment, isParentPath, pathsEqual, validateReadJsonPath, validateWriteJsonPath } from "./path.js";
 import { EXPRESSION_NATIVE_TYPES, type ExpressionNativeType } from "./types.js";
+import { utf8WithinLimit } from "./utf8.js";
 
 export const EXPRESSION_REQUIRED_COLUMNS = ["hk", "sk", "v", "ttl_epoch_utc_seconds", "data_kind", "data"] as const;
 
@@ -47,6 +48,11 @@ export type UpdateExpressionAnalysis = {
 	requiredColumns: readonly ExpressionRequiredColumn[];
 };
 
+export type ProjectionExpressionAnalysis = {
+	names: readonly string[];
+	requiredColumns: readonly ExpressionRequiredColumn[];
+};
+
 type AnalysisContext = {
 	operatorsAndFunctions: number;
 	requiredColumns: Set<ExpressionRequiredColumn>;
@@ -59,8 +65,11 @@ export function analyzeExpressionValue(expression: unknown, expressionContext: E
 	return { nativeTypes: orderedTypesFrom(facts.types), requiredColumns: requiredColumnsFrom(context) };
 }
 
-export function validateConditionExpression(expression: unknown): ConditionExpressionAnalysis {
-	const context = createContext("condition");
+export function validateConditionExpression(
+	expression: unknown,
+	expressionContext: ExpressionContext = "condition",
+): ConditionExpressionAnalysis {
+	const context = createContext(expressionContext);
 	analyzeCondition(expression, 1, context);
 	return { requiredColumns: requiredColumnsFrom(context) };
 }
@@ -69,6 +78,48 @@ export function validateUpdateExpression(expression: unknown): UpdateExpressionA
 	const context = createContext("update-value");
 	analyzeUpdate(expression, context);
 	return { requiredColumns: requiredColumnsFrom(context) };
+}
+
+/**
+ * Validates a projection list and resolves the output name of every entry.
+ *
+ * One analysis context serves the whole list, so the operator and function budget counts across
+ * entries, exactly as it does across the actions of one update. Each entry runs `analyzeValue`
+ * before its name resolves, so a malformed node fails as an expression error, not a naming error.
+ */
+export function validateProjectionExpression(expression: unknown): ProjectionExpressionAnalysis {
+	if (!Array.isArray(expression) || expression.length === 0) {
+		throw new ExpressionError("invalid_ast", "projection must contain at least one entry");
+	}
+	if (expression.length > EXPRESSION_LIMITS.projectionEntries) {
+		throw new ExpressionError("complexity_limit", "projection entry limit exceeded");
+	}
+	const context = createContext("projection");
+	const names = new Set<string>();
+	for (const entry of expression) {
+		assertNode(entry, "invalid projection entry");
+		assertFields(entry, "expr", undefined, "as");
+		analyzeValue(entry.expr, 1, context);
+		const name = projectionEntryName(entry);
+		if (names.has(name)) throw new ExpressionError("invalid_ast", "duplicate projection name");
+		names.add(name);
+	}
+	return { names: [...names], requiredColumns: requiredColumnsFrom(context) };
+}
+
+function projectionEntryName(entry: Record<string, unknown>): string {
+	if (entry.as !== undefined) {
+		if (typeof entry.as !== "string") throw new ExpressionError("invalid_ast", "projection alias must be a string");
+		if (entry.as.length === 0) throw new ExpressionError("invalid_ast", "projection alias must not be empty");
+		if (!utf8WithinLimit(entry.as, EXPRESSION_LIMITS.projectionAliasBytes)) {
+			throw new ExpressionError("complexity_limit", "projection alias exceeds the alias limit");
+		}
+		return entry.as;
+	}
+	const expr = entry.expr as Record<string, unknown>;
+	if (expr.ref === "data" && Object.hasOwn(expr, "path")) return expr.path as string;
+	if (typeof expr.ref === "string") return expr.ref;
+	throw new ExpressionError("invalid_ast", "projection alias is required for a computed value");
 }
 
 function createContext(expressionContext: ExpressionContext = "condition"): AnalysisContext {
@@ -382,6 +433,18 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 	const argFacts: ValueFacts[] = [];
 	for (let i = 0; i < args.length; i++) {
 		argFacts.push(analyzeValue(args[i], depth + 1, context));
+	}
+
+	// A SQLite function reads the stored form of a value. For a JSON item the stored form of the
+	// complete data is the JSONB blob, which must never reach a caller, so a projection forbids it
+	// as a direct argument. Every other context keeps accepting it because the result never leaves
+	// the statement.
+	if (context.expressionContext === "projection" && operation.name.startsWith("sqlite.")) {
+		for (const arg of args) {
+			if (typeof arg === "object" && arg !== null && (arg as { ref?: unknown }).ref === "data" && !Object.hasOwn(arg, "path")) {
+				throw new ExpressionError("invalid_type", "a SQLite function must not take the complete data in a projection");
+			}
+		}
 	}
 
 	return operation.typeRule(argFacts, args);

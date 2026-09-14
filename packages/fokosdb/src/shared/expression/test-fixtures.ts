@@ -130,6 +130,36 @@ export const PROJECTION_PRESENCE_FIXTURES = [
 		projection: { expr: { ref: "data", path: "$.value" } },
 		expected: { present: true, value: null },
 	},
+	{
+		name: "a direct projection includes a JSON Boolean",
+		item: jsonItem({ value: true }),
+		projection: { expr: { ref: "data", path: "$.value" } },
+		expected: { present: true, value: true },
+	},
+	{
+		name: "a direct projection includes a nested object",
+		item: jsonItem({ value: { a: 1 } }),
+		projection: { expr: { ref: "data", path: "$.value" } },
+		expected: { present: true, value: { a: 1 } },
+	},
+	{
+		name: "a direct projection omits a path on text data",
+		item: textItem,
+		projection: { expr: { ref: "data", path: "$.value" } },
+		expected: { present: false },
+	},
+	{
+		name: "a direct projection omits an absent TTL",
+		item: textItem,
+		projection: { expr: { ref: "ttlAt" } },
+		expected: { present: false },
+	},
+	{
+		name: "a direct projection includes a TTL",
+		item: { ...textItem, ttlAt: 2_000_000_000 },
+		projection: { expr: { ref: "ttlAt" } },
+		expected: { present: true, value: 2_000_000_000 },
+	},
 ] as const satisfies readonly ProjectionPresenceFixture[];
 
 export const VALID_CONDITION_SHAPE_FIXTURES = [
@@ -208,8 +238,10 @@ export const EXPRESSION_LIMIT_FIXTURES = [
 	{ name: "astDepth", atLimit: 32, aboveLimit: 33 },
 	{ name: "jsonPathDereferences", atLimit: 32, aboveLimit: 33 },
 	{ name: "inChoices", atLimit: 100, aboveLimit: 101 },
+	{ name: "projectionEntries", atLimit: 48, aboveLimit: 49 },
 	{ name: "sqliteFunctionArguments", atLimit: 32, aboveLimit: 33 },
 	{ name: "sqlitePatternBytes", atLimit: 50, aboveLimit: 51 },
+	{ name: "projectionAliasBytes", atLimit: 256, aboveLimit: 257 },
 	{ name: "jsonPathBytes", atLimit: 4 * 1024, aboveLimit: 4 * 1024 + 1 },
 	{ name: "canonicalPayloadBytes", atLimit: 512 * 1024, aboveLimit: 512 * 1024 + 1 },
 	{ name: "compiledSqlBytes", atLimit: 100_000, aboveLimit: 100_001 },

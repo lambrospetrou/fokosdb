@@ -3,6 +3,9 @@ import { hash64 } from "../hash-primitives.js";
 import type { SkInterval } from "./sk-interval.js";
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
 function cursorMalformed(message: string, cause?: unknown): FokosValidationError {
 	return new FokosValidationError(VALIDATION_CODES.cursor_malformed, { message, cause });
 }
@@ -40,13 +43,13 @@ export function encodeCursor(c: DecodedCursor): string {
 						incl: c.inner.inclusive,
 					},
 	};
-	return new TextEncoder().encode(JSON.stringify(wire)).toBase64({ alphabet: "base64url" });
+	return encoder.encode(JSON.stringify(wire)).toBase64({ alphabet: "base64url" });
 }
 
 export function decodeCursor(s: string): DecodedCursor {
 	let wire: CursorWire;
 	try {
-		wire = JSON.parse(new TextDecoder().decode(Uint8Array.fromBase64(s, { alphabet: "base64url" })));
+		wire = JSON.parse(decoder.decode(Uint8Array.fromBase64(s, { alphabet: "base64url" })));
 	} catch (e) {
 		throw cursorMalformed("cursor is not valid base64url-encoded JSON", e);
 	}
@@ -83,10 +86,17 @@ export function decodeCursor(s: string): DecodedCursor {
 /**
  * Fingerprint over the request's identity-determining fields ONLY — the ordered sub-query list
  * (each hashKey + its normalized interval bounds/inclusivity + direction, with empty intervals
- * marked). Deliberately excludes limit, maxResponseBytes, select, and cursor, which may change between pages.
+ * marked), then the filter and projection identities of the compiled plan. Deliberately excludes
+ * limit, maxResponseBytes, select, and cursor, which may change between pages.
+ *
+ * After the query list, each identity appends one byte 0 when absent, or one byte 1, a u32le byte
+ * length, and its UTF-8 bytes when present — filter first, then projection. Both absent appends
+ * nothing, so a request without a plan keeps the bytes a two-argument call produced.
  */
 export function computeCursorFingerprint(
 	queries: Array<{ hashKey: KeyBytes; interval: SkInterval | null; direction: "asc" | "desc" }>,
+	filterIdentity: string | null = null,
+	projectionIdentity: string | null = null,
 ): bigint {
 	const sizeOfBound = (b: { value: KeyBytes } | undefined) => (b ? 1 + 4 + b.value.byteLength : 0);
 	const sizeOfInterval = (q: (typeof queries)[number]) => {
@@ -94,8 +104,14 @@ export function computeCursorFingerprint(
 		return 1 + sizeOfBound(q.interval.lower) + 1 + sizeOfBound(q.interval.upper) + 1;
 	};
 
+	const identities =
+		filterIdentity === null && projectionIdentity === null
+			? []
+			: [filterIdentity, projectionIdentity].map((id) => (id === null ? null : encoder.encode(id)));
+
 	let total = 4;
 	for (const q of queries) total += 4 + q.hashKey.byteLength + sizeOfInterval(q);
+	for (const id of identities) total += id === null ? 1 : 1 + 4 + id.byteLength;
 
 	const buf = new Uint8Array(total);
 	const dv = new DataView(buf.buffer);
@@ -136,6 +152,13 @@ export function computeCursorFingerprint(
 			writeBytes(up.value);
 		}
 		writeU8(q.direction === "asc" ? 0 : 1);
+	}
+	for (const id of identities) {
+		writeU8(id ? 1 : 0);
+		if (id) {
+			writeU32le(id.byteLength);
+			writeBytes(id);
+		}
 	}
 	return hash64(buf);
 }

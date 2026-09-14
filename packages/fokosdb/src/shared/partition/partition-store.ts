@@ -3,12 +3,20 @@ import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
 import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
-import { UPDATE_MAX_TRAILING_BINDING_COUNT, type CompiledConditionPlan, type CompiledUpdatePlan } from "../expression/plan.js";
+import {
+	composeQueryStatement,
+	UPDATE_MAX_TRAILING_BINDING_COUNT,
+	type CompiledConditionPlan,
+	type CompiledQueryPlan,
+	type CompiledUpdatePlan,
+} from "../expression/plan.js";
+import { materializeExpressionBindings } from "../expression/bindings.js";
+import { decodeProjectedRow, type ProjectedWireRow } from "../expression/projection.js";
 import {
 	evaluateConditionPlan,
 	probeUpdatePlan,
+	validateQueryPlan,
 	validateUpdatePlan,
-	materializeExpressionBindings,
 	type ConditionEvaluationResult,
 	type UpdateProbeResult,
 } from "../expression/runtime.js";
@@ -186,8 +194,18 @@ export type RangeScanBounds = {
 	direction: "asc" | "desc";
 };
 
-/** One row of a queryItems leaf scan. Count rows carry `item: null`. */
-export type QueryScanRow = { sk: KeyBytes; estRowBytes: number; item: StoredItem | null };
+/**
+ * One row of a queryItems leaf scan. `matched` is false when the plan's filter rejected the
+ * candidate. A count row and a rejected candidate carry neither `item` nor `projected`; a matched
+ * row carries `item` when the request has no projection and `projected` when it has one.
+ */
+export type QueryScanRow = {
+	sk: KeyBytes;
+	estRowBytes: number;
+	matched: boolean;
+	item: StoredItem | null;
+	projected: ProjectedWireRow | null;
+};
 
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
@@ -233,9 +251,41 @@ function codeFromNullableKind(kind: DataKind | null): number | null {
 	return code;
 }
 
+/**
+ * The bytes the RPC serialization adds around one item, complete item or projected row, on top of
+ * the item's own key, data, and cell bytes. It stands for the object or array itself, its property
+ * names or cell slots, and one type tag and one length prefix per field or cell. It is an allowance,
+ * not a measurement: a StoredItem has 8 named fields and a projected row has at most
+ * `EXPRESSION_LIMITS.projectionEntries` cells, and 64 bytes is in the range both produce.
+ *
+ * The estimate only feeds the response-byte budget, which keeps one RPC response under the 32 MiB
+ * cap of Workers RPC. `MAX_RESPONSE_BYTES_PER_PAGE` (16 MiB) leaves a 2x margin: even an error of 64
+ * bytes per item on a page of 100,000 tiny items is about 6 MiB, inside that margin. Change this
+ * value only when the per-item wire shape grows well past what it stands for (many more named
+ * fields, or a much larger cell limit) or when that margin shrinks. Changing it moves page boundaries
+ * only; a cursor does not depend on it.
+ */
+const ITEM_ENVELOPE_BYTES = 64;
+
 export function estimateItemBytes(item: StoredItem): number {
 	const dataSize = typeof item.data === "string" ? item.data.length * 2 : item.data.byteLength;
-	return item.hk.byteLength + item.sk.byteLength + dataSize + 16 + 64;
+	return item.hk.byteLength + item.sk.byteLength + dataSize + 16 + ITEM_ENVELOPE_BYTES;
+}
+
+/**
+ * Estimated RPC bytes of one projected row: the item envelope plus per-cell sizes — `length * 2`
+ * for a string and for the JSON text of an array or an object, `byteLength` for a `Uint8Array`, and
+ * 8 for every other cell. It does not use `est_row_bytes`: a projected row carries only its cells.
+ */
+export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
+	let bytes = ITEM_ENVELOPE_BYTES;
+	for (const cell of row) {
+		if (typeof cell === "string") bytes += cell.length * 2;
+		else if (cell instanceof Uint8Array) bytes += cell.byteLength;
+		else if (cell !== null && typeof cell === "object") bytes += cell.json.length * 2;
+		else bytes += 8;
+	}
+	return bytes;
 }
 
 export function estimatePendingTxBytes(row: PendingTransactionRow): number {
@@ -294,13 +344,26 @@ function rangeScanConditions(opts: RangeScanBounds): { conds: string[]; params: 
 }
 
 /**
- * The SQL of one queryItems leaf scan. The count selection reads only `sk` and `est_row_bytes` from the
- * covering `idx_items_scan` index; the `INDEXED BY` pin is needed for the same reason as in
- * `#storedEstRowBytes`. The projection selection reads the complete item with json decoded to text.
- * `limit` binds as given.
+ * The SQL of one queryItems leaf scan. Without a plan, the count selection reads only `sk` and
+ * `est_row_bytes` from the covering `idx_items_scan` index; the `INDEXED BY` pin is needed for the
+ * same reason as in `#storedEstRowBytes`. The projection selection reads the complete item with json
+ * decoded to text. `limit` binds as given.
+ *
+ * With a plan the statement is the composed query statement, which gives every scan parameter an
+ * explicit number from `?2`. The bound values therefore start with the pool parameter `?1`, which is
+ * bound always — the materializer returns the text `[]` when the plan has no descriptor.
  */
-export function queryScanStatement(opts: RangeScanBounds & { limit: number; select: QuerySelect }): { sql: string; params: unknown[] } {
+export function queryScanStatement(opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null }): {
+	sql: string;
+	params: unknown[];
+} {
 	const { conds, params } = rangeScanConditions(opts);
+	if (opts.plan !== null) {
+		return {
+			sql: composeQueryStatement(opts.plan, { select: opts.select, direction: opts.direction, scanConditions: conds }),
+			params: [...materializeExpressionBindings(opts.plan.bindings, "pool"), ...params, opts.limit],
+		};
+	}
 	const order = `ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`;
 	const sql =
 		opts.select === "count"
@@ -1121,42 +1184,46 @@ export class PartitionStore {
 	/**
 	 * Streams the rows of one queryItems leaf scan in scan order. The caller consumes `rows` synchronously
 	 * and can stop early; `sqlMetrics()` reports the physical reads of the statement up to that point.
-	 * Count rows carry `item: null`; projection rows carry the complete item.
+	 * A plan statement selects `matched` plus the gated columns its mode needs; QueryScanRow documents
+	 * which payload a row carries.
 	 */
-	scanQueryPage(opts: RangeScanBounds & { limit: number; select: QuerySelect }): {
+	scanQueryPage(opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null }): {
 		rows: Iterable<QueryScanRow>;
 		sqlMetrics: () => SqlMetrics;
 	} {
+		const plan = opts.plan;
+		if (plan !== null) {
+			withExpressionErrors(() => validateQueryPlan(plan));
+		}
 		const { sql, params } = queryScanStatement(opts);
-		const cursor = this.#storage.sql.exec<{
-			hk: ArrayBuffer;
-			sk: ArrayBuffer;
-			est_row_bytes: number;
-			data: string | ArrayBuffer;
-			data_kind: number;
-			ttl_epoch_utc_seconds: number | null;
-			v: number;
-			last_read_ts: number;
-			last_write_ts: number;
-		}>(sql, ...params);
+		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const select = opts.select;
+		const entryCount = plan?.projection?.names.length ?? 0;
+		// The mode is fixed per request: count rows carry nothing, a complete-item scan carries `item`,
+		// and a projected scan carries `projected` — each only on a matched row.
+		const mode: "none" | "item" | "projected" = select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
 		function* rows(): Generator<QueryScanRow> {
 			for (const row of cursor) {
-				const sk = fromSqlKey(row.sk);
-				const item: StoredItem | null =
-					select === "count"
-						? null
-						: {
-								hk: fromSqlKey(row.hk),
-								sk,
-								data: fromSqlData(row.data),
-								kind: kindFromCode(row.data_kind),
-								ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
-								v: row.v,
-								last_read_ts: row.last_read_ts,
-								last_write_ts: row.last_write_ts,
-							};
-				yield { sk, estRowBytes: row.est_row_bytes, item };
+				const sk = fromSqlKey(row.sk as ArrayBuffer);
+				// Without a plan the statement yields no `matched` column; every candidate matches.
+				const matched = plan === null ? true : row.matched === 1;
+				let item: StoredItem | null = null;
+				let projected: ProjectedWireRow | null = null;
+				if (matched && mode === "projected") {
+					projected = decodeProjectedRow(row, entryCount);
+				} else if (matched && mode === "item") {
+					item = {
+						hk: fromSqlKey(row.hk as ArrayBuffer),
+						sk,
+						data: fromSqlData(row.data as string | ArrayBuffer),
+						kind: kindFromCode(row.data_kind as number),
+						ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds as number | null,
+						v: row.v as number,
+						last_read_ts: row.last_read_ts as number,
+						last_write_ts: row.last_write_ts as number,
+					};
+				}
+				yield { sk, estRowBytes: row.est_row_bytes as number, matched, item, projected };
 			}
 		}
 		return { rows: rows(), sqlMetrics: () => ({ rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten }) };

@@ -17,6 +17,7 @@ import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/p
 import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
+import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 
@@ -400,6 +401,283 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			}
 			expect(count).toBe(6);
 			expect(pages).toBeGreaterThan(1);
+		});
+	});
+
+	describe("FokosDB.queryItems — projections", () => {
+		it("returns flat projected records by resolved name", async () => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "alice", sortKey: "a1", data: { n: 1, s: "x" } });
+			await db.putItem({ hashKey: "alice", sortKey: "a2", data: { s: "y" } });
+			await db.putItem({ hashKey: "alice", sortKey: "a3", data: { n: 3, s: "z", k: [1, 2] } });
+			await db.putItem({ hashKey: "alice", sortKey: "a4", data: "text-item" });
+
+			const res = await db.queryItems({
+				queries: [{ hashKey: "alice" }],
+				projection: [
+					{ expr: { ref: "sortKey" }, as: "id" },
+					{ expr: { ref: "data", path: "$.n" } },
+					{ expr: { ref: "data", path: "$.k" }, as: "k" },
+					{ expr: { fn: "sqlite.upper", args: [{ ref: "data", path: "$.s" }] }, as: "S" },
+					{ expr: { ref: "data" } },
+				],
+			});
+
+			expect(res.items).toEqual([
+				{ id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } },
+				{ id: "a2", S: "Y", data: { s: "y" } },
+				{ id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } },
+				// A path over a text item is missing; a function over a missing argument sees NULL.
+				{ id: "a4", S: null, data: "text-item" },
+			]);
+			// A missing cell leaves the key absent, not undefined.
+			expect(Object.keys(res.items[1])).not.toContain("$.n");
+			expect(res.count).toBe(4);
+			expect(res.scannedCount).toBe(4);
+		});
+
+		it("rejects a projection with count selection", async () => {
+			const db = makeDB();
+			await expect(
+				db.queryItems({ queries: [{ hashKey: "alice" }], select: "count", projection: [{ expr: { ref: "sortKey" } }] }),
+			).rejects.toThrow(fokosErrorWith("query_projection_with_count"));
+		});
+
+		it("rejects a cursor resumed with another projection or none", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			const projectionA: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
+			const projectionB: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "sk" }];
+
+			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, limit: 2 });
+			expect(first.items).toEqual([{ id: "a1" }, { id: "a2" }]);
+			expect(first.cursor).toBeDefined();
+
+			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionB, cursor: first.cursor })).rejects.toThrow(
+				fokosErrorWith("cursor_fingerprint_mismatch"),
+			);
+			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
+				fokosErrorWith("cursor_fingerprint_mismatch"),
+			);
+
+			// The same projection resumes without a gap or a duplicate.
+			const got: unknown[] = first.items.map((item) => item.id);
+			let cursor = first.cursor;
+			for (;;) {
+				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, cursor });
+				got.push(...res.items.map((item) => item.id));
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+			}
+			expect(got).toEqual(["a1", "a2", "a3", "a4"]);
+		});
+
+		it("paginates projected rows across sub-queries without gaps or duplicates", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+
+			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
+			const projection: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
+			const got: unknown[] = [];
+			let cursor: string | undefined;
+			let pages = 0;
+			for (;;) {
+				const res = await db.queryItems({ queries, projection, limit: 2, cursor });
+				got.push(...res.items.map((item) => item.id));
+				pages++;
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+				expect(pages).toBeLessThan(50);
+			}
+
+			expect(got).toEqual(["a1", "a2", "a3", "b1", "b2", "b3"]);
+			expect(pages).toBeGreaterThan(1);
+		});
+	});
+
+	describe("FokosDB.queryItems — filters", () => {
+		// Mixed data kinds under one hash key: the filter must evaluate per candidate and must not
+		// change candidate selection, so every case scans all four items. A missing operand makes a
+		// comparison false, which is what keeps the text and bytes items out of the numeric cases.
+		it.each<{ name: string; filter: ConditionExpression; expected: string[] }>([
+			{ name: "eq", filter: { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1"] },
+			{ name: "ne", filter: { op: "ne", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
+			{ name: "eq on a boolean", filter: { op: "eq", args: [{ ref: "data", path: "$.flag" }, { val: true }] }, expected: ["j1"] },
+			// A stored JSON null equals a null literal, and a path that is absent does not.
+			{ name: "eq on a JSON null", filter: { op: "eq", args: [{ ref: "data", path: "$.none" }, { val: null }] }, expected: ["j1"] },
+			{ name: "lt", filter: { op: "lt", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1"] },
+			{ name: "lte", filter: { op: "lte", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1", "j2"] },
+			{ name: "gt", filter: { op: "gt", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
+			{ name: "gte", filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1", "j2"] },
+			{
+				name: "between",
+				filter: { op: "between", args: [{ ref: "data", path: "$.n" }, { val: 2 }, { val: 5 }] },
+				expected: ["j2"],
+			},
+			{
+				name: "in",
+				filter: { op: "in", args: [{ ref: "data", path: "$.s" }, { val: "alpha" }, { val: "gamma" }] },
+				expected: ["j1"],
+			},
+			{
+				name: "and",
+				filter: {
+					op: "and",
+					args: [
+						{ op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
+						{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
+					],
+				},
+				expected: ["j2"],
+			},
+			{
+				name: "or",
+				filter: {
+					op: "or",
+					args: [
+						{ op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
+						{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
+					],
+				},
+				expected: ["j1", "j2"],
+			},
+			{
+				name: "not",
+				filter: { op: "not", args: [{ op: "exists", args: [{ ref: "data", path: "$.n" }] }] },
+				expected: ["b1", "t1"],
+			},
+			{ name: "exists", filter: { op: "exists", args: [{ ref: "data", path: "$.tags" }] }, expected: ["j1", "j2"] },
+			{ name: "not_exists", filter: { op: "not_exists", args: [{ ref: "data", path: "$.s" }] }, expected: ["b1", "t1"] },
+			{
+				name: "begins_with on a path",
+				filter: { op: "begins_with", args: [{ ref: "data", path: "$.s" }, { val: "al" }] },
+				expected: ["j1"],
+			},
+			{
+				name: "begins_with on whole text data",
+				filter: { op: "begins_with", args: [{ ref: "data" }, { val: "text-" }] },
+				expected: ["t1"],
+			},
+			{
+				name: "contains on a JSON array",
+				filter: { op: "contains", args: [{ ref: "data", path: "$.tags" }, { val: "x" }] },
+				expected: ["j1"],
+			},
+			{
+				name: "contains on byte data",
+				filter: { op: "contains", args: [{ ref: "data" }, { b64: "Ag==" }] },
+				expected: ["b1"],
+			},
+			{
+				name: "sort-key reference",
+				filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "j2" }] },
+				expected: ["j2", "t1"],
+			},
+		])("every condition operator as a filter, on mixed data kinds: $name", async ({ filter, expected }) => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "alice", sortKey: "j1", data: { n: 1, s: "alpha", tags: ["x", "y"], flag: true, none: null } });
+			await db.putItem({ hashKey: "alice", sortKey: "j2", data: { n: 2, s: "beta", tags: ["y"] } });
+			await db.putItem({ hashKey: "alice", sortKey: "t1", data: "text-value" });
+			await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
+
+			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter });
+
+			expect(sksOf(res)).toEqual(expected);
+			expect(res.count).toBe(expected.length);
+			expect(res.scannedCount).toBe(4);
+		});
+
+		it("a filter that rejects every candidate pages the whole interval", async () => {
+			const db = makeDB();
+			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+			const filter: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 999 }] };
+
+			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2 });
+			expect(first.items).toEqual([]);
+			expect(first.count).toBe(0);
+			expect(first.scannedCount).toBe(2);
+			expect(first.cursor).toBeDefined();
+
+			let count = first.count;
+			let scannedCount = first.scannedCount;
+			let cursor = first.cursor;
+			let pages = 1;
+			for (;;) {
+				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2, cursor });
+				expect(res.items).toEqual([]);
+				count += res.count;
+				scannedCount += res.scannedCount;
+				pages++;
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+				expect(pages).toBeLessThan(50);
+			}
+			expect(count).toBe(0);
+			expect(scannedCount).toBe(5);
+		});
+
+		it("count mode with a filter returns the matched count of the page", async () => {
+			const db = makeDB();
+			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+			const filter: ConditionExpression = { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] };
+
+			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, select: "count" });
+			expect(res.items).toEqual([]);
+			expect(res.count).toBe(2);
+			expect(res.scannedCount).toBe(5);
+			expect(res.count).toBeLessThan(res.scannedCount);
+		});
+
+		it("rejects a filtered cursor resumed with another filter or none", async () => {
+			const db = makeDB();
+			for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			const filterA: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a2" }] };
+			const filterB: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a1" }] };
+
+			// limit 2 evaluates two candidates: a1 is rejected and a2 is matched, so one item returns.
+			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, limit: 2 });
+			expect(sksOf(first)).toEqual(["a2"]);
+			expect(first.cursor).toBeDefined();
+
+			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterB, cursor: first.cursor })).rejects.toThrow(
+				fokosErrorWith("cursor_fingerprint_mismatch"),
+			);
+			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
+				fokosErrorWith("cursor_fingerprint_mismatch"),
+			);
+
+			// The same filter resumes without a gap or a duplicate.
+			const got: Array<string | Uint8Array | undefined> = sksOf(first);
+			let cursor = first.cursor;
+			let pages = 1;
+			for (;;) {
+				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, cursor });
+				got.push(...sksOf(res));
+				pages++;
+				if (res.cursor === undefined) break;
+				cursor = res.cursor;
+				expect(pages).toBeLessThan(50);
+			}
+			expect(got).toEqual(["a2", "a3", "a4"]);
+		});
+
+		it("a filter and a projection compose in one request", async () => {
+			const db = makeDB();
+			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i, s: `v${i}` } });
+
+			const res = await db.queryItems({
+				queries: [{ hashKey: "alice" }],
+				filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] },
+				projection: [{ expr: { ref: "sortKey" }, as: "id" }, { expr: { ref: "data", path: "$.n" } }],
+			});
+
+			expect(res.items).toEqual([
+				{ id: "s3", "$.n": 3 },
+				{ id: "s4", "$.n": 4 },
+			]);
+			expect(res.count).toBe(2);
+			expect(res.scannedCount).toBe(5);
 		});
 	});
 

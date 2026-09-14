@@ -46,9 +46,12 @@ import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from
 import { tryWhile } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
 import { collectBatch } from "../shared/partition/batch-scan.js";
+import type { CompiledQueryPlan } from "../shared/expression/plan.js";
+import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
+	estimateProjectedRowBytes,
 	PartitionStore,
 	type MigratedItem,
 	type StoredItem,
@@ -166,6 +169,7 @@ export type GetItemRpcResponse =
 
 export type { SkInterval } from "../shared/query/sk-interval.js";
 export type { ScanCursor } from "../shared/partition/partition-store.js";
+export type { ProjectedWireRow } from "../shared/expression/projection.js";
 
 export type QueryItemsRpcRequest = {
 	hashKey: KeyBytes;
@@ -180,10 +184,13 @@ export type QueryItemsRpcRequest = {
 	allowOversizedFirstItem: boolean;
 	cursor: ScanCursor | null;
 	select: QuerySelect;
+	/** The compiled filter/projection plan, or null for a request with neither. */
+	plan: CompiledQueryPlan | null;
 };
 
 export type QueryItemsRpcResponse = {
-	items: StoredItem[];
+	/** One shape per request: complete items, or positional projected rows. The client narrows by the plan it sent. */
+	items: Array<StoredItem | ProjectedWireRow>;
 	/** Matched items in this response. */
 	count: number;
 	/** Evaluated items in this response. */
@@ -742,13 +749,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// One row beyond the budget tells a stopped page from a drained interval.
 			limit: Math.max(0, req.remainingEvaluatedItems) + 1,
 			select: req.select,
+			plan: req.plan,
 		});
 		const page = collectQueryPage({
 			rows: scan.rows,
 			hashKey: hk,
 			select: req.select,
 			budget: req,
-			estimateResponseBytes: estimateItemBytes,
+			estimateResponseBytes: (item) => (Array.isArray(item) ? estimateProjectedRowBytes(item) : estimateItemBytes(item)),
 		});
 		const { rowsRead, rowsWritten } = scan.sqlMetrics();
 
@@ -803,7 +811,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const { interval, cursor, direction } = req;
 		const budget = new QueryPageBudget(req);
 
-		const allItems: StoredItem[] = [];
+		const allItems: Array<StoredItem | ProjectedWireRow> = [];
 		// Only leaf entries accumulate here — a range router (this node) and any deeper routers
 		// contribute nothing of their own; they're captured numerically via `forwardCount`.
 		const leafMetas: Array<OperationMetrics & PartitionInfoInternal> = [];

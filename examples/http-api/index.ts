@@ -14,6 +14,10 @@ import {
 	type GetItemResult,
 	type InitiateReadResponse,
 	type JsonValue,
+	type ProjectedItem,
+	type ProjectionExpression,
+	type QueryItemsProjectedOptions,
+	type QueryItemsProjectedResult,
 	type QueryItemsResult,
 	type SplitConditions,
 	type TransactWriteOperationResult,
@@ -91,6 +95,11 @@ const ConditionExpressionSchema: v.GenericSchema<ConditionExpression> = v.lazy((
 		}),
 	]),
 );
+
+const ProjectionEntrySchema: v.GenericSchema<ProjectionExpression> = v.strictObject({
+	expr: ExpressionValueSchema,
+	as: v.optional(v.string()),
+});
 
 const PutItemBodySchema = v.strictObject({
 	hashKey: v.string(),
@@ -201,6 +210,8 @@ const QueryItemsBodySchema = v.object({
 	maxResponseBytes: v.optional(PositiveIntSchema),
 	cursor: v.optional(v.string()),
 	select: v.optional(v.union([v.literal("projection"), v.literal("count")])),
+	filter: v.optional(ConditionExpressionSchema),
+	projection: v.optional(v.array(ProjectionEntrySchema)),
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -268,6 +279,30 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 			}
 			return { ...rest, hashKey, sortKey, ...encodeData(data) };
 		}),
+	};
+}
+
+// A projected record can hold a Uint8Array cell (a `b64` literal or byte data); it serializes as
+// `{ b64 }`. Every other projected value is already JSON-serializable.
+function serializeProjectedItem(item: ProjectedItem): Record<string, unknown> {
+	return Object.fromEntries(
+		Object.entries(item).map(([name, value]) => [
+			name,
+			value instanceof Uint8Array ? { b64: Buffer.from(value).toString("base64") } : value,
+		]),
+	);
+}
+
+// The fields are listed rather than spread: spreading the `Omit<QueryItemsResult, "items">`-based
+// result type into c.json overflows the type instantiation limit.
+function serializeProjectedQueryItemsResult(result: QueryItemsProjectedResult) {
+	return {
+		items: result.items.map(serializeProjectedItem),
+		count: result.count,
+		scannedCount: result.scannedCount,
+		cursor: result.cursor,
+		meta: result.meta,
+		partitionMetas: result.partitionMetas,
 	};
 }
 
@@ -436,6 +471,14 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 		}
 		case "queryItems": {
 			const { partitionOptions, ...opts } = parseBody(QueryItemsBodySchema);
+			if (opts.projection !== undefined) {
+				const result = await makeFokosDB(c.env, tableName, partitionOptions).queryItems({
+					...opts,
+					projection: opts.projection,
+				} as QueryItemsProjectedOptions);
+				c.set("dbItemMeta", result.meta);
+				return c.json(serializeProjectedQueryItemsResult(result));
+			}
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).queryItems(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeQueryItemsResult(result));

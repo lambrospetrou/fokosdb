@@ -13,7 +13,7 @@ import {
 	UPDATE_PLAN_VERSION,
 	type CompiledUpdatePlan,
 } from "./plan.js";
-import { materializeExpressionBindings } from "./runtime.js";
+import { materializeExpressionBindings } from "./bindings.js";
 import type { ConditionExpression, UpdateExpression } from "./types.js";
 
 /**
@@ -471,6 +471,23 @@ describe("update SQLite compiler", () => {
 			const plan = compileUpdateExpression(update);
 			const row = runUpdatePlan(state, plan, JSON.stringify({ flag: true, off: false }));
 			expect(JSON.parse(row.doc)).toEqual({ flag: true, off: false, viaCoalesce: true, viaIfnull: false, viaIfNotExists: true });
+			expect(row.applicable).toBe(1);
+		});
+	});
+
+	it("stores a document that a pass-through function returns as a nested document", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-passthrough-doc-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const update: UpdateExpression = [
+				{
+					action: "set",
+					target: { ref: "data", path: "$.copy" },
+					value: { fn: "sqlite.coalesce", args: [{ ref: "data" }, { val: 0 }] },
+				},
+			];
+			const plan = compileUpdateExpression(update);
+			const row = runUpdatePlan(state, plan, JSON.stringify({ a: 1 }));
+			expect(JSON.parse(row.doc)).toEqual({ a: 1, copy: { a: 1 } });
 			expect(row.applicable).toBe(1);
 		});
 	});

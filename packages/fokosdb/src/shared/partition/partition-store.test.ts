@@ -6,7 +6,14 @@ import { compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
-import { estimateItemBytes, PartitionStore, queryScanStatement, type ItemLinkId, type ScanCursor } from "./partition-store.js";
+import {
+	estimateItemBytes,
+	estimateProjectedRowBytes,
+	PartitionStore,
+	queryScanStatement,
+	type ItemLinkId,
+	type ScanCursor,
+} from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
@@ -457,11 +464,14 @@ describe("PartitionStore - items", () => {
 					direction: "asc",
 					limit: 100,
 					select: "count",
+					plan: null,
 				}).rows,
 			];
 			expect(rows.map((r) => KeyCodec.decode(r.sk))).toEqual(["b", "j", "t"]);
 			for (const r of rows) {
 				expect(r.item).toBeNull();
+				expect(r.matched).toBe(true);
+				expect(r.projected).toBeNull();
 				expect(r.estRowBytes).toBe(storedEst(KeyCodec.decode(r.sk) as string));
 			}
 			expect(rows[0].estRowBytes).toBe(expectedRowBytes(new Uint8Array([1, 2, 3]), hk, kb("b")));
@@ -488,6 +498,7 @@ describe("PartitionStore - items", () => {
 					direction: "asc",
 					limit: 100,
 					select,
+					plan: null,
 				}).rows,
 			];
 			const countRows = scan("count");
@@ -526,6 +537,7 @@ describe("PartitionStore - items", () => {
 							direction,
 							limit: 100,
 							select: "count",
+							plan: null,
 							lower: opts.lower ?? EMPTY,
 							lowerInclusive: opts.lowerInclusive ?? true,
 							upper: opts.upper ?? null,
@@ -565,6 +577,7 @@ describe("PartitionStore - items", () => {
 				upperInclusive: false,
 				cursor: null,
 				direction: "asc" as const,
+				plan: null,
 			};
 
 			const limited = store.scanQueryPage({ ...bounds, limit: 3, select: "count" });
@@ -592,7 +605,7 @@ describe("PartitionStore - items", () => {
 					.map((r) => r.detail)
 					.join(" | ");
 
-			const bounds = { hk: kb("hk"), lower: kb("a"), lowerInclusive: true, upper: kb("z"), upperInclusive: false };
+			const bounds = { hk: kb("hk"), lower: kb("a"), lowerInclusive: true, upper: kb("z"), upperInclusive: false, plan: null };
 			for (const direction of ["asc", "desc"] as const) {
 				for (const cursor of [null, { hk: kb("hk"), sk: kb("m") }]) {
 					const { sql, params } = queryScanStatement({ ...bounds, direction, cursor, limit: 10, select: "count" });
@@ -605,6 +618,11 @@ describe("PartitionStore - items", () => {
 			expect(projPlan).not.toContain("COVERING INDEX");
 			expect(projPlan).not.toContain("USE TEMP B-TREE FOR ORDER BY");
 		});
+	});
+
+	it("estimateProjectedRowBytes charges the envelope plus per-cell sizes", () => {
+		// string "abc" → 3*2, Uint8Array(5) → 5, { json: "[1]" } → 3*2, the other four cells → 8 each.
+		expect(estimateProjectedRowBytes([undefined, null, true, 2, "abc", new Uint8Array(5), { json: "[1]" }])).toBe(64 + 8 * 4 + 6 + 5 + 6);
 	});
 
 	it("estimateItemBytes grows with text, bytes, and JSON text payloads", () => {

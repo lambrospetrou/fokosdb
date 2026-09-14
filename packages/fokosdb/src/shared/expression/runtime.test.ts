@@ -8,7 +8,8 @@ import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
 import { compileConditionExpression } from "./compiler.js";
 import { composeConditionStatement } from "./plan.js";
-import { evaluateConditionPlan, materializeExpressionBindings } from "./runtime.js";
+import { materializeExpressionBindings } from "./bindings.js";
+import { evaluateConditionPlan } from "./runtime.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, type ExpressionSemanticItem } from "./test-fixtures.js";
 import type { ConditionExpression } from "./types.js";
 

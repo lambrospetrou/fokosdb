@@ -315,6 +315,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	query_limit_invalid: "k4g8z5",
 	query_max_response_bytes_invalid: "xytewt",
 	query_select_invalid: "k6wmvn",
+	query_projection_with_count: "xyz9jz",
 	cursor_malformed: "pndxkq",
 	cursor_version_unknown: "s62ybe",
 	cursor_query_index_out_of_range: "sevnxx",

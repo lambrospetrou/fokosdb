@@ -1,10 +1,30 @@
 import type { JsonPrimitive } from "../json-types.js";
+import { JSON_KIND_CODE } from "../partition/item-size.js";
+import type { QuerySelect } from "../types.js";
 import type { ExpressionRequiredColumn } from "./semantic.js";
 
 export const CONDITION_PLAN_VERSION = 1 as const;
 export const CONDITION_FIXED_BINDING_COUNT = 2;
 
 export const UPDATE_PLAN_VERSION = 1 as const;
+
+export const PROJECTION_PLAN_VERSION = 1 as const;
+export const QUERY_PLAN_VERSION = 1 as const;
+
+/** hk and sk, bound after the pool in a projected point read. */
+export const PROJECTION_FIXED_BINDING_COUNT = 2;
+/**
+ * The parameter every pool-layout plan owns, bound always — the text "[]" when the plan has no
+ * descriptor. Workers SQLite requires the bound value count to equal the statement's parameter
+ * count, and a statement that runs a pool plan numbers its own parameters explicitly from ?2, so
+ * an unused ?1 still counts. Direct-layout plans (condition, update) are unchanged: their
+ * parameters follow the statement's fixed head.
+ */
+export const POOL_PARAM = 1;
+/** hk, near bound, far bound, LIMIT: the widest scan tail after the pool of a query plan. */
+export const QUERY_MAX_TRAILING_BINDING_COUNT = 4;
+/** The scan terms of the widest query statement, used for the SQL size check. */
+export const QUERY_WIDEST_SCAN_CONDITIONS: readonly string[] = ["hk = ?", "sk >= ?", "sk <= ?"];
 
 /**
  * Parameters every statement that runs an update plan binds BEFORE the plan's own, in this order:
@@ -34,12 +54,73 @@ FROM requested
 LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
 }
 
+export function composeProjectionStatement(plan: Pick<CompiledProjectionPlan, "valueSql" | "typeSql">): string {
+	const columns = plan.valueSql.flatMap((valueSql, index) => [`${valueSql} AS p${index}`, `${plan.typeSql[index]} AS t${index}`]);
+	return `SELECT i.v, i.ttl_epoch_utc_seconds, ${columns.join(", ")}
+FROM items AS i
+WHERE i.hk = ?2 AND i.sk = ?3
+LIMIT 1`;
+}
+
+export function composeQueryStatement(
+	plan: Pick<CompiledQueryPlan, "filterSql" | "projection">,
+	opts: { select: QuerySelect; direction: "asc" | "desc"; scanConditions: readonly string[] },
+): string {
+	// SQLite numbers an unnumbered ? as one above the largest number seen so far, so a bare ? here
+	// would take ?2 only when the pool ?1 precedes it in the text. A filter reads the pool in the
+	// select list before the WHERE, a projection reads it only after, so whether it precedes depends
+	// on the plan. Every scan parameter is numbered explicitly from ?2 instead.
+	let nextParam = POOL_PARAM + 1;
+	const conds = opts.scanConditions.map((condition) => condition.replace(/\?/g, () => `?${nextParam++}`)).join(" AND ");
+	const limitParam = `?${nextParam}`;
+	const order = opts.direction === "asc" ? "ASC" : "DESC";
+	const matchedSql = plan.filterSql === null ? "1 AS matched" : `CASE WHEN (${plan.filterSql}) THEN 1 ELSE 0 END AS matched`;
+	if (opts.select === "count") {
+		return `SELECT sk, est_row_bytes, ${matchedSql}
+FROM items AS i
+WHERE ${conds}
+ORDER BY sk ${order}
+LIMIT ${limitParam}`;
+	}
+	const projection = plan.projection;
+	const outerColumns =
+		projection === null
+			? [
+					"CASE WHEN matched THEN i.hk END AS hk",
+					`CASE WHEN matched THEN (CASE WHEN i.data_kind = ${JSON_KIND_CODE} THEN json(i.data) ELSE i.data END) END AS data`,
+					"CASE WHEN matched THEN i.data_kind END AS data_kind",
+					"CASE WHEN matched THEN i.ttl_epoch_utc_seconds END AS ttl_epoch_utc_seconds",
+					"CASE WHEN matched THEN i.v END AS v",
+					"CASE WHEN matched THEN i.last_read_ts END AS last_read_ts",
+					"CASE WHEN matched THEN i.last_write_ts END AS last_write_ts",
+				]
+			: projection.valueSql.flatMap((valueSql, index) => [
+					`CASE WHEN matched THEN ${valueSql} END AS p${index}`,
+					`CASE WHEN matched THEN ${projection.typeSql[index]} END AS t${index}`,
+				]);
+	return `WITH candidates AS (
+SELECT hk, sk, est_row_bytes, v, ttl_epoch_utc_seconds, data_kind, data, last_read_ts, last_write_ts, ${matchedSql}
+FROM items AS i
+WHERE ${conds}
+ORDER BY sk ${order}
+LIMIT ${limitParam})
+SELECT sk, est_row_bytes, matched, ${outerColumns.join(", ")}
+FROM candidates AS i
+ORDER BY sk ${order}`;
+}
+
 export type ExpressionBindingDescriptor =
 	| { kind: "val"; value: JsonPrimitive }
 	| { kind: "keyText"; value: string }
 	| { kind: "keyB64"; value: string }
 	| { kind: "b64"; value: string }
 	| { kind: "path"; value: string };
+
+/**
+ * How a plan's value descriptors reach the statement. "direct" binds one parameter per descriptor;
+ * "pool" binds one JSON array parameter and each descriptor reads its element with json_extract.
+ */
+export type ExpressionBindingLayout = "direct" | "pool";
 
 /**
  * Compiled SQL plan for evaluating a write condition expression.
@@ -126,4 +207,76 @@ export type CompiledUpdatePlan = {
 	};
 	/** Canonical deterministic fingerprint used for transaction idempotency. */
 	identity: string;
+};
+
+/**
+ * Compiled SQL plan for a projected point read.
+ * The plan is JSON-serializable and crosses the RPC boundary to the partition.
+ */
+export type CompiledProjectionPlan = {
+	/** Plan schema version number. */
+	version: typeof PROJECTION_PLAN_VERSION;
+	/** Discriminant for projection plans. */
+	kind: "projection";
+	/** Descriptors bind as one JSON array parameter, never as one parameter each. */
+	bindingLayout: "pool";
+	/** Resolved output names, in entry order. */
+	names: readonly string[];
+	/** One value SQL fragment per entry, over alias `i`. */
+	valueSql: readonly string[];
+	/** One type SQL fragment per entry, over alias `i`. */
+	typeSql: readonly string[];
+	/** Descriptors for expression values bound through the pool parameter. */
+	bindings: readonly ExpressionBindingDescriptor[];
+	/** Number of binding descriptors in this plan. */
+	bindingCount: number;
+	/** POOL_PARAM plus PROJECTION_FIXED_BINDING_COUNT (2: hk, sk); the pool is bound also when the plan has no descriptor. */
+	completeBindingCount: number;
+	/** Storage columns required to execute the projection statement. */
+	requiredColumns: readonly ExpressionRequiredColumn[];
+	/** Item data dependencies needed by the projection. */
+	dataDependencies: {
+		/** True if the projection accesses the complete data column rather than specific paths. */
+		completeData: boolean;
+		/** List of distinct JSON paths accessed in item data. */
+		paths: readonly string[];
+	};
+	/** Canonical deterministic fingerprint of the projection expression. */
+	identity: string;
+};
+
+/**
+ * Compiled SQL plan for one queryItems leaf scan with a filter, a projection, or both.
+ * The plan is JSON-serializable and crosses the RPC boundary to the partition.
+ */
+export type CompiledQueryPlan = {
+	/** Plan schema version number. */
+	version: typeof QUERY_PLAN_VERSION;
+	/** Discriminant for query plans. */
+	kind: "query";
+	/** Descriptors bind as one JSON array parameter, never as one parameter each. */
+	bindingLayout: "pool";
+	/** The predicate over alias `i`, or null when the request has no filter. */
+	filterSql: string | null;
+	/** The projection fragments, or null when the request returns complete items. */
+	projection: { names: readonly string[]; valueSql: readonly string[]; typeSql: readonly string[] } | null;
+	/** Descriptors for expression values bound through the pool parameter. */
+	bindings: readonly ExpressionBindingDescriptor[];
+	/** Number of binding descriptors in this plan. */
+	bindingCount: number;
+	/** POOL_PARAM plus QUERY_MAX_TRAILING_BINDING_COUNT: the pool plus the widest scan tail. */
+	completeBindingCount: number;
+	/** Storage columns required to execute the query statement. */
+	requiredColumns: readonly ExpressionRequiredColumn[];
+	/** Item data dependencies needed by the filter and the projection. */
+	dataDependencies: {
+		/** True if the plan accesses the complete data column rather than specific paths. */
+		completeData: boolean;
+		/** List of distinct JSON paths accessed in item data. */
+		paths: readonly string[];
+	};
+	/** Canonical deterministic fingerprint of the filter, or null without one. */
+	filterIdentity: string | null;
+	/** Canonical deterministic fingerprint of the projection, or null without one. */
+	projectionIdentity: string | null;
 };

@@ -1,11 +1,14 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO, QueryItemsRpcRequest, QueryItemsRpcResponse } from "../../src/server/do-partition.js";
+import { PartitionDO, QueryItemsRpcRequest, QueryItemsRpcResponse, type ProjectedWireRow } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
-import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { estimateProjectedRowBytes, PartitionStore, type StoredItem } from "../../src/shared/partition/partition-store.js";
+import { compileQueryExpression } from "../../src/shared/expression/compiler.js";
+import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
+import type { ProjectionExpression } from "../../src/shared/expression/types.js";
 import { EST_ROW_BYTES_K } from "../../src/shared/partition/item-size.js";
 import { kb, makeStub } from "./helpers.js";
 import {
@@ -30,6 +33,7 @@ describe("PartitionDO — range split", () => {
 		allowOversizedFirstItem: true,
 		cursor: null,
 		select: "projection" as const,
+		plan: null,
 		...overrides,
 	});
 
@@ -98,6 +102,82 @@ describe("PartitionDO — range split", () => {
 			});
 		});
 
+		it("count mode with a filter returns the matched count below scannedCount", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				seed45(state);
+				const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
+
+				const result = await instance.apiQueryItems(ctx, request("asc", { select: "count", plan }));
+
+				expect(result.items).toEqual([]);
+				expect(result.responseBytes).toBe(0);
+				expect(result.count).toBe(5);
+				expect(result.scannedCount).toBe(45);
+				expect(result.rowsReturned).toBe(45);
+				expect(result.nextCursor).toBeNull();
+			});
+		});
+
+		it("a rejected candidate consumes the evaluated budgets and advances the cursor", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				seed45(state);
+				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
+
+				const first = await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10 }));
+				expect(first.count).toBe(0);
+				expect(first.items).toEqual([]);
+				expect(first.scannedCount).toBe(10);
+				expect(first.rowsReturned).toBe(11);
+				expect(first.nextCursor?.inclusive).toBe(true);
+				expect(KeyCodec.decode(first.nextCursor!.sk)).toBe("010");
+
+				let count = first.count;
+				let scannedCount = first.scannedCount;
+				const seen: string[] = [];
+				let cursor = first.nextCursor;
+				let pages = 0;
+				while (cursor !== null) {
+					const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10, cursor }));
+					count += res.count;
+					scannedCount += res.scannedCount;
+					seen.push(...res.items.map((it) => KeyCodec.decode((it as StoredItem).sk) as string));
+					cursor = res.nextCursor;
+					invariant(++pages < 50, "queryItems pagination did not terminate");
+				}
+				expect(count).toBe(1);
+				expect(scannedCount).toBe(45);
+				expect(seen).toEqual(["044"]);
+			});
+		});
+
+		it("a rejected candidate spends zero response bytes", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				for (let i = 0; i < 6; i++) {
+					store.upsertItem({
+						hk: kb("alice"),
+						sk: kb(`big${i}`),
+						data: new Uint8Array(100 * 1024),
+						kind: "bytes",
+						ttlAt: null,
+						txOrderTs: 0,
+					});
+				}
+				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "big5" }] } });
+
+				// 250 KiB admits two 100 KiB items but not six; the page drains only because the five
+				// rejected candidates charged nothing to the response budget.
+				const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 }));
+				expect(res.nextCursor).toBeNull();
+				expect(res.scannedCount).toBe(6);
+				expect(res.items).toHaveLength(1);
+				expect(KeyCodec.decode((res.items[0] as StoredItem).sk)).toBe("big5");
+			});
+		});
+
 		it("count and projection pages can stop at different positions and exchange cursors", async () => {
 			const { ctx, stub } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
@@ -135,7 +215,7 @@ describe("PartitionDO — range split", () => {
 				expect(cnt3.nextCursor).not.toBeNull();
 				const projResume = await instance.apiQueryItems(ctx, request("asc", { cursor: cnt3.nextCursor }));
 				expect(projResume.items).toHaveLength(3);
-				expect(projResume.items.map((it) => KeyCodec.decode(it.sk))).toEqual(["big3", "big4", "big5"]);
+				expect(projResume.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(["big3", "big4", "big5"]);
 				expect(projResume.nextCursor).toBeNull();
 			});
 		});
@@ -149,6 +229,114 @@ describe("PartitionDO — range split", () => {
 
 				expect(result.meta.rowsRead).toBeGreaterThan(0);
 				expect(result.partitionMetas[0].rowsRead).toBe(result.meta.rowsRead);
+			});
+		});
+
+		it.each(["asc", "desc"] as const)(
+			"a projection returns positional rows in %s order with the complete-item counters",
+			async (direction) => {
+				const { ctx, stub } = makeStub();
+				await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+					seed45(state);
+					const plan = compileQueryExpression({
+						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
+					});
+
+					const result = await instance.apiQueryItems(ctx, request(direction, { plan, remainingEvaluatedItems: 10 }));
+
+					const expected = Array.from({ length: 10 }, (_, i) => [String(direction === "asc" ? i : 44 - i).padStart(3, "0"), 1]);
+					expect(result.items).toEqual(expected);
+					expect(result.count).toBe(10);
+					expect(result.scannedCount).toBe(10);
+					expect(result.rowsReturned).toBe(11);
+					expect(result.nextCursor?.inclusive).toBe(true);
+					expect(KeyCodec.decode(result.nextCursor!.sk)).toBe(direction === "asc" ? "010" : "034");
+				});
+			},
+		);
+
+		it("a projection page stops on the response budget over the projected rows", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				// A 60 KiB text cell estimates at 64 + 120 KiB, so two rows fit a 250 KiB page.
+				const doc = JSON.stringify({ big: "x".repeat(60 * 1024) });
+				for (let i = 0; i < 6; i++) {
+					store.upsertItem({ hk: kb("alice"), sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
+				}
+				const plan = compileQueryExpression({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
+
+				const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 }));
+				expect(res.items).toHaveLength(2);
+				expect(res.count).toBe(2);
+				expect(res.nextCursor?.inclusive).toBe(true);
+				expect(KeyCodec.decode(res.nextCursor!.sk)).toBe("big2");
+				// The estimate is exact: it charges the envelope and the cells, never est_row_bytes.
+				expect(res.responseBytes).toBe(res.items.reduce((sum, item) => sum + estimateProjectedRowBytes(item as ProjectedWireRow), 0));
+
+				// The first oversized projected row of a page is still admitted once.
+				const oversized = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 1 }));
+				expect(oversized.items).toHaveLength(1);
+				expect(oversized.responseBytes).toBe(estimateProjectedRowBytes(oversized.items[0] as ProjectedWireRow));
+				expect(oversized.nextCursor?.inclusive).toBe(true);
+				expect(KeyCodec.decode(oversized.nextCursor!.sk)).toBe("big1");
+			});
+		});
+
+		it("keeps undefined projected cells across the RPC hop", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				for (let i = 0; i < 6; i++) {
+					// `opt` exists on every other item, so every other wire row has a missing first cell.
+					const doc = i % 2 === 0 ? { opt: i } : { other: i };
+					store.upsertItem({
+						hk: kb("alice"),
+						sk: kb(String(i).padStart(3, "0")),
+						data: JSON.stringify(doc),
+						kind: "json",
+						ttlAt: null,
+						txOrderTs: 0,
+					});
+				}
+			});
+
+			// Calling the stub directly crosses a real RPC boundary, which runInDurableObject does not.
+			const plan = compileQueryExpression({
+				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
+			});
+			const result = await stub.apiQueryItems(ctx, request("asc", { plan }));
+
+			expect(result.items).toHaveLength(6);
+			for (const [i, item] of result.items.entries()) {
+				const row = item as ProjectedWireRow;
+				const sk = String(i).padStart(3, "0");
+				if (i % 2 === 0) {
+					expect(row).toEqual([i, sk]);
+				} else {
+					expect(row).toEqual([undefined, sk]);
+					// A missing cell stays an own array element, not a hole a serializer dropped.
+					expect(row).toHaveLength(2);
+					expect(Object.hasOwn(row, "0")).toBe(true);
+				}
+			}
+		});
+
+		it("runs a projection at the entry limit through the leaf", async () => {
+			const { ctx, stub } = makeStub();
+			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+				const store = new PartitionStore(state.storage);
+				const doc = Object.fromEntries(Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => [`f${k}`, k]));
+				store.upsertItem({ hk: kb("alice"), sk: kb("s"), data: JSON.stringify(doc), kind: "json", ttlAt: null, txOrderTs: 0 });
+				const projection: ProjectionExpression[] = Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => ({
+					expr: { ref: "data", path: `$.f${k}` },
+				}));
+				const plan = compileQueryExpression({ projection });
+
+				const res = await instance.apiQueryItems(ctx, request("asc", { plan }));
+				expect(res.items).toHaveLength(1);
+				expect(res.items[0]).toHaveLength(EXPRESSION_LIMITS.projectionEntries);
+				expect((res.items[0] as ProjectedWireRow)[17]).toBe(17);
 			});
 		});
 
@@ -175,7 +363,7 @@ describe("PartitionDO — range split", () => {
 						ctx,
 						request(direction, { remainingResponseBytes: MAX_ITEM_BYTES + 100, remainingEvaluatedItems: 2, cursor }),
 					);
-					seen.push(...result.items.map((item) => KeyCodec.decode(item.sk) as string));
+					seen.push(...result.items.map((item) => KeyCodec.decode((item as StoredItem).sk) as string));
 					if (result.nextCursor === null) break;
 					cursor = result.nextCursor;
 				}
@@ -228,7 +416,7 @@ describe("PartitionDO — range split", () => {
 				count += res.count;
 				scannedCount += res.scannedCount;
 				rowsReturned += res.rowsReturned;
-				for (const it of res.items) out.push(KeyCodec.decode(it.sk));
+				for (const it of res.items) out.push(KeyCodec.decode((it as StoredItem).sk));
 				for (const m of res.partitionMetas) leaves.add(m.servedByActorName);
 				if (res.nextCursor === null) break;
 				cursor = res.nextCursor;
@@ -243,7 +431,7 @@ describe("PartitionDO — range split", () => {
 
 			const res = await queryPage(root);
 			expect(res.nextCursor).toBeNull();
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
 
 			// The fan-out actually touched every leaf — before the fix it routed by the sentinel sort key
 			// to the single leftmost leaf and silently dropped the rest.
@@ -278,7 +466,7 @@ describe("PartitionDO — range split", () => {
 			expect(sks.length).toBeGreaterThanOrEqual(6);
 
 			const res = await queryPage(root, { remainingEvaluatedItems: 5 });
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort().slice(0, 5));
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort().slice(0, 5));
 			expect(res.nextCursor).not.toBeNull();
 		});
 
@@ -329,7 +517,7 @@ describe("PartitionDO — range split", () => {
 				const result = await root.stub.internalQueryItemsDirect(fullRequest());
 
 				// The router's own DB still holds all items (parent rows are never deleted during split).
-				expect(result.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+				expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
 				// Local read only: no forwarding to children.
 				expect(result.meta.forwardCount).toBe(0);
 			});
@@ -353,7 +541,7 @@ describe("PartitionDO — range split", () => {
 			expect(full.responseBytes).toBeGreaterThan(0);
 
 			const res = await queryPage(root, { remainingResponseBytes: full.responseBytes });
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
 			expect(res.nextCursor).toBeNull();
 		});
 
@@ -375,7 +563,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.partitionMetas).toHaveLength(2);
 			const expected = [...sks].sort().filter((sk) => KeyCodec.compare(KeyCodec.encode(sk), upper) < 0);
 			expect(expected.length).toBeGreaterThan(0);
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual(expected);
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
 			expect(res.nextCursor).toBeNull();
 		});
 
@@ -410,7 +598,7 @@ describe("PartitionDO — range split", () => {
 			const { root, sks } = await buildSplitTree(N);
 
 			const res = await queryPage(root, { remainingEvaluatedItems: sks.length });
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual([...sks].sort());
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
 			expect(res.nextCursor).toBeNull();
 
 			const cnt = await queryPage(root, { select: "count", remainingEvaluatedItems: sks.length });
@@ -434,11 +622,13 @@ describe("PartitionDO — range split", () => {
 			// One byte past leaf 0's response leaves no room for leaf 1's first item, and the first-item
 			// exception was already spent by leaf 0 — the second leaf must be visited and reject its row.
 			const res = await queryPage(root, { remainingResponseBytes: leaf0.responseBytes + 1 });
-			expect(res.items.map((it) => KeyCodec.decode(it.sk))).toEqual(leaf0.items.map((it) => KeyCodec.decode(it.sk)));
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(
+				leaf0.items.map((it) => KeyCodec.decode((it as StoredItem).sk)),
+			);
 			expect(res.partitionMetas).toHaveLength(2);
 			expect(res.rowsReturned).toBe(leaf0.rowsReturned + 1);
 			expect(res.nextCursor?.inclusive).toBe(true);
-			expect(KeyCodec.compare(res.nextCursor!.sk, leaf1.items[0].sk)).toBe(0);
+			expect(KeyCodec.compare(res.nextCursor!.sk, (leaf1.items[0] as StoredItem).sk)).toBe(0);
 
 			// The same oversized first item is admitted when it starts the page.
 			const res2 = await queryPage(root, {
@@ -466,7 +656,7 @@ describe("PartitionDO — range split", () => {
 			expect(KeyCodec.compare(p1.nextCursor!.sk, B)).toBe(0);
 
 			const p2 = await queryPage(root, { direction: "desc", cursor: p1.nextCursor });
-			expect(KeyCodec.compare(p2.items[0].sk, B)).toBe(0);
+			expect(KeyCodec.compare((p2.items[0] as StoredItem).sk, B)).toBe(0);
 
 			const { sks: got } = await collect(root, { direction: "desc", remainingEvaluatedItems: K });
 			expect(got).toEqual([...sks].sort().reverse());
@@ -512,7 +702,7 @@ describe("PartitionDO — range split", () => {
 
 			// Delete every item the right grandchild owns; it must then drain empty on the next page.
 			const under = await left.stub.apiQueryItems(left.ctx, fullRequest());
-			const leftSks = under.items.map((it) => it.sk);
+			const leftSks = under.items.map((it) => (it as StoredItem).sk);
 			for (const sk of leftSks) {
 				if (KeyCodec.compare(sk, g2Start) >= 0) {
 					await root.stub.apiDeleteItem(root.ctx, { hashKey: kb("alice"), sortKey: sk });
@@ -553,6 +743,97 @@ describe("PartitionDO — range split", () => {
 			await root.awaitSplitCompleted();
 		});
 
+		it("returns projected rows from every leaf, with missing cells intact", async () => {
+			const N = 4;
+			const { root, sks } = await buildSplitTree(N);
+			// The seeded items are text, so the $.opt cell is missing on every row.
+			const plan = compileQueryExpression({
+				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
+			});
+
+			const res = await queryPage(root, { plan });
+			expect(res.nextCursor).toBeNull();
+			const expected = [...sks].sort();
+			expect(res.items).toHaveLength(expected.length);
+			for (const [i, item] of res.items.entries()) {
+				const row = item as ProjectedWireRow;
+				expect(row).toEqual([undefined, expected[i]]);
+				expect(row).toHaveLength(2);
+				expect(Object.hasOwn(row, "0")).toBe(true);
+			}
+			// The fan-out touched every leaf.
+			expect(new Set(res.partitionMetas.map((m) => m.servedByActorName)).size).toBe(N);
+		});
+
+		it("a filter marks only matched rows across every leaf", async () => {
+			const N = 4;
+			const { root, sks } = await buildSplitTree(N);
+			const sorted = [...sks].sort();
+			const median = sorted[Math.floor(sorted.length / 2)];
+			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
+
+			const res = await queryPage(root, { plan });
+			const expected = sorted.filter((sk) => sk >= median);
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
+			expect(res.count).toBe(expected.length);
+			expect(res.scannedCount).toBe(sks.length);
+			expect(res.nextCursor).toBeNull();
+			// The fan-out still touched every leaf: the filter rejects rows, not partitions.
+			expect(res.partitionMetas).toHaveLength(N);
+		});
+
+		it("a migrating range child answers a projected query from its parent", async () => {
+			const N = 2;
+			const { root, sks } = await makeRangeRoot(N);
+			await withMigrationHeld(root, async (waitForAllChildRequests) => {
+				const start = sks.length;
+				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
+				await root.awaitSplitStarted();
+				await waitForAllChildRequests();
+
+				const child = (await root.children())[0];
+				const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
+				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
+				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual([...sks].sort());
+				// The parent still holds every row of the key, so the page covers the whole range.
+				expect(res.count).toBe(sks.length);
+				expect(res.meta.forwardCount).toBe(0);
+				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+			});
+
+			// Drain pending child migrations so their background work doesn't outlive the test.
+			await root.awaitSplitCompleted();
+		});
+
+		it("a migrating range child answers a filtered query from its parent", async () => {
+			const N = 2;
+			const { root, sks } = await makeRangeRoot(N);
+			await withMigrationHeld(root, async (waitForAllChildRequests) => {
+				const start = sks.length;
+				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
+				await root.awaitSplitStarted();
+				await waitForAllChildRequests();
+
+				const sorted = [...sks].sort();
+				const median = sorted[Math.floor(sorted.length / 2)];
+				const plan = compileQueryExpression({
+					filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] },
+					projection: [{ expr: { ref: "sortKey" } }],
+				});
+				const child = (await root.children())[0];
+				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
+				const expected = sorted.filter((sk) => sk >= median);
+				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);
+				expect(res.count).toBe(expected.length);
+				expect(res.scannedCount).toBe(sks.length);
+				expect(res.meta.forwardCount).toBe(0);
+				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+			});
+
+			// Drain pending child migrations so their background work doesn't outlive the test.
+			await root.awaitSplitCompleted();
+		});
+
 		it("sums SQL result rows across range leaves", async () => {
 			const N = 4;
 			const { root, sks } = await buildSplitTree(N);
@@ -580,6 +861,74 @@ describe("PartitionDO — range split", () => {
 			expect(res.items).toHaveLength(0);
 			expect(res.meta.forwardCount).toBe(1);
 			expect(res.partitionMetas).toHaveLength(1);
+		});
+
+		it("a filter that matches nothing still reports the forwarded leaf's evaluated count", async () => {
+			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+			const writes = await root.triggerHashSplit();
+			await root.awaitSplitCompleted();
+
+			const hk = writes[0].hashKey;
+			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
+			// The seeded rows carry no TTL, so exists(ttlAt) matches no candidate.
+			const plan = compileQueryExpression({ filter: { op: "exists", args: [{ ref: "ttlAt" }] } });
+			const res = await root.stub.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
+
+			expect(res.count).toBe(0);
+			expect(res.items).toHaveLength(0);
+			expect(res.scannedCount).toBe(expected);
+			expect(res.meta.forwardCount).toBe(1);
+			expect(res.partitionMetas).toHaveLength(1);
+		});
+
+		it("projection mode returns the forwarded leaf's projected rows", async () => {
+			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+			const writes = await root.triggerHashSplit();
+			await root.awaitSplitCompleted();
+
+			const hk = writes[0].hashKey;
+			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
+			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
+			const res = await root.stub.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
+
+			expect(res.count).toBe(expected);
+			expect(res.items).toEqual(Array.from({ length: expected }, () => ["sk", 1]));
+			expect(res.meta.forwardCount).toBe(1);
+			expect(res.partitionMetas).toHaveLength(1);
+		});
+	});
+
+	describe("queryItems through a promoted key", () => {
+		it("serves a filtered page from the range root", async () => {
+			const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+			const writes = await partition.triggerPromotion("alice", (i) => `sk${String(i).padStart(3, "0")}`);
+			const rangeRoot = await partition.awaitPromoted("alice");
+
+			const sorted = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
+			const median = sorted[Math.floor(sorted.length / 2)];
+			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
+			const res = await partition.stub.apiQueryItems(partition.ctx, fullRequest({ plan }));
+
+			const expected = sorted.filter((sk) => sk >= median);
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
+			expect(res.count).toBe(expected.length);
+			expect(res.scannedCount).toBe(writes.length);
+			expect(res.partitionMetas[0].servedByActorName).toBe(rangeRoot.doName);
+		});
+
+		it("serves a projected page from the range root", async () => {
+			const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+			const writes = await partition.triggerPromotion("alice", (i) => `sk${String(i).padStart(3, "0")}`);
+			const rangeRoot = await partition.awaitPromoted("alice");
+
+			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
+			const res = await partition.stub.apiQueryItems(partition.ctx, fullRequest({ plan }));
+
+			const expected = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
+			expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);
+			expect(res.count).toBe(writes.length);
+			expect(res.meta.forwardCount).toBeGreaterThanOrEqual(1);
+			expect(res.partitionMetas[0].servedByActorName).toBe(rangeRoot.doName);
 		});
 	});
 });

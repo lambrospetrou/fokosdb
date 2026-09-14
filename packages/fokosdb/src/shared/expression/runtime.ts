@@ -1,18 +1,27 @@
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
-import { decodeBase64Bytes } from "./byte-literal.js";
+import { type KeyBytes } from "../partition-topology/key-codec.js";
+import { materializeExpressionBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
 import {
 	composeConditionStatement,
+	composeProjectionStatement,
+	composeQueryStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
+	POOL_PARAM,
+	PROJECTION_FIXED_BINDING_COUNT,
+	PROJECTION_PLAN_VERSION,
+	QUERY_MAX_TRAILING_BINDING_COUNT,
+	QUERY_PLAN_VERSION,
+	QUERY_WIDEST_SCAN_CONDITIONS,
 	UPDATE_FIXED_BINDING_COUNT,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
 	UPDATE_PLAN_VERSION,
 	type CompiledConditionPlan,
+	type CompiledProjectionPlan,
+	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
-	type ExpressionBindingDescriptor,
 } from "./plan.js";
 import { utf8WithinLimit } from "./utf8.js";
 
@@ -36,23 +45,6 @@ export type UpdateProbeResult = {
 	rowsRead: number;
 	rowsWritten: number;
 };
-
-export function materializeExpressionBindings(descriptors: readonly ExpressionBindingDescriptor[]): unknown[] {
-	return descriptors.map((descriptor) => {
-		switch (descriptor.kind) {
-			case "val":
-				return typeof descriptor.value === "boolean" ? Number(descriptor.value) : descriptor.value;
-			case "path":
-				return descriptor.value;
-			case "keyText":
-				return KeyCodec.encode(descriptor.value);
-			case "keyB64":
-				return KeyCodec.encode(decodeBase64Bytes(descriptor.value));
-			case "b64":
-				return decodeBase64Bytes(descriptor.value);
-		}
-	});
-}
 
 export function evaluateConditionPlan(
 	storage: DurableObjectStorage,
@@ -99,6 +91,68 @@ export function validateConditionPlan(plan: CompiledConditionPlan): string {
 		throw new ExpressionError("sql_limit", "condition plan has an invalid binding count");
 	}
 	return statement;
+}
+
+function assertProjectionShape(projection: { names: readonly string[]; valueSql: readonly string[]; typeSql: readonly string[] }): void {
+	if (
+		projection.names.length !== projection.valueSql.length ||
+		projection.names.length !== projection.typeSql.length ||
+		projection.names.length < 1 ||
+		projection.names.length > EXPRESSION_LIMITS.projectionEntries
+	) {
+		throw new ExpressionError("runtime_capability", "projection plan has an invalid shape");
+	}
+}
+
+/** Validates the plan and returns the composed statement so the caller does not compose it again. */
+export function validateProjectionPlan(plan: CompiledProjectionPlan): string {
+	if (plan.version !== PROJECTION_PLAN_VERSION || plan.kind !== "projection") {
+		throw new ExpressionError("runtime_capability", "unsupported projection plan version or kind");
+	}
+	if (plan.bindingLayout !== "pool") {
+		throw new ExpressionError("runtime_capability", "unsupported projection plan binding layout");
+	}
+	assertProjectionShape(plan);
+	const statement = composeProjectionStatement(plan);
+	if (!utf8WithinLimit(statement, EXPRESSION_LIMITS.compiledSqlBytes)) {
+		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	}
+	if (
+		plan.bindings.length !== plan.bindingCount ||
+		plan.completeBindingCount !== POOL_PARAM + PROJECTION_FIXED_BINDING_COUNT ||
+		plan.completeBindingCount > EXPRESSION_LIMITS.completeStatementBindings
+	) {
+		throw new ExpressionError("sql_limit", "projection plan has an invalid binding count");
+	}
+	return statement;
+}
+
+export function validateQueryPlan(plan: CompiledQueryPlan): void {
+	if (plan.version !== QUERY_PLAN_VERSION || plan.kind !== "query") {
+		throw new ExpressionError("runtime_capability", "unsupported query plan version or kind");
+	}
+	if (plan.bindingLayout !== "pool") {
+		throw new ExpressionError("runtime_capability", "unsupported query plan binding layout");
+	}
+	if (plan.filterSql === null && plan.projection === null) {
+		throw new ExpressionError("runtime_capability", "query plan has neither a filter nor a projection");
+	}
+	if (plan.projection !== null) assertProjectionShape(plan.projection);
+	const widest = composeQueryStatement(plan, {
+		select: "projection",
+		direction: "desc",
+		scanConditions: QUERY_WIDEST_SCAN_CONDITIONS,
+	});
+	if (!utf8WithinLimit(widest, EXPRESSION_LIMITS.compiledSqlBytes)) {
+		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
+	}
+	if (
+		plan.bindings.length !== plan.bindingCount ||
+		plan.completeBindingCount !== POOL_PARAM + QUERY_MAX_TRAILING_BINDING_COUNT ||
+		plan.completeBindingCount > EXPRESSION_LIMITS.completeStatementBindings
+	) {
+		throw new ExpressionError("sql_limit", "query plan has an invalid binding count");
+	}
 }
 
 export function validateUpdatePlan(plan: CompiledUpdatePlan): void {

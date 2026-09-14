@@ -1,22 +1,30 @@
 import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../partition-topology/key-codec.js";
+import type { ProjectedWireRow } from "../expression/projection.js";
 import type { QueryScanRow, StoredItem } from "../partition/partition-store.js";
 import type { QueryPageBudgetState } from "./page-budget.js";
 import { collectQueryPage } from "./query-collector.js";
 
 const hk = KeyCodec.encode("hk");
 
-// A scan row. `item` is present on projection rows only.
+// A matched scan row. `item` is present on complete-item projection rows only.
 function row(sk: string, estRowBytes: number, item?: Partial<StoredItem>): QueryScanRow {
 	const skBytes = KeyCodec.encode(sk);
 	return {
 		sk: skBytes,
 		estRowBytes,
+		matched: true,
 		item:
 			item === undefined
 				? null
 				: { hk, sk: skBytes, data: "x", kind: "text", ttl_epoch_utc_seconds: null, v: 1, last_read_ts: 0, last_write_ts: 0, ...item },
+		projected: null,
 	};
+}
+
+// A scan row that carries a projected wire row instead of a complete item.
+function projectedRow(sk: string, estRowBytes: number, projected: ProjectedWireRow): QueryScanRow {
+	return { sk: KeyCodec.encode(sk), estRowBytes, matched: true, item: null, projected };
 }
 
 // Records how many rows the consumer pulled, to prove the stream stops at a rejected candidate.
@@ -122,7 +130,7 @@ describe("collectQueryPage", () => {
 			hashKey: hk,
 			select: "projection",
 			budget: budget({ remainingResponseBytes: 100, allowOversizedFirstItem: true }),
-			estimateResponseBytes: (item) => sizes.get(KeyCodec.decode(item.sk) as string)!,
+			estimateResponseBytes: (item) => sizes.get(KeyCodec.decode((item as StoredItem).sk) as string)!,
 		});
 		expect(state.items).toHaveLength(1);
 		expect(state.responseBytes).toBe(500);
@@ -167,5 +175,48 @@ describe("collectQueryPage", () => {
 		expect(state.scannedCount).toBe(3);
 		expect(state.responseBytes).toBe(0);
 		expect(state.nextCursor).toBeNull();
+	});
+
+	it("pushes a projected wire row as-is and charges its estimate", () => {
+		const wire: ProjectedWireRow = ["a", 7, undefined];
+		const { rows } = tracked([projectedRow("a", 10, wire)]);
+		const estimate = vi.fn().mockReturnValue(42);
+		const state = collectQueryPage({ rows, hashKey: hk, select: "projection", budget: budget(), estimateResponseBytes: estimate });
+		expect(state.items[0]).toBe(wire);
+		expect(estimate).toHaveBeenCalledWith(wire);
+		expect(state.responseBytes).toBe(42);
+		expect(state.count).toBe(1);
+		expect(state.scannedCount).toBe(1);
+	});
+
+	it("an unmatched candidate consumes the evaluated budgets and advances the cursor but counts nothing", () => {
+		const unmatched: QueryScanRow = { sk: KeyCodec.encode("a"), estRowBytes: 10, matched: false, item: null, projected: null };
+		const { rows } = tracked([unmatched]);
+		const estimate = vi.fn();
+		const state = collectQueryPage({ rows, hashKey: hk, select: "projection", budget: budget(), estimateResponseBytes: estimate });
+		expect(state.items).toEqual([]);
+		expect(state.count).toBe(0);
+		expect(state.scannedCount).toBe(1);
+		expect(state.evaluatedBytes).toBe(10);
+		expect(state.responseBytes).toBe(0);
+		expect(state.lastEvaluatedCursor).toEqual({ hk, sk: KeyCodec.encode("a") });
+		expect(state.nextCursor).toBeNull();
+		expect(estimate).not.toHaveBeenCalled();
+	});
+
+	it("admits an oversized projected first row once, then stops before the next", () => {
+		const { rows, pulled } = tracked([projectedRow("a", 10, ["x"]), projectedRow("b", 10, ["y"])]);
+		const state = collectQueryPage({
+			rows,
+			hashKey: hk,
+			select: "projection",
+			budget: budget({ remainingResponseBytes: 5, allowOversizedFirstItem: true }),
+			estimateResponseBytes: () => 10,
+		});
+		expect(state.items).toEqual([["x"]]);
+		expect(state.responseBytes).toBe(10);
+		expect(state.count).toBe(1);
+		expect(state.nextCursor).toEqual({ hk, sk: KeyCodec.encode("b"), inclusive: true });
+		expect(pulled()).toBe(2);
 	});
 });

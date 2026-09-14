@@ -5,7 +5,8 @@ import type {
 	TransactWriteItemsOptions,
 } from "./transaction-types.js";
 import type { JsonComposite, JsonValue } from "./json-types.js";
-import type { ConditionExpression } from "./expression/types.js";
+import type { ConditionExpression, ProjectionExpression } from "./expression/types.js";
+import type { ProjectedItem } from "./expression/projection.js";
 
 // ─── Item data kinds ────────────────────────────────────────────────────────────
 
@@ -24,6 +25,7 @@ export type {
 	UpdateExpression,
 	UpdateTarget,
 } from "./expression/types.js";
+export type { ProjectedItem, ProjectedValue } from "./expression/projection.js";
 
 // ONE source of truth: the array. The on-disk `data_kind` column stores the compact integer code =
 // the array index; the TS/public discriminant is the readable string literal. Both lookups are index
@@ -217,6 +219,7 @@ export type SortKeyCondition =
 	  };
 
 export interface ItemQuerier {
+	queryItems(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult>;
 	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
 }
 
@@ -233,7 +236,24 @@ export type QueryItemsOptions = {
 	cursor?: string;
 	/** Defaults to "projection". "count" returns `items: []` and the matched count of one page. */
 	select?: QuerySelect;
+	/**
+	 * SQLite evaluates the filter on every candidate. It does not change candidate selection, routing, or the
+	 * sort-key interval. A rejected candidate still consumes the page's evaluated budgets and advances the
+	 * cursor. Valid with `select: "count"`, which then returns the matched count of the page.
+	 */
+	filter?: ConditionExpression;
+	/** A projection returns a flat record per item in place of the complete item. Not valid with `select: "count"`. */
+	projection?: readonly ProjectionExpression[];
 };
+
+/** A `queryItems` request that carries a projection. The projected overload resolves on this type. */
+export type QueryItemsProjectedOptions = QueryItemsOptions & {
+	projection: readonly ProjectionExpression[];
+	select?: "projection";
+};
+
+/** The `queryItems` result of a projected request: one flat record per item, by resolved name. */
+export type QueryItemsProjectedResult = Omit<QueryItemsResult, "items"> & { items: ProjectedItem[] };
 
 export type QueryItemsMeta = {
 	/** Physical SQLite rows read by the leaf query statements. */
@@ -259,7 +279,7 @@ export type QueryItemsResult = {
 	}>;
 	/** Matched items in this page. */
 	count: number;
-	/** Evaluated items in this page. Equal to `count` until filters exist. */
+	/** Evaluated items in this page. Equal to `count` for a request with no filter; with a filter, `count <= scannedCount`. */
 	scannedCount: number;
 	cursor?: string;
 	meta: QueryItemsMeta;
