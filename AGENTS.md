@@ -4,6 +4,9 @@ FokosDB is a globally strongly-consistent key-value database built on Cloudflare
 
 ## Critical tips
 
+- Use Simplified Technical English (ASD-STE100) language as defined in `.claude/skills/spec-write/references/ste-rules.md`.
+- Correctness and reliability above everything, with as little code as necessary to achieve what we need.
+- When you write comments inline the code do not refer to discussion references like W1 or W2 or report XYZ. Those do not mean anything to future readers. Your comments should always be stand-alone and not refering to ideas or bainstorming discussions and features that never shipped. Never reference anything not in the current codebase.
 - Always run tests `pnpm test` in a subagent to not pollute the context with the verbose output.
 - Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any [Workers](https://developers.cloudflare.com/workers/) and [Durable Objects](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/) tasks. For all limits and quotas, retrieve from the product's `/platform/limits/` page. eg. `/workers/platform/limits`.
 
