@@ -9,13 +9,17 @@ import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import type { InitiateWriteResponse, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
+import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
 
 export type Key = { hashKey: string; sortKey: string };
 
-/** The outcome of a transaction write: the committed result, or the fields of the cancel it raised. */
+/**
+ * The outcome of a transaction write: the committed result, or the fields of the cancel it raised.
+ * The tag is this helper's own. `transactWriteItems` returns the committed result alone and raises on
+ * a cancel, so only a value that holds both needs one.
+ */
 export type WriteOutcome =
-	| InitiateWriteResponse
+	| ({ outcome: "committed" } & TransactWriteItemsResult)
 	| {
 			outcome: "cancelled";
 			transactionId: string;
@@ -27,9 +31,9 @@ export type WriteOutcome =
  * Awaits a transaction write that can commit or cancel. A cancelled `transactWriteItems` raises
  * FokosTransactionCancelledError, and a test that checks either outcome reads it back as a value here.
  */
-export async function writeOutcome(write: Promise<InitiateWriteResponse>): Promise<WriteOutcome> {
+export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Promise<WriteOutcome> {
 	try {
-		return await write;
+		return { outcome: "committed", ...(await write) };
 	} catch (e) {
 		if (!FokosTransactionCancelledError.is(e)) throw e;
 		return {

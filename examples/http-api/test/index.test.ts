@@ -161,8 +161,8 @@ describe("http-api example worker", () => {
 			items: [{ hashKey: "tx-p1", projection: [{ expr: { ref: "data" }, as: "d" }] }, { hashKey: "tx-p2" }],
 		});
 		expect(res.status).toBe(200);
-		const body = (await res.json()) as { outcome: string; items: Array<Record<string, unknown>> };
-		expect(body.outcome).toBe("committed");
+		const body = (await res.json()) as { items: Array<Record<string, unknown>> };
+		expect(body.items).toHaveLength(2);
 		expect(body.items[0]).toMatchObject({
 			found: true,
 			hashKey: "tx-p1",

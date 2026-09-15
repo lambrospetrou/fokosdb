@@ -1,6 +1,6 @@
 # RFC — Read projections and `queryItems` filters
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-14
 **Author:** Lambros
 
@@ -153,8 +153,7 @@ the `matched` handling of the collector, and the filter test matrix of section 4
 ### 3.4 M4 — Point-read projections
 
 Deliver `getItem` and per-item `transactGetItems` projections on both read paths, the unique-key rule of
-`transactGetItems`, the store method, the RPC variants, the client overload and result types, and the HTTP
-example.
+`transactGetItems`, the store method, the RPC variants, the client result types, and the HTTP example.
 
 ### 3.5 M5 — Hardening and documentation
 
@@ -253,35 +252,61 @@ Rules:
 type ProjectedValue = JsonValue | Uint8Array;
 type ProjectedItem = Record<string, ProjectedValue>;
 
-type QueryItemsProjectedResult = Omit<QueryItemsResult, "items"> & { items: ProjectedItem[] };
+type CallerType<T, Widest> = [T] extends [never] ? Widest : T;
 
-type GetItemProjectedResult =
-  | { found: true; item: { hashKey; sortKey?; data: ProjectedItem; kind: "projected"; version; ttlAt? }; meta }
+type ReadItemValue<T = never> =
+  | { kind: "bytes"; data: Uint8Array }
+  | { kind: "text"; data: string }
+  | { kind: "json"; data: CallerType<T, JsonValue> }
+  | { kind: "projected"; data: CallerType<T, ProjectedItem> };
+
+type ReadItem<T = never> = ItemKey & ReadItemValue<T> & { ttlAt?: number; version: number };
+
+type GetItemResult<T = never> =
+  | { found: true; item: ReadItem<T>; meta: OperationMetrics & PartitionInfo }
   | { found: false; item: ItemKey; meta: OperationMetrics & PartitionInfo };
 
-type ReadForTransactionItemResult =
-  | { found: true; hashKey; sortKey?; data; kind; version; ttlAt? }   // as today
-  | { found: true; hashKey; sortKey?; data: ProjectedItem; kind: "projected"; version; ttlAt? }
-  | { found: false; hashKey; sortKey? };
+type MaybeReadItem<T = never> = ({ found: true } & ReadItem<T>) | ({ found: false } & ItemKey);
+type TransactGetItemsResult<Ts extends readonly unknown[] = never[]> = { items: { [K in keyof Ts]: MaybeReadItem<Ts[K]> } };
+
+type QueryItemsPage<Item> = { items: Item[]; count; scannedCount; cursor?; meta; partitionMetas };
+type QueryItemsResult<T = never> = QueryItemsPage<ReadItem<T>>;
+type QueryItemsProjectedResult<T = never> = QueryItemsPage<CallerType<T, ProjectedItem>>;
 ```
 
 A projected point read carries its record as `data` in the ordinary item envelope, and `kind` is
-`"projected"`. One envelope serves every read, so a caller reaches the value through `item.data` whether it
-projected or not, and narrows on `kind` — the same field it already tests to use `data`. `"projected"` is a
-public read-result kind only: `DataKind` stays the storage enum whose index is the on-disk `data_kind` code,
-and no row ever stores this kind. Section 5.9 records the rejected alternative.
+`"projected"`. One envelope, `ReadItem`, serves every read of every operation, so a caller reaches the value
+through `item.data` whether it projected or not, and narrows on `kind` — the same field it already tests to use
+`data`. `"projected"` is a public read-result kind only: `DataKind` stays the storage enum whose index is the
+on-disk `data_kind` code, and no row ever stores this kind. Section 5.9 records the rejected alternative.
 
-A projected query page keeps bare records, `items: ProjectedItem[]`. A page names its projection once, so its
-overload types every element exactly, and an envelope would add keys and a version that the projection did not
-ask for.
+`kind` discriminates the value, so narrowing it also gives the type of `data`. `T` is the caller's own type of
+the json value and of the projected record, for example `getItem<{ name: string }>({ hashKey, projection })`.
+The store holds opaque data, so the library never checks `T`: it is a statement by the caller, like the type
+argument of `JSON.parse` wrappers. A read that names no `T` keeps the widest type the library can return, which
+is what `CallerType` resolves through the `never` default.
 
-`FokosDB.queryItems` and `FokosDB.getItem` get one overload each. The overload whose options type requires
-`projection` returns the projected result type. The existing signature keeps its result type. The `ItemQuerier`
-and `ItemGetter` interfaces carry the same overloads.
+A projected query page keeps bare records. A page names its projection once, so a single overload types every
+element exactly, and an envelope would add keys and a version that the projection did not ask for. Only the
+element of the page differs between the two forms, so `QueryItemsPage` declares the page around its element
+once and both result types are aliases of it. Each still takes `T`, so the type parameter means the caller's own
+data type on every read method, and no caller has to wrap `T` by hand to name a result.
 
-`transactGetItems` returns a union for each position, because each item chooses its own projection. Both found
-members carry `data`, `kind`, and `version`, so `item.found` alone reaches the value and `item.kind ===
-"projected"` narrows the payload type.
+`FokosDB.getItem` and `FokosDB.transactGetItems` have one signature each: the projected result is a member of
+the `ReadItem` union and needs no overload. `FokosDB.queryItems` keeps one overload, whose options type requires
+`projection`, for the bare-record page above. All three take the type parameter, and the `ItemGetter`,
+`ItemQuerier`, and `ItemTransactor` interfaces carry the same signatures.
+
+`transactGetItems` answers each position with the same envelope, because each item chooses its own projection.
+`item.found` alone reaches the value and `item.kind === "projected"` narrows the payload type. Its result follows
+the naming of every other read method, `TransactGetItemsResult`, and carries no `outcome`: the value exists only
+when the read committed, because every other end raises.
+
+Its type parameter is a tuple, one member per item by position, because the purpose of the method is to read
+unrelated items and one type for the call would describe none of them. The tuple fixes the item count as well,
+and an array type gives one type to every position of a request of any length. The options are wrapped in
+`NoInfer`, so a call that names no tuple keeps the widest types: the request keys are not a source of element
+types, and without the guard they would infer `unknown` for every position.
 
 The `queryItems` invariants become:
 
@@ -678,13 +703,15 @@ filter reads `data` inside SQLite and returns three columns per candidate.
 
 The change adds no table, column, or index. No Durable Object migration is needed.
 
-Additive changes: `filter` and `projection` on the requests, the overloads, and the `projected` result variants.
+Additive changes: `filter` and `projection` on the requests, the `queryItems` overload, the optional type
+parameter of the three read methods, and the `projected` member of the read envelope.
 
 Changes that break an existing caller:
 
 - `transactGetItems` rejects duplicate keys.
-- The `transactGetItems` result element type becomes a union with a `projected` variant. A caller that never
-  projects sees the existing variants only.
+- Every read result discriminates `data` on `kind`, and `kind` gains `"projected"`. A caller that reads `data`
+  after testing `kind` is unaffected. A caller that passes `data` on without testing `kind` gets the wider
+  union and has to narrow.
 
 The internal RPC request and response shapes change. As with the selection RFC, a Worker and a Durable Object on
 different versions can fail a read during rollout; do not use a gradual deployment. A rollback restores the old
@@ -785,12 +812,22 @@ fails, and the client could not tell a JSON string from JSON text without a type
 
 ### 5.9 A top-level `projected` field beside the item envelope
 
-The first built form of section 4.2.2. `getItem` survived it, because its overload keeps a non-projecting caller
-on the old result type, but `transactGetItems` chooses per item, so its element type is one union and `found:
-true` stopped discriminating the payload: every caller, projecting or not, had to add a `"data" in item` test
-before reading a value. Two payload field names also block the single item decoder that the roadmap wants across
-the three reads. The record moved into `data` under `kind: "projected"`, which keeps one envelope and narrows on
-the field a caller already tests. Rejected.
+The first built form of section 4.2.2. It put the record in its own field, so `found: true` stopped
+discriminating the payload: every caller, projecting or not, had to add a `"data" in item` test before reading a
+value. Two payload field names also block the single item decoder that the roadmap wants across the three reads.
+The record moved into `data` under `kind: "projected"`, which keeps one envelope and narrows on the field a
+caller already tests. Rejected.
+
+### 5.10 One options type and one result type per operation for a projected read
+
+The second built form. Each point read carried a `…ProjectedOptions` and a `…ProjectedResult` type and one
+overload that paired them. A projected result has the structure of a complete one, so the pair restated the
+envelope for the sole purpose of choosing between two `data` types, and it multiplied by operation: two more
+public names and one more overload each, for `getItem`, `queryItems`, and `transactGetItems`. The overload also
+gave nothing beyond `kind`, which already discriminates the value. `"projected"` became a member of the one
+`ReadItem` union instead, and the type parameter of section 4.2.2 gives the caller the precise type that the
+separate result type could only give as `ProjectedItem`. `queryItems` keeps its overload alone, for the page of
+bare records. Rejected.
 
 ## 6. Frequently asked questions
 

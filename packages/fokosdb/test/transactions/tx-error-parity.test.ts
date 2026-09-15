@@ -95,7 +95,7 @@ describe.each(PATHS)("transactGetItems on %s", (_path, pathOptions) => {
 		} finally {
 			await release();
 		}
-		await expect(db.transactGetItems({ items: keys })).resolves.toMatchObject({ outcome: "committed" });
+		await expect(db.transactGetItems({ items: keys })).resolves.toMatchObject({ items: expect.any(Array) });
 	});
 });
 

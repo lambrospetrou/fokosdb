@@ -7,6 +7,7 @@ import type {
 	ItemKey,
 	JsonComposite,
 	JsonValue,
+	ReadItem,
 	ReturnValuesOnConditionCheckFailure,
 } from "./types.js";
 import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
@@ -221,19 +222,6 @@ export type ReadForTransactionRequest = {
 	items: TransactionReadItem[];
 };
 
-// The value half of a read result, shared by the RPC and public variants. Only `data` differs
-// between them (JSON text on the wire, parsed JsonValue in public), so it is the one type parameter.
-type ReadForTransactionItemValueOf<D> =
-	| {
-			found: true;
-			data: D;
-			kind: DataKind;
-			version: number;
-			/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
-			ttlAt?: number;
-	  }
-	| { found: false };
-
 /**
  * RPC result (participant→Worker read driver). Keys are canonical KeyBytes and sortKey is always
  * present (the empty KeyBytes [] is the absent sentinel), matching the request side. Per the KeyCodec
@@ -248,54 +236,38 @@ type ReadForTransactionItemValueOf<D> =
  * json data is JSON text here, and the type is free of the recursive JsonValue so the Workers-RPC type
  * machinery does not instantiate infinitely deep.
  *
- * The projected result is a separate member and not a parameter of the value type. The wire carries
- * the positional row and never a record, because only the client holds the resolved names. `kind` is
+ * The projected result is its own member. The wire carries the positional row and never a record,
+ * because only the client holds the resolved names of the projection. `kind` is
  * `"projected"`, which is a read-result tag and never a `DataKind`: that array indexes the on-disk
  * `data_kind` code. `version` stays on the wire, because `sameCommittedState` in `db.ts` compares it
  * for each found item.
  */
-export type ReadForTransactionItemResultEncoded =
-	| (ReadForTransactionItemValueOf<string | Uint8Array> & {
-			hashKey: KeyBytes;
-			sortKey: KeyBytes;
-			deleteRevision: number;
-			hasPendingWrite: boolean;
-	  })
+export type ReadForTransactionItemResultEncoded = {
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
+	deleteRevision: number;
+	hasPendingWrite: boolean;
+} & (
 	| {
 			found: true;
-			hashKey: KeyBytes;
-			sortKey: KeyBytes;
-			projected: ProjectedWireRow;
-			kind: "projected";
+			data: string | Uint8Array;
+			kind: DataKind;
 			version: number;
+			/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
 			ttlAt?: number;
-			deleteRevision: number;
-			hasPendingWrite: boolean;
-	  };
+	  }
+	| { found: true; projected: ProjectedWireRow; kind: "projected"; version: number; ttlAt?: number }
+	| { found: false }
+);
 
 /**
- * Public variant surfaced by FokosDB.transactGetItems: `db.ts` has decoded the keys (the empty
- * sentinel maps back to an absent sortKey), parsed json text into a JsonValue, and dropped the
- * 2PC internals.
- *
- * A projected item holds its record in `data`, in the same envelope a complete item uses, and `kind`
- * is `"projected"`. Each found member therefore carries `data`, `kind`, and `version`: a caller reads
- * the value after `if (item.found)`, and tests `kind` only to get the type of the value.
+ * One answer of a read: the item, or the keys that found nothing. Public variant surfaced by
+ * FokosDB.transactGetItems, where `db.ts` has decoded the keys (the empty sentinel maps back to an
+ * absent sortKey), parsed json text into a JsonValue, and dropped the 2PC internals. A found item is
+ * the ordinary `ReadItem` envelope, so a projected item and a complete item have one shape and `T`
+ * types both, exactly as `getItem` returns them.
  */
-export type ReadForTransactionItemResult =
-	| (ReadForTransactionItemValueOf<string | Uint8Array | JsonValue> & {
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
-	  })
-	| {
-			found: true;
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
-			data: ProjectedItem;
-			kind: "projected";
-			version: number;
-			ttlAt?: number;
-	  };
+export type MaybeReadItem<T = never> = ({ found: true } & ReadItem<T>) | ({ found: false } & ItemKey);
 
 export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResultEncoded[];
@@ -429,8 +401,20 @@ export type TransactWriteItemsOptions = {
 	clientRequestToken?: string;
 };
 
-export type TransactGetItemsOptions = {
-	items: Array<ItemKey & { projection?: readonly ProjectionExpression[] }>;
+/** One requested key, with the projection that item asks for. Each item chooses its own. */
+export type TransactGetItemKey = ItemKey & { projection?: readonly ProjectionExpression[] };
+
+/**
+ * `Ts` names the type of each item, by position: `transactGetItems<[Profile, Stats]>` says item 0 holds
+ * a Profile and item 1 a Stats. One request reads unrelated items, so one type for the whole call would
+ * describe none of them. The tuple also fixes the item count, and an array type such as `Profile[]`
+ * gives one type to every position of a request of any length.
+ *
+ * A call that names no `Ts` keeps the widest types, so `NoInfer` guards the options: it keeps `Ts` off
+ * the inference path, where the keys alone would otherwise infer it as `unknown` per position.
+ */
+export type TransactGetItemsOptions<Ts extends readonly unknown[] = never[]> = {
+	items: { [K in keyof Ts]: TransactGetItemKey };
 };
 
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
@@ -474,11 +458,10 @@ export type InitiateWriteResponseEncoded =
 	  };
 
 /**
- * The public result of FokosDB.transactWriteItems. A cancelled transaction raises
- * `FokosTransactionCancelledError` instead.
+ * The public result of FokosDB.transactWriteItems. It carries no outcome: this value exists only when
+ * the transaction committed, because a cancelled one raises `FokosTransactionCancelledError` instead.
  */
-export type InitiateWriteResponse = {
-	outcome: "committed";
+export type TransactWriteItemsResult = {
 	transactionId: TransactionId;
 	idempotencyToken: IdempotencyToken;
 };
@@ -499,7 +482,10 @@ export type InitiateReadRequest = {
  */
 export type InitiateReadResponseEncoded = { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] };
 
-// Public variant surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts
-// boundary. Same positional guarantee as InitiateReadResponseEncoded. A read that cannot answer raises
-// a FokosError instead, for example `FokosConflictError` with `read_conflict` or `pending_write`.
-export type InitiateReadResponse = { outcome: "committed"; items: ReadForTransactionItemResult[] };
+// Public result surfaced by FokosDB.transactGetItems: json items decoded to JsonValue at the db.ts
+// boundary. Same positional guarantee as InitiateReadResponseEncoded, and no outcome for the same
+// reason the write result carries none — a read that cannot answer raises a FokosError instead, for
+// example `FokosConflictError` with `read_conflict` or `pending_write`.
+export type TransactGetItemsResult<Ts extends readonly unknown[] = never[]> = {
+	items: { [K in keyof Ts]: MaybeReadItem<Ts[K]> };
+};

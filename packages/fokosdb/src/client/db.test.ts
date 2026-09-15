@@ -19,6 +19,7 @@ import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
+import type { JsonValue } from "../shared/json-types.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 
@@ -532,7 +533,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				meta: expect.anything(),
 			});
 			// The projected record sits in `data` inside the normal envelope, tagged `kind: "projected"`.
-			invariant(res.found);
+			invariant(res.found && res.item.kind === "projected");
 			expect(Object.keys(res)).toEqual(["found", "item", "meta"]);
 			expect(Object.keys(res.item)).toEqual(["hashKey", "sortKey", "data", "kind", "version"]);
 			expect(Object.keys(res.item.data)).not.toContain("missing");
@@ -552,6 +553,64 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const res = await db.getItem({ hashKey: "alice", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
 			expect(res).toMatchObject({ found: false, item: { hashKey: "alice", sortKey: "nope" } });
 		});
+	});
+
+	// Every property access below also fails to compile when the type parameter stops reaching the
+	// json value or the projected record of a result.
+	describe("FokosDB reads — the caller's own type", () => {
+		type Player = { name: string; score: number };
+
+		it("types the json value and the projected record of every read", async () => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "alice", sortKey: "p1", data: { name: "alpha", score: 3 } });
+
+			const whole = await db.getItem<Player>({ hashKey: "alice", sortKey: "p1" });
+			invariant(whole.found && whole.item.kind === "json");
+			expect(whole.item.data.name).toBe("alpha");
+
+			const projected = await db.getItem<Pick<Player, "name">>({
+				hashKey: "alice",
+				sortKey: "p1",
+				projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }],
+			});
+			invariant(projected.found && projected.item.kind === "projected");
+			expect(projected.item.data.name).toBe("alpha");
+
+			const page = await db.queryItems<Pick<Player, "score">>({
+				queries: [{ hashKey: "alice", sortKeyCondition: { op: "eq", value: "p1" } }],
+				projection: [{ expr: { ref: "data", path: "$.score" }, as: "score" }],
+			});
+			expect(page.items[0].score).toBe(3);
+
+			// One request, two unrelated items: each position is typed by its own member of the tuple.
+			await db.putItem({ hashKey: "alice", sortKey: "p2", data: { label: "beta" } });
+			const read = await db.transactGetItems<[Player, { label: string }]>({
+				items: [
+					{ hashKey: "alice", sortKey: "p1" },
+					{ hashKey: "alice", sortKey: "p2" },
+				],
+			});
+			const [first, second] = read.items;
+			invariant(first.found && first.kind === "json");
+			expect(first.data.score).toBe(3);
+			invariant(second.found && second.kind === "json");
+			expect(second.data.label).toBe("beta");
+		});
+
+		// Type-level contract, never executed: the tuple fixes the item count in both directions, and a
+		// call that names no type keeps the widest types.
+		async function _transactGetItemsArity(db: FokosDB) {
+			// @ts-expect-error two types named, one item passed
+			await db.transactGetItems<[Player, Player]>({ items: [{ hashKey: "a" }] });
+			// @ts-expect-error one type named, two items passed
+			await db.transactGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
+			const wide = await db.transactGetItems({ items: [{ hashKey: "a" }] });
+			if (wide.items[0].found && wide.items[0].kind === "json") {
+				const value: JsonValue = wide.items[0].data;
+				void value;
+			}
+		}
+		void _transactGetItemsArity;
 	});
 
 	describe("FokosDB.queryItems — filters", () => {
@@ -946,15 +1005,13 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const write = await db.transactWriteItems({
 				items: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
 			});
-			expect(write.outcome).toBe("committed");
+			// A cancelled write raises, so the returned token is the commit.
+			expect(write.idempotencyToken).toEqual(expect.any(String));
 
 			const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
-			expect(read.outcome).toBe("committed");
-			if (read.outcome === "committed") {
-				expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
-				const item = read.items[0];
-				if (item.found) expect(item.data).toEqual(obj);
-			}
+			expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
+			const item = read.items[0];
+			if (item.found) expect(item.data).toEqual(obj);
 		});
 
 		it("rejects data that is not JSON-serializable", async () => {
@@ -1071,9 +1128,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const atLimitTx = new Uint8Array(MAX_ITEM_BYTES - KeyCodec.encode("at-limit-tx").byteLength - EST_ROW_BYTES_K);
 			await expect(
 				db.transactWriteItems({ items: [{ hashKey: "at-limit-tx", operation: "put", data: atLimitTx }] }),
-			).resolves.toMatchObject({
-				outcome: "committed",
-			});
+			).resolves.toMatchObject({ transactionId: expect.any(String) });
 		});
 
 		it("caps the transactGetItems item count like the write path", async () => {

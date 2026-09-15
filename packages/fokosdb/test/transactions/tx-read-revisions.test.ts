@@ -81,7 +81,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 
 		// A check advances only the read watermark: `version` and the delete revision stand still.
 		const result = await db.transactGetItems({ items: [key] });
-		expect(result).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 	});
 
 	it("a pending check on the item does not abort the read", async () => {
@@ -92,7 +92,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const release = await holdPendingLock(db, key, { operation: "check", condition: itemExists() });
 		try {
 			const result = await db.transactGetItems({ items: [key] });
-			expect(result).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", version: 1 }] });
+			expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 		} finally {
 			await release();
 		}
@@ -187,7 +187,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		});
 
 		const result = await db.transactGetItems({ items: [key] });
-		expect(result).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 	});
 
 	it("a user delete in a different partition does not change this partition's revision", async () => {
@@ -203,7 +203,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		});
 
 		const result = await db.transactGetItems({ items: [key] });
-		expect(result).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", version: 1 }] });
+		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 	});
 
 	it("the single-partition read fast path applies the same pending-lock classification", async () => {
@@ -219,7 +219,10 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const releaseCheck = await holdPendingLock(db, key, { operation: "check", condition: itemExists() });
 		try {
 			const result = await db.transactGetItems({ items: [key, sibling] });
-			expect(result).toMatchObject({ outcome: "committed" });
+			expect(result.items).toMatchObject([
+				{ found: true, data: "value" },
+				{ found: true, data: "sibling" },
+			]);
 		} finally {
 			await releaseCheck();
 		}

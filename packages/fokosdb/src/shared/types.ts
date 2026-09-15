@@ -1,6 +1,6 @@
 import type {
-	InitiateReadResponse,
-	InitiateWriteResponse,
+	TransactGetItemsResult,
+	TransactWriteItemsResult,
 	TransactGetItemsOptions,
 	TransactWriteItemsOptions,
 } from "./transaction-types.js";
@@ -57,8 +57,17 @@ export type ConditionCheckImage = ConditionCheckImageOf<string | Uint8Array | Js
 // only ever sees `string | Uint8Array`. JSON text → store as jsonb(data)
 export type EncodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: string };
 
+/**
+ * The type a read gives to its json value and to its projected record: the caller's own `T` when the
+ * method names one, and the widest type the library can return when it does not.
+ */
+export type CallerType<T, Widest> = [T] extends [never] ? Widest : T;
+
 // Decoded for public READ — json rebuilt at the db.ts boundary.
-export type DecodedItemData = { kind: "bytes"; data: Uint8Array } | { kind: "text"; data: string } | { kind: "json"; data: JsonValue };
+export type DecodedItemData<T = never> =
+	| { kind: "bytes"; data: Uint8Array }
+	| { kind: "text"; data: string }
+	| { kind: "json"; data: CallerType<T, JsonValue> };
 
 export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor {}
 
@@ -110,59 +119,46 @@ export type DeleteItemResult = {
 	meta: OperationMetrics & PartitionInfo & {};
 };
 
+/**
+ * The value half of a read result. `kind` discriminates it, so a caller that tests `kind` also gets
+ * the type of `data`. `"projected"` is a read-result tag and never a `DataKind`: that array indexes
+ * the on-disk `data_kind` code, and no item is stored projected.
+ */
+export type ReadItemValue<T = never> = DecodedItemData<T> | { kind: "projected"; data: CallerType<T, ProjectedItem> };
+
+/**
+ * One item of a read result: the caller's own keys, the value, and the item metadata. A projection
+ * returns its flat record in `data`, in this same envelope, so one shape serves every read: a caller
+ * reaches the value through `item.data` and tests `kind` for its type, never the presence of a field.
+ *
+ * `T` is the caller's own type of the json value and of the projected record, for example
+ * `getItem<{ name: string }>({ hashKey, projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }] })`.
+ * The library never checks `T` against the stored item.
+ */
+export type ReadItem<T = never> = ItemKey &
+	ReadItemValue<T> & {
+		/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
+		ttlAt?: number;
+		version: number;
+	};
+
 export interface ItemGetter {
-	getItem(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult>;
-	getItem(opts: GetItemOptions): Promise<GetItemResult>;
+	getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T>>;
 }
 
 export type GetItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
-	/** The read returns a flat record in `data` in place of the complete item. */
+	/** The read returns a flat record in `data`, with `kind: "projected"`, in place of the complete item. */
 	projection?: readonly ProjectionExpression[];
 };
 
-/** A `getItem` request that carries a projection. The projected overload resolves on this type. */
-export type GetItemProjectedOptions = GetItemOptions & {
-	projection: readonly ProjectionExpression[];
-};
-
-/**
- * The `getItem` result of a projected request. The flat record sits in `data`, in the same item
- * envelope a complete read returns. `kind` is `"projected"`, which is a read-result tag and never a
- * `DataKind`: that array indexes the on-disk `data_kind` code. A projected item carries `version`
- * and `ttlAt` like every other item.
- */
-export type GetItemProjectedResult =
-	| {
-			found: true;
-			item: {
-				hashKey: string | Uint8Array;
-				sortKey?: string | Uint8Array;
-				data: ProjectedItem;
-				kind: "projected";
-				/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
-				ttlAt?: number;
-				version: number;
-			};
-			meta: OperationMetrics & PartitionInfo & {};
-	  }
-	| { found: false; item: ItemKey; meta: OperationMetrics & PartitionInfo & {} };
-
 // Public result surfaced by FokosDB.getItem. The keys are the caller's own, and db.ts has parsed json
 // text into a JsonValue. The DO's counterpart is GetItemRpcResponse, which carries no keys at all.
-export type GetItemResult =
+export type GetItemResult<T = never> =
 	| {
 			found: true;
-			item: {
-				hashKey: string | Uint8Array;
-				sortKey?: string | Uint8Array;
-				data: string | Uint8Array | JsonValue;
-				kind: DataKind;
-				/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
-				ttlAt?: number;
-				version: number;
-			};
+			item: ReadItem<T>;
 			meta: OperationMetrics & PartitionInfo & {};
 	  }
 	| {
@@ -216,22 +212,24 @@ export type OperationMetrics = {
 };
 
 export interface ItemTransactor {
-	transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse>;
-	transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse>;
+	transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult>;
+	transactGetItems<Ts extends readonly unknown[] = never[]>(
+		opts: NoInfer<TransactGetItemsOptions<Ts>>,
+	): Promise<TransactGetItemsResult<Ts>>;
 }
 
+// Only what a caller of FokosDB needs. The 2PC wire types — the coordinator requests, the driver items,
+// and the encoded read results that carry `projected` as a positional row — stay internal to `db.ts`
+// and the participant, so the public surface shows one read envelope and never the wire beneath it.
 export type {
-	InitiateWriteRequest,
-	InitiateWriteResponse,
-	InitiateReadRequest,
-	InitiateReadResponseEncoded,
-	InitiateReadResponse,
-	TCWriteOperation,
-	TCReadItem,
+	TransactWriteItemsResult,
+	TransactGetItemsResult,
+	MaybeReadItem,
 	TransactWriteItem,
 	TransactWriteItemsOptions,
 	TransactWriteOperationResult,
 	RejectionReason,
+	TransactGetItemKey,
 	TransactGetItemsOptions,
 } from "./transaction-types.js";
 
@@ -249,8 +247,8 @@ export type SortKeyCondition =
 	  };
 
 export interface ItemQuerier {
-	queryItems(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult>;
-	queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
+	queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
 }
 
 /** The selection of a queryItems page: materialized items, or the matched count only. */
@@ -283,8 +281,12 @@ export type QueryItemsProjectedOptions = QueryItemsOptions & {
 	select?: "projection";
 };
 
-/** The `queryItems` result of a projected request: one flat record per item, by resolved name. */
-export type QueryItemsProjectedResult = Omit<QueryItemsResult, "items"> & { items: ProjectedItem[] };
+/**
+ * The `queryItems` result of a projected request: one flat record per item, by resolved name. The page
+ * keeps bare records, because a projected request projects every item of the page, and its overload
+ * therefore types every element exactly.
+ */
+export type QueryItemsProjectedResult<T = never> = QueryItemsPage<CallerType<T, ProjectedItem>>;
 
 export type QueryItemsMeta = {
 	/** Physical SQLite rows read by the leaf query statements. */
@@ -295,19 +297,11 @@ export type QueryItemsMeta = {
 	partitionsVisited: number;
 };
 
-// Public result surfaced by FokosDB.queryItems. The keys are decoded back to the caller's own form and
-// db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which
-// carries raw key bytes and the stored data representation.
-export type QueryItemsResult = {
-	items: Array<{
-		hashKey: string | Uint8Array;
-		sortKey?: string | Uint8Array;
-		data: string | Uint8Array | JsonValue;
-		kind: DataKind;
-		/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
-		ttlAt?: number;
-		version: number;
-	}>;
+// One page of a query, around whichever element the request asks for. Only that element differs
+// between a complete page and a projected one, so the counts, the cursor, and the metas are declared
+// here once and both result types below name this page.
+export type QueryItemsPage<Item> = {
+	items: Item[];
 	/** Matched items in this page. */
 	count: number;
 	/** Evaluated items in this page. Equal to `count` for a request with no filter. With a filter, `count <= scannedCount`. */
@@ -316,3 +310,8 @@ export type QueryItemsResult = {
 	meta: QueryItemsMeta;
 	partitionMetas: Array<OperationMetrics & PartitionInfo>;
 };
+
+// Public result surfaced by FokosDB.queryItems. The keys are decoded back to the caller's own form and
+// db.ts has parsed json text into a JsonValue. The DO's counterpart is QueryItemsRpcResponse, which
+// carries raw key bytes and the stored data representation.
+export type QueryItemsResult<T = never> = QueryItemsPage<ReadItem<T>>;

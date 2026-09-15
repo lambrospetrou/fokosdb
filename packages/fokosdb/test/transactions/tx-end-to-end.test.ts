@@ -475,8 +475,6 @@ describe("transactions - end-to-end", () => {
 
 		const readResult = await db.transactGetItems({ items: keys });
 
-		expect(readResult.outcome).toBe("committed");
-		invariant(readResult.outcome === "committed");
 		expect(readResult.items).toHaveLength(10);
 		for (const item of readResult.items) {
 			expect(item.found).toBe(true);
@@ -541,7 +539,6 @@ describe("transactions - end-to-end", () => {
 		}
 
 		const readResult = await db.transactGetItems({ items: keys });
-		invariant(readResult.outcome === "committed");
 		expect(readResult.items).toHaveLength(keys.length);
 		readResult.items.forEach((item, i) => {
 			expect(item).toMatchObject({
@@ -626,7 +623,7 @@ describe("transactions - end-to-end", () => {
 		});
 		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "value", ttlAt } });
 		const read = await db.transactGetItems({ items: [key] });
-		expect(read).toMatchObject({ outcome: "committed", items: [{ found: true, data: "value", ttlAt }] });
+		expect(read).toMatchObject({ items: [{ found: true, data: "value", ttlAt }] });
 	});
 
 	it("includes ttlAt in idempotent transaction identity", async () => {

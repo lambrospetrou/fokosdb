@@ -60,7 +60,6 @@ describe("transactions - single-partition fast path", () => {
 		const slow = await slowDb.transactGetItems({ items: keys });
 		expect(transactionCalls).toHaveBeenCalledTimes(2);
 		expect(fast).toEqual(slow);
-		invariant(fast.outcome === "committed");
 		expect(fast.items.map((i) => i.found)).toEqual([true, true, false]);
 	});
 
@@ -85,7 +84,6 @@ describe("transactions - single-partition fast path", () => {
 		const slow = await slowDb.transactGetItems({ items });
 		expect(transactionCalls).toHaveBeenCalledTimes(2);
 		expect(fast).toEqual(slow);
-		invariant(fast.outcome === "committed");
 		expect(fast.items[0]).toMatchObject({
 			found: true,
 			hashKey: keys[0].hashKey,
@@ -123,7 +121,7 @@ describe("transactions - single-partition fast path", () => {
 		const { snapshotCalls, transactionCalls } = countReadPathCalls();
 		const result = await db.transactGetItems({ items: keys });
 
-		expect(result.outcome).toBe("committed");
+		expect(result.items).toHaveLength(keys.length);
 		expect(snapshotCalls).not.toHaveBeenCalled();
 		expect(transactionCalls).toHaveBeenCalledTimes(4);
 	});
@@ -143,7 +141,6 @@ describe("transactions - single-partition fast path", () => {
 
 		expect(snapshotCalls).toHaveBeenCalledTimes(1);
 		expect(transactionCalls).toHaveBeenCalledTimes(2);
-		invariant(result.outcome === "committed");
 		expect(result.items.map((i) => i.found)).toEqual([true, true]);
 		expect(result.items.map((i) => (i.found ? i.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
 	});
@@ -183,7 +180,7 @@ describe("transactions - single-partition fast path", () => {
 		expect(partitionCalls).toHaveBeenCalledTimes(1);
 		expect(coordinatorCalls).not.toHaveBeenCalled();
 		// The public shape is the same on both paths, so a caller cannot tell which one ran.
-		expect(result).toMatchObject({ outcome: "committed", transactionId: expect.any(String), idempotencyToken: expect.any(String) });
+		expect(result).toMatchObject({ transactionId: expect.any(String), idempotencyToken: expect.any(String) });
 
 		await expect(db.getItem(keys[0])).resolves.toMatchObject({ found: true, item: { data: "written" } });
 		await expect(db.getItem(keys[1])).resolves.toMatchObject({ found: false });

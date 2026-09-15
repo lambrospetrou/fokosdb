@@ -11,16 +11,15 @@ import {
 	type ConditionExpression,
 	type ExpressionReference,
 	type ExpressionValue,
-	type GetItemProjectedOptions,
-	type GetItemProjectedResult,
 	type GetItemResult,
-	type InitiateReadResponse,
+	type TransactGetItemsResult,
 	type JsonValue,
 	type ProjectedItem,
 	type ProjectionExpression,
 	type QueryItemsProjectedOptions,
 	type QueryItemsProjectedResult,
 	type QueryItemsResult,
+	type ReadItemValue,
 	type SplitConditions,
 	type TransactWriteOperationResult,
 	type UpdateAction,
@@ -263,21 +262,17 @@ function encodeData(data: string | Uint8Array | JsonValue): { data: string; data
 	return { data: JSON.stringify(data), dataEncoding: "json" };
 }
 
-function serializeGetItemResult(result: GetItemResult | GetItemProjectedResult) {
+function serializeGetItemResult(result: GetItemResult) {
 	if (!result.found) return result;
-	if (result.item.kind === "projected") {
-		const { data, ...itemRest } = result.item;
-		return { ...result, item: { ...itemRest, data: serializeProjectedItem(data), dataEncoding: "projected" } };
-	}
-	const { data, ...itemRest } = result.item;
-	return { ...result, item: { ...itemRest, ...encodeData(data) } };
+	const { data: _data, ...itemRest } = result.item;
+	return { ...result, item: { ...itemRest, ...encodeReadItemData(result.item) } };
 }
 
 function serializeQueryItemsResult(result: QueryItemsResult) {
 	return {
 		...result,
 		items: result.items.map((item) => {
-			const { data, hashKey, sortKey, ...rest } = item;
+			const { data: _data, hashKey, sortKey, ...rest } = item;
 			// The HTTP surface is string-only for keys (every endpoint uses v.string()), so writes can
 			// only produce UTF-8 keys and a scan can only decode strings back. A Uint8Array key here
 			// means a binary key reached the store via the programmatic/RPC API — it would serialize to
@@ -286,9 +281,19 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 			if (hashKey instanceof Uint8Array || sortKey instanceof Uint8Array) {
 				throw new HTTPException(500, { message: "fokos/queryItems: binary keys are not supported over the HTTP API" });
 			}
-			return { ...rest, hashKey, sortKey, ...encodeData(data) };
+			return { ...rest, hashKey, sortKey, ...encodeReadItemData(item) };
 		}),
 	};
+}
+
+// One encoder for every read result: `getItem`, `queryItems` and `transactGetItems` return one item
+// envelope, so each of them serializes its value the same way. A projected record gets its own
+// `dataEncoding`, and every stored kind takes encodeData.
+function encodeReadItemData(item: ReadItemValue): {
+	data: string | Record<string, unknown>;
+	dataEncoding: "utf8" | "base64" | "json" | "projected";
+} {
+	return item.kind === "projected" ? { data: serializeProjectedItem(item.data), dataEncoding: "projected" } : encodeData(item.data);
 }
 
 // A projected record can hold a Uint8Array cell (a `b64` literal or byte data). It serializes as
@@ -302,30 +307,17 @@ function serializeProjectedItem(item: ProjectedItem): Record<string, unknown> {
 	);
 }
 
-// The fields are listed rather than spread: spreading the `Omit<QueryItemsResult, "items">`-based
-// result type into c.json overflows the type instantiation limit.
 function serializeProjectedQueryItemsResult(result: QueryItemsProjectedResult) {
-	return {
-		items: result.items.map(serializeProjectedItem),
-		count: result.count,
-		scannedCount: result.scannedCount,
-		cursor: result.cursor,
-		meta: result.meta,
-		partitionMetas: result.partitionMetas,
-	};
+	return { ...result, items: result.items.map(serializeProjectedItem) };
 }
 
-function serializeTransactGetItemsResult(result: InitiateReadResponse) {
+function serializeTransactGetItemsResult(result: TransactGetItemsResult) {
 	return {
 		...result,
 		items: result.items.map((item) => {
 			if (!item.found) return item;
-			if (item.kind === "projected") {
-				const { data, ...rest } = item;
-				return { ...rest, data: serializeProjectedItem(data), dataEncoding: "projected" };
-			}
-			const { data, ...rest } = item;
-			return { ...rest, ...encodeData(data) };
+			const { data: _data, ...rest } = item;
+			return { ...rest, ...encodeReadItemData(item) };
 		}),
 	};
 }
@@ -464,14 +456,6 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
-			if (opts.projection !== undefined) {
-				const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem({
-					...opts,
-					projection: opts.projection,
-				} as GetItemProjectedOptions);
-				c.set("dbItemMeta", result.meta);
-				return c.json(serializeGetItemResult(result));
-			}
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeGetItemResult(result));

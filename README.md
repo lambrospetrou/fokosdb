@@ -78,7 +78,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add global eventual indexes (DynamoDB GSIs).
 - Batch item operations (non-transactions).
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
-- Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
+- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Add jurisdictions support.
 - Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.

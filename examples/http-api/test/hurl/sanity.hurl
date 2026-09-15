@@ -237,7 +237,6 @@ Content-Type: application/json
 }
 HTTP 200
 [Asserts]
-jsonpath "$.outcome" == "committed"
 jsonpath "$.items" count == 3
 jsonpath "$.items[0].found" == true
 jsonpath "$.items[0].data" == "value1"
@@ -258,7 +257,7 @@ Content-Type: application/json
 }
 HTTP 200
 [Asserts]
-jsonpath "$.outcome" == "committed"
+jsonpath "$.items" count == 2
 jsonpath "$.items[0].found" == true
 jsonpath "$.items[1].found" == false
 

@@ -3,15 +3,14 @@ import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import {
 	DataKind,
+	DecodedItemData,
 	DeleteItemOptions,
 	DeleteItemResult,
 	EncodedItemData,
 	GetItemOptions,
-	GetItemProjectedOptions,
-	GetItemProjectedResult,
 	GetItemResult,
-	InitiateReadResponse,
-	InitiateWriteResponse,
+	TransactGetItemsResult,
+	TransactWriteItemsResult,
 	JsonComposite,
 	JsonValue,
 	OperationMetrics,
@@ -39,6 +38,7 @@ import type {
 	SingleShotResponse,
 	TCWriteOperation,
 	TCReadItem,
+	TransactGetItemKey,
 	TransactGetItemsOptions,
 	TransactWriteItemsOptions,
 	TransactWriteOperationResult,
@@ -142,10 +142,11 @@ function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemD
 // The matching decode boundary: json rows arrive from the DO as JSON text, parsed once back to a
 // JsonValue; bytes/text pass through untouched. A parse failure means the stored JSONB → json() text
 // is malformed (a store/encoding bug, not user input), so surface it loudly rather than returning junk.
-function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): string | Uint8Array | JsonValue {
-	if (kind !== "json") return data;
+function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): DecodedItemData {
+	// The store writes `data_kind` beside the value, so the pair is always the one that was written.
+	if (kind !== "json") return { kind, data } as DecodedItemData;
 	try {
-		return JSON.parse(data as string);
+		return { kind, data: JSON.parse(data as string) as JsonValue };
 	} catch (err) {
 		console.error({
 			message: "fokos: failed to parse json item data returned by the store",
@@ -165,7 +166,7 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 			...reason,
 			item: {
 				...reason.item,
-				data: decodeItemData(reason.item.kind, reason.item.data),
+				...decodeItemData(reason.item.kind, reason.item.data),
 			},
 		};
 	}
@@ -306,28 +307,33 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#putItem(opts));
 	}
 
-	async getItem(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult>;
-	async getItem(opts: GetItemOptions): Promise<GetItemResult>;
-	async getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
-		return await withFokosErrors(async () => await this.#getItem(opts));
+	// `T` types the json value and the projected record of the result. The store holds opaque data, so
+	// the library cannot check `T`: it is the caller's own statement about what the item holds.
+	async getItem<T = never>(opts: GetItemOptions): Promise<GetItemResult<T>> {
+		return (await withFokosErrors(async () => await this.#getItem(opts))) as GetItemResult<T>;
 	}
 
 	async deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		return await withFokosErrors(async () => await this.#deleteItem(opts));
 	}
 
-	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+	async transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
 		return await withFokosErrors(async () => await this.#transactWriteItems(opts));
 	}
 
-	async transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
-		return await withFokosErrors(async () => await this.#transactGetItems(opts));
+	// `Ts` types each item by position, so one request can read unrelated items and answer each with its
+	// own type. The store holds opaque data, so the library cannot check `Ts`: it is the caller's own
+	// statement about what each item holds.
+	async transactGetItems<Ts extends readonly unknown[] = never[]>(
+		opts: NoInfer<TransactGetItemsOptions<Ts>>,
+	): Promise<TransactGetItemsResult<Ts>> {
+		return (await withFokosErrors(async () => await this.#transactGetItems(opts))) as TransactGetItemsResult<Ts>;
 	}
 
-	async queryItems(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult>;
-	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult>;
-	async queryItems(opts: QueryItemsOptions): Promise<QueryItemsResult | QueryItemsProjectedResult> {
-		return await withFokosErrors(async () => await this.#queryItems(opts));
+	async queryItems<T = never>(opts: QueryItemsProjectedOptions): Promise<QueryItemsProjectedResult<T>>;
+	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T>>;
+	async queryItems<T = never>(opts: QueryItemsOptions): Promise<QueryItemsResult<T> | QueryItemsProjectedResult<T>> {
+		return (await withFokosErrors(async () => await this.#queryItems(opts))) as QueryItemsResult<T> | QueryItemsProjectedResult<T>;
 	}
 
 	/** Stops at the first failure. A partial destroy stays partial, and a later call continues it. */
@@ -363,7 +369,7 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
 
-	async #getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
+	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
@@ -392,7 +398,7 @@ export class FokosDB {
 			}
 			return {
 				found: true,
-				item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey, data: decodeItemData(res.item.kind, res.item.data) },
+				item: { hashKey: opts.hashKey, sortKey: opts.sortKey, ...res.item, ...decodeItemData(res.item.kind, res.item.data) },
 				meta: publicMeta(res.meta),
 			};
 		}
@@ -418,7 +424,7 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
 	}
 
-	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<InitiateWriteResponse> {
+	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
 		if (opts.clientRequestToken !== undefined) validateClientRequestToken(opts.clientRequestToken);
 
 		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
@@ -459,11 +465,15 @@ export class FokosDB {
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
 
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
-		// method here. See InitiateWriteResponse.
+		// method here. See TransactWriteItemsResult.
 		const encoded = await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
 			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
 		});
-		if (encoded.outcome === "committed") return encoded;
+		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
+		// method returns, and a cancelled one raises instead.
+		if (encoded.outcome === "committed") {
+			return { transactionId: encoded.transactionId, idempotencyToken: encoded.idempotencyToken };
+		}
 		throw transactionCancelledError(encoded);
 	}
 
@@ -476,7 +486,7 @@ export class FokosDB {
 	 * `transactionId` is generated here, as the coordinator would generate it: nothing on this path
 	 * stores it, and it exists only so the public response shape is the same on both paths.
 	 */
-	async #writeSingleShotFastPath(items: TCWriteOperation[]): Promise<InitiateWriteResponse | null> {
+	async #writeSingleShotFastPath(items: TCWriteOperation[]): Promise<TransactWriteItemsResult | null> {
 		if (!this.#options.singlePartitionFastPath) return null;
 
 		const target = singlePartitionTarget(items);
@@ -512,12 +522,14 @@ export class FokosDB {
 		}
 
 		if (response.outcome === "committed") {
-			return { outcome: "committed", transactionId, idempotencyToken: transactionId };
+			return { transactionId, idempotencyToken: transactionId };
 		}
 		throw transactionCancelledError({ transactionId, idempotencyToken: transactionId, ...response });
 	}
 
-	async #transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
+	// The positional types of the public method are erased here: every item takes the same path, and only
+	// the caller knows which type belongs to which position.
+	async #transactGetItems(opts: { items: readonly TransactGetItemKey[] }): Promise<TransactGetItemsResult> {
 		validateTransactGetItemCount(opts.items.length);
 		// Each item is built explicitly: the raw projection AST never crosses the RPC boundary, only the
 		// compiled plan does, and only when the caller asked for one.
@@ -539,17 +551,16 @@ export class FokosDB {
 		// The public boundary — the single exit where the internal representation becomes the public one:
 		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
 		// queryItems), parse json text once into a JsonValue, and drop the read-transaction bookkeeping
-		// (deleteRevision / hasPendingWrite) so callers never depend on it. Those two are meaningless in
-		// a "committed" outcome regardless — the driver raises an error when any item has a pending write.
+		// (deleteRevision / hasPendingWrite) so callers never depend on it. Those two are meaningless in a
+		// committed read regardless — the driver raises an error when any item has a pending write.
 		return {
-			...response,
 			items: response.items.map((encoded, index) => {
 				const { deleteRevision: _deleteRevision, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item } = encoded;
 				const keys = {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
-				if (!item.found) return { ...item, ...keys };
+				if (!item.found) return { ...keys, ...item };
 				if (item.kind === "projected") {
 					// items[i] answers request.items[i], so the record's names come from that item's own plan.
 					const plan = items[index].projection;
@@ -563,7 +574,7 @@ export class FokosDB {
 						...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
 					};
 				}
-				return { ...item, ...keys, data: decodeItemData(item.kind, item.data) };
+				return { ...keys, ...item, ...decodeItemData(item.kind, item.data) };
 			}),
 		};
 	}
@@ -845,8 +856,7 @@ export class FokosDB {
 							hashKey: KeyCodec.decode(stored.hk),
 							sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
 							// json data arrives as JSON text and is parsed once here to the public JsonValue.
-							data: decodeItemData(stored.kind, stored.data),
-							kind: stored.kind,
+							...decodeItemData(stored.kind, stored.data),
 							ttlAt: stored.ttl_epoch_utc_seconds ?? undefined,
 							version: stored.v,
 						});
