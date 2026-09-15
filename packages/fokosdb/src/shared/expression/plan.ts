@@ -14,7 +14,7 @@ export const QUERY_PLAN_VERSION = 1 as const;
 /** hk and sk, bound after the pool in a projected point read. */
 export const PROJECTION_FIXED_BINDING_COUNT = 2;
 /**
- * The parameter every pool-layout plan owns, bound always — the text "[]" when the plan has no
+ * The parameter every pool-layout plan owns, bound always, with the text "[]" when the plan has no
  * descriptor. Workers SQLite requires the bound value count to equal the statement's parameter
  * count, and a statement that runs a pool plan numbers its own parameters explicitly from ?2, so
  * an unused ?1 still counts. Direct-layout plans (condition, update) are unchanged: their

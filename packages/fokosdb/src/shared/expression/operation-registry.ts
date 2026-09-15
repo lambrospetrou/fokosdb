@@ -236,7 +236,7 @@ function buildSqliteOperations(): OperationDefinition[] {
 		if (!arity) continue;
 		const valueArgsFrom = SQLITE_VALUE_PASSTHROUGH.get(name);
 
-		// SQLite's iif takes exactly three arguments; the two-argument form of the expression means a
+		// SQLite's iif takes exactly three arguments. The two-argument form of the expression means a
 		// NULL else-branch, so it is spelled with an explicit NULL.
 		const argumentList = (args: readonly ExpressionValue[], renderers: OperationRenderers, jsonFrom?: number): string => {
 			const rendered = args.map((arg, i) => renderers.renderValue(arg, jsonFrom !== undefined && i >= jsonFrom ? "json" : "sqlite"));

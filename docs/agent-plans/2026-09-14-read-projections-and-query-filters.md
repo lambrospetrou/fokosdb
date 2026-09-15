@@ -256,21 +256,32 @@ type ProjectedItem = Record<string, ProjectedValue>;
 type QueryItemsProjectedResult = Omit<QueryItemsResult, "items"> & { items: ProjectedItem[] };
 
 type GetItemProjectedResult =
-  | { found: true; projected: ProjectedItem; meta: OperationMetrics & PartitionInfo }
+  | { found: true; item: { hashKey; sortKey?; data: ProjectedItem; kind: "projected"; version; ttlAt? }; meta }
   | { found: false; item: ItemKey; meta: OperationMetrics & PartitionInfo };
 
 type ReadForTransactionItemResult =
   | { found: true; hashKey; sortKey?; data; kind; version; ttlAt? }   // as today
-  | { found: true; hashKey; sortKey?; projected: ProjectedItem }
+  | { found: true; hashKey; sortKey?; data: ProjectedItem; kind: "projected"; version; ttlAt? }
   | { found: false; hashKey; sortKey? };
 ```
+
+A projected point read carries its record as `data` in the ordinary item envelope, and `kind` is
+`"projected"`. One envelope serves every read, so a caller reaches the value through `item.data` whether it
+projected or not, and narrows on `kind` — the same field it already tests to use `data`. `"projected"` is a
+public read-result kind only: `DataKind` stays the storage enum whose index is the on-disk `data_kind` code,
+and no row ever stores this kind. Section 5.9 records the rejected alternative.
+
+A projected query page keeps bare records, `items: ProjectedItem[]`. A page names its projection once, so its
+overload types every element exactly, and an envelope would add keys and a version that the projection did not
+ask for.
 
 `FokosDB.queryItems` and `FokosDB.getItem` get one overload each. The overload whose options type requires
 `projection` returns the projected result type. The existing signature keeps its result type. The `ItemQuerier`
 and `ItemGetter` interfaces carry the same overloads.
 
-`transactGetItems` returns a union for each position, because each item chooses its own projection. The
-`"projected" in result` test narrows the union.
+`transactGetItems` returns a union for each position, because each item chooses its own projection. Both found
+members carry `data`, `kind`, and `version`, so `item.found` alone reaches the value and `item.kind ===
+"projected"` narrows the payload type.
 
 The `queryItems` invariants become:
 
@@ -548,7 +559,7 @@ type GetItemRpcRequest = ItemRpcKeys & { projection?: CompiledProjectionPlan };
 
 type GetItemRpcResponse =
   | { found: true; item: { data; kind; ttlAt?; version }; meta }
-  | { found: true; projected: ProjectedWireRow; meta }
+  | { found: true; item: { projected: ProjectedWireRow; kind: "projected"; ttlAt?; version }; meta }
   | { found: false; meta };
 
 type ReadForTransactionRequest = {
@@ -559,9 +570,13 @@ type ReadSnapshotRequest = { items: Array<TransactionItemKey & { projection?: Co
 
 type ReadForTransactionItemResultEncoded =
   | { found: true; hashKey; sortKey; data; kind; version; ttlAt?; deleteRevision; hasPendingWrite }
-  | { found: true; hashKey; sortKey; projected: ProjectedWireRow; version; deleteRevision; hasPendingWrite }
+  | { found: true; hashKey; sortKey; projected: ProjectedWireRow; kind: "projected"; version; ttlAt?; deleteRevision; hasPendingWrite }
   | { found: false; hashKey; sortKey; deleteRevision; hasPendingWrite };
 ```
+
+The wire keeps the positional row under `projected` and never a record: only the client holds the resolved
+names. `kind`, `version`, and `ttlAt` sit beside it, so the client copies the envelope fields from one place and
+decodes the row into `data` at the public boundary.
 
 Routing carries the plans with no change of its own: `withSplitForwarding` and `walkRangeChildren` spread the
 request, the migration fallback passes the request to `internalQueryItemsDirect`, `#txReadForTransaction` spreads
@@ -594,6 +609,9 @@ LIMIT 1
 No row means `found: false`. A projection needs no `LEFT JOIN`: a condition must evaluate on an absent item, a
 projection has nothing to return for one. `readItemLocally` selects the store method from the presence of the
 plan. Split forwarding and the migration fallback are unchanged.
+
+The statement selects `i.v` and `i.ttl_epoch_utc_seconds` beside the cells, so the envelope of section 4.2.2
+costs no extra read and a projected read reports the same `version` a complete read reports.
 
 **`transactGetItems`.** `readForTransactionLocal` selects `getItem` or `getItemProjected` for each item from
 its own plan. The projected result keeps `version`, `deleteRevision`, and `hasPendingWrite`, so
@@ -764,6 +782,15 @@ Rejected.
 
 One column per row instead of two per entry. `json_object` cannot hold a BLOB, so a binary key or byte data
 fails, and the client could not tell a JSON string from JSON text without a type tag. Rejected.
+
+### 5.9 A top-level `projected` field beside the item envelope
+
+The first built form of section 4.2.2. `getItem` survived it, because its overload keeps a non-projecting caller
+on the old result type, but `transactGetItems` chooses per item, so its element type is one union and `found:
+true` stopped discriminating the payload: every caller, projecting or not, had to add a `"data" in item` test
+before reading a value. Two payload field names also block the single item decoder that the roadmap wants across
+the three reads. The record moved into `data` under `kind: "projected"`, which keeps one envelope and narrows on
+the field a caller already tests. Rejected.
 
 ## 6. Frequently asked questions
 

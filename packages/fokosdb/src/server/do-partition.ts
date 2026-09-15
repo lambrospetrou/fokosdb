@@ -46,7 +46,7 @@ import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from
 import { tryWhile } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
 import { collectBatch } from "../shared/partition/batch-scan.js";
-import type { CompiledQueryPlan } from "../shared/expression/plan.js";
+import type { CompiledProjectionPlan, CompiledQueryPlan } from "../shared/expression/plan.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import {
 	estimateItemBytes,
@@ -153,14 +153,23 @@ export type DeleteItemRpcResponse =
 			meta: OperationMetrics & PartitionInfoInternal;
 	  };
 
-export type GetItemRpcRequest = ItemRpcKeys;
+export type GetItemRpcRequest = ItemRpcKeys & { projection?: CompiledProjectionPlan };
 
 // json data is JSON text here; db.ts parses it once at the public boundary. The type is free of the
 // recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
+//
+// A projected read carries the positional row inside `item`, so `kind`, `version`, and `ttlAt` are
+// common to both found variants. `kind` is then `"projected"`, which is a read-result tag and never
+// a stored `data_kind`.
 export type GetItemRpcResponse =
 	| {
 			found: true;
 			item: { data: string | Uint8Array; kind: DataKind; ttlAt?: number; version: number };
+			meta: OperationMetrics & PartitionInfoInternal;
+	  }
+	| {
+			found: true;
+			item: { projected: ProjectedWireRow; kind: "projected"; ttlAt?: number; version: number };
 			meta: OperationMetrics & PartitionInfoInternal;
 	  }
 	| { found: false; meta: OperationMetrics & PartitionInfoInternal };
@@ -2113,7 +2122,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private readItemLocally(pCtx: PartitionContextResolved, req: GetItemRpcRequest): GetItemRpcResponse {
-		const res = this.#store.getItem(req.hashKey, req.sortKey);
+		const res =
+			req.projection === undefined
+				? this.#store.getItem(req.hashKey, req.sortKey)
+				: this.#store.getItemProjected(req.projection, req.hashKey, req.sortKey);
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
 		const actorMeta = {
@@ -2132,6 +2144,18 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 		if (!result) {
 			return { found: false, meta: actorMeta };
+		}
+		if ("projected" in result) {
+			return {
+				found: true,
+				item: {
+					projected: result.projected,
+					kind: "projected",
+					...(result.ttlAt === undefined ? {} : { ttlAt: result.ttlAt }),
+					version: result.version,
+				},
+				meta: actorMeta,
+			};
 		}
 		return {
 			found: true,

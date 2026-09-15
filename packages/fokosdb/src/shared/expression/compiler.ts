@@ -305,7 +305,7 @@ export function compileProjectionExpression(projection: readonly ProjectionExpre
 	if (!utf8WithinLimit(composeProjectionStatement({ valueSql, typeSql }), EXPRESSION_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
-	// The pool ?1 is bound always — the text "[]" when the plan has no descriptor — because Workers
+	// The pool ?1 is bound always, with the text "[]" when the plan has no descriptor. Workers
 	// SQLite requires the bound value count to equal the statement's parameter count, and the
 	// statement's ?2 and ?3 keep ?1 in that count.
 	const completeBindingCount = POOL_PARAM + PROJECTION_FIXED_BINDING_COUNT;
@@ -335,7 +335,8 @@ export function compileQueryExpression(input: {
 	}
 	const filterAnalysis = filter === undefined ? undefined : validateConditionExpression(filter, "filter");
 	const projectionAnalysis = projection === undefined ? undefined : validateProjectionExpression(projection);
-	// Filter and projection share one context, so a path or a literal both use binds once.
+	// The filter and the projection share one compile context. A path or a literal that both halves
+	// use binds one time only.
 	const context: CompileContext = {
 		bindings: [],
 		bindingIndexByKey: new Map(),
@@ -373,9 +374,9 @@ export function compileQueryExpression(input: {
 		projection: projectionFragments,
 		bindings: context.bindings,
 		bindingCount: context.bindings.length,
-		// Every pool plan owns ?1 and binds it always — the text "[]" when the plan has no
-		// descriptor — because Workers SQLite requires the bound value count to equal the
-		// statement's parameter count; the scan parameters are numbered explicitly from ?2.
+		// Every pool plan owns ?1 and binds it always, with the text "[]" when the plan has no
+		// descriptor. Workers SQLite requires the bound value count to equal the statement's
+		// parameter count. The scan parameters are numbered explicitly from ?2.
 		completeBindingCount: POOL_PARAM + QUERY_MAX_TRAILING_BINDING_COUNT,
 		requiredColumns: EXPRESSION_REQUIRED_COLUMNS.filter(
 			(column) =>

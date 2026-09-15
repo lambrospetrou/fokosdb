@@ -11,6 +11,8 @@ import {
 	type ConditionExpression,
 	type ExpressionReference,
 	type ExpressionValue,
+	type GetItemProjectedOptions,
+	type GetItemProjectedResult,
 	type GetItemResult,
 	type InitiateReadResponse,
 	type JsonValue,
@@ -113,6 +115,7 @@ const PutItemBodySchema = v.strictObject({
 const GetItemBodySchema = v.object({
 	hashKey: v.string(),
 	sortKey: v.optional(v.string()),
+	projection: v.optional(v.array(ProjectionEntrySchema)),
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -182,7 +185,9 @@ const TransactWriteItemsBodySchema = v.object({
 });
 
 const TransactGetItemsBodySchema = v.object({
-	items: v.array(v.object({ hashKey: v.string(), sortKey: v.optional(v.string()) })),
+	items: v.array(
+		v.object({ hashKey: v.string(), sortKey: v.optional(v.string()), projection: v.optional(v.array(ProjectionEntrySchema)) }),
+	),
 	partitionOptions: PartitionOptionsSchema,
 });
 
@@ -258,8 +263,12 @@ function encodeData(data: string | Uint8Array | JsonValue): { data: string; data
 	return { data: JSON.stringify(data), dataEncoding: "json" };
 }
 
-function serializeGetItemResult(result: GetItemResult) {
+function serializeGetItemResult(result: GetItemResult | GetItemProjectedResult) {
 	if (!result.found) return result;
+	if (result.item.kind === "projected") {
+		const { data, ...itemRest } = result.item;
+		return { ...result, item: { ...itemRest, data: serializeProjectedItem(data), dataEncoding: "projected" } };
+	}
 	const { data, ...itemRest } = result.item;
 	return { ...result, item: { ...itemRest, ...encodeData(data) } };
 }
@@ -282,7 +291,7 @@ function serializeQueryItemsResult(result: QueryItemsResult) {
 	};
 }
 
-// A projected record can hold a Uint8Array cell (a `b64` literal or byte data); it serializes as
+// A projected record can hold a Uint8Array cell (a `b64` literal or byte data). It serializes as
 // `{ b64 }`. Every other projected value is already JSON-serializable.
 function serializeProjectedItem(item: ProjectedItem): Record<string, unknown> {
 	return Object.fromEntries(
@@ -311,6 +320,10 @@ function serializeTransactGetItemsResult(result: InitiateReadResponse) {
 		...result,
 		items: result.items.map((item) => {
 			if (!item.found) return item;
+			if (item.kind === "projected") {
+				const { data, ...rest } = item;
+				return { ...rest, data: serializeProjectedItem(data), dataEncoding: "projected" };
+			}
 			const { data, ...rest } = item;
 			return { ...rest, ...encodeData(data) };
 		}),
@@ -451,6 +464,14 @@ api.post("/rpc/:tableName/:rpcAction", async (c) => {
 		}
 		case "getItem": {
 			const { partitionOptions, ...opts } = parseBody(GetItemBodySchema);
+			if (opts.projection !== undefined) {
+				const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem({
+					...opts,
+					projection: opts.projection,
+				} as GetItemProjectedOptions);
+				c.set("dbItemMeta", result.meta);
+				return c.json(serializeGetItemResult(result));
+			}
 			const result = await makeFokosDB(c.env, tableName, partitionOptions).getItem(opts);
 			c.set("dbItemMeta", result.meta);
 			return c.json(serializeGetItemResult(result));

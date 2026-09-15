@@ -90,7 +90,7 @@ export function decodeCursor(s: string): DecodedCursor {
  * limit, maxResponseBytes, select, and cursor, which may change between pages.
  *
  * After the query list, each identity appends one byte 0 when absent, or one byte 1, a u32le byte
- * length, and its UTF-8 bytes when present — filter first, then projection. Both absent appends
+ * length, and its UTF-8 bytes when present: filter first, then projection. Both absent appends
  * nothing, so a request without a plan keeps the bytes a two-argument call produced.
  */
 export function computeCursorFingerprint(

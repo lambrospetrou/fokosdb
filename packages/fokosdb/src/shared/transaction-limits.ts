@@ -13,6 +13,7 @@ import type { PartitionContextResolved } from "./partition-topology/partition-co
 import type {
 	ParticipantOperationResultEncoded,
 	RejectionReasonEncoded,
+	TransactionItemKey,
 	TransactionOperationType,
 	TransactionTimestamp,
 } from "./transaction-types.js";
@@ -319,6 +320,27 @@ export function validateTransactGetItemCount(itemCount: number): void {
 			message: `transactGetItems supports at most ${MAX_ITEMS_PER_TX} items`,
 			attributes: { limit: MAX_ITEMS_PER_TX, count: itemCount },
 		});
+	}
+}
+
+/**
+ * Rejects a `transactGetItems` request in which two items name the same key. The two-phase driver
+ * pairs phase 1 with phase 2 by key, so two items naming one key would collapse to a single entry
+ * and, with two different projections, one of them would receive the other's record. Runs on the
+ * ENCODED keys, after the caller encodes them. Identity is `KeyCodec.pairKey` over the canonical
+ * bytes, never a template string over the public keys (the write-side check above gives the reason).
+ */
+export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[]): void {
+	const seen = new Set<bigint>();
+	for (const [itemIndex, item] of keys.entries()) {
+		const identity = KeyCodec.pairKey(item.hashKey, item.sortKey);
+		if (seen.has(identity)) {
+			throw new FokosValidationError(VALIDATION_CODES.transact_duplicate_key, {
+				message: "transactGetItems duplicate key",
+				attributes: { itemIndex, ...decodeItemKeys(item.hashKey, item.sortKey) },
+			});
+		}
+		seen.add(identity);
 	}
 }
 

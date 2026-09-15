@@ -7,6 +7,8 @@ import {
 	DeleteItemResult,
 	EncodedItemData,
 	GetItemOptions,
+	GetItemProjectedOptions,
+	GetItemProjectedResult,
 	GetItemResult,
 	InitiateReadResponse,
 	InitiateWriteResponse,
@@ -51,6 +53,7 @@ import {
 	validateReturnValuesOnConditionCheckFailure,
 	singlePartitionTarget,
 	validateTransactGetItemCount,
+	validateTransactGetItemKeys,
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 	decodeItemKeys,
@@ -89,7 +92,12 @@ import {
 	MAX_RESPONSE_BYTES_PER_PAGE,
 	QueryPageBudget,
 } from "../shared/query/page-budget.js";
-import { compileConditionExpression, compileQueryExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
+import {
+	compileConditionExpression,
+	compileProjectionExpression,
+	compileQueryExpression,
+	compileUpdateExpression,
+} from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
 import { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
 
@@ -298,7 +306,9 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#putItem(opts));
 	}
 
-	async getItem(opts: GetItemOptions): Promise<GetItemResult> {
+	async getItem(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult>;
+	async getItem(opts: GetItemOptions): Promise<GetItemResult>;
+	async getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
 		return await withFokosErrors(async () => await this.#getItem(opts));
 	}
 
@@ -353,16 +363,33 @@ export class FokosDB {
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
 	}
 
-	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
+	async #getItem(opts: GetItemOptions): Promise<GetItemResult | GetItemProjectedResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
+		const projection =
+			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
 		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
 		const stub = partitionStub(env[this.#options.topology.partitionContext().ns], doId);
-		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey });
+		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) });
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
+			if (res.item.kind === "projected") {
+				invariant(projection, "fokos/getItem: projected response without a projection plan");
+				return {
+					found: true,
+					item: {
+						hashKey: opts.hashKey,
+						sortKey: opts.sortKey,
+						data: projectedItemFromWireRow(projection.names, res.item.projected),
+						kind: "projected",
+						...(res.item.ttlAt === undefined ? {} : { ttlAt: res.item.ttlAt }),
+						version: res.item.version,
+					},
+					meta: publicMeta(res.meta),
+				};
+			}
 			return {
 				found: true,
 				item: { ...res.item, hashKey: opts.hashKey, sortKey: opts.sortKey, data: decodeItemData(res.item.kind, res.item.data) },
@@ -492,13 +519,18 @@ export class FokosDB {
 
 	async #transactGetItems(opts: TransactGetItemsOptions): Promise<InitiateReadResponse> {
 		validateTransactGetItemCount(opts.items.length);
+		// Each item is built explicitly: the raw projection AST never crosses the RPC boundary, only the
+		// compiled plan does, and only when the caller asked for one.
 		const items: TCReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
 			const hashKey = encodeHashKey(item.hashKey);
 			const sortKey = encodeSortKey(item.sortKey);
+			const projection =
+				item.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(item.projection!));
 			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-			return { ...item, hashKey, sortKey, partitionContext };
+			return { hashKey, sortKey, partitionContext, ...(projection === undefined ? {} : { projection }) };
 		});
+		validateTransactGetItemKeys(items);
 
 		// TODO: Make the two-phase driver location configurable. A global caller Worker can be far from the
 		// data partitions, so a coordinator near those partitions can reduce repeated cross-region trips.
@@ -511,12 +543,27 @@ export class FokosDB {
 		// a "committed" outcome regardless — the driver raises an error when any item has a pending write.
 		return {
 			...response,
-			items: response.items.map(({ deleteRevision: _deleteRevision, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item }) => {
+			items: response.items.map((encoded, index) => {
+				const { deleteRevision: _deleteRevision, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item } = encoded;
 				const keys = {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
-				return item.found ? { ...item, ...keys, data: decodeItemData(item.kind, item.data) } : { ...item, ...keys };
+				if (!item.found) return { ...item, ...keys };
+				if (item.kind === "projected") {
+					// items[i] answers request.items[i], so the record's names come from that item's own plan.
+					const plan = items[index].projection;
+					invariant(plan, "fokos/transactGetItems: projected result without a projection plan");
+					return {
+						...keys,
+						found: true as const,
+						data: projectedItemFromWireRow(plan.names, item.projected),
+						kind: "projected" as const,
+						version: item.version,
+						...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
+					};
+				}
+				return { ...item, ...keys, data: decodeItemData(item.kind, item.data) };
 			}),
 		};
 	}
@@ -532,7 +579,9 @@ export class FokosDB {
 		if (!target) return null;
 
 		const stub = partitionStubByName(env[target.ns], target.doName);
-		const request = { items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) };
+		const request = {
+			items: items.map(({ hashKey, sortKey, projection }) => ({ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) })),
+		};
 		let response: ReadSnapshotResponse;
 		try {
 			response = await tryWhile(
@@ -573,7 +622,11 @@ export class FokosDB {
 					async () =>
 						await partitionStubByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
-							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
+							items: items.map((i) => ({
+								hashKey: i.hashKey,
+								sortKey: i.sortKey,
+								...(i.projection === undefined ? {} : { projection: i.projection }),
+							})),
 						}),
 					(_err, nextAttempt) => nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
@@ -597,7 +650,11 @@ export class FokosDB {
 					async () =>
 						await partitionStubByName(env[pCtx.ns], pCtx.doName).txReadForTransaction(pCtx, {
 							transactionId,
-							items: items.map((i) => ({ hashKey: i.hashKey, sortKey: i.sortKey })),
+							items: items.map((i) => ({
+								hashKey: i.hashKey,
+								sortKey: i.sortKey,
+								...(i.projection === undefined ? {} : { projection: i.projection }),
+							})),
 						}),
 					(_err, nextAttempt) => nextAttempt <= 5,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
@@ -787,7 +844,7 @@ export class FokosDB {
 						items.push({
 							hashKey: KeyCodec.decode(stored.hk),
 							sortKey: stored.sk.byteLength === 0 ? undefined : KeyCodec.decode(stored.sk),
-							// json data arrives as JSON text — parse it once here to the public JsonValue.
+							// json data arrives as JSON text and is parsed once here to the public JsonValue.
 							data: decodeItemData(stored.kind, stored.data),
 							kind: stored.kind,
 							ttlAt: stored.ttl_epoch_utc_seconds ?? undefined,

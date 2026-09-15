@@ -111,13 +111,43 @@ export type DeleteItemResult = {
 };
 
 export interface ItemGetter {
+	getItem(opts: GetItemProjectedOptions): Promise<GetItemProjectedResult>;
 	getItem(opts: GetItemOptions): Promise<GetItemResult>;
 }
 
 export type GetItemOptions = {
 	hashKey: string | Uint8Array;
 	sortKey?: string | Uint8Array;
+	/** The read returns a flat record in `data` in place of the complete item. */
+	projection?: readonly ProjectionExpression[];
 };
+
+/** A `getItem` request that carries a projection. The projected overload resolves on this type. */
+export type GetItemProjectedOptions = GetItemOptions & {
+	projection: readonly ProjectionExpression[];
+};
+
+/**
+ * The `getItem` result of a projected request. The flat record sits in `data`, in the same item
+ * envelope a complete read returns. `kind` is `"projected"`, which is a read-result tag and never a
+ * `DataKind`: that array indexes the on-disk `data_kind` code. A projected item carries `version`
+ * and `ttlAt` like every other item.
+ */
+export type GetItemProjectedResult =
+	| {
+			found: true;
+			item: {
+				hashKey: string | Uint8Array;
+				sortKey?: string | Uint8Array;
+				data: ProjectedItem;
+				kind: "projected";
+				/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
+				ttlAt?: number;
+				version: number;
+			};
+			meta: OperationMetrics & PartitionInfo & {};
+	  }
+	| { found: false; item: ItemKey; meta: OperationMetrics & PartitionInfo & {} };
 
 // Public result surfaced by FokosDB.getItem. The keys are the caller's own, and db.ts has parsed json
 // text into a JsonValue. The DO's counterpart is GetItemRpcResponse, which carries no keys at all.
@@ -237,12 +267,13 @@ export type QueryItemsOptions = {
 	/** Defaults to "projection". "count" returns `items: []` and the matched count of one page. */
 	select?: QuerySelect;
 	/**
-	 * SQLite evaluates the filter on every candidate. It does not change candidate selection, routing, or the
-	 * sort-key interval. A rejected candidate still consumes the page's evaluated budgets and advances the
-	 * cursor. Valid with `select: "count"`, which then returns the matched count of the page.
+	 * SQLite evaluates the filter on each candidate. The filter does not change candidate selection, routing,
+	 * or the sort-key interval. A rejected candidate still consumes the evaluated budgets of the page, and it
+	 * still advances the cursor. The filter is valid with `select: "count"`. Count mode then returns the
+	 * matched count of the page.
 	 */
 	filter?: ConditionExpression;
-	/** A projection returns a flat record per item in place of the complete item. Not valid with `select: "count"`. */
+	/** The page returns a flat record for each item in place of the complete item. It is not valid with `select: "count"`. */
 	projection?: readonly ProjectionExpression[];
 };
 
@@ -279,7 +310,7 @@ export type QueryItemsResult = {
 	}>;
 	/** Matched items in this page. */
 	count: number;
-	/** Evaluated items in this page. Equal to `count` for a request with no filter; with a filter, `count <= scannedCount`. */
+	/** Evaluated items in this page. Equal to `count` for a request with no filter. With a filter, `count <= scannedCount`. */
 	scannedCount: number;
 	cursor?: string;
 	meta: QueryItemsMeta;

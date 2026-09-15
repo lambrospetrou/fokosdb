@@ -11,6 +11,9 @@ import { compileConditionExpression, compileProjectionExpression, compileQueryEx
 import { composeProjectionStatement, composeQueryStatement, type CompiledProjectionPlan, type CompiledQueryPlan } from "./plan.js";
 import { decodeProjectedRow, projectedItemFromWireRow, type ProjectedItem } from "./projection.js";
 import { evaluateConditionPlan } from "./runtime.js";
+import { EXPRESSION_LIMITS } from "./limits.js";
+import { estimateProjectedRowBytes } from "../partition/partition-store.js";
+import { MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { MISSING_NULL_SEMANTIC_FIXTURES, PROJECTION_PRESENCE_FIXTURES } from "./test-fixtures.js";
 import type { ConditionExpression, ProjectionExpression } from "./types.js";
 
@@ -419,6 +422,36 @@ describe("query statement", () => {
 		});
 	});
 
+	it("runs a 100-choice in filter with a maximum-size projection in one statement", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-query.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode("a"), item("a", { n: 5 }));
+			const plan = compileQueryExpression({
+				filter: {
+					op: "in",
+					args: [{ ref: "v" }, ...Array.from({ length: EXPRESSION_LIMITS.inChoices }, (_, i) => ({ val: i }))],
+				} as unknown as ConditionExpression,
+				projection: [
+					{ expr: { ref: "sortKey" }, as: "k0" },
+					{ expr: { ref: "data", path: "$.n" }, as: "k1" },
+					{ expr: { ref: "v" }, as: "k2" },
+					...Array.from({ length: EXPRESSION_LIMITS.projectionEntries - 3 }, (_, i) => ({
+						expr: { val: i + 3 } as const,
+						as: `k${i + 3}`,
+					})),
+				],
+			});
+			expect(plan.completeBindingCount).toBeLessThanOrEqual(EXPRESSION_LIMITS.completeStatementBindings);
+
+			const scanned = scan(state, plan, "projection");
+			expect(scanned.map((row) => row.matched)).toEqual([1]);
+			// The CTE has 3 fixed columns plus 2 per entry: 3 + 2 × 48 = 99, under the 100-column cap.
+			const record = projectedItemFromWireRow(plan.projection!.names, decodeProjectedRow(scanned[0], plan.projection!.names.length));
+			expect(Object.keys(record)).toHaveLength(EXPRESSION_LIMITS.projectionEntries);
+			expect(record).toMatchObject({ k0: "a", k1: 5, k2: 1, k47: 47 });
+		});
+	});
+
 	it("binds an empty pool for a plan with no descriptor", async () => {
 		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-query.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
@@ -476,4 +509,63 @@ describe("query statement", () => {
 			});
 		},
 	);
+});
+
+describe("projected point read — limits", () => {
+	it("runs a maximum-size projection in one statement", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-projection.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const hashKey = KeyCodec.encode("h");
+			const sortKey = KeyCodec.encode("a");
+			putFixture(state.storage, hashKey, sortKey, { hashKey: "h", sortKey: "a", data: { n: 5 }, kind: "json" });
+			// Workers SQLite allows 100 result columns; the point-read statement has 2 fixed columns
+			// (v, ttl) plus 2 per entry, and the CTE query has 3 fixed plus 2 per entry. 48 entries is
+			// the largest count under both caps.
+			const plan = compileProjectionExpression([
+				{ expr: { ref: "sortKey" }, as: "k0" },
+				{ expr: { ref: "data", path: "$.n" }, as: "k1" },
+				{ expr: { ref: "v" }, as: "k2" },
+				...Array.from({ length: EXPRESSION_LIMITS.projectionEntries - 3 }, (_, i) => ({
+					expr: { val: i + 3 } as const,
+					as: `k${i + 3}`,
+				})),
+			]);
+			expect(plan.completeBindingCount).toBeLessThanOrEqual(EXPRESSION_LIMITS.completeStatementBindings);
+
+			const record = readProjected(state, plan, hashKey, sortKey);
+			expect(Object.keys(record!)).toHaveLength(EXPRESSION_LIMITS.projectionEntries);
+			expect(record).toMatchObject({ k0: "a", k1: 5, k2: 1, k47: 47 });
+		});
+	});
+
+	it("a projected read of a 400 KiB item returns a wire row two orders of magnitude smaller", async () => {
+		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-projection.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const hashKey = KeyCodec.encode("h");
+			const sortKey = KeyCodec.encode("a");
+			// The pad is sized so the measured row lands just under the item byte cap.
+			const doc = { n: 7, pad: "x".repeat(MAX_ITEM_BYTES - 1024) };
+			const data = JSON.stringify(doc);
+			const store = new PartitionStore(state.storage);
+			const storedBytes = store.measureItemBytes({ hk: hashKey, sk: sortKey, data, kind: "json" });
+			expect(storedBytes).toBeLessThanOrEqual(MAX_ITEM_BYTES);
+			expect(storedBytes).toBeGreaterThan(MAX_ITEM_BYTES - 4 * 1024);
+			store.upsertItem({ hk: hashKey, sk: sortKey, data, kind: "json", ttlAt: null, txOrderTs: 0 });
+
+			const plan = compileProjectionExpression([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "sortKey" } }]);
+			const row = state.storage.sql
+				.exec<
+					Record<string, SqlStorageValue>
+				>(composeProjectionStatement(plan), ...materializeExpressionBindings(plan.bindings, "pool"), hashKey, sortKey)
+				.toArray()[0];
+			expect(row).toBeDefined();
+			const wire = decodeProjectedRow(row, plan.names.length);
+			expect(projectedItemFromWireRow(plan.names, wire)).toEqual({ "$.n": 7, sortKey: "a" });
+
+			// Measured in workerd: 408,704 stored bytes against a 74-byte wire row, about 5,500 times
+			// smaller. The projected read touches the same row. Only the returned payload shrinks.
+			const projectedBytes = estimateProjectedRowBytes(wire);
+			expect(projectedBytes * 100).toBeLessThan(storedBytes);
+		});
+	});
 });

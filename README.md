@@ -62,7 +62,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
-- Garbage collect the items table after splits and hash key promotions.
+- Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
 - Use the partial range topology within each partition to speed up transactions as well.
 - Add topology keeper and encoding. Schema and versioning per change (split).
@@ -81,18 +81,17 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`. One item envelope for `getItem`, `queryItems` and `transactGetItems`, so a client can write a single item decoder.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Add jurisdictions support.
-- Expose an RPC/API to trigger a manual split.
 - Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
-- Allow custom split conditions in user-provided function of the partition DO class, and also for custom item selection per child partition.
-- Implement projections, filter expression, and update expressions as described in `docs/agent-plans/2026-08-29-typed-expression-engine-spec.md`. Condition expressions are fully implemented.
-- Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
-- Add a healthcheck of each partition DO to a provider Workers KV namespace (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
-- Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion.
 - User provided code running inside the DO for N+1 operations. ONLY for library or self-hosted mode where the user controls the Durable Object class used, otherwise we would need Dynamic Workers and the `pipe()` operator.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
+- Expose an RPC/API to trigger a manual split.
+- Allow custom split conditions in user-provided function of the partition DO class, and also for custom item selection per child partition.
+- Check for background alarms runaway errors due to errors, for example: `✘ [ERROR] Uncaught Error: fokos: initFromSplit called with conflicting options. child: ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059 vs ad5552a31e5a5114e6c86c803e1b4b246f682f228be84e94591af0d193355059, parent: undefined vs 12b4100173770e9309970f0603f1e4fa4b0fa58877fb760afd31a29eef73691e, splitType: undefined vs hash Error`
+- Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
+- Consider adding reference tables, small tables replicated in all partitions. Useful on their own, and also with anything we do for server-side procedures.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
 - Support large items through R2.
 - Support CASPaxosDO for the data partitions for multi-region availability. Use Paxos Commit and CAS Paxos for the topology keeper for higher availability (speed is no issue).

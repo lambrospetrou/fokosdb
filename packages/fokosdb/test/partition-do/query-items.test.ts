@@ -168,7 +168,7 @@ describe("PartitionDO — range split", () => {
 				}
 				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "big5" }] } });
 
-				// 250 KiB admits two 100 KiB items but not six; the page drains only because the five
+				// 250 KiB admits two 100 KiB items but not six. The page drains only because the five
 				// rejected candidates charged nothing to the response budget.
 				const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 }));
 				expect(res.nextCursor).toBeNull();
@@ -522,7 +522,7 @@ describe("PartitionDO — range split", () => {
 				expect(result.meta.forwardCount).toBe(0);
 			});
 
-			// Drain pending child migrations so their background work doesn't outlive the test.
+			// Drain pending child migrations so their background work does not outlive the test.
 			await root.awaitSplitCompleted();
 		});
 
@@ -739,7 +739,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
 
-			// Drain pending child migrations so their background work doesn't outlive the test.
+			// Drain pending child migrations so their background work does not outlive the test.
 			await root.awaitSplitCompleted();
 		});
 
@@ -801,7 +801,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
 
-			// Drain pending child migrations so their background work doesn't outlive the test.
+			// Drain pending child migrations so their background work does not outlive the test.
 			await root.awaitSplitCompleted();
 		});
 
@@ -830,7 +830,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
 
-			// Drain pending child migrations so their background work doesn't outlive the test.
+			// Drain pending child migrations so their background work does not outlive the test.
 			await root.awaitSplitCompleted();
 		});
 

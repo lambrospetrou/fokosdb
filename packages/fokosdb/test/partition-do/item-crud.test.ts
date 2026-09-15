@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
 import { kb, makeStub } from "./helpers.js";
 
 describe("PartitionDO - putItem / getItem", () => {
@@ -130,6 +131,33 @@ describe("PartitionDO - putItem / getItem", () => {
 			servedByActorId: expect.any(String),
 			servedByActorName: expect.stringMatching(/^test\..+/),
 		});
+	});
+
+	it("getItem with a projection returns the wire cells and no item envelope", async ({ expect }) => {
+		const { ctx, stub } = makeStub();
+
+		await stub.apiPutItem(ctx, {
+			hashKey: kb("hk"),
+			sortKey: kb("sk"),
+			data: JSON.stringify({ n: 7, none: null, k: [1, 2] }),
+			kind: "json",
+		});
+		const projection = compileProjectionExpression([
+			{ expr: { ref: "data", path: "$.n" } },
+			{ expr: { ref: "data", path: "$.none" } },
+			{ expr: { ref: "data", path: "$.k" }, as: "k" },
+			{ expr: { ref: "v" }, as: "ver" },
+		]);
+		const result = await stub.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), projection });
+		expect(result).toMatchObject({
+			found: true,
+			item: { projected: [7, null, { json: "[1,2]" }, 1], kind: "projected", version: 1 },
+			meta: { forwardCount: 0 },
+		});
+		expect(result.found && result.item.kind === "projected" ? result.item.projected : []).toHaveLength(4);
+
+		const missing = await stub.apiGetItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk"), projection });
+		expect(missing).toMatchObject({ found: false });
 	});
 
 	it("includes operation metrics in getItem result", async ({ expect }) => {

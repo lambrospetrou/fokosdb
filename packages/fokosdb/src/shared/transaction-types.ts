@@ -9,8 +9,9 @@ import type {
 	JsonValue,
 	ReturnValuesOnConditionCheckFailure,
 } from "./types.js";
-import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
-import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
+import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
+import type { ProjectedItem, ProjectedWireRow } from "./expression/projection.js";
+import type { ConditionExpression, ProjectionExpression, UpdateExpression } from "./expression/types.js";
 import type { FokosErrorCode } from "./errors-operations.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
@@ -212,9 +213,12 @@ export type DebugForceResolveTransactionResponse = CommitResponse | CancelRespon
 
 // ─── PartitionDO — ReadForTransaction ─────────────────────────────────────────
 
+/** A read item on the wire: the canonical keys plus the item's compiled projection plan, when it has one. */
+export type TransactionReadItem = TransactionItemKey & { projection?: CompiledProjectionPlan };
+
 export type ReadForTransactionRequest = {
 	transactionId: TransactionId;
-	items: TransactionItemKey[];
+	items: TransactionReadItem[];
 };
 
 // The value half of a read result, shared by the RPC and public variants. Only `data` differs
@@ -243,23 +247,55 @@ type ReadForTransactionItemValueOf<D> =
  *
  * json data is JSON text here, and the type is free of the recursive JsonValue so the Workers-RPC type
  * machinery does not instantiate infinitely deep.
+ *
+ * The projected result is a separate member and not a parameter of the value type. The wire carries
+ * the positional row and never a record, because only the client holds the resolved names. `kind` is
+ * `"projected"`, which is a read-result tag and never a `DataKind`: that array indexes the on-disk
+ * `data_kind` code. `version` stays on the wire, because `sameCommittedState` in `db.ts` compares it
+ * for each found item.
  */
-export type ReadForTransactionItemResultEncoded = ReadForTransactionItemValueOf<string | Uint8Array> & {
-	hashKey: KeyBytes;
-	sortKey: KeyBytes;
-	deleteRevision: number;
-	hasPendingWrite: boolean;
-};
+export type ReadForTransactionItemResultEncoded =
+	| (ReadForTransactionItemValueOf<string | Uint8Array> & {
+			hashKey: KeyBytes;
+			sortKey: KeyBytes;
+			deleteRevision: number;
+			hasPendingWrite: boolean;
+	  })
+	| {
+			found: true;
+			hashKey: KeyBytes;
+			sortKey: KeyBytes;
+			projected: ProjectedWireRow;
+			kind: "projected";
+			version: number;
+			ttlAt?: number;
+			deleteRevision: number;
+			hasPendingWrite: boolean;
+	  };
 
 /**
  * Public variant surfaced by FokosDB.transactGetItems: `db.ts` has decoded the keys (the empty
  * sentinel maps back to an absent sortKey), parsed json text into a JsonValue, and dropped the
  * 2PC internals.
+ *
+ * A projected item holds its record in `data`, in the same envelope a complete item uses, and `kind`
+ * is `"projected"`. Each found member therefore carries `data`, `kind`, and `version`: a caller reads
+ * the value after `if (item.found)`, and tests `kind` only to get the type of the value.
  */
-export type ReadForTransactionItemResult = ReadForTransactionItemValueOf<string | Uint8Array | JsonValue> & {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
-};
+export type ReadForTransactionItemResult =
+	| (ReadForTransactionItemValueOf<string | Uint8Array | JsonValue> & {
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+	  })
+	| {
+			found: true;
+			hashKey: string | Uint8Array;
+			sortKey?: string | Uint8Array;
+			data: ProjectedItem;
+			kind: "projected";
+			version: number;
+			ttlAt?: number;
+	  };
 
 export type ReadForTransactionResponse = {
 	items: ReadForTransactionItemResultEncoded[];
@@ -307,11 +343,11 @@ export type SingleShotResponse =
  * locked, nothing is persisted, and there is no second phase to correlate with.
  */
 export type ReadSnapshotRequest = {
-	items: TransactionItemKey[];
+	items: TransactionReadItem[];
 };
 
 /**
- * `items` is positionally matched to the request, one entry per requested key, duplicates included.
+ * `items` is positionally matched to the request, one entry per requested key.
  *
  * There is no `read_conflict`: a partition DO is single-threaded and reads the whole set with no
  * `await` in between, so the result already IS a consistent snapshot and no second phase can
@@ -394,7 +430,7 @@ export type TransactWriteItemsOptions = {
 };
 
 export type TransactGetItemsOptions = {
-	items: ItemKey[];
+	items: Array<ItemKey & { projection?: readonly ProjectionExpression[] }>;
 };
 
 // ─── TC RPC (called by Client Worker / FokosDB) ───────────────────────────────
@@ -448,9 +484,7 @@ export type InitiateWriteResponse = {
 };
 
 // Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).
-export type TCReadItem = {
-	hashKey: KeyBytes;
-	sortKey: KeyBytes;
+export type TCReadItem = TransactionReadItem & {
 	/** Resolved partition context for the PartitionDO that owns this key. */
 	partitionContext: PartitionContextResolved;
 };
@@ -461,7 +495,7 @@ export type InitiateReadRequest = {
 
 /**
  * On "committed", `items` is positionally matched to the request: `items[i]` answers
- * `request.items[i]`, one entry per requested key, duplicates included.
+ * `request.items[i]`, one entry per requested key.
  */
 export type InitiateReadResponseEncoded = { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] };
 

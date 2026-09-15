@@ -3,6 +3,11 @@
 Date: 2026-08-29  
 Status: **accepted design; M0-M6 implemented**
 
+Projections (section 8) and query filters (section 9) are carried forward by
+`2026-09-14-read-projections-and-query-filters.md`. That RFC is the document the implementation
+follows: it adds the executable plan types, the statement shapes, the pooled binding layout, the
+projected result types, and the page accounting of a rejected candidate.
+
 ---
 
 ## 1. Goal and scope
@@ -698,6 +703,9 @@ Integration requirements:
 
 ## 8. Projections
 
+`2026-09-14-read-projections-and-query-filters.md` sections 4.2.3 to 4.2.6 and 4.2.11 hold the built
+form of this section.
+
 Projections apply to `getItem`, each `transactGetItems` item, and `queryItems`. Without a projection,
 return the current complete item.
 
@@ -738,6 +746,9 @@ when the projection omits them.
 ---
 
 ## 9. Query filters
+
+`2026-09-14-read-projections-and-query-filters.md` sections 4.2.7, 4.2.8, and 4.2.10 hold the built
+form of this section.
 
 Filters use `ConditionExpression` and apply only to `queryItems` candidates.
 

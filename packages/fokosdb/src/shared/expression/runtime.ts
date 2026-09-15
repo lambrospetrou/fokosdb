@@ -1,6 +1,7 @@
 import { type KeyBytes } from "../partition-topology/key-codec.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
+import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
 import {
@@ -30,6 +31,12 @@ export type ConditionEvaluationResult = {
 	conditionOk: boolean;
 	lastReadTs: number | null;
 	lastWriteTs: number | null;
+	rowsRead: number;
+	rowsWritten: number;
+};
+
+export type ProjectedReadResult = {
+	row?: { projected: ProjectedWireRow; version: number; ttlAt?: number };
 	rowsRead: number;
 	rowsWritten: number;
 };
@@ -69,6 +76,42 @@ export function evaluateConditionPlan(
 			conditionOk: row.condition_ok === 1,
 			lastReadTs: row.last_read_ts,
 			lastWriteTs: row.last_write_ts,
+			rowsRead: cursor.rowsRead,
+			rowsWritten: cursor.rowsWritten,
+		};
+	} catch (error) {
+		if (error instanceof ExpressionError) throw error;
+		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
+	}
+}
+
+/**
+ * Runs a projected point read: one row of the items table through the plan's value and type
+ * columns. The pool is `?1`, `hk` is `?2`, and `sk` is `?3` of the composed statement. An absent row
+ * is a `found: false` read. A projection has nothing to return for one, so no LEFT JOIN is needed.
+ */
+export function readProjectedItem(
+	storage: DurableObjectStorage,
+	plan: CompiledProjectionPlan,
+	hashKey: KeyBytes,
+	sortKey: KeyBytes,
+): ProjectedReadResult {
+	const statement = validateProjectionPlan(plan);
+	try {
+		const cursor = storage.sql.exec<Record<string, SqlStorageValue>>(
+			statement,
+			...materializeExpressionBindings(plan.bindings, "pool"),
+			hashKey,
+			sortKey,
+		);
+		const row = cursor.toArray()[0];
+		if (row === undefined) return { row: undefined, rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
+		return {
+			row: {
+				projected: decodeProjectedRow(row, plan.names.length),
+				version: row.v as number,
+				ttlAt: (row.ttl_epoch_utc_seconds as number | null) ?? undefined,
+			},
 			rowsRead: cursor.rowsRead,
 			rowsWritten: cursor.rowsWritten,
 		};

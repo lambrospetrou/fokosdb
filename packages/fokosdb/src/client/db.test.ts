@@ -3,6 +3,7 @@ import { StaticShardedDO } from "durable-utils/do-sharding";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { FokosStd } from "./fokos-std.js";
+import invariant from "../shared/invariant.js";
 import { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import { PartitionDO } from "../server/do-partition.js";
 import {
@@ -427,7 +428,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				{ id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } },
 				{ id: "a2", S: "Y", data: { s: "y" } },
 				{ id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } },
-				// A path over a text item is missing; a function over a missing argument sees NULL.
+				// A path over a text item is missing. A function over a missing argument sees NULL.
 				{ id: "a4", S: null, data: "text-item" },
 			]);
 			// A missing cell leaves the key absent, not undefined.
@@ -493,6 +494,63 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			expect(got).toEqual(["a1", "a2", "a3", "b1", "b2", "b3"]);
 			expect(pages).toBeGreaterThan(1);
+		});
+	});
+
+	describe("FokosDB.getItem — projections", () => {
+		it("returns a flat projected record for a found item, across cell kinds", async () => {
+			const db = makeDB();
+			await db.putItem({
+				hashKey: "alice",
+				sortKey: "j1",
+				data: { n: 1, s: "alpha", none: null, k: [1, 2] },
+			});
+
+			const res = await db.getItem({
+				hashKey: "alice",
+				sortKey: "j1",
+				projection: [
+					{ expr: { ref: "sortKey" }, as: "id" },
+					{ expr: { ref: "data", path: "$.n" } },
+					{ expr: { ref: "data", path: "$.s" }, as: "name" },
+					{ expr: { ref: "data", path: "$.none" } },
+					{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
+					{ expr: { ref: "data", path: "$.k" }, as: "k" },
+					{ expr: { ref: "v" }, as: "ver" },
+				],
+			});
+
+			expect(res).toEqual({
+				found: true,
+				item: {
+					hashKey: "alice",
+					sortKey: "j1",
+					data: { id: "j1", "$.n": 1, name: "alpha", "$.none": null, k: [1, 2], ver: 1 },
+					kind: "projected",
+					version: 1,
+				},
+				meta: expect.anything(),
+			});
+			// The projected record sits in `data` inside the normal envelope, tagged `kind: "projected"`.
+			invariant(res.found);
+			expect(Object.keys(res)).toEqual(["found", "item", "meta"]);
+			expect(Object.keys(res.item)).toEqual(["hashKey", "sortKey", "data", "kind", "version"]);
+			expect(Object.keys(res.item.data)).not.toContain("missing");
+		});
+
+		it("projects a bytes cell as a Uint8Array", async () => {
+			const db = makeDB();
+			await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
+
+			const res = await db.getItem({ hashKey: "alice", sortKey: "b1", projection: [{ expr: { ref: "data" }, as: "bytes" }] });
+			invariant(res.found && res.item.kind === "projected");
+			expect(res.item.data.bytes).toEqual(new Uint8Array([1, 2, 3]));
+		});
+
+		it("returns found:false with the caller's keys for a missing item", async () => {
+			const db = makeDB();
+			const res = await db.getItem({ hashKey: "alice", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
+			expect(res).toMatchObject({ found: false, item: { hashKey: "alice", sortKey: "nope" } });
 		});
 	});
 

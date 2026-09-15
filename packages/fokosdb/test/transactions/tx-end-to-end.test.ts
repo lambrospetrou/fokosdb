@@ -554,11 +554,12 @@ describe("transactions - end-to-end", () => {
 			if (item.found) expect(item.data).toBe(`data-${keys[i].hashKey}`);
 		}
 
-		// A key asked for twice is answered twice, at both positions — one entry per requested position.
+		// Two items naming one key are rejected: the two-phase driver pairs the phases by key, so a
+		// duplicate could hand one item the other's record.
 		const withDuplicate = [keys[0], keys[1], keys[0]];
-		const dupResult = await db.transactGetItems({ items: withDuplicate });
-		invariant(dupResult.outcome === "committed");
-		expect(dupResult.items.map((item) => item.hashKey)).toEqual(withDuplicate.map((k) => k.hashKey));
+		await expect(db.transactGetItems({ items: withDuplicate })).rejects.toThrow(
+			fokosErrorWith("transact_duplicate_key", { itemIndex: 2, hashKey: keys[0].hashKey }),
+		);
 	});
 
 	describe("Worker read transaction driver", () => {

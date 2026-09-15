@@ -235,4 +235,34 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		expect(snapshotSpy).toHaveBeenCalledTimes(2);
 		expect(twoPhaseSpy).not.toHaveBeenCalled();
 	});
+
+	it("a committed put between the phases aborts a projected read", async () => {
+		const db = makeDB({ singlePartitionFastPath: false });
+		const key = keysInOnePartition(db, 1, "put-between-proj")[0];
+		await db.putItem({ ...key, data: { n: 1 } });
+		const doName = partitionNameOf(db, key);
+
+		betweenPhases(doName, async function (this: PartitionDO, pCtx) {
+			await this.apiPutItem(pCtx, { hashKey: kb(key.hashKey), sortKey: kb(key.sortKey), data: "changed", kind: "text" });
+		});
+
+		await expect(db.transactGetItems({ items: [{ ...key, projection: [{ expr: { ref: "data", path: "$.n" } }] }] })).rejects.toThrow(
+			fokosErrorWith("read_conflict", { hashKey: key.hashKey }),
+		);
+	});
+
+	it("a pending content mutation on the item aborts a projected read", async () => {
+		const db = makeDB({ singlePartitionFastPath: false });
+		const key = keysInOnePartition(db, 1, "pending-put-proj")[0];
+		await db.putItem({ ...key, data: { n: 1 } });
+
+		const release = await holdPendingLock(db, key, { operation: "put", data: "pending", kind: "text" });
+		try {
+			await expect(db.transactGetItems({ items: [{ ...key, projection: [{ expr: { ref: "data", path: "$.n" } }] }] })).rejects.toThrow(
+				fokosErrorWith("pending_write"),
+			);
+		} finally {
+			await release();
+		}
+	});
 });

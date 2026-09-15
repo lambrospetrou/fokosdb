@@ -493,7 +493,9 @@ export class TransactionParticipant {
 		for (const item of request.items) {
 			const sk = item.sortKey;
 
-			const itemRow = this.#store.getItem(item.hashKey, sk).row;
+			const itemRow = item.projection
+				? this.#store.getItemProjected(item.projection, item.hashKey, sk).row
+				: this.#store.getItem(item.hashKey, sk).row;
 			const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
 
 			const hasPendingWrite = pendingRow != null && !READ_ONLY_PENDING_OPERATIONS.has(pendingRow.operation);
@@ -502,7 +504,20 @@ export class TransactionParticipant {
 			const hashKey = item.hashKey;
 			const sortKey = sk;
 
-			if (itemRow) {
+			if (itemRow && "projected" in itemRow) {
+				results.push({
+					found: true,
+					hashKey,
+					sortKey,
+					projected: itemRow.projected,
+					kind: "projected",
+					// `v` stays: the two-phase driver compares it for every found item.
+					version: itemRow.version,
+					...(itemRow.ttlAt === undefined ? {} : { ttlAt: itemRow.ttlAt }),
+					deleteRevision: deleteRevisionFor(item.hashKey),
+					hasPendingWrite,
+				});
+			} else if (itemRow) {
 				results.push({
 					found: true,
 					hashKey,

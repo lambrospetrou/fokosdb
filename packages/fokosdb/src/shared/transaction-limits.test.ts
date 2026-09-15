@@ -7,6 +7,7 @@ import {
 	validateClientRequestToken,
 	validateItemKeys,
 	validateTransactGetItemCount,
+	validateTransactGetItemKeys,
 	validateTransactWriteOperations,
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
@@ -223,5 +224,31 @@ describe("validateTransactGetItemCount", () => {
 	it("accepts exactly the max item count and rejects one more", () => {
 		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX)).not.toThrow();
 		expect(() => validateTransactGetItemCount(MAX_ITEMS_PER_TX + 1)).toThrow(fokosErrorWith("transact_items_too_many", { limit: 100 }));
+	});
+});
+
+describe("validateTransactGetItemKeys", () => {
+	const key = (hashKey: string, sortKey = "") => ({
+		hashKey: KeyCodec.encode(hashKey),
+		sortKey: KeyCodec.encodeOptional(sortKey || undefined),
+	});
+
+	it("rejects two items that name the same key, with the decoded keys on the error", () => {
+		expect(() => validateTransactGetItemKeys([key("a", "s1"), key("b"), key("a", "s1")])).toThrow(
+			fokosErrorWith("transact_duplicate_key", { itemIndex: 2, hashKey: "a", sortKey: "s1" }),
+		);
+	});
+
+	it("treats a missing sortKey as the empty sortKey for duplicate detection", () => {
+		expect(() =>
+			validateTransactGetItemKeys([
+				{ hashKey: KeyCodec.encode("a"), sortKey: KeyCodec.encodeOptional(undefined) },
+				{ hashKey: KeyCodec.encode("a"), sortKey: KeyCodec.encodeOptional(undefined) },
+			]),
+		).toThrow(fokosErrorWith("transact_duplicate_key"));
+	});
+
+	it("allows the same hashKey with different sortKeys", () => {
+		expect(() => validateTransactGetItemKeys([key("a", "s1"), key("a", "s2"), key("b")])).not.toThrow();
 	});
 });

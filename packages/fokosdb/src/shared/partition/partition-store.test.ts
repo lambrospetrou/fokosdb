@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
-import { compileUpdateExpression } from "../expression/compiler.js";
+import { compileProjectionExpression, compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
@@ -119,6 +119,36 @@ describe("PartitionStore - items", () => {
 			expect(got.row?.data).toEqual(bin);
 
 			expect(store.getItem(kb("hk"), kb("missing")).row).toBeUndefined();
+		});
+	});
+
+	it("getItemProjected returns the wire cells, the version, and the ttl of one row", async () => {
+		await withStore((store) => {
+			const doc = { n: 7, s: "x", none: null, k: [1, 2] };
+			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: JSON.stringify(doc), kind: "json", ttlAt: 1234, txOrderTs: 0 });
+			const plan = compileProjectionExpression([
+				{ expr: { ref: "data", path: "$.n" } },
+				{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
+				{ expr: { ref: "data", path: "$.none" } },
+				{ expr: { ref: "data", path: "$.k" }, as: "k" },
+				{ expr: { ref: "v" }, as: "ver" },
+			]);
+
+			const res = store.getItemProjected(plan, kb("hk"), kb("j"));
+			expect(res.rowsRead).toBe(1);
+			expect(res.row).toEqual({
+				// Cells are positional in plan order: number, missing, JSON null, array as JSON text, version.
+				projected: [7, undefined, null, { json: "[1,2]" }, 1],
+				version: 1,
+				ttlAt: 1234,
+			});
+
+			const bin = new Uint8Array([9, 8]);
+			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
+			const binPlan = compileProjectionExpression([{ expr: { ref: "data" } }]);
+			expect(store.getItemProjected(binPlan, kb("hk"), kb("b")).row?.projected).toEqual([bin]);
+
+			expect(store.getItemProjected(plan, kb("hk"), kb("missing")).row).toBeUndefined();
 		});
 	});
 

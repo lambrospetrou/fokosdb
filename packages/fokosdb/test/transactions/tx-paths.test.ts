@@ -64,6 +64,53 @@ describe("transactions - single-partition fast path", () => {
 		expect(fast.items.map((i) => i.found)).toEqual([true, true, false]);
 	});
 
+	it("reads projected items in one round trip, and answers exactly as the two-phase driver does", async () => {
+		const db = makeDB();
+		const slowDb = makeDB({ singlePartitionFastPath: false });
+
+		const keys = keysInOnePartition(db, 2, "fast-read-proj");
+		expect(countDistinctPartitions(db, keys)).toBe(1);
+		for (const key of keys) {
+			await db.putItem({ ...key, data: { n: 1, tag: key.hashKey } });
+			await slowDb.putItem({ ...key, data: { n: 1, tag: key.hashKey } });
+		}
+
+		// A projected item and a complete item in one request: each returns its own shape, in request order.
+		const items = [{ ...keys[0], projection: [{ expr: { ref: "data", path: "$.tag" }, as: "tag" }] as const }, { ...keys[1] }];
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
+		const fast = await db.transactGetItems({ items });
+		expect(snapshotCalls).toHaveBeenCalledTimes(1);
+		expect(transactionCalls).not.toHaveBeenCalled();
+
+		const slow = await slowDb.transactGetItems({ items });
+		expect(transactionCalls).toHaveBeenCalledTimes(2);
+		expect(fast).toEqual(slow);
+		invariant(fast.outcome === "committed");
+		expect(fast.items[0]).toMatchObject({
+			found: true,
+			hashKey: keys[0].hashKey,
+			data: { tag: keys[0].hashKey },
+			kind: "projected",
+			version: 1,
+		});
+		expect(fast.items[1]).toMatchObject({ found: true, data: { n: 1, tag: keys[1].hashKey }, kind: "json", version: 1 });
+		// The envelope is uniform: `data` and `kind` are reachable on every found element, projected or not.
+		expect(fast.items.filter((i) => i.found).map((i) => (i.found ? i.kind : null))).toEqual(["projected", "json"]);
+	});
+
+	it("rejects a request in which two items name the same key", async () => {
+		const db = makeDB();
+		const key = keysInOnePartition(db, 1, "dup-read")[0];
+		await db.putItem({ ...key, data: "v" });
+
+		const { snapshotCalls, transactionCalls } = countReadPathCalls();
+		await expect(db.transactGetItems({ items: [key, { ...key, projection: [{ expr: { ref: "data" } }] }] })).rejects.toThrow(
+			expect.objectContaining({ code: "transact_duplicate_key" }),
+		);
+		expect(snapshotCalls).not.toHaveBeenCalled();
+		expect(transactionCalls).not.toHaveBeenCalled();
+	});
+
 	it("drives a multi-partition read from the Worker in two phases", async () => {
 		const db = makeDB();
 		const keys = [

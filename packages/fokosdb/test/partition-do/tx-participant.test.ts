@@ -372,7 +372,8 @@ describe("PartitionDO — single-partition read snapshot", () => {
 		invariant(res.outcome === "committed");
 		expect(res.items.map((i) => i.found)).toEqual([true, false, true, true]);
 		expect(res.items.map((i) => KeyCodec.decode(i.hashKey))).toEqual(["snap-b", "snap-missing", "snap-a", "snap-b"]);
-		expect(res.items.filter((i) => i.found).map((i) => (i.found ? i.data : null))).toEqual(["b", "a", "b"]);
+		// The encoded wire variant carries `projected`, not `data`. db.ts decodes it downstream.
+		expect(res.items.filter((i) => i.found).map((i) => (i.found && "data" in i ? i.data : null))).toEqual(["b", "a", "b"]);
 	});
 
 	it("aborts with pending_write when a two-phase transaction holds a lock on one of the keys", async () => {

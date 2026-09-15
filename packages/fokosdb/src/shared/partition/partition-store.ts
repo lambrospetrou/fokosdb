@@ -7,6 +7,7 @@ import {
 	composeQueryStatement,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
 	type CompiledConditionPlan,
+	type CompiledProjectionPlan,
 	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
 } from "../expression/plan.js";
@@ -15,9 +16,11 @@ import { decodeProjectedRow, type ProjectedWireRow } from "../expression/project
 import {
 	evaluateConditionPlan,
 	probeUpdatePlan,
+	readProjectedItem,
 	validateQueryPlan,
 	validateUpdatePlan,
 	type ConditionEvaluationResult,
+	type ProjectedReadResult,
 	type UpdateProbeResult,
 } from "../expression/runtime.js";
 import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS, decodeItemKeys } from "../transaction-limits.js";
@@ -273,7 +276,7 @@ export function estimateItemBytes(item: StoredItem): number {
 }
 
 /**
- * Estimated RPC bytes of one projected row: the item envelope plus per-cell sizes — `length * 2`
+ * Estimated RPC bytes of one projected row: the item envelope plus per-cell sizes, `length * 2`
  * for a string and for the JSON text of an array or an object, `byteLength` for a `Uint8Array`, and
  * 8 for every other cell. It does not use `est_row_bytes`: a projected row carries only its cells.
  */
@@ -351,7 +354,7 @@ function rangeScanConditions(opts: RangeScanBounds): { conds: string[]; params: 
  *
  * With a plan the statement is the composed query statement, which gives every scan parameter an
  * explicit number from `?2`. The bound values therefore start with the pool parameter `?1`, which is
- * bound always — the materializer returns the text `[]` when the plan has no descriptor.
+ * bound always. The materializer returns the text `[]` when the plan has no descriptor.
  */
 export function queryScanStatement(opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null }): {
 	sql: string;
@@ -680,6 +683,10 @@ export class PartitionStore {
 
 	evaluateCondition(plan: CompiledConditionPlan, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
 		return withExpressionErrors(() => evaluateConditionPlan(this.#storage, plan, hk, sk));
+	}
+
+	getItemProjected(plan: CompiledProjectionPlan, hk: KeyBytes, sk: KeyBytes): ProjectedReadResult {
+		return withExpressionErrors(() => readProjectedItem(this.#storage, plan, hk, sk));
 	}
 
 	probeUpdate(plan: CompiledUpdatePlan, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
@@ -1199,8 +1206,8 @@ export class PartitionStore {
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const select = opts.select;
 		const entryCount = plan?.projection?.names.length ?? 0;
-		// The mode is fixed per request: count rows carry nothing, a complete-item scan carries `item`,
-		// and a projected scan carries `projected` — each only on a matched row.
+		// The mode is fixed per request. Count rows carry nothing, a complete-item scan carries `item`,
+		// and a projected scan carries `projected`. Each payload appears on a matched row only.
 		const mode: "none" | "item" | "projected" = select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
 		function* rows(): Generator<QueryScanRow> {
 			for (const row of cursor) {

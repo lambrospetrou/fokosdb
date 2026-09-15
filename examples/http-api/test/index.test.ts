@@ -118,6 +118,62 @@ describe("http-api example worker", () => {
 		expect(body.scannedCount).toBe(3);
 	});
 
+	it("getItem returns a projected record and serializes a bytes cell", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		const put = await rpc(table, "putItem", { hashKey: "pi", sortKey: "s1", data: "v-s1" });
+		expect(put.status).toBe(200);
+
+		const res = await rpc(table, "getItem", {
+			hashKey: "pi",
+			sortKey: "s1",
+			projection: [
+				{ expr: { ref: "data" }, as: "d" },
+				{ expr: { b64: "AQID" }, as: "bin" },
+				{ expr: { ref: "v" }, as: "ver" },
+			],
+		});
+		expect(res.status).toBe(200);
+		expect(await res.json()).toMatchObject({
+			found: true,
+			item: {
+				hashKey: "pi",
+				sortKey: "s1",
+				data: { d: "v-s1", bin: { b64: "AQID" }, ver: 1 },
+				kind: "projected",
+				version: 1,
+				dataEncoding: "projected",
+			},
+		});
+
+		const missing = await rpc(table, "getItem", { hashKey: "pi", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
+		expect(missing.status).toBe(200);
+		expect(await missing.json()).toMatchObject({ found: false });
+	});
+
+	it("transactGetItems returns projected and complete items in request order", async () => {
+		const table = `t-${crypto.randomUUID()}`;
+		for (const hk of ["tx-p1", "tx-p2"]) {
+			const put = await rpc(table, "putItem", { hashKey: hk, data: `v-${hk}` });
+			expect(put.status).toBe(200);
+		}
+
+		const res = await rpc(table, "transactGetItems", {
+			items: [{ hashKey: "tx-p1", projection: [{ expr: { ref: "data" }, as: "d" }] }, { hashKey: "tx-p2" }],
+		});
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { outcome: string; items: Array<Record<string, unknown>> };
+		expect(body.outcome).toBe("committed");
+		expect(body.items[0]).toMatchObject({
+			found: true,
+			hashKey: "tx-p1",
+			data: { d: "v-tx-p1" },
+			kind: "projected",
+			version: 1,
+			dataEncoding: "projected",
+		});
+		expect(body.items[1]).toMatchObject({ found: true, hashKey: "tx-p2", data: "v-tx-p2", dataEncoding: "utf8" });
+	});
+
 	it("rejects a projection on a count query as 400", async () => {
 		const res = await rpc(`t-${crypto.randomUUID()}`, "queryItems", {
 			queries: [{ hashKey: "qi" }],

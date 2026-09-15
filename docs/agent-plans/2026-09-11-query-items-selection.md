@@ -679,6 +679,10 @@ Sections 4.2.13 through 4.2.17 record constraints for future filter and projecti
 implementation milestones in this RFC. A future specification must define the executable plan types and close
 the open binding-layout item in section 4.2.15.
 
+`2026-09-14-read-projections-and-query-filters.md` is that specification. It defines
+`CompiledQueryPlan` and `CompiledProjectionPlan`, closes the binding-layout item with the pooled
+layout of its section 4.2.5, and holds the built form of every constraint below.
+
 A future query compiler must compile the filter and projection into SQL. The plan must remain JSON-serializable.
 The partition must validate the version, binding count, SQL byte size, and expression limits after the plan
 crosses the RPC boundary.

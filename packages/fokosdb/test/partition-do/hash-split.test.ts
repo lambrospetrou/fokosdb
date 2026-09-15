@@ -5,6 +5,7 @@ import { InitFromSplitOptions, PartitionDO } from "../../src/server/do-partition
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
+import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
 	assertSplitTreeComplete,
@@ -276,6 +277,27 @@ describe("PartitionDO - splitting", () => {
 
 			const result = await stub.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
+			expect(result.meta.forwardCount).toBe(1);
+			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
+		});
+
+		it("forwards a projected getItem to the owning child after split", async ({ expect }) => {
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const { ctx, stub } = partition;
+
+			await partition.splitHash();
+
+			const hashKey = "projected-key";
+			await stub.apiPutItem(ctx, {
+				hashKey: kb(hashKey),
+				sortKey: kb("sk"),
+				data: JSON.stringify({ n: 3 }),
+				kind: "json",
+			});
+
+			const projection = compileProjectionExpression([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
+			const result = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
+			expect(result).toMatchObject({ found: true, item: { projected: [3, 1], kind: "projected" } });
 			expect(result.meta.forwardCount).toBe(1);
 			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
 		});
@@ -614,6 +636,15 @@ describe("PartitionDO - splitting", () => {
 					const result = await child.get(item);
 					expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { servedByActorName: partition.doName } });
 				}
+
+				// A projected read takes the same fallback: the parent answers the wire cells.
+				const projection = compileProjectionExpression([{ expr: { ref: "data" } }]);
+				const projected = await child.get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
+				expect(projected).toMatchObject({
+					found: true,
+					item: { projected: ["data-alpha-1"], kind: "projected" },
+					meta: { servedByActorName: partition.doName },
+				});
 			});
 			await assertSplitTreeComplete(partition);
 		});
