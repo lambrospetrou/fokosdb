@@ -13,7 +13,7 @@ import type {
 	TransactionItem,
 	TransactionItemKey,
 	TransactionTimestamp,
-} from "../transaction-types.js";
+} from "../transaction-wire-types.js";
 import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";

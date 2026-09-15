@@ -4,8 +4,8 @@ import { tryWhile } from "durable-utils/retries";
 import type { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
+import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
 import type {
-	ExecutionFailureCode,
 	InitiateWriteRequest,
 	InitiateWriteResponseEncoded,
 	ParticipantOperationResultEncoded,
@@ -13,10 +13,10 @@ import type {
 	RecoverTransactionResult,
 	RejectionReasonEncoded,
 	TCState,
+	TransactWriteOperationResultEncoded,
 	TransactionItem,
 	TransactionItemKey,
-	TransactWriteOperationResultEncoded,
-} from "../shared/transaction-types.js";
+} from "../shared/transaction-wire-types.js";
 import { PartitionDO } from "./do-partition.js";
 import {
 	FokosError,

@@ -30,7 +30,7 @@ import {
 	type FokosErrorOptions,
 } from "./errors.js";
 import type { ExpressionError } from "./expression/errors.js";
-import type { ConditionFailedReason, TransactWriteOperationResult } from "./transaction-types.js";
+import type { ConditionFailedReason, TransactWriteOperationResult } from "./transaction-api-types.js";
 import type { OperationMetrics, PartitionInfo } from "./types.js";
 
 export const CONDITION_CHECK_CODES = defineCodes("FokosConditionCheckError", "caller", 409, {

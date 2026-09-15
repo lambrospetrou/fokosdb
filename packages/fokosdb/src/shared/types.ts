@@ -1,9 +1,3 @@
-import type {
-	TransactGetItemsResult,
-	TransactWriteItemsResult,
-	TransactGetItemsOptions,
-	TransactWriteItemsOptions,
-} from "./transaction-types.js";
 import type { JsonComposite, JsonValue } from "./json-types.js";
 import type { ConditionExpression, ProjectionExpression } from "./expression/types.js";
 import type { ProjectedItem } from "./expression/projection.js";
@@ -68,8 +62,6 @@ export type DecodedItemData<T = never> =
 	| { kind: "bytes"; data: Uint8Array }
 	| { kind: "text"; data: string }
 	| { kind: "json"; data: CallerType<T, JsonValue> };
-
-export interface FokosDBAPI extends ItemPutter, ItemGetter, ItemDeleter, ItemQuerier, ItemTransactor {}
 
 export interface ItemPutter {
 	putItem(opts: PutItemOptions): Promise<PutItemResult>;
@@ -210,28 +202,6 @@ export type OperationMetrics = {
 	databaseSize: number;
 	timings?: {};
 };
-
-export interface ItemTransactor {
-	transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult>;
-	transactGetItems<Ts extends readonly unknown[] = never[]>(
-		opts: NoInfer<TransactGetItemsOptions<Ts>>,
-	): Promise<TransactGetItemsResult<Ts>>;
-}
-
-// Only what a caller of FokosDB needs. The 2PC wire types — the coordinator requests, the driver items,
-// and the encoded read results that carry `projected` as a positional row — stay internal to `db.ts`
-// and the participant, so the public surface shows one read envelope and never the wire beneath it.
-export type {
-	TransactWriteItemsResult,
-	TransactGetItemsResult,
-	MaybeReadItem,
-	TransactWriteItem,
-	TransactWriteItemsOptions,
-	TransactWriteOperationResult,
-	RejectionReason,
-	TransactGetItemKey,
-	TransactGetItemsOptions,
-} from "./transaction-types.js";
 
 // ─── queryItems public API ────────────────────────────────────────────────────
 

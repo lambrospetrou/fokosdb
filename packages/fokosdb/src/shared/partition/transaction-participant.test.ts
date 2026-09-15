@@ -4,7 +4,7 @@ import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
-import type { PrepareRequest, TransactionItem } from "../transaction-types.js";
+import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";

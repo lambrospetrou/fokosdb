@@ -9,8 +9,6 @@ import {
 	EncodedItemData,
 	GetItemOptions,
 	GetItemResult,
-	TransactGetItemsResult,
-	TransactWriteItemsResult,
 	JsonComposite,
 	JsonValue,
 	OperationMetrics,
@@ -30,20 +28,24 @@ import type { TransactionCoordinatorDO } from "../server/do-transaction-coordina
 import type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
 import type {
 	ExecutionFailureCode,
+	RejectionReason,
+	TransactGetItemKey,
+	TransactGetItemsOptions,
+	TransactGetItemsResult,
+	TransactWriteItemsOptions,
+	TransactWriteItemsResult,
+	TransactWriteOperationResult,
+} from "../shared/transaction-api-types.js";
+import type {
 	InitiateReadResponseEncoded,
 	ReadForTransactionItemResultEncoded,
 	ReadSnapshotResponse,
-	RejectionReason,
 	RejectionReasonEncoded,
 	SingleShotResponse,
-	TCWriteOperation,
 	TCReadItem,
-	TransactGetItemKey,
-	TransactGetItemsOptions,
-	TransactWriteItemsOptions,
-	TransactWriteOperationResult,
+	TCWriteOperation,
 	TransactWriteOperationResultEncoded,
-} from "../shared/transaction-types.js";
+} from "../shared/transaction-wire-types.js";
 import {
 	encodeHashKey,
 	encodeSortBound,

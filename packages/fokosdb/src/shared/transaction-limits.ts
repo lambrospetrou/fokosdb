@@ -16,7 +16,7 @@ import type {
 	TransactionItemKey,
 	TransactionOperationType,
 	TransactionTimestamp,
-} from "./transaction-types.js";
+} from "./transaction-wire-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, type Key, writeOutcome } from "./tx-helpers.js";
 import invariant from "../../src/shared/invariant.js";
 import { applyImageCap, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
-import type { ParticipantOperationResultEncoded, TransactWriteItemsOptions } from "../../src/shared/transaction-types.js";
+import type { TransactWriteItemsOptions } from "../../src/shared/transaction-api-types.js";
+import type { ParticipantOperationResultEncoded } from "../../src/shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 
 describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operation results", () => {

@@ -13,7 +13,7 @@ import type {
 	PrepareResponse,
 	TCState,
 	TransactWriteOperationResultEncoded,
-} from "../shared/transaction-types.js";
+} from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);

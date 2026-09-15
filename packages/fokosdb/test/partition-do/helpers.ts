@@ -13,7 +13,7 @@ import { PartitionContextCreator } from "../../src/shared/partition-topology/par
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import type { SplitStatusKVItem } from "../../src/shared/partition-topology/split-state.js";
-import type { TransactionItem } from "../../src/shared/transaction-types.js";
+import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 
 export const kb = (s?: string) => KeyCodec.encodeOptional(s);
 export const compiledCondition = (condition: ConditionExpression) => compileConditionExpression(condition);

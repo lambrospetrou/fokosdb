@@ -8,7 +8,7 @@ import {
 	TRANSACTION_CANCELLED_CODES,
 	isFokosAnyError,
 } from "./errors-operations.js";
-import type { RejectionReason, TransactWriteOperationResult } from "./transaction-types.js";
+import type { RejectionReason, TransactWriteOperationResult } from "./transaction-api-types.js";
 
 const DEFS = FOKOS_LIBRARY_CODE_TABLES.flatMap((table) => Object.values(table));
 

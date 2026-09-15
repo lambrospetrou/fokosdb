@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
 import { KeyCodec } from "./partition-topology/key-codec.js";
-import type { TCWriteOperation } from "./transaction-types.js";
+import type { TCWriteOperation } from "./transaction-wire-types.js";
 import { compileConditionExpression } from "./expression/compiler.js";
 
 describe("hashTransactionOperations", () => {

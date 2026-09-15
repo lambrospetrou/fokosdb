@@ -19,7 +19,7 @@ import type {
 	SingleShotRequest,
 	SingleShotResponse,
 	TransactionItem,
-} from "../shared/transaction-types.js";
+} from "../shared/transaction-wire-types.js";
 import {
 	areImmutableOptionsEqual,
 	areMutableOptionsEqual,

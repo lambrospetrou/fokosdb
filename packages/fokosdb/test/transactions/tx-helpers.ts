@@ -9,7 +9,7 @@ import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-types.js";
+import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 
 export type Key = { hashKey: string; sortKey: string };
 

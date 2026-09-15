@@ -8,7 +8,7 @@ import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
-import type { TransactionItem } from "../../src/shared/transaction-types.js";
+import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { type Key, keysAcrossPartitions, keysInOnePartition, makeDB, partitionNameOf } from "./tx-helpers.js";
 
