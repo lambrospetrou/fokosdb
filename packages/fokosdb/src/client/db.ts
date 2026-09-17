@@ -226,8 +226,9 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 		const err = FokosError.wrap(e);
 		// A partition stamps its routing meta on its error. The routing state stops here, as it does on a result.
 		const routed = routedError(err);
-		console.log("BOOM: ", routed);
-		if (routed) Object.assign(routed, { meta: publicMeta(routed.meta) });
+		if (routed) {
+			Object.assign(routed, { meta: publicMeta(routed.meta) });
+		}
 		throw err;
 	}
 }
