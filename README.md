@@ -59,8 +59,8 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
+- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Garbage collect the `range_hierarchy` table of each partition. It is written on every forwarded request and never pruned.
 - Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
@@ -74,16 +74,17 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- queryItems: filter + projections.
+- Add jurisdictions support.
+- Add custom jobs to run on alarms, with their own best-effort interval.
 - Add global eventual indexes (DynamoDB GSIs).
+- Add operation hooks that will run on the final serving partition (onAfterOperation).
 - Batch item operations (non-transactions).
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
-- Add jurisdictions support.
 - Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
-- Think about backups and export in a consistent fashion.
+- Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - User provided code running inside the DO for N+1 operations. ONLY for library or self-hosted mode where the user controls the Durable Object class used, otherwise we would need Dynamic Workers and the `pipe()` operator.
 - Add WAE metrics per request, per split.
 - Add canonical logs per request in the service with an overridable requestId.
@@ -95,7 +96,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add heuristics for the split decision (cardinality of keys and frequency per key). See https://claude.ai/chat/50f7710a-2fcb-4022-895c-1a56904cc44e
 - Support large items through R2.
 - Support CASPaxosDO for the data partitions for multi-region availability. Use Paxos Commit and CAS Paxos for the topology keeper for higher availability (speed is no issue).
-- Migrate the splitting/migration to the Durable Objects forking/cloning API.
 
 ## Benchmarks
 

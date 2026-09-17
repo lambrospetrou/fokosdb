@@ -426,7 +426,7 @@ own stored route context, which the host policy inside it makes sufficient.
 CREATE TABLE fokos_repartitions (
 	id            TEXT PRIMARY KEY,   -- `<partitionId>:<sequence>`
 	kind          TEXT NOT NULL,      -- 'hash_split' | 'range_split' | 'key_promotion'
-	state         TEXT NOT NULL,      -- 'queued' | 'cutover' | 'completed' | 'cleaned'
+	state         TEXT NOT NULL,      -- 'queued' | 'cutover' | 'completed' | 'cleaned' | 'abandoned'
 	plan          BLOB NOT NULL,      -- structured-clone of FokosRepartitionPlan
 	cleanup_cursor BLOB,              -- opaque host cursor for source cleanup
 	queued_at     INTEGER NOT NULL,
@@ -748,7 +748,8 @@ or more parts and one part per remote target.
    - state `importing` and `whileMigrating: "read_source"` → run owner resolution step 1 (ownership) for the
      keys of the request and throw `fokos_out_of_range` on a miss; then call
      `source.fokosExecuteLocal({ op, request, caller: selfRef })`, add one to `forwardCount`, return
-     (section 5.2.13).
+     (section 5.2.13). The gate runs before owner resolution steps 2 to 4, so the target does not apply its own
+     route overrides here. The source applies them for the key (section 5.2.13, step 3).
    - state `importing` and `whileMigrating: "retry"` → throw `fokos_importing`.
    The states `imported` and `active` pass the gate. The data is complete.
 3. **Owner resolution** for every key (section 5.2.7). Group the items by destination.
@@ -870,9 +871,12 @@ One state machine serves hash splits, range splits, and key promotions.
 
 ```
  (none) ──queue──► queued ──start──► cutover ──last ack──► completed ──cleanup done──► cleaned
-                     │  ▲
-                     └──┘ retry: boundaries not ready, beforeCutover false, target init failed
+                     │  ▲   │
+                     └──┘   └──hash split of this partition completed──► abandoned
+       retry: boundaries not ready, beforeCutover false, target init failed
 ```
+
+Only a `key_promotion` reaches `abandoned`, and section 5.2.11 gives the rule.
 
 | Transition            | Trigger                                              | Durable write (one `transactionSync`)                                  | Then                                              |
 | --------------------- | ---------------------------------------------------- | ---------------------------------------------------------------------- | ------------------------------------------------- |
@@ -880,7 +884,7 @@ One state machine serves hash splits, range splits, and key promotions.
 | `start` step 1: plan  | Job `source_repartition`, state `queued`             | none                                                                   | Build targets (table below)                       |
 | `start` step 2: init  | Plan built                                           | none                                                                   | `target.fokosInit(...)` for all targets, parallel, `migration.initRetries` (default 5) each |
 | `start` step 3: cut   | Every init succeeded                                 | `beforeCutover(plan)` must return true; set `cutover`, `cutover_at`; `role` becomes `router` for splits | `target.fokosStartImport()` all, best effort |
-| `ack`                 | `fokosMigrationAck` from a member target             | Set `acknowledged = 1`; if all acknowledged: `beforeComplete(plan)`, set `completed` | On `completed`: schedule `source_cleanup` on the fast path, set the fallback alarm, `onLifecycleEvent(repartition_completed)` |
+| `ack`                 | `fokosMigrationAck` from a member target             | Set `acknowledged = 1`; if all acknowledged: `beforeComplete(plan)`, set `completed`, and for a `hash_split` set every `queued` `key_promotion` row to `abandoned` and delete its override row | On `completed`: schedule `source_cleanup` on the fast path, set the fallback alarm, `onLifecycleEvent(repartition_completed)` |
 | `cleanup`             | Job `source_cleanup`, state `completed`              | Each step: persist `cleanup_cursor`; on `null`: set `cleaned`          | Reschedule until done                             |
 
 | Kind            | Selected ownership          | Targets                                                                   | `sourceAfterCutover` |
@@ -923,15 +927,32 @@ closes the queue window of audit 24.7.
 
 | Request                       | Accepted when                                                                                  |
 | ----------------------------- | ---------------------------------------------------------------------------------------------- |
-| queue `hash_split`            | Partition kind is `hash`, and no row of any kind is `queued` or `cutover`                      |
+| queue `hash_split`            | Partition kind is `hash`, no split row is `queued` or `cutover`, and no `key_promotion` row is `cutover` |
 | queue `range_split`           | Partition kind is `range`, and no row is `queued` or `cutover`                                 |
-| queue `key_promotion`         | Partition kind is `hash`, no `hash_split` row is `queued` or `cutover`, no override for the key |
-| cut over `key_promotion`      | No `hash_split` row is `queued` or `cutover`, and `beforeCutover` returned true                |
+| queue `key_promotion`         | Partition kind is `hash`, no `hash_split` row exists in any state, and no override for the key  |
+| cut over `key_promotion`      | No `hash_split` row exists in any state, and `beforeCutover` returned true                      |
 | cut over a split              | `beforeCutover` returned true or is undefined                                                   |
 
-A `hash_split` row in `completed` or `cleaned` does not need to block later promotions, because a router
-receives no local writes and therefore no promotion signals. A `key_promotion` row in `completed` or `cleaned`
-never blocks anything.
+A `key_promotion` row in `queued` does not block a hash split. The `queued` state carries no routing decision,
+so the source still owns every key. A `queued` promotion that blocks a split starves it: `beforeCutover` can
+refuse every attempt, for example because the hash key holds a transaction lock on each sample, and the leaf
+then reaches its size cap and rejects every write.
+
+A `key_promotion` row in `cutover` does block a hash split. The range tree already owns the key, and
+`belongsToTarget` excludes a key only from a `completed` or a `cleaned` override, so a hash child would receive a
+second copy of the data of that key.
+
+A `hash_split` row in any state blocks a promotion, in both directions. A router owns no row, so a promotion
+from it copies a stale snapshot and then shadows the live data of the child.
+
+Because of these two rules, a split can complete while a `key_promotion` row is still `queued`. The completion
+transaction of the split sets that row to `abandoned` and deletes its override row. An `abandoned` row decides
+no route, drives no job, and blocks nothing. It keeps its target rows, so `fokosStatus().links` still reports a
+range root that `fokosInit` created before the split, and `FokosRouter.walk` can destroy it. The child that
+owns the hash key queues its own promotion when its next signal names the key, and `fokosInit` takes over the
+range root of the abandoned plan (section 5.2.15).
+
+A `key_promotion` row in `completed` or `cleaned` never blocks anything.
 
 Signals arrive from `afterLocalSuccess`, `requestSplitEvaluation`, and `requestPromotion`. The runtime handles a
 signal in the request that produced it, after the result is fixed:
@@ -1019,15 +1040,26 @@ The target first runs owner resolution step 1 for the keys of the request (secti
    source owns the data and the caller must not serve it. The states `cutover` and `completed` pass.
 2. Finds the operation by name. It must exist and be `readOnly`; otherwise `fokos_operation_invalid`.
 3. Extracts the keys with the descriptor (`key`, `items`, or `scan`) and tests each one with the
-   `belongsToTarget` predicate of the caller's slice. A key outside the slice throws `fokos_out_of_range`.
-   This closes audit 24.13 for the key, not only for the caller.
+   `belongsToTarget` predicate of the caller's slice. A key outside the slice throws `fokos_out_of_range`,
+   with one exception below. This closes audit 24.13 for the key, not only for the caller.
+
+   The exception is a hash key that a route override moved. `belongsToTarget` of a `hash_child` slice returns
+   false for it, because a range tree owns it, and the source must not answer it from its own rows. The source
+   resolves the owner of that key (section 5.2.7, step 2), forwards the request with the `forward` callback of
+   the operation, and returns that envelope. It does not throw. Without this rule a read of a promoted key fails
+   with `fokos_out_of_range`, which no caller retries, for the whole import of the hash child. A caller reaches
+   the importing child for such a key when a hash arena cache of an ancestor holds a deeper hint and the
+   promotion Bloom cache of that ancestor holds no entry for the key.
 4. Runs the `local` handler without owner resolution and without the lifecycle gate, under the operation's
    `localConcurrency` mode. `admit` and `afterLocalSuccess` do not run: the source serves a copy, it does not
    take a decision about it.
 5. Returns the result in an envelope with the source's own `route`.
 
 The target does not return that envelope as is. It replaces `servedBy`, `hashDepth`, and `rangeDepth` with its
-own values, replaces `_hint` with its own ancestors, and adds one to `forwardCount`. The caller forwarded to the
+own values, replaces `_hint` with its own ancestors, and adds one to `forwardCount`. An answer that the source
+forwarded to an override owner is the one exception: the target keeps `servedBy` and `_hint` of that answer and
+replaces the two depths only, so the caller learns the promotion in its Bloom cache and the range boundaries in
+its hierarchy cache. The caller forwarded to the
 target, and a cache that learns from the envelope needs the depth of the partition it reached, not the depth
 of the source; today's code patches `hashDepth` for the same reason. `afterRequest` on the target reports
 `handling: "read_source"`.
@@ -1145,8 +1177,19 @@ type FokosStatus = {
 };
 ```
 
-`fokosInit` with a conflicting existing identity or a different `(repartitionId, source)` throws
-`fokos_init_conflict`. A conflicting retry is a defect and must not be repaired silently.
+`fokosInit` with a conflicting existing identity throws `fokos_init_conflict`. A conflicting retry is a defect
+and must not be repaired silently.
+
+`fokosInit` with a different `(repartitionId, source)` takes the target over when the import record is still
+`awaiting_data`. It rewrites the record with the new plan, the new source, and the new slice. The target holds
+no page then, so it claims no ownership, and the plan that created it can no longer cut over: an abandoned
+promotion (section 5.2.11) and an abandoned range-split attempt both leave a source that arbitration refuses.
+An import record in `importing` or later throws `fokos_init_conflict`, because a source that cut over is
+already sending its data.
+
+Without the takeover rule a target that a failed or an abandoned plan created keeps its record forever, and the
+next plan that resolves the same name can never initialize it. The name of a range partition is deterministic
+from its hash key and its boundaries, so a later plan does resolve the same name.
 
 `fokosStatus().links` gives one graph view for administration. Destruction walks `links` post-order and calls
 `fokosDestroy` on each partition. The Worker does not need to know about split children and promoted keys
@@ -1202,7 +1245,7 @@ says how FokosDB keeps its public codes.
 | `fokos_importing`             | yes       | Target imports and the operation is `whileMigrating: "retry"`.             |
 | `fokos_out_of_range`          | no        | Key cannot belong to this partition. Routing defect.                       |
 | `fokos_single_owner_fallback` | no        | `single_owner` items span more than one partition. No side effects.        |
-| `fokos_init_conflict`         | no        | `fokosInit` disagrees with stored identity or import record.               |
+| `fokos_init_conflict`         | no        | `fokosInit` disagrees with the stored identity, or the import record is `importing` or later. |
 | `fokos_repartition_unknown`   | no        | Pull or ack for an unknown repartition.                                    |
 | `fokos_target_unknown`        | no        | Pull, ack, or execute-local from a partition that is not a member.         |
 | `fokos_group_partial_failure` | yes       | `attempt_all` group had at least one failed remote group. Message lists them. |
@@ -1239,6 +1282,9 @@ Host errors, including admission rejections, pass through unchanged. The runtime
 | Locks prepared before a split migrate to the new owner                   | The host's page phases include pending transactions                                         |
 | Recovery uses the routed operation                                       | The host calls `dispatch` for commit and cancel from its recovery job                       |
 | Promotion cutover never moves a key with local locks                     | `beforeCutover` runs inside the cutover transaction; FokosDB returns false on any lock      |
+| A router never promotes a key                                            | Arbitration refuses a promotion when a `hash_split` row exists in any state                 |
+| A queued promotion never starves a split                                 | Arbitration accepts a hash split while a `key_promotion` row is `queued`; the completion abandons that row |
+| A read of a promoted key is correct while its hash child imports         | The source resolves the override for the key in `fokosExecuteLocal`                         |
 | Reads and deletes stay available on an over-size leaf                    | Admission tags are host policy; the runtime rejects nothing by size                         |
 | Failed background work keeps durable state for retry                    | Every job step reads and writes durable state; errors do not roll back committed steps      |
 
@@ -1495,12 +1541,15 @@ next start. That holds for a hash split, whose children are deterministic. A ran
 boundaries from live data on every attempt, and the source still accepts writes while `queued`, so a retry
 after a partial init produces different child names. The children of the first attempt keep an identity and an
 `awaiting_data` import record forever: they are not member rows, so every pull returns `fokos_target_unknown`
-and reschedules, and they are not in `links`, so `walk` never destroys them. If a later split of a sibling
-produces the same `(start, end)` name, `fokosInit` arrives with a different `(repartitionId, source)` and
-throws `fokos_init_conflict`, so that partition can never split. The same gap makes the check order of
-`fokosMigrationPull` ambiguous: a member test before a state test returns `fokos_target_unknown` instead of
+and reschedules, and they are not in `links`, so `walk` never destroys them. The same gap makes the check order
+of `fokosMigrationPull` ambiguous: a member test before a state test returns `fokos_target_unknown` instead of
 `fokos_not_owner_yet` when target rows are written only at cutover. Today's `runSplit` has the same orphan
-behavior without the hard conflict error.
+behavior.
+
+The takeover rule of section 5.2.15 answers one half of this question. A later plan that resolves the name of
+an orphan takes the target over while its record is `awaiting_data`, so the orphan no longer makes that
+partition unable to split. The orphan still polls its source and still stays outside `links` until a plan
+claims it.
 
 The likely fix is to persist the plan and the target rows in one `transactionSync` at step 1, before any
 `fokosInit`, and reuse that plan on every retry, with `computeRangeBoundaries` called once per plan. The open
