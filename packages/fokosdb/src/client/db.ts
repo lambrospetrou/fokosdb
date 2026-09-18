@@ -65,9 +65,11 @@ import {
 	FokosConflictError,
 	FokosError,
 	FokosInternalError,
+	FokosUnavailableError,
 	FokosValidationError,
 	INTERNAL_CODES,
 	ROUTING_CODES,
+	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
 	isRuntimeRetryableError,
 } from "../shared/errors.js";
@@ -81,7 +83,7 @@ import {
 import invariant from "../shared/invariant.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
-import { routedError } from "../shared/partition-topology/forward-meta.js";
+import { routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
 import { normalizeSkInterval } from "../shared/query/sk-interval.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
@@ -102,6 +104,7 @@ import {
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
 import { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
+import type { FokosPartitionRef, FokosStatusCursor, FokosStatusPage } from "../shared/partition/repartition/repartition-types.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 const TX_COORDINATOR_DESTROY_BATCH_SIZE = 1_000;
@@ -223,7 +226,7 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
-		const err = FokosError.wrap(e);
+		const err = mapInternalErrorToPublic(FokosError.wrap(e));
 		// A partition stamps its routing meta on its error. The routing state stops here, as it does on a result.
 		const routed = routedError(err);
 		if (routed) {
@@ -231,6 +234,29 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 		}
 		throw err;
 	}
+}
+
+/**
+ * Translates an internal condition that reached the public boundary into the code a client already
+ * knows how to handle.
+ *
+ * With `repartition_not_cut_over`, the repartition protocol tells a target that its source still
+ * owns the slice. A client has no repartitions in its vocabulary, and the condition means to it what
+ * `partition_migrating` means: retry shortly. The internal code stays in `attributes.runtimeCode`,
+ * and the error keeps its original `error_id`, so one log line still joins the two ends.
+ */
+function mapInternalErrorToPublic(err: FokosError): FokosError {
+	if (err.code !== UNAVAILABLE_CODES.repartition_not_cut_over.code) return err;
+	const mapped = new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+		message: "partition split in progress, please retry later",
+		error_id: err.error_id,
+		cause: err.cause,
+		attributes: { ...err.attributes, runtimeCode: err.code },
+	});
+	// The routing meta is an own property of the error object, so a new object loses it. It must move
+	// with the mapping. This code would otherwise be the only one that reaches a client with no meta.
+	const routed = routedError(err);
+	return routed ? stampRoutingMeta(mapped, routed.meta) : mapped;
 }
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
@@ -942,24 +968,34 @@ export class FokosDB {
 			await this.#staticShardedTCs.some(destroyCoordinator, { filterFn: (shard) => shard >= start && shard < end });
 		}
 
-		// The router owns the traversal (child-discovery order, range-root resolution, dedup);
-		// FokosDB supplies the two callbacks that perform the RPCs.
+		// The router owns the traversal, which is the target order and the dedup. FokosDB supplies the
+		// two callbacks that make the RPCs.
 		await this.#options.topology.traverseForDestroy(
-			async (ctx) => {
-				const stub = partitionStubByName(env[ns], ctx.doName);
-				console.warn(`Destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
-				const { splitStatus, promotedKeys } = await stub.status(ctx);
-				return { splitStatus, promotedKeys };
+			async (partition, rootContext) => {
+				const stub = partitionStubByName(env[ns], partition.doName);
+				console.warn(`Destroying partition DO ${partition.doName} (partitionId=${partition.partitionId})`);
+				// The fence first, and the pages after it. The fence stops every background transition, so
+				// nothing extends the set of target links below while the traversal walks it.
+				await stub.fokosPrepareDestroy({ rootContext });
+				const targets: FokosPartitionRef[] = [];
+				let cursor: FokosStatusCursor | null = null;
+				do {
+					const page: FokosStatusPage = await stub.fokosStatus({ cursor, rootContext });
+					for (const entry of page.entries) {
+						if (entry.target) targets.push(entry.target.ref);
+					}
+					cursor = page.nextCursor;
+				} while (cursor !== null);
+				return targets;
 			},
-			async (ctx) => {
-				const stub = partitionStubByName(env[ns], ctx.doName);
+			async (partition) => {
+				const stub = partitionStubByName(env[ns], partition.doName);
 				try {
 					await stub.destroyPartition();
 				} catch (e) {
-					// console.error(`Error destroying partition DO ${ctx.doName} (partitionId=${ctx.partitionId}):`, e);
 					if (!isDestroyAbortError(e)) throw e;
 				}
-				console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
+				console.warn(`Destroyed partition DO ${partition.doName} (partitionId=${partition.partitionId})`);
 			},
 		);
 

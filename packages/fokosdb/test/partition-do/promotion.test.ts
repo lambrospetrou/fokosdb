@@ -1,5 +1,9 @@
 import { env } from "cloudflare:workers";
-import { describe, expect, it } from "vitest";
+import { runInDurableObject } from "cloudflare:test";
+import { describe, expect, it, vi } from "vitest";
+import { PartitionDO } from "../../src/server/do-partition.js";
+import { PartialRangeTopology } from "../../src/shared/partition-topology/partial-range-topology.js";
+import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
@@ -209,5 +213,145 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 		expect(second.status).toBeDefined();
 
 		await partition.awaitPromoted("alice");
+	}, 30_000);
+
+	it("restores the fallback alarm when it reports an in-flight promotion", async () => {
+		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+
+		const txId = crypto.randomUUID();
+		const lockResult = await partition.stub.txPrepare(partition.ctx, {
+			transactionId: txId,
+			transactionTimestamp: Date.now(),
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
+		});
+		expect(lockResult.outcome).toBe("accepted");
+		try {
+			await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+			await partition.awaitPromotedKeyStatus("alice", ["queued"]);
+
+			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+				state.storage.sql.exec(`UPDATE fokos_repartitions SET next_attempt_at = ?`, Date.now() + 60_000);
+				await state.storage.deleteAlarm();
+				expect(await state.storage.getAlarm()).toBeNull();
+			});
+
+			const again = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+			expect(again.queued).toBe(false);
+
+			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
+				expect(await state.storage.getAlarm(), "the status report must restore the fallback alarm").not.toBeNull();
+				state.storage.sql.exec(`UPDATE fokos_repartitions SET next_attempt_at = ?`, Date.now());
+			});
+		} finally {
+			await partition.stub.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
+			await partition.awaitPromoted("alice");
+		}
+	}, 30_000);
+});
+
+describe("PartitionDO — promotion read fallback", () => {
+	it("a read falls back to the local rows while the promotion waits for cutover; a write does not", async () => {
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await partition.splitHash();
+		const owner = await partition.childOwning("alice");
+
+		await partition.stub.debugForcePromoteKey(partition.ctx, kb("bob"));
+		const bobOwner = await partition.childOwning("bob");
+		await bobOwner.awaitPromoted("bob");
+		const warm = await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
+		expect(warm.meta.servedByActorName).toBe(bobOwner.rangeRoot("bob").doName);
+
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
+
+		const maybePromotedSpy = vi.spyOn(PartialRangeTopology.prototype, "maybePromoted").mockReturnValue(true);
+
+		const aliceRangeRoot = partition.rangeRoot("alice");
+		let initCalls = 0;
+		let release!: () => void;
+		const held = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const originalInit = PartitionDO.prototype.fokosInit;
+		const initSpy = vi.spyOn(PartitionDO.prototype, "fokosInit").mockImplementation(async function (this: PartitionDO, req) {
+			const result = await originalInit.call(this, req);
+			if (req.target.doName === aliceRangeRoot.doName) {
+				initCalls++;
+				await held;
+			}
+			return result;
+		});
+
+		try {
+			await owner.stub.debugForcePromoteKey(owner.ctx, kb("alice"));
+			await vi.waitFor(() => expect(initCalls).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+
+			const g = await partition.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
+			expect(g).toMatchObject({ found: true, item: { data: "v" } });
+
+			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.apiPutItem(partition.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
+				).rejects.toThrow(fokosErrorWith("partition_migrating"));
+			});
+		} finally {
+			release();
+			initSpy.mockRestore();
+			maybePromotedSpy.mockRestore();
+		}
+
+		await owner.awaitPromoted("alice");
+	}, 30_000);
+});
+
+describe("PartitionDO — transaction commit and promotion candidates", () => {
+	it("keeps the local promotion candidates when a forwarded child commit fails", async () => {
+		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		const rangeRoot = await partition.awaitPromoted("alice");
+
+		const txId = crypto.randomUUID();
+		const txTs = Date.now();
+		const prepare = await partition.stub.txPrepare(partition.ctx, {
+			transactionId: txId,
+			transactionTimestamp: txTs,
+			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			items: withOpIndex([
+				{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "v", kind: "text" },
+				{ hashKey: kb("hot"), sortKey: kb("sk1"), operation: "put", data: PROMOTION_BIG_DATA, kind: "text" },
+			]),
+		});
+		expect(prepare.outcome).toBe("accepted");
+
+		let failed = false;
+		const original = PartitionDO.prototype.txCommit;
+		const spy = vi.spyOn(PartitionDO.prototype, "txCommit").mockImplementation(function (this: PartitionDO, pCtx, request) {
+			if (this.ctx.id.name === rangeRoot.doName && !failed) {
+				failed = true;
+				return Promise.reject(new Error("simulated child commit failure"));
+			}
+			return original.call(this, pCtx, request);
+		});
+
+		const commit = {
+			transactionId: txId,
+			transactionTimestamp: txTs,
+			items: [
+				{ hashKey: kb("alice"), sortKey: kb("sk1") },
+				{ hashKey: kb("hot"), sortKey: kb("sk1") },
+			],
+		};
+		try {
+			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+				await expect(instance.txCommit(partition.ctx, commit)).rejects.toThrow(fokosErrorWith("foreign_error"));
+			});
+
+			expect(await partition.promotedKeyStatus("hot"), "the local hot key must be queued for promotion").toBeDefined();
+		} finally {
+			spy.mockRestore();
+		}
+
+		await expect(partition.stub.txCommit(partition.ctx, commit)).resolves.toMatchObject({ outcome: "committed" });
+		await partition.awaitPromoted("hot");
 	}, 30_000);
 });

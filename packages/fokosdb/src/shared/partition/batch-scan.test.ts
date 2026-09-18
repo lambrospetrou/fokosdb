@@ -197,6 +197,48 @@ describe("collectBatch", () => {
 		expect(result.nextCursor).toEqual({ afterId: 2 });
 	});
 
+	it("stops at the scanned-row cap even when nothing matched, and resumes where it stopped", () => {
+		// This cap bounds a sparse slice. Without it, one page scans the whole table.
+		const table = makeTable(rows([1, 10], [2, 10], [3, 10], [4, 10], [5, 10]));
+		const opts = {
+			fetchPage: table.fetchPage,
+			advanceCursor,
+			estimateBytes,
+			include: (row: Row) => row.id === 5,
+			budgetBytes: 1000,
+			maxScannedRows: 2,
+			pageSize: 10,
+		};
+		const first = collectBatch({ ...opts, startCursor: null });
+		// An empty page with a non-null cursor: the scan made progress and has more work.
+		expect(first.rows).toEqual([]);
+		expect(first.nextCursor).toEqual({ afterId: 2 });
+
+		const second = collectBatch({ ...opts, startCursor: first.nextCursor });
+		expect(second.rows).toEqual([]);
+		expect(second.nextCursor).toEqual({ afterId: 4 });
+
+		const third = collectBatch({ ...opts, startCursor: second.nextCursor });
+		expect(third.rows.map((r) => r.id)).toEqual([5]);
+		expect(third.nextCursor).toBeNull();
+	});
+
+	it("never reads more rows than the scanned-row cap, whatever the page size", () => {
+		const table = makeTable(rows(...Array.from({ length: 50 }, (_, i) => [i + 1, 10] as [number, number])));
+		const result = collectBatch({
+			fetchPage: table.fetchPage,
+			advanceCursor,
+			estimateBytes,
+			budgetBytes: 1_000_000,
+			maxScannedRows: 12,
+			pageSize: 10,
+			startCursor: null,
+		});
+		expect(result.rows).toHaveLength(12);
+		// The last fetch asks for the remainder of the cap, not another whole page.
+		expect(table.fetchCalls.map((c) => c.pageSize)).toEqual([10, 2]);
+	});
+
 	it("starts from a provided startCursor", () => {
 		const table = makeTable(rows([1, 10], [2, 10], [3, 10]));
 		const result = collectBatch({

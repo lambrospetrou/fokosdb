@@ -19,13 +19,15 @@ import {
 } from "../../src/shared/partition-topology/partition-id.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { RANGE_PROMOTION_FRACTION } from "../../src/shared/partition-topology/split-policy.js";
-import type { SplitStatusKVItem } from "../../src/shared/partition-topology/split-state.js";
+import type { SplitStatusView } from "../../src/server/do-partition.js";
+import type { FokosMigrationPage } from "../../src/shared/partition/repartition/repartition-types.js";
+import type { FokosDbHostPage } from "../../src/shared/partition/fokos-migration-host.js";
 import { MAX_ITEM_BYTES, validateItemKeys } from "../../src/shared/transaction-limits.js";
 import { type PartitionOptions, type SplitStartedOrCompleted, expectSplitStatus, kb, makeStub } from "./helpers.js";
 
 type PartitionWriter = {
 	apiPutItem(ctx: PartitionContextResolved, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
-	status(ctx?: PartitionContextResolved): Promise<{ splitStatus?: SplitStatusKVItem }>;
+	status(ctx?: PartitionContextResolved): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
 // Each hash filler is below the promotion threshold and the write-reject grace band.
@@ -89,6 +91,17 @@ export class TestPartition {
 	async splitStatus(): Promise<SplitStartedOrCompleted> {
 		const state = await this.status();
 		return expectSplitStatus(state.splitStatus, this.doName);
+	}
+
+	/** The id of the split repartition of this partition, which a read-through caller must name. */
+	async splitRepartitionId(): Promise<string> {
+		return await runInDurableObject(this.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			const rows = state.storage.sql
+				.exec<{ id: string }>(`SELECT id FROM fokos_repartitions WHERE kind IN ('hash_split', 'range_split') LIMIT 1`)
+				.toArray();
+			invariant(rows[0], `${this.doName}: no split repartition`);
+			return rows[0].id;
+		});
 	}
 
 	/** The promotion status this partition holds for `hashKey`, or undefined if it holds no entry. */
@@ -410,22 +423,22 @@ export async function withMigrationHeld<T>(
 		release = resolve;
 	});
 	const restore = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
-		// The spy MUST go on the prototype: the RPC dispatcher rejects methods installed as own
-		// properties on the DO instance ("receiver does not implement the method"). The guard keeps
-		// the shared-prototype mock scoped to this one instance — including stray background RPCs
-		// from other partitions. Never call this from `it.concurrent`: two installs would compose
-		// spies on the same prototype and each would capture the other's mock as its "original".
+		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
+		// property on the DO instance ("receiver does not implement the method"). The guard keeps the
+		// mock on the shared prototype scoped to this one instance, and it also covers a stray
+		// background RPC from another partition. Never call this from `it.concurrent`: two installs
+		// compose spies on one prototype, and each one captures the mock of the other as its original.
 		const prototype: PartitionDO = Object.getPrototypeOf(instance);
-		const original = prototype.migrationGetPartitionTransactionMetadata;
-		const spy = vi.spyOn(prototype, "migrationGetPartitionTransactionMetadata").mockImplementation(async function (
-			this: PartitionDO,
-			request,
-		) {
-			if (this === instance) {
-				requestedBy.add(request.childPartitionContext.doName);
+		const original = prototype.fokosMigrationPull;
+		const spy = vi.spyOn(prototype, "fokosMigrationPull").mockImplementation(async function (this: PartitionDO, req) {
+			// Held in the pending-transaction stream, which is the last stream an import runs. Every
+			// target has pulled its items by then, so the whole tree migrates when the wait returns.
+			const inPendingTx = req.cursor?.phase === "host" && (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx";
+			if (this === instance && inPendingTx) {
+				requestedBy.add(req.target.doName);
 				await held;
 			}
-			return original.call(this, request);
+			return await original.call(this, req);
 		});
 		return () => spy.mockRestore();
 	});
@@ -447,11 +460,12 @@ export async function withMigrationHeld<T>(
 }
 
 /**
- * Caps every migration batch response the parent serves at `maxRows` rows, forcing each stream
- * (items, pending transactions, promoted keys) through multiple cursor-paginated round trips.
- * A truncated response points its cursor at the last row returned; resume continues strictly after
- * it, so no row is lost or duplicated — the same path the real byte budget takes when it stops a
- * scan. `run` receives counters so the test can assert pagination actually happened.
+ * Caps every migration page the source serves at `maxRows` rows. Each phase and each stream of the
+ * host then needs more than one round trip of the cursor.
+ *
+ * A truncated page points its cursor at the last row it returned, and the resume continues after that
+ * row. No row is lost and none is duplicated, which is the path the real byte budget takes when it
+ * stops a scan. `run` receives counters, so a test can assert that the pagination happened.
  */
 export async function withMigrationBatchCap<T>(
 	parent: TestPartition,
@@ -462,57 +476,22 @@ export async function withMigrationBatchCap<T>(
 	let calls = 0;
 	let truncated = 0;
 	const restore = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
-		// The spies MUST go on the prototype: the RPC dispatcher rejects methods installed as own
-		// properties on the DO instance ("receiver does not implement the method"). The guard keeps
-		// the shared-prototype mocks scoped to this one instance — including stray background RPCs
-		// from other partitions. Never call this from `it.concurrent`: two installs would compose
-		// spies on the same prototype and each would capture the other's mock as its "original".
+		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
+		// property on the DO instance ("receiver does not implement the method"). The guard keeps the
+		// mock on the shared prototype scoped to this one instance, and it also covers a stray
+		// background RPC from another partition. Never call this from `it.concurrent`: two installs
+		// compose spies on one prototype, and each one captures the mock of the other as its original.
 		const prototype: PartitionDO = Object.getPrototypeOf(instance);
-
-		const origItems = prototype.migrationGetItemsBatch;
-		const itemsSpy = vi.spyOn(prototype, "migrationGetItemsBatch").mockImplementation(async function (this: PartitionDO, opts) {
-			const result = await origItems.call(this, opts);
-			if (this !== instance) return result;
+		const original = prototype.fokosMigrationPull;
+		const spy = vi.spyOn(prototype, "fokosMigrationPull").mockImplementation(async function (this: PartitionDO, req) {
+			const page = await original.call(this, req);
+			if (this !== instance) return page;
 			calls++;
-			if (result.items.length <= maxRows) return result;
-			truncated++;
-			const last = result.items[maxRows - 1];
-			return { items: result.items.slice(0, maxRows), nextCursor: { hk: last.hk, sk: last.sk } };
+			const capped = capPage(page, maxRows);
+			if (capped) truncated++;
+			return capped ?? page;
 		});
-
-		const origTx = prototype.migrationGetPartitionTransactionMetadata;
-		const txSpy = vi.spyOn(prototype, "migrationGetPartitionTransactionMetadata").mockImplementation(async function (
-			this: PartitionDO,
-			opts,
-		) {
-			const result = await origTx.call(this, opts);
-			if (this !== instance) return result;
-			calls++;
-			if (result.pendingTransactions.length <= maxRows) return result;
-			truncated++;
-			const last = result.pendingTransactions[maxRows - 1];
-			return {
-				...result,
-				pendingTransactions: result.pendingTransactions.slice(0, maxRows),
-				nextCursor: { hk: last.hk, sk: last.sk, transaction_id: last.transaction_id },
-			};
-		});
-
-		const origPk = prototype.migrationGetPromotedKeysBatch;
-		const pkSpy = vi.spyOn(prototype, "migrationGetPromotedKeysBatch").mockImplementation(async function (this: PartitionDO, opts) {
-			const result = await origPk.call(this, opts);
-			if (this !== instance) return result;
-			calls++;
-			if (result.rows.length <= maxRows) return result;
-			truncated++;
-			return { rows: result.rows.slice(0, maxRows), nextCursor: { hashKey: result.rows[maxRows - 1].hash_key } };
-		});
-
-		return () => {
-			itemsSpy.mockRestore();
-			txSpy.mockRestore();
-			pkSpy.mockRestore();
-		};
+		return () => spy.mockRestore();
 	});
 	try {
 		return await run({ calls: () => calls, truncated: () => truncated });
@@ -542,4 +521,39 @@ export async function makeTriggeredRangeRoot(
 	const start = sks.length;
 	sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
 	return { root, sks };
+}
+
+/**
+ * Truncates one page to `maxRows` rows and points its cursor at the last row it kept. It returns null
+ * when the page already fits. The flow owns the overrides phase and the host owns its own streams, so
+ * each one carries its own row shape and its own cursor.
+ */
+function capPage(page: FokosMigrationPage, maxRows: number): FokosMigrationPage | null {
+	if (page.phase === "overrides") {
+		if (page.overrides.length <= maxRows) return null;
+		const kept = page.overrides.slice(0, maxRows);
+		return { phase: "overrides", overrides: kept, nextCursor: { phase: "overrides", inner: { hashKey: kept[maxRows - 1].hashKey } } };
+	}
+	const hostPage = page.page as FokosDbHostPage;
+	if (hostPage.stream === "items") {
+		if (hostPage.items.length <= maxRows) return null;
+		const kept = hostPage.items.slice(0, maxRows);
+		const last = kept[maxRows - 1];
+		return {
+			phase: "host",
+			page: { stream: "items", items: kept },
+			nextCursor: { phase: "host", inner: { stream: "items", cursor: { hk: last.hk, sk: last.sk } } },
+		};
+	}
+	if (hostPage.pendingTransactions.length <= maxRows) return null;
+	const kept = hostPage.pendingTransactions.slice(0, maxRows);
+	const last = kept[maxRows - 1];
+	return {
+		phase: "host",
+		page: { ...hostPage, pendingTransactions: kept },
+		nextCursor: {
+			phase: "host",
+			inner: { stream: "pending_tx", cursor: { hk: last.hk, sk: last.sk, transaction_id: last.transaction_id } },
+		},
+	};
 }

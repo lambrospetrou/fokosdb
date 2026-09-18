@@ -1,8 +1,8 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
-import { PartitionIdHelper, hashRootIndex, resolveRangePartitionContext } from "./partition-id.js";
+import { PartitionIdHelper, hashRootIndex } from "./partition-id.js";
 import type { KeyBytes } from "./key-codec.js";
-import type { SplitStatusKVItem } from "./split-state.js";
+import type { FokosPartitionRef } from "../partition/repartition/repartition-types.js";
 import { assertExists } from "../tsutils.js";
 
 export interface PartitionTopologyRouter {
@@ -18,16 +18,17 @@ export interface PartitionTopologyRouter {
 	rootPartitionContexts(): PartitionContextResolved[];
 
 	/**
-	 * Full-tree traversal for destroy: the router owns child-discovery order (children before
-	 * their parent, linked range structures before the hash partition that links them) and the
-	 * dedup of shared range roots; the caller supplies the two RPC-performing callbacks.
+	 * The whole-tree traversal for destroy. The router owns the order, which visits every target
+	 * before the partition that links it, and the dedup of shared range roots. The caller supplies the
+	 * two callbacks that make the RPCs.
+	 *
+	 * `discoverTargets` must fence the partition before it reads the target links, so nothing adds one
+	 * after the read. It receives a root context only for a root partition, which can need it to
+	 * bootstrap.
 	 */
 	traverseForDestroy(
-		getStatus: (ctx: PartitionContextResolved) => Promise<{
-			splitStatus?: SplitStatusKVItem;
-			promotedKeys?: { hashKey: KeyBytes; status: string }[];
-		}>,
-		visit: (ctx: PartitionContextResolved) => Promise<void>,
+		discoverTargets: (partition: FokosPartitionRef, rootContext?: PartitionContextResolved) => Promise<FokosPartitionRef[]>,
+		visit: (partition: FokosPartitionRef) => Promise<void>,
 	): Promise<void>;
 }
 
@@ -129,40 +130,27 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	}
 
 	async traverseForDestroy(
-		getStatus: (ctx: PartitionContextResolved) => Promise<{
-			splitStatus?: SplitStatusKVItem;
-			promotedKeys?: { hashKey: KeyBytes; status: string }[];
-		}>,
-		visit: (ctx: PartitionContextResolved) => Promise<void>,
+		discoverTargets: (partition: FokosPartitionRef, rootContext?: PartitionContextResolved) => Promise<FokosPartitionRef[]>,
+		visit: (partition: FokosPartitionRef) => Promise<void>,
 	): Promise<void> {
-		// Dedupe range structures: a 'promoted' entry is inherited by every hash child that took ownership,
-		// so the same global rangeRoot(hashKey) may be enumerated from multiple hash partitions.
-		const destroyedRangeRoots = new Set<string>();
+		// One range root is the target of a promotion on every hash child that inherited the key, so the
+		// traversal reaches the same partition from more than one place. One set over the whole
+		// traversal, keyed by the name a destroy call needs, stops a second visit.
+		const visited = new Set<string>();
 
-		const destroyPartition = async (ctx: PartitionContextResolved): Promise<void> => {
-			// Discover children dynamically: the in-memory topology only knows root nodes,
-			// but split children are recorded in the DO's own split status.
-			const { splitStatus, promotedKeys } = await getStatus(ctx);
-			if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-				for (const childCtx of splitStatus.childPartitionContexts) {
-					await destroyPartition(childCtx);
-				}
+		const destroyPartition = async (partition: FokosPartitionRef, rootContext?: PartitionContextResolved): Promise<void> => {
+			if (visited.has(partition.doName)) return;
+			visited.add(partition.doName);
+			// The in-memory topology knows only the roots. Everything below a root is a durable target
+			// link that the partition reports: the split children, and the range trees of its promotions.
+			for (const target of await discoverTargets(partition, rootContext)) {
+				await destroyPartition(target);
 			}
-			// Destroy each linked range structure BEFORE the hash partition that links it. Each range root
-			// recurses its own split children via the same path. Deduped by hashKey across the whole tree.
-			// Skip 'queued' keys — their range root is not created yet (nothing to destroy).
-			for (const { hashKey, status } of promotedKeys ?? []) {
-				if (status === "queued") continue;
-				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(ctx, hashKey, null, null);
-				if (destroyedRangeRoots.has(rangeRootCtx.doName)) continue;
-				destroyedRangeRoots.add(rangeRootCtx.doName);
-				await destroyPartition(rangeRootCtx);
-			}
-			await visit(ctx);
+			await visit(partition);
 		};
 
 		for (const rootCtx of this.rootPartitionContexts()) {
-			await destroyPartition(rootCtx);
+			await destroyPartition({ partitionId: rootCtx.partitionId, doName: rootCtx.doName }, rootCtx);
 		}
 	}
 }

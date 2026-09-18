@@ -29,18 +29,21 @@ import {
 	pCtxForLog,
 	PartitionContext,
 	PartitionContextResolved,
-	type InitFromSplitOptions,
 	PartitionContextLivePartition,
 } from "../shared/partition-topology/partition-context.js";
-import { PartitionIdHelper, resolveRangePartitionContext } from "../shared/partition-topology/partition-id.js";
+import {
+	PartitionIdHelper,
+	resolveHashChildPartitionContexts,
+	resolveRangePartitionContext,
+} from "../shared/partition-topology/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.js";
 import {
 	HashPartitionTopologyImpl,
 	PartitionTopologySplitter,
+	RANGE_PROMOTION_FRACTION,
 	RangePartitionTopologyImpl,
 	type OperationIntent,
 } from "../shared/partition-topology/split-policy.js";
-import { SplitStatusKVItem } from "../shared/partition-topology/split-state.js";
 import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "../shared/partition-topology/types.js";
 import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
 import { tryWhile } from "durable-utils/retries";
@@ -53,25 +56,37 @@ import {
 	estimatePendingTxBytes,
 	estimateProjectedRowBytes,
 	PartitionStore,
-	type MigratedItem,
 	type StoredItem,
 	type ScanCursor,
-	type PendingTransactionCursor,
-	type PendingTransactionRow,
-	type PromotedKeyCursor,
 	type PromotedKeyStatus,
+	type RepartitionState,
+	type RepartitionTargetRow,
 } from "../shared/partition/partition-store.js";
-import {
-	type GetItemsBatchResult,
-	type GetPartitionTransactionMetadataResult,
-	type GetPromotedKeysBatchResult,
-	type PartitionPeer,
-} from "../shared/partition/partition-peer.js";
-import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus } from "../shared/partition/migration.js";
-import { PromotionManager } from "../shared/partition/hash-key-promotion.js";
 import { TransactionParticipant } from "../shared/partition/transaction-participant.js";
+import type { PromotionCandidate } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
-import { assertPointInSlice, clipQueryToSlice, type FokosSlice } from "../shared/partition/repartition-slice.js";
+import { assertPointInSlice, clipQueryToSlice } from "../shared/partition/repartition/repartition-slice.js";
+import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
+import {
+	RepartitionSource,
+	RepartitionTarget,
+	REPARTITION_KV_KEYS,
+	type RepartitionCommonDeps,
+	type RepartitionSourceDeps,
+	type RepartitionTargetDeps,
+} from "../shared/partition/repartition/repartition-flow.js";
+import type {
+	FokosImportState,
+	FokosInitRequest,
+	FokosMigrationAckRequest,
+	FokosMigrationPage,
+	FokosMigrationPullRequest,
+	FokosPartitionStatusRpc,
+	FokosPrepareDestroyRequest,
+	FokosStartImportRequest,
+	FokosStatusPage,
+	FokosStatusRequest,
+} from "../shared/partition/repartition/repartition-types.js";
 import { AddResult } from "../shared/bloom-filter.js";
 import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "../shared/partition-topology/partial-range-topology.js";
 import {
@@ -226,20 +241,8 @@ export type QueryItemsRpcResponse = {
 
 // ─── read-through types ───────────────────────────────────────────────────────
 
-/** The immutable identity of one remote participant of a split or a key promotion. */
-export type FokosPartitionRef = {
-	partitionId: string;
-	doName: string;
-};
-
-/**
- * One read a repartition target asks its source to serve while the target is still importing.
- * `caller` is the target's own immutable identity; the source resolves the slice that target owns
- * from its own durable records and never trusts a name alone.
- */
-export type FokosExecuteLocalRequest =
-	| { op: "getItem"; caller: FokosPartitionRef; request: GetItemRpcRequest }
-	| { op: "queryItems"; caller: FokosPartitionRef; request: QueryItemsRpcRequest };
+export type { FokosPartitionRef, FokosExecuteLocalRequest } from "../shared/partition/repartition/repartition-types.js";
+import type { FokosExecuteLocalRequest } from "../shared/partition/repartition/repartition-types.js";
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -250,8 +253,6 @@ export type PartitionDOStub = {
 	apiGetItem(ctx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
 	apiDeleteItem(ctx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
 	apiQueryItems(ctx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
-
-	internalTriggerMigration(): Promise<void>;
 
 	txPrepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
 	txCommit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
@@ -273,11 +274,7 @@ export type DebugForcePromoteKeyResponse = {
 	status: PromotedKeyStatus | undefined;
 };
 
-// Re-exported for existing importers (tests, FokosDB); the type itself is context-level and
-// lives in partition-topology/partition-context.ts.
-export type { InitFromSplitOptions };
-
-export class PartitionDO extends DurableObject implements PartitionAPI {
+export class PartitionDO extends DurableObject implements PartitionAPI, FokosPartitionStatusRpc {
 	static get(ns: DurableObjectNamespace<PartitionDO>, id: DurableObjectId): DurableObjectStub<PartitionDO> {
 		return ns.get(id);
 	}
@@ -291,30 +288,39 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// Updated on splits and key promotions.
 		PARTITION_DEPTH: "__partition_depth",
 
-		PARENT_PARTITION_CONTEXT: "__parent_partition_context",
-		PARENT_SPLIT_TYPE: "__parent_split_type",
-
 		PARTIAL_RANGE_TOPOLOGY: "__partial_range_topology",
 	};
 
 	private static readonly STALE_TX_MS = 5_000;
 	private static readonly MIGRATION_FALLBACK_ALARM_MS = 10_000;
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
+	/** How far ahead a work pass arms its fallback, before it changes state or calls an RPC. */
+	private static readonly WORK_FALLBACK_ALARM_MS = 5_000;
+	private static readonly IMPORT_PAGES_PER_PASS = 16;
+	/** Both bounds of one `fokosStatus` page: the entry count, and the estimated serialized size. */
+	private static readonly STATUS_PAGE_ENTRIES = 1_000;
+	private static readonly STATUS_PAGE_BYTES = 20 * 1024 * 1024;
 
 	private readonly STRING_PCTX_INIT_ERROR = `fokos/partition: partition context not initialized for ${this.ctx.id.toString()}[${this.ctx.id.name}]`;
 
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
-	#promotion: PromotionManager;
+	#source: RepartitionSource;
+	#target: RepartitionTarget;
 	#ttl: TtlExpiry;
 
-	#_parentPartitionContext?: PartitionContextLivePartition;
 	#_partitionContext?: PartitionContextLivePartition;
 	#_topology?: PartitionTopologySplitter;
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
-	#_migrationInFlight: Promise<void> | null = null;
-
+	/**
+	 * The one background pass in flight.
+	 *
+	 * A timer, an alarm and a request all reach `runBackgroundWork`. Two passes over one import each
+	 * hold a page the other has moved past. The promise lives in memory only, so an eviction loses it.
+	 * The durable guards inside each transition make the work safe. This field only stops the waste.
+	 */
+	#_backgroundInFlight: Promise<void> | null = null;
 	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
 	// non-blocking from the constructor, so it may be undefined for the first few
 	// requests after the DO wakes. Never gate correctness on it.
@@ -327,21 +333,10 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
-		this.#participant = new TransactionParticipant({
-			store: this.#store,
-			// Committed transactional puts feed the same promotion queue check as non-transactional puts.
-			onItemUpserted: (hashKey, keyEstBytes) => this.#promotion.maybeQueuePromotion(this.pCtx(), hashKey, keyEstBytes),
-		});
-		this.#promotion = new PromotionManager({
-			store: this.#store,
-			// Boundary rule: only the DO acquires stubs — the manager receives this factory.
-			getRangeRootPeer: (rangeRootCtx) => this.env[rangeRootCtx.ns].get(this.env[rangeRootCtx.ns].idFromName(rangeRootCtx.doName)),
-			scheduleWork: async (opts) => {
-				this.scheduleBackgroundWork(opts);
-				await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-			},
-			logParams: () => this.logParams(),
-		});
+		this.#participant = new TransactionParticipant({ store: this.#store });
+		const repartitionDeps = this.repartitionDeps();
+		this.#source = new RepartitionSource(this.#store, ctx.storage, repartitionDeps);
+		this.#target = new RepartitionTarget(this.#store, ctx.storage, repartitionDeps);
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
 			canSweep: () => this.ttlCanSweep(),
@@ -370,11 +365,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				if (prtSnap) {
 					this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
 				}
-
-				const parentPctx = ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-				if (parentPctx) {
-					this.#_parentPartitionContext = parentPctx;
-				}
 			}
 		});
 		this.#ttl.arm(this.fokosTtlConfig().initialDelayMs);
@@ -390,73 +380,141 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}, 0);
 	}
 
+	// ═══ the repartition control RPCs ════════════════════════════════════════
+
 	/**
-	 * Only called from the parent partition during the split process to initialize the new child partition
-	 * with the right context and its parent partition info that it can use to get data during migration.
+	 * Creates this partition as the target of a repartition, or confirms an identical earlier call.
 	 *
-	 * This is not meant to be called directly by clients.
+	 * Only this call creates a range partition. Only this call tells a hash child that it exists,
+	 * before its first user request arrives. A client must not call it.
 	 */
-	async internalInitFromSplit(opts: InitFromSplitOptions): Promise<void> {
-		return await this.#rpc("internalInitFromSplit", async () => await this.#internalInitFromSplit(opts));
+	async fokosInit(req: FokosInitRequest): Promise<void> {
+		return await this.#rpc("fokosInit", async () => await this.#target.initAsTarget(req));
 	}
 
-	async #internalInitFromSplit(opts: InitFromSplitOptions): Promise<void> {
-		const { parentPartitionContext, newPartitionContext, newPartitionRangeDepth, splitType } = opts;
+	/** Asks this target to start its import now, instead of at its own fallback alarm. */
+	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
+		return await this.#rpc("fokosStartImport", async () => await this.#target.startImport(req));
+	}
 
-		if (this.#_partitionContext) {
-			const storedParent = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-			const storedSplitType = this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE);
-			if (
-				this.#_partitionContext.primaryDoIdStr !== newPartitionContext.primaryDoIdStr ||
-				storedParent?.primaryDoIdStr !== parentPartitionContext.primaryDoIdStr ||
-				storedSplitType !== splitType
-			) {
-				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
-					message: "initFromSplit called with conflicting options",
-					attributes: {
-						child: [this.#_partitionContext.primaryDoIdStr, newPartitionContext.primaryDoIdStr],
-						parent: [storedParent?.primaryDoIdStr, parentPartitionContext.primaryDoIdStr],
-						splitType: [storedSplitType, splitType],
-					},
+	/** Serves one bounded migration page to a target that is still catching up. */
+	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
+		return await this.#rpc("fokosMigrationPull", async () => this.#source.servePage(req));
+	}
+
+	/** Records that one target holds a complete copy of its slice. */
+	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
+		return await this.#rpc("fokosMigrationAck", async () => this.#source.acceptAck(req));
+	}
+
+	/**
+	 * Fences this partition for destroy. Every background transition stops, and no new target appears.
+	 *
+	 * The traversal reads the target links after this call returns. The fence must therefore hold
+	 * before the pass that can add a target ends. One transaction writes the fence and the optional
+	 * root bootstrap. The call then waits for the pass in flight. That pass re-reads the fence before
+	 * each remaining step, so the alarm this method cancels stays cancelled. A repeated call succeeds.
+	 */
+	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
+		return await this.#rpc("fokosPrepareDestroy", async () => await this.#fokosPrepareDestroy(req));
+	}
+
+	async #fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
+		this.#store.transactionSync(() => {
+			if (req.rootContext) this.ensurePartitionContext(req.rootContext);
+			this.ctx.storage.kv.put<boolean>(REPARTITION_KV_KEYS.DESTROYING, true);
+		});
+		// A failed pass is a stopped pass, and the fence is already durable. Its error must not fail the
+		// destroy that deletes this partition whole.
+		await this.#_backgroundInFlight?.catch(() => {});
+		// After the pass, never before it: the end of a pass can re-arm both of these.
+		this.#ttl.disarm();
+		await this.ctx.storage.deleteAlarm();
+	}
+
+	/**
+	 * One bounded page of every repartition this partition holds, with the target links inside it.
+	 *
+	 * A destroy traversal walks this view, so it reports every target row. A `pending` target has had
+	 * no initialization call and is a leaf. An `initializing` target can already hold storage of its
+	 * own. A root request carries its context and bootstraps an empty root. A target request omits the
+	 * context and must never create an empty partition.
+	 */
+	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
+		return await this.#rpc("fokosStatus", async () => this.#fokosStatus(req));
+	}
+
+	#fokosStatus(req: FokosStatusRequest): FokosStatusPage {
+		if (req.rootContext) this.ensurePartitionContext(req.rootContext);
+		const destroying = this.isDestroying();
+		const pCtx = this.#_partitionContext;
+		if (!pCtx) {
+			return { initialized: false, destroying, partitionContext: null, importState: null, entries: [], nextCursor: null };
+		}
+		const { entries, nextCursor } = this.#source.statusEntries(req.cursor, PartitionDO.STATUS_PAGE_ENTRIES, PartitionDO.STATUS_PAGE_BYTES);
+		return { initialized: true, destroying, partitionContext: pCtx, importState: this.#target.importState(), entries, nextCursor };
+	}
+
+	/**
+	 * What both halves of the repartition flow need from this Durable Object.
+	 *
+	 * One object serves both halves. The source reads the parts it declares, and the target reads its
+	 * own. The constructor type of each half keeps them apart. Everything that acquires a stub, reads
+	 * application data, or sets the alarm lives here, because the flow does none of that.
+	 */
+	private repartitionDeps(): RepartitionSourceDeps & RepartitionTargetDeps {
+		const common: RepartitionCommonDeps = {
+			// Boundary rule: only DO classes and FokosDB hold stubs.
+			getPeer: (ref) => this.env[this.pCtx().ns].getByName(ref.doName),
+			host: new FokosMigrationHost({ store: this.#store, hashSplitN: () => this.pCtx().hashSplitN }),
+			identity: () => ({ pCtx: this.pCtx(), depth: this.depth(), rangeAncestors: this.#_rangeAncestors }),
+			// Forced, because the flow calls this when work has just become due: a queued repartition, an
+			// acknowledgement that completed one, or a start notification. The scheduler drops an unforced
+			// request while another one is pending, which leaves the new work until the next alarm.
+			scheduleWork: () => this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true }),
+			logParams: () => this.logParams(),
+		};
+		return {
+			...common,
+			hasIdentity: () => this.#_partitionContext !== undefined,
+			applyTargetIdentity: (req) => this.applyTargetIdentity(req),
+			ensureAlarmSet: async (targetMs) => await this.ensureAlarmSet(targetMs),
+
+			computeRangeBoundaries: (hashKey, start, end, n) => this.#store.computeRangeSplitBoundaries(hashKey, start, end, n),
+			lockCountForKey: (hashKey) => this.#store.pendingLockCountForHashKey(hashKey),
+			cleanupStep: (hashKey) => {
+				this.#store.deleteItemsBatchForHashKey(hashKey, 1000);
+				this.#store.deletePendingTxForHashKey(hashKey);
+				if (this.#store.hasItemsForHashKey(hashKey)) return false;
+				this.#store.deleteKeySizeEstimate(hashKey);
+				return true;
+			},
+			onSplitCompleted: () => this.#store.deleteAllPendingTx(),
+		};
+	}
+
+	/**
+	 * Writes this partition's identity, depth and range ancestors from a `fokosInit`. It is
+	 * synchronous by contract: the flow calls it inside the transaction that writes the import record.
+	 */
+	private applyTargetIdentity(req: FokosInitRequest): void {
+		const pCtx = this.ensurePartitionContext(req.target, /* isInit */ true);
+		if (isRangePartition(pCtx)) {
+			invariant(req.rangeDepth !== undefined, "fokos/partition.fokosInit: a range target needs its depth");
+			this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, req.rangeDepth);
+			this.#_depth = req.rangeDepth;
+			if (req.rangeAncestors && req.rangeAncestors.length > 0) {
+				invariant(req.rangeDepth > 0, "fokos/partition.fokosInit: only a non-root range partition has ancestors");
+				this.#store.setRangeAncestors(pCtx.rangePartition.hashKey, req.rangeAncestors);
+				// Append non-root "self".
+				this.#_rangeAncestors = req.rangeAncestors.concat({
+					depth: req.rangeDepth,
+					startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
+					endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
 				});
 			}
-			// All options match — idempotent retry, nothing to do.
-			return;
 		}
-
-		this.ctx.storage.transactionSync(() => {
-			const pCtx = this.ensurePartitionContext(opts.newPartitionContext, /* isInit */ true);
-			this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT, parentPartitionContext);
-			this.ctx.storage.kv.put<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE, splitType);
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_initialized");
-
-			this.#_parentPartitionContext = parentPartitionContext;
-
-			if (isRangePartition(pCtx)) {
-				invariant(newPartitionRangeDepth !== undefined, "fokos/partition: newPartitionRangeDepth must be provided for range partitions");
-				this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, newPartitionRangeDepth);
-
-				if (opts.rangeAncestors && opts.rangeAncestors.length > 0) {
-					invariant(newPartitionRangeDepth > 0, "fokos/partition: rangeAncestors should only be set for non-root range partitions");
-					this.#store.setRangeAncestors(pCtx.rangePartition.hashKey, opts.rangeAncestors);
-					// Append non-root "self".
-					this.#_rangeAncestors = opts.rangeAncestors.concat({
-						depth: newPartitionRangeDepth,
-						startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
-						endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
-					});
-				}
-			}
-			this.depth(); // populate #_depth
-
-			// FIXME: Let a child start its own migration. Today the parent must trigger it with
-			// triggerMigration() after initFromSplit. A child that runs its background job for any other
-			// reason also starts the migration job.
-			// Fallback: alarm fires if the DO is evicted before setTimeout runs.
-			// await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
-			// Fast path: begin migration in this request's event loop turn.
-			// this.scheduleBackgroundWork(0);
-		});
+		this.depth(); // populate #_depth
 	}
 
 	//////////////////////////////
@@ -493,26 +551,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
+	/**
+	 * Both sweeps ask the same questions, because both need complete local state. An importing target
+	 * does not hold it yet. A split router no longer holds it: its targets own the keys and sweep
+	 * their own rows. A fenced partition is on its way out and must make no transition.
+	 */
+	private canSweepLocally(): boolean {
+		if (!this.#_partitionContext) return false;
+		if (this.isDestroying()) return false;
+		return !this.#target.isImporting() && !this.#source.routerRole();
+	}
+
 	private ttlCanSweep(): boolean {
-		const pCtx = this.#_partitionContext;
-		if (!pCtx) return false;
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-		// A migrating child does not yet have all rows or inherited transaction locks.
-		if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") return false;
-		const splitStatus = this.ensureTopology(pCtx).splitStatus()?.status;
-		// A split parent no longer owns a key range; its children sweep their own rows.
-		return splitStatus !== "split_started" && splitStatus !== "split_completed";
+		return this.canSweepLocally();
 	}
 
 	private txPendingCanSweep(): boolean {
-		const pCtx = this.#_partitionContext;
-		if (!pCtx) return false;
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-		// A migrating child does not yet have complete, authoritative transaction locks.
-		if (migrationStatus === "migration_initialized" || migrationStatus === "migration_migrating") return false;
-		const splitStatus = this.ensureTopology(pCtx).splitStatus()?.status;
-		// A split parent holds redundant lock copies while its children own the keys.
-		return splitStatus !== "split_started" && splitStatus !== "split_completed";
+		return this.canSweepLocally();
 	}
 
 	///////////////////////////////
@@ -526,31 +581,87 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		return await this.#rpc("status", async () => await this.#status(pCtx));
 	}
 
+	/**
+	 * The compatibility view. It keeps the shape the partition suites already read.
+	 *
+	 * Nothing persists this view. Every field below comes from `fokos_repartitions`, its target rows,
+	 * and `__fokos/import`. A destroy traversal reads the paginated `fokosStatus` instead, which
+	 * reports every target row and not only the targets of a split.
+	 */
 	async #status(pCtx?: PartitionContextLivePartition) {
 		// Only a test passes pCtx. In production the public API initializes the DO before this call.
 		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
+		const importRecord = this.#target.importRecord();
 		return {
 			depth: this.depth(),
 			partitionContext: pCtx,
 			partitionContextStored: this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
-			splitStatus: pCtx ? this.ensureTopology(pCtx).splitStatus() : undefined,
-			migrationStatus: this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
-			parentPartitionContext: this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT),
-			parentSplitType: this.ctx.storage.kv.get<SplitType>(PartitionDO.KV_KEYS.PARENT_SPLIT_TYPE),
-			promotedKeys: this.#promotion.snapshot(),
+			splitStatus: pCtx ? this.derivedSplitStatus(pCtx) : undefined,
+			migrationStatus: derivedMigrationStatus(importRecord?.state),
+			parentPartitionContext: importRecord?.source,
+			parentSplitType: importRecord ? (importRecord.slice.kind === "hash_child" ? "hash" : "range") : undefined,
+			promotedKeys: this.derivedPromotedKeys(),
 		};
 	}
 
-	async internalTriggerMigration(): Promise<void> {
-		return await this.#rpc("internalTriggerMigration", async () => await this.#internalTriggerMigration());
+	/** The split lifecycle, as the old KV record described it. */
+	private derivedSplitStatus(pCtx: PartitionContextLivePartition): SplitStatusView | undefined {
+		const row = this.#source.splitRepartition();
+		if (!row) return undefined;
+		const splitType: SplitType = row.kind === "hash_split" ? "hash" : "range";
+		const status =
+			row.state === "queued" || row.state === "planned" ? "split_queued" : row.state === "cutover" ? "split_started" : "split_completed";
+		if (status === "split_queued") {
+			return { status, splitType, createdAt: row.queuedAt, partitionContext: pCtx };
+		}
+		const targets = this.#source.splitTargets();
+		const history: Extract<SplitStatusView, { history: unknown }>["history"] = [
+			{ status: "split_queued", splitType, createdAt: row.queuedAt, partitionContext: pCtx },
+		];
+		if (status === "split_completed" && row.cutoverAt !== null) {
+			history.push({ status: "split_started", splitType, createdAt: row.cutoverAt, partitionContext: pCtx });
+		}
+		return {
+			status,
+			splitType,
+			createdAt: (status === "split_started" ? row.cutoverAt : row.completedAt) ?? row.queuedAt,
+			partitionContext: pCtx,
+			// Built from THIS partition's current context, never from a snapshot taken at split time.
+			childPartitionContexts: targets.map((t) => this.targetContext(pCtx, t)),
+			migratedChildDoNames: targets.filter((t) => t.acknowledged).map((t) => t.doName),
+			history,
+		};
 	}
 
-	async #internalTriggerMigration(): Promise<void> {
-		invariant(this.pCtx(), "fokos/partition.triggerMigration: partition context is required");
-		const isMigrating = await this.ensureMigration("triggerMigration", false);
-		if (isMigrating) {
-			this.scheduleBackgroundWork({ delayMs: 0, forceSchedule: true });
+	/** The promotion lifecycle of every key this partition has moved or inherited. */
+	private derivedPromotedKeys(): { hashKey: KeyBytes; status: PromotedKeyStatus }[] {
+		const out: { hashKey: KeyBytes; status: PromotedKeyStatus }[] = [];
+		let cursor = null as { seq: number; targetIndex: number } | null;
+		for (;;) {
+			const page = this.#source.statusEntries(cursor, 1000);
+			for (const entry of page.entries) {
+				if (entry.repartition.kind !== "key_promotion") continue;
+				if (entry.target !== null && entry.target.index !== 0) continue;
+				const row = this.#store.getRepartition(entry.repartition.id);
+				if (!row?.hashKey) continue;
+				out.push({ hashKey: row.hashKey, status: promotedKeyStatusOf(entry.repartition.state) });
+			}
+			if (!page.nextCursor) return out;
+			cursor = page.nextCursor;
 		}
+	}
+
+	/** Rebuilds one target's context from this partition's CURRENT context and the target's stored slice. */
+	private targetContext(pCtx: PartitionContextLivePartition, target: RepartitionTargetRow): PartitionContextResolved {
+		if (target.slice.kind === "hash_child") {
+			const child = resolveHashChildPartitionContexts(pCtx).find((c) => c.partitionId === target.partitionId);
+			invariant(child, () => `fokos/partition: no hash child matches target ${target.doName}`);
+			return child;
+		}
+		const slice = target.slice;
+		const start = slice.kind === "range" ? slice.start : null;
+		const end = slice.kind === "range" ? slice.end : null;
+		return resolveRangePartitionContext(pCtx, slice.hashKey, start, end).partitionContext;
 	}
 
 	async apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
@@ -603,9 +714,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				}
 
 				const { writeRes, conditionRes } = localRes;
-				this.#promotion.maybeQueuePromotion(pCtx, hashKey, writeRes.keyEstBytes);
-
-				await this.checkSplits(pCtx, hashKey, sortKey);
+				// The row is committed, so this method logs and drops a failure of the signals below. The
+				// next write to this partition repeats both checks. A failure raised here would instead
+				// tell the caller that a write which DID apply did not.
+				//
+				// Promotions run before splits: a key that has grown past its own cap must get its own
+				// range tree, and an unfinished promotion blocks the split behind it.
+				try {
+					await this.queuePromotionIfOverThreshold(pCtx, hashKey, writeRes.keyEstBytes);
+					await this.checkSplits(pCtx, hashKey, sortKey);
+				} catch (error) {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition.putItem: the post-write split check failed after the write applied.",
+						error: String(error),
+						errorProps: error,
+					});
+				}
 				return {
 					outcome: "ok",
 					version: writeRes.version,
@@ -675,12 +800,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		this.ensurePartitionContext(pCtx);
 
 		if (await this.ensureMigration("getItem", false)) {
-			// Read directly from parent while this child is still migrating its share of the data.
-			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
-			const parentStub = PartitionDO.getByName(this.env[parentCtx.ns], parentCtx.doName);
-			const result = (await parentStub.fokosExecuteLocal({
+			// Read through the source while this target still imports its share of the data.
+			const record = this.#target.importRecord();
+			invariant(record, "fokos/partition.getItem: no import record while importing");
+			const sourceStub = PartitionDO.getByName(this.env[record.source.ns], record.source.doName);
+			const result = (await sourceStub.fokosExecuteLocal({
 				op: "getItem",
+				repartitionId: record.repartitionId,
 				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
 				request: req,
 			})) as GetItemRpcResponse;
@@ -723,15 +849,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async #fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
 		const pCtx = this.pCtx();
-		const slice = this.resolveCallerSlice(pCtx, req.caller);
-		// A promoted key's rows live in the range tree; the local copies are stale or already collected.
-		// Follow the promotion with ordinary forwarding rather than reading them. Only a hash-child
-		// caller can reach one — a range or promoted-key slice is itself inside a range tree.
-		const followsPromotion = slice.kind === "hash_child" && this.#promotion.statusFor(req.request.hashKey) === "promoted";
+		const slice = this.#source.resolveCallerSlice(req.repartitionId, req.caller);
 
 		if (req.op === "getItem") {
 			const getReq = req.request;
-			if (followsPromotion) {
+			assertPointInSlice(slice, getReq.hashKey, getReq.sortKey, pCtx.hashSplitN, "fokosExecuteLocal");
+			// A promoted key's rows live in the range tree; the local copies are stale or already collected.
+			// Follow the promotion with ordinary forwarding rather than reading them. Only a hash-child
+			// caller can reach one — a range or promoted-key slice is itself inside a range tree.
+			if (slice.kind === "hash_child" && this.#source.ownedByRangeTree(getReq.hashKey)) {
 				return await this.forwardToRangeRootPartition<GetItemRpcResponse>(
 					pCtx,
 					getReq.hashKey,
@@ -739,68 +865,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 					getReq.sortKey,
 				);
 			}
-			assertPointInSlice(slice, getReq.hashKey, getReq.sortKey, pCtx.hashSplitN, "fokosExecuteLocal");
 			return this.readItemLocally(pCtx, getReq);
 		}
 
 		const queryReq = req.request;
-		if (followsPromotion) {
+		const interval = clipQueryToSlice(slice, queryReq, pCtx.hashSplitN, "fokosExecuteLocal");
+		if (slice.kind === "hash_child" && this.#source.ownedByRangeTree(queryReq.hashKey)) {
 			// A query spans sort keys, so it carries no single key that could resolve a deeper range
 			// slice; it enters at the range root and the routers below it fan out.
 			return await this.forwardToRangeRootPartition<QueryItemsRpcResponse>(
 				pCtx,
 				queryReq.hashKey,
-				async (stub, toCtx) => await stub.apiQueryItems(toCtx, queryReq),
+				async (stub, toCtx) => await stub.apiQueryItems(toCtx, { ...queryReq, interval }),
 			);
 		}
-		const interval = clipQueryToSlice(slice, queryReq, pCtx.hashSplitN, "fokosExecuteLocal");
 		return this.queryItemsLocal(pCtx, { ...queryReq, interval });
-	}
-
-	/**
-	 * Resolves the slice a read-through caller owns, from this partition's own durable records.
-	 *
-	 * A split source knows its children by name and identity, and each child's context carries the
-	 * slice it was created with. A promotion source instead knows one key: the range root's identity
-	 * encodes the key it was promoted for, and only a key still in 'promoting' has a root that reads
-	 * through — after that the root is complete and asks for nothing.
-	 */
-	private resolveCallerSlice(pCtx: PartitionContextResolved, caller: FokosPartitionRef): FokosSlice {
-		const splitStatus = this.ensureTopology(pCtx).splitStatus();
-		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-			// Both halves of the identity must match: a name alone is a value the caller chose.
-			const child = splitStatus.childPartitionContexts.find((c) => c.doName === caller.doName && c.partitionId === caller.partitionId);
-			if (child) {
-				if (isRangePartition(child)) {
-					const rp = child.rangePartition;
-					return { kind: "range", hashKey: rp.hashKey, start: rp.startBoundary ?? null, end: rp.endBoundary ?? null };
-				}
-				const childIdBytes = Uint8Array.fromHex(child.partitionId);
-				return {
-					kind: "hash_child",
-					childIndex: PartitionIdHelper.lastChildIdx(childIdBytes),
-					depth: PartitionIdHelper.depth(childIdBytes),
-				};
-			}
-		}
-
-		if (isHashPartition(pCtx) && PartitionIdHelper.isRangePartition(caller.partitionId)) {
-			const decoded = PartitionIdHelper.decode(Uint8Array.fromHex(caller.partitionId));
-			// A promotion creates the range ROOT, whose slice is the whole key: both boundaries unbounded.
-			if (
-				decoded.schema === 1 &&
-				decoded.startBoundary === null &&
-				decoded.endBoundary === null &&
-				this.#promotion.statusFor(decoded.hashKey) === "promoting"
-			) {
-				return { kind: "promoted_key", hashKey: decoded.hashKey };
-			}
-		}
-
-		throw new FokosInternalError(INTERNAL_CODES.repartition_target_unknown, {
-			message: "caller is not a target of any repartition this partition owns",
-			attributes: { operation: "fokosExecuteLocal", caller: caller.doName, callerPartitionId: caller.partitionId, source: pCtx.doName },
-		});
 	}
 
 	async apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
@@ -812,11 +891,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 		// If still migrating, read directly from the parent (mirrors getItem / getItemDirect).
 		if (await this.ensureMigration("queryItems", false)) {
-			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-			invariant(parentCtx, "fokos/partition.queryItems: no parent partition context stored during migration");
-			const parentStub = PartitionDO.getByName(this.env[parentCtx.ns], parentCtx.doName);
-			const result = (await parentStub.fokosExecuteLocal({
+			const record = this.#target.importRecord();
+			invariant(record, "fokos/partition.queryItems: no import record while importing");
+			const sourceStub = PartitionDO.getByName(this.env[record.source.ns], record.source.doName);
+			const result = (await sourceStub.fokosExecuteLocal({
 				op: "queryItems",
+				repartitionId: record.repartitionId,
 				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
 				request: req,
 			})) as QueryItemsRpcResponse;
@@ -912,30 +992,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	private async queryItemsAsRangeNode(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
-		const topology = this.ensureTopology(pCtx);
-		const splitStatus = topology.splitStatus();
-
-		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-			return await this.walkRangeChildren(pCtx, this.rangeChildContexts(pCtx, splitStatus.childPartitionContexts), req);
-		}
-
-		return this.queryItemsLocal(pCtx, req);
-	}
-
-	/**
-	 * Rebuilds this router's range children from its CURRENT context plus their stored immutable
-	 * boundaries. The split record holds a snapshot of each child context taken at split time, so
-	 * forwarding it would hand the child split thresholds an operator has since changed, and the child
-	 * would persist those stale values as its own. Boundaries, hashKey, ns and tableName are immutable,
-	 * so each rebuilt identity (doName, partitionId) is byte-for-byte the stored one, in the same order.
-	 */
-	private rangeChildContexts(pCtx: PartitionContextResolved, stored: PartitionContextResolved[]): PartitionContextResolved[] {
-		const hashKey = pCtx.rangePartition!.hashKey;
-		return stored.map((childCtx) => {
-			const rp = childCtx.rangePartition;
-			invariant(rp, "fokos/partition.rangeChildContexts: child has no rangePartition context");
-			return resolveRangePartitionContext(pCtx, hashKey, rp.startBoundary ?? null, rp.endBoundary ?? null).partitionContext;
-		});
+		if (!this.#source.routerRole()) return this.queryItemsLocal(pCtx, req);
+		// Built from this router's CURRENT context and each target's stored boundaries, in target_index
+		// order, which is ascending boundary order. A stored context would hand the child the split
+		// thresholds of an earlier operator setting, and the child would then persist them as its own.
+		const children = this.#source.splitTargets().map((t) => this.targetContext(this.pCtx(), t));
+		return await this.walkRangeChildren(pCtx, children, req);
 	}
 
 	private async walkRangeChildren(
@@ -1065,448 +1127,81 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
-	////////////////////////
-	// MIGRATION HELPERS
-	////////////////////////
-
-	async migrationGetItemsBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: ScanCursor | null;
-	}): Promise<GetItemsBatchResult> {
-		return await this.#rpc("migrationGetItemsBatch", async () => await this.#migrationGetItemsBatch(opts));
-	}
-
-	async #migrationGetItemsBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: ScanCursor | null;
-	}): Promise<GetItemsBatchResult> {
-		const pCtx = this.pCtx();
-
-		// Range-child migration (promotion or range-split).
-		const childPartitionContext = opts.childPartitionContext;
-		if (isRangePartition(childPartitionContext)) {
-			const hk = childPartitionContext.rangePartition.hashKey;
-			if (isHashPartition(pCtx)) {
-				// This is a hash DO: authorize through promoted_keys[hk] === 'promoting'.
-				const status = this.#promotion.statusFor(hk);
-				invariant(
-					status === "promoting",
-					() => `fokos/partition.migrationGetItemsBatch: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
-				);
-				return this.migrationGetItemsBatchForRange(hk, null, null, opts.cursor);
-			}
-			// Range split: this range DO becomes a router. Authorize the child and stream its [start, end) slice.
-			const topology = this.ensureTopology(pCtx);
-			const splitStatus = topology.splitStatus();
-			invariant(
-				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
-				`fokos/partition.migrationGetItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
-			);
-			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
-			invariant(isKnownChild, `fokos/partition.migrationGetItemsBatch: unknown range child partition "${childPartitionContext.doName}"`);
-			return this.migrationGetItemsBatchForRange(
-				hk,
-				childPartitionContext.rangePartition.startBoundary,
-				childPartitionContext.rangePartition.endBoundary,
-				opts.cursor,
-			);
-		}
-
-		// Hash-child migration.
-		const topology = this.ensureHashTopology(pCtx);
-		const splitStatus = topology.splitStatus();
-		// Allowed at split_completed: the items table is not deleted at split_completed (only pending_transactions is),
-		// so children with racy migration jobs can still fetch item batches after the last sibling has acknowledged.
-		invariant(
-			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
-			`fokos/partition.migrationGetItemsBatch: expected split_started or split_completed, got ${splitStatus?.status}`,
-		);
-		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
-		invariant(isKnownChild, `fokos/partition.migrationGetItemsBatch: unknown child partition "${opts.childPartitionContext.doName}"`);
-
-		// Workers RPC caps a message at 32MB and a DO has 128MB of memory, so this batch stays near 20MB.
-		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
-		const PAGE_SIZE = 1000;
-
-		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
-
-		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
-			fetchPage: (cursor, pageSize) => this.#store.queryItemsPage(cursor, pageSize),
-			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
-			// Filter: only items for the requesting hash child, excluding promoted keys
-			// (their data lives in range structures — hash children must not inherit local copies).
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk) && !this.#promotion.hasStatus(row.hk),
-			estimateBytes: estimateItemBytes,
-			budgetBytes: BATCH_LIMIT_BYTES,
-			pageSize: PAGE_SIZE,
-			startCursor: opts.cursor,
-		});
-		return { items: rows, nextCursor };
-	}
-
-	// Streams items for a range DO child's owned slice [start, end) (start/end null = unbounded edge).
-	// Used by both promotion (start=end=null: the whole hashKey) and range-split (the child's sub-slice).
-	private migrationGetItemsBatchForRange(
-		hashKey: KeyBytes,
-		start: KeyBytes | null,
-		end: KeyBytes | null,
-		cursor: ScanCursor | null,
-	): GetItemsBatchResult {
-		const BATCH_LIMIT_BYTES = 20 * 1024 * 1024;
-		const PAGE_SIZE = 1000;
-		const lower = start ?? KeyCodec.encodeOptional(undefined);
-
-		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
-			// Resume strictly after the cursor; otherwise start from the range's lower bound. Always bound by `end`.
-			fetchPage: (pageCursor, pageSize) =>
-				this.#store.queryRangeItemsPage({
-					hk: hashKey,
-					lower,
-					lowerInclusive: true,
-					upper: end,
-					upperInclusive: false,
-					cursor: pageCursor,
-					limit: pageSize,
-					direction: "asc",
-					decodeJson: false, // migration read: copy the raw JSONB blob verbatim.
-				}),
-			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
-			estimateBytes: estimateItemBytes,
-			budgetBytes: BATCH_LIMIT_BYTES,
-			pageSize: PAGE_SIZE,
-			startCursor: cursor,
-		});
-		return { items: rows, nextCursor };
-	}
-
-	async migrationGetPartitionTransactionMetadata(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PendingTransactionCursor | null;
-	}): Promise<GetPartitionTransactionMetadataResult> {
-		return await this.#rpc(
-			"migrationGetPartitionTransactionMetadata",
-			async () => await this.#migrationGetPartitionTransactionMetadata(opts),
-		);
-	}
-
-	async #migrationGetPartitionTransactionMetadata(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PendingTransactionCursor | null;
-	}): Promise<GetPartitionTransactionMetadataResult> {
-		const pCtx = this.pCtx();
-		const { maxDeleteTxOrderTs, deleteRevision } = this.#store.getDeletionMetadata();
-
-		// Range-child migration (promotion or range-split).
-		const childPartitionContext = opts.childPartitionContext;
-		if (isRangePartition(childPartitionContext)) {
-			const hk = childPartitionContext.rangePartition.hashKey;
-			if (isHashPartition(pCtx)) {
-				// Hash DO serving a promotion: lock-free cutover guarantees no pending_transactions for this key.
-				// Return only the deletion metadata so the range root can sync it.
-				const status = this.#promotion.statusFor(hk);
-				invariant(
-					status === "promoting",
-					() =>
-						`fokos/partition.migrationGetPartitionTransactionMetadata: key ${KeyCodec.keyForLog(hk)} is not in promoting state (got ${status})`,
-				);
-				return { maxDeleteTxOrderTs, deleteRevision, pendingTransactions: [], nextCursor: null };
-			}
-			// Range-split: stream the child's pending locks (sk ∈ [start, end)) so commit/cancel can follow.
-			const topology = this.ensureTopology(pCtx);
-			const splitStatus = topology.splitStatus();
-			invariant(
-				splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
-				`fokos/partition.migrationGetPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
-			);
-			const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === childPartitionContext.doName);
-			invariant(
-				isKnownChild,
-				`fokos/partition.migrationGetPartitionTransactionMetadata: unknown range child partition "${childPartitionContext.doName}"`,
-			);
-
-			const lower = childPartitionContext.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined);
-			const upper = childPartitionContext.rangePartition.endBoundary; // null = unbounded
-			const inChildRange = (sk: KeyBytes) => KeyCodec.compare(sk, lower) >= 0 && (upper === null || KeyCodec.compare(sk, upper) < 0);
-
-			const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
-				fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
-				advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
-				include: (row) => KeyCodec.compare(row.hk, hk) === 0 && inChildRange(row.sk),
-				estimateBytes: estimatePendingTxBytes,
-				budgetBytes: 20 * 1024 * 1024,
-				pageSize: 1000,
-				startCursor: opts.cursor,
-			});
-			return {
-				maxDeleteTxOrderTs,
-				deleteRevision,
-				pendingTransactions: rows,
-				nextCursor,
-			};
-		}
-
-		// Hash-child migration.
-		const topology = this.ensureHashTopology(pCtx);
-		const splitStatus = topology.splitStatus();
-		// Allowed at split_completed: pending_transactions is deleted atomically with the split_completed transition
-		// (acknowledgeChildMigrationComplete), so a call at split_completed returns empty results, which is correct —
-		// all children already fetched their rows before the last ack landed.
-		invariant(
-			splitStatus?.status === "split_started" || splitStatus?.status === "split_completed",
-			`fokos/partition.migrationGetPartitionTransactionMetadata: expected split_started or split_completed, got ${splitStatus?.status}`,
-		);
-		const isKnownChild = splitStatus.childPartitionContexts.some((c) => c.doName === opts.childPartitionContext.doName);
-		invariant(
-			isKnownChild,
-			`fokos/partition.migrationGetPartitionTransactionMetadata: unknown child partition "${opts.childPartitionContext.doName}"`,
-		);
-
-		const isCorrectHashChildPartition = topology.makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
-
-		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
-			fetchPage: (cursor, pageSize) => this.#store.queryPendingTxPage(cursor, pageSize),
-			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
-			include: (row) => isCorrectHashChildPartition(row.hk, row.sk.length === 0 ? undefined : row.sk),
-			estimateBytes: estimatePendingTxBytes,
-			budgetBytes: 20 * 1024 * 1024,
-			pageSize: 1000,
-			startCursor: opts.cursor,
-		});
-
-		return {
-			maxDeleteTxOrderTs,
-			deleteRevision,
-			pendingTransactions: rows,
-			nextCursor,
-		};
-	}
-
-	async migrationAcknowledgeChildComplete(childDoName: string): Promise<void> {
-		return await this.#rpc("migrationAcknowledgeChildComplete", async () => await this.#migrationAcknowledgeChildComplete(childDoName));
-	}
-
-	async #migrationAcknowledgeChildComplete(childDoName: string): Promise<void> {
-		const topology = this.ensureTopology(this.pCtx());
-		// Atomically transition topology and clean up parent's pending_transactions when
-		// all children have migrated. Children now own authoritative copies; parent's are redundant.
-		this.#store.transactionSync(() => {
-			topology.acknowledgeChildMigration(childDoName);
-			if (topology.splitStatus()?.status === "split_completed") {
-				this.#store.deleteAllPendingTx();
-			}
-		});
-	}
-
-	// Paginated promoted_keys for hash-split inheritance: a hash child pulls the promoted-key entries
-	// (forward-pointers) for the keys it now owns. Only the set transfers — never the data, which lives
-	// in the autonomous range structure (the range-root name is recomputable from the hashKey).
-	async migrationGetPromotedKeysBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PromotedKeyCursor | null;
-	}): Promise<GetPromotedKeysBatchResult> {
-		return await this.#rpc("migrationGetPromotedKeysBatch", async () => await this.#migrationGetPromotedKeysBatch(opts));
-	}
-
-	async #migrationGetPromotedKeysBatch(opts: {
-		childPartitionContext: PartitionContextResolved;
-		cursor: PromotedKeyCursor | null;
-	}): Promise<GetPromotedKeysBatchResult> {
-		const pCtx = this.pCtx();
-		invariant(isHashPartition(pCtx), "fokos/partition.migrationGetPromotedKeysBatch: only hash partitions have promoted keys");
-
-		const isCorrectChild = this.ensureHashTopology(pCtx).makeIsCorrectChildHashPartition(pCtx, opts.childPartitionContext);
-		// promoted_keys rows are small (≤ ~1 KB each given the hash_key length cap), so 10K rows ≈ 10 MB,
-		// comfortably under the 32 MB RPC limit — one page usually drains the whole table.
-		const SCAN_LIMIT = 10_000;
-		const { rows, nextCursor } = collectBatch<{ hash_key: KeyBytes; status: PromotedKeyStatus }, PromotedKeyCursor>({
-			fetchPage: (cursor, pageSize) => this.#store.queryPromotedKeysPage(cursor, pageSize),
-			advanceCursor: (row) => ({ hashKey: row.hash_key }),
-			include: (row) => isCorrectChild(row.hash_key),
-			estimateBytes: (row) => row.hash_key.byteLength + 16,
-			budgetBytes: 20 * 1024 * 1024,
-			pageSize: SCAN_LIMIT,
-			startCursor: opts.cursor,
-		});
-		return { rows, nextCursor };
-	}
-
-	// Called by a promoted range root once its item migration is complete.
-	async migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
-		return await this.#rpc("migrationAcknowledgePromotionComplete", async () => await this.#migrationAcknowledgePromotionComplete(hashKey));
-	}
-
-	async #migrationAcknowledgePromotionComplete(hashKey: KeyBytes): Promise<void> {
-		const pCtx = this.pCtx();
-		invariant(isHashPartition(pCtx), "fokos/partition.migrationAcknowledgePromotionComplete: only hash partitions can have promoted keys");
-		await this.#promotion.acknowledgePromotionComplete(hashKey);
-	}
-
-	private async checkSplits(pCtx: PartitionContextResolved, hashKey: KeyBytes, sortKey?: KeyBytes): Promise<SplitStatusKVItem | undefined> {
-		const topology = this.ensureTopology(pCtx);
-		const splitStatus = await topology.maybeQueueSplit(hashKey, sortKey, {
-			hasInFlightPromotions: this.#promotion.hasInFlightPromotions(),
-		});
-		if (splitStatus) {
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Split conditions met.",
-				splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
-			});
-			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-			this.scheduleBackgroundWork({ delayMs: 10 });
-		}
-
-		return splitStatus;
-	}
-
-	private async checkSplitsNoKey(pCtx: PartitionContextResolved): Promise<SplitStatusKVItem | undefined> {
-		const topology = this.ensureTopology(pCtx);
-		const splitStatus = await topology.maybeQueueSplitNoKey({
-			hasInFlightPromotions: this.#promotion.hasInFlightPromotions(),
-		});
-		if (splitStatus) {
-			console.log({
-				...this.logParams(),
-				message: "fokos/partition: Split conditions met.",
-				splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
-			});
-			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-			this.scheduleBackgroundWork({ delayMs: 10 });
-		}
-
-		return splitStatus;
+	/**
+	 * Asks the flow to queue a split when this partition has grown past its cap.
+	 *
+	 * The topology decides the size question. Arbitration decides whether the split can start, and
+	 * only the transaction inside `queue` answers that without a race against another queue request.
+	 * A refused request is normal, because an unfinished promotion still owns the move of a key. The
+	 * next write asks again.
+	 */
+	private async checkSplits(pCtx: PartitionContextResolved, hashKey?: KeyBytes, sortKey?: KeyBytes): Promise<void> {
+		const splitType = this.ensureTopology(pCtx).shouldSplit(hashKey, sortKey);
+		if (!splitType) return;
+		await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+		const row = this.#source.queue({ kind: splitType === "hash" ? "hash_split" : "range_split" });
+		if (!row) return;
+		console.log({ ...this.logParams(), message: "fokos/partition: Split conditions met.", repartitionId: row.id, kind: row.kind });
+		await this.wakeRepartitionWork();
 	}
 
 	/**
-	 * Orchestrates the split fan-out: the policy decides (prepareSplit), the DO performs the RPCs
-	 * (boundary rule: only DO classes and FokosDB hold stubs). The failure order matters: when the
-	 * initialization of a child fails, the DO aborts BEFORE the split_started KV transition, which
-	 * keeps the retry path open.
+	 * Queues a promotion for a key that has grown past its share of the cap of the partition.
+	 *
+	 * It runs after the item transaction commits, never inside it, because `queue` opens a transaction
+	 * of its own. The write has already succeeded, so the caller logs and drops a failure here. The
+	 * next write to the same key asks again.
 	 */
-	private async runSplit(topology: PartitionTopologySplitter): Promise<void> {
-		const splitStatus = topology.splitStatus();
-		if (!splitStatus || splitStatus.status !== "split_queued") {
-			// Already started or completed — idempotent no-op.
-			return;
-		}
-
-		// Range splits need boundaries computed from the data (a store query); the policy receives them as input.
-		let boundaries: KeyBytes[] | null = null;
-		if (splitStatus.splitType === "range") {
-			const pCtx = this.pCtx();
-			const rp = pCtx.rangePartition;
-			invariant(rp, "fokos/range.startSplit: missing rangePartition identity");
-			const N = pCtx.rangeSplitN;
-			invariant(N != null && N >= 2, "fokos/range.startSplit: rangeSplitN must be >= 2");
-			// Compute N-1 split boundaries within the owned slice [start, end) in one snapshot.
-			boundaries = this.#store.computeRangeSplitBoundaries(rp.hashKey, rp.startBoundary, rp.endBoundary, N);
-			if (!boundaries) {
-				// Not enough distinct items to split into N non-empty children — retry on a later cycle.
-				console.error({
-					...this.logParams(),
-					message: "fokos/range.startSplit: insufficient items to split into N children; will retry.",
-					hashKey: KeyCodec.keyForLog(rp.hashKey),
-					startBoundary: rp.startBoundary === null ? null : KeyCodec.keyForLog(rp.startBoundary),
-					endBoundary: rp.endBoundary === null ? null : KeyCodec.keyForLog(rp.endBoundary),
-				});
-				return;
-			}
-		}
-
-		const childInits = topology.prepareSplit({
-			parentDepth: this.depth(),
-			boundaries,
-			parentRangeAncestors: splitStatus.splitType === "range" ? this.#_rangeAncestors : undefined,
-		});
-		if (!childInits) return;
-
-		// Call the new DOs at `internalInitFromSplit()` to initialize them with the right context and their
-		// parent partition info that they will use to get data during migration (retry ≤5 each).
-		const promises = childInits.map(async (childInitOptions) => {
-			const doId = this.env[childInitOptions.newPartitionContext.ns].idFromName(childInitOptions.newPartitionContext.doName);
-			try {
-				return await tryWhile(
-					async () => {
-						const childDo = PartitionDO.get(this.env[childInitOptions.newPartitionContext.ns], doId);
-						return await childDo.internalInitFromSplit(childInitOptions);
-					},
-					(_error, nextAttempt) => {
-						return nextAttempt <= 5; // Retry up to 5 times
-					},
-				);
-			} catch (error) {
-				// Handle initialization errors
-				console.error({
-					message: "fokos/topology: Split initialization failed, aborting split process. Will retry later.",
-					error: String(error),
-					errorProps: error,
-					doName: childInitOptions.newPartitionContext.doName,
-					doId: doId.toString(),
-					childContext: {
-						parentPartitionContext: pCtxForLog(childInitOptions.parentPartitionContext),
-						newPartitionContext: pCtxForLog(childInitOptions.newPartitionContext),
-						splitType: childInitOptions.splitType,
-					},
-				});
-				throw error; // Rethrow to be caught by the outer try-catch and trigger a retry of the split process.
-			}
-		});
-
-		// The split aborts when the initialization of any child fails, and a later cycle retries it.
-		// The partition DOs are the source of truth, so this parent stays the owner of the data until
-		// every child is initialized.
-		// FIXME: Accept a partial initialization. This needs a router that can ask the parent for the
-		// context of a child again.
-		try {
-			await Promise.all(promises);
-		} catch (error) {
-			console.error({
-				message: "fokos/topology: Some split initialization failed, aborting split process. Will retry later.",
-				error: String(error),
-				errorProps: error,
-				parentPartitionContext: pCtxForLog(this.pCtx()),
-			});
-
-			// The throw stops the split. The next request calls `queueSplit()` again and sets a new alarm,
-			// which retries the split and succeeds if the errors were transient.
-			throw error;
-		}
-
-		// Mark the split status as `split_started`: the new partitions now handle requests and this
-		// partition is just a proxy that forwards to them until migration completes (split_completed).
-		topology.commitSplitStarted(childInits.map((c) => c.newPartitionContext));
-
-		// Kick off migration on each child immediately so it doesn't wait for the first user request.
-		// Fire-and-forget: failures are logged but do not fail the split — the child will
-		// start migrating on its first incoming request if this doesn't reach it.
-		// It does not use this.ctx.waitUntil(...), because that causes vitest errors with dangling log messages.
-		await Promise.allSettled(
-			childInits.map(async (childInitOptions) => {
-				try {
-					const childDo = PartitionDO.getByName(
-						this.env[childInitOptions.newPartitionContext.ns],
-						childInitOptions.newPartitionContext.doName,
-					);
-					await childDo.internalTriggerMigration();
-				} catch (error) {
-					console.error({
-						message: "fokos/topology: Failed to trigger migration on child partition; will start on the next request.",
-						error: String(error),
-						errorProps: error,
-						childDoName: childInitOptions.newPartitionContext.doName,
-					});
-				}
-			}),
-		);
-
+	private async queuePromotionIfOverThreshold(pCtx: PartitionContextResolved, hashKey: KeyBytes, keyEstBytes: number): Promise<void> {
+		if (!isHashPartition(pCtx)) return;
+		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
+		if (threshold <= 0 || keyEstBytes < threshold) return;
+		await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+		const row = this.#source.queue({ kind: "key_promotion", hashKey });
+		if (!row) return;
 		console.log({
-			message: "fokos/topology: Split process completed successfully.",
-			childPartitionContexts: childInits.map((c) => ({
-				parentPartitionContext: pCtxForLog(c.parentPartitionContext),
-				newPartitionContext: pCtxForLog(c.newPartitionContext),
-				splitType: c.splitType,
-			})),
+			...this.logParams(),
+			message: "fokos/partition: Key queued for promotion.",
+			hashKey: KeyCodec.keyForLog(hashKey),
+			repartitionId: row.id,
+			keyEstBytes,
 		});
+		await this.wakeRepartitionWork();
+	}
+
+	/**
+	 * Wakes the background pass for a repartition this request just queued.
+	 *
+	 * Both halves are needed. The timer runs the pass in this isolate within milliseconds, and that
+	 * pass then arms the real deadline of the queued row. The durable alarm survives an eviction
+	 * between this method and that timer. A later write must not stand in for the alarm, because
+	 * `queue` refuses a second repartition and returns before it reaches this method.
+	 */
+	private async wakeRepartitionWork(): Promise<void> {
+		await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+		this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
+	}
+
+	/**
+	 * Queues a promotion for each key that the transaction which just applied grew past its share.
+	 *
+	 * The candidates arrive as an argument, so they belong to THIS transaction and to no other. An
+	 * apply that rolled back or threw returns none, and nothing outlives the call.
+	 *
+	 * It keeps the largest candidate per key: one transaction can write many sort keys of one hash
+	 * key, and each upsert reports the running total after its own row.
+	 */
+	private async drainPromotionCandidates(pCtx: PartitionContextResolved, candidates: readonly PromotionCandidate[]): Promise<void> {
+		if (candidates.length === 0) return;
+		const largest = new Map<string, PromotionCandidate>();
+		for (const candidate of candidates) {
+			const id = candidate.hashKey.toBase64({ alphabet: "base64url" });
+			const seen = largest.get(id);
+			if (!seen || candidate.keyEstBytes > seen.keyEstBytes) largest.set(id, candidate);
+		}
+		for (const { hashKey, keyEstBytes } of largest.values()) {
+			await this.queuePromotionIfOverThreshold(pCtx, hashKey, keyEstBytes);
+		}
 	}
 
 	async destroyPartition(): Promise<void> {
@@ -1627,22 +1322,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		for (const [, { pCtx: childPCtx, items }] of forwarded) {
 			tasks.push(this.getChildStub(childPCtx).txCommit(childPCtx, { ...request, items }));
 		}
-		if (local.length > 0) {
-			tasks.push(Promise.resolve(this.#participant.commitLocal({ ...request, items: local })));
-		}
-		await Promise.all(tasks);
+		const localResult = local.length > 0 ? this.#participant.commitLocal({ ...request, items: local }) : undefined;
+		const childResults = await Promise.allSettled(tasks);
 
-		if (local.length > 0) {
+		if (localResult) {
 			// Transactional writes grow a partition exactly as apiPutItem does, so they have to be able
 			// to queue a split too — the background job only RUNS a split that is already queued, it
 			// never queues one. Without this, a workload that writes only through transactions grows
 			// without ever splitting.
 			//
-			// Unlike apiPutItem, a throw here is absorbed: the coordinator has already decided this
-			// transaction and the items are already applied, so failing the commit would wedge a decided
-			// transaction over bookkeeping that the next write repeats anyway.
+			// This block absorbs a throw. The coordinator has already decided this transaction and the
+			// items are already applied, so a failed commit would wedge a decided transaction over
+			// bookkeeping that the next write repeats.
 			try {
-				await this.checkSplitsNoKey(pCtx);
+				this.wakeLockBlockedPromotion();
+				await this.drainPromotionCandidates(pCtx, localResult.promotionCandidates);
+				await this.checkSplits(pCtx);
 			} catch (error) {
 				console.error({
 					...this.logParams(),
@@ -1653,6 +1348,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				});
 			}
 		}
+
+		const childFailure = childResults.find((r): r is PromiseRejectedResult => r.status === "rejected");
+		if (childFailure) throw childFailure.reason;
 		return { outcome: "committed" };
 	}
 
@@ -1676,6 +1374,19 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		await this.ensureMigration("cancel");
 		// First, so that the local lock is released even when a child cancel fails and throws below.
 		this.#participant.cancelLocal(request.transactionId);
+		// The lock is gone either way, so a failed wake must not stop the child cancels below. The
+		// promotion still moves on its own retry deadline.
+		try {
+			this.wakeLockBlockedPromotion();
+		} catch (error) {
+			console.error({
+				...this.logParams(),
+				message: "fokos/partition.cancel: waking the lock-blocked promotion failed after the local cancel.",
+				transactionId: request.transactionId,
+				error: String(error),
+				errorProps: error,
+			});
+		}
 
 		// Cancel only DELETEs pending rows, so size backpressure must not wedge it — same reasoning as
 		// txCommit, and cancel is the path that BRINGS an over-size partition back under its cap.
@@ -1738,26 +1449,40 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	 *
 	 * Idempotent: a key that already has a promotion entry comes back with `queued: false`.
 	 *
-	 * Only the partition that owns the key's rows may queue it. A split parent forwards to the child
-	 * that owns the key, because a promotion from a router would migrate a stale snapshot and then
-	 * shadow the live rows in the child. A partition with a queued split rejects the call: the split
-	 * runs regardless of in-flight promotions, and the queued entry would outlive it on the router.
+	 * Only the partition that owns the rows of the key can queue it. A split parent forwards to the
+	 * child that owns the key, because a promotion from a router would migrate a stale snapshot and
+	 * then shadow the live rows in the child. An importing child rejects the call with
+	 * `partition_migrating` and creates no row. The caller can retry after that import completes.
 	 */
 	async debugForcePromoteKey(pCtx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse> {
 		return await this.#rpc("debugForcePromoteKey", async () => {
 			this.ensurePartitionContext(pCtx);
 			await this.ensureMigration("debugForcePromoteKey");
-			const status = this.#promotion.statusFor(hashKey);
-			if (status !== undefined) return { queued: false, status };
-			if (this.ensureTopology(this.pCtx()).splitStatus()?.status === "split_queued") {
-				throw errExceededDatabaseSize("debugForcePromoteKey");
+			const existing = this.#source.overrideFor(hashKey);
+			if (existing !== undefined) {
+				if (existing === "queued" || existing === "planned" || existing === "cutover") {
+					await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+				}
+				return { queued: false, status: promotedKeyStatusOf(existing) };
 			}
+
+			// routeSingleDestination, not the local record. After cutover the key belongs to a hash child,
+			// and a promotion queued on the router would migrate a snapshot and then shadow the live rows.
 			const route = this.routeSingleDestination([{ hashKey }], "ignore_size_reject", "debugForcePromoteKey");
 			if (route.destination === "child") {
 				return await this.getChildStub(route.pCtx).debugForcePromoteKey(route.pCtx, hashKey);
 			}
-			const queued = await this.#promotion.queuePromotion(this.pCtx(), hashKey);
-			return { queued, status: this.#promotion.statusFor(hashKey) };
+
+			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+			const row = this.#source.queue({ kind: "key_promotion", hashKey });
+			if (!row) {
+				// This partition still owns the key, and arbitration refused: a split row exists, so the key
+				// moves soon. This is the answer a queued split has always given.
+				throw errExceededDatabaseSize("debugForcePromoteKey");
+			}
+			await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
+			this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
+			return { queued: true, status: promotedKeyStatusOf(row.state) };
 		});
 	}
 
@@ -1834,7 +1559,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		if (route.destination === "child") {
 			return await this.getChildStub(route.pCtx).txExecuteSingleShot(route.pCtx, request);
 		}
-		const response = this.#participant.executeSingleShot(request);
+		const { response, promotionCandidates } = this.#participant.executeSingleShot(request);
 		if (response.outcome === "rejected") {
 			return response;
 		}
@@ -1843,7 +1568,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		// A throw here is absorbed, as txCommit absorbs it: the items are already applied, and db.ts reads
 		// any error of this path as "nothing applied", so it must not throw after the apply commits.
 		try {
-			await this.checkSplitsNoKey(pCtx);
+			await this.drainPromotionCandidates(pCtx, promotionCandidates);
+			await this.checkSplits(pCtx);
 		} catch (error) {
 			console.error({
 				...this.logParams(),
@@ -1993,21 +1719,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
-				? new RangePartitionTopologyImpl(pCtx, this.ctx, this.#store)
-				: new HashPartitionTopologyImpl(pCtx, this.ctx, this.#store);
+				? new RangePartitionTopologyImpl(pCtx, this.ctx, this.#store, this.#source)
+				: new HashPartitionTopologyImpl(pCtx, this.ctx, this.#store, this.#source);
 		}
 		return this.#_topology;
 	}
 
+	/**
+	 * The import gate. An incomplete target holds only some of the rows and some of the inherited
+	 * locks, so a write cannot apply and this partition cannot answer a read locally.
+	 *
+	 * A request that reaches an incomplete target also asks for one more import step and restores the
+	 * fallback alarm. The partition then makes progress even when no start notification arrived.
+	 */
 	private async ensureMigration(op: string, throwIfMigrating = true): Promise<boolean> {
 		// TODO Optimize this away by keeping it in memory.
-		const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-		if (!migrationStatus || migrationStatus === "migration_completed") {
-			return false;
-		}
-		if (migrationStatus === "migration_initialized") {
-			this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
-		}
+		if (!this.#target.isImporting()) return false;
+		this.scheduleBackgroundWork({ delayMs: 0, forceSchedule: true });
 		await this.ensureAlarmSet(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
 		if (throwIfMigrating) {
 			// TODO: Migrate only the requested keys.
@@ -2065,12 +1793,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		hashKey: KeyBytes,
 		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
 		sortKey?: KeyBytes,
+		fallbackOnNotCutOver: boolean = false,
 	): Promise<T | null> {
 		try {
 			return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 		} catch (e) {
 			// A range DO that was never initialized bounces the request, and the caller falls back to the range root.
 			if (FokosError.isCode(e, ROUTING_CODES.range_partition_not_initialized)) {
+				return null;
+			}
+			if (fallbackOnNotCutOver && FokosError.isCode(e, UNAVAILABLE_CODES.repartition_not_cut_over)) {
 				return null;
 			}
 			throw e;
@@ -2095,16 +1827,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		} = opts;
 
 		if (isHashPartition(ctx)) {
-			// Step 1: Authoritative promotion check for the keys this partition promoted or inherited.
-			const promotedStatus = this.#promotion.statusFor(hashKey);
-			if (promotedStatus === "promoting" || promotedStatus === "promoted") {
+			// Step 1: the override check for the keys this partition promoted or inherited. It is final.
+			if (this.#source.ownedByRangeTree(hashKey)) {
 				return await this.forwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
 			}
 
 			// Step 2: Speculative bloom filter check — learned promotions from descendants.
 			const prt = this.#_partialRangeTopology;
 			if (prt?.maybePromoted(hashKey)) {
-				const result = await this.maybeForwardToRangeRootPartition(ctx, hashKey, forward, sortKey);
+				const result = await this.maybeForwardToRangeRootPartition(ctx, hashKey, forward, sortKey, intent === "read");
 				if (result) return result;
 			}
 		}
@@ -2186,14 +1917,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 
 		for (const item of items) {
-			// On hash partitions only: forward promoted/promoting keys to their range root.
-			if (isHashPartition(pCtx)) {
-				const promotedStatus = this.#promotion.statusFor(item.hashKey);
-				if (promotedStatus === "promoting" || promotedStatus === "promoted") {
-					const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
-					addForwarded(rangeRootCtx, item);
-					continue;
-				}
+			// On a hash partition only: forward a key the range tree now owns to its range root.
+			if (isHashPartition(pCtx) && this.#source.ownedByRangeTree(item.hashKey)) {
+				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
+				addForwarded(rangeRootCtx, item);
+				continue;
 			}
 
 			const decision = topology.shouldAllow(item.hashKey, item.sortKey, intent);
@@ -2297,38 +2025,13 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	}
 
 	/**
-	 * Runs the import, joining the run already in flight instead of starting a second one. The alarm,
-	 * the background timer and an incoming request all reach here, and two loops over one import both
-	 * hold pages the other has already moved past — applying one re-inserts rows a user deleted after
-	 * the import finished. The promise is in-memory only, so it survives no eviction; the durable
-	 * guards inside each page transaction are what make the ingest safe.
+	 * How many import pages one background pass applies, one at a time. A subclass can override it, as
+	 * it can override `fokosStaleTransactionMs`. Import throughput matters more than the other jobs,
+	 * because every write to this partition waits for it. A request that arrives during an import asks
+	 * for one step, not for a whole pass.
 	 */
-	private runMigration(): Promise<void> {
-		if (this.#_migrationInFlight) return this.#_migrationInFlight;
-		const run = this.#runMigrationOnce().finally(() => {
-			this.#_migrationInFlight = null;
-		});
-		this.#_migrationInFlight = run;
-		return run;
-	}
-
-	// The driver loops live in partition/migration.ts (SplitMigration); the DO only resolves the
-	// parent stub (boundary rule: only DO classes and FokosDB acquire stubs) and wires the deps.
-	async #runMigrationOnce(): Promise<void> {
-		const pCtx = this.pCtx();
-		const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
-		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");
-
-		const parent: PartitionPeer = this.env[parentCtx.ns].getByName(parentCtx.doName);
-
-		const migration = new SplitMigration({
-			store: this.#store,
-			storage: this.ctx.storage,
-			parent,
-			logParams: () => this.logParams(),
-			onPromotedKeyInherited: (_hashKey, _status) => {},
-		});
-		await migration.runMigration(pCtx, parentCtx);
+	protected fokosImportPagesPerPass(): number {
+		return Math.max(1, PartitionDO.IMPORT_PAGES_PER_PASS);
 	}
 
 	private async ensureAlarmSet(targetMs: number): Promise<void> {
@@ -2373,164 +2076,84 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		}, delayMs);
 	}
 
-	private async runBackgroundWork(): Promise<void> {
+	/**
+	 * Runs one background pass. It joins the pass in flight instead of starting a second one.
+	 *
+	 * A timer, an alarm and an incoming request all reach here. Two passes over one import each hold a
+	 * page the other has moved past, and such a page re-inserts rows a user deleted after the import
+	 * finished. The promise lives in memory only, so an eviction loses it. The durable guards inside
+	 * each transition make the work safe. This method only stops the waste.
+	 */
+	private runBackgroundWork(): Promise<void> {
+		if (this.#_backgroundInFlight) return this.#_backgroundInFlight;
+		const run = this.#runBackgroundWorkOnce().finally(() => {
+			this.#_backgroundInFlight = null;
+		});
+		this.#_backgroundInFlight = run;
+		return run;
+	}
+
+	async #runBackgroundWorkOnce(): Promise<void> {
 		invariant(this.#_partitionContext, "fokos/partition.runBackgroundWork: partition context not initialized");
 		/**
 		 * INVARIANTS FOR ALL BACKGROUND JOBS:
-		 * - A job must be idempotent and safe to run concurrently, because the alarm can fire again while
-		 *   a run is still in progress.
-		 * - A job must be crash-safe: a crash must let the other jobs run, and the job must resume or
+		 * - A job must read its durable state before it writes. The in-flight promise above is not
+		 *   durable progress, and a revived instance can still hold stale work.
+		 * - A job must be crash-safe. A crash must let the other jobs run, and the job must resume or
 		 *   retry its own work with no data loss and no inconsistency.
-		 * - On an error, a job must log it and schedule the next run, so that the work still progresses.
+		 * - On an error, a job must log it and leave a durable deadline behind, so the work goes on.
 		 */
+		if (this.isDestroying()) return;
+
+		// Armed BEFORE the pass changes state or calls an RPC. A crash inside the pass then leaves an
+		// alarm that can read the new durable state. The end of the pass replaces it with the earliest
+		// real deadline.
+		await this.ensureAlarmSet(Date.now() + PartitionDO.WORK_FALLBACK_ALARM_MS);
+
 		try {
 			////////////////////////////////////////////////////////
-			// ── Job: Partition migration (for child partitions)
+			// ── Job: target import (this partition is catching up)
 			try {
-				const migrationStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-				const parentAckPending = this.ctx.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
-				if (
-					migrationStatus === "migration_initialized" ||
-					migrationStatus === "migration_migrating" ||
-					(migrationStatus === "migration_completed" && parentAckPending)
-				) {
-					if (migrationStatus === "migration_initialized") {
-						this.ctx.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_migrating");
-					}
-					await tryWhile(
-						async () => {
-							await this.runMigration();
-						},
-						(_error, nextAttempt) => nextAttempt <= 5,
-					);
-					if (this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS) === "migration_completed") {
-						this.#ttl.arm();
-					}
+				for (let i = 0; i < this.fokosImportPagesPerPass(); i++) {
+					if (this.isDestroying()) break;
+					const outcome = await this.#target.importOnePage();
+					if (outcome !== "progressed") break;
 				}
+				if (!this.#target.isImporting()) this.#ttl.arm();
 			} catch (error) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition: Migration job failed.",
-					error: String(error),
-					errorProps: error,
-				});
+				this.logJobFailure("target import", error);
+			}
+
+			////////////////////////////////////////////////
+			// ── Job: target acknowledgement
+			try {
+				if (!this.isDestroying()) await this.#target.sendAck();
+			} catch (error) {
+				this.logJobFailure("target ack", error);
 			}
 
 			/////////////////////////////////////////////////////
-			// ── Job: Partition split (for parent partitions)
-			const topology = this.ensureTopology(this.pCtx());
+			// ── Job: source repartition (one due row, one step)
 			try {
-				const splitStatus = topology.splitStatus();
-				if (splitStatus?.status === "split_queued") {
-					console.log({
-						...this.logParams(),
-						message: "fokos/partition: Running split process.",
-						splitStatus: { status: splitStatus.status, splitType: splitStatus.splitType },
-					});
-					await tryWhile(
-						async () => {
-							await this.runSplit(topology);
-						},
-						(_error, nextAttempt) => nextAttempt <= 5,
-					);
-				}
+				if (!this.isDestroying()) await this.#source.sourceStep();
 			} catch (error) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition: Split job failed.",
-					error: String(error),
-					errorProps: error,
-				});
+				this.logJobFailure("source repartition", error);
+			}
+
+			///////////////////////////////////////////////////
+			// ── Job: source cleanup (one bounded batch)
+			try {
+				if (!this.isDestroying()) this.#source.sourceCleanupStep();
+			} catch (error) {
+				this.logJobFailure("source cleanup", error);
 			}
 
 			////////////////////////////////////////
 			// ── Job: Stale transaction recovery
 			try {
-				if (this.txPendingCanSweep()) {
-					const staleTxRows = this.#participant.listStaleTransactions(this.fokosStaleTransactionMs(), 10);
-					for (const row of staleTxRows) {
-						if (!row.coordinator_do_id) continue;
-						try {
-							const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
-							const result = await tcStub.recoverTransaction(row.transaction_id);
-
-							const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
-							if (pendingRows.length === 0) continue;
-							const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
-
-							if (result.state === "COMMITTED") {
-								await this.txCommit(this.pCtx(), {
-									transactionId: row.transaction_id,
-									transactionTimestamp: pendingRows[0].transaction_ts,
-									items,
-								});
-							} else if (result.state === "CANCELLED") {
-								await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
-							} else if (result.state === "not_found") {
-								const { local } = this.groupItemsByRouting(items, "read", "staleTransactionRecovery");
-								if (local.length === 0) {
-									this.#store.deletePendingTx(row.transaction_id);
-									continue;
-								}
-
-								const now = Date.now();
-								const lockCreatedAt = Math.min(...pendingRows.map((pending) => pending.created_at));
-								const lockAgeMs = now - lockCreatedAt;
-								if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
-									if (this.#store.guardPendingTx(row.transaction_id, now)) {
-										const pCtx = this.pCtx();
-										console.error({
-											...this.logParams(),
-											message: "fokos/partition: lock-age guard: over-age lock with not_found",
-											transactionId: row.transaction_id,
-											coordinatorDoId: row.coordinator_do_id,
-											keys: pendingRows.map((pending) => ({
-												hashKey: pending.hk.toBase64({ alphabet: "base64url" }),
-												sortKey: pending.sk.toBase64({ alphabet: "base64url" }),
-											})),
-											lockCreatedAt,
-											lockAgeMs,
-											windowMs: IDEMPOTENCY_WINDOW_MS,
-											doName: pCtx.doName,
-											partitionId: pCtx.partitionId,
-										});
-									}
-									continue;
-								}
-
-								await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
-							}
-						} catch (e) {
-							console.error({
-								...this.logParams(),
-								message: "fokos/partition: failed to poke stale TC",
-								transactionId: row.transaction_id,
-								error: String(e),
-							});
-						}
-					}
-				}
+				if (!this.isDestroying()) await this.recoverStaleTransactions();
 			} catch (error) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition: Stale TX recovery job failed.",
-					error: String(error),
-					errorProps: error,
-				});
-			}
-
-			///////////////////////////////////////////////////////////////////////////
-			// ── Jobs: Promotion drive and GC (hash partitions only, not routers)
-			//
-			// FIXME: Interleave the key promotion with the transactions above, or schedule them cooperatively, to avoid starvation.
-			//
-			const pCtx = this.pCtx();
-			if (isHashPartition(pCtx)) {
-				// Drive: advance each queued key through init → cutover → migrate.
-				await this.#promotion.drive(pCtx, () => this.ensureTopology(pCtx).splitStatus());
-
-				// GC: delete local items and pending_transactions for fully-promoted keys.
-				this.#promotion.runGC();
+				this.logJobFailure("stale transaction recovery", error);
 			}
 		} catch (error) {
 			console.error({
@@ -2540,46 +2163,130 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 				errorProps: error,
 			});
 		} finally {
-			/////////////////////////////////////////////////
-			// Find the jobs that need the next alarm.
-			/////////////////////////////////////////////////
+			await this.scheduleNextPass();
+		}
+	}
 
-			let nextAlarmMs: number | null = null;
-			const wantAlarm = (ms: number) => {
-				if (nextAlarmMs === null || ms < nextAlarmMs) nextAlarmMs = ms;
-			};
-			this.#store.transactionSync(() => {
-				// Job: Partition migration for child partitions.
-				const postStatus = this.ctx.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS);
-				const postParentAckPending = this.ctx.storage.kv.get<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
-				if (postStatus === "migration_migrating" || postParentAckPending) {
-					wantAlarm(Date.now() + PartitionDO.MIGRATION_FALLBACK_ALARM_MS);
+	/**
+	 * Moves the alarm to the earliest deadline that a durable job still holds.
+	 *
+	 * This write REPLACES the fallback the pass armed, and it can move the alarm later. The pass is
+	 * over here, so the earlier fallback protects nothing. Without the replacement, the alarm fires at
+	 * the fallback interval for as long as durable work sits further out.
+	 */
+	private async scheduleNextPass(): Promise<void> {
+		// A fenced pass schedules nothing: a destroy has started, and the partition must stop.
+		if (this.isDestroying()) return;
+
+		let nextAlarmMs: number | null = null;
+		const wantAlarm = (ms: number | null) => {
+			if (ms === null) return;
+			if (nextAlarmMs === null || ms < nextAlarmMs) nextAlarmMs = ms;
+		};
+		this.#store.transactionSync(() => {
+			wantAlarm(this.#target.importDeadline());
+			wantAlarm(this.#source.sourceDeadline());
+			if (this.txPendingCanSweep() && this.#store.hasAnyUnguardedPendingTx()) {
+				wantAlarm(Date.now() + this.fokosStaleTransactionMs());
+			}
+		});
+
+		if (nextAlarmMs !== null) {
+			await this.ctx.storage.setAlarm(nextAlarmMs);
+			// Do not wait for the alarm when the work is already due.
+			if (nextAlarmMs <= Date.now()) this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
+		} else {
+			// No durable work is left, so the fallback this pass armed must go. It would otherwise wake
+			// every idle partition at the fallback interval for ever, with no work to do.
+			await this.ctx.storage.deleteAlarm();
+			console.log({ ...this.logParams(), message: "fokos/partition: Background work ran, nothing to schedule forward." });
+		}
+	}
+
+	/**
+	 * Wakes a promotion that waits for a lock this transaction can have just released.
+	 *
+	 * A promotion cannot move a locked key, and only a commit and a cancel clear a lock. Without this
+	 * call the source learns of the release on its own 5-second retry, which is the fallback and not
+	 * the signal. One indexed seek gates it, so an ordinary transaction pays nothing.
+	 */
+	private wakeLockBlockedPromotion(): void {
+		if (!this.#store.hasUnfinishedPromotion()) return;
+		this.#source.onLockReleased();
+		this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
+	}
+
+	/** True after `fokosPrepareDestroy` fences this partition. Every transition must then stop. */
+	private isDestroying(): boolean {
+		return this.ctx.storage.kv.get<boolean>(REPARTITION_KV_KEYS.DESTROYING) === true;
+	}
+
+	private logJobFailure(job: string, error: unknown): void {
+		console.error({ ...this.logParams(), message: `fokos/partition: ${job} job failed.`, error: String(error), errorProps: error });
+	}
+
+	/** Asks the coordinator of each stale transaction to resolve it, and applies the answer. */
+	private async recoverStaleTransactions(): Promise<void> {
+		if (!this.txPendingCanSweep()) return;
+		const staleTxRows = this.#participant.listStaleTransactions(this.fokosStaleTransactionMs(), 10);
+		for (const row of staleTxRows) {
+			if (!row.coordinator_do_id) continue;
+			try {
+				const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
+				const result = await tcStub.recoverTransaction(row.transaction_id);
+
+				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
+				if (pendingRows.length === 0) continue;
+				const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
+
+				if (result.state === "COMMITTED") {
+					await this.txCommit(this.pCtx(), {
+						transactionId: row.transaction_id,
+						transactionTimestamp: pendingRows[0].transaction_ts,
+						items,
+					});
+				} else if (result.state === "CANCELLED") {
+					await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
+				} else if (result.state === "not_found") {
+					const { local } = this.groupItemsByRouting(items, "read", "staleTransactionRecovery");
+					if (local.length === 0) {
+						this.#store.deletePendingTx(row.transaction_id);
+						continue;
+					}
+
+					const now = Date.now();
+					const lockCreatedAt = Math.min(...pendingRows.map((pending) => pending.created_at));
+					const lockAgeMs = now - lockCreatedAt;
+					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
+						if (this.#store.guardPendingTx(row.transaction_id, now)) {
+							const pCtx = this.pCtx();
+							console.error({
+								...this.logParams(),
+								message: "fokos/partition: lock-age guard: over-age lock with not_found",
+								transactionId: row.transaction_id,
+								coordinatorDoId: row.coordinator_do_id,
+								keys: pendingRows.map((pending) => ({
+									hashKey: pending.hk.toBase64({ alphabet: "base64url" }),
+									sortKey: pending.sk.toBase64({ alphabet: "base64url" }),
+								})),
+								lockCreatedAt,
+								lockAgeMs,
+								windowMs: IDEMPOTENCY_WINDOW_MS,
+								doName: pCtx.doName,
+								partitionId: pCtx.partitionId,
+							});
+						}
+						continue;
+					}
+
+					await this.txCancel(this.pCtx(), { transactionId: row.transaction_id, items });
 				}
-
-				// Job: Split process for parent partitions.
-				if (this.ensureTopology(this.pCtx()).splitStatus()?.status === "split_queued") {
-					wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-				}
-
-				// Jobs: Promotion drive (queued keys) and GC (promoted keys with residual items).
-				if (this.#promotion.needsBackgroundWork()) {
-					wantAlarm(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
-				}
-
-				// Job: Stale transaction recovery.
-				if (this.txPendingCanSweep() && this.#store.hasAnyUnguardedPendingTx()) {
-					wantAlarm(Date.now() + this.fokosStaleTransactionMs());
-				}
-			});
-
-			if (nextAlarmMs !== null) {
-				await this.ensureAlarmSet(nextAlarmMs);
-				// Schedule background work to ensure progress without waiting for the alarm.
-				this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
-			} else {
-				console.log({
+			} catch (e) {
+				console.error({
 					...this.logParams(),
-					message: "fokos/partition: Background work ran, nothing to schedule forward.",
+					message: "fokos/partition: failed to poke stale TC",
+					transactionId: row.transaction_id,
+					error: String(e),
 				});
 			}
 		}
@@ -2622,8 +2329,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 
 	async #rpc<T>(_name: string, fn: () => Promise<T>): Promise<T> {
 		// TODO Add observability and canonical logs.
-		this.#ttl.arm();
+		const destroying = this.isDestroying();
+		const allowedWhileDestroying =
+			_name === "status" || _name === "fokosStatus" || _name === "fokosPrepareDestroy" || _name === "destroyPartition";
+		if (!destroying) this.#ttl.arm();
 		try {
+			if (destroying && !allowedWhileDestroying) {
+				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+					message: "partition destroy in progress, please retry later",
+					attributes: { operation: _name },
+				});
+			}
 			return await fn();
 		} catch (e) {
 			// Every error that leaves a partition is a FokosError, so a caller classifies it by its code.
@@ -2660,16 +2376,58 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			// KeyBytes fields are rendered via keyForLog so they never appear as bare Uint8Array.
 			partitionContext: pCtxForLog(this.#_partitionContext),
 		};
-		if (this.#_parentPartitionContext) {
+		const importSource = this.#target.importRecord()?.source;
+		if (importSource) {
 			Object.assign(info, {
-				parentPartition: {
-					actorName: this.#_parentPartitionContext.doName,
-					actorId: this.#_parentPartitionContext.primaryDoIdStr,
-				},
+				importSource: { actorName: importSource.doName, actorId: importSource.primaryDoIdStr },
 			});
 		}
 		return info;
 	}
+}
+
+/**
+ * The shape `status()` has always reported for a split. Every call derives it from the repartition
+ * rows, and nothing writes it. The partition suites read it.
+ */
+export type SplitStatusView =
+	| { status: "split_queued"; splitType: SplitType; createdAt: number; partitionContext: PartitionContextResolved }
+	| {
+			status: "split_started" | "split_completed";
+			splitType: SplitType;
+			createdAt: number;
+			partitionContext: PartitionContextResolved;
+			childPartitionContexts: PartitionContextResolved[];
+			migratedChildDoNames: string[];
+			history: {
+				status: "split_queued" | "split_started";
+				splitType: SplitType;
+				createdAt: number;
+				partitionContext: PartitionContextResolved;
+			}[];
+	  };
+
+/** The migration status the old KV key reported, taken from the import record that replaced it. */
+function derivedMigrationStatus(
+	state: FokosImportState | undefined,
+): "migration_initialized" | "migration_migrating" | "migration_completed" | undefined {
+	switch (state) {
+		case undefined:
+			return undefined;
+		case "awaiting_data":
+			return "migration_initialized";
+		case "importing":
+			return "migration_migrating";
+		default:
+			return "migration_completed";
+	}
+}
+
+/** The promotion status the old table reported, taken from the repartition state that replaced it. */
+function promotedKeyStatusOf(state: RepartitionState): PromotedKeyStatus {
+	if (state === "queued" || state === "planned") return "queued";
+	if (state === "cutover") return "promoting";
+	return "promoted";
 }
 
 /** Transient: the partition is healthy but past its cap, and a split will bring it back under. */

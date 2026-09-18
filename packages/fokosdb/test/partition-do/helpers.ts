@@ -12,7 +12,7 @@ import type { ConditionExpression } from "../../src/shared/expression/types.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
-import type { SplitStatusKVItem } from "../../src/shared/partition-topology/split-state.js";
+import type { SplitStatusView } from "../../src/server/do-partition.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 
 export const kb = (s?: string) => KeyCodec.encodeOptional(s);
@@ -27,7 +27,7 @@ export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): Transact
 	return items.map((item, i) => ({ ...item, opIndex: i }));
 }
 
-export type SplitStartedOrCompleted = Extract<SplitStatusKVItem, { status: "split_started" | "split_completed" }>;
+export type SplitStartedOrCompleted = Extract<SplitStatusView, { status: "split_started" | "split_completed" }>;
 export type PartitionOptions = Partial<Parameters<typeof PartitionContextCreator.create>[0]>;
 
 export function makeStub(opts?: PartitionOptions) {
@@ -51,7 +51,7 @@ export function makeStub(opts?: PartitionOptions) {
  * `childPartitionContexts` need that narrowing; failing here reports the status the partition was
  * actually in, instead of surfacing an `undefined` several lines later.
  */
-export function expectSplitStatus(status: SplitStatusKVItem | undefined, doName?: string): SplitStartedOrCompleted {
+export function expectSplitStatus(status: SplitStatusView | undefined, doName?: string): SplitStartedOrCompleted {
 	invariant(
 		status?.status === "split_started" || status?.status === "split_completed",
 		`${doName ?? "partition"}: expected a started or completed split, got ${status?.status ?? "none"}`,

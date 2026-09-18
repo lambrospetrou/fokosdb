@@ -7,6 +7,7 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
 import { HashPartitionTopologyImpl, RangePartitionTopologyImpl, type OperationIntent } from "./split-policy.js";
+import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
 
 // An empty SQLite database already occupies several KB, so any partition built with this cap is
 // over its 10% backpressure threshold from the first request — no data has to be written.
@@ -102,10 +103,19 @@ async function withTopology<T>(
 	});
 }
 
+// These tests cover backpressure and range membership only, so the partition is never a router and
+// owns no override. `repartition-flow.test.ts` drives the real repartition rows.
+const NOT_REPARTITIONING: RepartitionRouting = {
+	routerRole: () => false,
+	splitTargets: () => [],
+	overrideFor: () => undefined,
+	ownedByRangeTree: () => false,
+};
+
 function withHashTopology(pCtx: PartitionContextResolved, fn: (t: HashPartitionTopologyImpl) => void): Promise<void> {
-	return withTopology((c, state, store) => new HashPartitionTopologyImpl(c, state, store), pCtx, fn);
+	return withTopology((c, state, store) => new HashPartitionTopologyImpl(c, state, store, NOT_REPARTITIONING), pCtx, fn);
 }
 
 function withRangeTopology(pCtx: PartitionContextResolved, fn: (t: RangePartitionTopologyImpl) => void): Promise<void> {
-	return withTopology((c, state, store) => new RangePartitionTopologyImpl(c, state, store), pCtx, fn);
+	return withTopology((c, state, store) => new RangePartitionTopologyImpl(c, state, store, NOT_REPARTITIONING), pCtx, fn);
 }

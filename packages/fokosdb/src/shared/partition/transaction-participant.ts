@@ -53,12 +53,21 @@ export type TransactionParticipantDeps = {
 	 * defaults to txOrderTimestampNow.
 	 */
 	txOrderTimestamp?: () => TransactionTimestamp;
-	/**
-	 * Called after a committed "put" lands, with the key's updated size estimate — the DO wires
-	 * this to the promotion manager's queue check so the participant stays promotion-agnostic.
-	 */
-	onItemUpserted?: (hashKey: KeyBytes, keyEstBytes: number) => void;
 };
+
+/**
+ * A key that one applied write grew, with its updated size estimate.
+ *
+ * The apply runs in one storage transaction, and `queue` opens a transaction of its own. The decision
+ * therefore cannot happen where the number is measured. The applying method collects these keys and
+ * returns them, and the caller decides after the storage transaction commits. An apply that rolled
+ * back or threw returns none, because the array lives only as long as the call.
+ */
+export type PromotionCandidate = { hashKey: KeyBytes; keyEstBytes: number };
+
+/** What a local apply returns: the protocol answer, and the keys it grew. */
+export type CommitLocalResult = { response: CommitResponse; promotionCandidates: PromotionCandidate[] };
+export type SingleShotResult = { response: SingleShotResponse; promotionCandidates: PromotionCandidate[] };
 
 /**
  * The 2PC participant: prepare/commit/cancel/read for the items this partition owns locally.
@@ -73,13 +82,11 @@ export class TransactionParticipant {
 	#store: PartitionStore;
 	#now: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
-	#onItemUpserted?: (hashKey: KeyBytes, keyEstBytes: number) => void;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
-		this.#onItemUpserted = deps.onItemUpserted;
 	}
 
 	/**
@@ -296,12 +303,14 @@ export class TransactionParticipant {
 		});
 	}
 
-	commitLocal(request: CommitRequest): CommitResponse {
+	commitLocal(request: CommitRequest): CommitLocalResult {
 		const pendingCount = this.#store.pendingTxCountFor(request.transactionId);
 
 		if (pendingCount === 0) {
-			return { outcome: "committed" };
+			return { response: { outcome: "committed" }, promotionCandidates: [] };
 		}
+
+		const promotionCandidates: PromotionCandidate[] = [];
 
 		this.#store.transactionSync(() => {
 			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
@@ -322,16 +331,21 @@ export class TransactionParticipant {
 				}
 			}
 
-			this.#applyCommitItems(request.transactionId, request.transactionTimestamp, request.items);
+			this.#applyCommitItems(request.transactionId, request.transactionTimestamp, request.items, promotionCandidates);
 			this.#store.deletePendingTx(request.transactionId);
 		});
 
-		return { outcome: "committed" };
+		return { response: { outcome: "committed" }, promotionCandidates };
 	}
 
 	// Items are keys only: every per-item fact applied here (operation, data, kind, conditions) comes
 	// from the partition's own pending_transactions row that prepare wrote.
-	#applyCommitItems(transactionId: string, transactionTimestamp: number, items: TransactionItemKey[]): void {
+	#applyCommitItems(
+		transactionId: string,
+		transactionTimestamp: number,
+		items: TransactionItemKey[],
+		promotionCandidates: PromotionCandidate[],
+	): void {
 		for (const item of items) {
 			const sk = item.sortKey;
 			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
@@ -354,7 +368,7 @@ export class TransactionParticipant {
 					ttlAt: pendingRow.ttl_epoch_utc_seconds,
 					txOrderTs: transactionTimestamp,
 				});
-				this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
+				promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
 			} else if (pendingRow.operation === "delete") {
 				this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
 			} else if (pendingRow.operation === "check") {
@@ -375,10 +389,11 @@ export class TransactionParticipant {
 	 * The timestamp is this partition's own clock, as `apiPutItem` stamps it. `PartitionStore` keeps
 	 * per-item monotonicity in SQL, so a stamp from a lagging clock is absorbed, not applied.
 	 */
-	executeSingleShot(request: SingleShotRequest): SingleShotResponse {
+	executeSingleShot(request: SingleShotRequest): SingleShotResult {
 		const transactionTimestamp = this.#txOrderTimestamp();
+		const promotionCandidates: PromotionCandidate[] = [];
 
-		return this.#store.transactionSync<SingleShotResponse>(() => {
+		const response = this.#store.transactionSync<SingleShotResponse>(() => {
 			const results: ParticipantOperationResultEncoded[] = [];
 			for (const item of request.items) {
 				const { opIndex } = item;
@@ -449,7 +464,7 @@ export class TransactionParticipant {
 						ttlAt: item.ttlAt ?? null,
 						txOrderTs: transactionTimestamp,
 					});
-					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
+					promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
 				} else if (item.operation === "update") {
 					invariant(item.update, "fokos/partition.singleShot: update item missing update plan");
 					const res = this.#store.updateItemSingleShot({
@@ -459,7 +474,7 @@ export class TransactionParticipant {
 						ttlAt: item.ttlAt,
 						txOrderTs: transactionTimestamp,
 					});
-					this.#onItemUpserted?.(item.hashKey, res.keyEstBytes);
+					promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
 				} else if (item.operation === "delete") {
 					this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
 				} else {
@@ -471,6 +486,9 @@ export class TransactionParticipant {
 
 			return { outcome: "committed" };
 		});
+		// No guard on the outcome. The check pass above returns a rejection BEFORE the apply loop runs,
+		// so a rejected answer grew no key and the array is empty. A throw discards it with the frame.
+		return { response, promotionCandidates };
 	}
 
 	cancelLocal(transactionId: string): void {

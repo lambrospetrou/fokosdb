@@ -26,7 +26,6 @@ type Harness = {
 	participant: TransactionParticipant;
 	store: PartitionStore;
 	clock: { now: number };
-	upserts: Array<{ hashKey: KeyBytes; keyEstBytes: number }>;
 };
 
 // Runs `fn` against a TransactionParticipant over REAL Durable Object storage (vitest-pool-workers).
@@ -37,14 +36,12 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const clock = { now: BASE_NOW };
-		const upserts: Array<{ hashKey: KeyBytes; keyEstBytes: number }> = [];
 		const participant = new TransactionParticipant({
 			store,
 			now: () => clock.now,
 			txOrderTimestamp: () => clock.now * TX_ORDER_TS_UNITS_PER_MS,
-			onItemUpserted: (hashKey, keyEstBytes) => upserts.push({ hashKey, keyEstBytes }),
 		});
-		await fn({ participant, store, clock, upserts });
+		await fn({ participant, store, clock });
 	});
 }
 
@@ -226,7 +223,7 @@ describe("TransactionParticipant - prepare", () => {
 	// with no row: without one, commit would find an empty key set and report success for a write it
 	// never applied.
 	it("locks an absent item for an update, and commit creates it", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
+		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			const plan = compileUpdateExpression([
 				{
@@ -242,13 +239,12 @@ describe("TransactionParticipant - prepare", () => {
 			// Nothing is written before commit.
 			expect(store.getItem(kb("fresh"), sk).row).toBeUndefined();
 
-			expect(
-				participant.commitLocal({
-					transactionId: request.transactionId,
-					transactionTimestamp: request.transactionTimestamp,
-					items: [{ hashKey: kb("fresh"), sortKey: sk }],
-				}),
-			).toEqual({ outcome: "committed" });
+			const commit = participant.commitLocal({
+				transactionId: request.transactionId,
+				transactionTimestamp: request.transactionTimestamp,
+				items: [{ hashKey: kb("fresh"), sortKey: sk }],
+			});
+			expect(commit.response).toEqual({ outcome: "committed" });
 
 			const created = store.getItem(kb("fresh"), sk).row;
 			expect(created).toMatchObject({
@@ -259,7 +255,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 			expect(JSON.parse(created?.data as string)).toEqual({ n: 1 });
 			// The created item is a new row for its key, so the size accounting must hear about it.
-			expect(upserts).toEqual([{ hashKey: kb("fresh"), keyEstBytes: expect.any(Number) }]);
+			expect(commit.promotionCandidates).toEqual([{ hashKey: kb("fresh"), keyEstBytes: expect.any(Number) }]);
 		});
 	});
 
@@ -302,7 +298,8 @@ describe("TransactionParticipant - prepare", () => {
 
 			// The single-shot path answers with the same reason.
 			expect(
-				participant.executeSingleShot({ items: withOpIndex([{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }]) }),
+				participant.executeSingleShot({ items: withOpIndex([{ hashKey: binaryKey, sortKey: sk, operation: "update", update: plan }]) })
+					.response,
 			).toMatchObject({
 				outcome: "rejected",
 				results: aRejection({ code: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) }),
@@ -311,7 +308,7 @@ describe("TransactionParticipant - prepare", () => {
 	});
 
 	it("materializes update document in pending_transactions at prepare and applies it at commit", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
+		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({
 				hk: kb("user"),
@@ -343,13 +340,12 @@ describe("TransactionParticipant - prepare", () => {
 			const materializedBytes = (pending?.data as Uint8Array).byteLength;
 
 			// Commit applies the materialized document
-			expect(
-				participant.commitLocal({
-					transactionId: request.transactionId,
-					transactionTimestamp: request.transactionTimestamp,
-					items: [{ hashKey: kb("user"), sortKey: sk }],
-				}),
-			).toEqual({ outcome: "committed" });
+			const commit = participant.commitLocal({
+				transactionId: request.transactionId,
+				transactionTimestamp: request.transactionTimestamp,
+				items: [{ hashKey: kb("user"), sortKey: sk }],
+			});
+			expect(commit.response).toEqual({ outcome: "committed" });
 
 			const committed = store.getItem(kb("user"), sk);
 			expect(committed.row?.v).toBe(2);
@@ -363,7 +359,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			// An update reports its new key size like a put does, so promotion and split accounting see
 			// the growth of an item that the request itself never carried.
-			expect(upserts).toEqual([
+			expect(commit.promotionCandidates).toEqual([
 				{ hashKey: kb("user"), keyEstBytes: materializedBytes + kb("user").byteLength + sk.byteLength + EST_ROW_BYTES_K },
 			]);
 		});
@@ -610,7 +606,7 @@ describe("TransactionParticipant - prepare", () => {
 
 describe("TransactionParticipant - commit", () => {
 	it("applies put, delete, and check operations and clears the locks", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
+		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
 				hk: kb("to-delete"),
 				sk: KeyCodec.encodeOptional(undefined),
@@ -646,16 +642,13 @@ describe("TransactionParticipant - commit", () => {
 
 			const commitTs = request.transactionTimestamp;
 			const commitItems = request.items.map((item) => (item.operation === "put" ? { ...item, ttlAt: 999 } : item));
-			expect(participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: commitTs, items: commitItems })).toEqual(
-				{
-					outcome: "committed",
-				},
-			);
+			const commit = participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: commitTs, items: commitItems });
+			expect(commit.response).toEqual({ outcome: "committed" });
 
 			// Commit applies the expiry instant from the prepared row, not from the commit request.
 			const put = store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row;
 			expect(put).toMatchObject({ data: "new-value", ttl_epoch_utc_seconds: 777, last_read_ts: commitTs, last_write_ts: commitTs });
-			expect(upserts).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
+			expect(commit.promotionCandidates).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
 			// delete: row gone, the deletion watermark advanced to the commit timestamp, and the
 			// delete revision counted the removed row.
@@ -680,11 +673,14 @@ describe("TransactionParticipant - commit", () => {
 				check: store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row,
 				metadata: store.getDeletionMetadata(),
 			};
-			expect(participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: commitTs, items: commitItems })).toEqual(
-				{
-					outcome: "committed",
-				},
-			);
+			const retryCommit = participant.commitLocal({
+				transactionId: request.transactionId,
+				transactionTimestamp: commitTs,
+				items: commitItems,
+			});
+			expect(retryCommit.response).toEqual({ outcome: "committed" });
+			// A retry re-applies nothing, so it grew no key and must name no candidate.
+			expect(retryCommit.promotionCandidates).toEqual([]);
 			expect(store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.put);
 			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.check);
 			expect(store.getDeletionMetadata()).toEqual(afterCommit.metadata);
@@ -692,12 +688,11 @@ describe("TransactionParticipant - commit", () => {
 	});
 
 	it("is idempotent: committing a transaction with no pending locks is a no-op", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
-			expect(participant.commitLocal({ transactionId: "unknown-tx", transactionTimestamp: BASE_NOW, items: [] })).toEqual({
-				outcome: "committed",
-			});
+		await withParticipant(({ participant, store }) => {
+			const commit = participant.commitLocal({ transactionId: "unknown-tx", transactionTimestamp: BASE_NOW, items: [] });
+			expect(commit.response).toEqual({ outcome: "committed" });
 			expect(store.getMaxDeleteTxOrderTs()).toBe(0);
-			expect(upserts).toEqual([]);
+			expect(commit.promotionCandidates).toEqual([]);
 		});
 	});
 
@@ -749,7 +744,7 @@ describe("TransactionParticipant - single shot", () => {
 			expect(
 				participant.executeSingleShot({
 					items: withOpIndex([{ hashKey: kb("ttl-put"), sortKey, operation: "put", data: "value", kind: "text", ttlAt: 777 }]),
-				}),
+				}).response,
 			).toEqual({ outcome: "committed" });
 			expect(store.getItem(kb("ttl-put"), sortKey).row?.ttl_epoch_utc_seconds).toBe(777);
 		});
@@ -772,7 +767,7 @@ describe("TransactionParticipant - single shot", () => {
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("u1"), sortKey, operation: "update", update: updatePlan }]),
 			});
-			expect(res).toEqual({ outcome: "committed" });
+			expect(res.response).toEqual({ outcome: "committed" });
 
 			const updated = store.getItem(kb("u1"), sortKey);
 			expect(updated.row?.v).toBe(2);
@@ -782,19 +777,19 @@ describe("TransactionParticipant - single shot", () => {
 	});
 
 	it("creates the item when a single-shot update finds none", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
+		await withParticipant(({ participant, store }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
 
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan, ttlAt: 42 }]),
 			});
-			expect(res).toEqual({ outcome: "committed" });
+			expect(res.response).toEqual({ outcome: "committed" });
 
 			const created = store.getItem(kb("missing-u"), sortKey).row;
 			expect(created).toMatchObject({ v: 1, ttl_epoch_utc_seconds: 42 });
 			expect(JSON.parse(created?.data as string)).toEqual({ a: 1 });
-			expect(upserts).toEqual([{ hashKey: kb("missing-u"), keyEstBytes: expect.any(Number) }]);
+			expect(res.promotionCandidates).toEqual([{ hashKey: kb("missing-u"), keyEstBytes: expect.any(Number) }]);
 		});
 	});
 
@@ -807,10 +802,12 @@ describe("TransactionParticipant - single shot", () => {
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("no-parent"), sortKey, operation: "update", update: updatePlan }]),
 			});
-			expect(res).toMatchObject({
+			expect(res.response).toMatchObject({
 				outcome: "rejected",
 				results: aRejection({ code: "update_not_applicable", hashKey: "no-parent" }),
 			});
+			// A rejected single-shot writes nothing, so it names no candidate.
+			expect(res.promotionCandidates).toEqual([]);
 			expect(store.getItem(kb("no-parent"), sortKey).row).toBeUndefined();
 		});
 	});
@@ -840,7 +837,7 @@ describe("TransactionParticipant - cancel", () => {
 	// A cancelled update must leave no trace of the document prepare materialized: not the item, not
 	// its version, and not the size accounting that a materialized pending row would otherwise skew.
 	it("discards the materialized document of an update and leaves the item untouched", async () => {
-		await withParticipant(({ participant, store, upserts }) => {
+		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({ hk: kb("user"), sk, data: JSON.stringify({ score: 10 }), kind: "json", ttlAt: null, txOrderTs: 10 });
 
@@ -854,13 +851,12 @@ describe("TransactionParticipant - cancel", () => {
 			const item = store.getItem(kb("user"), sk);
 			expect(item.row?.v).toBe(1);
 			expect(JSON.parse(item.row?.data as string)).toEqual({ score: 10 });
-			// Nothing was applied, so the split and promotion accounting was never told of a new size.
-			expect(upserts).toEqual([]);
+			// Nothing applied, so no call reported a new size for this key.
 
 			// The key is preparable again, and the second update sees the ORIGINAL pre-image.
 			const retry = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(retry)).toEqual({ outcome: "accepted" });
-			participant.commitLocal({
+			const commit = participant.commitLocal({
 				transactionId: retry.transactionId,
 				transactionTimestamp: retry.transactionTimestamp,
 				items: [{ hashKey: kb("user"), sortKey: sk }],
@@ -870,8 +866,8 @@ describe("TransactionParticipant - cancel", () => {
 			expect(JSON.parse(committed.row?.data as string)).toEqual({ score: 999 });
 			// Applied exactly once, for this key. The byte arithmetic of the estimate is partition-store's
 			// own test: est_row_bytes measures the stored JSONB, which is not the length of the JSON text.
-			expect(upserts).toHaveLength(1);
-			expect(upserts[0].hashKey).toEqual(kb("user"));
+			expect(commit.promotionCandidates).toHaveLength(1);
+			expect(commit.promotionCandidates[0].hashKey).toEqual(kb("user"));
 		});
 	});
 });

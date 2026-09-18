@@ -5,10 +5,10 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
-import type { SplitStatusKVItem } from "../../src/shared/partition-topology/split-state.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { MIGRATION_KV_KEYS, type PartitionSplitMigrationStatus } from "../../src/shared/partition/migration.js";
+import { REPARTITION_KV_KEYS } from "../../src/shared/partition/repartition/repartition-flow.js";
+import type { FokosImportRecord } from "../../src/shared/partition/repartition/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
@@ -59,7 +59,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		return recoverTransaction;
 	}
 
-	it.each(["split_started", "split_completed"] as const)("skips stale recovery on a parent in %s", async (splitStatus) => {
+	// A source that has cut over is a router. Its targets own the keys and hold the true locks.
+	it.each(["cutover", "completed"] as const)("skips stale recovery on a source in %s", async (state_) => {
 		const { ctx, stub } = makeStub({ hashSplitN: 2 });
 		await stub.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
@@ -73,16 +74,24 @@ describe("PartitionDO — stale transaction recovery", () => {
 		}));
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			state.storage.kv.put<SplitStatusKVItem>("__split_status", {
-				status: splitStatus,
-				splitType: "hash",
-				createdAt: Date.now(),
-				partitionContext: ctx,
-				childPartitionContexts,
-				migratedChildDoNames: splitStatus === "split_completed" ? childPartitionContexts.map((child) => child.doName) : [],
-				history: [],
+			const store = new PartitionStore(state.storage);
+			const now = Date.now();
+			store.insertRepartition({ id: "r1", seq: 1, kind: "hash_split", state: state_, hashKey: null, queuedAt: now, nextAttemptAt: now });
+			childPartitionContexts.forEach((child, index) => {
+				store.insertRepartitionTarget({
+					repartitionId: "r1",
+					kind: "hash_split",
+					partitionId: child.partitionId,
+					doName: child.doName,
+					targetIndex: index,
+					slice: { kind: "hash_child", childIndex: index },
+					initialization: "initialized",
+					startNotified: true,
+					acknowledged: state_ === "completed",
+					nextAttemptAt: now,
+				});
 			});
-			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
+			insertStalePendingLock(state, transactionId, coordinatorDoId);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -92,7 +101,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 	});
 
-	it.each(["migration_initialized", "migration_migrating"] as const)("skips stale recovery on a child in %s", async (migrationStatus) => {
+	// An incomplete target holds only some of the rows and only some of the inherited locks.
+	it.each(["awaiting_data", "importing"] as const)("skips stale recovery on a target in %s", async (importState) => {
 		const { ctx: parentCtx } = makeStub({ hashSplitN: 2 });
 		const child = PartitionIdHelper.calculateHashChildPartitionIds(parentCtx)[0];
 		const childId = env.PARTITION_DO.idFromName(child.doName);
@@ -103,21 +113,29 @@ describe("PartitionDO — stale transaction recovery", () => {
 			primaryDoIdStr: childId.toString(),
 		};
 		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
-		await childStub.internalInitFromSplit({ parentPartitionContext: parentCtx, newPartitionContext: childCtx, splitType: "hash" });
+		await childStub.fokosInit({
+			repartitionId: "r1",
+			source: parentCtx,
+			target: childCtx,
+			slice: { kind: "hash_child", childIndex: 0, depth: 1 },
+		});
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
 
 		await runInDurableObject(childStub, async (instance: PartitionDO, state: DurableObjectState) => {
-			state.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, migrationStatus);
-			const migration = vi.spyOn(instance as unknown as { runMigration(): Promise<void> }, "runMigration").mockResolvedValue();
+			const record = state.storage.kv.get<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT)!;
+			state.storage.kv.put<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT, { ...record, state: importState });
+			// This test cannot reach the source, so it stubs the import step out. The case is about
+			// recovery staying away, and not about how far the import gets.
+			vi.spyOn(instance as unknown as { runBackgroundWork(): Promise<void> }, "runBackgroundWork");
 			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
 			expect(recoverTransaction).not.toHaveBeenCalled();
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
-			state.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+			state.storage.kv.put<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT, { ...record, state: "active" });
 			store.deletePendingTx(transactionId);
 			await state.storage.deleteAlarm();
 		});

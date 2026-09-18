@@ -1,8 +1,8 @@
-import { hashChildIndex } from "../hash-primitives.js";
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
-import type { ScanCursor } from "./partition-store.js";
-import { clipToChildRange, cursorFallsInChild, rangeIntersects, type SkInterval } from "../query/sk-interval.js";
-import { FokosRoutingError, ROUTING_CODES } from "../errors.js";
+import { hashChildIndex } from "../../hash-primitives.js";
+import { KeyCodec, type KeyBytes } from "../../partition-topology/key-codec.js";
+import type { ScanCursor } from "../partition-store.js";
+import { clipToChildRange, cursorFallsInChild, rangeIntersects, type SkInterval } from "../../query/sk-interval.js";
+import { FokosRoutingError, ROUTING_CODES } from "../../errors.js";
 
 /**
  * The part of a source partition's keyspace that one repartition target owns.
@@ -46,6 +46,21 @@ function hashKeyInSlice(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number
 		case "promoted_key":
 			return KeyCodec.compare(hashKey, slice.hashKey) === 0;
 	}
+}
+
+/**
+ * Says whether one stored item belongs to the slice. Migration filters its source rows with it, so a
+ * target receives exactly the rows it owns and nothing a sibling owns.
+ */
+export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey: KeyBytes, hashSplitN: number): boolean {
+	if (!hashKeyInSlice(slice, hashKey, hashSplitN)) return false;
+	if (slice.kind !== "range") return true;
+	return KeyCodec.compare(sortKey, sliceStart(slice.start)) >= 0 && (slice.end === null || KeyCodec.compare(sortKey, slice.end) < 0);
+}
+
+/** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
+export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number): boolean {
+	return hashKeyInSlice(slice, hashKey, hashSplitN);
 }
 
 /** Throws `partition_misrouted` when the point is outside the slice. */

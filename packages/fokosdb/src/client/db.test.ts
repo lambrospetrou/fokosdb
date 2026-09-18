@@ -22,6 +22,8 @@ import type { ConditionExpression, ProjectionExpression } from "../shared/expres
 import type { JsonValue } from "../shared/json-types.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
+import { routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
+import { FokosUnavailableError, UNAVAILABLE_CODES, type FokosError } from "../shared/errors.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -49,6 +51,48 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(meta.servedByActorName).toBeTypeOf("string");
 			}
 			expect(query.partitionMetas).not.toHaveLength(0);
+		});
+	});
+
+	describe("FokosDB — internal codes at the public root", () => {
+		it("maps repartition_not_cut_over to partition_migrating and keeps the internal code and error id", async () => {
+			const db = makeDB();
+			// The repartition protocol tells a target that its source still owns the slice. A client has
+			// no repartitions in its vocabulary, and the condition means "retry shortly" to it.
+			const internal = stampRoutingMeta(
+				new FokosUnavailableError(UNAVAILABLE_CODES.repartition_not_cut_over, {
+					message: "the source still owns this slice",
+					attributes: { repartitionId: "r1" },
+				}),
+				{
+					servedByActorId: "actor",
+					servedByActorName: "leaf",
+					servedByPartitionId: "01",
+					forwardCount: 1,
+					hashDepth: 1,
+					rangeDepth: 0,
+					_internal: { rangeAncestors: [] },
+				},
+			);
+			const spy = vi.spyOn(PartitionDO.prototype, "apiGetItem").mockRejectedValue(internal);
+			try {
+				await expect(db.getItem({ hashKey: "alice" })).rejects.toThrow(fokosErrorWith("partition_migrating"));
+				const raised: FokosError = await db.getItem({ hashKey: "alice" }).then(
+					() => {
+						throw new Error("getItem resolved; it must raise the mapped error");
+					},
+					(e: FokosError) => e,
+				);
+				expect(raised.error_id).toBe(internal.error_id);
+				expect(raised.attributes.runtimeCode).toBe(UNAVAILABLE_CODES.repartition_not_cut_over.code);
+				// The mapping builds a new error object, so the routing meta must move with it. The public
+				// boundary must still strip the internal half of that meta.
+				const meta = routedError(raised)?.meta;
+				expect(meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1 });
+				expect(meta).not.toHaveProperty("_internal");
+			} finally {
+				spy.mockRestore();
+			}
 		});
 	});
 

@@ -254,8 +254,13 @@ describe("an extension in another package", () => {
 		if (!isShardAnyError(e)) throw new Error("unreachable");
 		switch (e._tag) {
 			case "FokosUnavailableError": {
-				const code: "partition_over_size" | "partition_migrating" | "coordinator_over_size" | "prepare_unanswered" | "shard_migrating" =
-					e.code;
+				const code:
+					| "partition_over_size"
+					| "partition_migrating"
+					| "repartition_not_cut_over"
+					| "coordinator_over_size"
+					| "prepare_unanswered"
+					| "shard_migrating" = e.code;
 				expect(code).toBe("shard_migrating");
 				break;
 			}

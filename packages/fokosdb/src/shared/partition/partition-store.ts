@@ -101,7 +101,8 @@ function throwItemTooLarge(hk: KeyBytes, sk: KeyBytes): never {
 
 /**
  * PartitionStore owns ALL SQL on the partition's tables: items, pending_transactions,
- * deletion_metadata, key_size_estimates, promoted_keys, and range_hierarchy — plus the schema
+ * deletion_metadata, key_size_estimates, range_hierarchy, and the three repartition tables —
+ * fokos_repartitions, fokos_repartition_targets and fokos_route_overrides — plus the schema
  * migrations and the row-size estimators. No other class touches these tables.
  *
  * Design rules:
@@ -213,9 +214,8 @@ export type QueryScanRow = {
 /** Scan checkpoint of the route-override stream, in `hash_key` order. */
 export type PromotedKeyCursor = { hashKey: KeyBytes };
 
+/** The promotion lifecycle as `status()` reports it, derived from a repartition's own state. */
 export type PromotedKeyStatus = "queued" | "promoting" | "promoted";
-
-export type PromotedKeyRow = { hash_key: KeyBytes; status: PromotedKeyStatus };
 
 export type SqlMetrics = { rowsRead: number; rowsWritten: number };
 
@@ -620,7 +620,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//
 		// Index `idx_items_scan`:
 		// - The index contains (hk, sk, est_row_bytes). Thus, the est_row_bytes scans
-		//   (computeRangeSplitBoundaries, rebuildKeySizeEstimates) read only the index, and never read the
+		//   (computeRangeSplitBoundaries) read only the index, and never read the
 		//   item rows.
 		sql: `
             CREATE TABLE IF NOT EXISTS items (
@@ -784,16 +784,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE TABLE IF NOT EXISTS fokos_route_overrides (
                 hash_key       BLOB NOT NULL PRIMARY KEY,
                 repartition_id TEXT NOT NULL
-            ) WITHOUT ROWID, STRICT;
-
-            CREATE TABLE IF NOT EXISTS promoted_keys (
-                hash_key   BLOB    NOT NULL PRIMARY KEY,
-                status     TEXT    NOT NULL,
-                gc_done    INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
-            ) WITHOUT ROWID, STRICT;
-            CREATE INDEX IF NOT EXISTS idx_promoted_keys_status ON promoted_keys (status, gc_done);`,
+            ) WITHOUT ROWID, STRICT;`,
 	},
 	{
 		idMonotonicInc: 4,
@@ -985,8 +976,8 @@ export class PartitionStore {
 	 *
 	 * Do NOT replace this read with `AFTER INSERT/UPDATE/DELETE` triggers on items that maintain
 	 * key_size_estimates. A trigger fires for EVERY writer of items, including the two that do their
-	 * size accounting in bulk: insertItemIfAbsent (migration ingest, followed by one
-	 * rebuildKeySizeEstimates) and deleteItemsBatchForHashKey (GC, 1000 rows per call, followed by one
+	 * size accounting in bulk: insertItemIfAbsent (migration ingest, one addKeySizeEstimate per key per
+	 * page) and deleteItemsBatchForHashKey (cleanup, 1000 rows per call, followed by one
 	 * deleteKeySizeEstimate). It would add one row WRITE per row on those paths to save one row READ here.
 	 */
 	#storedEstRowBytes(hk: KeyBytes, sk: KeyBytes): number {
@@ -1962,140 +1953,6 @@ export class PartitionStore {
 		);
 	}
 
-	/**
-	 * Post-migration rebuild: recomputes every key's estimate from the ingested rows, and drops the
-	 * estimate of every key that has no rows left.
-	 *
-	 * The refresh alone touches only keys that still have rows, so a key whose rows have all gone would
-	 * keep its old estimate forever. That number is a running total — `upsertItem` adds its delta to
-	 * whatever is already there — so a stale base makes every later value for that key too large, and
-	 * the key promotes too early. The prune is what makes the method match its name.
-	 *
-	 * Refresh first, then prune: neither statement needs a transaction, because each one on its own
-	 * leaves the table no worse than it found it. `DELETE` everything and re-`INSERT` would need one,
-	 * because a crash between the two would zero every estimate.
-	 *
-	 * The prune uses `NOT EXISTS`, not `hk NOT IN (SELECT hk FROM items)`: `NOT EXISTS` is one index
-	 * seek per estimate row, while `NOT IN` materialises every `hk` in items.
-	 */
-	rebuildKeySizeEstimates(): void {
-		this.#storage.sql.exec(
-			`INSERT INTO key_size_estimates (hk, est_bytes)
-			 SELECT hk, SUM(est_row_bytes) FROM items GROUP BY hk
-			 ON CONFLICT(hk) DO UPDATE SET est_bytes = excluded.est_bytes`,
-		);
-		this.#storage.sql.exec(
-			`DELETE FROM key_size_estimates
-			 WHERE NOT EXISTS (SELECT 1 FROM items WHERE items.hk = key_size_estimates.hk)`,
-		);
-	}
-
-	// ─── promoted_keys ──────────────────────────────────────────────────────
-
-	listPromotedKeys(status?: PromotedKeyStatus): PromotedKeyRow[] {
-		let sql = `SELECT hash_key, status FROM promoted_keys`;
-		const params: any[] = [];
-		if (status) {
-			sql += ` WHERE status = ?`;
-			params.push(status);
-		}
-		return this.#storage.sql
-			.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(sql, ...params)
-			.toArray()
-			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
-	}
-
-	getPromotedKeyStatus(hk: KeyBytes): PromotedKeyStatus | undefined {
-		return this.#storage.sql.exec<{ status: PromotedKeyStatus }>(`SELECT status FROM promoted_keys WHERE hash_key = ?`, hk).toArray()[0]
-			?.status;
-	}
-
-	hasInFlightPromotedKeys(): boolean {
-		return (
-			this.#storage.sql.exec<{ one: 1 }>(`SELECT 1 AS one FROM promoted_keys WHERE status IN ('queued', 'promoting') LIMIT 1`).toArray()
-				.length > 0
-		);
-	}
-
-	hasResidualItemsForPromotedKeys(): boolean {
-		return (
-			this.#storage.sql.exec<{ one: 1 }>(`SELECT 1 AS one FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0 LIMIT 1`).toArray()
-				.length > 0
-		);
-	}
-
-	listPromotedKeysNeedingGC(limit?: number): KeyBytes[] {
-		return this.#storage.sql
-			.exec<{ hash_key: ArrayBuffer }>(
-				limit != null
-					? `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0 LIMIT ?`
-					: `SELECT hash_key FROM promoted_keys WHERE status = 'promoted' AND gc_done = 0`,
-				...(limit != null ? [limit] : []),
-			)
-			.toArray()
-			.map((r) => fromSqlKey(r.hash_key));
-	}
-
-	markPromotedKeyGcDone(hk: KeyBytes): void {
-		this.#storage.sql.exec(`UPDATE promoted_keys SET gc_done = 1 WHERE hash_key = ?`, hk);
-	}
-
-	/**
-	 * Idempotent: used both when queueing a new promotion and when inheriting entries on hash
-	 * split. Returns whether a new row was actually inserted — false means the key already had a
-	 * row (whose status may differ from `status`), so callers keeping an in-memory cache must
-	 * resync from storage instead of assuming `status` was written.
-	 */
-	insertPromotedKey(hk: KeyBytes, status: PromotedKeyStatus, now: number): { inserted: boolean } {
-		const res = this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO promoted_keys (hash_key, status, created_at, updated_at) VALUES (?, ?, ?, ?)`,
-			hk,
-			status,
-			now,
-			now,
-		);
-		return { inserted: res.rowsWritten > 0 };
-	}
-
-	/**
-	 * Guarded transition: only updates when the row is currently in `fromStatus`. Returns whether
-	 * a row actually transitioned — false means the key was absent or in a different status, so
-	 * callers keeping an in-memory cache must resync from storage instead of assuming `toStatus`.
-	 */
-	updatePromotedKeyStatus(
-		hk: KeyBytes,
-		fromStatus: PromotedKeyStatus,
-		toStatus: PromotedKeyStatus,
-		updatedAt: number,
-	): { updated: boolean } {
-		const res = this.#storage.sql.exec(
-			`UPDATE promoted_keys SET status = ?, updated_at = ? WHERE hash_key = ? AND status = ?`,
-			toStatus,
-			updatedAt,
-			hk,
-			fromStatus,
-		);
-		return { updated: res.rowsWritten > 0 };
-	}
-
-	/** Pages promoted_keys in hash_key order, strictly after `cursor`. */
-	queryPromotedKeysPage(cursor: PromotedKeyCursor | null, limit: number): PromotedKeyRow[] {
-		return (
-			cursor
-				? this.#storage.sql.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(
-						`SELECT hash_key, status FROM promoted_keys WHERE hash_key > ? ORDER BY hash_key LIMIT ?`,
-						cursor.hashKey,
-						limit,
-					)
-				: this.#storage.sql.exec<{ hash_key: ArrayBuffer; status: PromotedKeyStatus }>(
-						`SELECT hash_key, status FROM promoted_keys ORDER BY hash_key LIMIT ?`,
-						limit,
-					)
-		)
-			.toArray()
-			.map((r) => ({ hash_key: fromSqlKey(r.hash_key), status: r.status }));
-	}
-
 	// ─── fokos_repartitions ─────────────────────────────────────────────────
 
 	/** The sequence of the next local repartition. Rows are permanent, so a value never repeats. */
@@ -2188,6 +2045,26 @@ export class PartitionStore {
 			        ?2)
 			  WHERE id = ?1`,
 			id,
+			now,
+		);
+	}
+
+	/**
+	 * Makes every unfinished promotion due now, with every target of one that still needs a call.
+	 *
+	 * A promotion that cannot move a locked key parks itself 5 seconds out. The release of that lock is
+	 * the event it waits for, so the caller brings the deadline forward. The retry interval must not
+	 * decide how long the key stays where it is.
+	 */
+	markPromotionsDueNow(now: number): void {
+		this.#storage.sql.exec(
+			`UPDATE fokos_repartitions SET next_attempt_at = ?1 WHERE kind = 'key_promotion' AND state IN ('queued', 'planned')`,
+			now,
+		);
+		this.#storage.sql.exec(
+			`UPDATE fokos_repartition_targets SET next_attempt_at = ?1
+			  WHERE initialization != 'initialized'
+			    AND repartition_id IN (SELECT id FROM fokos_repartitions WHERE kind = 'key_promotion' AND state IN ('queued', 'planned'))`,
 			now,
 		);
 	}

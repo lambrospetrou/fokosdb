@@ -7,7 +7,7 @@
  *   re-evaluates rows that were already filtered out.
  * - The first matched row is always included even if it alone exceeds the byte budget,
  *   so a single oversized row cannot stall progress.
- * - Scanning stops when a fetched page is shorter than `pageSize` (the table is exhausted).
+ * - Scanning stops when a fetched page is shorter than the page size asked for (the table is exhausted).
  * - `nextCursor` is non-null when the byte budget or the item cap stopped the scan. A null
  *   `nextCursor` means the scan reached the end of the table.
  */
@@ -28,6 +28,13 @@ export type CollectBatchOptions<TRow, TCursor> = {
 	 * oversized row). When omitted, only the byte budget bounds the scan.
 	 */
 	maxItems?: number;
+	/**
+	 * Optional cap on rows READ from the source, matched or not. The item cap bounds what a page
+	 * returns; this bounds the work a page costs, which is what a sparse filter can otherwise run
+	 * away with — a slice that matches one row in ten thousand would scan the whole table for one
+	 * page. Checked after the cursor advances, so the scan resumes where it stopped.
+	 */
+	maxScannedRows?: number;
 	pageSize: number;
 	startCursor: TCursor | null;
 };
@@ -40,15 +47,21 @@ export type CollectBatchResult<TRow, TCursor> = {
 };
 
 export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCursor>): CollectBatchResult<TRow, TCursor> {
-	const { fetchPage, advanceCursor, include, estimateBytes, budgetBytes, maxItems, pageSize } = opts;
+	const { fetchPage, advanceCursor, include, estimateBytes, budgetBytes, maxItems, maxScannedRows, pageSize } = opts;
 
 	const rows: TRow[] = [];
 	let totalBytes = 0;
+	let scanned = 0;
 	let cursor = opts.startCursor;
 	let reachedLimit = false;
 
 	while (true) {
-		const page = fetchPage(cursor, pageSize);
+		const remainingScan = maxScannedRows === undefined ? pageSize : Math.min(pageSize, maxScannedRows - scanned);
+		if (remainingScan <= 0) {
+			reachedLimit = true;
+			break;
+		}
+		const page = fetchPage(cursor, remainingScan);
 		if (page.length === 0) break;
 
 		for (const row of page) {
@@ -65,16 +78,21 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 			}
 			// Always advance the table cursor regardless of whether the row matched.
 			cursor = advanceCursor(row);
+			scanned++;
 
 			// Item-count cap: checked *after* advancing the cursor so the included row is not re-emitted.
 			if (maxItems !== undefined && rows.length >= maxItems) {
 				reachedLimit = true;
 				break;
 			}
+			if (maxScannedRows !== undefined && scanned >= maxScannedRows) {
+				reachedLimit = true;
+				break;
+			}
 		}
 		if (reachedLimit) break;
 
-		if (page.length < pageSize) break;
+		if (page.length < remainingScan) break;
 	}
 
 	return { rows, nextCursor: reachedLimit ? cursor : null, totalBytes };

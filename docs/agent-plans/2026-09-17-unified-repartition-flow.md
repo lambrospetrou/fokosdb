@@ -1,7 +1,9 @@
 # RFC — One repartition flow for hash splits, range splits, and key promotions
 
-**State:** Draft
-**Milestone state:** M0 is complete on 2026-09-18. M1 has not started.
+**State:** Implemented
+**Milestone state:** M0 is complete on 2026-09-18. M1 is complete on 2026-09-18: all four stages are
+delivered. The 100 MB migration benchmark of section 4.14 is not delivered, because its before-M1
+half cannot be measured after the old components are removed.
 **Date:** 2026-09-17
 **Author:** Lambros
 
@@ -171,7 +173,8 @@ M0 is complete. It delivers:
   `internalGetItemDirect` and `internalQueryItemsDirect` are removed.
 - `repartition_target_unknown` in `INTERNAL_CODES`.
 - `FokosSlice` and the pure slice validation in
-  `packages/fokosdb/src/shared/partition/repartition-slice.ts`. M1 lifts this file into `RepartitionFlow`.
+  `packages/fokosdb/src/shared/partition/repartition-slice.ts`. M1 moves this file beside the flow, in
+  `packages/fokosdb/src/shared/partition/repartition/`.
 - One in-memory import promise in `PartitionDO`, and one durable guard in each migration page transaction.
 - Forwarded range-child contexts that the router rebuilds from its current context.
 
@@ -198,7 +201,7 @@ M1 delivers the complete unified flow in one deployment. It includes:
 - The three SQL tables and the plan KV records.
 - The `__fokos/import` target record.
 - Both state machines and the arbitration rules.
-- The `RepartitionFlow` class, the `MigrationHost` interface, and the FokosDB host.
+- The `RepartitionSource` and `RepartitionTarget` classes, the `MigrationHost` interface, and the FokosDB host.
 - The four control RPCs and `fokosExecuteLocal`.
 - The phased migration cursor and bounded pull work.
 - Single-flight background work and fair due-row selection.
@@ -213,6 +216,91 @@ M1 removes:
 - The old migration RPCs.
 - `promoted_keys`.
 - The old target migration KV keys.
+
+#### M1 stages
+
+M1 ships as one deployment, but it is built in four stages. Each stage builds, type checks, and keeps
+the whole test suite green, so work can stop and resume at a stage boundary. The old components stay
+until stage 3, which is the only way the earlier stages can compile.
+
+**Stage 1 — the store, the schema, and the row types. Complete.**
+Migration 3 creates `fokos_repartitions`, `fokos_repartition_targets`, and `fokos_route_overrides`,
+and `PartitionStore` gains the API for them: sequence allocation, arbitration reads, due-row and
+cleanup selection, target progress, the joined override lookup, and the paginated status view.
+`insertItemIfAbsent` now reports the exact stored bytes so an import can maintain `key_size_estimates`
+page by page, and `deleteExpiredItems` reads `fokos_route_overrides` instead of `promoted_keys`.
+`promoted_keys` stays in the same migration until stage 3 removes its last caller.
+
+**Stage 2 — the source and target halves, the host boundary, and the unit suite. Complete.**
+`packages/fokosdb/src/shared/partition/repartition/` holds the flow, its wire types, and the slice
+helpers, and `fokos-migration-host.ts` holds the FokosDB `items` and `pending_tx` streams behind the
+opaque host phase. `test/repartition/repartition-flow.test.ts` drives real flows over real stores through a harness
+whose peer calls land on the receiving flow directly. Nothing calls the flow outside its own suite
+yet.
+
+**Stage 3 — wire `PartitionDO` to the flow, and delete the old components. Complete.**
+`PartitionDO` holds one flow and delegates to it: the five control RPCs, the request-path reads of
+section 4.8, the derived `status()` view of section 4.12.1, single-flight background work, and the
+alarm computation of section 4.9.5. `SplitStateMachine`, `PromotionManager`, `SplitMigration`,
+`promoted_keys`, the old migration RPCs, and the old target migration KV keys all go in this stage,
+and `withFokosErrors` starts mapping `repartition_not_cut_over` to `partition_migrating`.
+
+**Stage 4 — destroy, `fokosStatus`, and the integration tests. Complete.**
+The destroy fence, `fokosPrepareDestroy`, the paginated `fokosStatus`, and the traversal of section
+4.12.2, together with the integration tests of section 4.14 and the harness changes to
+`withMigrationHeld` and `withMigrationBatchCap`. The concurrent stale-page cases that M0 holds in
+`migration.test.ts` move here rather than into the unit suite: holding a page in flight needs two
+interleaved loops, which the unit harness cannot express.
+
+#### M1 stage 3 notes
+
+- The source keeps NO in-memory cache of its split row. Section 4.3 allows one, but the case worth caching
+  is absence, which every leaf hits on every request, and a stale negative answer is the dangerous
+  direction: a router that believes it is not one serves rows its targets already own. The lookup is one
+  seek of a partial index, which is what the KV read it replaced cost.
+- A lock release wakes the promotion waiting on it. A promotion that cannot move a locked key parks five
+  seconds out; a commit or a cancel is the only event that can change that answer, so it clears the
+  deadline rather than letting the poll interval decide how long the key stays put.
+- `fokosInit` arms the target's fallback alarm and starts nothing. The source is still `planned` when it
+  calls, so an immediate pull would earn `repartition_not_cut_over` and park the target behind a retry it
+  did not need. `fokosStartImport` begins the import and clears any such deadline.
+- The hash routing cache is created on demand, not in the topology constructor. The topology is built on
+  the first request, long before the partition splits, so a constructor decision would leave a router
+  unable to learn.
+- `withMigrationHeld` now holds the `pending_tx` stream, the last one an import runs. The overrides phase
+  runs FIRST, so a held import has already inherited its route overrides — which is what section 4.13's
+  D2 fix requires, and it inverts the precondition one read-through test used to assert.
+
+#### M1 stage 4 notes
+
+- `traverseForDestroy` no longer resolves a range root from a promoted hash key. Every partition
+  below a root is now a durable target link that `fokosStatus` reports, so the router walks refs and
+  needs neither the split status nor the promoted-key list. It dedupes by `doName` over the whole
+  traversal, which is what a range root shared by two hash children needs.
+- The destroy fence also stops the TTL sweep and the stale-transaction sweep. Both read
+  `canSweepLocally`, so one guard covers the two jobs section 4.9.3 lists last.
+- `fokosPrepareDestroy` waits for the in-flight pass and only then deletes the alarm. The pass can
+  re-arm the alarm at its own end, so deleting first would leave one behind.
+- `statusEntries` takes the byte budget, so the count limit and the size limit are enforced in one
+  place. The first entry of a page always goes out: a page that returned none could never drain.
+
+#### M1 decisions taken during implementation
+
+1. **The cleanup stage is unified, and `cleanup_started` is gone.** `completed` already means that
+   every target acknowledged and cleanup is pending, so the flag named a state that `state` implied.
+   Every kind now ends `completed` then `cleaned`, a split's cleanup step reclaims nothing and reports
+   itself done, and one job drives all three kinds with no branch on the kind.
+2. **`fokos_repartition_targets` stores no slice kind.** A repartition never mixes slice kinds, so its
+   `kind` gives the kind of every target, and every reader holds the repartition row first. The write
+   path asserts the slice matches, because nothing else can.
+3. **Wide columns sit last in both rowid tables.** SQLite reads a record until it has the columns a
+   query needs, so the keys and the derived names follow every column the due-row scan, the alarm, and
+   the target counts read.
+4. **The test split threshold moved from 0.1 MB to 0.25 MB.** The new tables and indexes cost about
+   45 KB of empty pages, which put a fresh partition over a 0.1 MB cap before its first write. It
+   affects `hash-split.test.ts` and `destroy.test.ts` only; production defaults are 100 MB.
+5. **`collectBatch` gained `maxScannedRows`.** Section 2.3 bounds a pull at 10,000 scanned source rows
+   and the helper had no way to express it, so a sparse slice would scan a whole table for one page.
 
 ## 4. Proposed solution
 
@@ -257,22 +345,41 @@ promotions move to the owning hash child as route overrides.
 
 #### 4.1.1 Code structure
 
-One class, `RepartitionFlow` in `packages/fokosdb/src/shared/partition/repartition/repartition-flow.ts`, owns
-the flow. `PartitionDO` holds one instance and delegates to it. The class follows the pattern of
-`TransactionParticipant` and `TtlExpiry`: it takes the real `PartitionStore`, the `DurableObjectStorage`, and a
-deps object. It holds no stub and makes no RPC of its own.
+Two classes, `RepartitionSource` and `RepartitionTarget`, both in
+`packages/fokosdb/src/shared/partition/repartition/repartition-flow.ts`, own the flow. `PartitionDO` holds one
+of each and delegates to them. Each follows the pattern of `TransactionParticipant` and `TtlExpiry`: it takes
+the real `PartitionStore`, the `DurableObjectStorage`, and a deps object. Neither holds a stub or makes an RPC
+of its own.
 
-One instance serves both roles. A hash child is a target first and a source later, and the two roles share no
-in-memory state. The file has these sections, in this order:
+A partition is both halves, because a hash child is a target first and a source later. The two share no
+in-memory state and never call each other; the only thing they have in common is the `PartitionStore`. The
+request path joins them at the Durable Object: the request gate reads the source's `routerRole()` and the
+target's `isImporting()`, and the alarm reads `sourceDeadline()` and `importDeadline()`. The receiver is what
+names the role at a call site, so no method carries a role prefix.
+
+The deps split the same way. `RepartitionCommonDeps` holds `getPeer`, `host`, `identity`, `scheduleWork`, and
+`logParams`. `RepartitionSourceDeps` adds `computeRangeBoundaries`, `lockCountForKey`, `cleanupStep`, and
+`onSplitCompleted`. `RepartitionTargetDeps` adds `hasIdentity`, `applyTargetIdentity`, and `ensureAlarmSet`.
+The DO builds one object that satisfies both.
+
+The file has these sections, in this order:
 
 1. The wire types and the `MigrationHost` interface.
-2. The source: arbitration, `queue`, `plan`, `init_start`, `init_done`, `cutover`, `start_import`, `ack`,
-   cleanup scheduling, and due-row selection.
-3. The migration protocol, both ends side by side: `servePage` for the source and `importOnePage` for the
-   target. The `overrides` page build and apply sit next to each other. The host phase passes through to the
-   injected host.
-4. The target: `init`, `startImport`, `ackOnce`, and the request gate answer.
-5. The `fokosStatus` pages.
+2. `RepartitionSource`: the reads the request path makes, arbitration, `queue`, `plan`, `init_start`,
+   `init_done`, `cutover`, `start_import`, `sourceCleanupStep`, due-row selection, the `fokosStatus` pages,
+   `acceptAck`, and `resolveCallerSlice`.
+3. `RepartitionTarget`: `importOnePage`, the request-gate reads (`importRecord`, `importState`,
+   `isImporting`, `importDeadline`), `initAsTarget`, `startImport`, and `sendAck`.
+4. Shared module functions: the retry delay, the backoff, and the cursor and slice comparisons.
+
+The migration protocol keeps its two ends side by side across the class boundary: `servePage` is the LAST
+member of the source and `importOnePage` is the FIRST of the target, and the `overrides` page build and apply
+sit either side of the same line. The host phase passes through to the injected host.
+
+Four methods still name their role, because the receiver alone leaves them ambiguous. `acceptAck` on the
+source and `sendAck` on the target are the two sides of one acknowledgement and must not be read for each
+other. `initAsTarget` would otherwise read as "initialize this object". `sourceCleanupStep` matches the
+`source_cleanup` job name of section 4.9.3, and pairs with `sourceStep`.
 
 The DO keeps:
 
@@ -303,6 +410,89 @@ owner of the SQL statements, and the flow calls its methods.
 This structure is one step toward the runtime package. A later change lifts the class, the host interface, and
 the deps object as they are. The dispatch pipeline, the route context, the response envelope, and the identity
 split stay out of scope.
+
+#### 4.1.2 A hash split, end to end
+
+This walkthrough names every method, RPC and state change of one `hash_split` on a hash leaf `P` with
+`hashSplitN = 2`. A range split is the same sequence with different targets and slices. A key promotion is the
+same sequence with one target, plus the lock check of section 4.4 and the row reclaim of section 4.9.3.
+
+```text
+source P                                               targets C0, C1
+────────                                               ──────────────
+queue({kind:"hash_split"})            state: queued
+  |
+sourceStep -> #plan                   state: planned   target rows: pending
+  |
+sourceStep -> #initializeTargets      target: initializing
+  |-- fokosInit --------------------------------------> initAsTarget
+  |                                                       identity + import record
+  |   <----------------- ok -------------------------     fallback alarm armed
+  |                                 target: initialized   state: awaiting_data
+  |
+sourceStep -> #cutover                state: cutover  <== ROUTING MOVES HERE
+  |
+sourceStep -> #notifyStart
+  |-- fokosStartImport -------------------------------> startImport (clears the deadline)
+  |
+  |   <--- fokosMigrationPull (overrides) ------------- importOnePage
+  |-- servePage -> #buildOverridesPage ---------------> #applyOverrides + cursor
+  |   <--- fokosMigrationPull (host, items) ----------- state: importing
+  |-- servePage -> host.buildPage --------------------> host.applyPage + cursor
+  |   <--- fokosMigrationPull (host, pending_tx) -----
+  |-- servePage -> host.buildPage --------------------> final page, cursor null
+  |                                                       state: imported
+  |   <--- fokosMigrationAck -------------------------- sendAck
+acceptAck: all targets acknowledged                       state: active
+  |  state: completed, onSplitCompleted()
+  |
+sourceCleanupStep                     state: cleaned
+```
+
+**1. Queue.** A successful local write asks `PartitionDO` to evaluate the split policy. The DO calls
+`RepartitionSource.queue`, which arbitrates and writes the row in one transaction: it refuses a second split,
+and it refuses a split while a promotion is unfinished. The row starts in `queued` and is due now.
+
+**2. Plan.** The next background pass calls `sourceStep`, which selects the one due row by
+`(next_attempt_at, seq)` and dispatches on its state. `#plan` resolves the `hashSplitN` deterministic child
+contexts, writes one target row per child with the slice `{ kind: "hash_child", childIndex }`, writes the plan
+key, and sets `planned`. All of this is one transaction, so a crash leaves no half plan.
+
+**3. Initialize.** `#advancePlanned` calls `#initializeTargets` until every target is `initialized`. Each pass
+takes up to `REPARTITION_RPC_CONCURRENCY` due targets and marks each `initializing` BEFORE its call. A call in
+flight is therefore indistinguishable from one that lost its reply, and the retry repeats the same idempotent
+`fokosInit`. The target writes its identity and its import record in `awaiting_data`, arms its fallback alarm,
+and starts nothing. A failed call leaves its own target behind a backoff and does not hold up its siblings.
+
+**4. Cut over.** When every target is `initialized`, `#advancePlanned` calls `#cutover`. It re-reads the counts
+inside the transaction, sets `cutover`, and deletes the now spent plan key. This is the only step that moves
+ownership: from here `routerRole()` is true, and the request path forwards every key to its child instead of
+serving it locally.
+
+**5. Start.** `#notifyStart` calls `fokosStartImport` on up to `REPARTITION_RPC_CONCURRENCY` due targets. The
+call is an optimisation, not a requirement: it clears the retry deadline the target may hold, and each target
+also has its own alarm, so an import still starts when no call arrives.
+
+**6. Import.** Each target runs `importOnePage` up to `fokosImportPagesPerPass()` times per pass, and one step
+applies at most one page. It calls `fokosMigrationPull` with its durable cursor. The source answers through
+`servePage`, which validates the caller, checks its own state, and builds one page of one phase: the
+`overrides` phase first, then the `host` phase that the injected host owns. The target applies the page and the
+new cursor in ONE storage transaction, after it re-reads the durable record and proves the page is not stale.
+The page with a null cursor sets `imported`.
+
+While the target is in `awaiting_data` or `importing`, a read that reaches it goes back to the source through
+`fokosExecuteLocal`, and a write fails with `partition_migrating`. Section 4.8 holds those rules.
+
+**7. Acknowledge.** The target persists `imported` before it calls, so a lost reply costs nothing. `sendAck`
+calls `fokosMigrationAck` and retries until the source accepts it. `acceptAck` marks the target and, when every
+target has acknowledged, sets `completed` and calls `onSplitCompleted()`, which deletes the source lock rows
+that every target now owns its own copy of. The target then sets itself `active`.
+
+**8. Clean.** `sourceCleanupStep` runs for a `completed` row. A split keeps its item rows for life, so its step
+reclaims nothing and moves the row straight to `cleaned`. Only a promotion has rows to give back.
+
+Every step of the source is one bounded transaction, and every step of the target commits one page with its
+cursor. Both are driven by the same single-flight background pass, which section 4.9 describes.
 
 ### 4.2 Data model
 
@@ -786,7 +976,8 @@ The source must apply these rules in order:
 
 1. Seek the repartition target by `(repartitionId, caller.partitionId)` and validate the complete caller identity.
 2. Reject `queued` and `planned` with `repartition_not_cut_over`.
-3. Reject a promotion after cleanup starts with `partition_migrating`.
+3. Reject a promotion in `completed` or `cleaned` with `repartition_slice_reclaimed`. The rows went back to
+   the range tree, so no retry can make them readable here.
 4. Validate every requested key or interval against the caller slice.
 5. For a promoted key from a hash-child caller, forward to the range root.
 6. Otherwise, read the validated local slice without normal forwarding or lifecycle gates.
@@ -1095,10 +1286,12 @@ traversal reads its final page.
 
 M0 adds `repartition_target_unknown` as a non-retryable `FokosInternalError`. The target is not a member.
 
-M1 adds two more internal codes in `packages/fokosdb/src/shared/errors.ts`:
+M1 adds three more codes in `packages/fokosdb/src/shared/errors.ts`:
 
 - `repartition_not_cut_over` is a retryable `FokosUnavailableError`. The source still owns the slice.
 - `repartition_unknown` is a non-retryable `FokosInternalError`. The repartition does not exist.
+- `repartition_slice_reclaimed` is a non-retryable `FokosInternalError`. A read-through caller asked for a
+  promoted key whose rows the source already gave back.
 
 A speculative read must fall back on `repartition_not_cut_over`. If this code reaches the public root,
 `withFokosErrors` must map it to `partition_migrating`. The mapped error must keep the internal code in
@@ -1174,9 +1367,12 @@ boundaries.
 
 ### 4.14 Testing
 
-The replaced unit suites move to `repartition-flow.test.ts`. They must keep their current cases.
+The replaced unit suites move to `packages/fokosdb/test/repartition/repartition-flow.test.ts`. They must keep
+their current cases. The suite and its harness live under `test/`, not beside the source: they drive several real
+partitions at once and need a harness, which is not what a unit test beside its module looks like.
 
-That suite must run two `RepartitionFlow` instances over two real `PartitionStore` instances in one process.
+That suite must run several partitions' source and target halves over real `PartitionStore` instances in one
+process.
 The peer factory of the target returns the source instance, so a control call lands on it directly. The suite
 drives each step by hand and inspects the rows between steps. It must cover the arbitration table, the due-row
 rules, the cursor and phase validation, the retry deadlines, and every recovery case of section 4.11, for each

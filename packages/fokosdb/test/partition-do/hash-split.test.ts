@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import { InitFromSplitOptions, PartitionDO } from "../../src/server/do-partition.js";
+import { PartitionDO } from "../../src/server/do-partition.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
@@ -88,118 +88,59 @@ describe("PartitionDO - splitting", () => {
 		}
 	});
 
-	it("initFromSplit is idempotent when called with identical options", async ({ expect }) => {
+	it("fokosInit is idempotent for identical options, and restores the fallback alarm", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
-		const childName = `test.initfromsplit-idempotent.${crypto.randomUUID()}`;
+		const childName = `test.fokosinit-idempotent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = {
-			...parentCtx,
-			doName: childName,
-			primaryDoIdStr: childId.toString(),
-		};
+		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
 		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
 
-		const opts: InitFromSplitOptions = {
-			parentPartitionContext: parentCtx,
-			newPartitionContext: childCtx,
-			splitType: "hash",
+		const req = {
+			repartitionId: "r1",
+			source: parentCtx,
+			target: childCtx,
+			slice: { kind: "hash_child" as const, childIndex: 0, depth: 1 },
 		};
+		await childStub.fokosInit(req);
+		// A lost reply leaves the source believing the target is initialized. A matching retry must
+		// therefore succeed AND leave an alarm behind, or the target has nothing to start itself with.
+		await expect(childStub.fokosInit(req)).resolves.not.toThrow();
+		await runInDurableObject(childStub, async (_i: PartitionDO, state: DurableObjectState) => {
+			expect(await state.storage.getAlarm()).not.toBeNull();
+		});
 
-		await childStub.internalInitFromSplit(opts);
-		// Calling again with identical opts must not throw.
-		await expect(childStub.internalInitFromSplit(opts)).resolves.not.toThrow();
-
-		// State must reflect the first (and only) initialization.
-		const state = await childStub.status();
-		expect(state.partitionContext?.primaryDoIdStr).toBe(childCtx.primaryDoIdStr);
-		expect(state.parentPartitionContext?.primaryDoIdStr).toBe(parentCtx.primaryDoIdStr);
-		expect(state.parentSplitType).toBe("hash");
+		const status = await childStub.status();
+		expect(status.partitionContext?.primaryDoIdStr).toBe(childCtx.primaryDoIdStr);
+		expect(status.parentPartitionContext?.primaryDoIdStr).toBe(parentCtx.primaryDoIdStr);
+		expect(status.parentSplitType).toBe("hash");
+		expect(status.migrationStatus).toBe("migration_initialized");
 	});
 
-	it("initFromSplit throws when called with a conflicting child context", async ({ expect }) => {
+	it("fokosInit refuses a call that conflicts with the import the target already holds", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
-		const childName = `test.initfromsplit-conflict.${crypto.randomUUID()}`;
+		const childName = `test.fokosinit-conflict.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = {
-			...parentCtx,
-			doName: childName,
-			primaryDoIdStr: childId.toString(),
-		};
+		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
 		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
-		await childStub.internalInitFromSplit({
-			parentPartitionContext: parentCtx,
-			newPartitionContext: childCtx,
-			splitType: "hash",
-		});
+		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
 
-		// Use runInDurableObject so the caught rejection stays inside the DO's execution context
-		// and doesn't leak as an unhandled rejection at the worker level.
-		const { ctx: otherCtx } = makeStub();
+		// runInDurableObject keeps each caught rejection inside the execution context of the DO, so none
+		// of them leaks as an unhandled rejection at the worker level.
+		const { ctx: otherParentCtx } = makeStub();
 		await runInDurableObject(childStub, async (instance: PartitionDO) => {
+			// A different repartition.
+			await expect(instance.fokosInit({ repartitionId: "r2", source: parentCtx, target: childCtx, slice })).rejects.toThrow(
+				fokosErrorWith("partition_context_mismatch"),
+			);
+			// A different source.
+			await expect(instance.fokosInit({ repartitionId: "r1", source: otherParentCtx, target: childCtx, slice })).rejects.toThrow(
+				fokosErrorWith("partition_context_mismatch"),
+			);
+			// A different slice.
 			await expect(
-				instance.internalInitFromSplit({
-					parentPartitionContext: parentCtx,
-					newPartitionContext: otherCtx,
-					splitType: "hash",
-				}),
-			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
-		});
-	});
-
-	it("initFromSplit throws when called with a conflicting parent context", async ({ expect }) => {
-		const { ctx: parentCtx } = makeStub();
-		const childName = `test.initfromsplit-conflict-parent.${crypto.randomUUID()}`;
-		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = {
-			...parentCtx,
-			doName: childName,
-			primaryDoIdStr: childId.toString(),
-		};
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
-
-		await childStub.internalInitFromSplit({
-			parentPartitionContext: parentCtx,
-			newPartitionContext: childCtx,
-			splitType: "hash",
-		});
-
-		const { ctx: differentParentCtx } = makeStub();
-		await runInDurableObject(childStub, async (instance: PartitionDO) => {
-			await expect(
-				instance.internalInitFromSplit({
-					parentPartitionContext: differentParentCtx,
-					newPartitionContext: childCtx,
-					splitType: "hash",
-				}),
-			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
-		});
-	});
-
-	it("initFromSplit throws when called with a conflicting splitType", async ({ expect }) => {
-		const { ctx: parentCtx } = makeStub();
-		const childName = `test.initfromsplit-conflict-splittype.${crypto.randomUUID()}`;
-		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = {
-			...parentCtx,
-			doName: childName,
-			primaryDoIdStr: childId.toString(),
-		};
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
-
-		await childStub.internalInitFromSplit({
-			parentPartitionContext: parentCtx,
-			newPartitionContext: childCtx,
-			splitType: "hash",
-		});
-
-		await runInDurableObject(childStub, async (instance: PartitionDO) => {
-			await expect(
-				instance.internalInitFromSplit({
-					parentPartitionContext: parentCtx,
-					newPartitionContext: childCtx,
-					splitType: "range",
-				}),
+				instance.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice: { ...slice, childIndex: 1 } }),
 			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});

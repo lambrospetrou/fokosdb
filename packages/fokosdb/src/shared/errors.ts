@@ -354,6 +354,8 @@ export const TRANSACTION_PENDING_CODES = defineCodes("FokosTransactionPendingErr
 export const UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "service", 503, {
 	partition_over_size: "49j6ez",
 	partition_migrating: "4rpgyu",
+	/** The repartition source still owns the slice, so the target must ask again after cutover. */
+	repartition_not_cut_over: "spf2v8",
 	coordinator_over_size: "tg8r62",
 	prepare_unanswered: "mpncbz",
 });
@@ -373,6 +375,10 @@ export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500,
 	partition_fanout_failed: "f3aqhc",
 	/** A read-through or migration caller is not a target of any repartition this partition owns. */
 	repartition_target_unknown: "8hqw3n",
+	/** The named repartition does not exist on this partition. */
+	repartition_unknown: "ns5maa",
+	/** A read-through caller asked the source for a slice whose rows the source already gave back. */
+	repartition_slice_reclaimed: "7tjj5t",
 	foreign_error: "jvufz5",
 });
 

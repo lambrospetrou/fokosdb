@@ -24,7 +24,9 @@ describe("PartitionDO — range split", () => {
 		expect(children[N - 1].rangePartition!.endBoundary).toBeNull();
 		for (let i = 0; i < N - 1; i++) {
 			expect(children[i].rangePartition!.endBoundary).not.toBeNull();
-			expect(children[i].rangePartition!.endBoundary).toBe(children[i + 1].rangePartition!.startBoundary);
+			// Compared by value. A router builds each child context from its current context on every
+			// call, so adjacent boundaries are equal bytes and not one shared object.
+			expect(children[i].rangePartition!.endBoundary).toStrictEqual(children[i + 1].rangePartition!.startBoundary);
 		}
 		expect(children.map((c) => c.rangePartition!.endBoundary)).toEqual([kb("sk004"), kb("sk009"), kb("sk014"), null]);
 

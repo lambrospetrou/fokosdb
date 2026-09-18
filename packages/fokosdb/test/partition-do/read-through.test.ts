@@ -35,6 +35,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
 		const children = await partition.splitHash();
+		const repartitionId = await partition.splitRepartitionId();
 
 		// A name alone is a value the caller chose, so a real child's name with someone else's identity
 		// must not pass either.
@@ -47,9 +48,18 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
 			for (const caller of impostors) {
 				await expect(
-					instance.fokosExecuteLocal({ op: "getItem", caller, request: { hashKey: kb("hk"), sortKey: kb("sk") } }),
+					instance.fokosExecuteLocal({ op: "getItem", repartitionId, caller, request: { hashKey: kb("hk"), sortKey: kb("sk") } }),
 				).rejects.toThrow(fokosErrorWith("repartition_target_unknown", { caller: caller.doName }));
 			}
+			// An id that no repartition carries is a different defect, and it says so.
+			await expect(
+				instance.fokosExecuteLocal({
+					op: "getItem",
+					repartitionId: "r999",
+					caller: { partitionId: children[0].ctx.partitionId, doName: children[0].doName },
+					request: { hashKey: kb("hk"), sortKey: kb("sk") },
+				}),
+			).rejects.toThrow(fokosErrorWith("repartition_unknown"));
 		});
 	});
 
@@ -57,6 +67,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.put({ hashKey: kb("alpha"), sortKey: kb("s1"), data: "alpha-value", kind: "text" as const });
 		await partition.splitHash();
+		const repartitionId = await partition.splitRepartitionId();
 
 		const owner = await partition.childOwning("alpha");
 		const sibling = (await partition.children()).find((c) => c.doName !== owner.doName);
@@ -64,6 +75,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 
 		const mine = (await partition.stub.fokosExecuteLocal({
 			op: "getItem",
+			repartitionId,
 			caller: { partitionId: owner.ctx.partitionId, doName: owner.doName },
 			request: { hashKey: kb("alpha"), sortKey: kb("s1") },
 		})) as GetItemRpcResponse;
@@ -75,6 +87,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			await expect(
 				instance.fokosExecuteLocal({
 					op: "getItem",
+					repartitionId,
 					caller: { partitionId: sibling!.ctx.partitionId, doName: sibling!.doName },
 					request: { hashKey: kb("alpha"), sortKey: kb("s1") },
 				}),
@@ -104,7 +117,10 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			await waitForAllChildRequests();
 
 			const child = await partition.childOwning("alice");
-			expect(await child.promotedKeyStatus("alice"), "the child must not have inherited the entry yet").toBeUndefined();
+			// The overrides phase runs before any item page, so the child already holds the forward
+			// pointer here. That is the point of the case: the child must follow the pointer, and not
+			// read the rows of the source, which the promotion has reclaimed.
+			expect(await child.promotedKeyStatus("alice"), "the child inherits the override first").toBe("promoted");
 
 			const point = await child.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 			expect(point.found, "a promoted key must stay readable through an importing hash child").toBe(true);
@@ -112,18 +128,36 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 
 			const page = (await partition.stub.fokosExecuteLocal({
 				op: "queryItems",
+				repartitionId: await partition.splitRepartitionId(),
 				caller: { partitionId: child.ctx.partitionId, doName: child.doName },
 				request: queryRequest("alice"),
 			})) as QueryItemsRpcResponse;
 			expect(page.items.length, "a query of a promoted key must reach the range tree too").toBeGreaterThan(0);
 			expect(page.meta.servedByActorName).toBe(rangeRoot.doName);
+
+			const sibling = (await partition.children()).find((c) => c.doName !== child.doName);
+			expect(sibling, "a two-way split should have a sibling").toBeDefined();
+			const repartitionId = await partition.splitRepartitionId();
+			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.fokosExecuteLocal({
+						op: "getItem",
+						repartitionId,
+						caller: { partitionId: sibling!.ctx.partitionId, doName: sibling!.doName },
+						request: { hashKey: kb("alice"), sortKey: kb("sk1") },
+					}),
+				).rejects.toThrow(fokosErrorWith("partition_misrouted"));
+			});
 		});
-	});
+		// The promotion, its cleanup and the split after it all run as background passes, so this case
+		// needs more than the default 5 seconds.
+	}, 20_000);
 
 	it("clips a range child's query to the slice it owns", async () => {
 		const { root, sks } = await makeTriggeredRangeRoot(2);
 		await root.awaitSplitCompleted();
 		const children = await root.children();
+		const repartitionId = await root.splitRepartitionId();
 
 		// The split source keeps its item rows, so the router can still answer for every one of them —
 		// which is exactly why it has to narrow the answer to the caller's slice.
@@ -133,6 +167,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 
 		const page = (await root.stub.fokosExecuteLocal({
 			op: "queryItems",
+			repartitionId,
 			caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
 			// The caller asks for the whole key; the source narrows it to what this child owns.
 			request: queryRequest("alice"),
@@ -149,6 +184,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			await expect(
 				instance.fokosExecuteLocal({
 					op: "queryItems",
+					repartitionId,
 					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
 					request: queryRequest("alice", { cursor: { hk: kb("alice"), sk: end! } }),
 				}),

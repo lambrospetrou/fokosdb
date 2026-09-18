@@ -8,6 +8,7 @@ import { RangePartitionTopologyImpl } from "./split-policy.js";
 import { PartitionDO } from "../../server/do-partition.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import { KeyCodec } from "./key-codec.js";
+import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
 
 const kb = (s?: string) => KeyCodec.encodeOptional(s);
 
@@ -47,19 +48,30 @@ function makeRangeCtx(
 /**
  * Runs `body` against a live `RangePartitionTopologyImpl` for `rangeCtx`.
  *
- * The topology reads its split status from KV and its size from SQLite, so it needs real storage —
- * but nothing else. The Durable Object here is only the storage container: no split, no migration
- * and no partition context of its own, which is why these stay unit tests of the routing decision
- * rather than tests of a partition that had to be brought to a serving state first.
+ * The topology reads its size from SQLite, so it needs real storage and nothing else. The Durable
+ * Object here is the storage container only: it has no split, no migration and no partition context
+ * of its own. These therefore stay unit tests of the routing decision, and not tests of a partition
+ * that a case must first bring to a serving state.
+ *
+ * These tests stub the repartition rows the topology reads. Whether this node is a router, and which
+ * targets it holds, is state of the flow, and `repartition-flow.test.ts` drives the real rows.
  */
 async function withRangeTopology(
 	rangeCtx: PartitionContextResolved,
 	body: (topology: RangePartitionTopologyImpl, store: PartitionStore) => void | Promise<void>,
+	routing: Partial<RepartitionRouting> = {},
 ): Promise<void> {
 	const stub = PartitionDO.getByName(env.PARTITION_DO, rangeCtx.doName);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		await body(new RangePartitionTopologyImpl(rangeCtx, state, store), store);
+		const stubRouting: RepartitionRouting = {
+			routerRole: () => false,
+			splitTargets: () => [],
+			overrideFor: () => undefined,
+			ownedByRangeTree: () => false,
+			...routing,
+		};
+		await body(new RangePartitionTopologyImpl(rangeCtx, state, store, stubRouting), store);
 	});
 }
 
@@ -99,45 +111,37 @@ describe("RangePartitionTopologyImpl — shouldAllow by sort-key range", () => {
 		});
 	});
 
-	it("forwards every sort key once the node has split, owning nothing itself", async () => {
-		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
-		const rangeCtx = makeRangeCtx(base, "alice", null, null);
-		await withRangeTopology(rangeCtx, async (topology, store) => {
-			fillRows(store, 10);
-			expect(await topology.maybeQueueSplitNoKey({ hasInFlightPromotions: false })).toMatchObject({ status: "split_queued" });
-
-			const children = topology.prepareSplit({ parentDepth: 0, boundaries: [kb("m")] });
-			expect(children).toHaveLength(2);
-			topology.commitSplitStarted(children!.map((child) => child.newPartitionContext));
-
-			// A router owns no key range of its own, so even a sort key it used to serve is forwarded.
-			expect(topology.shouldAllow(kb("alice"), kb("a"), "write")).toBe("forward");
-			expect(topology.shouldAllow(kb("alice"), kb("zzzzz"), "write")).toBe("forward");
-		});
+	it("forwards every sort key once the node has become a router, owning nothing itself", async () => {
+		const rangeCtx = makeRangeCtx(makeUniqueBase({ rangeSplitN: 2 }), "alice", null, null);
+		await withRangeTopology(
+			rangeCtx,
+			async (topology) => {
+				// A router owns no key range of its own, so it forwards even a sort key it used to serve.
+				expect(topology.shouldAllow(kb("alice"), kb("a"), "write")).toBe("forward");
+				expect(topology.shouldAllow(kb("alice"), kb("zzzzz"), "write")).toBe("forward");
+			},
+			{ routerRole: () => true },
+		);
 	});
 });
 
-describe("RangePartitionTopologyImpl — maybeQueueSplit", () => {
-	it("queues a range split when the database exceeds rangeSplitConditions.maxSizeMb", async () => {
+describe("RangePartitionTopologyImpl — shouldSplit", () => {
+	it("calls for a range split when the database exceeds rangeSplitConditions.maxSizeMb", async () => {
 		const base = makeUniqueBase({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 0.1 } });
 		const rangeCtx = makeRangeCtx(base, "alice", null, null);
 		await withRangeTopology(rangeCtx, async (topology, store) => {
 			fillRows(store, 10);
-			expect(await topology.maybeQueueSplitNoKey({ hasInFlightPromotions: false })).toMatchObject({
-				status: "split_queued",
-				splitType: "range",
-			});
-			expect(topology.splitStatus()).toMatchObject({ status: "split_queued", splitType: "range" });
+			// A size answer only. Arbitration in the repartition flow decides whether the split starts.
+			expect(topology.shouldSplit()).toBe("range");
 		});
 	});
 
-	it("does not queue a split when the database is within limits", async () => {
+	it("does not call for a split when the database is within limits", async () => {
 		// The default rangeSplitConditions.maxSizeMb is 500, which these rows come nowhere near.
 		const rangeCtx = makeRangeCtx(makeUniqueBase(), "alice", null, null);
 		await withRangeTopology(rangeCtx, async (topology, store) => {
 			fillRows(store, 1);
-			expect(await topology.maybeQueueSplitNoKey({ hasInFlightPromotions: false })).toBeUndefined();
-			expect(topology.splitStatus()).toBeUndefined();
+			expect(topology.shouldSplit()).toBeNull();
 		});
 	});
 });

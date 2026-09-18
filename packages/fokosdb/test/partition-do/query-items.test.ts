@@ -533,6 +533,7 @@ describe("PartitionDO — range split", () => {
 				const caller = children[0];
 				const result = (await root.stub.fokosExecuteLocal({
 					op: "queryItems",
+					repartitionId: await root.splitRepartitionId(),
 					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
 					request: fullRequest(),
 				})) as QueryItemsRpcResponse;

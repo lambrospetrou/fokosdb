@@ -5,6 +5,6 @@
  * find the classes its bindings name.
  */
 export { PartitionDO } from "./do-partition.js";
-export type { PartitionAPI, PartitionDOStub, InitFromSplitOptions } from "./do-partition.js";
+export type { PartitionAPI, PartitionDOStub } from "./do-partition.js";
 
 export { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";

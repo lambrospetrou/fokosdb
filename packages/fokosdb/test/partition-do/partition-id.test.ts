@@ -6,6 +6,7 @@ import { PartitionIdHelper } from "../../src/shared/partition-topology/partition
 import { HashPartitionTopologyImpl } from "../../src/shared/partition-topology/split-policy.js";
 import invariant from "../../src/shared/invariant.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { sliceIncludesHashKey } from "../../src/shared/partition/repartition/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
 
@@ -25,17 +26,23 @@ describe("PartitionDO - partitionId encoding", () => {
 		}
 	});
 
-	it("pickChildPartition and makeIsCorrectChildHashPartition agree at every tree level", async ({ expect }) => {
-		// This test guards the entropy consistency between the two methods.
+	it("pickChildPartition and the hash-child slice agree at every tree level", async ({ expect }) => {
+		// This test guards the entropy consistency between routing and migration filtering.
 		// If the depth offset used in one changes without the other, routing will silently
-		// assign keys to different partitions than the migration check expects.
+		// assign keys to different partitions than the migration filter expects.
 		const { ctx: pCtx, stub } = makeStub({
 			hashSplitN: 4,
 			hashSplitConditions: { maxSizeMb: 100 },
 		});
 		let topology: HashPartitionTopologyImpl;
 		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage));
+			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage), {
+				// Routing only. This test never makes the partition a router and gives it no override.
+				routerRole: () => false,
+				splitTargets: () => [],
+				overrideFor: () => undefined,
+				ownedByRangeTree: () => false,
+			});
 		});
 		invariant(topology!, "topology should be initialized in the DO instance");
 		const hashKey = "routing-consistency-key";
@@ -50,7 +57,13 @@ describe("PartitionDO - partitionId encoding", () => {
 				partitionId: sib.partitionIdOpaque,
 				primaryDoIdStr: "",
 			};
-			expect(topology.makeIsCorrectChildHashPartition(pCtx, sibCtx)(kb(hashKey))).toBe(sib.doName === child.doName);
+			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
+			const slice = {
+				kind: "hash_child" as const,
+				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
+				depth: sliceDepth,
+			};
+			expect(sliceIncludesHashKey(slice, kb(hashKey), pCtx.hashSplitN)).toBe(sib.doName === child.doName);
 		}
 
 		// Depth 1 → 2: same invariant one level deeper.
@@ -63,7 +76,13 @@ describe("PartitionDO - partitionId encoding", () => {
 				partitionId: sib.partitionIdOpaque,
 				primaryDoIdStr: "",
 			};
-			expect(topology.makeIsCorrectChildHashPartition(child, sibCtx)(kb(hashKey))).toBe(sib.doName === grandchild.doName);
+			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
+			const slice = {
+				kind: "hash_child" as const,
+				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
+				depth: sliceDepth,
+			};
+			expect(sliceIncludesHashKey(slice, kb(hashKey), child.hashSplitN)).toBe(sib.doName === grandchild.doName);
 		}
 	});
 
