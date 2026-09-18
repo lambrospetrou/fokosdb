@@ -613,10 +613,10 @@ describe("PartitionDO - splitting", () => {
 			const { ctx, stub } = partition;
 
 			const seedItems = [
-				{ hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-1", kind: "text" as const },
-				{ hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const },
+				{ name: "alpha", item: { hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-1", kind: "text" as const } },
+				{ name: "banana", item: { hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const } },
 			];
-			for (const item of seedItems) {
+			for (const { item } of seedItems) {
 				await stub.apiPutItem(ctx, item);
 			}
 
@@ -625,21 +625,25 @@ describe("PartitionDO - splitting", () => {
 				await partition.triggerHashSplit();
 				await partition.awaitSplitStarted();
 				await waitForAllChildRequests();
-				const child = (await partition.children())[0];
 
-				// Child migration is blocked at the gate — verify it is still migrating.
-				expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				// Child migration is blocked at the gate — verify they are still migrating.
+				for (const child of await partition.children()) {
+					expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				}
 
-				// While migration is in progress, getItem on the child must read through to the parent
-				// so callers can read data that has not yet been copied to the child.
-				for (const item of seedItems) {
-					const result = await child.get(item);
+				// While migration is in progress, getItem on the child must read through to the parent so
+				// callers can read data that has not yet been copied to the child. Each key is read on the
+				// child that owns it: the parent serves a read-through only for the slice the calling child
+				// is importing, so a child asking for a sibling's key is a routing defect, not a lookup.
+				for (const { name, item } of seedItems) {
+					const owner = await partition.childOwning(name);
+					const result = await owner.get(item);
 					expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { servedByActorName: partition.doName } });
 				}
 
 				// A projected read takes the same fallback: the parent answers the wire cells.
 				const projection = compileProjectionExpression([{ expr: { ref: "data" } }]);
-				const projected = await child.get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
+				const projected = await (await partition.childOwning("alpha")).get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
 				expect(projected).toMatchObject({
 					found: true,
 					item: { projected: ["data-alpha-1"], kind: "projected" },
@@ -683,21 +687,6 @@ describe("PartitionDO - splitting", () => {
 			}
 
 			await assertSplitTreeComplete(partition);
-		});
-
-		it("getItemDirect bypasses split forwarding and reads from local storage", async ({ expect }) => {
-			const { ctx, stub } = makeStub();
-
-			await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "direct-value", kind: "text" as const });
-
-			const result = await stub.internalGetItemDirect({ hashKey: kb("hk"), sortKey: kb("sk") });
-			expect(result).toMatchObject({
-				found: true,
-				item: { data: "direct-value", kind: "text" as const },
-			});
-
-			const miss = await stub.internalGetItemDirect({ hashKey: kb("missing"), sortKey: kb("sk") });
-			expect(miss.found).toBe(false);
 		});
 	});
 });

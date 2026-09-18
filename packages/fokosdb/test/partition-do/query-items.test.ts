@@ -37,6 +37,21 @@ describe("PartitionDO — range split", () => {
 		...overrides,
 	});
 
+	/**
+	 * The sort keys of `sks` that fall in `child`'s immutable [start, end) slice. A migrating child
+	 * reads through its parent, which still holds every row of the key and answers only for this slice.
+	 */
+	const ownedByChild = (sks: string[], child: TestPartition): string[] => {
+		const { startBoundary, endBoundary } = child.ctx.rangePartition!;
+		return [...sks]
+			.sort()
+			.filter(
+				(sk) =>
+					(startBoundary === null || KeyCodec.compare(kb(sk), startBoundary) >= 0) &&
+					(endBoundary === null || KeyCodec.compare(kb(sk), endBoundary) < 0),
+			);
+	};
+
 	describe("queryItems leaf pages", () => {
 		const request = (direction: "asc" | "desc", overrides: Partial<QueryItemsRpcRequest> = {}) => fullRequest({ direction, ...overrides });
 
@@ -494,13 +509,13 @@ describe("PartitionDO — range split", () => {
 			expect(new Set(got.map(String)).size).toBe(got.length);
 		});
 
-		it("queryItemsDirect reads from the router's own local rows, never fanning out to children (regression: infinite loop when children are migrating)", async () => {
-			// Scenario: a migrating range child calls parent.queryItemsDirect(). Before the fix,
-			// queryItemsDirect on a range router called queryItemsAsRangeNode → walkRangeChildren →
-			// child.queryItems() → child detects it's still migrating → parent.queryItemsDirect() → …
-			// (infinite loop until the subrequest depth limit is hit).
+		it("fokosExecuteLocal reads the router's own local rows and never fans out to children (regression: infinite loop when children are migrating)", async () => {
+			// Scenario: a migrating range child reads through its parent. Before the fix, the direct-read
+			// RPC on a range router called queryItemsAsRangeNode → walkRangeChildren → child.queryItems()
+			// → child detects it's still migrating → parent direct read → … (infinite loop until the
+			// subrequest depth limit is hit).
 			//
-			// queryItemsDirect always calls queryItemsLocal and bypasses the child routing. forwardCount=0
+			// fokosExecuteLocal always calls queryItemsLocal and bypasses the child routing. forwardCount=0
 			// asserts that: a walk of the children would report one forward per child, migrated or not.
 			const N = 2;
 			const { root, sks } = await makeRangeRoot(N);
@@ -512,12 +527,22 @@ describe("PartitionDO — range split", () => {
 				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
 				await root.awaitSplitStarted();
 				await waitForAllChildRequests();
-				for (const child of await root.children()) expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				const children = await root.children();
+				for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
 
-				const result = await root.stub.internalQueryItemsDirect(fullRequest());
+				const caller = children[0];
+				const result = (await root.stub.fokosExecuteLocal({
+					op: "queryItems",
+					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+					request: fullRequest(),
+				})) as QueryItemsRpcResponse;
 
-				// The router's own DB still holds all items (parent rows are never deleted during split).
-				expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
+				// The router's own DB still holds every item (parent rows are never deleted during a split),
+				// but it answers only for the slice the calling child owns.
+				const end = caller.ctx.rangePartition!.endBoundary;
+				const ownedByCaller = [...sks].sort().filter((sk) => end === null || KeyCodec.compare(kb(sk), end) < 0);
+				expect(ownedByCaller.length, "the leftmost child should own part of the seeded range").toBeGreaterThan(0);
+				expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(ownedByCaller);
 				// Local read only: no forwarding to children.
 				expect(result.meta.forwardCount).toBe(0);
 			});
@@ -733,8 +758,12 @@ describe("PartitionDO — range split", () => {
 				const child = (await root.children())[0];
 				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ select: "count" }));
 				expect(res.items).toHaveLength(0);
-				// The parent still holds every row of the key, so the count covers the whole range.
-				expect(res.count).toBe(sks.length);
+				// The parent still holds every row of the key, but it answers a read-through only for the
+				// slice the calling child owns — counting the whole range here would count a sibling's rows.
+				const owned = ownedByChild(sks, child);
+				expect(owned.length).toBeGreaterThan(0);
+				expect(owned.length).toBeLessThan(sks.length);
+				expect(res.count).toBe(owned.length);
 				expect(res.meta.forwardCount).toBe(0);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
@@ -794,9 +823,13 @@ describe("PartitionDO — range split", () => {
 				const child = (await root.children())[0];
 				const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
 				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
-				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual([...sks].sort());
-				// The parent still holds every row of the key, so the page covers the whole range.
-				expect(res.count).toBe(sks.length);
+				// The parent still holds every row of the key, but it clips the page to the calling child's
+				// slice, so the child never serves rows a sibling owns.
+				const owned = ownedByChild(sks, child);
+				expect(owned.length).toBeGreaterThan(0);
+				expect(owned.length).toBeLessThan(sks.length);
+				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(owned);
+				expect(res.count).toBe(owned.length);
 				expect(res.meta.forwardCount).toBe(0);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
@@ -820,12 +853,16 @@ describe("PartitionDO — range split", () => {
 					filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] },
 					projection: [{ expr: { ref: "sortKey" } }],
 				});
-				const child = (await root.children())[0];
+				// The upper child owns the matching half; the filter and the slice clip independently, so the
+				// page is the intersection and the scan covers only the clipped interval.
+				const child = (await root.children())[1];
 				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
-				const expected = sorted.filter((sk) => sk >= median);
+				const owned = ownedByChild(sks, child);
+				const expected = owned.filter((sk) => sk >= median);
+				expect(expected.length).toBeGreaterThan(0);
 				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);
 				expect(res.count).toBe(expected.length);
-				expect(res.scannedCount).toBe(sks.length);
+				expect(res.scannedCount).toBe(owned.length);
 				expect(res.meta.forwardCount).toBe(0);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});

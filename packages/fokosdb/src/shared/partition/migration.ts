@@ -1,8 +1,14 @@
 import { isHashPartition, type PartitionContextResolved } from "../partition-topology/partition-context.js";
-import type { KeyBytes } from "../partition-topology/key-codec.js";
-import type { PartitionStore, ScanCursor, PendingTransactionCursor, PromotedKeyCursor, PromotedKeyStatus } from "./partition-store.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import type {
+	MigratedItem,
+	PartitionStore,
+	ScanCursor,
+	PendingTransactionCursor,
+	PromotedKeyCursor,
+	PromotedKeyStatus,
+} from "./partition-store.js";
 import type { PartitionPeer } from "./partition-peer.js";
-import invariant from "../invariant.js";
 
 export type PartitionSplitMigrationStatus = "migration_initialized" | "migration_migrating" | "migration_completed";
 
@@ -26,11 +32,25 @@ export type SplitMigrationDeps = {
 	onPromotedKeyInherited: (hashKey: KeyBytes, status: PromotedKeyStatus) => void;
 };
 
+/** Compares two item-scan checkpoints by value; both ends survive a KV structured-clone round trip. */
+function sameCursor(a: ScanCursor | null, b: ScanCursor | null): boolean {
+	if (a === null || b === null) return a === b;
+	return KeyCodec.compare(a.hk, b.hk) === 0 && KeyCodec.compare(a.sk, b.sk) === 0 && (a.inclusive ?? false) === (b.inclusive ?? false);
+}
+
 /**
  * Child-side migration PULL DRIVER: pulls this partition's share of data from its parent after a
  * split (hash or range) or a promotion, with crash/resume via the SPLIT_MIGRATION_CURSOR KV
  * checkpoint. Parent-side batch serving deliberately stays as thin PartitionDO methods (an
  * authorization invariant + a store page query through collectBatch).
+ *
+ * Every page commits inside one storage transaction that first re-reads the durable state the page
+ * was built against, and stops the run when that state has moved on. A page in flight outlives the
+ * decision to fetch it: the DO can finish the import, serve user deletes, and only then see this
+ * page land. Applying it would re-insert rows the user deleted, because the ingest is INSERT OR
+ * IGNORE and the row is absent. The guard is what makes the ingest safe, not the loop structure —
+ * PartitionDO keeps one import promise so two loops never run at once, but an evicted-and-revived
+ * instance can still hold a page from a previous life.
  */
 export class SplitMigration {
 	constructor(private readonly deps: SplitMigrationDeps) {}
@@ -54,11 +74,22 @@ export class SplitMigration {
 			return;
 		}
 
-		if (isHashPartition(pCtx)) {
-			await this.runHashChildMigration(pCtx, parentCtx);
-		} else {
-			await this.runRangeChildMigration(pCtx, parentCtx);
-		}
+		// The streams run in order and each one drains before the next starts. A hash child also
+		// inherits the promoted-key forward pointers for the keys it now owns; a range child has none.
+		if (!(await this.importItems(pCtx))) return;
+		if (!(await this.importTransactionMetadata(pCtx))) return;
+		if (isHashPartition(pCtx) && !(await this.importPromotedKeys(pCtx))) return;
+
+		if (!this.completeMigration()) return;
+		await this.acknowledgeParent(pCtx, parentCtx);
+		this.deps.storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
+
+		console.log({
+			...this.deps.logParams(),
+			message: isHashPartition(pCtx)
+				? "fokos/partition: Hash child migration completed."
+				: "fokos/partition: Range child migration completed.",
+		});
 	}
 
 	private async acknowledgeParent(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
@@ -79,168 +110,145 @@ export class SplitMigration {
 		}
 	}
 
-	private async runHashChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
-		const { store, storage, parent } = this.deps;
-
-		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
-
-		let nextBatchPromise = parent.migrationGetItemsBatch({
-			childPartitionContext: pCtx,
-			cursor,
-		});
-
-		while (true) {
-			const { items, nextCursor } = await nextBatchPromise;
-			if (nextCursor) {
-				// Pre-fetch the next batch while we process this one.
-				nextBatchPromise = parent.migrationGetItemsBatch({
-					childPartitionContext: pCtx,
-					cursor: nextCursor,
-				});
-			}
-
-			if (items.length > 0) {
-				for (const item of items) {
-					// INSERT OR IGNORE rather than OR REPLACE: all writes to this partition are rejected
-					// with 503 while migration_migrating, so no user write can have arrived yet.
-					// IGNORE is safer for retries — when a crash followed a written batch, the insert
-					// skip re-inserting those items rather than overwriting them unnecessarily.
-					store.insertItemIfAbsent(item);
-				}
-			}
-
-			// Checkpoint the cursor after each batch, so an interrupted migration resumes from it.
-			cursor = nextCursor;
-			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
-
-			if (!nextCursor) break;
-		}
-		invariant(cursor === null, "fokos/partition.runHashChildMigration: loop exited with non-null cursor — data may be incomplete");
-
-		// Migrate transaction metadata: pending locks, the deletion transaction order watermark, and the delete revision.
-		let txCursor: PendingTransactionCursor | null = null;
-		while (true) {
-			const { maxDeleteTxOrderTs, deleteRevision, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata(
-				{
-					childPartitionContext: pCtx,
-					cursor: txCursor,
-				},
-			);
-
-			store.transactionSync(() => {
-				for (const row of pendingTransactions) {
-					store.insertPendingLock(row);
-				}
-				store.mergeDeletionMetadata({ maxDeleteTxOrderTs, deleteRevision });
-			});
-
-			if (!nextCursor) break;
-			txCursor = nextCursor;
-		}
-
-		// Inherit promoted-key entries for the keys this child now owns. Only the forward-pointer entry
-		// transfers — the data lives in the range structure, and hash-child item migration already excluded
-		// promoted keys. Mutual exclusion guarantees every such key is 'promoted' at hash-split time.
-		let pkCursor: PromotedKeyCursor | null = null;
-		while (true) {
-			const { rows, nextCursor } = await parent.migrationGetPromotedKeysBatch({
-				childPartitionContext: pCtx,
-				cursor: pkCursor,
-			});
-			if (rows.length > 0) {
-				store.transactionSync(() => {
-					for (const row of rows) {
-						store.insertPromotedKey(row.hash_key, row.status, Date.now());
-						this.deps.onPromotedKeyInherited(row.hash_key, row.status);
-					}
-				});
-			}
-			if (!nextCursor) break;
-			pkCursor = nextCursor;
-		}
-
-		store.rebuildKeySizeEstimates();
-		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
-		storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
-		await this.acknowledgeParent(pCtx, parentCtx);
-		storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
-
-		console.log({
-			...this.deps.logParams(),
-			message: "fokos/partition: Hash child migration completed.",
+	/**
+	 * Applies one page under the durable state it was built against. Returns false when the run must
+	 * stop: the import is no longer migrating, so this page belongs to a run that already finished.
+	 */
+	private commitPage(apply: () => void): boolean {
+		const { store, storage } = this.deps;
+		return store.transactionSync(() => {
+			if (storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS) !== "migration_migrating") return false;
+			apply();
+			return true;
 		});
 	}
 
-	private async runRangeChildMigration(pCtx: PartitionContextResolved, parentCtx: PartitionContextResolved): Promise<void> {
-		const { store, storage, parent } = this.deps;
-
-		// Migrate items for this range DO's owned slice.
-		// For a promotion root the parent is a hash DO (filter by hk only);
-		// for a range-split child the parent is a range DO (filter by hk and sk range).
-		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
-
-		let nextBatchPromise = parent.migrationGetItemsBatch({
-			childPartitionContext: pCtx,
-			cursor,
+	/**
+	 * The item-stream form of `commitPage`. The items stream checkpoints its position, so a page also
+	 * has to prove that the checkpoint still reads where it did when the page was requested: two runs
+	 * of the same import both see "migrating" and would each apply a page built from a cursor the
+	 * other has already moved past.
+	 */
+	private commitItemPage(expectedCursor: ScanCursor | null, items: readonly MigratedItem[], nextCursor: ScanCursor | null): boolean {
+		const { store, storage } = this.deps;
+		return store.transactionSync(() => {
+			if (storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS) !== "migration_migrating") return false;
+			const durableCursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
+			if (!sameCursor(durableCursor, expectedCursor)) return false;
+			for (const item of items) {
+				// INSERT OR IGNORE rather than OR REPLACE: all writes to this partition are rejected with
+				// 503 while migration_migrating, so no user write can have arrived yet. IGNORE is safer for
+				// retries — when a crash followed a written batch, the insert skips re-inserting those
+				// items rather than overwriting them unnecessarily.
+				store.insertItemIfAbsent(item);
+			}
+			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, nextCursor);
+			return true;
 		});
+	}
 
+	/** Logs the page the guard rejected, so a stopped run is visible rather than silent. */
+	private logStalePage(stream: string): void {
+		console.warn({
+			...this.deps.logParams(),
+			message: "fokos/partition.runMigration: durable state moved on while a page was in flight; dropping it.",
+			stream,
+			migrationStatus: this.deps.storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS),
+		});
+	}
+
+	/**
+	 * Items for this partition's owned slice. For a hash child the parent filters by the child's hash
+	 * bucket; for a promotion root the parent (a hash DO) filters by hashKey; for a range-split child
+	 * the parent (a range DO) filters by hashKey and the child's [start, end) slice.
+	 */
+	private async importItems(pCtx: PartitionContextResolved): Promise<boolean> {
+		const { storage, parent } = this.deps;
+
+		// No prefetch: the durable checkpoint is the only record of progress, so a page must not be
+		// requested against a cursor that the previous page has not committed yet.
+		let cursor = storage.kv.get<ScanCursor>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR) ?? null;
 		while (true) {
-			const { items, nextCursor } = await nextBatchPromise;
-			if (nextCursor) {
-				// Pre-fetch the next batch while we process this one.
-				nextBatchPromise = parent.migrationGetItemsBatch({
-					childPartitionContext: pCtx,
-					cursor: nextCursor,
-				});
+			const { items, nextCursor } = await parent.migrationGetItemsBatch({ childPartitionContext: pCtx, cursor });
+			if (!this.commitItemPage(cursor, items, nextCursor)) {
+				this.logStalePage("items");
+				return false;
 			}
-
-			if (items.length > 0) {
-				for (const item of items) {
-					store.insertItemIfAbsent(item);
-				}
-			}
-
+			if (!nextCursor) return true;
 			cursor = nextCursor;
-			storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, cursor);
-
-			if (!nextCursor) break;
 		}
-		invariant(cursor === null, "fokos/partition.runRangeChildMigration: loop exited with non-null cursor");
+	}
 
-		// Migrate transaction metadata: pending locks, the deletion transaction order watermark, and the delete revision.
-		// A promotion root's parent returns no pending locks (lock-free cutover), so this only syncs the metadata;
-		// a range-split child's parent returns the locks in the child's [start, end) slice so commit/cancel can follow.
-		let txCursor: PendingTransactionCursor | null = null;
+	/**
+	 * Pending locks, the deletion transaction order watermark, and the delete revision. A promotion
+	 * root's parent returns no pending locks (lock-free cutover), so this only syncs the metadata; a
+	 * split child's parent returns the locks in the child's slice so commit/cancel can follow.
+	 */
+	private async importTransactionMetadata(pCtx: PartitionContextResolved): Promise<boolean> {
+		const { store, parent } = this.deps;
+
+		let cursor: PendingTransactionCursor | null = null;
 		while (true) {
 			const { maxDeleteTxOrderTs, deleteRevision, pendingTransactions, nextCursor } = await parent.migrationGetPartitionTransactionMetadata(
 				{
 					childPartitionContext: pCtx,
-					cursor: txCursor,
+					cursor,
 				},
 			);
-
-			store.transactionSync(() => {
+			const applied = this.commitPage(() => {
 				for (const row of pendingTransactions) {
 					store.insertPendingLock(row);
 				}
 				store.mergeDeletionMetadata({ maxDeleteTxOrderTs, deleteRevision });
 			});
-
-			if (!nextCursor) break;
-			txCursor = nextCursor;
+			if (!applied) {
+				this.logStalePage("pending_transactions");
+				return false;
+			}
+			if (!nextCursor) return true;
+			cursor = nextCursor;
 		}
+	}
 
-		store.rebuildKeySizeEstimates();
-		storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
-		storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
-		storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
-		await this.acknowledgeParent(pCtx, parentCtx);
-		storage.kv.delete(MIGRATION_KV_KEYS.PARENT_ACK_PENDING);
+	/**
+	 * Promoted-key entries for the keys this hash child now owns. Only the forward-pointer entry
+	 * transfers — the data lives in the range structure, and hash-child item migration already excluded
+	 * promoted keys. Mutual exclusion guarantees every such key is 'promoted' at hash-split time.
+	 */
+	private async importPromotedKeys(pCtx: PartitionContextResolved): Promise<boolean> {
+		const { store, parent } = this.deps;
 
-		console.log({
-			...this.deps.logParams(),
-			message: "fokos/partition: Range child migration completed.",
+		let cursor: PromotedKeyCursor | null = null;
+		while (true) {
+			const { rows, nextCursor } = await parent.migrationGetPromotedKeysBatch({ childPartitionContext: pCtx, cursor });
+			const applied = this.commitPage(() => {
+				for (const row of rows) {
+					store.insertPromotedKey(row.hash_key, row.status, Date.now());
+					this.deps.onPromotedKeyInherited(row.hash_key, row.status);
+				}
+			});
+			if (!applied) {
+				this.logStalePage("promoted_keys");
+				return false;
+			}
+			if (!nextCursor) return true;
+			cursor = nextCursor;
+		}
+	}
+
+	/**
+	 * Closes the import in one transaction: the size estimates, the completed status, the spent
+	 * checkpoint, and the pending parent acknowledgement. Returns false when another run closed it.
+	 */
+	private completeMigration(): boolean {
+		const { store, storage } = this.deps;
+		return store.transactionSync(() => {
+			if (storage.kv.get<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS) !== "migration_migrating") return false;
+			store.rebuildKeySizeEstimates();
+			storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+			storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
+			storage.kv.put<boolean>(MIGRATION_KV_KEYS.PARENT_ACK_PENDING, true);
+			return true;
 		});
 	}
 }

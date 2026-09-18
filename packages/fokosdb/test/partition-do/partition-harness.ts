@@ -128,6 +128,20 @@ export class TestPartition {
 		return node;
 	}
 
+	/**
+	 * Counts this partition's OWN item rows for `hashKey`, straight from its SQLite storage.
+	 *
+	 * Reads through the public API answer for whoever owns the key now — a split child, or a range
+	 * tree after a promotion. A test that asks whether the rows are still on THIS partition (promotion
+	 * GC, or hash-child migration excluding a promoted key) has to look at the storage instead.
+	 */
+	async localItemCount(hashKey: string): Promise<number> {
+		return await runInDurableObject(this.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			const rows = state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM items WHERE hk = ?`, kb(hashKey)).toArray();
+			return rows[0].n;
+		});
+	}
+
 	/** The range root of `hashKey`: the partition a promotion of that key creates. */
 	rangeRoot(hashKey: string): TestPartition {
 		return TestPartition.at(resolveRangePartitionContext(this.ctx, kb(hashKey), null, null).partitionContext);

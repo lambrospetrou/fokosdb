@@ -36,6 +36,33 @@ describe("PartitionDO — range split", () => {
 		}
 	});
 
+	it("forwards its CURRENT mutable context to a child, not the snapshot taken at split time", async () => {
+		// The split record stores a full child context, captured when the split ran. Forwarding that
+		// snapshot hands the child split thresholds an operator has since changed, and the child then
+		// persists the stale values as its own — a silent downgrade that survives every later request.
+		const { root, sks } = await makeTriggeredRangeRoot(2);
+		await root.awaitSplitCompleted();
+
+		const child = (await root.children())[0];
+		const splitTimeMaxSizeMb = child.ctx.rangeSplitConditions!.maxSizeMb!;
+		const raisedMaxSizeMb = splitTimeMaxSizeMb * 4;
+
+		// An operator raises the range split threshold; the new value travels with every request.
+		const updatedCtx: PartitionContextResolved = {
+			...root.ctx,
+			rangeSplitConditions: { ...root.ctx.rangeSplitConditions!, maxSizeMb: raisedMaxSizeMb },
+		};
+		const ownedSk = [...sks].sort()[0];
+		const read = await root.stub.apiGetItem(updatedCtx, { hashKey: kb("alice"), sortKey: kb(ownedSk) });
+		expect(read.found, "the read must actually reach the child").toBe(true);
+		expect(read.meta.servedByActorName).toBe(child.doName);
+
+		// Read the child's stored context WITHOUT passing one, so the assertion observes what the
+		// router forwarded rather than writing the threshold itself.
+		const stored = await child.stub.status();
+		expect(stored.partitionContext!.rangeSplitConditions!.maxSizeMb).toBe(raisedMaxSizeMb);
+	});
+
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
 		const N = 4;
 		const { root, sks } = await makeTriggeredRangeRoot(N);

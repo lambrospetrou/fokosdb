@@ -371,6 +371,8 @@ export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500,
 	commit_keyset_mismatch: "e3kh5s",
 	unexpected_transaction_state: "j6uhd6",
 	partition_fanout_failed: "f3aqhc",
+	/** A read-through or migration caller is not a target of any repartition this partition owns. */
+	repartition_target_unknown: "8hqw3n",
 	foreign_error: "jvufz5",
 });
 

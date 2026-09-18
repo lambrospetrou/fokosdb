@@ -137,7 +137,7 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 		const rangeRoot = await partition.awaitPromoted("alice");
 		await drainUntil(
 			[partition, rangeRoot],
-			async () => !(await partition.stub.internalGetItemDirect({ hashKey: kb("alice"), sortKey: kb("sk1") })).found,
+			async () => (await partition.localItemCount("alice")) === 0,
 			"alice to be garbage-collected from the hash DO",
 			8000,
 		);
@@ -151,12 +151,11 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 
 		// alice's DATA must not be migrated into any hash child (the child inherits only the forward-pointer
 		// entry, never the data — which lives in the range structure). The child that owns alice must:
-		//   (a) hold no local copy of alice's data (strictly-local getItemDirect → not found), and
+		//   (a) hold no local copy of alice's data (no item rows for the key in its own storage), and
 		//   (b) inherit alice's promoted-key entry, so a normal read forwards to the range structure.
 		const aliceChildren: TestPartition[] = [];
 		for (const child of children) {
-			const local = await child.stub.internalGetItemDirect({ hashKey: kb("alice"), sortKey: kb("sk1") });
-			expect(local.found, `alice's data must not be migrated locally into hash child ${child.doName}`).toBe(false);
+			expect(await child.localItemCount("alice"), `alice's data must not be migrated locally into hash child ${child.doName}`).toBe(0);
 			if ((await child.promotedKeyStatus("alice")) === "promoted") aliceChildren.push(child);
 		}
 

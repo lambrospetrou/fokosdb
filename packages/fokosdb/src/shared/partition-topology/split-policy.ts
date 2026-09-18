@@ -13,7 +13,6 @@ import {
 import {
 	PartitionIdHelper,
 	resolveDescendantHashPartitionContext,
-	resolveDoId,
 	resolveHashChildPartitionContexts,
 	resolveRangePartitionContext,
 } from "./partition-id.js";
@@ -609,7 +608,17 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 			return resolveRangePartitionContext(partitionContext, hashKey, learned.startBoundary, learned.endBoundary);
 		}
 
-		return { doId: resolveDoId(partitionContext.ns, best.doName), partitionContext: best };
+		// Rebuild the child context from THIS router's current context plus the child's stored immutable
+		// boundaries. The stored child context is a snapshot taken at split time, so forwarding it would
+		// hand the child split thresholds that an operator has since changed, and the child would persist
+		// those stale values as its own. Boundaries, hashKey, ns and tableName are immutable, so the
+		// rebuilt identity (doName, partitionId) is byte-for-byte the stored one.
+		return resolveRangePartitionContext(
+			partitionContext,
+			hashKey,
+			best.rangePartition!.startBoundary ?? null,
+			best.rangePartition!.endBoundary ?? null,
+		);
 	}
 
 	recordForwardResult(

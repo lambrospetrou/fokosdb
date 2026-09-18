@@ -292,6 +292,97 @@ describe("SplitMigration — status gate", () => {
 	});
 });
 
+describe("SplitMigration — a page that outlives the state it was built against", () => {
+	// A page is requested against durable state and applied later, and the two moments can be far
+	// apart: the alarm and the background timer both drive the import, an evicted instance can revive
+	// holding a page from a previous life, and the ingest is INSERT OR IGNORE, so a row the user has
+	// deleted since looks absent and comes back. Every page therefore re-reads the state it assumed
+	// inside its own commit transaction, and the run stops when that state has moved on.
+
+	it("drops an item page whose import completed while the page was in flight, so a deleted item stays deleted", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+
+		await withMigrationEnv(async (menv) => {
+			const { peer } = makeFakePeer({
+				items: [item("a", "1"), item("a", "2")],
+				onItemsBatch: () => {
+					// Another loop finishes the whole import, and the now-active target serves a user write
+					// and then a user delete of one of the imported rows.
+					menv.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+					menv.storage.kv.delete(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR);
+					menv.store.upsertItem({ hk: kb("a"), sk: kb("1"), data: "user-write", kind: "text", ttlAt: null, txOrderTs: 1 });
+					menv.store.deleteItem({ hk: kb("a"), sk: kb("1"), txOrderTs: 2 });
+				},
+			});
+			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
+
+			// Neither row is written: the deleted one is not resurrected, and the page is dropped whole.
+			expect(menv.store.queryItemsPage(null, 100)).toEqual([]);
+			expect(menv.status()).toBe("migration_completed");
+		});
+	});
+
+	it("drops an item page built from a checkpoint that has already advanced", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+
+		await withMigrationEnv(async (menv) => {
+			const { peer } = makeFakePeer({
+				items: [item("a", "1"), item("a", "2"), item("a", "3")],
+				itemBatchSize: 1,
+				onItemsBatch: (call) => {
+					// While the second page is on the wire, another loop of the same import commits past it.
+					if (call !== 2) return;
+					menv.storage.kv.put<ScanCursor | null>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_CURSOR, { hk: kb("a"), sk: kb("3") });
+				},
+			});
+			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
+
+			// The first page applied. The second was built against a checkpoint the other loop has passed,
+			// so it is dropped and the import stays open for whichever loop still owns it.
+			expect(menv.store.queryItemsPage(null, 100).map((r) => KeyCodec.decode(r.sk))).toEqual(["1"]);
+			expect(menv.status()).toBe("migration_migrating");
+		});
+	});
+
+	it("drops a pending-lock page whose import completed while the page was in flight", async () => {
+		const base = makeBase();
+		const pCtx = hashCtx(base, [0, 1]);
+		const parentCtx = hashCtx(base, [0]);
+		const lock = {
+			hk: kb("a"),
+			sk: kb("1"),
+			transaction_id: "tx1",
+			transaction_ts: 123,
+			operation: "put",
+			data: "d",
+			kind: "text" as const,
+			conditions_json: null,
+			ttl_epoch_utc_seconds: null,
+			coordinator_do_id: "tc-1",
+			created_at: 1000,
+			guarded_at: null,
+		};
+
+		await withMigrationEnv(async (menv) => {
+			const { peer } = makeFakePeer({
+				txBatches: [{ maxDeleteTxOrderTs: 0, deleteRevision: 0, pendingTransactions: [lock], nextCursor: null }],
+				onTxBatch: () => {
+					// The import completed and the transaction that held this lock has since been resolved,
+					// so re-inserting the row would leak a lock that nothing will ever release.
+					menv.storage.kv.put<PartitionSplitMigrationStatus>(MIGRATION_KV_KEYS.SPLIT_MIGRATION_STATUS, "migration_completed");
+				},
+			});
+			await menv.makeMigration(peer).runMigration(pCtx, parentCtx);
+
+			expect(menv.store.pendingLockFor(kb("a"), kb("1"))).toBeUndefined();
+		});
+	});
+});
+
 // ─── Harness ──────────────────────────────────────────────────────────────────
 
 function makeBase(): PartitionContext {
@@ -346,6 +437,13 @@ type FakePeerOptions = {
 	/** 1-based getItemsBatch call number that throws once (simulated crash mid-migration). */
 	failItemsCall?: number;
 	failChildAck?: boolean;
+	/**
+	 * Runs just before a page is returned, with the 1-based call number. It stands for everything that
+	 * can happen to the target while a page is on the wire: another loop committing pages, the import
+	 * completing, and the now-active target serving user writes.
+	 */
+	onItemsBatch?: (call: number) => void;
+	onTxBatch?: (call: number) => void;
 };
 
 function makeFakePeer(opts: FakePeerOptions = {}) {
@@ -375,11 +473,15 @@ function makeFakePeer(opts: FakePeerOptions = {}) {
 				failItemsCall = 0; // fail once, then recover
 				throw new Error("simulated parent crash");
 			}
-			return itemBatch(cursor);
+			const page = itemBatch(cursor);
+			opts.onItemsBatch?.(calls.itemCursors.length);
+			return page;
 		},
 		async migrationGetPartitionTransactionMetadata() {
 			calls.txCalls++;
-			return opts.txBatches?.[txIdx++] ?? { maxDeleteTxOrderTs: 0, deleteRevision: 0, pendingTransactions: [], nextCursor: null };
+			const page = opts.txBatches?.[txIdx++] ?? { maxDeleteTxOrderTs: 0, deleteRevision: 0, pendingTransactions: [], nextCursor: null };
+			opts.onTxBatch?.(calls.txCalls);
+			return page;
 		},
 		async migrationGetPromotedKeysBatch() {
 			calls.pkCalls++;

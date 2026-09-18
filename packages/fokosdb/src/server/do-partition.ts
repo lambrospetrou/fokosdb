@@ -71,6 +71,7 @@ import { MIGRATION_KV_KEYS, SplitMigration, type PartitionSplitMigrationStatus }
 import { PromotionManager } from "../shared/partition/hash-key-promotion.js";
 import { TransactionParticipant } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
+import { assertPointInSlice, clipQueryToSlice, type FokosSlice } from "../shared/partition/repartition-slice.js";
 import { AddResult } from "../shared/bloom-filter.js";
 import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "../shared/partition-topology/partial-range-topology.js";
 import {
@@ -223,6 +224,23 @@ export type QueryItemsRpcResponse = {
 	partitionMetas: Array<OperationMetrics & PartitionInfoInternal>;
 };
 
+// ─── read-through types ───────────────────────────────────────────────────────
+
+/** The immutable identity of one remote participant of a split or a key promotion. */
+export type FokosPartitionRef = {
+	partitionId: string;
+	doName: string;
+};
+
+/**
+ * One read a repartition target asks its source to serve while the target is still importing.
+ * `caller` is the target's own immutable identity; the source resolves the slice that target owns
+ * from its own durable records and never trusts a name alone.
+ */
+export type FokosExecuteLocalRequest =
+	| { op: "getItem"; caller: FokosPartitionRef; request: GetItemRpcRequest }
+	| { op: "queryItems"; caller: FokosPartitionRef; request: QueryItemsRpcRequest };
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
@@ -233,7 +251,6 @@ export type PartitionDOStub = {
 	apiDeleteItem(ctx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
 	apiQueryItems(ctx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 
-	internalQueryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 	internalTriggerMigration(): Promise<void>;
 
 	txPrepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
@@ -296,6 +313,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 	#_topology?: PartitionTopologySplitter;
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
+	#_migrationInFlight: Promise<void> | null = null;
 
 	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
 	// non-blocking from the constructor, so it may be undefined for the first few
@@ -661,7 +679,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.getItem: no parent partition context stored during migration");
 			const parentStub = PartitionDO.getByName(this.env[parentCtx.ns], parentCtx.doName);
-			const result = await parentStub.internalGetItemDirect(req);
+			const result = (await parentStub.fokosExecuteLocal({
+				op: "getItem",
+				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				request: req,
+			})) as GetItemRpcResponse;
 			// The parent returns its own hashDepth, but the caller forwarded to this child partition.
 			// recordForwardResult on the caller requires responseHashDepth >= toAbsDepth (this child's depth).
 			if (isHashPartition(pCtx)) {
@@ -683,10 +705,102 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		});
 	}
 
-	// Internal RPC: reads directly from local storage, bypassing split forwarding.
-	// Called by child partitions during migration to avoid a forwarding loop back into the child.
-	async internalGetItemDirect(req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
-		return await this.#rpc("internalGetItemDirect", async () => await this.readItemLocally(this.pCtx(), req));
+	/**
+	 * Serves one read for a repartition target that is still importing from this partition.
+	 *
+	 * A target cannot serve its own reads until its copy is complete, and it cannot ask this source
+	 * through the ordinary API either: the source would route the request straight back to the target
+	 * that sent it. This method reads local rows only, with no forwarding and no lifecycle gate.
+	 *
+	 * That makes the caller check load-bearing rather than cosmetic. The source resolves, from its own
+	 * durable records, which slice the caller owns, and answers only for that slice — otherwise a
+	 * target could read a sibling's keys, or read keys this partition has already promoted away, whose
+	 * local rows are stale or already collected. A caller it cannot place is rejected outright.
+	 */
+	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
+		return await this.#rpc("fokosExecuteLocal", async () => await this.#fokosExecuteLocal(req));
+	}
+
+	async #fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
+		const pCtx = this.pCtx();
+		const slice = this.resolveCallerSlice(pCtx, req.caller);
+		// A promoted key's rows live in the range tree; the local copies are stale or already collected.
+		// Follow the promotion with ordinary forwarding rather than reading them. Only a hash-child
+		// caller can reach one — a range or promoted-key slice is itself inside a range tree.
+		const followsPromotion = slice.kind === "hash_child" && this.#promotion.statusFor(req.request.hashKey) === "promoted";
+
+		if (req.op === "getItem") {
+			const getReq = req.request;
+			if (followsPromotion) {
+				return await this.forwardToRangeRootPartition<GetItemRpcResponse>(
+					pCtx,
+					getReq.hashKey,
+					async (stub, toCtx) => await stub.apiGetItem(toCtx, getReq),
+					getReq.sortKey,
+				);
+			}
+			assertPointInSlice(slice, getReq.hashKey, getReq.sortKey, pCtx.hashSplitN, "fokosExecuteLocal");
+			return this.readItemLocally(pCtx, getReq);
+		}
+
+		const queryReq = req.request;
+		if (followsPromotion) {
+			// A query spans sort keys, so it carries no single key that could resolve a deeper range
+			// slice; it enters at the range root and the routers below it fan out.
+			return await this.forwardToRangeRootPartition<QueryItemsRpcResponse>(
+				pCtx,
+				queryReq.hashKey,
+				async (stub, toCtx) => await stub.apiQueryItems(toCtx, queryReq),
+			);
+		}
+		const interval = clipQueryToSlice(slice, queryReq, pCtx.hashSplitN, "fokosExecuteLocal");
+		return this.queryItemsLocal(pCtx, { ...queryReq, interval });
+	}
+
+	/**
+	 * Resolves the slice a read-through caller owns, from this partition's own durable records.
+	 *
+	 * A split source knows its children by name and identity, and each child's context carries the
+	 * slice it was created with. A promotion source instead knows one key: the range root's identity
+	 * encodes the key it was promoted for, and only a key still in 'promoting' has a root that reads
+	 * through — after that the root is complete and asks for nothing.
+	 */
+	private resolveCallerSlice(pCtx: PartitionContextResolved, caller: FokosPartitionRef): FokosSlice {
+		const splitStatus = this.ensureTopology(pCtx).splitStatus();
+		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
+			// Both halves of the identity must match: a name alone is a value the caller chose.
+			const child = splitStatus.childPartitionContexts.find((c) => c.doName === caller.doName && c.partitionId === caller.partitionId);
+			if (child) {
+				if (isRangePartition(child)) {
+					const rp = child.rangePartition;
+					return { kind: "range", hashKey: rp.hashKey, start: rp.startBoundary ?? null, end: rp.endBoundary ?? null };
+				}
+				const childIdBytes = Uint8Array.fromHex(child.partitionId);
+				return {
+					kind: "hash_child",
+					childIndex: PartitionIdHelper.lastChildIdx(childIdBytes),
+					depth: PartitionIdHelper.depth(childIdBytes),
+				};
+			}
+		}
+
+		if (isHashPartition(pCtx) && PartitionIdHelper.isRangePartition(caller.partitionId)) {
+			const decoded = PartitionIdHelper.decode(Uint8Array.fromHex(caller.partitionId));
+			// A promotion creates the range ROOT, whose slice is the whole key: both boundaries unbounded.
+			if (
+				decoded.schema === 1 &&
+				decoded.startBoundary === null &&
+				decoded.endBoundary === null &&
+				this.#promotion.statusFor(decoded.hashKey) === "promoting"
+			) {
+				return { kind: "promoted_key", hashKey: decoded.hashKey };
+			}
+		}
+
+		throw new FokosInternalError(INTERNAL_CODES.repartition_target_unknown, {
+			message: "caller is not a target of any repartition this partition owns",
+			attributes: { operation: "fokosExecuteLocal", caller: caller.doName, callerPartitionId: caller.partitionId, source: pCtx.doName },
+		});
 	}
 
 	async apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
@@ -701,7 +815,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 			invariant(parentCtx, "fokos/partition.queryItems: no parent partition context stored during migration");
 			const parentStub = PartitionDO.getByName(this.env[parentCtx.ns], parentCtx.doName);
-			const result = await parentStub.internalQueryItemsDirect(req);
+			const result = (await parentStub.fokosExecuteLocal({
+				op: "queryItems",
+				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				request: req,
+			})) as QueryItemsRpcResponse;
 			if (isHashPartition(pCtx)) {
 				const myDepth = this.depth();
 				return { ...result, meta: { ...result.meta, hashDepth: myDepth } };
@@ -728,14 +846,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 			forward: async (stub, childPCtx) => await stub.apiQueryItems(childPCtx, req),
 			local: async () => await this.queryItemsLocal(this.pCtx(), req),
 		});
-	}
-
-	// Direct read bypassing split forwarding — used by migrating children to avoid forwarding loops
-	// (same rationale as getItemDirect). Must always read local rows only: a range router that fans
-	// out to children via queryItemsAsRangeNode would route back to the calling migrating child,
-	// causing an infinite loop (child → queryItemsDirect → walkRangeChildren → child.queryItems → …).
-	async internalQueryItemsDirect(req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
-		return await this.#rpc("internalQueryItemsDirect", async () => await this.queryItemsLocal(this.pCtx(), req));
 	}
 
 	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
@@ -806,10 +916,26 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		const splitStatus = topology.splitStatus();
 
 		if (splitStatus?.status === "split_started" || splitStatus?.status === "split_completed") {
-			return await this.walkRangeChildren(pCtx, splitStatus.childPartitionContexts, req);
+			return await this.walkRangeChildren(pCtx, this.rangeChildContexts(pCtx, splitStatus.childPartitionContexts), req);
 		}
 
 		return this.queryItemsLocal(pCtx, req);
+	}
+
+	/**
+	 * Rebuilds this router's range children from its CURRENT context plus their stored immutable
+	 * boundaries. The split record holds a snapshot of each child context taken at split time, so
+	 * forwarding it would hand the child split thresholds an operator has since changed, and the child
+	 * would persist those stale values as its own. Boundaries, hashKey, ns and tableName are immutable,
+	 * so each rebuilt identity (doName, partitionId) is byte-for-byte the stored one, in the same order.
+	 */
+	private rangeChildContexts(pCtx: PartitionContextResolved, stored: PartitionContextResolved[]): PartitionContextResolved[] {
+		const hashKey = pCtx.rangePartition!.hashKey;
+		return stored.map((childCtx) => {
+			const rp = childCtx.rangePartition;
+			invariant(rp, "fokos/partition.rangeChildContexts: child has no rangePartition context");
+			return resolveRangePartitionContext(pCtx, hashKey, rp.startBoundary ?? null, rp.endBoundary ?? null).partitionContext;
+		});
 	}
 
 	private async walkRangeChildren(
@@ -2170,9 +2296,25 @@ export class PartitionDO extends DurableObject implements PartitionAPI {
 		};
 	}
 
+	/**
+	 * Runs the import, joining the run already in flight instead of starting a second one. The alarm,
+	 * the background timer and an incoming request all reach here, and two loops over one import both
+	 * hold pages the other has already moved past — applying one re-inserts rows a user deleted after
+	 * the import finished. The promise is in-memory only, so it survives no eviction; the durable
+	 * guards inside each page transaction are what make the ingest safe.
+	 */
+	private runMigration(): Promise<void> {
+		if (this.#_migrationInFlight) return this.#_migrationInFlight;
+		const run = this.#runMigrationOnce().finally(() => {
+			this.#_migrationInFlight = null;
+		});
+		this.#_migrationInFlight = run;
+		return run;
+	}
+
 	// The driver loops live in partition/migration.ts (SplitMigration); the DO only resolves the
 	// parent stub (boundary rule: only DO classes and FokosDB acquire stubs) and wires the deps.
-	private async runMigration(): Promise<void> {
+	async #runMigrationOnce(): Promise<void> {
 		const pCtx = this.pCtx();
 		const parentCtx = this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARENT_PARTITION_CONTEXT);
 		invariant(parentCtx, "fokos/partition.runMigration: no parent partition context stored");

@@ -1,6 +1,7 @@
 # RFC — One repartition flow for hash splits, range splits, and key promotions
 
 **State:** Draft
+**Milestone state:** M0 is complete on 2026-09-18. M1 has not started.
 **Date:** 2026-09-17
 **Author:** Lambros
 
@@ -90,7 +91,8 @@ option ends after the first release.
 - M0 must fix the three defects in section 4.13 before M1 replaces the durable records.
 - The public `FokosDB` API and the transaction coordinator protocol must not change.
 - Existing public error codes must not change.
-- Existing integration assertions must continue to pass, except for replaced internal RPC names.
+- Existing integration assertions must continue to pass, except for replaced internal RPC names and for the
+  four assertions that section 3 records against M0.
 
 ### 2.2 Out of scope
 
@@ -160,6 +162,34 @@ The current source models authorize the caller and resolve its slice during M0:
 - A terminal override is a `promoted_keys` row in `promoted`.
 
 The slice validation and the read rules of section 4.8 apply to M0 with these inputs.
+
+#### M0 result
+
+M0 is complete. It delivers:
+
+- `fokosExecuteLocal` on `PartitionDO`, with the caller resolution and the slice validation above.
+  `internalGetItemDirect` and `internalQueryItemsDirect` are removed.
+- `repartition_target_unknown` in `INTERNAL_CODES`.
+- `FokosSlice` and the pure slice validation in
+  `packages/fokosdb/src/shared/partition/repartition-slice.ts`. M1 lifts this file into `RepartitionFlow`.
+- One in-memory import promise in `PartitionDO`, and one durable guard in each migration page transaction.
+- Forwarded range-child contexts that the router rebuilds from its current context.
+
+M0 changes two decisions of this RFC:
+
+1. **D1 keeps its multi-page pass.** The written plan also asked for one page per pass. That rule needs a
+   durable phase cursor, which M1 replaces with `FokosMigrationCursor`, so M0 would build and then delete it.
+   M0 implements the three durable rules of section 4.13 instead, and drops the prefetch. The guards, not the
+   loop shape, stop a stale page. Measurements show no migration slowdown from the dropped prefetch.
+2. **Slice clipping arrives in M0, not M1.** The caller slice decides each read, so M0 cannot resolve a slice
+   and then ignore it. Four existing integration assertions therefore change:
+   - `hash-split.test.ts` read two keys through one child. One key hashed to its sibling. Each key now reads
+     on the child that owns it.
+   - Three `query-items.test.ts` cases asserted that a migrating range child answers for the whole hash key.
+     Each case now expects the caller's slice. `forwardToRangeRootPartition` can send a broad interval to one
+     leaf, so this leak was reachable.
+
+   The M1 test "A broad query is clipped to one importing range child" moves to M0 for the same reason.
 
 ### M1 — Replace the durable flow
 
@@ -1102,6 +1132,10 @@ The same sequence can restore a pending lock.
 M0 must use one in-memory import promise. Each page transaction must recheck the durable migration state. An
 item page must also check its expected durable cursor. M1 applies the cursor check to every phase and stream.
 
+M0 does all three. It also removes the batch prefetch, so the durable checkpoint is the only record of
+progress. One pass still applies more than one page: section 3 records why. `SplitMigration` keeps one guard
+for the three streams, because the hash and the range drivers now share their page loops.
+
 #### D2 — A promoted-key read through an importing hash child can use stale source rows
 
 The current read-through calls the parent direct-read RPC before it resolves promotions. A hash split imports
@@ -1147,13 +1181,19 @@ The harness changes are:
 - `withMigrationHeld` must hold `fokosMigrationPull` in the `pending_tx` stream.
 - `withMigrationBatchCap` must cap each phase and stream of `fokosMigrationPull`.
 
-M0 must add integration tests for these behaviors. Each one starts as a failing test for its defect:
+M0 adds tests for these behaviors. Each one started as a failing test for its defect:
 
-- A stale import step cannot restore a deleted item or pending lock (D1).
-- One import pass applies at most one page (D1).
+- A stale import step cannot restore a deleted item or pending lock (D1). Three cases in `migration.test.ts`
+  cover the item state guard, the item cursor guard, and the pending-lock state guard. The suite drives a real
+  `PartitionStore` and moves the durable state while a page is on the wire.
 - Promoted-key point and query reads through an importing hash child reach the range tree (D2).
-- An unknown target cannot read through (D2).
+- An unknown target cannot read through (D2). A caller must match both `doName` and `partitionId`.
+- A hash child cannot read a sibling's key through its source (D2).
+- A broad query is clipped to one importing range child, and a cursor outside that slice fails (D2).
 - A range router forwards its current mutable context (D3).
+
+`test/partition-do/read-through.test.ts` holds the `fokosExecuteLocal` cases. `TestPartition.localItemCount`
+replaces the removed direct-read RPC where a test must read a partition's own rows.
 
 M1 must add integration tests for these behaviors:
 
@@ -1175,8 +1215,6 @@ M1 must add integration tests for these behaviors:
 - A retry after child import queues the promotion on that child.
 - A Bloom false positive before cutover falls back for reads only.
 - A range split reuses its plan after partial initialization.
-- A broad query is clipped to one importing range child.
-- A cursor outside the target slice fails.
 - A maximum-shape range plan fits the KV limit.
 - `repartition_not_cut_over` maps to `partition_migrating` at the public root.
 - Cache eviction does not change routing.
