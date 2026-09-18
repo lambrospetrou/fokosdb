@@ -229,9 +229,11 @@ The source and target use separate durable state machines:
 ```text
 source: fokos_repartitions.state
 
-(none) -> queued -> planned -> cutover -> completed -> cleaned (promotions only)
+(none) -> queued -> planned -> cutover -> completed -> cleaned
 
-Splits stop at completed.
+Every kind ends the same way. `completed` means every target acknowledged and source cleanup is
+pending. `cleaned` means that cleanup finished. A split reclaims no item rows, so its cleanup step
+deletes nothing and moves the row straight to `cleaned`.
 
 target: __fokos/import.state
 
@@ -314,7 +316,6 @@ CREATE TABLE IF NOT EXISTS fokos_repartitions (
     kind            TEXT    NOT NULL,
     state           TEXT    NOT NULL,
     hash_key        BLOB,
-    cleanup_started INTEGER NOT NULL DEFAULT 0,
     queued_at       INTEGER NOT NULL,
     cutover_at      INTEGER,
     completed_at    INTEGER,
@@ -333,7 +334,6 @@ CREATE TABLE IF NOT EXISTS fokos_repartition_targets (
     partition_id       TEXT    NOT NULL,
     do_name            TEXT    NOT NULL,
     target_index       INTEGER NOT NULL,
-    slice_kind         TEXT    NOT NULL,
     slice_hash_key     BLOB,
     slice_start        BLOB,
     slice_end          BLOB,
@@ -358,7 +358,6 @@ The valid values are:
 - `kind`: `hash_split`, `range_split`, or `key_promotion`.
 - `state`: `queued`, `planned`, `cutover`, `completed`, or `cleaned`.
 - `initialization`: `pending`, `initializing`, or `initialized`.
-- `slice_kind`: `hash_child`, `range`, or `promoted_key`.
 - `hash_key`: the promoted key of a `key_promotion`, and null for a split. A hash split moves every key, and a
   range split moves an interval of the key that the partition identity already holds.
 
@@ -367,6 +366,13 @@ values do not repeat. The source `doName` and local ID form a global identity.
 
 The slice uses SQL columns because migration filters and range routing read it. `target_index` defines target
 order. Range partition IDs do not sort by boundary.
+
+The target row stores no slice kind. A repartition never mixes slice kinds, so its `kind` gives the kind of
+every one of its targets: a `hash_split` hands out `hash_child` slices, a `range_split` hands out `range`
+slices, and a `key_promotion` hands out one `promoted_key` slice. Every reader holds the repartition row
+before it reads a target row, because `fokosMigrationPull` and `fokosMigrationAck` check that the repartition
+exists first. A stored kind would also be the only thing separating a `range` slice with two unbounded edges
+from a `promoted_key` slice, and the write path must reject a slice that its repartition kind does not take.
 
 The table stores no depth for a `hash_child` slice. The depth of a hash child is the source depth plus one, and
 the target `partition_id` encodes it. The source fills `FokosSlice.depth` from its own depth when it builds the
@@ -449,7 +455,7 @@ The new records replace the old records as follows:
 - The `imported` state replaces KV `__split_migration_parent_ack_pending`.
 - `__fokos/import.source` replaces KV `__parent_partition_context`.
 - The source repartition kind replaces KV `__parent_split_type`.
-- `completed`, `cleanup_started`, and `cleaned` replace `promoted_keys.gc_done`.
+- `completed` and `cleaned` replace `promoted_keys.gc_done`.
 - The repartition states replace `promoted_keys.status`.
 
 `PartitionStore.deleteExpiredItems` must check `fokos_route_overrides` instead of `promoted_keys`. The TTL
@@ -474,7 +480,9 @@ The source transitions are:
   `cutover_at`. Delete the plan.
 - `start_import`: At most six targets are due. Advance retries before calls. Mark each success as `start_notified`.
 - `ack`: A member target acknowledges. Mark it. Set `completed` and `completed_at` after the final acknowledgement.
-- `cleanup`: A completed promotion has source rows. Delete one batch and set `cleaned` after the final step.
+- `cleanup`: A repartition is `completed`. Run one bounded cleanup step for its kind and set `cleaned`
+  after the final step. A promotion deletes one batch of source rows. A split deletes nothing and
+  reports itself done at once.
 
 The queue path must arm the fallback alarm before it writes a row. An alarm with no row is a safe no-op. A
 repeated signal for an unfinished row must also restore a missing alarm.
@@ -662,7 +670,9 @@ source identity must throw `partition_context_mismatch`. A valid call schedules 
 1. The repartition must exist. Otherwise, throw `repartition_unknown`.
 2. The target identity must match a target row. Otherwise, throw `repartition_target_unknown`.
 3. A source in `queued` or `planned` must throw `repartition_not_cut_over`.
-4. A promotion with `cleanup_started = 1` must throw `partition_migrating`. This includes `cleaned`.
+4. A source in `completed` or `cleaned` must throw `partition_migrating`. Every target has
+   acknowledged at that point, so no target still needs a page, and a promotion source can already
+   have deleted the rows.
 5. The source must return one bounded page for the requested cursor.
 
 `fokosMigrationAck` must apply the first two checks. It must accept a repeated acknowledgement in `cutover`,
@@ -697,7 +707,7 @@ create:
 - A route override for the hash key.
 
 The page transaction must use one timestamp for `queued_at`, `cutover_at`, `completed_at`, and
-`next_attempt_at`. It must set `cleanup_started = 1`, both attempt counts to zero, and `target_index = 0`.
+`next_attempt_at`. It must set both attempt counts to zero and `target_index = 0`.
 Multiple rows in one page must receive consecutive local sequence values.
 
 The inherited row needs no plan or cleanup key. The child has no source item for that key. The row exists for
@@ -817,17 +827,19 @@ When `__fokos/destroying` is true, each normal request and control transition mu
 
 ### 4.9 Cleanup, scheduling, and recovery
 
-#### 4.9.1 Promotion cleanup
+#### 4.9.1 Source cleanup
 
-Only a key promotion cleans source item rows. One cleanup step must:
+Every repartition reaches `cleaned` through one job. Only a key promotion reclaims source item rows.
+One promotion cleanup step must:
 
-1. Set `cleanup_started = 1` in the first delete transaction.
-2. Delete at most 1,000 item rows with `deleteItemsBatchForHashKey`.
-3. Delete pending rows for the hash key with `deletePendingTxForHashKey`.
-4. Delete the key-size estimate after the last item row.
-5. Set the repartition to `cleaned`.
+1. Delete at most 1,000 item rows with `deleteItemsBatchForHashKey`.
+2. Delete pending rows for the hash key with `deletePendingTxForHashKey`.
+3. Delete the key-size estimate after the last item row.
+4. Set the repartition to `cleaned`.
 
-Hash and range split sources keep item rows. This keeps the current behavior.
+Hash and range split sources keep item rows. This keeps the current behavior. Their cleanup step
+reclaims nothing and sets `cleaned` at once, so one job drives every kind and no caller branches on
+the kind.
 
 #### 4.9.2 Single-flight work
 
@@ -850,7 +862,7 @@ The jobs run in this order:
    `flow.importOnePage()` in a loop.
 2. `target_ack`: make one acknowledgement attempt. `flow.ackOnce()`.
 3. `source_repartition`: advance one due repartition by one bounded step. `flow.sourceStep()`.
-4. `source_cleanup`: delete one batch for one completed promotion. `flow.cleanupStep()`.
+4. `source_cleanup`: run one bounded cleanup step for one completed repartition. `flow.cleanupStep()`.
 5. Stale transaction recovery.
 6. TTL expiry.
 
@@ -864,8 +876,8 @@ every write to the target waits for it. A request that reaches an incomplete tar
 not a full pass.
 
 `source_repartition` must select one due row by `(next_attempt_at, seq)`. A failed row moves to a later
-deadline. Another due row can then run. `source_cleanup` must use the same order for completed promotions and
-must move an incomplete cleanup to a later deadline.
+deadline. Another due row can then run. `source_cleanup` must use the same order for completed
+repartitions and must move an incomplete cleanup to a later deadline.
 
 A repartition row is due only when the source has a step to run for it:
 
@@ -893,7 +905,7 @@ The source uses these retry delays:
 - A lock-blocked promotion: 5 seconds with no backoff.
 - A range plan with no boundaries: exponential from 5 seconds to 5 minutes.
 - A target initialization or start failure: exponential from 5 seconds to 5 minutes.
-- An incomplete promotion cleanup: 5 seconds.
+- An incomplete cleanup: 5 seconds.
 
 The target uses these retry delays:
 
@@ -915,10 +927,10 @@ at its short interval for as long as any durable work has a later deadline. The 
 
 - An import in `awaiting_data`, `importing`, or `imported`.
 - A repartition row that section 4.9.3 defines as due, now or later.
-- A completed promotion that needs cleanup.
+- A repartition in `completed`, whose cleanup is still pending.
 - An unguarded pending transaction.
 
-A completed split and a cleaned promotion need no repartition alarm.
+A cleaned repartition needs no repartition alarm.
 
 The alarm handler must catch job errors and set a new durable deadline. Cloudflare retries a thrown alarm only
 six times, so correctness must not depend on those automatic retries.

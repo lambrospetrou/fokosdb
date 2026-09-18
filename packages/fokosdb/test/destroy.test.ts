@@ -7,12 +7,13 @@ import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/ro
 import { PartitionDO } from "../src/server/do-partition.js";
 
 // 3 root partitions, each splits into 2 children.
-// maxSizeMb: 0.1 = 102 400 bytes; 2 × 50 KB items per partition → split triggers.
+// maxSizeMb: 0.25 = 262 144 bytes. The empty schema already holds ~100 KB of pages, so a smaller cap
+// would put every partition over its limit before the first write. 4 × 50 KB items then split one.
 const PARTITION_OPTIONS = {
 	rootTreesN: 3,
 	hashSplitN: 2,
 	rangeSplitN: 2,
-	hashSplitConditions: { maxSizeMb: 0.1 },
+	hashSplitConditions: { maxSizeMb: 0.25 },
 	// rangeSplitConditions not specified here → PartitionContextCreator defaults to { splitN: 4, maxSizeMb: 500 }.
 };
 const ITEM_DATA = "x".repeat(50 * 1024); // 50 KB

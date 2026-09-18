@@ -305,11 +305,14 @@ describe("PartitionDO - splitting", () => {
 
 	describe("multi-level splits", async () => {
 		it("keeps all items accessible after splits at multiple tree depths", async ({ expect }) => {
-			// One row stays below the 10% overage band, so a successful crossing write can queue each split.
-			const ITEM_SIZE_BYTES = 4 * 1024;
+			// The threshold must clear the empty schema — its tables and indexes are ~100 KB of pages
+			// before a single item lands, and a partition that starts over its cap rejects every write.
+			// The item size keeps the cadence: about ten writes fill the headroom and queue each split,
+			// and one row stays below the 10% overage band, so the crossing write itself still lands.
+			const ITEM_SIZE_BYTES = 16 * 1024;
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.1 } });
+			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.25 } });
 			const { ctx, stub } = partition;
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];

@@ -12,12 +12,15 @@ import {
 	PartitionStore,
 	queryScanStatement,
 	type ItemLinkId,
+	type RepartitionKind,
+	type RepartitionState,
 	type ScanCursor,
+	type TargetInitialization,
 } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
-import { fokosErrorWith } from "../../../test/errors-matchers.js";
+import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
 
@@ -1019,9 +1022,37 @@ describe("PartitionStore - TTL deletion", () => {
 				created_at: 1,
 				guarded_at: null,
 			});
-			store.insertPromotedKey(kb("queued"), "queued", 1);
-			store.insertPromotedKey(kb("promoting"), "promoting", 1);
-			store.insertPromotedKey(kb("promoted"), "promoted", 1);
+			// An override at any lifecycle stage takes the key out of the sweep: the range tree owns it.
+			store.insertRepartition({
+				id: "r1",
+				seq: 1,
+				kind: "key_promotion",
+				state: "queued",
+				hashKey: kb("queued"),
+				queuedAt: 1,
+				nextAttemptAt: 1,
+			});
+			store.insertRepartition({
+				id: "r2",
+				seq: 2,
+				kind: "key_promotion",
+				state: "cutover",
+				hashKey: kb("promoting"),
+				queuedAt: 1,
+				nextAttemptAt: 1,
+			});
+			store.insertRepartition({
+				id: "r3",
+				seq: 3,
+				kind: "key_promotion",
+				state: "completed",
+				hashKey: kb("promoted"),
+				queuedAt: 1,
+				nextAttemptAt: 1,
+			});
+			store.insertRouteOverride(kb("queued"), "r1");
+			store.insertRouteOverride(kb("promoting"), "r2");
+			store.insertRouteOverride(kb("promoted"), "r3");
 
 			const first = store.deleteExpiredItems(100, 2);
 			expect(first).toEqual({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
@@ -1359,6 +1390,241 @@ describe("PartitionStore - promoted keys", () => {
 			expect(page1.map((r) => KeyCodec.decode(r.hash_key))).toEqual(["a", "b"]);
 			const page2 = store.queryPromotedKeysPage({ hashKey: kb("b") }, 2);
 			expect(page2.map((r) => KeyCodec.decode(r.hash_key))).toEqual(["c"]);
+		});
+	});
+});
+
+describe("PartitionStore - repartitions", () => {
+	function queue(store: PartitionStore, seq: number, kind: RepartitionKind, state: RepartitionState, nextAttemptAt: number): string {
+		const id = `r${seq}`;
+		store.insertRepartition({ id, seq, kind, state, hashKey: kind === "key_promotion" ? kb(id) : null, queuedAt: 1, nextAttemptAt });
+		return id;
+	}
+
+	function target(store: PartitionStore, repartitionId: string, index: number, nextAttemptAt: number, init: TargetInitialization) {
+		store.insertRepartitionTarget({
+			repartitionId,
+			kind: "hash_split",
+			partitionId: `${repartitionId}-p${index}`,
+			doName: `${repartitionId}-do${index}`,
+			targetIndex: index,
+			slice: { kind: "hash_child", childIndex: index },
+			initialization: init,
+			nextAttemptAt,
+		});
+	}
+
+	it("allocates sequences that never repeat and finds the one split row", async () => {
+		await withStore((store) => {
+			expect(store.nextRepartitionSeq()).toBe(1);
+			queue(store, 1, "key_promotion", "queued", 10);
+			expect(store.nextRepartitionSeq()).toBe(2);
+			expect(store.getSplitRepartition()).toBeUndefined();
+
+			queue(store, 2, "hash_split", "queued", 10);
+			expect(store.nextRepartitionSeq()).toBe(3);
+			expect(store.getSplitRepartition()?.id).toBe("r2");
+			expect(store.getRepartition("r1")?.kind).toBe("key_promotion");
+		});
+	});
+
+	it("reports an unfinished promotion until it reaches completed", async () => {
+		await withStore((store) => {
+			queue(store, 1, "key_promotion", "queued", 10);
+			expect(store.hasUnfinishedPromotion()).toBe(true);
+			store.setRepartitionState("r1", "cutover", { cutoverAt: 50 });
+			expect(store.hasUnfinishedPromotion()).toBe(true);
+			store.setRepartitionState("r1", "completed", { completedAt: 60 });
+			expect(store.hasUnfinishedPromotion()).toBe(false);
+			expect(store.getRepartition("r1")).toMatchObject({ state: "completed", cutoverAt: 50, completedAt: 60 });
+		});
+	});
+
+	it("selects the earliest due row and skips a cutover row that only waits for acknowledgements", async () => {
+		await withStore((store) => {
+			queue(store, 1, "hash_split", "cutover", 10);
+			target(store, "r1", 0, 10, "initialized");
+			store.setTargetStartNotified("r1", "r1-p0", 10);
+			queue(store, 2, "key_promotion", "queued", 20);
+			queue(store, 3, "key_promotion", "queued", 15);
+
+			// r1 has no step left: every target is notified and only an ack advances it.
+			expect(store.selectDueRepartition(100)?.id).toBe("r3");
+			expect(store.earliestRepartitionDeadline()).toBe(15);
+
+			// A failed row moves behind the other due row.
+			store.setRepartitionAttempt("r3", 1, 40);
+			expect(store.selectDueRepartition(100)?.id).toBe("r2");
+			// Nothing is due yet before its deadline.
+			expect(store.selectDueRepartition(19)).toBeUndefined();
+		});
+	});
+
+	it("refreshes a row's deadline from the targets that still need a call", async () => {
+		await withStore((store) => {
+			queue(store, 1, "hash_split", "planned", 10);
+			target(store, "r1", 0, 70, "pending");
+			target(store, "r1", 1, 50, "initializing");
+			target(store, "r1", 2, 30, "initialized");
+
+			store.refreshRepartitionDue("r1", 999);
+			expect(store.getRepartition("r1")?.nextAttemptAt).toBe(50);
+
+			expect(store.selectDueTargets("r1", "hash_split", "init", 60, 6).map((t) => t.targetIndex)).toEqual([1]);
+			expect(store.selectDueTargets("r1", "hash_split", "init", 999, 6).map((t) => t.targetIndex)).toEqual([1, 0]);
+
+			// With every target initialized the cutover step is due now.
+			store.setTargetInitialization("r1", "r1-p0", "initialized", 0, 0);
+			store.setTargetInitialization("r1", "r1-p1", "initialized", 0, 0);
+			store.refreshRepartitionDue("r1", 999);
+			expect(store.getRepartition("r1")?.nextAttemptAt).toBe(999);
+			expect(store.countRepartitionTargets("r1")).toEqual({ total: 3, initialized: 3, startNotified: 0, acknowledged: 0 });
+		});
+	});
+
+	it("records an acknowledgement once and keeps the stored slice of each target", async () => {
+		await withStore((store) => {
+			queue(store, 1, "range_split", "cutover", 10);
+			store.insertRepartitionTarget({
+				repartitionId: "r1",
+				kind: "range_split",
+				partitionId: "p0",
+				doName: "do0",
+				targetIndex: 0,
+				slice: { kind: "range", hashKey: kb("alice"), start: null, end: kb("m") },
+				nextAttemptAt: 5,
+			});
+			store.insertRepartitionTarget({
+				repartitionId: "r1",
+				kind: "range_split",
+				partitionId: "p1",
+				doName: "do1",
+				targetIndex: 1,
+				slice: { kind: "range", hashKey: kb("alice"), start: kb("m"), end: null },
+				nextAttemptAt: 5,
+			});
+
+			// The slice kind is not stored: it comes from the repartition kind the caller passes in.
+			expect(store.listRepartitionTargets("r1", "range_split").map((t) => t.slice)).toEqual([
+				{ kind: "range", hashKey: kb("alice"), start: null, end: kb("m") },
+				{ kind: "range", hashKey: kb("alice"), start: kb("m"), end: null },
+			]);
+			expect(store.getRepartitionTarget("r1", "p1", "range_split")?.doName).toBe("do1");
+			expect(store.getRepartitionTarget("r1", "nope", "range_split")).toBeUndefined();
+
+			expect(store.setTargetAcknowledged("r1", "p0")).toBe(true);
+			expect(store.setTargetAcknowledged("r1", "p0")).toBe(false);
+			expect(store.countRepartitionTargets("r1")).toEqual({ total: 2, initialized: 0, startNotified: 0, acknowledged: 1 });
+		});
+	});
+
+	it("refuses a target whose slice contradicts its repartition kind", async () => {
+		await withStore((store) => {
+			queue(store, 1, "range_split", "planned", 10);
+			// Nothing stores the slice kind, so a mismatched insert would come back as a range slice with
+			// two unbounded edges. The insert is where that has to be caught.
+			expect(() =>
+				store.insertRepartitionTarget({
+					repartitionId: "r1",
+					kind: "range_split",
+					partitionId: "p0",
+					doName: "do0",
+					targetIndex: 0,
+					slice: { kind: "promoted_key", hashKey: kb("alice") },
+					nextAttemptAt: 5,
+				}),
+			).toThrow(invariantFailure(/a range_split takes a range slice, got promoted_key/));
+		});
+	});
+
+	it("selects a due cleanup for every kind that reached completed, and none once cleaned", async () => {
+		await withStore((store) => {
+			queue(store, 1, "key_promotion", "cutover", 10);
+			queue(store, 2, "key_promotion", "completed", 20);
+			queue(store, 3, "key_promotion", "cleaned", 5);
+			// A split reclaims nothing, but it takes the same path: its step reports itself done at once.
+			queue(store, 4, "hash_split", "completed", 15);
+
+			expect(store.selectDueCleanup(100)?.id).toBe("r4");
+			expect(store.earliestCleanupDeadline()).toBe(15);
+
+			store.setRepartitionState("r4", "cleaned");
+			expect(store.selectDueCleanup(100)?.id).toBe("r2");
+			store.setRepartitionState("r2", "cleaned");
+			expect(store.selectDueCleanup(100)).toBeUndefined();
+			expect(store.earliestCleanupDeadline()).toBeNull();
+		});
+	});
+});
+
+describe("PartitionStore - route overrides", () => {
+	it("joins an override to its repartition state and lists only terminal ones", async () => {
+		await withStore((store) => {
+			const add = (seq: number, key: string, state: RepartitionState) => {
+				store.insertRepartition({ id: `r${seq}`, seq, kind: "key_promotion", state, hashKey: kb(key), queuedAt: 1, nextAttemptAt: 1 });
+				store.insertRouteOverride(kb(key), `r${seq}`);
+			};
+			add(1, "b", "queued");
+			add(2, "a", "completed");
+			add(3, "c", "cleaned");
+
+			expect(store.routeOverrideFor(kb("b"))).toEqual({ repartitionId: "r1", state: "queued" });
+			expect(store.routeOverrideFor(kb("zzz"))).toBeUndefined();
+			expect(store.hasRouteOverride(kb("b"))).toBe(true);
+			expect(store.hasTerminalRouteOverride(kb("b"))).toBe(false);
+			expect(store.hasTerminalRouteOverride(kb("a"))).toBe(true);
+
+			const page1 = store.queryTerminalRouteOverridesPage(null, 1);
+			expect(page1.map((r) => KeyCodec.decode(r.hashKey))).toEqual(["a"]);
+			const page2 = store.queryTerminalRouteOverridesPage({ hashKey: kb("a") }, 10);
+			expect(page2.map((r) => KeyCodec.decode(r.hashKey))).toEqual(["c"]);
+		});
+	});
+
+	it("pages the status view by (seq, target_index) and gives a target-less row index -1", async () => {
+		await withStore((store) => {
+			store.insertRepartition({ id: "r1", seq: 1, kind: "hash_split", state: "planned", hashKey: null, queuedAt: 1, nextAttemptAt: 1 });
+			store.insertRepartitionTarget({
+				repartitionId: "r1",
+				kind: "hash_split",
+				partitionId: "p0",
+				doName: "do0",
+				targetIndex: 0,
+				slice: { kind: "hash_child", childIndex: 0 },
+				nextAttemptAt: 1,
+			});
+			store.insertRepartitionTarget({
+				repartitionId: "r1",
+				kind: "hash_split",
+				partitionId: "p1",
+				doName: "do1",
+				targetIndex: 1,
+				slice: { kind: "hash_child", childIndex: 1 },
+				initialization: "initialized",
+				acknowledged: true,
+				nextAttemptAt: 1,
+			});
+			// A queued promotion has no target row yet, and destroy traversal must still see it.
+			store.insertRepartition({
+				id: "r2",
+				seq: 2,
+				kind: "key_promotion",
+				state: "queued",
+				hashKey: kb("k"),
+				queuedAt: 1,
+				nextAttemptAt: 1,
+			});
+
+			const page1 = store.queryRepartitionStatusPage(null, 2);
+			expect(page1.map((r) => [r.id, r.targetIndex])).toEqual([
+				["r1", 0],
+				["r1", 1],
+			]);
+			expect(page1[1]).toMatchObject({ doName: "do1", initialization: "initialized", acknowledged: true });
+
+			const page2 = store.queryRepartitionStatusPage({ seq: 1, targetIndex: 1 }, 10);
+			expect(page2.map((r) => [r.id, r.targetIndex])).toEqual([["r2", -1]]);
+			expect(page2[0]).toMatchObject({ partitionId: null, doName: null, initialization: null, acknowledged: false });
 		});
 	});
 });
