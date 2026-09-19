@@ -30,12 +30,18 @@ export function txCoordinatorNamespace(env: Env, ctx: PartitionContext): Durable
 	return ctx.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.jurisdiction);
 }
 
+function stubOptions(ctx: PartitionContext): DurableObjectNamespaceGetDurableObjectOptions | undefined {
+	return ctx.locationHint === undefined ? undefined : { locationHint: ctx.locationHint };
+}
+
 export function partitionStub(env: Env, ctx: PartitionContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
-	return partitionNamespace(env, ctx).get(id);
+	const options = stubOptions(ctx);
+	return options === undefined ? partitionNamespace(env, ctx).get(id) : partitionNamespace(env, ctx).get(id, options);
 }
 
 export function partitionStubByName(env: Env, ctx: PartitionContext, doName: string): DurableObjectStub<PartitionDO> {
-	return partitionNamespace(env, ctx).getByName(doName);
+	const options = stubOptions(ctx);
+	return options === undefined ? partitionNamespace(env, ctx).getByName(doName) : partitionNamespace(env, ctx).getByName(doName, options);
 }
 
 export function txCoordinatorStub(
@@ -44,6 +50,8 @@ export function txCoordinatorStub(
 	doId: DurableObjectId | string,
 ): DurableObjectStub<TransactionCoordinatorDO> {
 	const ns = txCoordinatorNamespace(env, ctx);
+	const targetId = typeof doId === "string" ? ns.idFromString(doId) : doId;
+	const options = stubOptions(ctx);
 	// A string is the stringified form of an id, never a name: no caller resolves a coordinator by name.
-	return ns.get(typeof doId === "string" ? ns.idFromString(doId) : doId);
+	return options === undefined ? ns.get(targetId) : ns.get(targetId, options);
 }

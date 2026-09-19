@@ -42,6 +42,12 @@ export type PartitionContext = {
 	jurisdiction?: DurableObjectJurisdiction;
 
 	/**
+	 * The location hint for Durable Objects of this table. It is best-effort placement advice
+	 * for the first time each object spawns. It is not part of the identity of an object.
+	 */
+	locationHint?: DurableObjectLocationHint;
+
+	/**
 	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
 	 */
 	rootTreesN: number;
@@ -180,7 +186,8 @@ export function areMutableOptionsEqual(opts1: PartitionContext, opts2: Partition
 		opts1.rangeSplitConditions?.maxSizeMb === opts2.rangeSplitConditions?.maxSizeMb &&
 		opts1.rangeSplitConditions?.maxItems === opts2.rangeSplitConditions?.maxItems &&
 		opts1.rangeAncestorsConfig?.fromRoot === opts2.rangeAncestorsConfig?.fromRoot &&
-		opts1.rangeAncestorsConfig?.fromLeaf === opts2.rangeAncestorsConfig?.fromLeaf
+		opts1.rangeAncestorsConfig?.fromLeaf === opts2.rangeAncestorsConfig?.fromLeaf &&
+		opts1.locationHint === opts2.locationHint
 	);
 }
 
@@ -196,6 +203,7 @@ export class PartitionContextCreator {
 		rangeSplitConditions?: SplitConditions;
 		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
 		jurisdiction?: DurableObjectJurisdiction;
+		locationHint?: DurableObjectLocationHint;
 	}): PartitionContext {
 		// Assert the input options and default to reasonable values if not provided.
 		if (!opts.rangeSplitConditions) {
@@ -272,9 +280,6 @@ export class PartitionContextCreator {
 			schema: 1,
 			ns: opts.ns,
 			nsTx: opts.nsTx,
-			// A table that selects no jurisdiction stores a context byte-identical to one built without
-			// the option, so an existing record and a new one compare equal.
-			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
 			tableName: opts.tableName,
 			rootTreesN: opts.rootTreesN,
 			hashSplitN: opts.hashSplitN,
@@ -282,6 +287,10 @@ export class PartitionContextCreator {
 			hashSplitConditions: opts.hashSplitConditions,
 			rangeSplitConditions: opts.rangeSplitConditions,
 			rangeAncestorsConfig: opts.rangeAncestorsConfig,
+			// A table that selects no jurisdiction stores a context byte-identical to one built without
+			// the option, so an existing record and a new one compare equal.
+			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
+			...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
 		};
 		return context;
 	}

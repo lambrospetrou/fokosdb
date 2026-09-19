@@ -15,7 +15,7 @@ function fakeNamespace() {
 	};
 }
 
-function makeEnv(jurisdiction?: DurableObjectJurisdiction) {
+function makeEnv(jurisdiction?: DurableObjectJurisdiction, locationHint?: DurableObjectLocationHint) {
 	const partitionNs = fakeNamespace();
 	const coordinatorNs = fakeNamespace();
 	const partitionSub = fakeNamespace();
@@ -31,6 +31,7 @@ function makeEnv(jurisdiction?: DurableObjectJurisdiction) {
 		hashSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 100 },
 		...(jurisdiction === undefined ? {} : { jurisdiction }),
+		...(locationHint === undefined ? {} : { locationHint }),
 	});
 	return { env, ctx, partitionNs, coordinatorNs, partitionSub, coordinatorSub };
 }
@@ -126,5 +127,18 @@ describe("stub helpers", () => {
 		expect(coordinatorNs.idFromString).toHaveBeenCalledWith("abc");
 		expect(coordinatorNs.get).toHaveBeenCalledTimes(1);
 		expect(coordinatorNs.get).toHaveBeenCalledWith("id-from-string:abc");
+	});
+
+	it("stub helpers pass locationHint to get and getByName when configured", () => {
+		const { env, ctx, partitionNs, coordinatorNs } = makeEnv(undefined, "weur");
+
+		expect(partitionStubByName(env, ctx, "p0")).toBe("stub-by-name:p0");
+		expect(partitionNs.getByName).toHaveBeenCalledWith("p0", { locationHint: "weur" });
+
+		expect(partitionStub(env, ctx, doId)).toBe(`stub-by-id:${String(doId)}`);
+		expect(partitionNs.get).toHaveBeenCalledWith(doId, { locationHint: "weur" });
+
+		expect(txCoordinatorStub(env, ctx, doId)).toBe(`stub-by-id:${String(doId)}`);
+		expect(coordinatorNs.get).toHaveBeenCalledWith(doId, { locationHint: "weur" });
 	});
 });

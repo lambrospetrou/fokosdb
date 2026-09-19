@@ -324,6 +324,7 @@ export class FokosDB {
 		this.#staticShardedTCs = new StaticShardedDO(txCoordinatorNamespace(env, partitionContext), {
 			numShards: this.#options.numTxCoordinators,
 			shardGroupName: `fokos_tc.${partitionContext.tableName}`,
+			...(partitionContext.locationHint === undefined ? {} : { shardLocationHintFn: () => partitionContext.locationHint }),
 		});
 	}
 

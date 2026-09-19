@@ -81,7 +81,7 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
 - Cleanup the public API, both for `do-partition.ts` and `db.ts`.
 - Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
-- Decide how to handle location hints for root partitions and transaction coordinators. Child partitions should stay close to the root for faster forwarding and migrations. `transactGetItems` runs its two-phase driver in the caller Worker; add an option to run it through a coordinator placed close to the partitions when the Worker is far from them.
+- Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion using Durable Object bookmarks.
 - User provided code running inside the DO for N+1 operations. ONLY for library or self-hosted mode where the user controls the Durable Object class used, otherwise we would need Dynamic Workers and the `pipe()` operator.

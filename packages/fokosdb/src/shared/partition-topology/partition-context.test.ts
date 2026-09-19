@@ -58,6 +58,22 @@ describe("areMutableOptionsEqual — rangeAncestorsConfig", () => {
 	});
 });
 
+describe("areMutableOptionsEqual — locationHint", () => {
+	it("treats equal location hints as equal", () => {
+		const ctx1 = PartitionContextCreator.create(makeOpts({ locationHint: "weur" }));
+		const ctx2 = PartitionContextCreator.create(makeOpts({ locationHint: "weur" }));
+		expect(areMutableOptionsEqual(ctx1, ctx2)).toBe(true);
+	});
+
+	it("treats different location hints as unequal", () => {
+		const ctx1 = PartitionContextCreator.create(makeOpts({ locationHint: "weur" }));
+		const ctx2 = PartitionContextCreator.create(makeOpts({ locationHint: "eeur" }));
+		const ctxNone = PartitionContextCreator.create(makeOpts());
+		expect(areMutableOptionsEqual(ctx1, ctx2)).toBe(false);
+		expect(areMutableOptionsEqual(ctx1, ctxNone)).toBe(false);
+	});
+});
+
 describe("PartitionContextCreator.create option errors", () => {
 	it.each([
 		["rootTreesN", { rootTreesN: 0 }, 0],
