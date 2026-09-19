@@ -1,0 +1,10 @@
+{
+	"extends": "../../packages/fokosdb/tsconfig.json",
+	"compilerOptions": {
+		"types": ["node"]
+	},
+	// Reuses fokosdb's own generated Workers runtime globals (DurableObjectNamespace and friends):
+	// `fokosdb/client`'s bundled .d.ts references them even from the types this package never touches,
+	// since tsdown bundles the whole package into one declaration file.
+	"include": ["./**/*.ts", "../../packages/fokosdb/worker-configuration.d.ts"]
+}
