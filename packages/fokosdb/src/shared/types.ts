@@ -31,9 +31,39 @@ export type DataKind = (typeof DATA_KINDS)[number]; // "bytes" | "text" | "json"
 
 export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
 
+/**
+ * Empty by default, so `HashKey`/`SortKey` below are `string | Uint8Array` for every caller. An
+ * application that only ever uses one of the two can narrow both across its whole codebase — every
+ * FokosDB method, and every type this package exports that carries a key — by augmenting this
+ * interface once, via TypeScript module augmentation on the client entry point:
+ *
+ * ```ts
+ * import "fokosdb/client";
+ *
+ * declare module "fokosdb/client" {
+ *   interface FokosTypeOverrides {
+ *     HashKey: string;
+ *     SortKey: string;
+ *   }
+ * }
+ * ```
+ *
+ * The `import` line is not optional: without it, this file has no top-level import/export, so
+ * TypeScript treats the `declare module` block as a brand new ambient module instead of an
+ * augmentation of the real one — silently replacing every other export of "fokosdb/client" with
+ * nothing but this interface.
+ *
+ * This is a compile-time narrowing only: `putItem`/`getItem`/etc. still accept and validate
+ * `string | Uint8Array` at runtime regardless of this interface.
+ */
+export interface FokosTypeOverrides {}
+
+export type HashKey = FokosTypeOverrides extends { HashKey: infer H } ? H : string | Uint8Array;
+export type SortKey = FokosTypeOverrides extends { SortKey: infer S } ? S : string | Uint8Array;
+
 export type ConditionCheckImageOf<D> = {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
+	hashKey: HashKey;
+	sortKey?: SortKey;
 	data: D;
 	kind: DataKind;
 	version: number;
@@ -72,8 +102,8 @@ export interface ItemDeleter {
 }
 
 export type PutItemOptions = {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
+	hashKey: HashKey;
+	sortKey?: SortKey;
 
 	/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
 	ttlAt?: number;
@@ -86,8 +116,8 @@ export type PutItemOptions = {
 };
 
 export type DeleteItemOptions = {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
+	hashKey: HashKey;
+	sortKey?: SortKey;
 
 	condition?: ConditionExpression;
 
@@ -95,8 +125,8 @@ export type DeleteItemOptions = {
 };
 
 export type ItemKey = {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
+	hashKey: HashKey;
+	sortKey?: SortKey;
 };
 
 export type PutItemResult = {
@@ -139,8 +169,8 @@ export interface ItemGetter {
 }
 
 export type GetItemOptions = {
-	hashKey: string | Uint8Array;
-	sortKey?: string | Uint8Array;
+	hashKey: HashKey;
+	sortKey?: SortKey;
 	/** The read returns a flat record in `data`, with `kind: "projected"`, in place of the complete item. */
 	projection?: readonly ProjectionExpression[];
 };
@@ -206,14 +236,14 @@ export type OperationMetrics = {
 // ─── queryItems public API ────────────────────────────────────────────────────
 
 export type SortKeyCondition =
-	| { op: "eq"; value: string | Uint8Array }
-	| { op: "lt" | "lte" | "gt" | "gte"; value: string | Uint8Array }
-	| { op: "between"; lower: string | Uint8Array; upper: string | Uint8Array }
-	| { op: "begins_with"; prefix: string | Uint8Array }
+	| { op: "eq"; value: SortKey }
+	| { op: "lt" | "lte" | "gt" | "gte"; value: SortKey }
+	| { op: "between"; lower: SortKey; upper: SortKey }
+	| { op: "begins_with"; prefix: SortKey }
 	| {
 			op: "range";
-			lower?: { value: string | Uint8Array; inclusive: boolean };
-			upper?: { value: string | Uint8Array; inclusive: boolean };
+			lower?: { value: SortKey; inclusive: boolean };
+			upper?: { value: SortKey; inclusive: boolean };
 	  };
 
 export interface ItemQuerier {
@@ -226,7 +256,7 @@ export type QuerySelect = "projection" | "count";
 
 // The field names what the list contains: `queries` here, `items` on the two transaction methods.
 export type QueryItemsOptions = {
-	queries: Array<{ hashKey: string | Uint8Array; sortKeyCondition?: SortKeyCondition; scanIndexForward?: boolean }>;
+	queries: Array<{ hashKey: HashKey; sortKeyCondition?: SortKeyCondition; scanIndexForward?: boolean }>;
 	/** Evaluated items per page. Defaults to DEFAULT_EVALUATED_ITEMS_PER_PAGE, clamped to MAX_EVALUATED_ITEMS_PER_PAGE. */
 	limit?: number;
 	/** Materialized item bytes per page. Defaults to DEFAULT_RESPONSE_BYTES_PER_PAGE, clamped to MAX_RESPONSE_BYTES_PER_PAGE. */

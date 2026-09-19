@@ -1,6 +1,6 @@
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { validateKeyContent } from "../shared/transaction-limits.js";
-import type { QueryItemsOptions } from "../shared/types.js";
+import type { HashKey, QueryItemsOptions, SortKey } from "../shared/types.js";
 
 type QuerySpec = QueryItemsOptions["queries"][number];
 
@@ -16,12 +16,9 @@ export class FokosStd {
 	 * Returns `undefined` when no such key exists: an empty prefix (every key begins with it), a string
 	 * of only U+10FFFF, or bytes of only 0xFF. A query for the keys after such a prefix has no upper bound.
 	 */
-	static sortKeySuccessor(prefix: string): string | undefined;
-	static sortKeySuccessor(prefix: Uint8Array): Uint8Array | undefined;
-	static sortKeySuccessor(prefix: string | Uint8Array): string | Uint8Array | undefined;
-	static sortKeySuccessor(prefix: string | Uint8Array): string | Uint8Array | undefined {
+	static sortKeySuccessor<K extends SortKey>(prefix: K): K | undefined {
 		validateKeyContent("sortKey", prefix);
-		return KeyCodec.publicSuccessor(prefix);
+		return KeyCodec.publicSuccessor(prefix) as K | undefined;
 	}
 
 	/**
@@ -36,11 +33,7 @@ export class FokosStd {
 	 * An empty prefix matches every sort key, so its complement is empty and the result is `[]`.
 	 * `queryItems` rejects an empty `queries` list; add the result to other sub-queries or check its length.
 	 */
-	static notBeginsWith(
-		hashKey: string | Uint8Array,
-		sortKeyPrefix: string | Uint8Array,
-		options?: { scanIndexForward?: boolean },
-	): QuerySpec[] {
+	static notBeginsWith(hashKey: HashKey, sortKeyPrefix: SortKey, options?: { scanIndexForward?: boolean }): QuerySpec[] {
 		if (sortKeyPrefix.length === 0) {
 			return [];
 		}

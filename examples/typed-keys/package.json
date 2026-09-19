@@ -1,0 +1,17 @@
+{
+	"name": "@fokosdb-example/typed-keys",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"test": "tsc --noEmit"
+	},
+	"dependencies": {
+		"fokosdb": "workspace:*"
+	},
+	"devDependencies": {
+		"@types/node": "^25.6.0",
+		"typescript": "^5.9.3"
+	}
+}

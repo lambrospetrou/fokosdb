@@ -21,8 +21,10 @@ export type {
 	DecodedItemData,
 	DeleteItemOptions,
 	DeleteItemResult,
+	FokosTypeOverrides,
 	GetItemOptions,
 	GetItemResult,
+	HashKey,
 	ItemDeleter,
 	ItemGetter,
 	ItemKey,
@@ -42,6 +44,7 @@ export type {
 	ReadItem,
 	ReadItemValue,
 	ReturnValuesOnConditionCheckFailure,
+	SortKey,
 	SortKeyCondition,
 } from "../shared/types.js";
 

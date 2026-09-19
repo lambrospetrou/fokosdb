@@ -9,6 +9,7 @@ import {
 	EncodedItemData,
 	GetItemOptions,
 	GetItemResult,
+	HashKey,
 	JsonComposite,
 	JsonValue,
 	OperationMetrics,
@@ -21,6 +22,7 @@ import {
 	QueryItemsProjectedResult,
 	QueryItemsResult,
 	QuerySelect,
+	SortKey,
 } from "../shared/types.js";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
 import { partitionStub, partitionStubByName } from "../shared/do-stubs.js";
@@ -180,7 +182,7 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
 function conditionCheckError(
-	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
+	keys: { hashKey: HashKey; sortKey?: SortKey },
 	res: { reason: RejectionReasonEncoded; meta: OperationMetrics & PartitionInfoInternal },
 ): FokosConditionCheckError {
 	const reason = decodeRejectionReason(res.reason);

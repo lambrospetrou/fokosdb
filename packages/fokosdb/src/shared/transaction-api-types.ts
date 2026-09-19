@@ -7,6 +7,7 @@ import type { FokosErrorCode } from "./errors-operations.js";
 import type { ConditionExpression, ProjectionExpression, UpdateExpression } from "./expression/types.js";
 import type {
 	ConditionCheckImage,
+	HashKey,
 	ItemDeleter,
 	ItemGetter,
 	ItemKey,
@@ -15,6 +16,7 @@ import type {
 	JsonComposite,
 	ReadItem,
 	ReturnValuesOnConditionCheckFailure,
+	SortKey,
 } from "./types.js";
 
 // ─── Transaction identity ─────────────────────────────────────────────────────
@@ -30,38 +32,38 @@ export type IdempotencyToken = string;
 // Result/OUT type: keys are decoded to the public form (string for UTF-8, Uint8Array for binary) by
 // the producing participant, so rejections are user-readable and JSON-serializable for the TC.
 export type RejectionReasonOf<I = ConditionCheckImage> =
-	| { code: "condition_failed"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; item?: I }
-	| { code: "timestamp_conflict"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { code: "condition_failed"; hashKey: HashKey; sortKey?: SortKey; item?: I }
+	| { code: "timestamp_conflict"; hashKey: HashKey; sortKey?: SortKey }
 	| {
 			code: "pending_conflict";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			conflictingTransactionId: TransactionId;
 	  }
 	/** The transaction timestamp is too far ahead of the clock of the partition that owns the operation. */
 	| {
 			code: "clock_skew";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			/** Both timestamps are in the transaction order unit: the partition wall clock and the transaction timestamp. */
 			serverTimestampMicros: number;
 			transactionTimestampMicros: number;
 	  }
-	| { code: "update_not_applicable"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { code: "update_not_applicable"; hashKey: HashKey; sortKey?: SortKey }
 	/**
 	 * A `set` value evaluated to bytes for this item, and a JSON document cannot hold bytes. It is one
 	 * cause of an inapplicable update, reported on its own because the caller can act on it: a key
 	 * reference is a valid update value for a text key and not for a binary one, and a SQLite function
 	 * can return a blob for one item and text for the next.
 	 */
-	| { code: "update_value_is_bytes"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
-	| { code: "item_too_large"; hashKey: string | Uint8Array; sortKey?: string | Uint8Array }
+	| { code: "update_value_is_bytes"; hashKey: HashKey; sortKey?: SortKey }
+	| { code: "item_too_large"; hashKey: HashKey; sortKey?: SortKey }
 	/**
 	 * The partition that owns the operation could not run it: the error it raised, or no answer at all.
 	 * Every operation of that partition carries the same code and the same `error_id`, which names the
 	 * error in the logs.
 	 */
-	| { code: ExecutionFailureCode; hashKey: string | Uint8Array; sortKey?: string | Uint8Array; error_id: string };
+	| { code: ExecutionFailureCode; hashKey: HashKey; sortKey?: SortKey; error_id: string };
 
 /** The codes of the rejections that say a premise of an operation did not hold. */
 export type PremiseRejectionCode =
@@ -113,8 +115,8 @@ export type TransactWriteOperationResult =
 export type TransactWriteItem =
 	| {
 			operation: "put";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			data: string | Uint8Array | JsonComposite;
 			/** Epoch UTC seconds. Reads can return the item after this instant until background deletion. */
 			ttlAt?: number;
@@ -123,15 +125,15 @@ export type TransactWriteItem =
 	  }
 	| {
 			operation: "delete";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			condition?: ConditionExpression;
 			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	  }
 	| {
 			operation: "check";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			/** A check must have one condition because it does not write. */
 			condition: ConditionExpression;
 			returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
@@ -143,8 +145,8 @@ export type TransactWriteItem =
 			 * operation must instead fail on an absent item.
 			 */
 			operation: "update";
-			hashKey: string | Uint8Array;
-			sortKey?: string | Uint8Array;
+			hashKey: HashKey;
+			sortKey?: SortKey;
 			update: UpdateExpression;
 			ttlAt?: number;
 			condition?: ConditionExpression;
