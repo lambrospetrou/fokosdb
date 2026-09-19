@@ -4,14 +4,182 @@
 **Date:** 2026-09-09
 **Author:** Lambros Petrou
 
-**Status:** Nothing is built. This document defines the abstraction. The existing behavior it must preserve is
-recorded in `docs/ideas/fokos-sharding/gptsol-existing-behavior.md` and
-`docs/ideas/fokos-sharding/gemini-existing-flows-spec.md`.
+**Status:** The repartition state machine, the migration protocol, the control RPCs, and the read-through of
+this document are built inside `PartitionDO` by `docs/agent-plans/2026-09-17-unified-repartition-flow.md`.
+The runtime object, the dispatch pipeline, the context split, the package entry, and the example host are
+not built. Section 1a records the decisions of the 2026-09-19 review. Where a later section disagrees with
+section 1a, section 1a wins. The next document is the implementation spec, and it derives from this document
+as amended by section 1a.
+
+---
+
+## 1a. Decisions of the 2026-09-19 review
+
+Each entry names the sections it changes. The implementation spec must follow these entries and not the
+original text of those sections.
+
+### Decided
+
+**D1. No lease mode.** §5.2.5, §5.2.14, §5.2.20, §5.3.7. `localConcurrency` and the `concurrency` field of
+`FokosJob` are removed. Every `local` handler and every `runStep` is synchronous. The runtime throws
+`fokos_local_must_be_sync` when either returns a thenable. A host job that must await, for example the
+stale-transaction recovery that asks the coordinator, awaits first and then calls `dispatch`; each `dispatch`
+resolves owners on entry, so there is no "resolve, await, write" sequence. The shared and exclusive lease,
+writer preference, and the re-entrancy question are gone.
+
+**D2. The envelope reaches the coordinator.** §3, §5.2.8, §5.2.22. Every `dispatch` returns a
+`FokosEnvelope<T>`, including the transaction operations. `TransactionCoordinatorDO` and `db.ts` unwrap the
+envelope. The scope section changes: the coordinator wire types change to carry the envelope; the coordinator
+state machine and the 2PC protocol do not change. This is what makes transaction fan-out learn routes.
+
+**D3. Read-through in `awaiting_data` and `importing`.** §5.2.6 step 2. A `read_source` operation reads
+through the source in both states. The source answers `repartition_not_cut_over` from its own row while it is
+still `queued` or `planned`. A `retry` operation throws the retryable importing error in both states. This is
+the shipped rule.
+
+**D4. No in-memory mirror.** §5.2.3, §5.2.21. The runtime does not load repartition rows or route overrides in
+its constructor and keeps no copy of them. SQL is authoritative; a point lookup is one indexed seek. The
+runtime caches only the identity, the policy, the import record, the split row and its at most 255 targets.
+
+**D5. Arbitration as shipped.** §5.2.10, §5.2.11, §5.2.15, §5.3.8. The source states are
+`queued → planned → cutover → completed → cleaned`. An unfinished promotion (`queued`, `planned`, `cutover`)
+blocks a hash split; a hash split row in any state blocks a promotion. There is no `abandoned` state and no
+`fokosInit` takeover of an `awaiting_data` target. The plan and every target row are persisted at `planned`
+before any `fokosInit`, so a range split retry reuses its targets. §5.3.8 is closed.
+
+**D6. Paginated status and a destroy fence.** §5.2.15, §5.2.16. `FokosStatus` with a `links` array is
+replaced by the shipped `fokosStatus(req)` page over `(seq, targetIndex)`, `fokosPrepareDestroy`, and the
+`__fokos/destroying` fence. `FokosRouter.walk` follows the pages.
+
+**D7. Jurisdiction is topology.** §5.2.2. `FokosTopology` gains `jurisdiction?: DurableObjectJurisdiction`.
+It is immutable and part of the identity check. `namespace(ctx)` returns the jurisdiction-bound namespace.
+
+**D8. Storage ownership by convention.** §5.2.3, milestone 5. Every SQL table with the prefix `fokos_` and
+every KV key under `__fokos/` belongs to the runtime. The runtime has its own store class that owns those
+statements and runs its own migrations in the runtime constructor, before the host runs its migrations. The
+host must not name a `fokos_` table in a migration or a statement. `PartitionStore` drops those statements.
+
+**D9. One page in flight.** §5.2.12, §5.2.20. No prefetch. A target pulls one page, commits it with its
+cursor, and then pulls the next. The source owns the page budget as one constant; the request carries none.
+There is no halved-budget retry.
+
+**D10. `forward` has a default.** §5.2.5. When a descriptor omits `forward`, the runtime calls the method of
+the same name on the target stub with the derived route context and the request. A host overrides it only
+when the remote method differs.
+
+**D11. Scheduler: no adapter, one job registry.** §5.2.14, §5.3.6. The runtime owns the Durable Object alarm
+and the host delegates `alarm()`. `FokosScheduler` and the Agents SDK adapter are removed. The host registers
+its background jobs as `FokosJob` entries; the runtime runs its own jobs first and then the host jobs, in
+registration order, one pass at a time. `runtime.scheduleJob(name, runAt)` remains.
+
+**D12. Errors: a sharding error module that extends `FokosError`.** §5.2.17, §5.2.22. `shared/errors.ts`
+stays the base. The sharding directory adds its own error module with its own codes, in the same way that the
+operation errors extend the base. The shipped codes `repartition_not_cut_over`, `repartition_unknown`,
+`repartition_target_unknown`, and `repartition_slice_reclaimed` move there unchanged. New codes are added
+only for what the runtime adds, for example the identity mismatch and the out-of-range check. The mapping of
+`repartition_not_cut_over` to `partition_migrating` in `withFokosErrors` stays. The rename table of §5.2.22
+is dropped.
+
+**D13. Hook names, budgets, and retry timings as shipped.** §5.2.4, §5.2.10, §5.2.12. The host boundary is
+`MigrationHost` with `buildPage`, `applyPage`, and `validatePage`. There is no `finalizeImport`: the host
+maintains its derived state page by page. The source retries at 5 s with a 5 min cap, a lock-blocked promotion
+at a flat 5 s with a wake on lock release, and cleanup at 5 s. The target retries at 10 s with a 5 min cap and
+a flat 10 s on `repartition_not_cut_over`.
+
+**D14. Core hooks now, extensions later.** §5.2.4. The first spec keeps the hooks the shipped flow has:
+`evaluateSplit`, `computeRangeBoundaries`, `MigrationHost`, `beforeCutover` (the lock check),
+`beforeComplete` (the pending-row delete), `cleanupSourceStep`, `admit`, and `jobs`. The following move to a
+"Future extensions" section of the spec with a stated purpose and no design yet: a hook before and after every
+incoming request, a runtime-to-host event stream for metrics and lifecycle events (`onLifecycleEvent`,
+`afterRequest`), `beforeDestroy`, and `logParams`. The extension hooks are designed for the hosts of D19.
+
+**D15. Bounds.** §5.2.2. `rootTreesN` is 1 to 65,000, as `PartitionContextCreator` enforces.
+
+**D16. Package boundary.** §5.3.1. A new entry of the `fokosdb` package, built from a new directory beside
+`client/` and `server/`. Everything that belongs to sharding lives in that directory: the runtime, the
+repartition flow, the topology caches, the ID codec, the route context, the sharding store, the sharding
+errors, the Worker-side router, and the example host tests. The directory and the entry take the name
+`sharding` until the spec fixes the final name. The `check-client-bundle` guard gains a second rule: the
+sharding entry must not reach `src/server/` or a FokosDB module.
+
+**D17. Milestone order: in place, move first.** §4. The runtime is not built beside `PartitionDO` and then
+swapped in. Each stage moves existing code and adapts it, so no code is written twice:
+
+1. Move all sharding code into the new directory. Add the entry and the build guard. No behavior change.
+2. Split `PartitionContext` into identity, topology, and policy (`FokosRouteContext`). Add D7.
+3. Build the runtime object, `dispatch`, owner resolution, and the shapes. Convert `PartitionDO` one
+   operation at a time; each conversion is one reviewable chunk. Apply D2 when the transaction operations
+   convert.
+4. The flow drops `PartitionStore` for the sharding store of D8.
+5. The example host, the property test, and the independence guard.
+
+**D18. Ownership rules are built in.** §3, §5.3.5. The hash tree and the range tree are the only two
+ownership rules, and they stay internal. No strategy interface is published. A host that models its data as
+hash key plus sort key uses both rules as they are.
+
+**D19. The second hosts.** §5.3, §8. The hosts this runtime is designed for, after FokosDB, are the GSI
+forwarders and a sharded free-text search index. Both model their data as hash key plus sort key. The
+extension hooks of D14 are shaped for them but are not in the first spec.
+
+**D20. Header and references.** The status header is corrected above. `partition-peer.ts` and
+`partition-errors.ts` no longer exist and leave §9.
+
+**D21. The scan shape.** §5.2.5 `scan`, §5.2.22 `walkRangeChildren`. The original `clip` and `fold` cannot
+express what `walkRangeChildren` does today: skip a child that lies before the resume cursor, give the cursor
+only to the child that contains it, emit a cursor only when a later child can contribute, and build a
+boundary cursor when the visit budget ends. The runtime keeps the loop, the interval intersection, and the
+ordering; the host takes every decision on its own types through two enriched callbacks:
+
+```ts
+type ScanChild = { ref: FokosPartitionRef; start: KeyBytes | null; end: KeyBytes | null };
+
+scan(req: Req): { hashKey: KeyBytes; start: KeyBytes | null; end: KeyBytes | null; descending: boolean };
+/** The request for one child, or null to skip that child. The cursor goes only to the child that holds it. */
+clip(req: Req, child: ScanChild): Req | null;
+fold(acc: Res | null, part: Res, req: Req, ctx: { child: ScanChild; hasLaterChild: boolean }):
+	{ acc: Res; remaining: Req | null };
+```
+
+The runtime resolves the router, intersects its ordered children with the `scan` interval, orders them by
+direction, and calls `clip` for every candidate before the first forward. `clip` is pure, so the runtime
+knows `hasLaterChild` exactly. It then forwards each kept child in order with the clipped request and calls
+`fold` after each one. `remaining` is the request for the next `clip`; the host carries its budgets inside
+it. `ctx.child` carries the interval, so the host can build a boundary cursor. The spec must show
+`walkRangeChildren` and the read-through clip of `fokosExecuteLocal` written with these callbacks.
+
+**D22. The primitive API is public, and the shapes are built on it.** §5.2.4, §5.2.5, §5.2.7. A host that
+needs a traversal no shape offers must not go around the runtime. The runtime therefore exposes the calls the
+shapes are made of:
+
+```ts
+identity(): FokosPartitionIdentity;
+lifecycle(): FokosLifecycle;
+owns(key: RouteKey): boolean;
+resolveOwner(key: RouteKey): FokosOwner;
+/** This router's targets in `target_index` order, with their intervals. Empty on an owner. */
+children(): ScanChild[];
+/** Forward one registered operation to one target: derives the route context, calls the stub, learns the caches, counts the hop. */
+forward<Res>(target: FokosPartitionRef, op: string, req: unknown): Promise<FokosEnvelope<Res>>;
+```
+
+The topology is a tree and every node runs the same class, so any traversal is a recursive operation: the
+host registers an operation with `shape: "local"`, and its handler does its local part, reads `children()`,
+forwards the same operation to the children it selects with `forward`, and merges the envelopes. Pre-order,
+post-order, parallel or sequential visits, early exit, and a different clip per child are all host code. The
+`scan` shape is that recursion with the ordered interval walk written once, and it stays in the runtime
+because FokosDB and both hosts of D19 need it. `forward` is the only way a host reaches another partition;
+the host creates no stub of its own. Whole-tree traversals from the Worker use `FokosRouter.allRoots()` and
+the `fokosStatus` pages of D6, as destroy does.
+
+### To settle in the spec
+
+Nothing is open. The spec fixes the name of D16 and shows the two rewrites that D21 requires.
 
 ---
 
 ## 1. Table of Contents
 
+- [1a. Decisions of the 2026-09-19 review](#1a-decisions-of-the-2026-09-19-review)
 - [1. Table of Contents](#1-table-of-contents)
 - [2. Overview and Context](#2-overview-and-context)
 - [3. Goals and Requirements](#3-goals-and-requirements)
@@ -1795,9 +1963,12 @@ The runtime finds the intersection between the query interval from `scan(req)` a
 
 - `docs/ideas/fokos-sharding/gptsol-existing-behavior.md`
 - `docs/ideas/fokos-sharding/gemini-existing-flows-spec.md`
+- `docs/agent-plans/2026-09-17-unified-repartition-flow.md`
 - `packages/fokosdb/src/server/do-partition.ts`
-- `packages/fokosdb/src/shared/partition/partition-peer.ts`
-- `packages/fokosdb/src/shared/partition-errors.ts`
+- `packages/fokosdb/src/shared/partition/repartition/repartition-flow.ts`
+- `packages/fokosdb/src/shared/partition/repartition/repartition-types.ts`
+- `packages/fokosdb/src/shared/partition/fokos-migration-host.ts`
+- `packages/fokosdb/src/shared/errors.ts`
 - `packages/fokosdb/src/shared/partition-topology/partition-context.ts`
 - `packages/fokosdb/src/shared/partition-topology/partition-id.ts`
 - [Rules of Durable Objects](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/)
