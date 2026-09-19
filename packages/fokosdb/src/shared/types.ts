@@ -38,6 +38,8 @@ export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
  * interface once, via TypeScript module augmentation on the client entry point:
  *
  * ```ts
+ * import "fokosdb/client";
+ *
  * declare module "fokosdb/client" {
  *   interface FokosTypeOverrides {
  *     HashKey: string;
@@ -45,6 +47,11 @@ export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
  *   }
  * }
  * ```
+ *
+ * The `import` line is not optional: without it, this file has no top-level import/export, so
+ * TypeScript treats the `declare module` block as a brand new ambient module instead of an
+ * augmentation of the real one — silently replacing every other export of "fokosdb/client" with
+ * nothing but this interface.
  *
  * This is a compile-time narrowing only: `putItem`/`getItem`/etc. still accept and validate
  * `string | Uint8Array` at runtime regardless of this interface.
