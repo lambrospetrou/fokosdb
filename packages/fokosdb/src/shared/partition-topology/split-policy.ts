@@ -2,7 +2,13 @@ import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { hashChildIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
-import { isHashPartition, isRangePartition, PartitionContextLivePartition, type PartitionContextResolved } from "./partition-context.js";
+import {
+	areImmutableOptionsEqual,
+	isHashPartition,
+	isRangePartition,
+	PartitionContextLivePartition,
+	type PartitionContextResolved,
+} from "./partition-context.js";
 import { PartitionIdHelper, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import invariant from "../invariant.js";
 import type { PartitionInfoInternal, RangeAncestorInfo } from "./types.js";
@@ -87,6 +93,8 @@ export interface PartitionTopologySplitter {
 		toCtx: PartitionContextResolved,
 		responsePartitionInfo: PartitionInfoInternal,
 	): void;
+
+	updatePartitionContext(partitionContext: PartitionContextLivePartition): void;
 }
 
 // The fraction of hashSplitConditions.maxSizeMb that one key must reach to become a promotion candidate.
@@ -122,6 +130,17 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		if (snapshot) {
 			this.#_hashTopology = HashTopology.fromSnapshot(snapshot);
 		}
+	}
+
+	updatePartitionContext(partitionContext: PartitionContextLivePartition): void {
+		invariant(isHashPartition(partitionContext), "fokos/topology: HashPartitionTopologyImpl requires a hash partition context");
+		invariant(
+			areImmutableOptionsEqual(this.partitionContext, partitionContext) &&
+				this.partitionContext.partitionId === partitionContext.partitionId &&
+				this.partitionContext.doName === partitionContext.doName,
+			"fokos/topology: HashPartitionTopologyImpl partition identity changed",
+		);
+		this.partitionContext = partitionContext;
 	}
 
 	/**
@@ -261,6 +280,10 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 }
 
+function sameOptionalKey(a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean {
+	return a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
+}
+
 /**
  * Topology splitter for range-structure DOs. A range DO owns exactly one hashKey and a fixed,
  * immutable [startBoundary, endBoundary) slice of the sortKey axis. On split it becomes a pure
@@ -282,6 +305,20 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		this.#storage = ctx.storage;
 		this.#partitionStore = partitionStore;
 		this.#routing = routing;
+	}
+
+	updatePartitionContext(partitionContext: PartitionContextLivePartition): void {
+		invariant(isRangePartition(partitionContext), "fokos/topology: RangePartitionTopologyImpl requires a range partition context");
+		invariant(
+			areImmutableOptionsEqual(this.partitionContext, partitionContext) &&
+				this.partitionContext.partitionId === partitionContext.partitionId &&
+				this.partitionContext.doName === partitionContext.doName &&
+				sameOptionalKey(this.partitionContext.rangePartition.hashKey, partitionContext.rangePartition.hashKey) &&
+				sameOptionalKey(this.partitionContext.rangePartition.startBoundary, partitionContext.rangePartition.startBoundary) &&
+				sameOptionalKey(this.partitionContext.rangePartition.endBoundary, partitionContext.rangePartition.endBoundary),
+			"fokos/topology: RangePartitionTopologyImpl partition identity changed",
+		);
+		this.partitionContext = partitionContext;
 	}
 
 	shouldAllow(_hashKey: KeyBytes, sortKey: KeyBytes | undefined, intent: OperationIntent): RoutingDecision {

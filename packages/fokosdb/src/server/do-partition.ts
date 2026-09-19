@@ -1323,31 +1323,36 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			tasks.push(this.getChildStub(childPCtx).txCommit(childPCtx, { ...request, items }));
 		}
 		const localResult = local.length > 0 ? this.#participant.commitLocal({ ...request, items: local }) : undefined;
-		const childResults = await Promise.allSettled(tasks);
-
 		if (localResult) {
-			// Transactional writes grow a partition exactly as apiPutItem does, so they have to be able
-			// to queue a split too — the background job only RUNS a split that is already queued, it
-			// never queues one. Without this, a workload that writes only through transactions grows
-			// without ever splitting.
-			//
-			// This block absorbs a throw. The coordinator has already decided this transaction and the
-			// items are already applied, so a failed commit would wedge a decided transaction over
-			// bookkeeping that the next write repeats.
-			try {
-				this.wakeLockBlockedPromotion();
-				await this.drainPromotionCandidates(pCtx, localResult.promotionCandidates);
-				await this.checkSplits(pCtx);
-			} catch (error) {
-				console.error({
-					...this.logParams(),
-					message: "fokos/partition.commit: split check failed after the transaction applied.",
-					transactionId: request.transactionId,
-					error: String(error),
-					errorProps: error,
-				});
-			}
+			this.ctx.waitUntil(
+				(async () => {
+					// Transactional writes grow a partition, so they have to be able
+					// to queue a split too — the background job only RUNS a split that is already queued, it
+					// never queues one. Without this, a workload that writes only through transactions grows
+					// without ever splitting.
+					//
+					// This block absorbs a throw. The coordinator has already decided this transaction and the
+					// items are already applied, so a failed commit would wedge a decided transaction over
+					// bookkeeping that the next write repeats.
+					try {
+						this.wakeLockBlockedPromotion();
+						await this.drainPromotionCandidates(pCtx, localResult.promotionCandidates);
+						await this.checkSplits(pCtx);
+					} catch (error) {
+						console.error({
+							...this.logParams(),
+							message: "fokos/partition.commit: split check failed after the transaction applied.",
+							transactionId: request.transactionId,
+							error: String(error),
+							errorProps: error,
+						});
+					}
+				})(),
+			);
 		}
+
+		// Wait for the child commit tasks to settle before returning the overall outcome.
+		const childResults = await Promise.allSettled(tasks);
 
 		const childFailure = childResults.find((r): r is PromiseRejectedResult => r.status === "rejected");
 		if (childFailure) throw childFailure.reason;
@@ -1374,19 +1379,23 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		await this.ensureMigration("cancel");
 		// First, so that the local lock is released even when a child cancel fails and throws below.
 		this.#participant.cancelLocal(request.transactionId);
-		// The lock is gone either way, so a failed wake must not stop the child cancels below. The
-		// promotion still moves on its own retry deadline.
-		try {
-			this.wakeLockBlockedPromotion();
-		} catch (error) {
-			console.error({
-				...this.logParams(),
-				message: "fokos/partition.cancel: waking the lock-blocked promotion failed after the local cancel.",
-				transactionId: request.transactionId,
-				error: String(error),
-				errorProps: error,
-			});
-		}
+		this.ctx.waitUntil(
+			(async () => {
+				// The lock is gone either way, so a failed wake must not stop the child cancels below. The
+				// promotion still moves on its own retry deadline.
+				try {
+					this.wakeLockBlockedPromotion();
+				} catch (error) {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition.cancel: waking the lock-blocked promotion failed after the local cancel.",
+						transactionId: request.transactionId,
+						error: String(error),
+						errorProps: error,
+					});
+				}
+			})(),
+		);
 
 		// Cancel only DELETEs pending rows, so size backpressure must not wedge it — same reasoning as
 		// txCommit, and cancel is the path that BRINGS an over-size partition back under its cap.
@@ -1567,17 +1576,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		// ONCE per transaction, not once per item.
 		// A throw here is absorbed, as txCommit absorbs it: the items are already applied, and db.ts reads
 		// any error of this path as "nothing applied", so it must not throw after the apply commits.
-		try {
-			await this.drainPromotionCandidates(pCtx, promotionCandidates);
-			await this.checkSplits(pCtx);
-		} catch (error) {
-			console.error({
-				...this.logParams(),
-				message: "fokos/partition.executeSingleShot: split check failed after the transaction applied.",
-				error: String(error),
-				errorProps: error,
-			});
-		}
+		this.ctx.waitUntil(
+			(async () => {
+				try {
+					await this.drainPromotionCandidates(pCtx, promotionCandidates);
+					await this.checkSplits(pCtx);
+				} catch (error) {
+					console.error({
+						...this.logParams(),
+						message: "fokos/partition.executeSingleShot: split check failed after the transaction applied.",
+						error: String(error),
+						errorProps: error,
+					});
+				}
+			})(),
+		);
 
 		return response;
 	}
@@ -1707,6 +1720,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		this.#_partitionContext._partitionIdBytes = undefined;
 		this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
 		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
+		this.#_topology?.updatePartitionContext(this.#_partitionContext);
 		return this.#_partitionContext;
 	}
 

@@ -145,6 +145,27 @@ describe("PartitionDO - splitting", () => {
 		});
 	});
 
+	it("a matching fokosInit retry stores the latest mutable options of both contexts", async ({ expect }) => {
+		const { ctx: parentCtx } = makeStub({ hashSplitConditions: { maxSizeMb: 100 } });
+		const childName = `test.fokosinit-mutable.${crypto.randomUUID()}`;
+		const childId = env.PARTITION_DO.idFromName(childName);
+		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
+
+		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
+		await childStub.fokosInit({
+			repartitionId: "r1",
+			source: { ...parentCtx, hashSplitConditions: { maxSizeMb: 50 } },
+			target: { ...childCtx, hashSplitConditions: { maxSizeMb: 25 } },
+			slice,
+		});
+
+		const status = await childStub.status();
+		expect(status.partitionContext?.hashSplitConditions.maxSizeMb).toBe(25);
+		expect(status.parentPartitionContext?.hashSplitConditions.maxSizeMb).toBe(50);
+	});
+
 	it("exposes split status via status()", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 

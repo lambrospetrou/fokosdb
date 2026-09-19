@@ -2,6 +2,8 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../server/do-partition.js";
+import { FokosError, UNAVAILABLE_CODES } from "../errors.js";
+import { invariantFailure } from "../../../test/errors-matchers.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
@@ -119,3 +121,81 @@ function withHashTopology(pCtx: PartitionContextResolved, fn: (t: HashPartitionT
 function withRangeTopology(pCtx: PartitionContextResolved, fn: (t: RangePartitionTopologyImpl) => void): Promise<void> {
 	return withTopology((c, state, store) => new RangePartitionTopologyImpl(c, state, store, NOT_REPARTITIONING), pCtx, fn);
 }
+
+describe("updatePartitionContext replaces the mutable options of the context a topology holds", () => {
+	it("a hash topology answers shouldAllow from the latest hashSplitConditions", async () => {
+		const pCtx = hashContext(100);
+		await withHashTopology(pCtx, (topology) => {
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
+			topology.updatePartitionContext({ ...pCtx, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } });
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
+		});
+	});
+
+	it("a range topology answers shouldAllow from the latest rangeSplitConditions", async () => {
+		const pCtx = rangeContext(100);
+		await withRangeTopology(pCtx, (topology) => {
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
+			topology.updatePartitionContext({ ...pCtx, rangeSplitConditions: { maxSizeMb: OVER_SIZE_MB } });
+			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
+		});
+	});
+
+	it("a hash topology rejects a changed hashSplitN", async () => {
+		const pCtx = hashContext(100);
+		await withHashTopology(pCtx, (topology) => {
+			expect(() => topology.updatePartitionContext({ ...pCtx, hashSplitN: 4 })).toThrow(
+				invariantFailure("HashPartitionTopologyImpl partition identity changed"),
+			);
+		});
+	});
+
+	it("a hash topology rejects a changed partitionId", async () => {
+		const pCtx = hashContext(100);
+		const otherId = PartitionIdHelper.fromHashIdxs(pCtx, [1]).encode(true).opaque;
+		await withHashTopology(pCtx, (topology) => {
+			expect(() => topology.updatePartitionContext({ ...pCtx, partitionId: otherId })).toThrow(
+				invariantFailure("HashPartitionTopologyImpl partition identity changed"),
+			);
+		});
+	});
+
+	it("a range topology rejects a changed boundary while the partitionId stays the same", async () => {
+		const pCtx = rangeContext(100, KeyCodec.encode("m"), null);
+		await withRangeTopology(pCtx, (topology) => {
+			expect(() =>
+				topology.updatePartitionContext({
+					...pCtx,
+					rangePartition: { ...pCtx.rangePartition!, endBoundary: KeyCodec.encode("z") },
+				}),
+			).toThrow(invariantFailure("RangePartitionTopologyImpl partition identity changed"));
+		});
+	});
+
+	it("a range topology rejects a changed doName", async () => {
+		const pCtx = rangeContext(100);
+		await withRangeTopology(pCtx, (topology) => {
+			expect(() => topology.updatePartitionContext({ ...pCtx, doName: `other-${crypto.randomUUID()}` })).toThrow(
+				invariantFailure("RangePartitionTopologyImpl partition identity changed"),
+			);
+		});
+	});
+
+	it("a partition applies the latest context to the topology it already built", async () => {
+		const pCtx = hashContext(100);
+		const stub = PartitionDO.getByName(env.PARTITION_DO, pCtx.doName);
+
+		await stub.apiPutItem(pCtx, { hashKey: HK, sortKey: SK, data: "v", kind: "text" });
+
+		let failure: unknown;
+		try {
+			await stub.apiPutItem(
+				{ ...pCtx, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } },
+				{ hashKey: HK, sortKey: SK, data: "v", kind: "text" },
+			);
+		} catch (error) {
+			failure = error;
+		}
+		expect(FokosError.isCode(failure, UNAVAILABLE_CODES.partition_over_size)).toBe(true);
+	});
+});

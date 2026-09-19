@@ -944,7 +944,10 @@ export class RepartitionTarget {
 			this.#assertInitMatches(existing, req);
 			// The policy inside the context is mutable and the source may have newer values; the identity
 			// and the slice are not, and the check above has already proved they are unchanged.
-			this.store.transactionSync(() => this.deps.applyTargetIdentity(req));
+			this.store.transactionSync(() => {
+				this.deps.applyTargetIdentity(req);
+				this.#putImport({ ...existing, source: req.source, updatedAt: now });
+			});
 		} else {
 			if (this.deps.hasIdentity()) {
 				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {

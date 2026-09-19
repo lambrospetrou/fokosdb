@@ -3,6 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/shared/partition-topology/partial-range-topology.js";
+import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, withOpIndex } from "./helpers.js";
 import {
@@ -351,7 +352,22 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 			spy.mockRestore();
 		}
 
-		await expect(partition.stub.txCommit(partition.ctx, commit)).resolves.toMatchObject({ outcome: "committed" });
+		// The promotion of the local hot key is queued off the request path, so the new range root can
+		// already be importing when the coordinator retries this decided transaction. The retry then
+		// gets the retryable `partition_migrating`, exactly as the coordinator does in production, and
+		// commits once the import completes.
+		await drainUntil(
+			[partition, partition.rangeRoot("hot")],
+			async () => {
+				try {
+					return (await partition.stub.txCommit(partition.ctx, commit)).outcome === "committed";
+				} catch (error) {
+					if (!FokosError.isCode(error, UNAVAILABLE_CODES.partition_migrating)) throw error;
+					return false;
+				}
+			},
+			"the retried commit to commit",
+		);
 		await partition.awaitPromoted("hot");
 	}, 30_000);
 });
