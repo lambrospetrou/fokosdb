@@ -17,7 +17,7 @@ import type {
 	TransactionItem,
 	TransactionItemKey,
 } from "../shared/transaction-wire-types.js";
-import { PartitionDO } from "./do-partition.js";
+import { partitionStubByName } from "../shared/do-stubs.js";
 import {
 	FokosError,
 	FokosInternalError,
@@ -241,19 +241,6 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
 export class TransactionCoordinatorDO extends DurableObject<Env> {
 	#migrations: SQLSchemaMigrations;
-
-	static get(
-		ns: DurableObjectNamespace<TransactionCoordinatorDO>,
-		id: DurableObjectId | string,
-	): DurableObjectStub<TransactionCoordinatorDO> {
-		if (typeof id === "string") {
-			id = ns.idFromString(id);
-		}
-		return ns.get(id);
-	}
-	static getByName(ns: DurableObjectNamespace<TransactionCoordinatorDO>, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
-		return ns.getByName(doName);
-	}
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -666,7 +653,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				const result = await tryWhile(
 					async () => {
-						const r = await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txPrepare(pCtx, {
+						const r = await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
 							transactionId,
 							coordinatorDoId,
 							transactionTimestamp: stateRow.transaction_ts,
@@ -751,7 +738,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						// the transaction stays in COMMITTING, the caller receives the commit-pending
 						// error, and the alarm finishes the fan-out.
 						if (Date.now() > deadlineMs) return;
-						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCommit(pCtx, {
+						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCommit(pCtx, {
 							transactionId,
 							transactionTimestamp: stateRow.transaction_ts,
 							items: toTransactionItemKeys(partitionKeys),
@@ -808,7 +795,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						// the transaction stays in CANCELLING, and the alarm finishes the fan-out. The
 						// caller still receives the cancelled outcome, which applied nothing anywhere.
 						if (Date.now() > deadlineMs) return;
-						await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txCancel(pCtx, {
+						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCancel(pCtx, {
 							transactionId,
 							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
 						});
@@ -859,7 +846,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				await tryWhile(
 					async () => {
-						const r = await PartitionDO.getByName(this.env[pCtx.ns], p.partition_do_name).txPrepare(pCtx, {
+						const r = await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
 							transactionId,
 							coordinatorDoId,
 							transactionTimestamp: stateRow.transaction_ts,

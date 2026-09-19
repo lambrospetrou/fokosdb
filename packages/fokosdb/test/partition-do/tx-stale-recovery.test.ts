@@ -1,8 +1,10 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
-import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import * as doStubs from "../../src/shared/do-stubs.js";
+import { testCoordinatorStub, testPartitionStub } from "../stub-helpers.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
@@ -46,14 +48,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 	/**
 	 * Substitutes the coordinator stub with a fake that answers `not_found`.
 	 *
-	 * The substitution is at `TransactionCoordinatorDO.get`, not at the class prototype: `get` returns
-	 * an RPC stub whose target runs outside this isolate, so a prototype spy records nothing. It also
-	 * lets these tests store sentinel coordinator ids such as "missing-tc" in a lock row, which the
-	 * real `get` would reject as malformed. The partial fake is why the cast is here.
+	 * The substitution is at the `txCoordinatorStub` helper, not at the class prototype: the helper
+	 * returns an RPC stub whose target runs outside this isolate, so a prototype spy records nothing.
+	 * It also lets these tests store sentinel coordinator ids such as "missing-tc" in a lock row,
+	 * which a real `idFromString` would reject as malformed. The partial fake is why the cast is here.
 	 */
 	function mockCoordinatorRecovery() {
 		const recoverTransaction = vi.fn(async () => ({ state: "not_found" as const }));
-		vi.spyOn(TransactionCoordinatorDO, "get").mockReturnValue({
+		vi.spyOn(doStubs, "txCoordinatorStub").mockReturnValue({
 			recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		return recoverTransaction;
@@ -112,7 +114,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			partitionId: child.partitionIdOpaque,
 			primaryDoIdStr: childId.toString(),
 		};
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const childStub = testPartitionStub(childId);
 		await childStub.fokosInit({
 			repartitionId: "r1",
 			source: parentCtx,
@@ -209,7 +211,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = vi.fn(async () => {
 			throw new Error("coordinator unavailable");
 		});
-		vi.spyOn(TransactionCoordinatorDO, "get").mockReturnValue({
+		vi.spyOn(doStubs, "txCoordinatorStub").mockReturnValue({
 			recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		const consoleError = captureConsoleError();
@@ -325,7 +327,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const transactionTimestamp = Date.now() - 10_000;
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 		const tcId = env.TRANSACTION_COORDINATOR_DO.newUniqueId();
-		const tcStub = TransactionCoordinatorDO.get(env.TRANSACTION_COORDINATOR_DO, tcId);
+		const tcStub = testCoordinatorStub(tcId);
 
 		await runInDurableObject(tcStub, async (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
@@ -338,7 +340,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				"0000000000000000",
 			);
 		});
-		const getCoordinatorById = vi.spyOn(TransactionCoordinatorDO, "get");
+		const getCoordinatorById = vi.spyOn(doStubs, "txCoordinatorStub");
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
 			store.insertPendingLock({
@@ -360,7 +362,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		await runDurableObjectAlarm(stub);
 		await vi.waitFor(async () => {
-			expect(getCoordinatorById).toHaveBeenCalledWith(env.TRANSACTION_COORDINATOR_DO, tcId.toString());
+			expect(getCoordinatorById).toHaveBeenCalledWith(env, expect.objectContaining({ doName: ctx.doName }), tcId.toString());
 			expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
 				found: true,
 				item: { data: "value", ttlAt },

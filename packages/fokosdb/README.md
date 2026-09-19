@@ -57,12 +57,27 @@ const partitionContext = PartitionContextCreator.create({
 
 const db = new FokosDB({
 	topology: new PartitionTopologyRouterImpl(partitionContext),
-	transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 });
 
 await db.putItem({ hashKey: "user#1", sortKey: "profile", data: "hello" });
 const result = await db.getItem({ hashKey: "user#1", sortKey: "profile" });
 ```
+
+### Jurisdictions and identity hazard
+
+A table can specify `jurisdiction: "eu" | "fedramp" | "us"` in `PartitionContextCreator.create`.
+The jurisdiction restricts all partition and transaction coordinator objects of the table to that geographic or regulatory area.
+
+- https://developers.cloudflare.com/durable-objects/reference/data-location/#supported-locations
+
+> [!WARNING]
+> **The jurisdiction is part of the identity of the table and is immutable.**
+> Cloudflare gives different Durable Object IDs for different jurisdictions.
+> If you add, change, or remove `jurisdiction` on an existing table:
+>
+> - The table connects to empty Durable Objects.
+> - The previous data remains in the old Durable Objects and becomes unreachable.
+> - The library cannot detect this change because the two sets of objects do not share context.
 
 ## You must re-export the Durable Object classes
 

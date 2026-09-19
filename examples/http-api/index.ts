@@ -245,7 +245,6 @@ function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOp
 	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({
 		topology,
-		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 	});
 }
 

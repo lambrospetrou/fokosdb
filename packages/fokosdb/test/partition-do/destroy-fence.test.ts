@@ -5,10 +5,10 @@
  * background transition, and the paginated status tells the traversal which partitions exist below
  * this one. The router suite covers the traversal order.
  */
-import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
@@ -39,7 +39,7 @@ describe("PartitionDO — fokosStatus", () => {
 	it("reports an uninitialized target as a leaf and does not bring it to life", async ({ expect }) => {
 		const { ctx } = makeStub();
 		const targetName = `test.fokosstatus-uninitialized.${crypto.randomUUID()}`;
-		const stub = PartitionDO.getByName(env.PARTITION_DO, targetName);
+		const stub = testPartitionStub(targetName);
 
 		const page = await stub.fokosStatus({ cursor: null });
 
@@ -139,12 +139,12 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		await partition.stub.fokosPrepareDestroy({});
 
 		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
-			await expect(
-				instance.apiPutItem(partition.ctx, { hashKey: kb("hk"), sortKey: kb("sk2"), data: "v", kind: "text" }),
-			).rejects.toThrow(fokosErrorWith("partition_migrating"));
-			await expect(
-				instance.fokosMigrationAck({ repartitionId: "r1", target: { partitionId: "00", doName: "nobody" } }),
-			).rejects.toThrow(fokosErrorWith("partition_migrating"));
+			await expect(instance.apiPutItem(partition.ctx, { hashKey: kb("hk"), sortKey: kb("sk2"), data: "v", kind: "text" })).rejects.toThrow(
+				fokosErrorWith("partition_migrating"),
+			);
+			await expect(instance.fokosMigrationAck({ repartitionId: "r1", target: { partitionId: "00", doName: "nobody" } })).rejects.toThrow(
+				fokosErrorWith("partition_migrating"),
+			);
 		});
 
 		const page = await partition.stub.fokosStatus({ cursor: null });

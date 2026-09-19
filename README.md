@@ -74,7 +74,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Add jurisdictions support.
 - Add custom jobs to run on alarms, with their own best-effort interval.
 - Add global eventual indexes (DynamoDB GSIs).
 - Add operation hooks that will run on the final serving partition (onAfterOperation).

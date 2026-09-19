@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
@@ -326,7 +326,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("evaluates pre-image document expression in Workers SQLite", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "remove", target: { ref: "data", path: "$.a" } },
@@ -341,7 +341,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("evaluates plain array index removal order in Workers SQLite", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "remove", target: { ref: "data", path: "$.r[1]" } },
@@ -355,7 +355,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("rejects invalid target in applicability check in Workers SQLite", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.missing.child" }, value: { val: 1 } }];
 			const plan = compileUpdateExpression(update);
@@ -365,7 +365,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("evaluates if_not_exists and arithmetic increment in Workers SQLite", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-compiler-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-compiler-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{
@@ -389,7 +389,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("preserves boolean values copied from data references", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-boolean-ref-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-boolean-ref-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.flag" }, value: { ref: "data", path: "$.source" } },
@@ -402,7 +402,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("preserves boolean literals in if_not_exists fallbacks", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-boolean-fallback-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-boolean-fallback-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{
@@ -419,7 +419,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("preserves string values that look like JSON literals", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-string-literal-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-string-literal-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.number" }, value: { val: "5" } },
@@ -434,7 +434,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("preserves string values copied from data references", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-string-ref-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-string-ref-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data", path: "$.source" } },
@@ -447,7 +447,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("preserves booleans copied through a value-passing function", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-passthrough-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-passthrough-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			// SQLite carries a JSON boolean as 1 or 0, so a function that returns one of its arguments
 			// must receive that argument already encoded as JSON. Otherwise `true` lands as the number 1.
@@ -476,7 +476,7 @@ describe("update SQLite compiler", () => {
 	});
 
 	it("stores a document that a pass-through function returns as a nested document", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `update-passthrough-doc-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`update-passthrough-doc-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
 				{

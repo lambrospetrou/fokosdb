@@ -5,7 +5,8 @@ import { PartitionContextCreator } from "./partition-context.js";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { RangePartitionTopologyImpl } from "./split-policy.js";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import { KeyCodec } from "./key-codec.js";
 import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
@@ -61,7 +62,7 @@ async function withRangeTopology(
 	body: (topology: RangePartitionTopologyImpl, store: PartitionStore) => void | Promise<void>,
 	routing: Partial<RepartitionRouting> = {},
 ): Promise<void> {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, rangeCtx.doName);
+	const stub = testPartitionStub(rangeCtx.doName);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const stubRouting: RepartitionRouting = {

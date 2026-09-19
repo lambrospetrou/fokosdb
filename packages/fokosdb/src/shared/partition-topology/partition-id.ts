@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
-import type { PartitionContext, PartitionContextResolved, PartitionNamespaceKey } from "./partition-context.js";
+import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
+import { partitionNamespace } from "../do-stubs.js";
 import type { PartitionNodeId } from "./types.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "../hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
@@ -70,7 +71,7 @@ export function resolveRangePartitionContext(
 	endBoundary: KeyBytes | null,
 ): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
-	const doId = env[base.ns].idFromName(doName!);
+	const doId = partitionNamespace(env, base).idFromName(doName!);
 	return {
 		doId,
 		partitionContext: {
@@ -83,16 +84,16 @@ export function resolveRangePartitionContext(
 	};
 }
 
-/** Deterministic DO ID resolution (no I/O). The split policies use this so `env` access stays in this file. */
-export function resolveDoId(ns: PartitionNamespaceKey, doName: string): DurableObjectId {
-	return env[ns].idFromName(doName);
+/** Deterministic DO ID resolution (no I/O) through the namespace the context names. */
+export function resolveDoId(ctx: PartitionContext, doName: string): DurableObjectId {
+	return partitionNamespace(env, ctx).idFromName(doName);
 }
 
 // Resolves the N hash child partition contexts of a splitting hash parent.
 export function resolveHashChildPartitionContexts(parentContext: PartitionContextResolved): PartitionContextResolved[] {
 	const childIds = PartitionIdHelper.calculateHashChildPartitionIds(parentContext);
 	return childIds.map(({ doName, partitionIdOpaque }) => {
-		const childDoId = env[parentContext.ns].idFromName(doName);
+		const childDoId = partitionNamespace(env, parentContext).idFromName(doName);
 		return {
 			...withoutIdBytes(parentContext),
 			doName,
@@ -111,7 +112,7 @@ export function resolveDescendantHashPartitionContext(
 ): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 	const { doName, opaque } = new PartitionIdHelper(basePartitionContext, partitionIdBytes).appendHashIdx(hashIdxs).encode(true);
 	assertExists(doName);
-	const doId = env[basePartitionContext.ns].idFromName(doName);
+	const doId = partitionNamespace(env, basePartitionContext).idFromName(doName);
 	return {
 		doId,
 		partitionContext: {

@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { TX_FANOUT_REQUEST_BUDGET_MS, TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import { keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
@@ -178,7 +178,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		// whose clock does not depend on how long the cancel retries happened to take. Force the
 		// partition's alarm on every attempt so the release does not depend on the scheduler,
 		// and retry the write that the lock was blocking until it goes through.
-		const unreachableStub = PartitionDO.getByName(env.PARTITION_DO, unreachable);
+		const unreachableStub = testPartitionStub(unreachable);
 		await vi.waitFor(
 			async () => {
 				await runDurableObjectAlarm(unreachableStub);

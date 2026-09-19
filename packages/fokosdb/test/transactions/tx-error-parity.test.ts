@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { partitionStubByName } from "../../src/shared/do-stubs.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
@@ -104,7 +104,7 @@ async function lockItem(db: ReturnType<typeof makeDB>, key: Key): Promise<() => 
 	const hashKey = KeyCodec.encode(key.hashKey);
 	const sortKey = KeyCodec.encode(key.sortKey);
 	const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
-	const stub = partitionStubByName(env.PARTITION_DO, partitionContext.doName);
+	const stub = testPartitionStub(partitionContext.doName);
 	const transactionId = crypto.randomUUID().replaceAll("-", "");
 	await stub.txPrepare(partitionContext, {
 		transactionId,

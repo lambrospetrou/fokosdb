@@ -4,7 +4,7 @@ import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { PartitionContextCreator } from "../src/shared/partition-topology/partition-context.js";
 import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/router.js";
-import { PartitionDO } from "../src/server/do-partition.js";
+import { testPartitionStub } from "./stub-helpers.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.25 = 262 144 bytes. The empty schema already holds ~100 KB of pages, so a smaller cap
@@ -26,7 +26,6 @@ function makeDB(tableName: string) {
 		...PARTITION_OPTIONS,
 	});
 	return new FokosDB({
-		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 		topology: new PartitionTopologyRouterImpl(base),
 	});
 }
@@ -58,7 +57,7 @@ describe.skip("FokosDB.destroy()", () => {
 
 		// Run the scheduled split alarm on every partition.
 		for (const doName of doNamesSet) {
-			await runDurableObjectAlarm(PartitionDO.getByName(env.PARTITION_DO, doName));
+			await runDurableObjectAlarm(testPartitionStub(doName));
 		}
 
 		// Destroy twice: the second call must be a no-op on an already-destroyed database.
@@ -69,7 +68,7 @@ describe.skip("FokosDB.destroy()", () => {
 		});
 
 		for (const doName of doNamesSet) {
-			const stub = PartitionDO.getByName(env.PARTITION_DO, doName);
+			const stub = testPartitionStub(doName);
 			const { partitionContextStored } = await stub.status();
 			expect(partitionContextStored).toBeFalsy();
 		}

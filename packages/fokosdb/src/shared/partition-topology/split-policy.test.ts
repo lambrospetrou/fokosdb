@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { FokosError, UNAVAILABLE_CODES } from "../errors.js";
 import { invariantFailure } from "../../../test/errors-matchers.js";
 import { PartitionStore } from "../partition/partition-store.js";
@@ -99,7 +99,7 @@ async function withTopology<T>(
 	pCtx: PartitionContextResolved,
 	fn: (topology: T) => void,
 ): Promise<void> {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, `splitpolicy-${crypto.randomUUID()}`);
+	const stub = testPartitionStub(`splitpolicy-${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		fn(make(pCtx, state, new PartitionStore(state.storage)));
 	});
@@ -183,7 +183,7 @@ describe("updatePartitionContext replaces the mutable options of the context a t
 
 	it("a partition applies the latest context to the topology it already built", async () => {
 		const pCtx = hashContext(100);
-		const stub = PartitionDO.getByName(env.PARTITION_DO, pCtx.doName);
+		const stub = testPartitionStub(pCtx.doName);
 
 		await stub.apiPutItem(pCtx, { hashKey: HK, sortKey: SK, data: "v", kind: "text" });
 

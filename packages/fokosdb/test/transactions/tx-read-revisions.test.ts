@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
@@ -20,7 +21,7 @@ const itemExists = () => compileConditionExpression({ op: "exists", args: [{ ref
 function owningPartition(db: FokosDB, key: Key) {
 	const topology = db.options().topology as PartitionTopologyRouterImpl;
 	const { partitionContext } = topology.pickPartition(kb(key.hashKey), kb(key.sortKey));
-	return { stub: PartitionDO.getByName(env.PARTITION_DO, partitionContext.doName), pCtx: partitionContext };
+	return { stub: testPartitionStub(partitionContext.doName), pCtx: partitionContext };
 }
 
 /**

@@ -1,8 +1,9 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
-import { PartitionDO } from "./do-partition.js";
+import type { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import type { PartitionDO } from "./do-partition.js";
+import * as doStubs from "../shared/do-stubs.js";
+import { testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
 import { KeyCodec } from "../shared/partition-topology/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
@@ -152,7 +153,7 @@ function tableNames(state: DurableObjectState): string[] {
 }
 
 async function withCoordinator(fn: (tc: CoordinatorInternals, state: DurableObjectState) => void | Promise<void>): Promise<void> {
-	const stub = TransactionCoordinatorDO.getByName(env.TRANSACTION_COORDINATOR_DO, `tc-test.${crypto.randomUUID()}`);
+	const stub = testCoordinatorStubByName(`tc-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 		await fn(instance as unknown as CoordinatorInternals, state);
 	});
@@ -349,7 +350,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				return { outcome: "accepted" as const };
 			});
 			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.alarm();
 
@@ -373,7 +374,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					message: "partition exceeded its limits, please retry later",
 				});
 			});
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
 
@@ -455,8 +456,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					},
 				],
 			}));
-			vi.spyOn(PartitionDO, "getByName").mockImplementation(
-				(_ns, name) => ({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				(_env, _ctx, name) =>
+					({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
@@ -506,8 +508,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					},
 				],
 			}));
-			vi.spyOn(PartitionDO, "getByName").mockImplementation(
-				(_ns, name) => ({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				(_env, _ctx, name) =>
+					({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
@@ -881,7 +884,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				throw new Error("partition unreachable");
 			});
 			const txCancel = vi.fn(async () => {});
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
 
@@ -920,7 +923,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
 
@@ -939,7 +942,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			insertParticipant(state, { name: "p1" });
 			const txPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
 			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
 
@@ -980,8 +983,8 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			});
 			const txCancelP1 = vi.fn(async () => {});
 			const txCancelP2 = vi.fn(async () => {});
-			vi.spyOn(PartitionDO, "getByName").mockImplementation(
-				(_ns, name) =>
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				(_env, _ctx, name) =>
 					({
 						txPrepare,
 						txCancel: name === "p1" ? txCancelP1 : txCancelP2,
@@ -1018,7 +1021,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				throw new Error("p1 unreachable");
 			});
 			const txCancel = vi.fn(async () => {});
-			vi.spyOn(PartitionDO, "getByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
 
@@ -1047,7 +1050,7 @@ describe("TransactionCoordinatorDO - destroyCoordinator", () => {
 	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was
 	// wiped with the partitions.
 	it("wipes the idempotency window and the alarm, then evicts the instance", async () => {
-		const stub = TransactionCoordinatorDO.getByName(env.TRANSACTION_COORDINATOR_DO, `tc-destroy.${crypto.randomUUID()}`);
+		const stub = testCoordinatorStubByName(`tc-destroy.${crypto.randomUUID()}`);
 
 		await runInDurableObject(stub, async (tc: TransactionCoordinatorDO, state: DurableObjectState) => {
 			seed(state, "COMMITTED");

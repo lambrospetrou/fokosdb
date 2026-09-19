@@ -1,8 +1,8 @@
 /** PartitionDO lifecycle helpers for splits, migration, and promotion. */
-import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { expect, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
@@ -63,7 +63,7 @@ export class TestPartition {
 
 	private constructor(ctx: PartitionContextResolved, stub?: DurableObjectStub<PartitionDO>) {
 		this.ctx = ctx;
-		this.stub = stub ?? PartitionDO.getByName(env.PARTITION_DO, ctx.doName);
+		this.stub = stub ?? testPartitionStub(ctx.doName);
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */

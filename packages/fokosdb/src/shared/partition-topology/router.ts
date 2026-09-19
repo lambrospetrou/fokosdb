@@ -1,5 +1,6 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
+import { partitionNamespace } from "../do-stubs.js";
 import { PartitionIdHelper, hashRootIndex } from "./partition-id.js";
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef } from "../partition/repartition/repartition-types.js";
@@ -52,9 +53,8 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 	 */
 	pickPartition(hashKey: KeyBytes, sortKey?: KeyBytes): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
 		const { doName, partitionIdOpaque } = this.findPartition({ hashKey, sortKey });
-		const { ns } = this.basePartitionContext;
 		// Use idFromName to ensure the DO itself will have the `.name` populated within itself.
-		const doId = env[ns].idFromName(doName);
+		const doId = partitionNamespace(env, this.basePartitionContext).idFromName(doName);
 		// Merge with any partition-specific context if needed.
 		const partitionContext: PartitionContextResolved = {
 			...this.basePartitionContext,
@@ -117,8 +117,7 @@ export class PartitionTopologyRouterImpl implements PartitionTopologyRouter {
 		}
 		const { doName, opaque } = PartitionIdHelper.fromHashIdxs(this.basePartitionContext, [idx]).encode(true);
 		assertExists(doName);
-		const { ns } = this.basePartitionContext;
-		const doId = env[ns].idFromName(doName);
+		const doId = partitionNamespace(env, this.basePartitionContext).idFromName(doName);
 		const resolvedContext = {
 			...this.basePartitionContext,
 			doName,

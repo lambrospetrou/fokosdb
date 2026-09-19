@@ -13,9 +13,9 @@
  * is the source's split cache — and it means every test runs against a cold cache, which is what the
  * RFC requires of it: eviction must not change behaviour.
  */
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
 import {
 	PartitionContextCreator,
@@ -146,7 +146,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		// — a cached stub would fail there with "cannot perform I/O on behalf of a different Durable
 		// Object", which is exactly the hop this harness exists to exercise.
 		const enter = async <T>(fn: (e: NodeEnv) => T | Promise<T>): Promise<T> =>
-			await runInDurableObject(PartitionDO.getByName(env.PARTITION_DO, stubName), async (_i: PartitionDO, state: DurableObjectState) => {
+			await runInDurableObject(testPartitionStub(stubName), async (_i: PartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const store = new PartitionStore(storage);
 				store.runMigrations();

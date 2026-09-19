@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { partitionStubByName } from "../src/shared/do-stubs.js";
+import { testPartitionStub } from "./stub-helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
 import { KeyCodec } from "../src/shared/partition-topology/key-codec.js";
@@ -32,7 +32,7 @@ describe("the errors of a partition, through the public API", () => {
 		const hashKey = KeyCodec.encode(key.hashKey);
 		const sortKey = KeyCodec.encode(key.sortKey);
 		const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
-		const stub = partitionStubByName(env.PARTITION_DO, partitionContext.doName);
+		const stub = testPartitionStub(partitionContext.doName);
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		await stub.txPrepare(partitionContext, {
 			transactionId,
@@ -75,13 +75,27 @@ describe("the errors of a partition, through the public API", () => {
 		const db = makeDB();
 		const hashKey = KeyCodec.encode("malformed");
 		const { partitionContext } = db.options().topology.pickPartition(hashKey, KeyCodec.encodeOptional(undefined));
-		const stub = partitionStubByName(env.PARTITION_DO, partitionContext.doName);
+		const stub = testPartitionStub(partitionContext.doName);
 
 		// A request without a partition context fails inside the partition with a plain TypeError.
 		const err = await errorOf(() => stub.apiGetItem(null as never, { hashKey, sortKey: KeyCodec.encodeOptional(undefined) }));
 
 		expect(err).toMatchObject({ _tag: "FokosInternalError", code: "foreign_error" });
 		expect(err.cause).toBeInstanceOf(Error);
+	});
+
+	it("rejects a context with a jurisdiction on a partition with none as partition_context_mismatch", async () => {
+		const db = makeDB();
+		const hashKey = KeyCodec.encode("k");
+		const sortKey = KeyCodec.encodeOptional(undefined);
+		const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
+		const stub = testPartitionStub(partitionContext.doName);
+
+		const mismatchedCtx = { ...partitionContext, jurisdiction: "eu" as DurableObjectJurisdiction };
+		const err = await errorOf(() => stub.apiGetItem(mismatchedCtx, { hashKey, sortKey }));
+
+		expect(FokosInternalError.is(err)).toBe(true);
+		expect(err).toMatchObject({ code: "partition_context_mismatch" });
 	});
 });
 
@@ -97,7 +111,7 @@ describe("the public methods of FokosDB", () => {
 				hashSplitConditions: { maxSizeMb: 100 },
 			}),
 		);
-		const db = new FokosDB({ topology, transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO });
+		const db = new FokosDB({ topology });
 
 		const err = await errorOf(() => db.getItem({ hashKey: "k" }));
 

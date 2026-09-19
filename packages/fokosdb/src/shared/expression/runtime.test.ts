@@ -1,8 +1,8 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../json-types.js";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
@@ -22,7 +22,7 @@ type StoredFixture = {
 };
 
 async function evaluate(item: StoredFixture | null, condition: ConditionExpression) {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-runtime.${crypto.randomUUID()}`);
+	const stub = testPartitionStub(`expression-runtime.${crypto.randomUUID()}`);
 	return await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const hashKey = KeyCodec.encode(item?.hashKey ?? "missing-hash-key");
 		const sortKey = item?.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
@@ -197,7 +197,7 @@ describe("compiled condition runtime", () => {
 	});
 
 	it("keeps the SQLite failure as the runtime error cause", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-runtime.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`expression-runtime.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const plan = { ...compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }), sql: "no_such_function()" };
 			const error = (() => {
@@ -217,7 +217,7 @@ describe("compiled condition runtime", () => {
 	it("uses a primary-key lookup and reports existing versus missing row reads", async () => {
 		const condition: ConditionExpression = { op: "exists", args: [{ ref: "hashKey" }] };
 		const plan = compileConditionExpression(condition);
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-plan.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`expression-plan.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encodeOptional(undefined);
@@ -290,7 +290,7 @@ describe("compiled condition runtime", () => {
 
 	it("uses a primary-key lookup for a byte key literal", async () => {
 		const plan = compileConditionExpression({ op: "eq", args: [{ ref: "sortKey" }, { b64: "YWI=" }] });
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `expression-plan.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`expression-plan.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const hashKey = KeyCodec.encode("item");
 			const sortKey = KeyCodec.encode(new Uint8Array([0x61, 0x62]));

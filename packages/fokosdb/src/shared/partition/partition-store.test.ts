@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { compileProjectionExpression, compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
@@ -39,7 +39,7 @@ function expectedRowBytes(data: string | Uint8Array, hk: KeyBytes, sk: KeyBytes)
 // The PartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withStore(fn: (store: PartitionStore, state: DurableObjectState) => void | Promise<void>): Promise<void> {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, `store-test.${crypto.randomUUID()}`);
+	const stub = testPartitionStub(`store-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		await fn(new PartitionStore(state.storage), state);
 	});
@@ -1083,7 +1083,7 @@ describe("PartitionStore - deletion watermark", () => {
 	});
 
 	it("a real user delete updates both deletion-metadata fields in one statement", async () => {
-		const stub = PartitionDO.getByName(env.PARTITION_DO, `store-test.${crypto.randomUUID()}`);
+		const stub = testPartitionStub(`store-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			// Records every statement the store issues. The migrations already ran in the PartitionDO
 			// constructor, so the wrapped storage never sees a migration statement.

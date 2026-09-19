@@ -830,11 +830,7 @@ export class RepartitionTarget {
 		}
 		if (page.phase === "host") {
 			try {
-				this.deps.host.validatePage(
-					requested.inner,
-					page.page,
-					page.nextCursor?.phase === "host" ? page.nextCursor.inner : null,
-				);
+				this.deps.host.validatePage(requested.inner, page.page, page.nextCursor?.phase === "host" ? page.nextCursor.inner : null);
 			} catch (error) {
 				this.#deferImport(rec, now, error);
 				return "stopped";

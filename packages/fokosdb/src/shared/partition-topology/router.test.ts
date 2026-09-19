@@ -5,12 +5,14 @@
  * through its status. The callbacks here record the calls, so each test asserts the order of a real
  * destroy with no Durable Object.
  */
+import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { PartitionContextCreator } from "./partition-context.js";
 import { PartitionTopologyRouterImpl } from "./router.js";
+import { KeyCodec } from "./key-codec.js";
 import type { FokosPartitionRef } from "../partition/repartition/repartition-types.js";
 
-function makeRouter(rootTreesN: number) {
+function makeRouter(rootTreesN: number, jurisdiction?: DurableObjectJurisdiction) {
 	return new PartitionTopologyRouterImpl(
 		PartitionContextCreator.create({
 			ns: "PARTITION_DO",
@@ -21,6 +23,7 @@ function makeRouter(rootTreesN: number) {
 			rangeSplitN: 2,
 			hashSplitConditions: { maxSizeMb: 100 },
 			rangeSplitConditions: { maxSizeMb: 500 },
+			...(jurisdiction === undefined ? {} : { jurisdiction }),
 		}),
 	);
 }
@@ -87,5 +90,23 @@ describe("PartitionTopologyRouterImpl.traverseForDestroy", () => {
 		);
 
 		expect(destroyed).toEqual(roots);
+	});
+});
+
+describe("PartitionTopologyRouterImpl.pickPartition", () => {
+	it("returns the id that the plain namespace binding resolves for the partition name", () => {
+		const router = makeRouter(1);
+		const { doId, partitionContext } = router.pickPartition(KeyCodec.encode("hk"));
+
+		expect(doId.toString()).toBe(env.PARTITION_DO.idFromName(partitionContext.doName).toString());
+	});
+
+	it("throws on a context that selects a jurisdiction, because workerd implements none", () => {
+		// workerd throws "Jurisdiction restrictions are not implemented in workerd." synchronously on
+		// every jurisdiction() call. The throw proves pickPartition resolves its namespace through the
+		// accessor, so the no-jurisdiction path above never reaches jurisdiction().
+		const router = makeRouter(1, "eu");
+
+		expect(() => router.pickPartition(KeyCodec.encode("hk"))).toThrow("Jurisdiction restrictions are not implemented in workerd.");
 	});
 });

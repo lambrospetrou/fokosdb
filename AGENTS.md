@@ -66,6 +66,7 @@ Items are keyed by `hashKey` (required) + `sortKey` (optional, defaults to `""`)
 - Routing uses hashing to map `hashKey` to a root partition index.
 - Partition IDs are opaque hex-encoded bytes and encodes the data partition location in the entire partitions topology. The opaque partition ID should only be accessed through the `PartitionIdHelper` class.
 - **`PartitionContext` is passed in every RPC call** — DOs cannot be configured at instantiation time in Workers RPC, so the topology config (splitN, ns, tableName, etc.) travels with every request. The DO validates the context matches its stored one.
+- **Namespace accessors and stub helpers** — Never read `env[ctx.ns]` or `env[ctx.nsTx]` directly outside `shared/do-stubs.ts`. Always use `partitionNamespace(env, ctx)` and `txCoordinatorNamespace(env, ctx)`, or the stub helpers `partitionStub(env, ctx, id)`, `partitionStubByName(env, ctx, name)`, and `txCoordinatorStub(env, ctx, idOrName)`. These helpers apply the configured `jurisdiction` at each resolution. Passing a raw namespace or skipping the accessor breaks object identity.
 - The `PartitionTopologyRouterImpl` is used by the client (`FokosDB`) to pick partitions. `PartitionTopologyImpl` is used inside the DOs for split management.
 
 ## Partition Splitting

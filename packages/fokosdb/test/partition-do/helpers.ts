@@ -3,10 +3,9 @@
  * split-status narrowing, and log capture. Split, migration, and promotion drivers live in
  * `partition-harness.ts`.
  */
-import { env } from "cloudflare:workers";
 import { vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
 import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
@@ -43,7 +42,7 @@ export function makeStub(opts?: PartitionOptions) {
 		...opts,
 	});
 	const ctx = new PartitionTopologyRouterImpl(base).pickPartition(kb("dummyHashKey")).partitionContext;
-	return { ctx, stub: PartitionDO.getByName(env.PARTITION_DO, ctx.doName) };
+	return { ctx, stub: testPartitionStub(ctx.doName) };
 }
 
 /**

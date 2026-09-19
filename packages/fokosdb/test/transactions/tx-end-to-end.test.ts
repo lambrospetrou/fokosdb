@@ -801,52 +801,45 @@ describe("transactions - end-to-end", () => {
 	it("coordinator distribution: 10 transactions across 3 coordinators land on multiple TCs", async () => {
 		// Intercept idFromName on the TC namespace to record which shard name each transaction
 		// is routed to. StaticShardedDO calls idFromName exactly once per transactWriteItems.
-		const calledTCNames: string[] = [];
-		const spyTCNs = new Proxy(env.TRANSACTION_COORDINATOR_DO, {
-			get(target, prop) {
-				if (prop === "idFromName") {
-					return (name: string) => {
-						calledTCNames.push(name);
-						return target.idFromName(name);
-					};
-				}
-				const value = (target as any)[prop];
-				return typeof value === "function" ? value.bind(target) : value;
-			},
-		}) as typeof env.TRANSACTION_COORDINATOR_DO;
+		const idFromNameSpy = vi.spyOn(env.TRANSACTION_COORDINATOR_DO, "idFromName");
 
-		const dbName = `tcdist.${crypto.randomUUID()}`;
-		const db = makeDB({ tableName: dbName, transactionCoordinatorNs: spyTCNs, numTxCoordinators: 3 });
+		try {
+			const dbName = `tcdist.${crypto.randomUUID()}`;
+			const db = makeDB({ tableName: dbName, numTxCoordinators: 3 });
 
-		for (let i = 0; i < 10; i++) {
-			const result = await writeOutcome(
-				db.transactWriteItems({
-					items: [
-						{
-							hashKey: `dist-hk-${i}`,
-							sortKey: `dist-sk-${i}`,
-							operation: "put",
-							data: `dist-data-${i}`,
-						},
-					],
-					clientRequestToken: `tcdist-token-${i}`,
-				}),
-			);
-			expect(result.outcome).toBe("committed");
+			for (let i = 0; i < 10; i++) {
+				const result = await writeOutcome(
+					db.transactWriteItems({
+						items: [
+							{
+								hashKey: `dist-hk-${i}`,
+								sortKey: `dist-sk-${i}`,
+								operation: "put",
+								data: `dist-data-${i}`,
+							},
+						],
+						clientRequestToken: `tcdist-token-${i}`,
+					}),
+				);
+				expect(result.outcome).toBe("committed");
+			}
+
+			// One idFromName call per transactWriteItems.
+			const calledTCNames = idFromNameSpy.mock.calls.map(([name]) => name);
+			expect(calledTCNames).toHaveLength(10);
+
+			// StaticShardedDO names shards as `${shardGroupName}-${index}`.
+			const expectedTCNames = new Set([`fokos_tc.${dbName}-0`, `fokos_tc.${dbName}-1`, `fokos_tc.${dbName}-2`]);
+			for (const name of calledTCNames) {
+				expect(expectedTCNames.has(name)).toBe(true);
+			}
+
+			// With 10 transactions across 3 shards, we are asserting >= 2 distinct TCs per coordinator.
+			const uniqueTCNames = new Set(calledTCNames);
+			expect(uniqueTCNames.size).toBeGreaterThanOrEqual(2);
+		} finally {
+			idFromNameSpy.mockRestore();
 		}
-
-		// One idFromName call per transactWriteItems.
-		expect(calledTCNames).toHaveLength(10);
-
-		// StaticShardedDO names shards as `${shardGroupName}-${index}`.
-		const expectedTCNames = new Set([`fokos_tc.${dbName}-0`, `fokos_tc.${dbName}-1`, `fokos_tc.${dbName}-2`]);
-		for (const name of calledTCNames) {
-			expect(expectedTCNames.has(name)).toBe(true);
-		}
-
-		// With 10 transactions across 3 shards, we are asserting >= 2 distinct TCs per coordinator.
-		const uniqueTCNames = new Set(calledTCNames);
-		expect(uniqueTCNames.size).toBeGreaterThanOrEqual(2);
 	});
 
 	it("keeps token replay on the same shard only when the pool size is unchanged", async () => {

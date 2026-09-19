@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.js";
@@ -32,7 +32,7 @@ type Harness = {
 // The PartitionDO constructor has already run the schema migrations by the time the callback runs;
 // constructing a second PartitionStore over the same storage is safe (migrations are idempotent).
 async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promise<void> {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, `participant-test.${crypto.randomUUID()}`);
+	const stub = testPartitionStub(`participant-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		const clock = { now: BASE_NOW };

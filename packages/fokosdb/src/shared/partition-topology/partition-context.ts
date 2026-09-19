@@ -35,6 +35,13 @@ export type PartitionContext = {
 	nsTx: TransactionCoordinatorNamespaceKey;
 
 	/**
+	 * The Durable Object jurisdiction of every object of this table. It is part of the identity of the
+	 * table: a jurisdiction that changes names a different set of objects, and the earlier data becomes
+	 * unreachable.
+	 */
+	jurisdiction?: DurableObjectJurisdiction;
+
+	/**
 	 * WARNING:: This should NOT CHANGE after initialization, otherwise it may lead to data loss.
 	 */
 	rootTreesN: number;
@@ -160,7 +167,8 @@ export function areImmutableOptionsEqual(opts1: PartitionContext, opts2: Partiti
 		opts1.schema === opts2.schema &&
 		opts1.tableName === opts2.tableName &&
 		opts1.rootTreesN === opts2.rootTreesN &&
-		opts1.hashSplitN === opts2.hashSplitN
+		opts1.hashSplitN === opts2.hashSplitN &&
+		opts1.jurisdiction === opts2.jurisdiction
 	);
 }
 
@@ -187,6 +195,7 @@ export class PartitionContextCreator {
 		rangeSplitN?: number;
 		rangeSplitConditions?: SplitConditions;
 		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
+		jurisdiction?: DurableObjectJurisdiction;
 	}): PartitionContext {
 		// Assert the input options and default to reasonable values if not provided.
 		if (!opts.rangeSplitConditions) {
@@ -263,6 +272,9 @@ export class PartitionContextCreator {
 			schema: 1,
 			ns: opts.ns,
 			nsTx: opts.nsTx,
+			// A table that selects no jurisdiction stores a context byte-identical to one built without
+			// the option, so an existing record and a new one compare equal.
+			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
 			tableName: opts.tableName,
 			rootTreesN: opts.rootTreesN,
 			hashSplitN: opts.hashSplitN,

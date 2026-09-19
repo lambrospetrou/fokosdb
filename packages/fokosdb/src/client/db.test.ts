@@ -1234,7 +1234,6 @@ function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; n
 	});
 	return new FokosDB({
 		topology: new PartitionTopologyRouterImpl(base),
-		transactionCoordinatorNs: env.TRANSACTION_COORDINATOR_DO,
 		numTxCoordinators: options?.numTxCoordinators,
 	});
 }

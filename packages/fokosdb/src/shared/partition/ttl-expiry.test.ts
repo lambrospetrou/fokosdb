@@ -1,7 +1,7 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { PartitionDO } from "../../server/do-partition.js";
+import type { PartitionDO } from "../../server/do-partition.js";
+import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { KeyCodec } from "../partition-topology/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
@@ -12,7 +12,7 @@ const kb = (value: string) => KeyCodec.encode(value);
 const NOW_SECONDS = 100;
 
 async function withStore(fn: (store: PartitionStore, state: DurableObjectState) => void | Promise<void>): Promise<void> {
-	const stub = PartitionDO.getByName(env.PARTITION_DO, `ttl-expiry-test.${crypto.randomUUID()}`);
+	const stub = testPartitionStub(`ttl-expiry-test.${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		await fn(new PartitionStore(state.storage), state);
 	});

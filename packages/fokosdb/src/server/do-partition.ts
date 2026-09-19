@@ -100,7 +100,7 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { collectQueryPage } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
+import { partitionStub, partitionStubByName, txCoordinatorStub } from "../shared/do-stubs.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -275,13 +275,6 @@ export type DebugForcePromoteKeyResponse = {
 };
 
 export class PartitionDO extends DurableObject implements PartitionAPI, FokosPartitionStatusRpc {
-	static get(ns: DurableObjectNamespace<PartitionDO>, id: DurableObjectId): DurableObjectStub<PartitionDO> {
-		return ns.get(id);
-	}
-	static getByName(ns: DurableObjectNamespace<PartitionDO>, doName: string): DurableObjectStub<PartitionDO> {
-		return ns.getByName(doName);
-	}
-
 	private static readonly KV_KEYS = {
 		PARTITION_CONTEXT: "__partition_context",
 
@@ -465,7 +458,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	private repartitionDeps(): RepartitionSourceDeps & RepartitionTargetDeps {
 		const common: RepartitionCommonDeps = {
 			// Boundary rule: only DO classes and FokosDB hold stubs.
-			getPeer: (ref) => this.env[this.pCtx().ns].getByName(ref.doName),
+			getPeer: (ref) => partitionStubByName(this.env, this.pCtx(), ref.doName),
 			host: new FokosMigrationHost({ store: this.#store, hashSplitN: () => this.pCtx().hashSplitN }),
 			identity: () => ({ pCtx: this.pCtx(), depth: this.depth(), rangeAncestors: this.#_rangeAncestors }),
 			// Forced, because the flow calls this when work has just become due: a queued repartition, an
@@ -803,7 +796,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			// Read through the source while this target still imports its share of the data.
 			const record = this.#target.importRecord();
 			invariant(record, "fokos/partition.getItem: no import record while importing");
-			const sourceStub = PartitionDO.getByName(this.env[record.source.ns], record.source.doName);
+			const sourceStub = partitionStubByName(this.env, record.source, record.source.doName);
 			const result = (await sourceStub.fokosExecuteLocal({
 				op: "getItem",
 				repartitionId: record.repartitionId,
@@ -893,7 +886,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		if (await this.ensureMigration("queryItems", false)) {
 			const record = this.#target.importRecord();
 			invariant(record, "fokos/partition.queryItems: no import record while importing");
-			const sourceStub = PartitionDO.getByName(this.env[record.source.ns], record.source.doName);
+			const sourceStub = partitionStubByName(this.env, record.source, record.source.doName);
 			const result = (await sourceStub.fokosExecuteLocal({
 				op: "queryItems",
 				repartitionId: record.repartitionId,
@@ -1682,6 +1675,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		pCtx: PartitionContextResolved | PartitionContextLivePartition,
 		isInit = false,
 	): PartitionContextLivePartition {
+		if (this.ctx.id.jurisdiction !== pCtx.jurisdiction) {
+			throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+				message: "partition context mismatch",
+				attributes: { doName: pCtx.doName, jurisdictionReq: pCtx.jurisdiction, jurisdictionActual: this.ctx.id.jurisdiction },
+			});
+		}
 		// Phantom-bounce guard: a range DO is born ONLY through initFromSplit (promotion creates the root,
 		// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
 		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
@@ -1794,7 +1793,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const learn = (meta: PartitionInfoInternal) => topology.recordForwardResult(hashKey, ctx, toCtx, meta);
 		// A hash partition answers with its own hash depth: its caller forwarded to it, and checks that depth.
 		const hashDepth = isHashPartition(ctx) ? this.depth() : undefined;
-		const result = await forward(PartitionDO.get(this.env[ctx.ns], doId), toCtx).catch((e: unknown) => {
+		const result = await forward(partitionStub(this.env, ctx, doId), toCtx).catch((e: unknown) => {
 			learnFromErrorMeta(e, learn, hashDepth);
 			throw e;
 		});
@@ -1861,7 +1860,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 				return await local();
 			case "forward": {
 				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
-				const stub = this.env[ctx.ns].get(doId);
+				const stub = partitionStub(this.env, ctx, doId);
 				// The result and the error of the forward both carry the routing meta of the target.
 				const learn = (meta: PartitionInfoInternal) => {
 					topology.recordForwardResult(hashKey, ctx, partitionContext, meta);
@@ -1955,7 +1954,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
-		return this.env[this.pCtx().ns].getByName(childPCtx.doName);
+		return partitionStubByName(this.env, this.pCtx(), childPCtx.doName);
 	}
 
 	/**
@@ -2246,7 +2245,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		for (const row of staleTxRows) {
 			if (!row.coordinator_do_id) continue;
 			try {
-				const tcStub = TransactionCoordinatorDO.get(this.env[this.pCtx().nsTx], row.coordinator_do_id);
+				const tcStub = txCoordinatorStub(this.env, this.pCtx(), row.coordinator_do_id);
 				const result = await tcStub.recoverTransaction(row.transaction_id);
 
 				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);

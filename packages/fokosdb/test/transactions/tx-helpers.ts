@@ -50,8 +50,6 @@ export type MakeDBOptions = {
 	maxSizeMb?: number;
 	rootTreesN?: number;
 	numTxCoordinators?: number;
-	/** Overrides the coordinator binding, so a test can observe how transactions are routed. */
-	transactionCoordinatorNs?: typeof env.TRANSACTION_COORDINATOR_DO;
 	/** Fixes the table name. Routing is a pure function of it, so two clients built with the same
 	 *  name share one topology. Omit it for a table no other test touches. */
 	tableName?: string;
@@ -59,7 +57,7 @@ export type MakeDBOptions = {
 
 /** A client over its own table, so no two tests share partitions. */
 export function makeDB(opts?: MakeDBOptions) {
-	const { maxSizeMb, rootTreesN, tableName, transactionCoordinatorNs = env.TRANSACTION_COORDINATOR_DO, ...dbOptions } = opts ?? {};
+	const { maxSizeMb, rootTreesN, tableName, ...dbOptions } = opts ?? {};
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
@@ -71,7 +69,7 @@ export function makeDB(opts?: MakeDBOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const topology = new PartitionTopologyRouterImpl(base);
-	return new FokosDB({ transactionCoordinatorNs, topology, ...dbOptions });
+	return new FokosDB({ topology, ...dbOptions });
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {

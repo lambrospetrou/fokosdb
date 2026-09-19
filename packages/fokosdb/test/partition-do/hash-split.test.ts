@@ -1,7 +1,8 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
@@ -70,7 +71,7 @@ describe("PartitionDO - splitting", () => {
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
 		for (const name of childNames) {
-			const childStub = PartitionDO.getByName(env.PARTITION_DO, name);
+			const childStub = testPartitionStub(name);
 			const childState = await childStub.status();
 
 			expect(childState.partitionContext).toMatchObject({
@@ -93,7 +94,7 @@ describe("PartitionDO - splitting", () => {
 		const childName = `test.fokosinit-idempotent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
 		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const childStub = testPartitionStub(childId);
 
 		const req = {
 			repartitionId: "r1",
@@ -121,7 +122,7 @@ describe("PartitionDO - splitting", () => {
 		const childName = `test.fokosinit-conflict.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
 		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
 		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
@@ -150,7 +151,7 @@ describe("PartitionDO - splitting", () => {
 		const childName = `test.fokosinit-mutable.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
 		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
-		const childStub = PartitionDO.get(env.PARTITION_DO, childId);
+		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
 		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
@@ -460,7 +461,7 @@ describe("PartitionDO - splitting", () => {
 			// may already be running or complete by the time we reach here. awaitMigrationCompleted
 			// handles both.
 			for (const childCtx of childContexts) {
-				const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
+				const childStub = testPartitionStub(childCtx.doName);
 				await TestPartition.at(childCtx).awaitMigrationCompleted();
 				const state = await childStub.status();
 				expect(state.migrationStatus).toBe("migration_completed");
@@ -488,7 +489,7 @@ describe("PartitionDO - splitting", () => {
 			for (const item of seedItems) {
 				let foundInDoName: string | undefined;
 				for (const childCtx of childContexts) {
-					const childStub = PartitionDO.getByName(env.PARTITION_DO, childCtx.doName);
+					const childStub = testPartitionStub(childCtx.doName);
 					const result = await childStub.apiGetItem(childCtx, {
 						hashKey: item.hashKey,
 						sortKey: item.sortKey,
