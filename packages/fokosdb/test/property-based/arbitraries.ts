@@ -47,10 +47,11 @@ export function expectedDataKind(data: ItemData): DataKind {
 
 /**
  * A fresh table on three root partitions, so random hash keys spread across partition DOs. The
- * default split threshold is far above what a run writes, so no partition splits; a suite that
- * wants splits passes a small `hashSplitMaxSizeMb`.
+ * default split thresholds are far above what a run writes, so no partition splits. A suite that
+ * wants hash splits passes a small `hashSplitMaxSizeMb`, and one that wants a key promoted into a
+ * range tree passes a small `rangeSplitMaxSizeMb` as well.
  */
-export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number }): FokosDB {
+export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number; rangeSplitMaxSizeMb?: number }): FokosDB {
 	const base = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
@@ -59,7 +60,7 @@ export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number }): FokosDB {
 		hashSplitN: 2,
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: opts?.hashSplitMaxSizeMb ?? 500 },
-		rangeSplitConditions: { maxSizeMb: 500 },
+		rangeSplitConditions: { maxSizeMb: opts?.rangeSplitMaxSizeMb ?? 500 },
 	});
 	return new FokosDB({ topology: new PartitionTopologyRouterImpl(base) });
 }

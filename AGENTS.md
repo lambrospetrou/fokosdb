@@ -1,173 +1,95 @@
 # FokosDB
 
-FokosDB is a globally strongly-consistent key-value database built on Cloudflare Durable Objects, inspired by DynamoDB's API and transaction model. It is a library published as the `fokosdb` npm package.
+FokosDB is a globally strongly-consistent key-value database on Cloudflare Durable Objects. Its API and transaction model follow DynamoDB. It ships as the `fokosdb` npm package.
 
-## Critical tips
+## Rules
 
-- Use Simplified Technical English (ASD-STE100) language as defined in `.claude/skills/spec-write/references/ste-rules.md`.
-- Correctness and reliability above everything, with as little code as necessary to achieve what we need.
-- When you write comments inline the code do not refer to discussion references like W1 or W2 or report XYZ. Those do not mean anything to future readers. Your comments should always be stand-alone and not refering to ideas or bainstorming discussions and features that never shipped. Never reference anything not in the current codebase.
-- Always run tests `pnpm test` in a subagent to not pollute the context with the verbose output.
-- Your knowledge of Cloudflare Workers APIs and limits may be outdated. Always retrieve current documentation before any [Workers](https://developers.cloudflare.com/workers/) and [Durable Objects](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/) tasks. For all limits and quotas, retrieve from the product's `/platform/limits/` page. eg. `/workers/platform/limits`.
+- Write in Simplified Technical English (ASD-STE100). `.claude/skills/spec-write/references/ste-rules.md` has the rules.
+- Correctness and reliability come first. Write as little code as the task needs.
+- A code comment must stand alone. Never name a discussion, a report, a plan, or a feature that the codebase does not contain.
+- Run `pnpm test` in a subagent. Its output is long.
+- Your knowledge of the Workers platform can be out of date. Read the current [Workers](https://developers.cloudflare.com/workers/) and [Durable Objects](https://developers.cloudflare.com/durable-objects/best-practices/rules-of-durable-objects/) documentation before you change either, and read a limit from the product's `/platform/limits/` page.
+- Do not add a production hook for a test.
 
 ## Commands
 
-This is a pnpm workspace. The `scripts` in the root `package.json` are the entry points. Run them from the repo root.
+This is a pnpm workspace. Run the scripts of the root `package.json` from the repository root.
 
-The examples import the library's built `dist/`, not its sources, so a source change needs a `pnpm build` before an example picks it up. `pnpm test` and `pnpm dev` already do this.
-
-`.github/workflows/preview-release.yml` publishes an installable preview build of the library for
-every commit on `main`, and for pull requests opened from a branch of this repository, through [pkg.pr.new](https://pkg.pr.new/). It runs `pnpm build`
-first, so the client-bundle guards gate every published build. Keep the `pkg-pr-new publish` call
-to one invocation in that workflow, and pass extra packages as extra arguments; a second invocation
-is treated as spam. The workflow publishes only when `lambrospetrou` triggers it, and the username
-is written out in the workflow, so it needs an edit if the account or the repository owner changes.
-Preview install URLs are documented as `pkg.pr.new/lambrospetrou/fokosdb/fokosdb@<sha>`.
-
-There are two wrangler projects:
-
-- `packages/fokosdb/wrangler.jsonc` — the library worker. It is never deployed. It gives `vitest` and `wrangler types` an entrypoint (`packages/fokosdb/test/worker-entry.ts`) that exports the library Durable Objects.
-- `examples/http-api/wrangler.jsonc` — the deployable example HTTP API worker, with its own `public/` assets, secrets and generated types.
-
-Run `pnpm cf-typegen` after changing bindings in either file. Each project has its own `worker-configuration.d.ts` and its own local state under `.wrangler/`.
+- `pnpm build`, `pnpm test`, `pnpm check` (build, lint, typecheck, format), `pnpm fmt`.
+- `pnpm cf-typegen` after you change a binding. Each wrangler project keeps its own `worker-configuration.d.ts` and its own `.wrangler/` state.
+- The examples import the built `dist/`, so a source change needs a build. `pnpm test` and `pnpm dev` build first.
+- There are two wrangler projects: `packages/fokosdb/wrangler.jsonc` gives vitest an entrypoint and is never deployed, and `examples/http-api/wrangler.jsonc` is the deployable example.
+- `.github/workflows/preview-release.yml` publishes a preview build through pkg.pr.new. Keep it to ONE `pkg-pr-new publish` call and pass extra packages as extra arguments, because a second call counts as spam.
 
 ## Package layout
 
-`packages/fokosdb/src` splits three ways, and the split is enforced by convention, not by the module system:
+`packages/fokosdb/src` has three parts. Convention keeps them apart, not the module system.
 
-- `client/` — `db.ts` plus the entry barrel. Published as `fokosdb/client`.
-- `server/` — the two Durable Object classes plus the entry barrel. Published as `fokosdb/server`.
-- `shared/` — everything both sides use: key codec, expression engine, partition topology, partition store, transaction types. Not published on its own; tsdown inlines it into whichever entry reaches it.
+- `client/` — `db.ts` and the entry barrel. Published as `fokosdb/client`.
+- `server/` — the two Durable Object classes. Published as `fokosdb/server`.
+- `shared/` — what both sides use. tsdown inlines it into whichever entry reaches it.
 
-**The client must never import a Durable Object class as a value.** Doing so pulls the whole server implementation into `dist/client`. Use the type-only helpers in `shared/do-stubs.ts` to get a typed stub, and keep class imports on the client side `import type`. The error classes live in `shared/errors.ts` and `shared/errors-operations.ts` for the same reason: the client raises and matches on them, and a match must not drag in `do-partition.ts`.
+**The client must never import a Durable Object class as a value.** That pulls the whole server implementation into `dist/client`. Use the type-only helpers in `shared/do-stubs.ts` and keep every class import `import type`. `pnpm build` enforces the rule, pins the packages the client may import, and holds the client bundle under a size budget.
 
-`pnpm build` enforces this rule. The `check-client-bundle` plugin in `packages/fokosdb/tsdown.config.ts` walks the chunks that the client entry imports and fails the build if a module below `src/server/` is in one of them. The same plugin pins the external packages that the client may import and holds the client bundle under a size budget. It also prints the raw, minified and gzipped size of each entry together with the chunks that the entry imports, which is what a consumer really ships; `esbuild` is a devDependency for that minify step. Keep the plugin inline in the `plugins` array: `defineConfig` gives its hooks their types, so a separate helper would need `rolldown` as a devDependency only for the plugin types.
-
-Cohesive folders stay whole inside `shared/` even when only one side uses them. An entry pulls in only the modules it names, so placing a server-only module in `shared/` costs the client bundle nothing.
+A cohesive folder stays whole inside `shared/` even when only one side uses it. An entry pulls in only the modules it names.
 
 ## Architecture
 
-Two Durable Object classes do all the work:
+- **`PartitionDO`** (`src/server/do-partition.ts`) — holds items in SQLite, one DO per partition shard. It serves single-item reads and writes, acts as a resource manager in 2PC, and splits itself when it grows past its cap.
+- **`TransactionCoordinatorDO`** (`src/server/do-transaction-coordinator.ts`) — one DO per write transaction, named by the idempotency token. It drives 2PC. A read transaction runs in the Worker instead.
+- **`FokosDB`** (`src/client/db.ts`) — the client entry point. It routes with `PartitionTopologyRouterImpl`, sends a multi-partition write to a coordinator, and drives a multi-partition read itself.
 
-- **`PartitionDO`** (`packages/fokosdb/src/server/do-partition.ts`) — stores items in SQLite. One DO per partition shard. Handles single-item reads/writes and participates in 2PC as a transaction resource manager. Automatically splits into child partitions when storage thresholds are met.
-- **`TransactionCoordinatorDO`** (`packages/fokosdb/src/server/do-transaction-coordinator.ts`) — one DO per write transaction (named by idempotency token). Drives 2-phase commit across multiple PartitionDOs. Read transactions run in the Worker.
+An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Array | string`, a `version` that every write increments, and an optional TTL.
 
-The `FokosDB` class (`packages/fokosdb/src/client/db.ts`) is the client-side entry point. It routes requests with `PartitionTopologyRouterImpl`, delegates multi-partition writes to `TransactionCoordinatorDO`, and drives multi-partition reads directly.
+**`PartitionContext` travels in every RPC.** Workers RPC cannot configure a DO at instantiation, so the topology configuration goes with each request and the DO compares it with the one it stored. Never read `env[ctx.ns]` outside `shared/do-stubs.ts`: use `partitionNamespace`, `txCoordinatorNamespace`, or the stub helpers, because each one applies the configured jurisdiction.
 
-The coordinator pool uses the shard group `fokos_tc.<tableName>`. Its size is `numTxCoordinators` or, by default, two shards per root partition. Retries with the same `clientRequestToken` must use the same pool size. In-flight recovery uses the coordinator ID in each participant lock and does not depend on the current pool size.
+## Partitions
 
-### Data Model
+- `rootTreesN` root partitions exist at startup, and a hash of the hash key selects one. A partition ID is opaque: read it only through `PartitionIdHelper`.
+- **Hash split** — a partition past `hashSplitConditions.maxSizeMb` queues a split, creates `hashSplitN` children, becomes a forwarding router, and the children import their share in the background. Its states are `split_queued`, `split_started` and `split_completed`.
+- **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION` moves into a range tree of its own, which then splits by sort key.
+- **`splitN` must never change after initialization.** A change breaks routing and loses data.
+- A partition refuses a write above 1.1 times its cap, and only a write that applies can queue the split that brings it back under.
 
-Items are keyed by `hashKey` (required) + `sortKey` (optional, defaults to `""`). Data is `Uint8Array | string`. Items have a `version` counter (incremented on every write) and an optional TTL.
+## queryItems
 
-## Partition Topology & Routing
+`queryItems` returns one bounded page. A caller follows `cursor` until it is absent, and a page can hold no items and still carry a cursor. `select` is `"projection"` or `"count"`. A request can also carry a `filter` and a `projection`; SQLite evaluates both and JavaScript evaluates neither.
 
-- At startup, `rootTreesN` root partitions are created (e.g. 10).
-- Routing uses hashing to map `hashKey` to a root partition index.
-- Partition IDs are opaque hex-encoded bytes and encodes the data partition location in the entire partitions topology. The opaque partition ID should only be accessed through the `PartitionIdHelper` class.
-- **`PartitionContext` is passed in every RPC call** — DOs cannot be configured at instantiation time in Workers RPC, so the topology config (splitN, ns, tableName, etc.) travels with every request. The DO validates the context matches its stored one.
-- **Namespace accessors and stub helpers** — Never read `env[ctx.ns]` or `env[ctx.nsTx]` directly outside `shared/do-stubs.ts`. Always use `partitionNamespace(env, ctx)` and `txCoordinatorNamespace(env, ctx)`, or the stub helpers `partitionStub(env, ctx, id)`, `partitionStubByName(env, ctx, name)`, and `txCoordinatorStub(env, ctx, idOrName)`. These helpers apply the configured `jurisdiction` at each resolution. Passing a raw namespace or skipping the accessor breaks object identity.
-- The `PartitionTopologyRouterImpl` is used by the client (`FokosDB`) to pick partitions. `PartitionTopologyImpl` is used inside the DOs for split management.
+Four budgets bound one page: evaluated items (`limit`), evaluated bytes, response bytes (`maxResponseBytes`), and partition visits. `QueryPageBudget` (`shared/query/page-budget.ts`) carries them across the sub-queries in `FokosDB` and across the children in `walkRangeChildren`.
 
-## Partition Splitting
+## Transactions (2PC)
 
-When a PartitionDO's SQLite size exceeds `hashSplitConditions.maxSizeMb`, it queues a hash split:
+The model follows the DynamoDB papers: [ATC 2023, Idziorek et al.](https://www.usenix.org/system/files/atc23-idziorek.pdf) and [ATC 2022, Elhemali et al.](https://www.usenix.org/system/files/atc22-elhemali.pdf)
 
-1. **`split_queued`**: After a write, `maybeQueueSplit` detects the threshold and queues. An alarm fires.
-2. **`split_started`**: `startSplit` initializes `N` child DOs via `initFromSplit`. The parent becomes a forwarding proxy. Children begin migrating data in background.
-3. Child migration: children call `getItemsBatch` + `getPartitionTransactionMetadata` on the parent via paginated RPC batches (~20 MB per batch). The parent filters only rows belonging to that child using the same hash function.
-4. **`split_completed`**: Once all children acknowledge migration complete, the parent transitions. Reads during migration go directly to parent (`getItemDirect`). Writes are rejected with a 503 during migration.
-
-**Critical**: `splitN` must NOT change after initialization — it would break routing and cause data loss.
-
-## queryItems paging
-
-`queryItems` returns one bounded page per call. `select` is `"projection"` (materialized items, the default) or `"count"` (`items: []` and the matched count of the page). The `select` value names the selection mode and is not the `projection` expression of the next subsection: a `"projection"` page materializes complete items, or projected records when the request carries a `projection`. A caller follows `cursor` until it is absent; a page can hold zero items and still carry a cursor.
-
-Four budgets bound a page, and `shared/query/page-budget.ts` holds their values: the evaluated-item budget (`limit`, default 1,000, maximum 100,000), a fixed evaluated-byte budget over the stored `est_row_bytes` of the evaluated items, the response-byte budget (`maxResponseBytes`) over the materialized items, and the partition-visit budget. `QueryPageBudget` tracks them across sub-queries in `FokosDB` and across children in `walkRangeChildren`; both pass the remaining values and `allowOversizedFirstItem` down in every RPC. The first materialized item of a page can exceed the response budget once, for the whole page and not once per leaf.
-
-The leaf scan is `PartitionStore.scanQueryPage` plus `shared/query/query-collector.ts`. The scan hands every candidate to a `QueryCandidateConsumer` (`createQueryPageCollector(...).consume`) and allocates nothing per row itself; the collector checks the evaluated budgets first and calls `decodePayload` only for a matched candidate of a `"projection"` selection that they admit, so a rejected candidate is never materialized. Count mode reads only `sk` and `est_row_bytes` from the covering `idx_items_scan` index. The statement binds `LIMIT remainingEvaluatedItems + 1`: the extra row tells a stopped page from a drained interval. A candidate that a budget rejects stops the page with an inclusive `nextCursor` at that candidate and is not counted; a range router that exhausts a budget resumes exclusively after `lastEvaluatedCursor`. `meta.rowsRead` and `meta.rowsReturned` are physical SQLite metrics and are never derived from `count` or `scannedCount`. Migration keeps `collectBatch` and its own byte budget; do not merge the two collectors.
-
-### Read projections and query filters
-
-`queryItems` accepts `filter?: ConditionExpression` and `projection?: readonly ProjectionExpression[]`. `getItem` and each item of `transactGetItems` accept `projection`. `FokosDB` validates and compiles the expressions before it routes the request: `compileQueryExpression` builds one `CompiledQueryPlan` for both halves of a query, so a path or a literal that both halves use binds once, and `compileProjectionExpression` builds the `CompiledProjectionPlan` of a point read. `docs/agent-plans/2026-09-14-read-projections-and-query-filters.md` is the specification.
-
-- SQLite evaluates both, and JavaScript evaluates neither. The filter is a `matched` result column and never a `WHERE` term, so a rejected candidate still reaches the query page collector: it consumes both evaluated budgets, advances the cursor, adds zero response bytes, and stays out of `items`. `count` is the matched count of the page and `count <= scannedCount`; the two are equal only for a request with no filter. A filter never changes candidate routing or the sort-key interval.
-- A projected point read (`getItem`, each `transactGetItems` item) returns its flat record as `data` in the ordinary item envelope, with `kind: "projected"` and the usual `version` and `ttlAt`. `ReadItem<T>` in `shared/types.ts` is that envelope and every read returns it: a caller reaches the value through `item.data` and narrows on `kind`, never on the presence of a field, and no read method needs a projected overload. `"projected"` is a public read-result kind only — do not add it to `DataKind`, whose index is the on-disk `data_kind` code. A projected `queryItems` page keeps bare records, and is the one overload that remains, because a page names its projection once and its overload types every element exactly. `QueryItemsPage<Item>` declares that page around its element, because the element is all that differs between the two forms, and both `QueryItemsResult<T>` and `QueryItemsProjectedResult<T>` are aliases of it. Keep `T` meaning the caller's own data type on every read method: a page parameterized by its element instead would make `QueryItemsResult<MyType>` compile as the projected shape.
-- The three read methods take an optional type parameter. It types `data` for `kind: "json"` and for `kind: "projected"` and nothing else. `getItem<T>` and `queryItems<T>` take one type. `transactGetItems<Ts>` takes a tuple, one member per item by position, because one request reads unrelated items; the tuple also fixes the item count, and an array type such as `Profile[]` gives one type to every position. Its options are wrapped in `NoInfer`, which keeps `Ts` off the inference path — the request keys would otherwise infer it as `unknown` per position and destroy the default of a call that names no type. `packages/fokosdb/src/client/db.test.ts` holds that contract as `@ts-expect-error` cases. The store holds opaque data, so the library never checks `T`; `db.ts` casts to it at the public method and keeps every private method on the default instantiation. `CallerType` resolves the `never` default back to the widest type the library can return, so a call without `T` keeps the types it had.
-- The wire row is positional (`ProjectedWireRow`, one value column and one type column per entry) and carries no names: the client owns the compiled plan, and `projectedItemFromWireRow` builds the record at the public boundary. The RPC variants keep the row under `projected` beside `kind`, `version`, and `ttlAt`.
-- Both plans use the `"pool"` binding layout: every literal and every path is one element of one JSON array bound as `?1`, so the SQL parameter count does not grow with the expression. A query statement numbers its scan parameters from `?2`; a projected point read binds `hk` as `?2` and `sk` as `?3`. The pool is bound always, as the text `"[]"` when the plan has no descriptor.
-- The cursor fingerprint covers `filterIdentity` and `projectionIdentity`, so a cursor is rejected with `cursor_fingerprint_mismatch` when either changes. A request with neither appends nothing, so a cursor issued before this feature stays valid.
-- `select: "count"` with a `projection` is rejected with `query_projection_with_count`. With a `filter` it is valid.
-- `transactGetItems` rejects two items that name one key with `transact_duplicate_key`: the two-phase driver pairs the phases by key, and per-item projections make a positional answer ambiguous.
-- Routing carries the plans and needs no code of its own: `withSplitForwarding`, `walkRangeChildren`, the migration fallback, and the transaction fan-out all spread the request they received.
-
-## Transaction Protocol (2PC)
-
-Modeled after the [_"Distributed Transactions at Scale in Amazon DynamoDB"_ USENIX ATC 2023 paper (Idziorek et al.)](https://www.usenix.org/system/files/atc23-idziorek.pdf) and the [_Amazon DynamoDB: A Scalable, Predictably Performant, and Fully Managed NoSQL Database Service_ USENIX ATC 2022 paper (Elhemali et al.)](https://www.usenix.org/system/files/atc22-elhemali.pdf).
-
-**Write transactions (`transactWriteItems`)**:
-
-- TC state machine: `CREATED → PREPARING → PREPARED → COMMITTING → COMMITTED` (or `→ CANCELLING → CANCELLED`)
-- Every state transition writes to SQLite **before** sending outbound RPCs (write-ahead).
-- `PREPARED` is the point of no return — a PREPARED transaction MUST eventually commit.
-- Conflict detection: `last_read_ts` and `last_write_ts` columns on items (a `check` compares with `last_write_ts` and advances only `last_read_ts`; a put, update, or delete compares with `last_read_ts` and advances both); `max_delete_tx_order_ts` in `deletion_metadata` for items that were deleted. Every transaction order timestamp is `Date.now() * TX_ORDER_TS_UNITS_PER_MS` from `txOrderTimestampNow()`.
-- Non-transactional writes (`putItem`/`deleteItem`) are **rejected** (not delayed) if a pending transaction holds the item's lock.
-- TC recovery: PartitionDO alarms poke stale TCs via `recoverTransaction()`; TC alarm retries stale in-flight transactions.
-- TC storage: payload is stripped at `PREPARED` or `CANCELLING`; item and participant rows are deleted only at the terminal transition.
-- Idempotency: `clientRequestToken` is 1 to 64 UTF-8 bytes and names the TC DO. The terminal `tc_state` row remains for 10 minutes after completion, then the TC alarm deletes it.
-
-**Read transactions (`transactGetItems`)**:
-
-- Two-phase double-read: read once, check no pending content mutation (a pending `check` does not count), read again, compare `found`, `version`, and the partition's `deleteRevision` (a counter that every user delete of a row advances; the TTL sweep does not). If anything changed → abort with `read_conflict`. An unrelated user delete in the same partition is a conservative `read_conflict`.
-- The Worker drives both phases directly. No coordinator or durable read state exists. If the Worker stops mid-read, the client retries.
-
-**Key invariants**:
-
-1. `items` table always contains committed state only.
-2. `pending_transactions` holds locks for in-flight transactions.
-3. `prepare`, `commit`, `cancel` are all idempotent.
-4. TC never transitions from PREPARED to CANCELLING.
-
-## Testing
-
-Tests run in the actual Cloudflare Workers runtime via `@cloudflare/vitest-pool-workers`. Each test suite creates isolated namespaces using `crypto.randomUUID()` prefixes. Integration tests are in `packages/fokosdb/test/transactions.test.ts`. The `PartitionDO` suites live in `packages/fokosdb/test/partition-do/`, one file per behaviour. The repartition-flow suites live in `packages/fokosdb/test/repartition/`: they drive several real flows over several real `PartitionStore` instances through `repartition-harness.ts`, so they need a harness of their own and stay out of `src/`. Use the small `makeStub` factory in `helpers.ts` for ordinary tests. Use `TestPartition` from `partition-harness.ts` only when a test drives a split, migration, or promotion.
-
-Use `triggerHashSplit`, `triggerPromotion`, and `triggerRangeSplit` when the test must inspect a transition. Use `splitHash` and `splitRange` when it needs a completed split. Filler hash keys belong to the target partition and are spread across its children. `makeRangeRoot` creates an empty range root without testing promotion detection; `makeTriggeredRangeRoot` also crosses the range-split threshold and returns all fixture sort keys. `runAlarm()` fires one scheduled alarm pass; the `await*` helpers and `drainUntil` poll durable state and run alarms only when progress stalls.
-
-For migration-in-progress tests, install `withMigrationHeld` before the crossing write. Its wait function returns after every child has reached the real transaction-metadata RPC. Cleanup releases the RPCs and restores the method in `finally`. Use `withMigrationBatchCap` to force cursor-paginated multi-batch migration without touching the real byte budget. Do not add production test hooks for tests.
-
-Property-based suites live in `packages/fokosdb/test/property-based/` and use `fast-check`. `arbitraries.ts` holds the shared arbitraries (`arbItemKey`, `arbItemData`, `arbPoolKey`), `makeTestDB`, and `keyId`; every arbitrary produces only inputs the public API accepts, so a failure is a library bug. Stateful suites use `fc.commands` plus `fc.asyncModelRun` against an in-memory model and draw keys from the small pool (`POOL_KEYS`) so commands collide. `model.ts` holds the shared model and the commands (`PutItem`, `GetItem`, `DeleteItem`, `TransactWrite`, `TransactGet`) that `transactions.test.ts` and `transactions-split.test.ts` run: the model evaluates only `exists` / `not_exists` conditions, a cancel leaves the model unchanged, and a `timestamp_conflict` cancel is accepted because a transaction in the same millisecond as the last write of an item is a legitimate conflict. A `TransactWrite` also carries `update` operations over top-level fields with literal values, which is the slice of the update expressions that the model can apply to its own document: it predicts `update_not_applicable` for a text or bytes pre-image and for a `set` over an array, it creates an absent item from the empty document, and `expectedRejection` names the codes each operation may be rejected with. `seedPool` writes one item per pool key but the last before the commands of a run start, so an update meets a text, a bytes, an object and an array pre-image instead of an empty table. `expectRead` compares `data` with `toEqual`, because `toMatchObject` matches a SUBSET of an object value and would accept a document that kept a field the model removed. `untilAvailable` retries a 503 (`FokosUnavailableError`, or a cancel with `origin: "service"`) because a partition mid-split answers that way; the split suite seeds one table with 1,000 items over a 0.5 MB threshold, runs every property run on that table with a per-run key prefix (`poolKeys(prefix)`), and verifies the seeded items before and after the property. `updates.test.ts` runs updates and reads alone over the same model and commands, because an update inside the mixed suite is one operation of one command type and a run applies about one: the dedicated suite applies about five, keeps the pre-image kinds balanced through its own `seedPool` data, and draws a one-operation transaction three times as often as a set of two or three, which is the atomicity case. `arbUpdateActions` and `arbOptionalCondition` are shared, so both suites build an operation the same way. `query-items.test.ts` does not use `fc.commands`: it seeds a table with a random write sequence, then drains every page of a random `queryItems` request and compares the whole sequence with the model. Its key oracle — the canonical key bytes, the byte order, and the meaning of every `sortKeyCondition` — is written in the suite itself and never calls `KeyCodec`, so a broken codec cannot agree with it. `drainQuery` caps the page count, because a cursor that makes no progress must fail with the request in the report and not on the vitest timeout. Give every property `it` a large explicit timeout: shrinking runs the scenario many times and the default 5 s hides the counterexample. Every property takes its run count from `propertyRuns(default)`: the default keeps an ordinary `pnpm test` fast, and `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/` searches deeper. A suite runs inside the Workers runtime and cannot read the shell environment, so the `define` block of `vitest.config.ts` substitutes the variable into the test modules. Replay a failure with the printed `seed` and `path` in the `fc.assert` parameters, and `replayPath` in `fc.commands`.
-
-Global fake timers can run Durable Object background callbacks in the wrong I/O context. The transaction suite currently uses `vi.useFakeTimers({ shouldAdvanceTime: true })` and can log cross-object TTL errors even when its assertions pass. Partition lifecycle tests use normal timers and scheduled-alarm test APIs instead.
+- Coordinator states are `CREATED → PREPARING → PREPARED → COMMITTING → COMMITTED`, or `→ CANCELLING → CANCELLED`. Every transition writes to SQLite BEFORE it sends an RPC.
+- **`PREPARED` is the point of no return.** A prepared transaction must commit, and the coordinator never goes from `PREPARED` to `CANCELLING`.
+- `prepare`, `commit` and `cancel` are idempotent. The `items` table holds committed state only, and `pending_transactions` holds the locks of the in-flight transactions.
+- A non-transactional write to a locked item is REFUSED, not delayed.
+- A read transaction reads twice and compares `found`, `version` and the partition's `deleteRevision`. Any change aborts it with `read_conflict`.
+- `clientRequestToken` names the coordinator DO and gives idempotency. A retry must use the same coordinator pool size.
 
 ## Rules for PartitionDO operations
 
-Every write or transaction RPC on `PartitionDO` must account for two concurrent state machines: **migration** (child catching up from parent) and **split** (parent routing to children). Failing to do so causes data loss or permanent lock leaks.
+Every write or transaction RPC meets two concurrent state machines: **migration** (a child that still imports) and **split** (a parent that now routes). A mistake here loses data or leaks a lock forever.
 
-**NOTE**: Once there is a native Durable Objects API to fork/clone/snapshot existing DO storage, we can scrap the entire migration flow (split will still be the same).
+- **Migration guard** — call `await this.ensureMigration("<op>")` near the top of every write and transaction RPC, after `ensurePartitionContext`. A read that tolerates stale data uses `ensureMigration("<op>", false)`, which reads through to the parent. Never guard the migration RPCs themselves (`getItemsBatch`, `getPartitionTransactionMetadata`, `acknowledgeChildMigrationComplete`), because they are what moves the migration forward.
+- **Split routing** — `putItem`, `deleteItem` and `getItem` use `withSplitForwarding`. `prepare`, `commit` and `readForTransaction` use `groupItemsByRouting` and then fan out. `cancel` must reach the children at `split_started` AND at `split_completed`, or their pending rows stay forever.
+- **Never swallow a child error** — try every child, collect the failures, then rethrow, so the coordinator stays non-terminal and retries until every child answers.
+- **Background recovery** — a split parent and an importing child must skip stale-transaction recovery; use the `txPendingCanSweep` guard. Apply a terminal outcome through the PUBLIC `commit()` and `cancel()`, never through inline SQL or a private helper, because only the public methods hold the migration guard and the split routing.
 
-### Migration guard
+## Testing
 
-A child partition in `migration_migrating` has not yet received all data or pending locks from its parent. Any operation that reads or writes local state during this window may act on incomplete data.
+Tests run in the real Workers runtime through `@cloudflare/vitest-pool-workers`. Each suite makes its own namespace with a `crypto.randomUUID()` prefix.
 
-- **All write and transaction RPCs** (`putItem`, `deleteItem`, `prepare`, `commit`, `cancel`, `readForTransaction`) must call `await this.ensureMigration("<opName>")` near the top, after `ensurePartitionContext`. This throws a 503-style error when the partition is still migrating, causing the caller to retry once migration completes.
-- **Read RPCs** that tolerate stale data (e.g. `getItem`) use the `false` variant — `ensureMigration("getItem", false)` — which reads directly from the parent instead of throwing.
-- Do **not** add `ensureMigration` to migration-protocol RPCs themselves (`getItemsBatch`, `getPartitionTransactionMetadata`, `acknowledgeChildMigrationComplete`) — these are the mechanism that drives migration forward.
+- `test/partition-do/` holds one file per `PartitionDO` behaviour, `test/transactions/` the transaction suites, and `test/repartition/` the repartition flows.
+- Use `makeStub` (`test/partition-do/helpers.ts`) for an ordinary test. Use `TestPartition` (`partition-harness.ts`) only when the test drives a split, a migration, or a promotion, with `triggerHashSplit`, `triggerRangeSplit`, `splitHash`, `splitRange`, `makeRangeRoot`, `runAlarm` and `drainUntil`.
+- Property-based suites are in `test/property-based/` and use `fast-check`. `arbitraries.ts` holds the shared arbitraries, `model.ts` the stateful model and its commands, and `query-model.ts` the key oracle of the query suites. Every arbitrary produces input that the public API accepts, so a failure is a library bug.
+- A suite whose fixture is expensive builds it once in `beforeAll` and shares it across the runs. `transactions-split.test.ts` gives each run its own key prefix because its runs write; `query-items-split.test.ts` needs neither, because a query changes nothing.
+- Give every property `it` a large explicit timeout, because shrinking reruns the scenario many times. `propertyRuns(default)` sets the run count, `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/` searches deeper, and a failure replays from the printed `seed`, `path` and `replayPath`.
+- Global fake timers can run a DO background callback in the wrong I/O context. Lifecycle tests use real timers and the scheduled-alarm test APIs instead.
 
-### Split routing
+## Where the detail lives
 
-A parent partition in `split_started` or `split_completed` no longer owns any key ranges — children do. Operations that write or lock items must be forwarded to the correct child; operations that act on already-forwarded locks must reach every relevant child.
-
-- **Item writes** (`putItem`, `deleteItem`) and **reads** (`getItem`) use `withSplitForwarding`, which handles routing automatically.
-- **Transaction RPCs** (`prepare`, `commit`, `readForTransaction`) call `groupItemsByRouting` to split items between local and forwarded sets, then fan out to the appropriate child stubs.
-- **`cancel`** must forward to children at both `split_started` **and** `split_completed`. After the last child acknowledges migration the parent transitions to `split_completed`; a cancel arriving after that transition must still reach children or their pending rows are never cleaned up.
-- When forwarding to multiple children, **do not swallow child errors**. Collect failures, attempt every child, then rethrow if any failed — so the TC stays in a non-terminal state and retries until all children are reachable.
-
-### Background recovery (stale-TX alarm)
-
-A split parent in `split_started` or `split_completed` and a child in `migration_initialized` or `migration_migrating` must skip stale-transaction recovery. Use the independent `txPendingCanSweep` guard. These partitions do not own authoritative, complete lock state.
-
-A `not_found` result has three paths. Delete directly when all keys route away. Cancel an owned lock that is no older than `IDEMPOTENCY_WINDOW_MS`. Quarantine an older owned lock by setting `guarded_at`, log the lock-age guard error once, and wait for `debugForceResolveTransaction`. Guarded transactions must stay out of the stale scan and its alarm scheduling.
-
-When the stale-TX alarm calls `recoverTransaction` on the TC and gets a terminal outcome back (`COMMITTED` / `CANCELLED`), it must apply the outcome by calling the **public** `commit()` / `cancel()` methods — not by inlining SQL or calling private helpers. The public methods encode the migration guard and split routing; bypassing them can write data to the wrong partition or skip child forwarding. `debugForceResolveTransaction` follows the same rule.
+- `docs/adr/` — architecture decisions.
+- `docs/agent-plans/` — one dated specification per feature. Read the matching one before you change that feature.
+- `docs/ideas/` — proposals that are not decided yet.
