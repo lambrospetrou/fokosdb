@@ -5,11 +5,11 @@ import { PartitionContextCreator } from "./partition-context.js";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper } from "./partition-id.js";
 import { RangePartitionTopologyImpl } from "./split-policy.js";
-import type { PartitionDO } from "../../server/do-partition.js";
-import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { PartitionStore } from "../partition/partition-store.js";
+import type { PartitionDO } from "../server/do-partition.js";
+import { testPartitionStub } from "../../test/stub-helpers.js";
+import { PartitionStore } from "../shared/partition/partition-store.js";
 import { KeyCodec } from "./key-codec.js";
-import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
+import type { RepartitionRouting } from "./repartition-types.js";
 
 const kb = (s?: string) => KeyCodec.encodeOptional(s);
 

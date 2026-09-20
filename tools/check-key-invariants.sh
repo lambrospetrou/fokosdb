@@ -8,7 +8,7 @@ set -euo pipefail
 
 FAIL=0
 SRC="src"
-KEY_CODEC="src/shared/partition-topology/key-codec.ts"
+KEY_CODEC="src/sharding/key-codec.ts"
 
 # charCodeAt / codePointAt / localeCompare outside key-codec.ts
 FOUND=$(grep -rn --include="*.ts" -E "charCodeAt|codePointAt|localeCompare" "$SRC" | grep -v "^${KEY_CODEC}:" || true)

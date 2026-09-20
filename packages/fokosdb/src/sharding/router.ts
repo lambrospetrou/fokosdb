@@ -1,10 +1,10 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
-import { partitionNamespace } from "../do-stubs.js";
+import { partitionNamespace } from "../shared/do-stubs.js";
 import { PartitionIdHelper, hashRootIndex } from "./partition-id.js";
 import type { KeyBytes } from "./key-codec.js";
-import type { FokosPartitionRef } from "../partition/repartition/repartition-types.js";
-import { assertExists } from "../tsutils.js";
+import type { FokosPartitionRef } from "./repartition-types.js";
+import { assertExists } from "../shared/tsutils.js";
 
 export interface PartitionTopologyRouter {
 	partitionContext(): PartitionContext;

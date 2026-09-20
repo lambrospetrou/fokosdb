@@ -4,7 +4,7 @@ import xxhash from "xxhash-wasm";
 // Creates the WebAssembly instance.
 const { h32, h32Raw, h64, h64Raw } = await xxhash();
 
-import type { KeyBytes } from "./partition-topology/key-codec.js";
+import type { KeyBytes } from "./key-codec.js";
 
 // Golden Ratio constant for better hash scattering.
 // See https://softwareengineering.stackexchange.com/a/402543

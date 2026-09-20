@@ -4,10 +4,10 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 // Type-only import: the emit erases it, so it makes NO runtime module cycle with do-partition.ts.
 // The namespace-key filter below needs it to match by class identity. A structural alternative
 // collapses to `any` when TypeScript resolves it mid-cycle from do-partition.ts itself.
-import type { PartitionDO } from "../../server/do-partition.js";
-import type { TransactionCoordinatorDO } from "../../server/do-transaction-coordinator.js";
-import invariant from "../invariant.js";
-import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
+import type { PartitionDO } from "../server/do-partition.js";
+import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
+import invariant from "../shared/invariant.js";
+import { FokosValidationError, VALIDATION_CODES } from "../shared/errors.js";
 
 export type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;

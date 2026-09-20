@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { queryScanStatement } from "../partition/partition-store.js";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { compileProjectionExpression, compileQueryExpression } from "./compiler.js";
 import { ExpressionError, type ExpressionErrorCode } from "./errors.js";

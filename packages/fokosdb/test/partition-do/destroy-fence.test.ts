@@ -9,7 +9,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
+import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition, TestPartition } from "./partition-harness.js";

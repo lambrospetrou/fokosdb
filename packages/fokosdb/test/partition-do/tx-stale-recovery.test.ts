@@ -5,12 +5,12 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
 import { testCoordinatorStub, testPartitionStub } from "../stub-helpers.js";
-import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
-import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
+import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { REPARTITION_KV_KEYS } from "../../src/shared/partition/repartition/repartition-flow.js";
-import type { FokosImportRecord } from "../../src/shared/partition/repartition/repartition-types.js";
+import { REPARTITION_KV_KEYS } from "../../src/sharding/repartition-flow.js";
+import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";

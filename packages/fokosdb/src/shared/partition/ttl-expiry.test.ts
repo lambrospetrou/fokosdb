@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { PartitionStore } from "./partition-store.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TtlExpiry, type TtlSweepConfig } from "./ttl-expiry.js";

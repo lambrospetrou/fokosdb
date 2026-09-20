@@ -5,9 +5,9 @@
 import { env } from "cloudflare:workers";
 import { expect } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
-import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { PartitionContextCreator } from "../../src/sharding/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 

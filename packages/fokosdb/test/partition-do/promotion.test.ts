@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import { PartialRangeTopology } from "../../src/shared/partition-topology/partial-range-topology.js";
+import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, withOpIndex } from "./helpers.js";

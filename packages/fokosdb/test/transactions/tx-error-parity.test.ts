@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { testPartitionStub } from "../stub-helpers.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
 import { keysInOnePartition, makeDB, type Key } from "./tx-helpers.js";
 

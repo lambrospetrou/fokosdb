@@ -4,7 +4,7 @@ import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { compileProjectionExpression, compileUpdateExpression } from "../expression/compiler.js";
 import type { UpdateExpression } from "../expression/types.js";
-import { type KeyBytes, KeyCodec } from "../partition-topology/key-codec.js";
+import { type KeyBytes, KeyCodec } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 import {
 	estimateItemBytes,

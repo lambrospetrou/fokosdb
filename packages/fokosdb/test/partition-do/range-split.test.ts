@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { kb } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot } from "./partition-harness.js";
 

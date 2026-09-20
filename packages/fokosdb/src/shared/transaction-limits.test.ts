@@ -11,7 +11,7 @@ import {
 	validateTransactWriteOperations,
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
-import { KeyCodec } from "./partition-topology/key-codec.js";
+import { KeyCodec } from "../sharding/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./expression/compiler.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 

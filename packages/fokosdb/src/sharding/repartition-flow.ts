@@ -28,18 +28,14 @@
  * is the first of the target, so the two ends of the migration protocol stay next to each other across
  * the class boundary — as do the overrides page they build and apply.
  */
-import { collectBatch } from "../batch-scan.js";
-import invariant from "../../invariant.js";
-import { KeyCodec, type KeyBytes } from "../../partition-topology/key-codec.js";
-import { isHashPartition, isRangePartition, type PartitionContextLivePartition } from "../../partition-topology/partition-context.js";
-import {
-	PartitionIdHelper,
-	resolveHashChildPartitionContexts,
-	resolveRangePartitionContext,
-} from "../../partition-topology/partition-id.js";
-import type { RangeAncestorInfo } from "../../partition-topology/types.js";
-import { selectRangeAncestors } from "../../partition-topology/split-policy.js";
-import { FokosInternalError, FokosUnavailableError, FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../../errors.js";
+import { collectBatch } from "./batch-scan.js";
+import invariant from "../shared/invariant.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import { isHashPartition, isRangePartition, type PartitionContextLivePartition } from "./partition-context.js";
+import { PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
+import type { RangeAncestorInfo } from "./types.js";
+import { selectRangeAncestors } from "./split-policy.js";
+import { FokosInternalError, FokosUnavailableError, FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
 import type {
 	PartitionStore,
 	PromotedKeyCursor,
@@ -48,7 +44,7 @@ import type {
 	RepartitionSlice,
 	RepartitionState,
 	RepartitionTargetRow,
-} from "../partition-store.js";
+} from "../shared/partition/partition-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
 import { sliceIncludesHashKey } from "./repartition-slice.js";
 import type {

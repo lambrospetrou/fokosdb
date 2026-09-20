@@ -15,7 +15,7 @@
  *    it like any other request.
  */
 import { DurableObject } from "cloudflare:workers";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { encodeHashKey } from "../../src/shared/transaction-limits.js";
 import type {
 	InitiateWriteResponseEncoded,

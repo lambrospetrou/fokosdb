@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { AddResult } from "../bloom-filter.js";
+import { AddResult } from "./bloom-filter.js";
 import { KeyCodec } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
 

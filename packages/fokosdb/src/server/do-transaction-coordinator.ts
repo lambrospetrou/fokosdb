@@ -1,8 +1,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
-import type { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
-import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.js";
+import type { PartitionContextResolved } from "../sharding/partition-context.js";
+import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
 import type {

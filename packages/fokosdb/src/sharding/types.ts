@@ -2,7 +2,7 @@
 // This file must not import from those modules, because that makes a circular dependency.
 
 import type { KeyBytes } from "./key-codec.js";
-import type { PartitionInfo } from "../types.js";
+import type { PartitionInfo } from "../shared/types.js";
 
 /**
  * INTERNAL ONLY - never reaches a public response.

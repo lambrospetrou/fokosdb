@@ -3,7 +3,7 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
 import type { JsonValue } from "../json-types.js";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
 import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";

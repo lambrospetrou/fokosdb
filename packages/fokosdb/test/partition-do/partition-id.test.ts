@@ -1,12 +1,12 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
-import { PartitionIdHelper } from "../../src/shared/partition-topology/partition-id.js";
-import { HashPartitionTopologyImpl } from "../../src/shared/partition-topology/split-policy.js";
+import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { HashPartitionTopologyImpl } from "../../src/sharding/split-policy.js";
 import invariant from "../../src/shared/invariant.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { sliceIncludesHashKey } from "../../src/shared/partition/repartition/repartition-slice.js";
+import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
 

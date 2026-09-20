@@ -1,4 +1,4 @@
-import { type KeyBytes } from "../partition-topology/key-codec.js";
+import { type KeyBytes } from "../../sharding/key-codec.js";
 import { materializedPlanBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";

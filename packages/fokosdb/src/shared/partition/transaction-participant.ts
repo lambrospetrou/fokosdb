@@ -16,7 +16,7 @@ import type {
 } from "../transaction-wire-types.js";
 import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import type { PartitionStore } from "./partition-store.js";
 import {
 	applyImageCap,

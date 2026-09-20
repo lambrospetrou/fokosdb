@@ -3,8 +3,8 @@ import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import invariant from "../../src/shared/invariant.js";
-import { KeyCodec, type KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
-import { isRangePartition } from "../../src/shared/partition-topology/partition-context.js";
+import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
+import { isRangePartition } from "../../src/sharding/partition-context.js";
 import { kb } from "./helpers.js";
 import { makePartition, makeRangeRoot, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-harness.js";
 

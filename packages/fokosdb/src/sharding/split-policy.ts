@@ -1,5 +1,5 @@
 import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
-import { hashChildIndex } from "../hash-primitives.js";
+import { hashChildIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
 import {
@@ -10,11 +10,11 @@ import {
 	type PartitionContextResolved,
 } from "./partition-context.js";
 import { PartitionIdHelper, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
-import invariant from "../invariant.js";
+import invariant from "../shared/invariant.js";
 import type { PartitionInfoInternal, RangeAncestorInfo } from "./types.js";
-import { PartitionStore } from "../partition/partition-store.js";
+import { PartitionStore } from "../shared/partition/partition-store.js";
 // Type-only. The emit erases it, so the topology and the repartition flow make no runtime cycle.
-import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
+import type { RepartitionRouting } from "./repartition-types.js";
 
 /**
  * What the operation asking to be routed does to the partition's size. Size backpressure gates on

@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import type { KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
-import type { PartitionInfoInternal } from "../../src/shared/partition-topology/types.js";
+import type { KeyBytes } from "../../src/sharding/key-codec.js";
+import type { PartitionInfoInternal } from "../../src/sharding/types.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, withOpIndex } from "./helpers.js";

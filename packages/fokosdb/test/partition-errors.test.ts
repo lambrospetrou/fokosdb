@@ -4,9 +4,9 @@ import { FokosDB } from "../src/client/db.js";
 import { testPartitionStub } from "./stub-helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
-import { KeyCodec } from "../src/shared/partition-topology/key-codec.js";
-import { PartitionContextCreator, type PartitionNamespaceKey } from "../src/shared/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/router.js";
+import { KeyCodec } from "../src/sharding/key-codec.js";
+import { PartitionContextCreator, type PartitionNamespaceKey } from "../src/sharding/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../src/sharding/router.js";
 import { MAX_ITEM_BYTES } from "../src/shared/transaction-limits.js";
 import { makeDB } from "./transactions/tx-helpers.js";
 

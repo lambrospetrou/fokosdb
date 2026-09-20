@@ -92,11 +92,11 @@ export { compileConditionExpression, compileUpdateExpression } from "../shared/e
 
 // ─── Partition topology ───────────────────────────────────────────────────────
 
-export { PartitionContextCreator } from "../shared/partition-topology/partition-context.js";
-export type { PartitionContext, PartitionContextResolved, SplitConditions } from "../shared/partition-topology/partition-context.js";
+export { PartitionContextCreator } from "../sharding/partition-context.js";
+export type { PartitionContext, PartitionContextResolved, SplitConditions } from "../sharding/partition-context.js";
 
-export { PartitionTopologyRouterImpl } from "../shared/partition-topology/router.js";
-export type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
+export { PartitionTopologyRouterImpl } from "../sharding/router.js";
+export type { PartitionTopologyRouter } from "../sharding/router.js";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 

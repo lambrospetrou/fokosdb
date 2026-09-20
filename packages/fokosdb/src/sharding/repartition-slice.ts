@@ -1,8 +1,8 @@
-import { hashChildIndex } from "../../hash-primitives.js";
-import { KeyCodec, type KeyBytes } from "../../partition-topology/key-codec.js";
-import type { ScanCursor } from "../partition-store.js";
-import { clipToChildRange, cursorFallsInChild, rangeIntersects, type SkInterval } from "../../query/sk-interval.js";
-import { FokosRoutingError, ROUTING_CODES } from "../../errors.js";
+import { hashChildIndex } from "./hash-primitives.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import type { ScanCursor } from "../shared/partition/partition-store.js";
+import { clipToChildRange, cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
+import { FokosRoutingError, ROUTING_CODES } from "../shared/errors.js";
 
 /**
  * The part of a source partition's keyspace that one repartition target owns.

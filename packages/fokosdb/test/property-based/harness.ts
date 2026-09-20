@@ -38,9 +38,9 @@ import {
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
-import { PartitionContextCreator } from "../../src/shared/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { PartitionContextCreator } from "../../src/sharding/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";

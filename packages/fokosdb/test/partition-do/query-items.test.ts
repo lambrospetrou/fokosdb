@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO, QueryItemsRpcRequest, QueryItemsRpcResponse, type ProjectedWireRow } from "../../src/server/do-partition.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";

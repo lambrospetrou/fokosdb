@@ -5,7 +5,7 @@ import { testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "./partition-store.js";
 import { TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.js";
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";
 import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
