@@ -6,7 +6,8 @@ import { expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import { FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import type { ConditionExpression } from "../../src/shared/expression/types.js";
+import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
+import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
 import type { TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import { expectedDataKind, keyId, type DataKind, type ItemData, type ItemKey } from "./arbitraries.js";
 
@@ -24,8 +25,14 @@ export function applyPut(m: Model, key: ItemKey, data: ItemData): number {
 /** Compares one read answer (a `getItem` result or one `transactGetItems` entry) with the model. */
 export function expectRead(m: Model, key: ItemKey, res: unknown): void {
 	const expected = m.items.get(keyId(key));
-	if (expected === undefined) expect(res).toMatchObject({ found: false, ...key });
-	else expect(res).toMatchObject({ found: true, ...key, ...expected });
+	if (expected === undefined) {
+		expect(res).toMatchObject({ found: false, ...key });
+		return;
+	}
+	expect(res).toMatchObject({ found: true, ...key, kind: expected.kind, version: expected.version });
+	// `toMatchObject` matches a SUBSET of an object value, so it accepts a document that kept a field
+	// the model removed. The data of a found item is therefore compared exactly.
+	expect((res as { data: unknown }).data).toEqual(expected.data);
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -51,19 +58,74 @@ export async function untilAvailable<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
+// One pre-image kind per pool key, so a run starts with a text, a bytes, an object and an array item
+// and an update meets every applicability rule from its first command on. Without it a run begins on
+// an empty table and nearly every update lands on an absent key.
+const SEED_DATA: readonly ItemData[] = [
+	"seed-text",
+	new Uint8Array([0x01, 0x02]),
+	{ alpha: 1, beta: "two" },
+	[1, "two", true],
+	{ gamma: null },
+];
+
+/**
+ * Writes one item for every pool key but the last, and records them in the model. The last key stays
+ * absent, so a run still covers the paths that create an item.
+ */
+export async function seedPool(db: FokosDB, m: Model, keys: readonly ItemKey[], seedData: readonly ItemData[] = SEED_DATA): Promise<void> {
+	for (const [index, key] of keys.slice(0, -1).entries()) {
+		const data = seedData[index % seedData.length];
+		await untilAvailable(() => db.putItem({ ...key, data }));
+		applyPut(m, key, data);
+	}
+}
+
 /** Reads every key of the pool in one transaction and compares each answer with the model. */
 export async function expectModelMatches(db: FokosDB, m: Model, keys: readonly ItemKey[]): Promise<void> {
 	const res = await untilAvailable(() => db.transactGetItems({ items: [...keys] }));
 	keys.forEach((key, i) => expectRead(m, key, res.items[i]));
 }
 
+// One action of an update, in the model's own vocabulary. The target is always a top-level field and
+// the value is always a literal, so the model can apply the action to its own copy of the document.
+export type ModelUpdateAction = { action: "set"; field: string; value: JsonPrimitive } | { action: "remove"; field: string };
+
 // One operation of a write transaction, in the model's own vocabulary. `expectExists` is the only
-// condition the model can evaluate: it is required for a check and optional for a put or a delete.
+// condition the model can evaluate: it is required for a check and optional for the others.
 export type TxOp = { key: ItemKey; expectExists?: boolean } & (
 	| { operation: "put"; data: ItemData }
 	| { operation: "delete" }
 	| { operation: "check"; expectExists: boolean }
+	| { operation: "update"; actions: ModelUpdateAction[] }
 );
+
+/**
+ * The document an update leaves behind, or `null` when the update does not apply. An absent item has
+ * the empty document as its pre-image, so an update creates it. Three rules decide the rest: a text
+ * or bytes pre-image is not a document; a `set` of a top-level field needs an object parent, which an
+ * array does not give; and a `remove` of a field an array cannot hold is a no-op.
+ */
+function updatedDocument(item: ModelItem | undefined, actions: readonly ModelUpdateAction[]): JsonComposite | null {
+	if (item !== undefined && item.kind !== "json") return null;
+	const preImage = (item?.data ?? {}) as JsonComposite;
+	if (Array.isArray(preImage)) return actions.some((a) => a.action === "set") ? null : preImage;
+
+	const document: { [field: string]: JsonValue } = { ...(preImage as { [field: string]: JsonValue }) };
+	for (const action of actions) {
+		if (action.action === "set") document[action.field] = action.value;
+		else delete document[action.field];
+	}
+	return document;
+}
+
+/** The one place that applies an update to the model. An update always stores a json document. */
+export function applyUpdate(m: Model, key: ItemKey, actions: readonly ModelUpdateAction[]): void {
+	const id = keyId(key);
+	const document = updatedDocument(m.items.get(id), actions);
+	if (document === null) throw new Error("an update that does not apply must not commit");
+	m.items.set(id, { data: document, kind: "json", version: (m.items.get(id)?.version ?? 0) + 1 });
+}
 
 function existsCondition(expectExists: boolean): ConditionExpression {
 	return { op: expectExists ? "exists" : "not_exists", args: [{ ref: "hashKey" }] };
@@ -73,6 +135,14 @@ function toTransactWriteItem(op: TxOp): TransactWriteItem {
 	const condition = op.expectExists === undefined ? undefined : existsCondition(op.expectExists);
 	if (op.operation === "put") return { operation: "put", ...op.key, data: op.data, condition };
 	if (op.operation === "delete") return { operation: "delete", ...op.key, condition };
+	if (op.operation === "update") {
+		const update: UpdateExpression = op.actions.map((action) =>
+			action.action === "set"
+				? { action: "set", target: { ref: "data", path: `$.${action.field}` }, value: { val: action.value } }
+				: { action: "remove", target: { ref: "data", path: `$.${action.field}` } },
+		);
+		return { operation: "update", ...op.key, update, condition };
+	}
 	return { operation: "check", ...op.key, condition: existsCondition(op.expectExists) };
 }
 
@@ -81,7 +151,26 @@ function toTransactWriteItem(op: TxOp): TransactWriteItem {
 // a partition that is mid-split when a mixed cancel also carries a caller-side reason.
 const ACCEPTED_CANCEL_CODES: ReadonlySet<string> = new Set(["timestamp_conflict", ...Object.keys(UNAVAILABLE_CODES)]);
 
-const isConditionFailed = (r: TransactWriteOperationResult) => r.outcome === "rejected" && r.reason.code === "condition_failed";
+// The rejection codes that say a premise the MODEL evaluates did not hold. Every other code comes
+// from the ordering or the availability of the partition, which the model does not predict.
+const PREMISE_CODES: ReadonlySet<string> = new Set(["condition_failed", "update_not_applicable"]);
+
+const premiseCode = (r: TransactWriteOperationResult): string | undefined =>
+	r.outcome === "rejected" && PREMISE_CODES.has(r.reason.code) ? r.reason.code : undefined;
+
+/**
+ * The codes an operation must be rejected with, or `null` when the model knows of no failing premise.
+ * Both premises can fail on one operation, and the participant reports the first one it evaluates, so
+ * the answer is the set of acceptable codes and not one code.
+ */
+function expectedRejection(m: Model, op: TxOp): string[] | null {
+	const codes: string[] = [];
+	if (op.expectExists !== undefined && op.expectExists !== m.items.has(keyId(op.key))) codes.push("condition_failed");
+	if (op.operation === "update" && updatedDocument(m.items.get(keyId(op.key)), op.actions) === null) {
+		codes.push("update_not_applicable");
+	}
+	return codes.length === 0 ? null : codes;
+}
 
 abstract class ModelCommand implements fc.AsyncCommand<Model, FokosDB> {
 	check(): boolean {
@@ -157,7 +246,7 @@ export class TransactWrite extends ModelCommand {
 		// item it touches, so the run first lets the clock move to keep commits common.
 		await sleep(2);
 
-		const failing = this.ops.map((op) => op.expectExists !== undefined && op.expectExists !== m.items.has(keyId(op.key)));
+		const rejections = this.ops.map((op) => expectedRejection(m, op));
 		// `results` is undefined on a commit and holds the positional answers on a cancel.
 		const results = await untilAvailable(() => db.transactWriteItems({ items: this.ops.map(toTransactWriteItem) })).then(
 			() => undefined,
@@ -167,19 +256,24 @@ export class TransactWrite extends ModelCommand {
 			},
 		);
 
-		if (failing.includes(true)) {
-			// The model knows a condition failed, so the transaction must cancel and name that operation.
+		if (rejections.some((codes) => codes !== null)) {
+			// The model knows a premise failed, so the transaction must cancel and name that operation.
 			// Every participant answers its own operations in parallel, so no failing one stays
 			// `not_evaluated`. The model does not change.
-			expect(results, "a failing condition must cancel the transaction").toBeDefined();
+			expect(results, "a failing premise must cancel the transaction").toBeDefined();
 			if (results === undefined) return;
 			expect(results).toHaveLength(this.ops.length);
-			failing.forEach((fails, i) => expect(isConditionFailed(results[i])).toBe(fails));
+			rejections.forEach((codes, i) => {
+				// An operation whose premises hold must not be blamed for one: it may still be rejected
+				// for an ordering or availability reason, which is another code.
+				if (codes === null) expect(premiseCode(results[i])).toBeUndefined();
+				else expect(codes).toContain(premiseCode(results[i]));
+			});
 			return;
 		}
 
 		if (results !== undefined) {
-			// Every condition held, so only an ordering or availability reason may cancel, and
+			// Every premise held, so only an ordering or availability reason may cancel, and
 			// atomicity says the model does not change.
 			for (const r of results) if (r.outcome === "rejected") expect(ACCEPTED_CANCEL_CODES).toContain(r.reason.code);
 			return;
@@ -188,15 +282,38 @@ export class TransactWrite extends ModelCommand {
 		for (const op of this.ops) {
 			if (op.operation === "put") applyPut(m, op.key, op.data);
 			else if (op.operation === "delete") m.items.delete(keyId(op.key));
+			else if (op.operation === "update") applyUpdate(m, op.key, op.actions);
 		}
 	}
 	toString(): string {
-		const ops = this.ops.map(
-			(op) => `${op.operation}${op.expectExists === undefined ? "" : op.expectExists ? "?exists" : "?absent"}(${keyId(op.key)})`,
-		);
+		const ops = this.ops.map((op) => {
+			const condition = op.expectExists === undefined ? "" : op.expectExists ? "?exists" : "?absent";
+			// The actions decide the document, so a counterexample must print them.
+			const actions =
+				op.operation === "update"
+					? ` [${op.actions.map((a) => (a.action === "set" ? `set ${a.field}=${JSON.stringify(a.value)}` : `remove ${a.field}`)).join(", ")}]`
+					: "";
+			return `${op.operation}${condition}(${keyId(op.key)})${actions}`;
+		});
 		return `TransactWrite(${ops.join(", ")})`;
 	}
 }
+
+// A random condition holds half of the time, and one failing operation cancels the whole set. The
+// optional condition is rare and the check operation is light, so most sets commit and the run still
+// sees enough cancels.
+export const arbOptionalCondition = fc.oneof({ arbitrary: fc.constant(undefined), weight: 4 }, { arbitrary: fc.boolean(), weight: 1 });
+
+// Four field names over the whole pool, so an update of one key often targets a field another update
+// wrote or removed. Two actions of one update must not name one field, because their order would then
+// decide the document and the model does not know it.
+const arbField = fc.constantFrom("alpha", "beta", "gamma", "delta");
+const arbFieldValue: fc.Arbitrary<JsonPrimitive> = fc.oneof(fc.string({ maxLength: 8 }), fc.integer(), fc.boolean(), fc.constant(null));
+const arbUpdateAction: fc.Arbitrary<ModelUpdateAction> = fc.oneof(
+	{ arbitrary: fc.tuple(arbField, arbFieldValue).map(([field, value]) => ({ action: "set" as const, field, value })), weight: 3 },
+	{ arbitrary: arbField.map((field) => ({ action: "remove" as const, field })), weight: 1 },
+);
+export const arbUpdateActions = fc.uniqueArray(arbUpdateAction, { minLength: 1, maxLength: 3, selector: (action) => action.field });
 
 /**
  * The command arbitraries of a stateful run over `keys`. The key arbitrary must draw from a small
@@ -206,16 +323,20 @@ export function commandArbitraries(
 	keys: fc.Arbitrary<ItemKey>,
 	data: fc.Arbitrary<ItemData>,
 ): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
-	// A random condition holds half of the time, and one failing operation cancels the whole set. The
-	// optional condition is rare and the check operation is light, so most sets commit and the run
-	// still sees enough cancels.
-	const arbOptionalCondition = fc.oneof({ arbitrary: fc.constant(undefined), weight: 4 }, { arbitrary: fc.boolean(), weight: 1 });
 	const arbTxOp: fc.Arbitrary<TxOp> = fc
 		.tuple(
 			keys,
 			fc.oneof(
 				{ arbitrary: fc.record({ operation: fc.constant("put" as const), data, expectExists: arbOptionalCondition }), weight: 3 },
 				{ arbitrary: fc.record({ operation: fc.constant("delete" as const), expectExists: arbOptionalCondition }), weight: 2 },
+				{
+					arbitrary: fc.record({
+						operation: fc.constant("update" as const),
+						actions: arbUpdateActions,
+						expectExists: arbOptionalCondition,
+					}),
+					weight: 3,
+				},
 				{ arbitrary: fc.record({ operation: fc.constant("check" as const), expectExists: fc.boolean() }), weight: 1 },
 			),
 		)
