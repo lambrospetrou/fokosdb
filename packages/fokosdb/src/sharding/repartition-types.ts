@@ -10,8 +10,9 @@
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
-import type { PromotedKeyCursor, RepartitionKind, RepartitionState, RepartitionTargetRow, TargetInitialization } from "./sharding-store.js";
+import type { PromotedKeyCursor, RepartitionKind, RepartitionState, TargetInitialization } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
+import type { FokosEnvelope, FokosRequestPromotionResult } from "./runtime-types.js";
 
 export type { FokosPartitionRef, FokosSlice };
 
@@ -21,19 +22,32 @@ export type RouteKey = { hashKey: KeyBytes; sortKey: KeyBytes };
 // ─── the source plan ─────────────────────────────────────────────────────────
 
 /**
- * The immutable part of a repartition, written once with the target rows and deleted at cutover.
+ * The head of the plan chain of one repartition, under `__fokos/repartition/<id>/plan/00000001`.
  *
- * It holds only what the target rows cannot: the source identity and the range ancestors selected for
- * this split. The computed boundaries are the target slices themselves, so the plan does not repeat
- * them, and the mutable split thresholds are never stored — a router rebuilds every forwarded context
- * from its own current context instead.
+ * The queue transaction writes it with the `queued` row, so the host policy and data of queue time
+ * survive a crash and reach every later hook unchanged. Planning fills `planned`. Cutover retains the
+ * head. The final cleanup transaction deletes the chain before it writes `cleaned`.
+ *
+ * Target references and slices are not repeated here: the target rows hold them, and the mutable
+ * split thresholds are never stored, because a router rebuilds every forwarded context from its own
+ * current context.
+ *
+ * Version 1 has one item. A later version can write another object first and then set `nextKey` to
+ * its key in the same transaction. Readers follow keys until `nextKey` is null.
  */
-export type RepartitionPlan = {
+export type FokosStoredRepartitionPlan<TPolicy = unknown> = {
 	schema: 1;
-	source: FokosPartitionRef;
-	/** The depth the targets receive. A range split's children, or 0 for a promotion's range root. */
-	rangeDepth?: number;
-	rangeAncestors?: RangeAncestorInfo[];
+	queue: {
+		policy: TPolicy;
+		data?: unknown;
+	};
+	planned: null | {
+		/** The depth the targets receive. A range split's children, or 0 for a promotion's range root. */
+		rangeDepth?: number;
+		rangeAncestors?: RangeAncestorInfo[];
+	};
+	/** The key of the next plan item. Version 1 always stores null. */
+	nextKey: string | null;
 };
 
 // ─── the target import record ────────────────────────────────────────────────
@@ -107,40 +121,43 @@ export type FokosMigrationPage =
 
 /**
  * One read a still-importing target asks its source to serve, for the slice that target owns. The
- * operation name and the request are opaque here: the source knows which operations it serves and
+ * operation name and the request are opaque here: the source finds the operation in its registry and
  * narrows both.
  */
 export type FokosExecuteLocalRequest = { op: string; repartitionId: string; caller: FokosPartitionRef; request: unknown };
 
-/** Everything one partition calls on another to run a repartition. */
-export interface FokosPartitionControlRpc {
+/**
+ * Queue a key promotion on the partition that owns the key now. `target` is the receiver, validated
+ * against its stored identity as a route context is. A router forwards the request to the owner.
+ */
+export type FokosRequestPromotionRequest = { target: FokosPartitionRef; hashKey: KeyBytes; data?: unknown };
+
+/**
+ * The control-plane surface. A host implements every method by delegation to its runtime, and these
+ * are the only methods the runtime calls on a peer of the host's own class.
+ */
+export interface FokosShardingRpc {
 	fokosInit(req: FokosInitRequest): Promise<void>;
 	fokosStartImport(req: FokosStartImportRequest): Promise<void>;
 	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage>;
 	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void>;
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<unknown>;
+	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>>;
+	fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult>;
+	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage>;
+	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
+	/** Cancel the schedule, delete all storage, abort. The caller traverses the status pages first. */
+	fokosDestroy(): Promise<void>;
+	alarm(info: AlarmInvocationInfo): Promise<void>;
 }
 
-/** The four methods the flow itself calls. It never reads through a peer; the DO owns that path. */
+/** Everything one partition calls on another to run a repartition. */
+export type FokosPartitionControlRpc = Pick<
+	FokosShardingRpc,
+	"fokosInit" | "fokosStartImport" | "fokosMigrationPull" | "fokosMigrationAck" | "fokosExecuteLocal"
+>;
+
+/** The four methods the flow itself calls. It never reads through a peer; the runtime owns that path. */
 export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteLocal">;
-
-/**
- * The part of the source half that routing reads, and the only part the topology policies see.
- *
- * It is a narrow interface and not the class, so that `split-policy.ts` needs a type-only import. The
- * flow imports `selectRangeAncestors` from there as a value, and a value import back would make a
- * runtime cycle.
- */
-export interface RepartitionRouting {
-	/** Whether this partition has become a pure router, owning no key of its own. */
-	routerRole(): boolean;
-	/** The targets of the split in `target_index` order, which a range split tiles in ascending order. */
-	splitTargets(): RepartitionTargetRow[];
-	/** How far the promotion of one hash key has got, or undefined when this partition still owns it. */
-	overrideFor(hashKey: KeyBytes): RepartitionState | undefined;
-	/** Whether the range tree, not this partition, owns the key. True from cutover onwards. */
-	ownedByRangeTree(hashKey: KeyBytes): boolean;
-}
 
 // ─── the application boundary ────────────────────────────────────────────────
 
@@ -167,7 +184,8 @@ export interface MigrationHost {
 export type FokosStatusCursor = { seq: number; targetIndex: number };
 
 export type FokosStatusEntry = {
-	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState };
+	/** `hashKey` is the key a promotion moves, and null for a split. */
+	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; hashKey: KeyBytes | null };
 	target: null | {
 		index: number;
 		ref: FokosPartitionRef;
@@ -194,10 +212,3 @@ export type FokosStatusRequest = {
 export type FokosPrepareDestroyRequest = {
 	rootContext?: FokosRouteContext<unknown>;
 };
-
-/** What a destroy traversal calls on every partition it reaches, in this order. */
-export interface FokosPartitionStatusRpc {
-	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
-	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage>;
-	destroyPartition(): Promise<void>;
-}

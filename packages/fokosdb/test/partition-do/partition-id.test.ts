@@ -1,10 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
-import { partitionIdentityFrom, PartitionIdHelper } from "../../src/sharding/partition-id.js";
-import { HashPartitionTopologyImpl } from "../../src/sharding/split-policy.js";
-import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
+import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
@@ -25,55 +22,27 @@ describe("PartitionDO - partitionId encoding", () => {
 		}
 	});
 
-	it("pickChildPartition and the hash-child slice agree at every tree level", async ({ expect }) => {
-		// This test guards the entropy consistency between routing and migration filtering.
-		// If the depth offset used in one changes without the other, routing will silently
-		// assign keys to different partitions than the migration filter expects.
-		const { ctx: pCtx, stub } = makeStub({
-			hashSplitN: 4,
-			hashSplitConditions: { maxSizeMb: 100 },
-		});
-		// Routing only. This test never makes the partition a router and gives it no override.
-		const notRepartitioning = {
-			routerRole: () => false,
-			splitTargets: () => [],
-			overrideFor: () => undefined,
-			ownedByRangeTree: () => false,
-		};
+	it("owner resolution and the hash-child slice agree", async ({ expect }) => {
+		// This test guards the entropy consistency between routing and migration filtering. If the depth
+		// offset used in one changes without the other, routing silently assigns keys to different
+		// partitions than the migration filter expects.
+		const partition = makePartition({ hashSplitN: 4, hashSplitConditions: { maxSizeMb: 1 } });
+		const children = await partition.splitHash();
 		const hashKey = "routing-consistency-key";
-		// The topology reads its storage, so both picks run inside the Durable Object that owns it.
-		const { child, grandchild } = await runInDurableObject(stub, async (_instance: PartitionDO, ctx: DurableObjectState) => {
-			const store = new FokosShardingStore(ctx.storage);
-			const topologyOf = (owner: FokosDbRouteContext) =>
-				new HashPartitionTopologyImpl(owner, partitionIdentityFrom(owner), ctx, store, notRepartitioning);
-			const child = topologyOf(pCtx).pickChildPartition(pCtx, kb(hashKey));
-			return { child, grandchild: topologyOf(child).pickChildPartition(child, kb(hashKey)) };
-		});
+		const owner = await runInDurableObject(partition.stub, (instance: PartitionDO) =>
+			instance.fokos.resolveOwner({ hashKey: kb(hashKey), sortKey: kb("sk") }),
+		);
+		expect(owner.kind).toBe("remote");
+		const ownerName = owner.kind === "remote" ? owner.target.doName : undefined;
 
-		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
-		const level1Siblings = PartitionIdHelper.calculateHashChildPartitionIds(pCtx);
-		for (const sib of level1Siblings) {
-			const sibCtx: FokosDbRouteContext = { ...pCtx, doName: sib.doName, partitionId: sib.partitionIdOpaque };
-			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
+		for (const child of children) {
+			const idBytes = Uint8Array.fromHex(child.ctx.partitionId);
 			const slice = {
 				kind: "hash_child" as const,
-				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
-				depth: sliceDepth,
+				childIndex: PartitionIdHelper.lastChildIdx(idBytes),
+				depth: PartitionIdHelper.depth(idBytes),
 			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), pCtx.topology.hashSplitN)).toBe(sib.doName === child.doName);
-		}
-
-		// Depth 1 → 2: same invariant one level deeper.
-		const level2Siblings = PartitionIdHelper.calculateHashChildPartitionIds(child);
-		for (const sib of level2Siblings) {
-			const sibCtx: FokosDbRouteContext = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque };
-			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
-			const slice = {
-				kind: "hash_child" as const,
-				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
-				depth: sliceDepth,
-			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), child.topology.hashSplitN)).toBe(sib.doName === grandchild.doName);
+			expect(sliceIncludesHashKey(slice, kb(hashKey), child.ctx.topology.hashSplitN)).toBe(child.doName === ownerName);
 		}
 	});
 

@@ -46,7 +46,7 @@ function makeCluster(links: Record<string, FokosPartitionRef[]>) {
 				events.push(`page:${doName}#${seq}`);
 				const entry: FokosStatusEntry | undefined = targets[seq]
 					? {
-							repartition: { id: `r${seq}`, seq, kind: "hash_split", state: "completed" },
+							repartition: { id: `r${seq}`, seq, kind: "hash_split", state: "completed", hashKey: null },
 							target: { index: 0, ref: targets[seq], initialization: "initialized", acknowledged: true },
 						}
 					: undefined;

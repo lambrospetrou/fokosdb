@@ -576,7 +576,7 @@ describe("transactions - end-to-end", () => {
 			) {
 				const response = await original.call(this, pCtx, request);
 				if (pCtx.doName !== pendingPartition) return response;
-				return { items: response.items.map((item) => ({ ...item, hasPendingWrite: true })) };
+				return { ...response, value: { items: response.value.items.map((item) => ({ ...item, hasPendingWrite: true })) } };
 			});
 
 			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("pending_write"));
@@ -601,7 +601,10 @@ describe("transactions - end-to-end", () => {
 				callsByPartition.set(pCtx.doName, call);
 				const response = await original.call(this, pCtx, request);
 				if (pCtx.doName !== changingPartition || call !== 2) return response;
-				return { items: response.items.map((item) => ({ ...item, deleteRevision: item.deleteRevision + 1 })) };
+				return {
+					...response,
+					value: { items: response.value.items.map((item) => ({ ...item, deleteRevision: item.deleteRevision + 1 })) },
+				};
 			});
 
 			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));

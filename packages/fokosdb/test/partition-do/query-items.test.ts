@@ -2,6 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO, QueryItemsRpcRequest, QueryItemsRpcResponse, type ProjectedWireRow } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { clipToChildRange } from "../../src/sharding/sk-interval.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
@@ -10,7 +11,8 @@ import { compileQueryExpression } from "../../src/shared/expression/compiler.js"
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import type { ProjectionExpression } from "../../src/shared/expression/types.js";
 import { EST_ROW_BYTES_K } from "../../src/shared/partition/item-size.js";
-import { kb, makeStub } from "./helpers.js";
+import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
+import { kb, makeStub, opened, type Opened } from "./helpers.js";
 import {
 	type TestPartition,
 	makePartition,
@@ -71,11 +73,11 @@ describe("PartitionDO — range split", () => {
 		};
 
 		it("reads one candidate beyond a full evaluated-item budget and returns an inclusive cursor", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 
-				const result = await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 }));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 })));
 
 				expect(result.items).toHaveLength(10);
 				expect(result.count).toBe(10);
@@ -87,11 +89,11 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("returns no cursor when the evaluated-item budget ends on the last candidate", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 
-				const result = await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 45 }));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 45 })));
 
 				expect(result.items).toHaveLength(45);
 				expect(result.count).toBe(45);
@@ -101,11 +103,11 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("count mode returns no items, zero response bytes, and the same page counters", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 
-				const result = await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 10 }));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 10 })));
 
 				expect(result.items).toEqual([]);
 				expect(result.responseBytes).toBe(0);
@@ -119,12 +121,12 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("count mode with a filter returns the matched count below scannedCount", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 				const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
 
-				const result = await instance.apiQueryItems(ctx, request("asc", { select: "count", plan }));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", plan })));
 
 				expect(result.items).toEqual([]);
 				expect(result.responseBytes).toBe(0);
@@ -136,12 +138,12 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("a rejected candidate consumes the evaluated budgets and advances the cursor", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
 
-				const first = await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10 }));
+				const first = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10 })));
 				expect(first.count).toBe(0);
 				expect(first.items).toEqual([]);
 				expect(first.scannedCount).toBe(10);
@@ -155,7 +157,7 @@ describe("PartitionDO — range split", () => {
 				let cursor = first.nextCursor;
 				let pages = 0;
 				while (cursor !== null) {
-					const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10, cursor }));
+					const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10, cursor })));
 					count += res.count;
 					scannedCount += res.scannedCount;
 					seen.push(...res.items.map((it) => KeyCodec.decode((it as StoredItem).sk) as string));
@@ -169,7 +171,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("a rejected candidate spends zero response bytes", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
@@ -186,7 +188,7 @@ describe("PartitionDO — range split", () => {
 
 				// 250 KiB admits two 100 KiB items but not six. The page drains only because the five
 				// rejected candidates charged nothing to the response budget.
-				const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 }));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 })));
 				expect(res.nextCursor).toBeNull();
 				expect(res.scannedCount).toBe(6);
 				expect(res.items).toHaveLength(1);
@@ -195,7 +197,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("count and projection pages can stop at different positions and exchange cursors", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
@@ -210,26 +212,26 @@ describe("PartitionDO — range split", () => {
 				}
 
 				// Projection stops when the response budget rejects the third item.
-				const proj = await instance.apiQueryItems(ctx, request("asc", { remainingResponseBytes: 250 * 1024 }));
+				const proj = opened(await instance.apiQueryItems(ctx, request("asc", { remainingResponseBytes: 250 * 1024 })));
 				expect(proj.items).toHaveLength(2);
 				expect(proj.nextCursor).not.toBeNull();
 
 				// Count ignores the response budget and drains the same interval.
-				const cnt = await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingResponseBytes: 250 * 1024 }));
+				const cnt = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingResponseBytes: 250 * 1024 })));
 				expect(cnt.items).toEqual([]);
 				expect(cnt.count).toBe(6);
 				expect(cnt.nextCursor).toBeNull();
 
 				// The projection cursor resumes under count at the rejected candidate.
-				const cntResume = await instance.apiQueryItems(ctx, request("asc", { select: "count", cursor: proj.nextCursor }));
+				const cntResume = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", cursor: proj.nextCursor })));
 				expect(cntResume.count).toBe(4);
 				expect(cntResume.nextCursor).toBeNull();
 
 				// The count cursor resumes under projection and materializes the rest.
-				const cnt3 = await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 3 }));
+				const cnt3 = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 3 })));
 				expect(cnt3.count).toBe(3);
 				expect(cnt3.nextCursor).not.toBeNull();
-				const projResume = await instance.apiQueryItems(ctx, request("asc", { cursor: cnt3.nextCursor }));
+				const projResume = opened(await instance.apiQueryItems(ctx, request("asc", { cursor: cnt3.nextCursor })));
 				expect(projResume.items).toHaveLength(3);
 				expect(projResume.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(["big3", "big4", "big5"]);
 				expect(projResume.nextCursor).toBeNull();
@@ -237,11 +239,11 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("physical rowsRead is reported from SQLite and is not derived from the logical counters", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state);
 
-				const result = await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 }));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 })));
 
 				expect(result.meta.rowsRead).toBeGreaterThan(0);
 				expect(result.partitionMetas[0].rowsRead).toBe(result.meta.rowsRead);
@@ -251,14 +253,14 @@ describe("PartitionDO — range split", () => {
 		it.each(["asc", "desc"] as const)(
 			"a projection returns positional rows in %s order with the complete-item counters",
 			async (direction) => {
-				const { ctx, stub } = makeStub();
+				const { ctx, stub, rpc } = makeStub();
 				await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 					seed45(state);
 					const plan = compileQueryExpression({
 						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
 					});
 
-					const result = await instance.apiQueryItems(ctx, request(direction, { plan, remainingEvaluatedItems: 10 }));
+					const result = opened(await instance.apiQueryItems(ctx, request(direction, { plan, remainingEvaluatedItems: 10 })));
 
 					const expected = Array.from({ length: 10 }, (_, i) => [String(direction === "asc" ? i : 44 - i).padStart(3, "0"), 1]);
 					expect(result.items).toEqual(expected);
@@ -272,7 +274,7 @@ describe("PartitionDO — range split", () => {
 		);
 
 		it("a projection page stops on the response budget over the projected rows", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				// A 60 KiB text cell estimates at 64 + 120 KiB, so two rows fit a 250 KiB page.
@@ -282,7 +284,7 @@ describe("PartitionDO — range split", () => {
 				}
 				const plan = compileQueryExpression({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
 
-				const res = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 }));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 })));
 				expect(res.items).toHaveLength(2);
 				expect(res.count).toBe(2);
 				expect(res.nextCursor?.inclusive).toBe(true);
@@ -291,7 +293,7 @@ describe("PartitionDO — range split", () => {
 				expect(res.responseBytes).toBe(res.items.reduce((sum, item) => sum + estimateProjectedRowBytes(item as ProjectedWireRow), 0));
 
 				// The first oversized projected row of a page is still admitted once.
-				const oversized = await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 1 }));
+				const oversized = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 1 })));
 				expect(oversized.items).toHaveLength(1);
 				expect(oversized.responseBytes).toBe(estimateProjectedRowBytes(oversized.items[0] as ProjectedWireRow));
 				expect(oversized.nextCursor?.inclusive).toBe(true);
@@ -300,7 +302,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("keeps undefined projected cells across the RPC hop", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
@@ -321,7 +323,7 @@ describe("PartitionDO — range split", () => {
 			const plan = compileQueryExpression({
 				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
 			});
-			const result = await stub.apiQueryItems(ctx, request("asc", { plan }));
+			const result = await rpc.apiQueryItems(ctx, request("asc", { plan }));
 
 			expect(result.items).toHaveLength(6);
 			for (const [i, item] of result.items.entries()) {
@@ -339,7 +341,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("runs a projection at the entry limit through the leaf", async () => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				const doc = Object.fromEntries(Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => [`f${k}`, k]));
@@ -349,7 +351,7 @@ describe("PartitionDO — range split", () => {
 				}));
 				const plan = compileQueryExpression({ projection });
 
-				const res = await instance.apiQueryItems(ctx, request("asc", { plan }));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan })));
 				expect(res.items).toHaveLength(1);
 				expect(res.items[0]).toHaveLength(EXPRESSION_LIMITS.projectionEntries);
 				expect((res.items[0] as ProjectedWireRow)[17]).toBe(17);
@@ -357,7 +359,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it.each(["asc", "desc"] as const)("pages 400 KiB items without gaps or duplicates in %s order", async (direction) => {
-			const { ctx, stub } = makeStub();
+			const { ctx, stub, rpc } = makeStub();
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (const sk of ["a", "b", "c"]) {
@@ -375,9 +377,11 @@ describe("PartitionDO — range split", () => {
 				const seen: string[] = [];
 				let cursor: QueryItemsRpcRequest["cursor"] = null;
 				for (;;) {
-					const result = await instance.apiQueryItems(
-						ctx,
-						request(direction, { remainingResponseBytes: MAX_ITEM_BYTES + 100, remainingEvaluatedItems: 2, cursor }),
+					const result: Opened<QueryItemsRpcResponse> = opened(
+						await instance.apiQueryItems(
+							ctx,
+							request(direction, { remainingResponseBytes: MAX_ITEM_BYTES + 100, remainingEvaluatedItems: 2, cursor }),
+						),
 					);
 					seen.push(...result.items.map((item) => KeyCodec.decode((item as StoredItem).sk) as string));
 					if (result.nextCursor === null) break;
@@ -409,14 +413,26 @@ describe("PartitionDO — range split", () => {
 			);
 
 		const queryPage = (root: TestPartition, overrides: Partial<QueryItemsRpcRequest> = {}) =>
-			root.stub.apiQueryItems(root.ctx, fullRequest(overrides));
+			root.rpc.apiQueryItems(root.ctx, fullRequest(overrides));
+
+		// A range partition serves only an interval inside its own, so a request to one is clipped to it first.
+		const leafEnvelope = (leaf: TestPartition, overrides: Partial<QueryItemsRpcRequest> = {}) => {
+			const { startBoundary, endBoundary } = rangeOf(leaf.ctx);
+			return leaf.stub.apiQueryItems(
+				leaf.ctx,
+				fullRequest({ ...overrides, interval: clipToChildRange(overrides.interval ?? {}, startBoundary, endBoundary) }),
+			);
+		};
+
+		const leafPage = async (leaf: TestPartition, overrides: Partial<QueryItemsRpcRequest> = {}) =>
+			opened(await leafEnvelope(leaf, overrides));
 
 		// Page through the whole result set, accumulating decoded sort keys, the summed page counters,
 		// and the set of leaf DOs touched. `onPage` observes each raw page (count pages carry no items).
 		const collect = async (
 			root: TestPartition,
 			overrides: Partial<QueryItemsRpcRequest> = {},
-			onPage?: (res: QueryItemsRpcResponse) => void,
+			onPage?: (res: Opened<QueryItemsRpcResponse>) => void,
 		) => {
 			const out: Array<string | Uint8Array> = [];
 			const leaves = new Set<string>();
@@ -532,12 +548,14 @@ describe("PartitionDO — range split", () => {
 				for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
 
 				const caller = children[0];
-				const result = (await root.stub.fokosExecuteLocal({
-					op: "queryItems",
-					repartitionId: await root.splitRepartitionId(),
-					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
-					request: fullRequest(),
-				})) as QueryItemsRpcResponse;
+				const result = opened(
+					(await root.stub.fokosExecuteLocal({
+						op: "apiQueryItems",
+						repartitionId: await root.splitRepartitionId(),
+						caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+						request: fullRequest(),
+					})) as FokosEnvelope<QueryItemsRpcResponse>,
+				);
 
 				// The router's own DB still holds every item (parent rows are never deleted during a split),
 				// but it answers only for the slice the calling child owns.
@@ -640,9 +658,8 @@ describe("PartitionDO — range split", () => {
 			const c0 = children[0];
 			const c1 = children[1];
 
-			// The leaf scans its own rows regardless of clipping, so the whole-range interval is fine.
-			const leaf0 = await c0.stub.apiQueryItems(c0.ctx, fullRequest());
-			const leaf1 = await c1.stub.apiQueryItems(c1.ctx, fullRequest());
+			const leaf0 = await leafPage(c0);
+			const leaf1 = await leafPage(c1);
 			expect(leaf0.items.length).toBeGreaterThan(0);
 			expect(leaf1.items.length).toBeGreaterThan(0);
 
@@ -703,7 +720,7 @@ describe("PartitionDO — range split", () => {
 			let remaining = 0;
 			for (const sk of sks) {
 				if (owns(children[0], sk) || owns(children[1], sk)) {
-					await root.stub.apiDeleteItem(root.ctx, { hashKey: kb("alice"), sortKey: kb(sk) });
+					await root.rpc.apiDeleteItem(root.ctx, { hashKey: kb("alice"), sortKey: kb(sk) });
 				} else {
 					remaining++;
 				}
@@ -728,17 +745,17 @@ describe("PartitionDO — range split", () => {
 			const g2Start = rangeOf(grandchildren[1].ctx).startBoundary!;
 
 			// Delete every item the right grandchild owns; it must then drain empty on the next page.
-			const under = await left.stub.apiQueryItems(left.ctx, fullRequest());
+			const under = await leafPage(left);
 			const leftSks = under.items.map((it) => (it as StoredItem).sk);
 			for (const sk of leftSks) {
 				if (KeyCodec.compare(sk, g2Start) >= 0) {
-					await root.stub.apiDeleteItem(root.ctx, { hashKey: kb("alice"), sortKey: sk });
+					await root.rpc.apiDeleteItem(root.ctx, { hashKey: kb("alice"), sortKey: sk });
 				}
 			}
 			const g1Sks = leftSks.filter((sk) => KeyCodec.compare(sk, g2Start) < 0);
 			expect(g1Sks.length).toBeGreaterThan(0);
 
-			const r = await left.stub.apiQueryItems(left.ctx, fullRequest());
+			const r = await leafPage(left);
 			expect(r.nextCursor).toBeNull();
 			expect(r.lastEvaluatedCursor).not.toBeNull();
 			expect(KeyCodec.compare(r.lastEvaluatedCursor!.sk, g1Sks[g1Sks.length - 1])).toBe(0);
@@ -758,7 +775,8 @@ describe("PartitionDO — range split", () => {
 				await waitForAllChildRequests();
 
 				const child = (await root.children())[0];
-				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ select: "count" }));
+				const envelope = await leafEnvelope(child, { select: "count" });
+				const res = opened(envelope);
 				expect(res.items).toHaveLength(0);
 				// The parent still holds every row of the key, but it answers a read-through only for the
 				// slice the calling child owns — counting the whole range here would count a sibling's rows.
@@ -766,8 +784,14 @@ describe("PartitionDO — range split", () => {
 				expect(owned.length).toBeGreaterThan(0);
 				expect(owned.length).toBeLessThan(sks.length);
 				expect(res.count).toBe(owned.length);
-				expect(res.meta.forwardCount).toBe(0);
+				// One RPC to the source, which executed the scan; the child is listed as the owner it read through for.
+				expect(res.meta.forwardCount).toBe(1);
+				expect(res.meta.servedByActorName).toBe(root.doName);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
+				expect(envelope.routing.servedBy.map((n) => [n.ref.doName, n.role])).toEqual([
+					[child.doName, "read_through"],
+					[root.doName, "executed"],
+				]);
 			});
 
 			// Drain pending child migrations so their background work does not outlive the test.
@@ -824,7 +848,7 @@ describe("PartitionDO — range split", () => {
 
 				const child = (await root.children())[0];
 				const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
-				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
+				const res = await leafPage(child, { plan });
 				// The parent still holds every row of the key, but it clips the page to the calling child's
 				// slice, so the child never serves rows a sibling owns.
 				const owned = ownedByChild(sks, child);
@@ -832,7 +856,7 @@ describe("PartitionDO — range split", () => {
 				expect(owned.length).toBeLessThan(sks.length);
 				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(owned);
 				expect(res.count).toBe(owned.length);
-				expect(res.meta.forwardCount).toBe(0);
+				expect(res.meta.forwardCount).toBe(1);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
 
@@ -858,14 +882,14 @@ describe("PartitionDO — range split", () => {
 				// The upper child owns the matching half; the filter and the slice clip independently, so the
 				// page is the intersection and the scan covers only the clipped interval.
 				const child = (await root.children())[1];
-				const res = await child.stub.apiQueryItems(child.ctx, fullRequest({ plan }));
+				const res = await leafPage(child, { plan });
 				const owned = ownedByChild(sks, child);
 				const expected = owned.filter((sk) => sk >= median);
 				expect(expected.length).toBeGreaterThan(0);
 				expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);
 				expect(res.count).toBe(expected.length);
 				expect(res.scannedCount).toBe(owned.length);
-				expect(res.meta.forwardCount).toBe(0);
+				expect(res.meta.forwardCount).toBe(1);
 				expect(res.partitionMetas[0].servedByActorName).toBe(root.doName);
 			});
 
@@ -881,8 +905,8 @@ describe("PartitionDO — range split", () => {
 			// Every leaf drains its interval, so its one extra read returns no row.
 			expect(res.rowsReturned).toBe(sks.length);
 			expect(res.partitionMetas.reduce((s, m) => s + m.rowsRead, 0)).toBeGreaterThanOrEqual(sks.length);
-			// The router itself reads no rows.
-			expect(res.meta.rowsRead).toBe(0);
+			// The router itself reads no rows, so it is not a leaf of the page.
+			expect(res.partitionMetas.map((m) => m.servedByActorName)).not.toContain(root.doName);
 		});
 	});
 
@@ -894,7 +918,7 @@ describe("PartitionDO — range split", () => {
 
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
-			const res = await root.stub.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, select: "count" }));
+			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, select: "count" }));
 
 			expect(res.count).toBe(expected);
 			expect(res.items).toHaveLength(0);
@@ -911,7 +935,7 @@ describe("PartitionDO — range split", () => {
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			// The seeded rows carry no TTL, so exists(ttlAt) matches no candidate.
 			const plan = compileQueryExpression({ filter: { op: "exists", args: [{ ref: "ttlAt" }] } });
-			const res = await root.stub.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
+			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
 
 			expect(res.count).toBe(0);
 			expect(res.items).toHaveLength(0);
@@ -928,7 +952,7 @@ describe("PartitionDO — range split", () => {
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
-			const res = await root.stub.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
+			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
 
 			expect(res.count).toBe(expected);
 			expect(res.items).toEqual(Array.from({ length: expected }, () => ["sk", 1]));
@@ -946,7 +970,7 @@ describe("PartitionDO — range split", () => {
 			const sorted = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
 			const median = sorted[Math.floor(sorted.length / 2)];
 			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
-			const res = await partition.stub.apiQueryItems(partition.ctx, fullRequest({ plan }));
+			const res = await partition.rpc.apiQueryItems(partition.ctx, fullRequest({ plan }));
 
 			const expected = sorted.filter((sk) => sk >= median);
 			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(expected);
@@ -961,7 +985,7 @@ describe("PartitionDO — range split", () => {
 			const rangeRoot = await partition.awaitPromoted("alice");
 
 			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
-			const res = await partition.stub.apiQueryItems(partition.ctx, fullRequest({ plan }));
+			const res = await partition.rpc.apiQueryItems(partition.ctx, fullRequest({ plan }));
 
 			const expected = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
 			expect(res.items.map((item) => (item as ProjectedWireRow)[0])).toEqual(expected);

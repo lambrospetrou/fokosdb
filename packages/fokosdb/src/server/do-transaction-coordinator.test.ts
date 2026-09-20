@@ -16,9 +16,22 @@ import type {
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
+import type { FokosEnvelope } from "../sharding/runtime-types.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
+
+/** A partition answer in its envelope, as a stand-in partition returns it. */
+function enveloped<T>(value: T): FokosEnvelope<T> {
+	const self = {
+		ref: { partitionId: "00", doName: "stand-in" },
+		actorId: "stand-in",
+		hashDepth: 0,
+		rangeDepth: 0,
+		role: "executed" as const,
+	};
+	return { value, routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false } };
+}
 
 const TX_ID = "tx-1";
 const TOKEN = "tok-1";
@@ -347,7 +360,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			insertParticipant(state, {});
 			const txPrepare = vi.fn(async (_pCtx: unknown, request: { items: Array<{ data?: string | Uint8Array }> }) => {
 				expect(request.items[0].data).toBe("v");
-				return { outcome: "accepted" as const };
+				return enveloped({ outcome: "accepted" as const });
 			});
 			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
@@ -441,21 +454,23 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const throwingPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
-			const rejectingPrepare = vi.fn(async () => ({
-				outcome: "rejected" as const,
-				results: [
-					{
-						opIndex: 1,
-						outcome: "rejected" as const,
-						reason: {
-							code: "condition_failed" as const,
-							hashKey: "hk2",
-							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+			const rejectingPrepare = vi.fn(async () =>
+				enveloped({
+					outcome: "rejected" as const,
+					results: [
+						{
+							opIndex: 1,
+							outcome: "rejected" as const,
+							reason: {
+								code: "condition_failed" as const,
+								hashKey: "hk2",
+								item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+							},
+							imageBytes: 7,
 						},
-						imageBytes: 7,
-					},
-				],
-			}));
+					],
+				}),
+			);
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
 				(_env, _ctx, name) =>
 					({ txPrepare: name === "p1" ? throwingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
@@ -492,22 +507,24 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 			insertParticipant(state, { name: "p1" });
 			insertParticipant(state, { name: "p2" });
-			const acceptingPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
-			const rejectingPrepare = vi.fn(async () => ({
-				outcome: "rejected" as const,
-				results: [
-					{
-						opIndex: 1,
-						outcome: "rejected" as const,
-						reason: {
-							code: "condition_failed" as const,
-							hashKey: "hk2",
-							item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+			const acceptingPrepare = vi.fn(async () => enveloped({ outcome: "accepted" as const }));
+			const rejectingPrepare = vi.fn(async () =>
+				enveloped({
+					outcome: "rejected" as const,
+					results: [
+						{
+							opIndex: 1,
+							outcome: "rejected" as const,
+							reason: {
+								code: "condition_failed" as const,
+								hashKey: "hk2",
+								item: { hashKey: "hk2", data: "image-1", kind: "text" as const, version: 1 },
+							},
+							imageBytes: 7,
 						},
-						imageBytes: 7,
-					},
-				],
-			}));
+					],
+				}),
+			);
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
 				(_env, _ctx, name) =>
 					({ txPrepare: name === "p1" ? acceptingPrepare : rejectingPrepare }) as unknown as DurableObjectStub<PartitionDO>,
@@ -940,8 +957,8 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING", undefined, Date.now() - 30_000);
 			insertParticipant(state, { name: "p1" });
-			const txPrepare = vi.fn(async () => ({ outcome: "accepted" as const }));
-			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
+			const txPrepare = vi.fn(async () => enveloped({ outcome: "accepted" as const }));
+			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);

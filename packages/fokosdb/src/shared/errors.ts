@@ -354,40 +354,27 @@ export const TRANSACTION_PENDING_CODES = defineCodes("FokosTransactionPendingErr
 export const UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "service", 503, {
 	partition_over_size: "49j6ez",
 	partition_migrating: "4rpgyu",
-	/** The repartition source still owns the slice, so the target must ask again after cutover. */
-	repartition_not_cut_over: "spf2v8",
 	coordinator_over_size: "tg8r62",
 	prepare_unanswered: "mpncbz",
 });
 
-export const ROUTING_CODES = defineCodes("FokosRoutingError", "internal", 500, {
-	partition_misrouted: "6ddzyj",
-	range_partition_not_initialized: "6ue24c",
-});
-
 export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
 	invariant_failed: "85quf8",
-	partition_context_mismatch: "8hv63q",
 	item_data_parse_failed: "dx9mht",
 	commit_keyset_mismatch: "e3kh5s",
 	unexpected_transaction_state: "j6uhd6",
-	partition_fanout_failed: "f3aqhc",
-	/** A read-through or migration caller is not a target of any repartition this partition owns. */
-	repartition_target_unknown: "8hqw3n",
-	/** The named repartition does not exist on this partition. */
-	repartition_unknown: "ns5maa",
-	/** A read-through caller asked the source for a slice whose rows the source already gave back. */
-	repartition_slice_reclaimed: "7tjj5t",
 	foreign_error: "jvufz5",
 });
 
-/** Every code table of this module, one for each category. */
+/**
+ * Every code table of this module. `FokosRoutingError` has no table here: the codes that only
+ * partitions exchange, its own among them, are in `sharding/errors.ts`.
+ */
 export const FOKOS_CODE_TABLES = [
 	VALIDATION_CODES,
 	EXPRESSION_CODES,
 	CONFLICT_CODES,
 	TRANSACTION_PENDING_CODES,
 	UNAVAILABLE_CODES,
-	ROUTING_CODES,
 	INTERNAL_CODES,
 ] as const;

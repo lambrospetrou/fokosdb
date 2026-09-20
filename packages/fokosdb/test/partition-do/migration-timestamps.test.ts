@@ -69,9 +69,9 @@ describe("PartitionDO — migration carries item timestamps and deletion metadat
 		await root.splitHash();
 		const child = await root.childOwning("marker");
 
-		// Ordinary traffic on the child.
+		// Ordinary traffic on the child, and on the tree: the root forwards the write to the child that owns it.
 		expect(await child.get({ hashKey: marker.hk, sortKey: marker.sk })).toMatchObject({ found: true });
-		await child.put({ hashKey: kb("new-key"), sortKey: kb("sk"), data: "new", kind: "text" });
+		await root.put({ hashKey: kb("new-key"), sortKey: kb("sk"), data: "new", kind: "text" });
 
 		const afterTraffic = await storeStateOf(child, marker);
 		expect(afterTraffic.row).toMatchObject({ last_read_ts: SEED.readTs, last_write_ts: SEED.writeTs });

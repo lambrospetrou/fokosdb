@@ -32,9 +32,9 @@ const wrongResult: FokosOperations<Ops> = {
 	echo: { shape: "point", whileMigrating: "retry", key: () => todo("key"), local: (req) => ({ text: String(req.n) }) },
 };
 
+// @ts-expect-error a range operation is read-through only
 const rangeMustReadSource: FokosOperation<{ n: number }, { n: number }> = {
 	shape: "range",
-	// @ts-expect-error a range operation is read-through only
 	whileMigrating: "retry",
 	readOnly: true,
 	range: () => todo("range"),

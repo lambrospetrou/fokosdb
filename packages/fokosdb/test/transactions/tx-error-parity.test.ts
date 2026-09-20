@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { testPartitionStub } from "../stub-helpers.js";
+import { openedRpc } from "../partition-do/helpers.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -104,15 +105,15 @@ async function lockItem(db: ReturnType<typeof makeDB>, key: Key): Promise<() => 
 	const hashKey = KeyCodec.encode(key.hashKey);
 	const sortKey = KeyCodec.encode(key.sortKey);
 	const partitionContext = db.options().topology.rootContext(hashKey);
-	const stub = testPartitionStub(partitionContext.doName);
+	const rpc = openedRpc(testPartitionStub(partitionContext.doName));
 	const transactionId = crypto.randomUUID().replaceAll("-", "");
-	await stub.txPrepare(partitionContext, {
+	await rpc.txPrepare(partitionContext, {
 		transactionId,
 		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
 		transactionTimestamp: Date.now(),
 		items: [{ opIndex: 0, hashKey, sortKey, operation: "put", data: "held", kind: "text" }],
 	});
 	return async () => {
-		await stub.txCancel(partitionContext, { transactionId, items: [{ hashKey, sortKey }] });
+		await rpc.txCancel(partitionContext, { transactionId, items: [{ hashKey, sortKey }] });
 	};
 }

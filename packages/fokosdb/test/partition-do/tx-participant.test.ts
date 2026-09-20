@@ -6,7 +6,7 @@ import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
-import { compiledCondition, kb, makeStub, withOpIndex } from "./helpers.js";
+import { compiledCondition, kb, makeStub, openedRpc, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
 /** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
@@ -18,14 +18,14 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
-		const prepareResp = await stub.txPrepare(ctx, {
+		const prepareResp = await rpc.txPrepare(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
@@ -36,7 +36,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		});
 		expect(prepareResp.outcome).toBe("accepted");
 
-		await stub.txCommit(ctx, {
+		await rpc.txCommit(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			// Keys only: the participant applies the payload from its own pending_transactions rows.
@@ -50,19 +50,19 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const aliceResult = await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk2") });
 		expect(aliceResult).toMatchObject({ found: true, item: { data: "from-txn" } });
 
-		const bobResult = await stub.apiGetItem(ctx, { hashKey: kb("bob"), sortKey: kb("sk1") });
+		const bobResult = await rpc.apiGetItem(ctx, { hashKey: kb("bob"), sortKey: kb("sk1") });
 		expect(bobResult).toMatchObject({ found: true, item: { data: "bob-data" } });
 	});
 
 	it("cancel via hash DO releases both local and promoted-key locks", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
 		const txId = crypto.randomUUID();
 		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
-		const prepareResp = await stub.txPrepare(ctx, {
+		const prepareResp = await rpc.txPrepare(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: coordId,
@@ -75,7 +75,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 		// Cancel via the hash DO. alice is promoted, so its lock lives on the range root and only the
 		// routed fan-out can release it; bob's lock is local. Both must be gone below.
-		await stub.txCancel(ctx, {
+		await rpc.txCancel(ctx, {
 			transactionId: txId,
 			items: [
 				{ hashKey: kb("alice"), sortKey: kb("sk2") },
@@ -85,7 +85,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 		// Both locks must be gone — a new prepare for the same keys must succeed.
 		const txId2 = crypto.randomUUID();
-		const prepareResp2 = await stub.txPrepare(ctx, {
+		const prepareResp2 = await rpc.txPrepare(ctx, {
 			transactionId: txId2,
 			transactionTimestamp: Date.now() + 1,
 			coordinatorDoId: coordId,
@@ -95,7 +95,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 			]),
 		});
 		expect(prepareResp2.outcome).toBe("accepted");
-		await stub.txCancel(ctx, {
+		await rpc.txCancel(ctx, {
 			transactionId: txId2,
 			items: [
 				{ hashKey: kb("alice"), sortKey: kb("sk2") },
@@ -117,7 +117,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	// retries, and it sees this error only AFTER a Durable Object RPC hop, which keeps the message but
 	// drops the class. Asserting it here, on a genuinely remote error, is what proves the skip fires.
 	it("prepare on an over-size partition reports backpressure", async () => {
-		const { ctx, stub } = makeStub(OVER_SIZE);
+		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
 		const error = await stub
 			.txPrepare(ctx, {
 				transactionId: crypto.randomUUID(),
@@ -135,10 +135,10 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	// Commit is non-growing (prepare already persisted the payload) and its outcome is already
 	// decided, so an over-size partition must not refuse it — that would wedge the transaction.
 	it("commit is not refused by an over-size partition", async () => {
-		const { ctx, stub } = makeStub(OVER_SIZE);
+		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
 		// No prepare ran, so commit finds no pending rows and is a no-op — enough to prove it routed.
 		await expect(
-			stub.txCommit(ctx, {
+			rpc.txCommit(ctx, {
 				transactionId: crypto.randomUUID(),
 				transactionTimestamp: Date.now(),
 				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
@@ -148,8 +148,8 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 
 	// Reads cannot grow a partition either, so they stay available.
 	it("readForTransaction is not refused by an over-size partition", async () => {
-		const { ctx, stub } = makeStub(OVER_SIZE);
-		const res = await stub.txReadForTransaction(ctx, {
+		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
+		const res = await rpc.txReadForTransaction(ctx, {
 			transactionId: crypto.randomUUID(),
 			items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
 		});
@@ -166,11 +166,11 @@ describe("PartitionDO — single-shot transaction", () => {
 	}
 
 	it("applies puts, deletes and checks in one shot, and takes no lock", async () => {
-		const { ctx, stub } = makeStub();
-		await stub.apiPutItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk"), data: "old", kind: "text" as const });
-		await stub.apiPutItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk"), data: "keep", kind: "text" as const });
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.apiPutItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk"), data: "old", kind: "text" as const });
+		await rpc.apiPutItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk"), data: "keep", kind: "text" as const });
 
-		const res = await stub.txExecuteSingleShot(ctx, {
+		const res = await rpc.txExecuteSingleShot(ctx, {
 			items: withOpIndex([
 				{ hashKey: kb("shot-new"), sortKey: kb("sk"), operation: "put", data: "written", kind: "text" },
 				{ hashKey: kb("shot-gone"), sortKey: kb("sk"), operation: "delete" },
@@ -184,12 +184,12 @@ describe("PartitionDO — single-shot transaction", () => {
 		});
 
 		expect(res).toEqual({ outcome: "committed" });
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-new"), sortKey: kb("sk") })).toMatchObject({
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("shot-new"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "written" },
 		});
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk") })).toMatchObject({ found: false });
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk") })).toMatchObject({
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("shot-gone"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("shot-checked"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "keep" },
 		});
@@ -198,11 +198,11 @@ describe("PartitionDO — single-shot transaction", () => {
 	});
 
 	it("rejects on a failed condition, leaving no partial write and no lock", async () => {
-		const { ctx, stub } = makeStub();
-		await stub.apiPutItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.apiPutItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 
 		// The failing item is LAST, so a non-atomic implementation would already have written the first.
-		const res = await stub.txExecuteSingleShot(ctx, {
+		const res = await rpc.txExecuteSingleShot(ctx, {
 			items: withOpIndex([
 				{ hashKey: kb("atomic-existing"), sortKey: kb("sk"), operation: "put", data: "v2", kind: "text" },
 				{ hashKey: kb("atomic-other"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
@@ -219,18 +219,18 @@ describe("PartitionDO — single-shot transaction", () => {
 			outcome: "rejected",
 			results: aRejection({ code: "condition_failed", hashKey: "atomic-absent", sortKey: "sk" }),
 		});
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk") })).toMatchObject({
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("atomic-existing"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
 			item: { data: "v1", version: 1 },
 		});
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("atomic-other"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("atomic-other"), sortKey: kb("sk") })).toMatchObject({ found: false });
 		expect(await pendingLockCount(stub)).toBe(0);
 	});
 
 	it("rejects with pending_conflict against a two-phase transaction that holds a lock", async () => {
-		const { ctx, stub } = makeStub();
+		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		const prepared = await stub.txPrepare(ctx, {
+		const prepared = await rpc.txPrepare(ctx, {
 			transactionId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -238,7 +238,7 @@ describe("PartitionDO — single-shot transaction", () => {
 		});
 		expect(prepared.outcome).toBe("accepted");
 
-		const res = await stub.txExecuteSingleShot(ctx, {
+		const res = await rpc.txExecuteSingleShot(ctx, {
 			items: withOpIndex([
 				{ hashKey: kb("shot-free"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
 				{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "never", kind: "text" },
@@ -250,17 +250,17 @@ describe("PartitionDO — single-shot transaction", () => {
 			outcome: "rejected",
 			results: aRejection({ code: "pending_conflict", hashKey: "shot-locked", conflictingTransactionId: transactionId }),
 		});
-		expect(await stub.apiGetItem(ctx, { hashKey: kb("shot-free"), sortKey: kb("sk") })).toMatchObject({ found: false });
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("shot-free"), sortKey: kb("sk") })).toMatchObject({ found: false });
 		// Only the two-phase lock, and this path added none of its own.
 		expect(await pendingLockCount(stub)).toBe(1);
 
-		await stub.txCancel(ctx, { transactionId, items: [{ hashKey: kb("shot-locked"), sortKey: kb("sk") }] });
+		await rpc.txCancel(ctx, { transactionId, items: [{ hashKey: kb("shot-locked"), sortKey: kb("sk") }] });
 	});
 
 	it("reports backpressure from an over-size partition", async () => {
 		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 		// written and every write is refused for size.
-		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
+		const { ctx, stub, rpc } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
 		const error = await stub
 			.txExecuteSingleShot(ctx, {
 				items: withOpIndex([{ hashKey: kb("over-size"), sortKey: kb("sk"), operation: "put", data: "d", kind: "text" }]),
@@ -274,20 +274,20 @@ describe("PartitionDO — single-shot transaction", () => {
 
 	it("queues a split once its writes push the partition over the threshold", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 		const data = "x".repeat(64 * 1024);
 
 		for (let i = 0; i < 40; i++) {
-			const res = await stub.txExecuteSingleShot(ctx, {
+			const res = await rpc.txExecuteSingleShot(ctx, {
 				items: withOpIndex([{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }]),
 			});
 			expect(res.outcome).toBe("committed");
-			if ((await stub.status()).splitStatus) break;
+			if ((await rpc.status(ctx)).splitStatus) break;
 		}
 
 		// Only the write paths that call checkSplits can queue a split — the background job runs one
 		// that is already queued, it never queues one itself.
-		const { splitStatus } = await stub.status();
+		const { splitStatus } = await rpc.status(ctx);
 		expect(splitStatus).toBeDefined();
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 		await partition.awaitSplitCompleted();
@@ -297,7 +297,7 @@ describe("PartitionDO — single-shot transaction", () => {
 describe("PartitionDO — two-phase commit queues splits", () => {
 	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now();
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
@@ -305,7 +305,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 			{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
 		]);
 		expect(
-			await stub.txPrepare(ctx, {
+			await rpc.txPrepare(ctx, {
 				transactionId,
 				transactionTimestamp,
 				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -315,7 +315,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 		await partition.splitHash();
 		expect(
-			await stub.txCommit(ctx, {
+			await rpc.txCommit(ctx, {
 				transactionId,
 				transactionTimestamp,
 				// Keys only: the split parent routes them to the children, which apply from their own
@@ -323,7 +323,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 				items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })),
 			}),
 		).toEqual({ outcome: "committed" });
-		expect(await stub.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
+		expect(await rpc.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
 			found: true,
 			item: { data: "value", ttlAt },
 		});
@@ -331,7 +331,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 	it("queues a split once committed transactions push the partition over the threshold", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 		const data = "x".repeat(64 * 1024);
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
 
@@ -341,13 +341,13 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 				{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const },
 			]);
 			const transactionTimestamp = Date.now() + i;
-			expect(await stub.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
-			await stub.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
-			if ((await stub.status()).splitStatus) break;
+			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
+			await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
+			if ((await rpc.status(ctx)).splitStatus) break;
 		}
 
 		// The background job only RUNS a queued split, so a status here proves commit queued one.
-		const { splitStatus } = await stub.status();
+		const { splitStatus } = await rpc.status(ctx);
 		expect(splitStatus).toBeDefined();
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
 		await partition.awaitSplitCompleted();
@@ -356,9 +356,9 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 describe("PartitionDO — single-partition read snapshot", () => {
 	it("answers every key from local storage, positionally matched to the request", async () => {
-		const { ctx, stub } = makeStub();
-		await stub.apiPutItem(ctx, { hashKey: kb("snap-a"), sortKey: kb("sk"), data: "a", kind: "text" as const });
-		await stub.apiPutItem(ctx, { hashKey: kb("snap-b"), sortKey: kb("sk"), data: "b", kind: "text" as const });
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.apiPutItem(ctx, { hashKey: kb("snap-a"), sortKey: kb("sk"), data: "a", kind: "text" as const });
+		await rpc.apiPutItem(ctx, { hashKey: kb("snap-b"), sortKey: kb("sk"), data: "b", kind: "text" as const });
 
 		// A missing key and a duplicate: each requested position gets its own answer.
 		const requested = [
@@ -367,7 +367,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			{ hashKey: kb("snap-a"), sortKey: kb("sk") },
 			{ hashKey: kb("snap-b"), sortKey: kb("sk") },
 		];
-		const res = await stub.txReadSnapshot(ctx, { items: requested });
+		const res = await rpc.txReadSnapshot(ctx, { items: requested });
 
 		invariant(res.outcome === "committed");
 		expect(res.items.map((i) => i.found)).toEqual([true, false, true, true]);
@@ -377,10 +377,10 @@ describe("PartitionDO — single-partition read snapshot", () => {
 	});
 
 	it("aborts with pending_write when a two-phase transaction holds a lock on one of the keys", async () => {
-		const { ctx, stub } = makeStub();
-		await stub.apiPutItem(ctx, { hashKey: kb("snap-free"), sortKey: kb("sk"), data: "free", kind: "text" as const });
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.apiPutItem(ctx, { hashKey: kb("snap-free"), sortKey: kb("sk"), data: "free", kind: "text" as const });
 
-		const prepared = await stub.txPrepare(ctx, {
+		const prepared = await rpc.txPrepare(ctx, {
 			transactionId: crypto.randomUUID(),
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -388,7 +388,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 		});
 		expect(prepared.outcome).toBe("accepted");
 
-		const res = await stub.txReadSnapshot(ctx, {
+		const res = await rpc.txReadSnapshot(ctx, {
 			items: [
 				{ hashKey: kb("snap-free"), sortKey: kb("sk") },
 				{ hashKey: kb("snap-locked"), sortKey: kb("sk") },
@@ -404,10 +404,11 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			ctx: FokosDbRouteContext,
 			count: number,
 		): Promise<Map<string, string[]>> {
+			const rpc = openedRpc(stub);
 			const byChild = new Map<string, string[]>();
 			for (let i = 0; i < count; i++) {
 				const hashKey = `probe-${i}`;
-				const res = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+				const res = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 				const child = res.meta.servedByActorName;
 				expect(child).not.toBe(ctx.doName);
 				byChild.set(child, [...(byChild.get(child) ?? []), hashKey]);
@@ -417,7 +418,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 
 		it("hands the whole request to the one child that owns every key, and falls back when the keys span two", async () => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 			await partition.splitHash();
 
 			// Routing is a pure hash of the key bytes, so this grouping is deterministic, not flaky.
@@ -426,7 +427,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			const [childA, childB] = [...byChild.values()];
 
 			// One destination: the split root owns nothing itself and forwards the whole set.
-			const oneChild = await stub.txReadSnapshot(ctx, { items: childA.slice(0, 2).map((hk) => ({ hashKey: kb(hk), sortKey: kb("sk") })) });
+			const oneChild = await rpc.txReadSnapshot(ctx, { items: childA.slice(0, 2).map((hk) => ({ hashKey: kb(hk), sortKey: kb("sk") })) });
 			invariant(oneChild.outcome === "committed");
 			expect(oneChild.items.map((i) => KeyCodec.decode(i.hashKey))).toEqual(childA.slice(0, 2));
 
@@ -437,13 +438,13 @@ describe("PartitionDO — single-partition read snapshot", () => {
 				{ hashKey: kb(childA[0]), sortKey: kb("sk") },
 				{ hashKey: kb(childB[0]), sortKey: kb("sk") },
 			];
-			expect(await stub.txReadSnapshot(ctx, { items: spanning })).toEqual({ outcome: "not_applicable" });
+			expect(await rpc.txReadSnapshot(ctx, { items: spanning })).toEqual({ outcome: "not_applicable" });
 			expect(
-				await stub.txExecuteSingleShot(ctx, {
+				await rpc.txExecuteSingleShot(ctx, {
 					items: withOpIndex(spanning.map((key) => ({ ...key, operation: "put" as const, data: "never", kind: "text" as const }))),
 				}),
 			).toEqual({ outcome: "not_applicable" });
-			for (const key of spanning) expect(await stub.apiGetItem(ctx, key)).toMatchObject({ found: false });
+			for (const key of spanning) expect(await rpc.apiGetItem(ctx, key)).toMatchObject({ found: false });
 		});
 	});
 });

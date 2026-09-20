@@ -13,10 +13,17 @@ import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 import { validateRangeConfig, validateTopology } from "../sharding/route-context.js";
-import type { SplitConditions } from "../sharding/split-policy.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 
-export type { SplitConditions };
+export type SplitConditions = {
+	/** The size in megabytes that makes the partition split. */
+	maxSizeMb?: number;
+	/**
+	 * The number of items that makes the partition split.
+	 * FIXME: Nothing reads this value. Remove it, or make the split policy use it.
+	 */
+	maxItems?: number;
+};
 
 export type PartitionNamespaceKey = {
 	[K in keyof Env]: Env[K] extends DurableObjectNamespace<PartitionDO> ? K : never;

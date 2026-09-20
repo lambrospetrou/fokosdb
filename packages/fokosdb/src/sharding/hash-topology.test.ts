@@ -81,6 +81,39 @@ describe("HashTopology", () => {
 		});
 	});
 
+	describe("invalidate", () => {
+		it("forgets the deepest hint of a path, so findLeaf stops at the nearest known ancestor", () => {
+			const cache = HashTopology.create(4, 0);
+			cache.updateFromHint(kb("key"), 3);
+			expect(cache.invalidate(kb("key"), 3)).toBe(true);
+			expect(cache.findLeaf(kb("key"))).toBe(2);
+			expect(cache.invalidate(kb("key"), 2)).toBe(true);
+			expect(cache.findLeaf(kb("key"))).toBe(1);
+			expect(cache.invalidate(kb("key"), 1)).toBe(true);
+			expect(cache.findLeaf(kb("key"))).toBe(0);
+		});
+
+		it("changes nothing for an unknown path or a depth of zero", () => {
+			const cache = HashTopology.create(4, 0);
+			cache.updateFromHint(kb("key"), 1);
+			expect(cache.invalidate(kb("key"), 0)).toBe(false);
+			expect(cache.invalidate(kb("key"), 3)).toBe(false);
+			expect(cache.findLeaf(kb("key"))).toBe(1);
+		});
+
+		it("keeps the hints of a sibling path that diverges above the forgotten level", () => {
+			const K = 4;
+			const keyA = "key-a";
+			const keyB = divergingKey(keyA, 0, 1, K);
+			const cache = HashTopology.create(K, 0);
+			cache.updateFromHint(kb(keyA), 3);
+			cache.updateFromHint(kb(keyB), 3);
+			expect(cache.invalidate(kb(keyA), 3)).toBe(true);
+			expect(cache.findLeaf(kb(keyA))).toBe(2);
+			expect(cache.findLeaf(kb(keyB))).toBe(3);
+		});
+	});
+
 	describe("multiple independent paths", () => {
 		it("two keys that hash to different child slots at level 1 don't interfere", () => {
 			const K = 4;

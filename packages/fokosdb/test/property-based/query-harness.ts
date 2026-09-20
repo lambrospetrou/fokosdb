@@ -135,7 +135,10 @@ export const expectedAnswer = (model: QueryModel, queries: readonly Query[]): Qu
 /** The rules every page obeys, whatever the request asked for. */
 function expectPageInvariants(page: QueryItemsResult, opts: QueryItemsOptions): void {
 	expect(page.count).toBeLessThanOrEqual(page.scannedCount);
-	expect(page.meta.partitionsVisited).toBe(page.partitionMetas.length);
+	// The route evidence of an envelope is capped in bytes, so a deep or wide tree can visit a leaf
+	// that the evidence could not name. The client skips such a leaf instead of reporting a
+	// partition it cannot identify, so a page names no more partitions than it visited.
+	expect(page.meta.partitionsVisited).toBeGreaterThanOrEqual(page.partitionMetas.length);
 	if (opts.limit !== undefined) expect(page.scannedCount).toBeLessThanOrEqual(opts.limit);
 	if (opts.select === "count") expect(page.items).toHaveLength(0);
 	else expect(page.items).toHaveLength(page.count);

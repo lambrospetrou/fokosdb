@@ -5,7 +5,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import { kb, withOpIndex } from "./helpers.js";
+import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
 	PROMOTION_TEST_MAX_SIZE_MB,
@@ -45,7 +45,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 
 		// Lock alice/sk1 so startPromotion defers the cutover and alice stays 'queued' throughout.
 		const txId = crypto.randomUUID();
-		const lockResult = await partition.stub.txPrepare(partition.ctx, {
+		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -65,7 +65,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 			expect(await partition.promotedKeyStatus("alice")).toBe("queued");
 			expect((await partition.status()).splitStatus).toBeUndefined();
 		} finally {
-			await partition.stub.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
+			await partition.rpc.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
 			await partition.awaitPromoted("alice");
 		}
 	});
@@ -77,7 +77,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 
 		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
 		const txId = crypto.randomUUID();
-		const lockResult = await partition.stub.txPrepare(partition.ctx, {
+		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -96,7 +96,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 			expect(r.meta.forwardCount).toBe(0);
 		} finally {
 			// Release the lock; next background cycle should complete the cutover.
-			await partition.stub.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
+			await partition.rpc.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
 			await partition.awaitPromoted("alice");
 		}
 	});
@@ -114,18 +114,23 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 		await partition.awaitPromotedKeyStatus("alice", ["promoted"], { drive: [rangeRoot] });
 
 		// Writes via the hash partition are forwarded to the range root.
-		const w = await partition.put({ hashKey: kb("alice"), sortKey: kb("sk2"), data: "in-range", kind: "text" as const });
-		expect(w.meta.forwardCount).toBe(1);
+		const w = await partition.stub.apiPutItem(partition.ctx, {
+			hashKey: kb("alice"),
+			sortKey: kb("sk2"),
+			data: "in-range",
+			kind: "text" as const,
+		});
+		expect(w.routing.forwardCount).toBe(1);
 		// The response must surface the serving range root's own rangeDepth/rangeAncestors (0/[] for a
 		// fresh root), not an empty/zero value from the forwarding hash partition's own context.
-		expect(w.meta.rangeDepth).toBe(0);
-		expect(w.meta._internal.rangeAncestors).toEqual([]);
+		expect(executedBy(w).rangeDepth).toBe(0);
+		expect(rangeAncestorsOf(w)).toEqual([]);
 
 		// Item is in the range root.
-		const g = await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk2") });
-		expect(g).toMatchObject({ found: true, item: { data: "in-range" } });
-		expect(g.meta.rangeDepth).toBe(0);
-		expect(g.meta._internal.rangeAncestors).toEqual([]);
+		const g = await rangeRoot.stub.apiGetItem(rangeRoot.ctx, { hashKey: kb("alice"), sortKey: kb("sk2") });
+		expect(g.value).toMatchObject({ found: true, item: { data: "in-range" } });
+		expect(executedBy(g).rangeDepth).toBe(0);
+		expect(rangeAncestorsOf(g)).toEqual([]);
 	});
 });
 
@@ -190,7 +195,7 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await root.splitHash();
 
-		const res = await root.stub.debugForcePromoteKey(root.ctx, kb("alice"));
+		const res = await root.rpc.debugForcePromoteKey(root.ctx, { hashKey: kb("alice") });
 		expect(res.queued).toBe(true);
 		// The forward queues on the child; an early background cycle may already have advanced it.
 		expect(["queued", "promoting", "promoted"]).toContain(res.status);
@@ -206,10 +211,10 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 	it("returns the existing status without queueing again", async () => {
 		const partition = makePartition();
 
-		const first = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		const first = await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		expect(first.queued).toBe(true);
 
-		const second = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		const second = await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		expect(second.queued).toBe(false);
 		expect(second.status).toBeDefined();
 
@@ -220,7 +225,7 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 
 		const txId = crypto.randomUUID();
-		const lockResult = await partition.stub.txPrepare(partition.ctx, {
+		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -228,7 +233,7 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 		});
 		expect(lockResult.outcome).toBe("accepted");
 		try {
-			await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 			await partition.awaitPromotedKeyStatus("alice", ["queued"]);
 
 			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
@@ -237,7 +242,7 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 				expect(await state.storage.getAlarm()).toBeNull();
 			});
 
-			const again = await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+			const again = await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 			expect(again.queued).toBe(false);
 
 			await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
@@ -245,7 +250,7 @@ describe("PartitionDO — debugForcePromoteKey", () => {
 				state.storage.sql.exec(`UPDATE fokos_repartitions SET next_attempt_at = ?`, Date.now());
 			});
 		} finally {
-			await partition.stub.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
+			await partition.rpc.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
 			await partition.awaitPromoted("alice");
 		}
 	}, 30_000);
@@ -257,7 +262,7 @@ describe("PartitionDO — promotion read fallback", () => {
 		await partition.splitHash();
 		const owner = await partition.childOwning("alice");
 
-		await partition.stub.debugForcePromoteKey(partition.ctx, kb("bob"));
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("bob") });
 		const bobOwner = await partition.childOwning("bob");
 		await bobOwner.awaitPromoted("bob");
 		const warm = await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
@@ -284,7 +289,7 @@ describe("PartitionDO — promotion read fallback", () => {
 		});
 
 		try {
-			await owner.stub.debugForcePromoteKey(owner.ctx, kb("alice"));
+			await owner.rpc.debugForcePromoteKey(owner.ctx, { hashKey: kb("alice") });
 			await vi.waitFor(() => expect(initCalls).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 
 			const g = await partition.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
@@ -308,12 +313,12 @@ describe("PartitionDO — promotion read fallback", () => {
 describe("PartitionDO — transaction commit and promotion candidates", () => {
 	it("keeps the local promotion candidates when a forwarded child commit fails", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
 		const txId = crypto.randomUUID();
 		const txTs = Date.now();
-		const prepare = await partition.stub.txPrepare(partition.ctx, {
+		const prepare = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: txTs,
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
@@ -344,7 +349,8 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 		};
 		try {
 			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
-				await expect(instance.txCommit(partition.ctx, commit)).rejects.toThrow(fokosErrorWith("foreign_error"));
+				// Commit attempts every group, so a failed remote group surfaces as the fan-out error.
+				await expect(instance.txCommit(partition.ctx, commit)).rejects.toThrow(fokosErrorWith("partition_fanout_failed"));
 			});
 
 			expect(await partition.promotedKeyStatus("hot"), "the local hot key must be queued for promotion").toBeDefined();
@@ -360,7 +366,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 			[partition, partition.rangeRoot("hot")],
 			async () => {
 				try {
-					return (await partition.stub.txCommit(partition.ctx, commit)).outcome === "committed";
+					return (await partition.rpc.txCommit(partition.ctx, commit)).outcome === "committed";
 				} catch (error) {
 					if (!FokosError.isCode(error, UNAVAILABLE_CODES.partition_migrating)) throw error;
 					return false;

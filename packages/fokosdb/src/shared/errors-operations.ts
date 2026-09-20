@@ -14,12 +14,10 @@ import {
 	FokosError,
 	FokosExpressionError,
 	FokosInternalError,
-	FokosRoutingError,
 	FokosTransactionPendingError,
 	FokosUnavailableError,
 	FokosValidationError,
 	INTERNAL_CODES,
-	ROUTING_CODES,
 	TRANSACTION_PENDING_CODES,
 	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
@@ -29,6 +27,7 @@ import {
 	type FokosCodesOf,
 	type FokosErrorOptions,
 } from "./errors.js";
+import { FOKOS_SHARDING_CODE_TABLES, type FokosShardingError } from "../sharding/errors.js";
 import type { ExpressionError } from "./expression/errors.js";
 import type { ConditionFailedReason, TransactWriteOperationResult } from "./transaction-api-types.js";
 import type { OperationMetrics, PartitionInfo } from "./types.js";
@@ -110,13 +109,18 @@ export type FokosAnyError =
 	| FokosTransactionCancelledError<FokosCodesOf<typeof TRANSACTION_CANCELLED_CODES>>
 	| FokosTransactionPendingError<FokosCodesOf<typeof TRANSACTION_PENDING_CODES>>
 	| FokosUnavailableError<FokosCodesOf<typeof UNAVAILABLE_CODES>>
-	| FokosRoutingError<FokosCodesOf<typeof ROUTING_CODES>>
-	| FokosInternalError<FokosCodesOf<typeof INTERNAL_CODES>>;
+	| FokosInternalError<FokosCodesOf<typeof INTERNAL_CODES>>
+	| FokosShardingError;
 
 export type FokosErrorCode = FokosAnyError["code"];
 
 /** Every code table of the library. */
-export const FOKOS_LIBRARY_CODE_TABLES = [...FOKOS_CODE_TABLES, CONDITION_CHECK_CODES, TRANSACTION_CANCELLED_CODES] as const;
+export const FOKOS_LIBRARY_CODE_TABLES = [
+	...FOKOS_CODE_TABLES,
+	...FOKOS_SHARDING_CODE_TABLES,
+	CONDITION_CHECK_CODES,
+	TRANSACTION_CANCELLED_CODES,
+] as const;
 
 /** Every code definition of the library by its code. */
 const FOKOS_LIBRARY_CODES: ReadonlyMap<string, FokosCodeDef> = new Map(

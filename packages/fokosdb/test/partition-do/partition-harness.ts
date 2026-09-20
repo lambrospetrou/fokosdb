@@ -3,7 +3,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { expect, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-partition.js";
+import { RANGE_PROMOTION_FRACTION, type GetItemRpcRequest, type PutItemRpcRequest } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
@@ -18,16 +18,23 @@ import {
 	resolveRangePartitionContext,
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import { RANGE_PROMOTION_FRACTION } from "../../src/sharding/split-policy.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
 import type { FokosMigrationPage } from "../../src/sharding/repartition-types.js";
 import type { FokosDbHostPage } from "../../src/shared/partition/fokos-migration-host.js";
 import { MAX_ITEM_BYTES, validateItemKeys } from "../../src/shared/transaction-limits.js";
-import { type PartitionOptions, type SplitStartedOrCompleted, expectSplitStatus, kb, makeStub } from "./helpers.js";
+import {
+	type OpenedPartitionRpc,
+	type PartitionOptions,
+	type SplitStartedOrCompleted,
+	expectSplitStatus,
+	kb,
+	makeStub,
+	openedRpc,
+} from "./helpers.js";
 
 type PartitionWriter = {
 	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
-	status(ctx?: FokosDbRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
+	status(ctx: FokosDbRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
 // Each hash filler is below the promotion threshold and the write-reject grace band.
@@ -59,11 +66,15 @@ export function makePartition(opts?: PartitionOptions): TestPartition {
 
 export class TestPartition {
 	readonly ctx: FokosDbRouteContext;
+	/** The raw stub: every call answers an envelope. `runInDurableObject` and prototype spies need it. */
 	readonly stub: DurableObjectStub<PartitionDO>;
+	/** The same stub with every envelope opened, as a test reads a response. */
+	readonly rpc: OpenedPartitionRpc;
 
 	private constructor(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>) {
 		this.ctx = ctx;
 		this.stub = stub ?? testPartitionStub(ctx.doName);
+		this.rpc = openedRpc(this.stub);
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */
@@ -76,15 +87,15 @@ export class TestPartition {
 	}
 
 	put(req: PutItemRpcRequest) {
-		return this.stub.apiPutItem(this.ctx, req);
+		return this.rpc.apiPutItem(this.ctx, req);
 	}
 
 	get(req: GetItemRpcRequest) {
-		return this.stub.apiGetItem(this.ctx, req);
+		return this.rpc.apiGetItem(this.ctx, req);
 	}
 
 	status() {
-		return this.stub.status(this.ctx);
+		return this.rpc.status(this.ctx);
 	}
 
 	/** This partition's split status, narrowed to a started or completed split. */
@@ -175,7 +186,7 @@ export class TestPartition {
 	}
 
 	/** Writes distributed filler items until this partition starts a hash split. */
-	async triggerHashSplit(writer: PartitionWriter = this.stub): Promise<PutItemRpcRequest[]> {
+	async triggerHashSplit(writer: PartitionWriter = this.rpc): Promise<PutItemRpcRequest[]> {
 		invariant(isHashPartition(this.ctx), `${this.doName}: not a hash partition`);
 		invariant(!(await writer.status(this.ctx)).splitStatus, `${this.doName}: already splitting`);
 		const data = fillerChunk(this.maxSizeMb("hash"));
@@ -514,7 +525,7 @@ export async function makeRangeRoot(rangeSplitN: number, overrides?: PartitionOp
 		rangeSplitConditions: { maxSizeMb: RANGE_SPLIT_MAX_SIZE_MB },
 		...overrides,
 	});
-	await hashPartition.stub.debugForcePromoteKey(hashPartition.ctx, kb("alice"));
+	await hashPartition.rpc.debugForcePromoteKey(hashPartition.ctx, { hashKey: kb("alice") });
 	return { root: await hashPartition.awaitPromoted("alice"), sks: [] };
 }
 

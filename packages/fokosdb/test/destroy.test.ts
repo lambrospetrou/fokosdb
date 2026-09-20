@@ -68,9 +68,9 @@ describe.skip("FokosDB.destroy()", () => {
 		});
 
 		for (const doName of doNamesSet) {
-			const stub = testPartitionStub(doName);
-			const { identityStored } = await stub.status();
-			expect(identityStored).toBeFalsy();
+			// A target request carries no context, so a destroyed partition stays uninitialized.
+			const page = await testPartitionStub(doName).fokosStatus({ cursor: null });
+			expect(page.initialized).toBe(false);
 		}
 
 		// All written items must be gone (verifies roots were destroyed).

@@ -4,11 +4,12 @@
 **Date:** 2026-09-19
 **Author:** Lambros Petrou
 
-**Status:** M1, M2 and M3 are built (section 3 records what each one changed). `FokosShardingRuntime`, `dispatch`,
-the shapes, the example host, and the coordinator host (M4 to M6) are not built. The repartition flow, the
-migration protocol, the control RPCs, and the read-through that this document reuses run inside `PartitionDO`,
-over `FokosShardingStore`. A type-only prototype of the public surface, with three hosts written against it, is
-in `packages/fokosdb/test/sharding-prototype/`. `pnpm check` type-checks it.
+**Status:** M1 to M4 are built (section 3 records what each one changed). `FokosShardingRuntime`, `dispatch`,
+the five shapes, the envelope, the scheduler, and the sharding error module exist in
+`packages/fokosdb/src/sharding/` and are exported from `fokosdb/sharding`. `PartitionDO` is a host: every public
+method is one `dispatch`, and the `PartitionDO` suites drive the runtime. The example host and the coordinator
+host (M5, M6) are not built. The prototype in `packages/fokosdb/test/sharding-prototype/` compiles against the
+real runtime.
 
 ## Table of contents
 
@@ -136,7 +137,7 @@ surface, and its data semantics.
   the same bounds.
 - One target step must pull and commit at most one page. One pass runs up to the value from
   `runtimeConfig().importPagesPerPass`. The default is 16 and the minimum is 1.
-- The serialized `routes` list of one envelope must stay at or below `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB).
+- The serialized `servedBy` list of one envelope must stay at or below `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB).
 
 ## 3. Milestones
 
@@ -229,6 +230,114 @@ Deliverables:
 - `withSplitForwarding`, `groupItemsByRouting`, `routeSingleDestination`, `walkRangeChildren`,
   `forwardToRangeRootPartition`, `ensureMigration`, `scheduleBackgroundWork`, and `runBackgroundWork` are deleted
   from `PartitionDO`.
+
+The milestone is built in two stages, each one reviewed on its own. A half-converted `PartitionDO` would need
+routing glue that the second stage deletes, so the runtime is built whole first and the host converts whole after.
+
+**Stage 1 — the runtime modules. Done.** `runtime.ts`, `runtime-types.ts`, `envelope.ts`, `range-frontier.ts`,
+`scheduler.ts`, and `errors.ts` in `packages/fokosdb/src/sharding/`. `PartitionDO` is untouched except for import
+paths and its flow deps, which it now expresses as hooks. These decisions were made during the implementation
+and differ from, or add to, the text of section 4.2:
+
+- `FokosRangeVisit.start` and `end` are the half-open segment the visit covers, inside the immutable interval of
+  the target, and not that whole interval (section 4.2.4 text). A visit that fills a gap of the learned
+  hierarchy covers only the gap; with the whole interval of its base target it would overlap the deeper visits
+  and serve one sort key twice. The host clips its request to the segment, as it clipped to a child before.
+- A range node carries the hash depth of the hash partition that entered the range tree. A range partition has
+  no hash depth, and a hash router above must learn the depth of the hash partition that owns a promoted key, so
+  a hash-to-range forward stamps its own `hashDepth` on the range nodes of the child envelope. A hash-to-hash
+  forward changes no field, as section 4.2.9 states.
+- `scheduleJob` returns `Promise<void>`, because the alarm write is asynchronous; `dispatch` awaits it in step 7.
+  `requestSplitEvaluation` stays `void` and runs in the background.
+- In step 5 the remote calls start before the signals of step 7 are applied, and the signals are awaited before
+  the remote results are, so a failed remote group cannot lose a `repartitionUnblocked` or a `jobs` signal. The
+  local write is committed before either.
+- `whileMigrating: "read_source"` is valid for the `point` and `range` shapes only; the constructor throws
+  `sharding_operation_invalid` for a `group` or `single_owner` descriptor that declares it. FokosDB needs it for
+  `apiGetItem` and `apiQueryItems` only.
+- The `group` and `single_owner` shapes resolve exactly: no Bloom step, and a promoted key enters its range tree
+  at the root and never at a learned slice, so a fan-out has no cache-miss fallback. `owns()` uses the same exact
+  resolution. `point` and `range` use both caches and own the fallbacks of section 4.2.8.
+- `FokosLifecycle.activeRepartition` is the split row while it is not terminal, else the oldest promotion in
+  `queued`, `planned`, or `cutover`.
+- A repartition row with no plan head, which only a direct write outside `queue` can produce, takes the live
+  policy in its hook plan, so it cannot stay at `completed` for ever. `queue` always writes the head.
+- The runtime loads the identity and the policy into memory; the import record is read from KV on each use.
+- The sharding codes of section 4.2.16 live in `SHARDING_ROUTING_CODES`, `SHARDING_UNAVAILABLE_CODES`, and
+  `SHARDING_INTERNAL_CODES`. `shared/errors.ts` keeps no routing table; `FokosAnyError` and
+  `FOKOS_LIBRARY_CODE_TABLES` include the sharding tables.
+- `RepartitionSource.canQueue` is the synchronous arbitration precheck of section 4.2.11.
+  `onLockReleased` is `onRepartitionUnblocked(): boolean`.
+- `HashTopology.invalidate(hashKey, relDepth)` forgets the deepest hint of one path for the cached-jump fallback.
+- The runtime class has no test of its own in this stage. The pure parts (the route collector, the frontier
+  planner, the arena invalidation, the store additions) have unit tests; stage 2 drives the whole runtime through
+  the `PartitionDO` suites.
+
+**Stage 2 — `PartitionDO` becomes a host. Done.** All thirteen operations are descriptors, `status()` is a
+`local` operation built from the runtime's public surface, `db.ts` and the coordinator unwrap the envelope,
+`db.ts` maps `error.routing` to the existing public error `meta`, the eight helpers above and `forward-meta.ts`,
+the split-policy classes, and `PartitionInfoInternal` are deleted, the test suites unwrap the envelope, the
+prototype compiles against the real runtime, and `AGENTS.md` is updated. These decisions were made during the
+implementation and differ from, or add to, the text of section 4.2:
+
+- `FokosLifecycle` gains `destroying`, and its `import` carries `source` and `slice` beside `state`. The
+  runtime also exposes two predicates that answer without building it, because `lifecycle()` reads the import
+  record and queries the repartition rows: `isFenced()`, the destroy fence on its own, which every request
+  asks before it arms the TTL sweep; and `initialized()`, which reads only memory. A host job that can run
+  before any request checks `initialized()` first and stops there: the TTL sweep runs from a timer the
+  constructor arms, and a partition with no identity can hold neither an import nor a repartition, so reading
+  storage to learn that is work the answer does not need. For the same reason `hooks.admit` receives
+  `lifecycle` as a lazy property: every dispatch admits, and a host that admits on its own size or tag alone
+  never reads it.
+  `FokosStatusEntry.repartition` gains `hashKey`, the key a promotion moves. The host `status()` view and the
+  host TTL sweep are built from these and read no `fokos_` table.
+  TODO: the TTL sweep arms only on the host's public operations. The internal calls of the runtime
+  (`fokosExecuteLocal`, `fokosStatus`, `fokosMigrationPull`, `fokosInit`, `fokosStartImport`,
+  `fokosMigrationAck`, `fokosRequestPromotion`) do not re-arm a sweep whose timer already ran out, so a
+  partition that serves only migration or traversal traffic can hold expired rows longer than before. Fix
+  either by arming the sweep in those entry points too, or by moving the arm into a wrapper that every
+  operation, internal or public, passes through.
+- The host registers `status` as a `local` operation with a `null` request, so it goes through identity
+  validation and the destroy fence like every other operation, except that a `local` descriptor can set
+  `allowedWhileDestroying` to answer behind the fence, which `status` does. It no longer bootstraps a root on its own or
+  answers without a route context; a test that wants the state of a partition it has no context for reads
+  `fokosStatus`, and a test that must observe a stored policy without writing one reads `fokos.policy()` inside
+  `runInDurableObject`. `SplitStatusView` drops `createdAt` and `history`.
+- The envelope was reworked during this stage into the form of section 4.2.9: one `servedBy` list of nodes with
+  a role, no scopes and no summary. The first cut kept the spec's `summary` and scoped `routes` and rewrote the
+  identities on a read-through; that hid the read-through from the client and left the leaf metrics naming a
+  partition the list did not hold. A runtime `local` call adds its node before the handler runs, so a handler
+  that throws still leaves it in the error's routing and a forwarding partition learns from the error as it
+  learns from a result.
+- The `forward` of a host `walk` returns the part, and not an envelope around it. The runtime merges the
+  route evidence of every visit into the routing of the whole walk before `forward` resolves, so an envelope
+  there could only repeat it. It repeated it wrongly: the envelope carried the whole collector as it stood at
+  that moment, which is self plus every earlier visit, and not the visit the host had just made. `forward` is
+  now symmetric with `local`, and a host folds the two the same way.
+- `fokosRequestPromotion` on a key whose promotion is `queued`, `planned`, or `cutover` moves the fallback
+  alarm earlier before it wakes the fast path, so an eviction that lost the alarm is repaired by the next
+  request that asks about the key.
+- A hash leaf refuses a key that does not hash to it with `partition_misrouted` (section 4.2.8 step 1). A test
+  that probes every child for an item asks only the child that owns it.
+- A read-through answer lists the target as `read_through` and the source as `executed`, and counts the source
+  RPC in `forwardCount` (section 4.2.12). The leaf metrics of a `queryItems` page name the partition that
+  scanned the rows, so `leafPartitionInfo` in `client/partition-info.ts` pairs them with the `executed` node of
+  the source; a leaf whose node the byte cap dropped is skipped.
+- The host `clip` of `apiQueryItems` keeps a cursor inside the visit, drops a cursor when the visit lies entirely
+  after it, and throws `partition_misrouted` when the visit lies entirely before it. The walk filters those
+  visits out first, so only a read-through caller that names a sibling's cursor reaches the throw, and a
+  target cannot receive rows it has already consumed.
+- `txCommit` throws `partition_fanout_failed` when a remote group fails, as every `attempt_all` group does.
+  Before this stage it rethrew the first child error as it arrived.
+- `debugForcePromoteKey` takes `{ hashKey }` as its request, like every other operation.
+- `PartitionStore.hasAnyUnguardedPendingTx` becomes `earliestUnguardedPendingTxCreatedAt`, the value the
+  stale-recovery job reports as its `deadline()`.
+- `selectRangeAncestors` moves to `sharding/range-ancestors.ts`; `SplitConditions` moves to
+  `shared/partition-context.ts`; `RANGE_PROMOTION_FRACTION` is a host constant in `do-partition.ts`.
+- The test adapter `openedRpc` in `packages/fokosdb/test/partition-do/helpers.ts` opens every envelope with the
+  same `partition-info.ts` functions `db.ts` uses, so a suite that reads `meta.forwardCount` or
+  `partitionMetas[i].servedByActorName` keeps its assertions; the suites that assert on route evidence read
+  `routing` directly.
 
 ### M5 — The example host and the independence tests
 
@@ -849,7 +958,7 @@ type FokosOperation<Req, Res> =
 				request: Req;
 				visits: readonly FokosRangeVisit[];
 				local(req: Req): Res | Promise<Res>;
-				forward(visit: FokosRangeVisit, req: Req): Promise<FokosEnvelope<Res>>;
+				forward(visit: FokosRangeVisit, req: Req): Promise<Res>;
 			}): Promise<Res>;
 		})
 	| {
@@ -925,7 +1034,7 @@ The prototype in `packages/fokosdb/test/sharding-prototype/fokosdb-partition-hos
    deadline and moves the alarm earlier when necessary. An error here is logged and does not change the result.
    This step runs before the response is returned. It is a behavior change for `txCommit` and
    `txExecuteSingleShot`, which today run their split check in `ctx.waitUntil` after the response. A follow-up
-   can let a descriptor mark its signals as deferred, so the runtime applies them in `waitUntil` after step 8.
+   can mark a signal as deferred, so the runtime applies it in `waitUntil` after step 8.
 8. **Envelope.** Return the value with the collected point and range route evidence.
 
 When `__fokos/destroying` is true, step 1 throws `partition_migrating` for every operation. `fokosStatus`,
@@ -980,71 +1089,94 @@ step 2 for range children, with one addition for hash children: a key with a ter
 
 #### 4.2.9 Response envelope
 
-The runtime wraps every result. Application response types do not carry routing hints. A host value can still
+The runtime wraps every result. Application response types do not carry routing facts. A host value can still
 carry application metrics.
 
 ```ts
-type FokosRouteScope =
-	| { kind: "point"; key: RouteKey }
-	| { kind: "range"; hashKey: KeyBytes; start: KeyBytes | null; end: KeyBytes | null };
+type FokosServedRole =
+	/** Ran the local handler for its scope. */
+	| "executed"
+	/** Ran `merge` or `walk` over parts from other partitions. A router. */
+	| "merged"
+	/** Owns the scope but still imports it: its source ran the handler on its behalf. */
+	| "read_through";
 
 type FokosRouteNode = {
-	servedBy: FokosPartitionRef;
-	servedByActorId: string;
+	ref: FokosPartitionRef;
+	actorId: string;
+	/** The hash depth of this partition, or, for a range partition, of the hash partition that entered its tree. */
 	hashDepth: number;
 	rangeDepth: number;
-	/** Internal. Bounded ancestor boundaries of a range leaf. Consumers must drop it. */
-	_hint?: { rangeAncestors: RangeAncestorInfo[] };
+	role: FokosServedRole;
+	/** Internal. The bounded ancestor boundaries of a range partition. Consumers must drop it. */
+	_rangeAncestors?: RangeAncestorInfo[];
 };
-
-/** One serving partition and every scope it served in this response. */
-type FokosRouteEvidence = FokosRouteNode & { scopes: FokosRouteScope[] };
 
 type FokosEnvelope<T> = {
 	value: T;
 	routing: {
-		/** The partition that produced or merged `value`. */
-		summary: FokosRouteNode;
-		routes: FokosRouteEvidence[];
-		/** Total outbound partition RPCs in this response tree. */
+		/** Every partition that served a scope of this request, once each, keyed by `ref.partitionId`. */
+		servedBy: FokosRouteNode[];
+		/** Total outbound partition RPCs in this response tree, forwards and read-throughs alike. */
 		forwardCount: number;
-		/** True when the byte cap dropped one or more entries from `routes`. */
-		routesTruncated: boolean;
+		/** True when the byte cap dropped one or more nodes from `servedBy`. */
+		servedByTruncated: boolean;
 	};
 };
 ```
 
-The list holds one entry per serving partition, keyed by `servedBy.partitionId`. A point result has one entry
-with one point scope. A grouped result adds one point scope per served key to the entry of its partition, in
-request order. A range result adds one range scope per served interval, in visit order. A forwarding partition
-merges the entries of a child envelope into its own list by the same key, so a partition that served ten keys
-appears once with ten scopes, and its `_hint` travels once.
+One envelope answers three questions: which partitions executed work for the request, which are the deepest
+owners the request reached, and what a router must learn to route the next request deeper. One list answers all
+three. A partition that only forwards is not in it.
+
+A partition adds its own node with role `executed` when it runs a local handler, with role `merged` when it runs
+`merge` or `walk`, and with role `read_through` when it answers for a slice it owns through its source (section
+4.2.12). One partition holds one node, under the most informative of the roles it took, and the order the roles
+were taken in does not matter: `executed` outranks `read_through`, which outranks `merged`. A range router that
+forwards to two children and also scans its own rows is therefore an executor, because a caller reports the
+partition that read the rows. A forwarding partition merges the list of a child envelope into its own by `ref.partitionId` and adds
+one to `forwardCount` for each outbound partition RPC. A range walk collects only the local and forwarded calls
+that the host made through its tracked functions.
+
+The list carries no scopes. The identity of a partition is its scope: a hash `partitionId` decodes to the root
+index and the child path, so a router tests any hash key against it; a range `partitionId` decodes to the hash
+key and the interval it owns. Section 4.2.10 states how each cache reads the list.
+
+One field is written by a partition other than its owner: a hash partition that forwards into a range tree
+writes its own `hashDepth` on every range node of the child envelope, because a range partition has no hash
+depth and the hash router above must learn the depth of the hash partition that owns the promoted key. A
+hash-to-hash forward and a range-to-range forward change no node.
 
 The serialized list is capped at `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB, section 2.3). The runtime measures the
-list with a conservative estimator, as `fokosStatus` measures its page. When an entry would cross the cap, the
-runtime drops that entry and every later one and sets `routesTruncated`. `summary` and `forwardCount` are never
-dropped. Evidence is a cache hint (section 4.2.10), so a dropped entry costs one more hop on a later request
-and nothing else. A `local` operation can return an empty route list when it serves no partitioned data.
-
-A local result uses the serving partition as `summary`. A forwarded `point` or `single_owner` result keeps the
-child `summary`. A `group` result that calls `merge` and a `range` result that calls `walk` use the current
-partition as `summary`, even when the host consumes one part.
-
-A forwarding partition learns every evidence entry from the child envelope, merges the entries into its own
-list by `servedBy.partitionId`, and changes no field of an entry. It adds one to the envelope-level
-`forwardCount` for each outbound partition RPC. A range walk collects only the
-local and forwarded calls that the host made through its tracked functions.
+list with a conservative estimator, as `fokosStatus` measures its page. When a node would cross the cap, the
+runtime drops that node and every later one and sets `servedByTruncated`. `forwardCount` is never dropped. The
+list is a cache hint (section 4.2.10), so a dropped node costs one more hop on a later request and nothing
+else. It never changes a count: a caller aggregates the per-partition metrics its response body carries, and
+never the subset of them the list could name. The cap drops nodes in insertion order today. Ranking the list
+before it cuts, so that the deepest owner and the executor survive a wide fan-out and the shallower routers go
+first, is an open optimization. A `local` operation can return an empty list when it serves no partitioned data.
 
 An error follows the same rule. The partition that raises an error attaches its `routing` as a serializable own
-data property and uses itself as `summary`. A forwarding partition learns from `error.routing`, adds its RPC
-count, and rethrows the same error object. A partition without an identity attaches no routing data.
+data property, with its own node in the list: a handler that throws still served the scope. The node is added
+for every error the partition raises, and not only for one a handler raised. Admission, the lifecycle gate, and
+owner resolution all throw before any handler runs, so the list would otherwise be empty and the caller could
+not name the partition that refused the request. A partition that had already forwarded takes `merged` there,
+because it is the router of the parts it merged, and its node leads the list: a fan-out that fails would
+otherwise lead with a group that answered, because a remote node lands while the router awaits the rest. A node
+at the head of the list also always survives the byte cap. A forwarding
+partition learns from `error.routing`, adds its RPC count, and rethrows the same error object. A partition
+without an identity attaches no routing data.
 
 Every operation returns an envelope, including transaction operations. `TransactionCoordinatorDO` unwraps the
 envelope of `txPrepare`, `txCommit`, and `txCancel` where it calls `partitionStubByName`. `db.ts` unwraps every
-partition call with `FokosRouter.unwrap`. The unwrap removes `scopes` and `_hint`. FokosDB combines `summary`
-with the aggregate operation metrics to build `meta`. It keeps `partitionMetas` inside `value` for per-partition
-operation metrics; each entry is `OperationMetrics & { partitionId }`, and `db.ts` pairs it with the route-list
-entry of that partition to build the public `PartitionInfo`. The old `_internal` field is removed.
+partition call with `FokosRouter.unwrap`. The unwrap removes `_rangeAncestors`. FokosDB builds `meta` from the
+`executed` node of an item RPC (the one partition that ran the handler on a point path; on a read-through it is
+the source, which scanned the rows) and the aggregate operation metrics. It keeps `partitionMetas` inside `value`
+for per-partition operation metrics; each entry is `OperationMetrics & { partitionId }`, and `db.ts` pairs it
+with the node of that partition, and skips a leaf whose node the cap dropped. It sums `meta.rowsRead` and counts
+`meta.partitionsVisited` over every entry the response body carries, before that pairing, so a capped list
+shortens `partitionMetas` and leaves both aggregates exact. The old `_internal` field is
+removed.
 
 #### 4.2.10 Route caches and the range frontier
 
@@ -1053,12 +1185,13 @@ decided by the route override table and the durable topology, never by a cache.
 
 The runtime uses three caches:
 
-- The hash arena uses KV `__fokos/cache/hash_arena`. It learns `hashDepth` from point and range route evidence.
-  `caches.hashArenaBytes` and the depth cap bound it.
-- The range hierarchy uses SQL `fokos_range_hierarchy`. It learns `_hint.rangeAncestors` from range evidence.
-  `caches.rangeHierarchyMaxRows` bounds it.
-- The Promotion Bloom cache uses KV `__fokos/cache/promotion_bloom`. It learns when a hash partition receives
-  evidence from a range partition. Its filter size bounds it, and it does not remove entries.
+- The hash arena uses KV `__fokos/cache/hash_arena`. For each hash key of its own request, a hash router takes
+  the deepest node whose hash path contains the key, or the `hashDepth` a hash partition stamped on a range
+  node whose hash key it is, and learns that depth. `caches.hashArenaBytes` and the depth cap bound it.
+- The range hierarchy uses SQL `fokos_range_hierarchy`. It learns `_rangeAncestors` of every range node under
+  the hash key that node's `partitionId` decodes to. `caches.rangeHierarchyMaxRows` bounds it.
+- The Promotion Bloom cache uses KV `__fokos/cache/promotion_bloom`. A hash partition learns the hash key of
+  every range node in the list. Its filter size bounds it, and it does not remove entries.
 
 The range hierarchy table holds learned rows only. A learn writes or refreshes `learned_at`. When full, the
 runtime evicts the rows with the oldest `learned_at`, deepest first. A partition's own ancestors are in its
@@ -1092,8 +1225,8 @@ A Promotion Bloom hit makes the range-root base cover speculative. A speculative
 `range_partition_not_initialized` or `repartition_not_cut_over` invalidates that plan. The runtime computes the
 hash-tree frontier again with the Bloom step disabled, inside the same `forward(visit, req)` call. On a hash
 router the new target is the hash child. On a hash leaf the new target is this partition: `forward` then calls
-the descriptor's `local` handler with the same clipped request and returns an envelope whose `summary` and
-evidence name this partition. The visit interval does not change, so the host's cursor and budget logic sees
+the descriptor's `local` handler with the same clipped request and returns an envelope whose list names this
+partition as `executed`. The visit interval does not change, so the host's cursor and budget logic sees
 one answer for one visit. This is what `withSplitForwarding` does today when `maybeForwardToRangeRootPartition`
 returns null. The host does not implement either fallback.
 
@@ -1198,11 +1331,12 @@ so it needs no stored remote context.
 6. Otherwise calls `local` with a no-op `FokosLocalCall`, without owner resolution, the lifecycle gate, `admit`,
    or `walk`. It returns the local point or range evidence from the source.
 
-For an ordinary source read, the target replaces `summary` with its own route node. It also replaces
-`servedBy`, `hashDepth`, `rangeDepth`, and `_hint` in each evidence entry with its own values. It adds one to the
-envelope-level `forwardCount`. When the source followed an override, the target keeps the served partition and
-`_hint` in `summary` and in each evidence entry. It replaces only `hashDepth` and `rangeDepth` with its own
-values. The caller then learns the promotion and range boundaries.
+The target merges the source's list into its own unchanged, adds one to `forwardCount` for the RPC, and adds
+its own node with role `read_through`: it owns the slice, and the source executed for it. Both facts reach the
+caller. For an ordinary source read the list then holds the target (`read_through`) and the source (`executed`).
+When the source followed an override, it holds the target and the range partition that executed; the target is
+a hash partition, so it stamps its own `hashDepth` on the range nodes as section 4.2.9 states, and the caller
+learns the promotion and the range boundaries.
 
 #### 4.2.13 Background scheduler
 
@@ -1332,10 +1466,9 @@ class FokosRouter<TPolicy> {
 	): Promise<void>;
 }
 
-type FokosPublicRoute = Omit<FokosRouteNode, "_hint">;
+type FokosPublicRoute = Omit<FokosRouteNode, "_rangeAncestors">;
 type FokosPublicRouting = {
-	summary: FokosPublicRoute;
-	routes: FokosPublicRoute[];
+	servedBy: FokosPublicRoute[];
 	forwardCount: number;
 };
 ```
@@ -1466,8 +1599,8 @@ The FokosDB host maps current mechanisms as follows:
 - `debugForcePromoteKey` and `fokosRequestPromotion` keep today's answer for a key whose promotion is `queued`
   or `planned`: `queued: false` with that state, not `partition_over_size`.
 - Asynchronous local closures become synchronous `local` functions.
-- Route hints move from `meta` and `partitionMetas` to `routing.summary` and `routing.routes`. Metrics stay in
-  `value`. `db.ts` combines them.
+- Route hints move from `meta` and `partitionMetas` to `routing.servedBy`. Metrics stay in `value`. `db.ts`
+  combines them.
 - `fokosStaleTransactionMs`, `fokosGetColoInfo`, and `fokosTtlConfig` remain host methods.
 - `fokosImportPagesPerPass` becomes `runtimeConfig().importPagesPerPass`.
 - `debugForcePromoteKey` calls `runtime.requestPromotion`.
@@ -1519,10 +1652,10 @@ not readable by the old code.
   range root. A partial cache test proves that cache gaps use the base target without a gap or duplicate. A
   learned partition that split again must plan and forward to its current leaves.
 - Route-list tests cover one point, grouped points at different depths, and one range request across three leaves.
-  They check `summary`, exact point and range scopes, leaf identities, internal hints, and total `forwardCount`.
-  A grouped request with many keys on one leaf yields one entry with many scopes and one `_hint`. A request
-  whose evidence crosses `ROUTE_EVIDENCE_MAX_BYTES` returns `routesTruncated: true`, a list under the cap, and
-  an intact `summary`.
+  They check the roles, the leaf identities, the internal hints, and total `forwardCount`. A grouped request
+  with many keys on one leaf yields one node. A read-through yields the owner as `read_through` and the source
+  as `executed`. A request whose list crosses `ROUTE_EVIDENCE_MAX_BYTES` returns `servedByTruncated: true`, a
+  list under the cap, and an intact `forwardCount`.
 - A `group` test proves the synchronous order of section 4.2.7 step 5: a cutover that becomes durable while the
   remote groups are in flight finds the local lock already written on the node that owned the key at
   resolution time, and never on a node that resolved after the cutover.

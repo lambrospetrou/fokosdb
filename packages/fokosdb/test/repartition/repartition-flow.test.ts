@@ -117,10 +117,12 @@ describe("Repartition — planning", () => {
 			]);
 			expect(targets.every((t) => t.initialization === "pending")).toBe(true);
 
-			const plan = sharding.getPlan("r1")!;
-			expect(plan.source).toEqual({ partitionId: root.ctx.partitionId, doName: root.ctx.doName });
-			// The boundaries ARE the target slices, so the plan does not repeat them.
-			expect(Object.keys(plan).sort()).toEqual(["schema", "source"]);
+			// The head holds the policy of queue time and what planning added. The boundaries ARE the
+			// target slices, so the head does not repeat them, and a hash split has no range fields.
+			const head = sharding.getPlanHead("r1")!;
+			expect(head.queue).toEqual({ policy: root.ctx.policy });
+			expect(head.planned).toEqual({});
+			expect(head.nextKey).toBeNull();
 		});
 	});
 
@@ -273,7 +275,7 @@ describe("Repartition — initialization and cutover", () => {
 		});
 	});
 
-	it("deletes the plan at cutover and reuses it after a partial initialization", async () => {
+	it("retains the plan head through cutover and reuses it after a partial initialization", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await plan(root, { kind: "hash_split" });
@@ -283,14 +285,14 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source, sharding }) => {
 			await source.sourceStep(T0);
 			// The plan survives a partial fan-out; the retry initializes against exactly the same one.
-			expect(sharding.getPlan("r1")).toBeDefined();
+			expect(sharding.getPlanHead("r1")).toBeDefined();
 		});
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0 + 300_000)));
 		await root.enter(async ({ source, sharding }) => {
 			await source.sourceStep(T0 + 300_000);
 			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
-			// Spent: every target is initialized and the target rows hold every routing slice.
-			expect(sharding.getPlan("r1")).toBeUndefined();
+			// Retained: the completion and cleanup hooks read the policy of queue time from it.
+			expect(sharding.getPlanHead("r1")?.queue).toEqual({ policy: root.ctx.policy });
 		});
 	});
 });
@@ -341,12 +343,15 @@ describe("Repartition — the migration protocol", () => {
 			expect(store.queryPendingTxPage(null, 10)).toEqual([]);
 			// A split keeps its item rows: only a promotion gives them back.
 			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
+			expect(sharding.getPlanHead("r1")).toBeDefined();
 		});
 
 		await root.enter(({ source, store, sharding }) => {
 			expect(source.sourceCleanupStep()).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
+			// The final cleanup deletes the plan chain.
+			expect(sharding.getPlanHead("r1")).toBeUndefined();
 			expect(source.sourceCleanupStep()).toBe("idle");
 		});
 	});

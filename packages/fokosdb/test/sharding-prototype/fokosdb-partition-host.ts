@@ -410,7 +410,7 @@ async function walkRange(
 	req: QueryReq,
 	visits: readonly FokosRangeVisit[],
 	local: (req: QueryReq) => QueryRes | Promise<QueryRes>,
-	forward: (visit: FokosRangeVisit, req: QueryReq) => Promise<FokosEnvelope<QueryRes>>,
+	forward: (visit: FokosRangeVisit, req: QueryReq) => Promise<QueryRes>,
 ): Promise<QueryRes> {
 	const { interval, cursor, direction } = req;
 	const budget = new QueryPageBudget(req);
@@ -445,7 +445,7 @@ async function walkRange(
 			remainingPartitionVisits: budget.remainingPartitionVisits,
 			allowOversizedFirstItem: budget.allowOversizedFirstItem,
 		};
-		const part = visit.target === "local" ? await local(sub) : (await forward(visit, sub)).value;
+		const part = visit.target === "local" ? await local(sub) : await forward(visit, sub);
 
 		if (req.select === "projection") out.items.push(...part.items);
 		out.partitionMetas.push(...part.partitionMetas);

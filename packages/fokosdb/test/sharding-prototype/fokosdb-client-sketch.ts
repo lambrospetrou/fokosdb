@@ -51,35 +51,39 @@ export class FokosDB {
 		return todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${ctx.doName})`);
 	}
 
-	/** `meta` combines the serving partition of the envelope with the operation metrics of the value. */
-	static meta(metrics: OperationMetrics, routing: FokosPublicRouting): PublicMeta {
+	/** `meta` combines the partition that executed the request with the operation metrics of the value. */
+	static meta(metrics: OperationMetrics, node: FokosPublicRoute, forwardCount: number): PublicMeta {
 		return {
 			...metrics,
-			servedByActorId: routing.summary.servedByActorId,
-			servedByActorName: routing.summary.servedBy.doName,
-			servedByPartitionId: routing.summary.servedBy.partitionId,
-			hashDepth: routing.summary.hashDepth,
-			rangeDepth: routing.summary.rangeDepth,
-			forwardCount: routing.forwardCount,
+			servedByActorId: node.actorId,
+			servedByActorName: node.ref.doName,
+			servedByPartitionId: node.ref.partitionId,
+			hashDepth: node.hashDepth,
+			rangeDepth: node.rangeDepth,
+			forwardCount,
 		};
+	}
+
+	static executor(routing: FokosPublicRouting): FokosPublicRoute {
+		return routing.servedBy.find((node) => node.role === "executed") ?? todo("an item RPC has one executing partition");
 	}
 
 	async getItem(hashKey: KeyBytes, sortKey: KeyBytes) {
 		const ctx = this.partitions.rootContext(hashKey);
 		const { value, routing } = this.partitions.unwrap(await this.partitionStub(ctx).apiGetItem(ctx, { hashKey, sortKey }));
-		return { ...value, meta: FokosDB.meta(value.meta, routing) };
+		return { ...value, meta: FokosDB.meta(value.meta, FokosDB.executor(routing), routing.forwardCount) };
 	}
 
-	/** One sub-query page. The leaf metrics pair with the route list by partition id. */
+	/** One sub-query page. The leaf metrics pair with the list by partition id; a leaf the cap dropped is skipped. */
 	async queryPage(req: QueryReq) {
 		const ctx = this.partitions.rootContext(req.hashKey);
 		const { value, routing } = this.partitions.unwrap(await this.partitionStub(ctx).apiQueryItems(ctx, req));
-		const byPartition = new Map(routing.routes.map((r) => [r.servedBy.partitionId, r]));
-		const partitionMetas = value.partitionMetas.map((leaf: LeafMetrics) => {
-			const route = byPartition.get(leaf.partitionId) ?? todo<FokosPublicRoute>("a leaf that scanned rows is always in the route list");
-			return FokosDB.meta(leaf, { summary: route, routes: [], forwardCount: 0 });
+		const byPartition = new Map(routing.servedBy.map((node) => [node.ref.partitionId, node]));
+		const partitionMetas = value.partitionMetas.flatMap((leaf: LeafMetrics) => {
+			const node = byPartition.get(leaf.partitionId);
+			return node ? [FokosDB.meta(leaf, node, 0)] : [];
 		});
-		return { ...value, partitionMetas, meta: FokosDB.meta({ rowsRead: 0, rowsWritten: 0, databaseSize: 0 }, routing) };
+		return { ...value, partitionMetas, forwardCount: routing.forwardCount };
 	}
 
 	/** The coordinator is chosen by the token, as before, and reached through its root. */

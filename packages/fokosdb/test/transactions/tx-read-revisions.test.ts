@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
+import { openedRpc } from "../partition-do/helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -19,7 +20,8 @@ const itemExists = () => compileConditionExpression({ op: "exists", args: [{ ref
 /** The stub and resolved context of the partition that owns `key`. */
 function owningPartition(db: FokosDB, key: Key) {
 	const partitionContext = db.options().topology.rootContext(kb(key.hashKey));
-	return { stub: testPartitionStub(partitionContext.doName), pCtx: partitionContext };
+	const stub = testPartitionStub(partitionContext.doName);
+	return { stub, rpc: openedRpc(stub), pCtx: partitionContext };
 }
 
 /**
@@ -31,17 +33,17 @@ async function holdPendingLock(
 	key: Key,
 	item: Omit<TransactionItem, "opIndex" | "hashKey" | "sortKey">,
 ): Promise<() => Promise<unknown>> {
-	const { stub, pCtx } = owningPartition(db, key);
+	const { rpc, pCtx } = owningPartition(db, key);
 	const transactionId = crypto.randomUUID();
 	const keys = { hashKey: kb(key.hashKey), sortKey: kb(key.sortKey) };
-	const res = await stub.txPrepare(pCtx, {
+	const res = await rpc.txPrepare(pCtx, {
 		transactionId,
 		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
 		transactionTimestamp: txOrderTimestampNow(),
 		items: [{ opIndex: 0, ...keys, ...item }],
 	});
 	expect(res.outcome).toBe("accepted");
-	return () => stub.txCancel(pCtx, { transactionId, items: [keys] });
+	return () => rpc.txCancel(pCtx, { transactionId, items: [keys] });
 }
 
 /**
