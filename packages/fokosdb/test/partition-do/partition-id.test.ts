@@ -4,7 +4,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { partitionIdentityFrom, PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { HashPartitionTopologyImpl } from "../../src/sharding/split-policy.js";
-import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition } from "./partition-harness.js";
@@ -43,7 +43,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		const hashKey = "routing-consistency-key";
 		// The topology reads its storage, so both picks run inside the Durable Object that owns it.
 		const { child, grandchild } = await runInDurableObject(stub, async (_instance: PartitionDO, ctx: DurableObjectState) => {
-			const store = new PartitionStore(ctx.storage);
+			const store = new FokosShardingStore(ctx.storage);
 			const topologyOf = (owner: FokosDbRouteContext) =>
 				new HashPartitionTopologyImpl(owner, partitionIdentityFrom(owner), ctx, store, notRepartitioning);
 			const child = topologyOf(pCtx).pickChildPartition(pCtx, kb(hashKey));

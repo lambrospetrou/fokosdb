@@ -4,7 +4,7 @@ import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
-import { PartitionStore } from "../shared/partition/partition-store.js";
+import { FokosShardingStore } from "./sharding-store.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionContextCreator, type FokosDbRouteContext } from "../shared/partition-context.js";
 import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
@@ -93,13 +93,13 @@ const identityOf = (pCtx: FokosDbRouteContext) =>
 
 // Runs `fn` against a topology backed by REAL Durable Object storage, so `sql.databaseSize` is real.
 async function withTopology<T>(
-	make: (pCtx: FokosDbRouteContext, state: DurableObjectState, store: PartitionStore) => T,
+	make: (pCtx: FokosDbRouteContext, state: DurableObjectState, store: FokosShardingStore) => T,
 	pCtx: FokosDbRouteContext,
 	fn: (topology: T) => void,
 ): Promise<void> {
 	const stub = testPartitionStub(`splitpolicy-${crypto.randomUUID()}`);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
-		fn(make(pCtx, state, new PartitionStore(state.storage)));
+		fn(make(pCtx, state, new FokosShardingStore(state.storage)));
 	});
 }
 

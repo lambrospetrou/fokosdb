@@ -19,7 +19,7 @@
  * retries that acknowledgement until the source accepts it.
  *
  * The two roles are two classes, both in this file. They share no in-memory state and never call each
- * other: the only thing they have in common is the `PartitionStore`. A partition holds one of each,
+ * other: the only thing they have in common is the `FokosShardingStore`. A partition holds one of each,
  * because a hash child is a target first and a source later, and the request path joins them at the
  * Durable Object rather than inside either class. Neither holds a stub or makes an RPC of its own —
  * the DO passes `getPeer` down (boundary rule: only DO classes and FokosDB hold stubs).
@@ -33,20 +33,19 @@ import invariant from "../shared/invariant.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { refOf, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { identityDepth, PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
-import type { RangeAncestorInfo } from "./types.js";
 import { selectRangeAncestors } from "./split-policy.js";
 import { FokosInternalError, FokosUnavailableError, FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
 import type {
-	PartitionStore,
+	FokosShardingStore,
 	PromotedKeyCursor,
 	RepartitionKind,
 	RepartitionRow,
 	RepartitionSlice,
 	RepartitionState,
 	RepartitionTargetRow,
-} from "../shared/partition/partition-store.js";
+} from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
-import { sliceIncludesHashKey } from "./repartition-slice.js";
+import { sliceIncludesHashKey, sliceIncludesItem } from "./repartition-slice.js";
 import type {
 	FokosImportRecord,
 	FokosImportState,
@@ -61,7 +60,9 @@ import type {
 	FokosStatusCursor,
 	FokosStatusEntry,
 	MigrationHost,
+	RepartitionPlan,
 	RepartitionRouting,
+	RouteKey,
 } from "./repartition-types.js";
 import { jitterBackoff } from "durable-utils/retries";
 
@@ -89,28 +90,6 @@ const IMPORT_RETRY_MAX_MS = 5 * 60_000;
 const NOT_CUT_OVER_RETRY_MS = 10_000;
 /** A protocol error no retry can fix. The state stays, the identifiers are logged, and the retry is slow. */
 const NON_RETRYABLE_RETRY_MS = 5 * 60_000;
-
-export const REPARTITION_KV_KEYS = {
-	IMPORT: "__fokos/import",
-	DESTROYING: "__fokos/destroying",
-	plan: (repartitionId: string) => `__fokos/repartition/${repartitionId}/plan`,
-} as const;
-
-/**
- * The immutable part of a repartition, written once with the target rows and deleted at cutover.
- *
- * It holds only what the target rows cannot: the source identity and the range ancestors selected for
- * this split. The computed boundaries are the target slices themselves, so the plan does not repeat
- * them, and the mutable split thresholds are never stored — a router rebuilds every forwarded context
- * from its own current context instead.
- */
-export type RepartitionPlan = {
-	schema: 1;
-	source: FokosPartitionRef;
-	/** The depth the targets receive. A range split's children, or 0 for a promotion's range root. */
-	rangeDepth?: number;
-	rangeAncestors?: RangeAncestorInfo[];
-};
 
 /** This partition's own route context, as the last request left it, and its immutable identity. */
 export type RepartitionIdentity = {
@@ -161,8 +140,7 @@ export type StepOutcome = "idle" | "progressed" | "stopped";
  */
 export class RepartitionSource implements RepartitionRouting {
 	constructor(
-		private readonly store: PartitionStore,
-		private readonly storage: DurableObjectStorage,
+		private readonly store: FokosShardingStore,
 		private readonly deps: RepartitionSourceDeps,
 	) {}
 
@@ -351,7 +329,7 @@ export class RepartitionSource implements RepartitionRouting {
 		this.store.transactionSync(() => {
 			const current = this.store.getRepartition(row.id);
 			if (current?.state !== "queued") return;
-			this.storage.kv.put<RepartitionPlan>(REPARTITION_KV_KEYS.plan(row.id), plan);
+			this.store.putPlan(row.id, plan);
 			targets.forEach((t, index) => {
 				this.store.insertRepartitionTarget({
 					repartitionId: row.id,
@@ -398,7 +376,7 @@ export class RepartitionSource implements RepartitionRouting {
 			return "idle";
 		}
 
-		const plan = this.storage.kv.get<RepartitionPlan>(REPARTITION_KV_KEYS.plan(row.id));
+		const plan = this.store.getPlan(row.id);
 		invariant(plan, () => `fokos/repartition.initializeTargets: no plan for ${row.id}`);
 		const { ctx } = this.deps.identity();
 
@@ -463,7 +441,7 @@ export class RepartitionSource implements RepartitionRouting {
 			}
 
 			this.store.setRepartitionState(row.id, "cutover", { cutoverAt: now });
-			this.storage.kv.delete(REPARTITION_KV_KEYS.plan(row.id));
+			this.store.deletePlan(row.id);
 			this.store.refreshRepartitionDue(row.id, now);
 			return "progressed";
 		});
@@ -743,8 +721,20 @@ export class RepartitionSource implements RepartitionRouting {
 		const cursor: FokosMigrationCursor = req.cursor ?? { phase: "overrides", inner: null };
 		if (cursor.phase === "overrides") return this.#buildOverridesPage(row, slice, cursor.inner);
 
-		const { page, nextCursor } = this.deps.host.buildPage(cursor.inner, slice);
+		const { page, nextCursor } = this.deps.host.buildPage(cursor.inner, slice, this.belongsToTarget(slice));
 		return { phase: "host", page, nextCursor: nextCursor === null ? null : { phase: "host", inner: nextCursor } };
+	}
+
+	/**
+	 * The ownership function of one target slice. A key with a terminal route override belongs to a
+	 * range tree and not to the hash child that inherits the override: the child receives the forward
+	 * pointer in the overrides phase and no data copy.
+	 */
+	belongsToTarget(slice: FokosSlice): (key: RouteKey) => boolean {
+		const n = this.deps.identity().ctx.topology.hashSplitN;
+		return (key) =>
+			sliceIncludesItem(slice, key.hashKey, key.sortKey, n) &&
+			!(slice.kind === "hash_child" && this.store.hasTerminalRouteOverride(key.hashKey));
 	}
 
 	/**
@@ -784,8 +774,7 @@ export class RepartitionSource implements RepartitionRouting {
  */
 export class RepartitionTarget {
 	constructor(
-		private readonly store: PartitionStore,
-		private readonly storage: DurableObjectStorage,
+		private readonly store: FokosShardingStore,
 		private readonly deps: RepartitionTargetDeps,
 	) {}
 
@@ -909,7 +898,7 @@ export class RepartitionTarget {
 	}
 
 	importRecord(): FokosImportRecord | undefined {
-		return this.storage.kv.get<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT);
+		return this.store.getImport();
 	}
 
 	/** The import state the request gate reads, or null when this partition is not a target. */
@@ -1050,7 +1039,7 @@ export class RepartitionTarget {
 	}
 
 	#putImport(record: FokosImportRecord): void {
-		this.storage.kv.put<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT, record);
+		this.store.putImport(record);
 	}
 
 	#deferImport(rec: FokosImportRecord, now: number, error: unknown): void {

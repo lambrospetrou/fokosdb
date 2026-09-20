@@ -17,8 +17,6 @@ export type { BloomFilterSnapshot } from "./bloom-filter.js";
 // ─── Identity and context ─────────────────────────────────────────────────────
 
 export {
-	FOKOS_IDENTITY_KV_KEY,
-	FOKOS_POLICY_KV_KEY,
 	RESERVED_SHARD_GROUP_PREFIX,
 	isHashPartition,
 	isRangePartition,
@@ -77,13 +75,30 @@ export {
 } from "./sk-interval.js";
 export type { SkInterval } from "./sk-interval.js";
 
+// ─── Sharding store ───────────────────────────────────────────────────────────
+
+export { FOKOS_KV_KEYS, FokosShardingStore, RANGE_HIERARCHY_MAX_ROWS } from "./sharding-store.js";
+export type {
+	FokosShardingStoreOptions,
+	LearnedRangeSlice,
+	PromotedKeyCursor,
+	RepartitionKind,
+	RepartitionRow,
+	RepartitionSlice,
+	RepartitionState,
+	RepartitionStatusCursor,
+	RepartitionStatusRow,
+	RepartitionTargetCounts,
+	RepartitionTargetRow,
+	TargetInitialization,
+} from "./sharding-store.js";
+
 // ─── Repartition flow ─────────────────────────────────────────────────────────
 
-export { REPARTITION_KV_KEYS, REPARTITION_RPC_CONCURRENCY, RepartitionSource, RepartitionTarget } from "./repartition-flow.js";
+export { REPARTITION_RPC_CONCURRENCY, RepartitionSource, RepartitionTarget } from "./repartition-flow.js";
 export type {
 	RepartitionCommonDeps,
 	RepartitionIdentity,
-	RepartitionPlan,
 	RepartitionSourceDeps,
 	RepartitionTargetDeps,
 	StepOutcome,
@@ -109,7 +124,9 @@ export type {
 	FokosStatusPage,
 	FokosStatusRequest,
 	MigrationHost,
+	RepartitionPlan,
 	RepartitionRouting,
+	RouteKey,
 } from "./repartition-types.js";
 export { collectBatch } from "./batch-scan.js";
 export type { CollectBatchOptions, CollectBatchResult } from "./batch-scan.js";

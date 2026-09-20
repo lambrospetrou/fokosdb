@@ -67,9 +67,6 @@ export type FokosPartitionIdentity = {
 /** The mutable part of the last route context a partition received, under `__fokos/policy`. */
 export type FokosStoredPolicy<TPolicy> = { rangeConfig: FokosRangeConfig; policy: TPolicy };
 
-export const FOKOS_IDENTITY_KV_KEY = "__fokos/identity";
-export const FOKOS_POLICY_KV_KEY = "__fokos/policy";
-
 /** The first byte of a partition ID names its schema; see `PartitionIdHelper`. */
 const HASH_SCHEMA_PREFIX = "00";
 const RANGE_SCHEMA_PREFIX = "01";

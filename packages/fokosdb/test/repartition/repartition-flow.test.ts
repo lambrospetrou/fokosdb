@@ -1,5 +1,5 @@
 /**
- * `RepartitionSource` and `RepartitionTarget` driven step by step, over real `PartitionStore` instances.
+ * `RepartitionSource` and `RepartitionTarget` driven step by step, over real `FokosShardingStore` instances.
  *
  * Every test drives the source and the target by hand and inspects the rows between steps, so a
  * failure names the transition that broke rather than the split that did not finish. The suite needs
@@ -10,10 +10,9 @@ import { describe, expect, it } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
-import { REPARTITION_KV_KEYS, type RepartitionPlan } from "../../src/sharding/repartition-flow.js";
 import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node } from "./repartition-harness.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
-import type { PartitionStore, RepartitionKind } from "../../src/shared/partition/partition-store.js";
+import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
 /**
  * Asserts a jittered retry deadline. `jitterBackoff` picks uniformly from [0, 2^attempt * base) and
@@ -39,24 +38,24 @@ describe("Repartition — arbitration", () => {
 	it("queues a hash split, and refuses a second one", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, sharding }) => {
 			expect(source.queue({ kind: "hash_split" })).toMatchObject({ id: "r1", kind: "hash_split", state: "queued" });
 			expect(source.queue({ kind: "hash_split" })).toBeUndefined();
-			expect(store.getSplitRepartition()?.id).toBe("r1");
+			expect(sharding.getSplitRepartition()?.id).toBe("r1");
 		});
 	});
 
 	it("lets an unfinished promotion block a hash split, and a finished one through", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, sharding }) => {
 			expect(source.queue({ kind: "key_promotion", hashKey: kb("hot") })).toMatchObject({ id: "r1" });
 			// queued, planned and cutover all still own the key's move.
 			expect(source.queue({ kind: "hash_split" })).toBeUndefined();
-			store.setRepartitionState("r1", "cutover");
+			sharding.setRepartitionState("r1", "cutover");
 			expect(source.queue({ kind: "hash_split" })).toBeUndefined();
 
-			store.setRepartitionState("r1", "completed");
+			sharding.setRepartitionState("r1", "completed");
 			expect(source.queue({ kind: "hash_split" })).toMatchObject({ id: "r2", kind: "hash_split" });
 		});
 	});
@@ -64,10 +63,10 @@ describe("Repartition — arbitration", () => {
 	it("lets a split row in any state block every later promotion", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, sharding }) => {
 			expect(source.queue({ kind: "hash_split" })).toMatchObject({ id: "r1" });
 			for (const state of ["queued", "planned", "cutover", "completed", "cleaned"] as const) {
-				store.setRepartitionState("r1", state);
+				sharding.setRepartitionState("r1", state);
 				expect(source.queue({ kind: "key_promotion", hashKey: kb("hot") }), `blocked at ${state}`).toBeUndefined();
 			}
 		});
@@ -76,13 +75,13 @@ describe("Repartition — arbitration", () => {
 	it("refuses a second promotion of one key, and allows two keys at once", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, sharding }) => {
 			expect(source.queue({ kind: "key_promotion", hashKey: kb("alice") })).toMatchObject({ id: "r1" });
 			expect(source.queue({ kind: "key_promotion", hashKey: kb("alice") })).toBeUndefined();
 			// A different key is unrelated: two promotions progress at the same time.
 			expect(source.queue({ kind: "key_promotion", hashKey: kb("bob") })).toMatchObject({ id: "r2" });
-			expect(store.routeOverrideFor(kb("alice"))).toEqual({ repartitionId: "r1", state: "queued" });
-			expect(store.routeOverrideFor(kb("bob"))).toEqual({ repartitionId: "r2", state: "queued" });
+			expect(sharding.routeOverrideFor(kb("alice"))).toEqual({ repartitionId: "r1", state: "queued" });
+			expect(sharding.routeOverrideFor(kb("bob"))).toEqual({ repartitionId: "r2", state: "queued" });
 		});
 	});
 
@@ -104,12 +103,12 @@ describe("Repartition — planning", () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => source.queue({ kind: "hash_split" }));
-		await root.enter(async ({ source, store, storage }) => {
+		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep()).toBe("progressed");
 
-			const row = store.getRepartition("r1")!;
+			const row = sharding.getRepartition("r1")!;
 			expect(row.state).toBe("planned");
-			const targets = store.listRepartitionTargets("r1", "hash_split");
+			const targets = sharding.listRepartitionTargets("r1", "hash_split");
 			expect(targets.map((t) => t.targetIndex)).toEqual([0, 1, 2]);
 			expect(targets.map((t) => t.slice)).toEqual([
 				{ kind: "hash_child", childIndex: 0 },
@@ -118,7 +117,7 @@ describe("Repartition — planning", () => {
 			]);
 			expect(targets.every((t) => t.initialization === "pending")).toBe(true);
 
-			const plan = storage.kv.get<RepartitionPlan>(REPARTITION_KV_KEYS.plan("r1"))!;
+			const plan = sharding.getPlan("r1")!;
 			expect(plan.source).toEqual({ partitionId: root.ctx.partitionId, doName: root.ctx.doName });
 			// The boundaries ARE the target slices, so the plan does not repeat them.
 			expect(Object.keys(plan).sort()).toEqual(["schema", "source"]);
@@ -133,24 +132,24 @@ describe("Repartition — planning", () => {
 			putItem(store, "alice", "s1");
 			source.queue({ kind: "range_split" }, T0);
 		});
-		await rangeRoot.enter(async ({ source, store }) => {
+		await rangeRoot.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(T0)).toBe("progressed");
 			// Only a new write can change the answer, so the row waits rather than failing.
-			const row = store.getRepartition("r1")!;
+			const row = sharding.getRepartition("r1")!;
 			expect(row.state).toBe("queued");
 			expect(row.attempts).toBe(1);
 			expectBackoffWindow(row.nextAttemptAt, T0, 0);
-			expect(store.listRepartitionTargets("r1", "range_split")).toEqual([]);
+			expect(sharding.listRepartitionTargets("r1", "range_split")).toEqual([]);
 		});
 		// The window doubles while the answer stays the same, and it stops at 5 minutes.
-		await rangeRoot.enter(async ({ source, store }) => {
-			store.setRepartitionAttempt("r1", 1, 0);
+		await rangeRoot.enter(async ({ source, sharding }) => {
+			sharding.setRepartitionAttempt("r1", 1, 0);
 			await source.sourceStep(T0 + 5_000);
-			expectBackoffWindow(store.getRepartition("r1")!.nextAttemptAt, T0 + 5_000, 1);
+			expectBackoffWindow(sharding.getRepartition("r1")!.nextAttemptAt, T0 + 5_000, 1);
 
-			store.setRepartitionAttempt("r1", 20, 0);
+			sharding.setRepartitionAttempt("r1", 20, 0);
 			await source.sourceStep(T0 + 20_000);
-			expectBackoffWindow(store.getRepartition("r1")!.nextAttemptAt, T0 + 20_000, 20);
+			expectBackoffWindow(sharding.getRepartition("r1")!.nextAttemptAt, T0 + 20_000, 20);
 		});
 	});
 
@@ -158,12 +157,12 @@ describe("Repartition — planning", () => {
 		const c = makeCluster({ rangeSplitN: 2 });
 		const root = c.hashNode([0]);
 		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
-		await rangeRoot.enter(async ({ source, store }) => {
+		await rangeRoot.enter(async ({ source, store, sharding }) => {
 			for (const sk of ["s1", "s2", "s3", "s4"]) putItem(store, "alice", sk, "x".repeat(200));
 			source.queue({ kind: "range_split" });
 			expect(await source.sourceStep()).toBe("progressed");
 
-			const targets = store.listRepartitionTargets("r1", "range_split");
+			const targets = sharding.listRepartitionTargets("r1", "range_split");
 			expect(targets).toHaveLength(2);
 			const first = targets[0].slice as { start: KeyBytes | null; end: KeyBytes };
 			const second = targets[1].slice as { start: KeyBytes; end: KeyBytes | null };
@@ -180,14 +179,14 @@ describe("Repartition — initialization and cutover", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await plan(root, { kind: "hash_split" });
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			const targets = store.listRepartitionTargets("r1", "hash_split");
+			const targets = sharding.listRepartitionTargets("r1", "hash_split");
 			expect(targets.map((t) => t.initialization)).toEqual(["initialized", "initialized"]);
 			// Every target is initialized, so the next step is the cutover.
-			expect(store.getRepartition("r1")!.state).toBe("planned");
+			expect(sharding.getRepartition("r1")!.state).toBe("planned");
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("cutover");
+			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
 		});
 	});
 
@@ -195,13 +194,13 @@ describe("Repartition — initialization and cutover", () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await plan(root, { kind: "hash_split" });
-		const failing = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split")[1].doName);
+		const failing = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[1].doName);
 		c.failNextInit(failing);
 		let failedDeadline = 0;
 
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			const byName = new Map(store.listRepartitionTargets("r1", "hash_split").map((t) => [t.doName, t]));
+			const byName = new Map(sharding.listRepartitionTargets("r1", "hash_split").map((t) => [t.doName, t]));
 			for (const [name, t] of byName) {
 				if (name === failing) {
 					// It stays `initializing`: the call may have arrived and lost its reply, so the retry
@@ -215,12 +214,12 @@ describe("Repartition — initialization and cutover", () => {
 				}
 			}
 			// The repartition's own deadline follows the one target that still needs a call.
-			expect(store.getRepartition("r1")!.nextAttemptAt).toBe(failedDeadline);
+			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(failedDeadline);
 		});
 
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(failedDeadline)).toBe("progressed");
-			expect(store.listRepartitionTargets("r1", "hash_split").every((t) => t.initialization === "initialized")).toBe(true);
+			expect(sharding.listRepartitionTargets("r1", "hash_split").every((t) => t.initialization === "initialized")).toBe(true);
 		});
 	});
 
@@ -234,9 +233,9 @@ describe("Repartition — initialization and cutover", () => {
 		});
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, sharding }) => {
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			const targetRow = store.listRepartitionTargets("r1", "key_promotion")[0];
+			const targetRow = sharding.listRepartitionTargets("r1", "key_promotion")[0];
 			// The target is never created while a lock is held, and the retry is flat: only a commit or a
 			// cancel can change the answer, so backing off would only slow the promotion down.
 			expect(targetRow.initialization).toBe("pending");
@@ -244,10 +243,10 @@ describe("Repartition — initialization and cutover", () => {
 			expect(targetRow.attempts).toBe(0);
 		});
 
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, store, sharding }) => {
 			store.deletePendingTx("tx-1");
 			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
-			expect(store.listRepartitionTargets("r1", "key_promotion")[0].initialization).toBe("initialized");
+			expect(sharding.listRepartitionTargets("r1", "key_promotion")[0].initialization).toBe("initialized");
 		});
 	});
 
@@ -261,16 +260,16 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
-		await root.enter(async ({ source, store }) => {
+		await root.enter(async ({ source, store, sharding }) => {
 			// The lock arrives after the range root exists but before routing moved.
 			putLock(store, "alice", "s1");
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("planned");
-			expect(store.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
+			expect(sharding.getRepartition("r1")!.state).toBe("planned");
+			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
 
 			store.deletePendingTx("tx-1");
 			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("cutover");
+			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
 		});
 	});
 
@@ -278,20 +277,20 @@ describe("Repartition — initialization and cutover", () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await plan(root, { kind: "hash_split" });
-		const failing = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split")[2].doName);
+		const failing = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[2].doName);
 		c.failNextInit(failing);
 
-		await root.enter(async ({ source, storage }) => {
+		await root.enter(async ({ source, sharding }) => {
 			await source.sourceStep(T0);
 			// The plan survives a partial fan-out; the retry initializes against exactly the same one.
-			expect(storage.kv.get<RepartitionPlan>(REPARTITION_KV_KEYS.plan("r1"))).toBeDefined();
+			expect(sharding.getPlan("r1")).toBeDefined();
 		});
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0 + 300_000)));
-		await root.enter(async ({ source, store, storage }) => {
+		await root.enter(async ({ source, sharding }) => {
 			await source.sourceStep(T0 + 300_000);
-			expect(store.getRepartition("r1")!.state).toBe("cutover");
+			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
 			// Spent: every target is initialized and the target rows hold every routing slice.
-			expect(storage.kv.get<RepartitionPlan>(REPARTITION_KV_KEYS.plan("r1"))).toBeUndefined();
+			expect(sharding.getPlan("r1")).toBeUndefined();
 		});
 	});
 });
@@ -312,7 +311,7 @@ describe("Repartition — the migration protocol", () => {
 		});
 		await cutOver(root);
 
-		const targets = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split"));
+		const targets = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split"));
 		const childA = c.node({ ...c.base, doName: targets[0].doName, partitionId: targets[0].partitionId });
 		const childB = c.node({ ...c.base, doName: targets[1].doName, partitionId: targets[1].partitionId });
 
@@ -337,16 +336,16 @@ describe("Repartition — the migration protocol", () => {
 		// The acknowledgements complete the source, which then drops its now-redundant lock copies.
 		for (const child of [childA, childB]) await child.enter(async ({ target }) => void (await target.sendAck()));
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
-		await root.enter(({ store }) => {
-			expect(store.getRepartition("r1")!.state).toBe("completed");
+		await root.enter(({ store, sharding }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(store.queryPendingTxPage(null, 10)).toEqual([]);
 			// A split keeps its item rows: only a promotion gives them back.
 			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
 		});
 
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, store, sharding }) => {
 			expect(source.sourceCleanupStep()).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("cleaned");
+			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
 			expect(source.sourceCleanupStep()).toBe("idle");
 		});
@@ -356,7 +355,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await plan(root, { kind: "hash_split" });
-		const target = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split")[0]);
+		const target = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[0]);
 		const ref = { partitionId: target.partitionId, doName: target.doName };
 
 		await root.enter(({ source }) => {
@@ -364,8 +363,8 @@ describe("Repartition — the migration protocol", () => {
 				fokosErrorWith("repartition_not_cut_over"),
 			);
 		});
-		await root.enter(({ source, store }) => {
-			store.setRepartitionState("r1", "completed");
+		await root.enter(({ source, sharding }) => {
+			sharding.setRepartitionState("r1", "completed");
 			// The rows may already have gone back, so the source stops answering rather than serving a
 			// page that is short of what the target asked for.
 			expect(() => source.servePage({ repartitionId: "r1", target: ref, cursor: null })).toThrow(fokosErrorWith("partition_migrating"));
@@ -375,10 +374,10 @@ describe("Repartition — the migration protocol", () => {
 	it("resolves a read-through slice after a split completes, but not after a promotion reclaimed its rows", async () => {
 		const split = makeCluster().hashNode([0]);
 		await plan(split, { kind: "hash_split" });
-		const splitTarget = await split.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split")[0]);
+		const splitTarget = await split.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[0]);
 
-		await split.enter(({ source, store }) => {
-			store.setRepartitionState("r1", "completed");
+		await split.enter(({ source, sharding }) => {
+			sharding.setRepartitionState("r1", "completed");
 			// A split source keeps its item rows for life, so a read-through caller still gets its slice.
 			expect(source.resolveCallerSlice("r1", splitTarget)).toMatchObject({ kind: "hash_child" });
 		});
@@ -386,10 +385,10 @@ describe("Repartition — the migration protocol", () => {
 		const promo = makeCluster().hashNode([0]);
 		const key = kb("alice");
 		await plan(promo, { kind: "key_promotion", hashKey: key });
-		const promoTarget = await promo.enter(({ store }) => store.listRepartitionTargets("r1", "key_promotion")[0]);
+		const promoTarget = await promo.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "key_promotion")[0]);
 
-		await promo.enter(({ source, store }) => {
-			store.setRepartitionState("r1", "cleaned");
+		await promo.enter(({ source, sharding }) => {
+			sharding.setRepartitionState("r1", "cleaned");
 			// The rows of the key went back to the range tree, so nothing here is left to read. No correct
 			// target can ask, because it reaches `imported` before its acknowledgement completes the
 			// promotion. This is a protocol defect, and not a condition that a retry can clear.
@@ -401,7 +400,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await cutOver(root, { kind: "hash_split" });
-		const targetRow = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split")[0]);
+		const targetRow = await root.enter(({ sharding }) => sharding.listRepartitionTargets("r1", "hash_split")[0]);
 
 		await root.enter(({ source }) => {
 			expect(() => source.servePage({ repartitionId: "nope", target: targetRow, cursor: null })).toThrow(
@@ -463,9 +462,9 @@ describe("Repartition — the migration protocol", () => {
 
 		// A page whose cursor walks back to an earlier phase is refused for the same reason.
 		c.nextPullPage(root.doName, { phase: "overrides", overrides: [], nextCursor: { phase: "overrides", inner: null } });
-		await child.enter(async ({ target, storage }) => {
+		await child.enter(async ({ target, sharding }) => {
 			const rec = target.importRecord()!;
-			storage.kv.put(REPARTITION_KV_KEYS.IMPORT, { ...rec, cursor: { phase: "host", inner: null }, nextAttemptAt: 0 });
+			sharding.putImport({ ...rec, cursor: { phase: "host", inner: null }, nextAttemptAt: 0 });
 			expect(await target.importOnePage(T0)).toBe("stopped");
 			expect(target.importRecord()!.cursor).toEqual({ phase: "host", inner: null });
 		});
@@ -486,9 +485,9 @@ describe("Repartition — the migration protocol", () => {
 			page: { stream: "pending_tx", pendingTransactions: [], deletionMetadata: { maxDeleteTxOrderTs: 0, deleteRevision: 0 } },
 			nextCursor: null,
 		});
-		await child.enter(async ({ target, storage }) => {
+		await child.enter(async ({ target, sharding }) => {
 			const rec = target.importRecord()!;
-			storage.kv.put(REPARTITION_KV_KEYS.IMPORT, {
+			sharding.putImport({
 				...rec,
 				cursor: { phase: "host", inner: { stream: "items", cursor: null } },
 				nextAttemptAt: 0,
@@ -513,10 +512,10 @@ describe("Repartition — the migration protocol", () => {
 			expect(rec.attempts).toBe(1);
 			expect(rec.nextAttemptAt).toBe(T0 + 10_000);
 		});
-		await child.enter(async ({ target, storage }) => {
+		await child.enter(async ({ target, sharding }) => {
 			// A second attempt keeps the same flat interval rather than doubling it.
 			const rec = target.importRecord()!;
-			storage.kv.put(REPARTITION_KV_KEYS.IMPORT, { ...rec, nextAttemptAt: 0 });
+			sharding.putImport({ ...rec, nextAttemptAt: 0 });
 			expect(await target.importOnePage(T0 + 20_000)).toBe("stopped");
 			expect(target.importRecord()!.nextAttemptAt).toBe(T0 + 20_000 + 10_000);
 		});
@@ -585,17 +584,17 @@ describe("Repartition — promotions", () => {
 		});
 		await rangeRoot.enter(async ({ target }) => void (await target.sendAck()));
 
-		await root.enter(({ source, store }) => {
-			expect(store.getRepartition("r1")!.state).toBe("completed");
+		await root.enter(({ source, store, sharding }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			// The batch is smaller than the key, so cleanup takes more than one step. An unfinished step
 			// puts the row five seconds out rather than spinning on the rows it has not reached yet.
 			expect(source.sourceCleanupStep(T0)).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("completed");
-			expect(store.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
 			expect(source.sourceCleanupStep(T0)).toBe("idle");
 
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
-			expect(store.getRepartition("r1")!.state).toBe("cleaned");
+			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			// Only the promoted key went back; every other key this partition owns stayed.
 			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 		});
@@ -607,12 +606,12 @@ describe("Repartition — promotions", () => {
 		const promoted = keyForChild(0, c.base.topology.hashSplitN, "p");
 		const plain = keyForChild(0, c.base.topology.hashSplitN, "q");
 
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, store, sharding }) => {
 			putItem(store, promoted, "s1");
 			putItem(store, plain, "s1");
 			// A promotion that finished long ago, with its source rows already reclaimed.
 			source.queue({ kind: "key_promotion", hashKey: kb(promoted) });
-			store.setRepartitionState("r1", "cleaned", { cutoverAt: 1, completedAt: 2 });
+			sharding.setRepartitionState("r1", "cleaned", { cutoverAt: 1, completedAt: 2 });
 			store.deleteItemsBatchForHashKey(kb(promoted), 100);
 			source.queue({ kind: "hash_split" });
 		});
@@ -620,14 +619,14 @@ describe("Repartition — promotions", () => {
 		const child = await firstChild(c, root);
 		await drainImport(child);
 
-		await child.enter(({ store }) => {
+		await child.enter(({ store, sharding }) => {
 			// The forward pointer came across as a finished promotion with an initialized, acknowledged
 			// target, so routing, status and destroy traversal all see the link.
-			const override = store.routeOverrideFor(kb(promoted))!;
+			const override = sharding.routeOverrideFor(kb(promoted))!;
 			expect(override.state).toBe("cleaned");
-			const inherited = store.getRepartition(override.repartitionId)!;
+			const inherited = sharding.getRepartition(override.repartitionId)!;
 			expect(inherited).toMatchObject({ kind: "key_promotion", state: "cleaned" });
-			expect(store.listRepartitionTargets(inherited.id, "key_promotion")[0]).toMatchObject({
+			expect(sharding.listRepartitionTargets(inherited.id, "key_promotion")[0]).toMatchObject({
 				initialization: "initialized",
 				startNotified: true,
 				acknowledged: true,
@@ -644,20 +643,20 @@ describe("Repartition — promotions", () => {
 		const mine = keyForChild(0, c.base.topology.hashSplitN, "m");
 		const sibling = keyForChild(1, c.base.topology.hashSplitN, "s");
 
-		await root.enter(({ source, store }) => {
+		await root.enter(({ source, sharding }) => {
 			source.queue({ kind: "key_promotion", hashKey: kb(mine) });
-			store.setRepartitionState("r1", "cleaned");
+			sharding.setRepartitionState("r1", "cleaned");
 			source.queue({ kind: "key_promotion", hashKey: kb(sibling) });
-			store.setRepartitionState("r2", "cleaned");
+			sharding.setRepartitionState("r2", "cleaned");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
 		const child = await firstChild(c, root);
 		await drainImport(child);
 
-		await child.enter(({ store }) => {
-			expect(store.hasRouteOverride(kb(mine))).toBe(true);
-			expect(store.hasRouteOverride(kb(sibling))).toBe(false);
+		await child.enter(({ sharding }) => {
+			expect(sharding.hasRouteOverride(kb(mine))).toBe(true);
+			expect(sharding.hasRouteOverride(kb(sibling))).toBe(false);
 		});
 	});
 });
@@ -734,23 +733,23 @@ async function cutOver(node: Node, request?: QueueRequest, now = T0): Promise<vo
 	if (request) await node.enter(({ source }) => void source.queue(request, now));
 	for (let i = 0; i < 20; i++) {
 		const at = now + i * 30_000;
-		const state = await node.enter(({ store }) => {
-			const id = activeRepartitionId(store);
+		const state = await node.enter(({ store, sharding }) => {
+			const id = activeRepartitionId(sharding);
 			if (!id) return "none";
-			const row = store.getRepartition(id)!;
-			const counts = store.countRepartitionTargets(id);
+			const row = sharding.getRepartition(id)!;
+			const counts = sharding.countRepartitionTargets(id);
 			return row.state === "cutover" && counts.total > 0 && counts.startNotified === counts.total ? "done" : "pending";
 		});
 		if (state === "done") return;
 		await node.enter(async ({ source }) => void (await source.sourceStep(at)));
 	}
-	const rows = await node.enter(({ store }) => store.queryRepartitionStatusPage(null, 50));
+	const rows = await node.enter(({ sharding }) => sharding.queryRepartitionStatusPage(null, 50));
 	throw new Error(`${node.doName}: the source did not reach cutover; ${JSON.stringify(rows)}`);
 }
 
 /** The one repartition this source is still working on, if any. */
-function activeRepartitionId(store: PartitionStore): string | undefined {
-	for (const row of store.queryRepartitionStatusPage(null, 500)) {
+function activeRepartitionId(sharding: FokosShardingStore): string | undefined {
+	for (const row of sharding.queryRepartitionStatusPage(null, 500)) {
 		if (row.state === "queued" || row.state === "planned" || row.state === "cutover") return row.id;
 	}
 	return undefined;
@@ -782,18 +781,18 @@ async function firstChild(c: ReturnType<typeof makeCluster>, source: Node): Prom
 
 /** The target at `index` of this source's split, as a node. */
 async function targetNode(c: ReturnType<typeof makeCluster>, source: Node, index: number): Promise<Node> {
-	const row = await source.enter(({ store }) => {
-		const split = store.getSplitRepartition()!;
-		return store.listRepartitionTargets(split.id, split.kind)[index];
+	const row = await source.enter(({ sharding }) => {
+		const split = sharding.getSplitRepartition()!;
+		return sharding.listRepartitionTargets(split.id, split.kind)[index];
 	});
 	return c.node({ ...c.base, doName: row.doName, partitionId: row.partitionId });
 }
 
 /** The request the source would send, rebuilt from its own rows. */
 async function initRequestFor(source: Node, target: Node) {
-	return await source.enter(({ store, source: src, ctx }) => {
-		const split = store.getSplitRepartition()!;
-		const row = store.listRepartitionTargets(split.id, split.kind).find((t) => t.doName === target.doName)!;
+	return await source.enter(({ source: src, ctx, sharding }) => {
+		const split = sharding.getSplitRepartition()!;
+		const row = sharding.listRepartitionTargets(split.id, split.kind).find((t) => t.doName === target.doName)!;
 		return { repartitionId: split.id, source: ctx, target: target.ctx, slice: src.materializeSlice(row.slice) };
 	});
 }

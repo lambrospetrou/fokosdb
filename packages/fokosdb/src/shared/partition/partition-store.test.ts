@@ -12,12 +12,9 @@ import {
 	PartitionStore,
 	queryScanStatement,
 	type ItemLinkId,
-	type RepartitionKind,
-	type RepartitionState,
 	type ScanCursor,
 	type SqlMetrics,
 	type StoredItem,
-	type TargetInitialization,
 } from "./partition-store.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
@@ -944,7 +941,6 @@ describe("PartitionStore - TTL deletion", () => {
 						      WHERE i.ttl_epoch_utc_seconds IS NOT NULL
 						        AND i.ttl_epoch_utc_seconds <= ?1
 						        AND NOT EXISTS (SELECT 1 FROM pending_transactions p WHERE p.hk = i.hk AND p.sk = i.sk)
-						        AND NOT EXISTS (SELECT 1 FROM fokos_route_overrides o WHERE o.hash_key = i.hk)
 						      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
 						      LIMIT ?2
 						 )
@@ -960,8 +956,7 @@ describe("PartitionStore - TTL deletion", () => {
 				expect(details).toContain("LIST SUBQUERY");
 				expect(details).toContain("SEARCH i USING COVERING INDEX idx_items_ttl");
 				expect(details).toMatch(/SEARCH p USING COVERING INDEX sqlite_autoindex_pending_transactions_1/);
-				expect(details).toMatch(/SEARCH o USING PRIMARY KEY/);
-				expect(details).not.toMatch(/SCAN (?:p|o)|USE TEMP B-TREE FOR ORDER BY/);
+				expect(details).not.toMatch(/SCAN p|USE TEMP B-TREE FOR ORDER BY/);
 			}
 		});
 	});
@@ -970,9 +965,6 @@ describe("PartitionStore - TTL deletion", () => {
 		await withStore((store, state) => {
 			const oldBytes = put(store, "a", "old", 10, "a");
 			const lockedBytes = put(store, "locked", "s", 11, "locked");
-			const queuedBytes = put(store, "queued", "s", 12, "queued");
-			const promotingBytes = put(store, "promoting", "s", 13, "promoting");
-			const promotedBytes = put(store, "promoted", "s", 14, "promoted");
 			const secondBytes = put(store, "b", "s", 20, "bb");
 			const nextBytes = put(store, "a", "next", 30, "ccc");
 			const exactBytes = put(store, "c", "exact", 100, "dddd");
@@ -993,37 +985,6 @@ describe("PartitionStore - TTL deletion", () => {
 				created_at: 1,
 				guarded_at: null,
 			});
-			// An override at any lifecycle stage takes the key out of the sweep: the range tree owns it.
-			store.insertRepartition({
-				id: "r1",
-				seq: 1,
-				kind: "key_promotion",
-				state: "queued",
-				hashKey: kb("queued"),
-				queuedAt: 1,
-				nextAttemptAt: 1,
-			});
-			store.insertRepartition({
-				id: "r2",
-				seq: 2,
-				kind: "key_promotion",
-				state: "cutover",
-				hashKey: kb("promoting"),
-				queuedAt: 1,
-				nextAttemptAt: 1,
-			});
-			store.insertRepartition({
-				id: "r3",
-				seq: 3,
-				kind: "key_promotion",
-				state: "completed",
-				hashKey: kb("promoted"),
-				queuedAt: 1,
-				nextAttemptAt: 1,
-			});
-			store.insertRouteOverride(kb("queued"), "r1");
-			store.insertRouteOverride(kb("promoting"), "r2");
-			store.insertRouteOverride(kb("promoted"), "r3");
 
 			const first = store.deleteExpiredItems(100, 2);
 			expect(first).toEqual({ deletedRows: 2, deletedBytes: oldBytes + secondBytes });
@@ -1046,15 +1007,8 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(kseBytes(state, "c")).toBe(0);
 			expect(store.getMaxDeleteTxOrderTs()).toBe(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 
-			for (const [hk, bytes] of [
-				["locked", lockedBytes],
-				["queued", queuedBytes],
-				["promoting", promotingBytes],
-				["promoted", promotedBytes],
-			] as const) {
-				expect(store.getItem(kb(hk), kb("s")).row).toBeDefined();
-				expect(kseBytes(state, hk)).toBe(bytes);
-			}
+			expect(store.getItem(kb("locked"), kb("s")).row).toBeDefined();
+			expect(kseBytes(state, "locked")).toBe(lockedBytes);
 			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
 			expect(store.deleteExpiredItems(100, 2)).toEqual({ deletedRows: 0, deletedBytes: 0 });
@@ -1524,93 +1478,6 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toBeNull();
-		});
-	});
-});
-
-describe("PartitionStore - findDeepestKnownRangeSlice", () => {
-	const UNBOUNDED = KeyCodec.encodeOptional(undefined);
-
-	// A single hash key's learned range tree:
-	//   depth 1: [-∞,"m") , ["m",+∞)
-	//   depth 2 (within ["m",+∞)): ["m","t") , ["t",+∞)
-	function seedTree(store: PartitionStore, hk = kb("h")) {
-		store.insertRangePartitionBoundary(hk, UNBOUNDED, kb("m"), 1);
-		store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
-		store.insertRangePartitionBoundary(hk, kb("m"), kb("t"), 2);
-		store.insertRangePartitionBoundary(hk, kb("t"), UNBOUNDED, 2);
-	}
-
-	it("returns null when nothing is stored", async () => {
-		await withStore((store) => {
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toBeNull();
-		});
-	});
-
-	it("returns the deepest slice containing the key", async () => {
-		await withStore((store) => {
-			seedTree(store);
-			// "p" is in ["m","t") at depth 2, a strict sub-slice of ["m",+∞) at depth 1.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("p"))).toEqual({
-				depth: 2,
-				startBoundary: kb("m"),
-				endBoundary: kb("t"),
-			});
-		});
-	});
-
-	it("selects an unbounded-end slice via the empty sentinel (decoded to null)", async () => {
-		await withStore((store) => {
-			seedTree(store);
-			// "z" is in ["t",+∞) at depth 2 — only matched because the end sentinel is treated as +∞.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("z"))).toEqual({
-				depth: 2,
-				startBoundary: kb("t"),
-				endBoundary: null,
-			});
-		});
-	});
-
-	it("selects an unbounded-start slice (decoded to null)", async () => {
-		await withStore((store) => {
-			seedTree(store);
-			// "a" only falls in [-∞,"m") at depth 1.
-			expect(store.findDeepestKnownRangeSlice(kb("h"), kb("a"))).toEqual({
-				depth: 1,
-				startBoundary: null,
-				endBoundary: kb("m"),
-			});
-		});
-	});
-
-	it("falls back to a shallower covering slice when the deeper slice lies to the side of the key", async () => {
-		await withStore((store) => {
-			const hk = kb("h");
-			// Only a depth-1 ["m",+∞) and a depth-2 ["t",+∞) are known; nothing at depth 2 covers ["m","t").
-			store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
-			store.insertRangePartitionBoundary(hk, kb("t"), UNBOUNDED, 2);
-			// "p" is left of "t", so the depth-2 slice does not contain it — fall back to depth 1.
-			expect(store.findDeepestKnownRangeSlice(hk, kb("p"))).toEqual({
-				depth: 1,
-				startBoundary: kb("m"),
-				endBoundary: null,
-			});
-		});
-	});
-
-	it("returns null when no stored slice covers the key", async () => {
-		await withStore((store) => {
-			const hk = kb("h");
-			// Only the right half is known; "a" is left of every stored start.
-			store.insertRangePartitionBoundary(hk, kb("m"), UNBOUNDED, 1);
-			expect(store.findDeepestKnownRangeSlice(hk, kb("a"))).toBeNull();
-		});
-	});
-
-	it("isolates by hash key", async () => {
-		await withStore((store) => {
-			seedTree(store, kb("h"));
-			expect(store.findDeepestKnownRangeSlice(kb("other"), kb("p"))).toBeNull();
 		});
 	});
 });

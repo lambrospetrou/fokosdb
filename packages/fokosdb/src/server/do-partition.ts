@@ -21,8 +21,6 @@ import type {
 	TransactionItem,
 } from "../shared/transaction-wire-types.js";
 import {
-	FOKOS_IDENTITY_KV_KEY,
-	FOKOS_POLICY_KV_KEY,
 	isHashPartition,
 	isRangePartition,
 	refOf,
@@ -51,22 +49,18 @@ import {
 } from "../sharding/split-policy.js";
 import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "../sharding/types.js";
 import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
-import { tryWhile } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
-import { collectBatch } from "../sharding/batch-scan.js";
 import type { CompiledProjectionPlan, CompiledQueryPlan } from "../shared/expression/plan.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import {
 	estimateItemBytes,
-	estimatePendingTxBytes,
 	estimateProjectedRowBytes,
 	PartitionStore,
 	type StoredItem,
 	type ScanCursor,
 	type PromotedKeyStatus,
-	type RepartitionState,
-	type RepartitionTargetRow,
 } from "../shared/partition/partition-store.js";
+import { FokosShardingStore, type RepartitionState, type RepartitionTargetRow } from "../sharding/sharding-store.js";
 import { TransactionParticipant } from "../shared/partition/transaction-participant.js";
 import type { PromotionCandidate } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
@@ -75,7 +69,6 @@ import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js"
 import {
 	RepartitionSource,
 	RepartitionTarget,
-	REPARTITION_KV_KEYS,
 	type RepartitionCommonDeps,
 	type RepartitionSourceDeps,
 	type RepartitionTargetDeps,
@@ -94,7 +87,7 @@ import type {
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
 import { AddResult } from "../sharding/bloom-filter.js";
-import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "../sharding/partial-range-topology.js";
+import { PartialRangeTopology } from "../sharding/partial-range-topology.js";
 import {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -284,10 +277,6 @@ export type DebugForcePromoteKeyResponse = {
 };
 
 export class PartitionDO extends DurableObject implements PartitionAPI, FokosPartitionStatusRpc {
-	private static readonly KV_KEYS = {
-		PARTIAL_RANGE_TOPOLOGY: "__partial_range_topology",
-	};
-
 	private static readonly STALE_TX_MS = 5_000;
 	private static readonly MIGRATION_FALLBACK_ALARM_MS = 10_000;
 	private static readonly SPLIT_FALLBACK_ALARM_MS = 5_000;
@@ -301,6 +290,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	private readonly STRING_PCTX_INIT_ERROR = `fokos/partition: partition context not initialized for ${this.ctx.id.toString()}[${this.ctx.id.name}]`;
 
 	#store: PartitionStore;
+	/** The `fokos_` tables and the `__fokos/` keys. Only the sharding code and this class reach them, through this store. */
+	#sharding: FokosShardingStore;
 	#participant: TransactionParticipant;
 	#source: RepartitionSource;
 	#target: RepartitionTarget;
@@ -331,10 +322,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
+		this.#sharding = new FokosShardingStore(ctx.storage);
 		this.#participant = new TransactionParticipant({ store: this.#store });
 		const repartitionDeps = this.repartitionDeps();
-		this.#source = new RepartitionSource(this.#store, ctx.storage, repartitionDeps);
-		this.#target = new RepartitionTarget(this.#store, ctx.storage, repartitionDeps);
+		this.#source = new RepartitionSource(this.#sharding, repartitionDeps);
+		this.#target = new RepartitionTarget(this.#sharding, repartitionDeps);
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
 			canSweep: () => this.ttlCanSweep(),
@@ -342,15 +334,17 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			config: () => this.fokosTtlConfig(),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
+			// The sharding store migrates first, before the host runs its own migrations.
+			this.#sharding.runMigrations();
 			this.#store.runMigrations();
 
 			// Load the identity and the policy from storage. Only this class writes them.
-			const identity = ctx.storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY);
-			const stored = ctx.storage.kv.get<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY);
+			const identity = this.#sharding.getIdentity();
+			const stored = this.#sharding.getPolicy<FokosDbPolicy>();
 			if (identity && stored) {
 				this.setIdentity(identity, stored);
 
-				const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
+				const prtSnap = this.#sharding.getPromotionBloom();
 				if (prtSnap) {
 					this.#_partialRangeTopology = PartialRangeTopology.fromSnapshot(prtSnap);
 				}
@@ -411,7 +405,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	async #fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		this.#store.transactionSync(() => {
 			if (req.rootContext) this.ensurePartitionContext(req.rootContext as FokosDbRouteContext);
-			this.ctx.storage.kv.put<boolean>(REPARTITION_KV_KEYS.DESTROYING, true);
+			this.#sharding.setDestroying();
 		});
 		// A failed pass is a stopped pass, and the fence is already durable. Its error must not fail the
 		// destroy that deletes this partition whole.
@@ -455,7 +449,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const common: RepartitionCommonDeps = {
 			// Boundary rule: only DO classes and FokosDB hold stubs.
 			getPeer: (ref) => partitionStubByName(this.env, this.pCtx(), ref.doName),
-			host: new FokosMigrationHost({ store: this.#store, hashSplitN: () => this.pCtx().topology.hashSplitN }),
+			host: new FokosMigrationHost({ store: this.#store }),
 			identity: () => ({ ctx: this.pCtx(), identity: this.identity() }),
 			// Forced, because the flow calls this when work has just become due: a queued repartition, an
 			// acknowledgement that completed one, or a start notification. The scheduler drops an unforced
@@ -576,7 +570,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		return {
 			depth: this.depth(),
 			partitionContext: pCtx,
-			identityStored: this.ctx.storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY),
+			identityStored: this.#sharding.getIdentity(),
 			splitStatus: pCtx ? this.derivedSplitStatus(pCtx) : undefined,
 			migrationStatus: derivedMigrationStatus(importRecord?.state),
 			parentPartitionContext: importRecord?.source,
@@ -623,7 +617,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			for (const entry of page.entries) {
 				if (entry.repartition.kind !== "key_promotion") continue;
 				if (entry.target !== null && entry.target.index !== 0) continue;
-				const row = this.#store.getRepartition(entry.repartition.id);
+				const row = this.#sharding.getRepartition(entry.repartition.id);
 				if (!row?.hashKey) continue;
 				out.push({ hashKey: row.hashKey, status: promotedKeyStatusOf(entry.repartition.state) });
 			}
@@ -1690,8 +1684,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			validateRangeConfig(pCtx.rangeConfig);
 			const identity = partitionIdentityFrom(pCtx, init);
 			const stored: FokosStoredPolicy<FokosDbPolicy> = { rangeConfig: pCtx.rangeConfig, policy: pCtx.policy };
-			this.ctx.storage.kv.put<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY, identity);
-			this.ctx.storage.kv.put<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY, stored);
+			this.#sharding.putIdentity(identity);
+			this.#sharding.putPolicy(stored);
 			this.setIdentity(identity, stored);
 			return this.pCtx();
 		}
@@ -1714,7 +1708,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		}
 		validateRangeConfig(pCtx.rangeConfig);
 		const next: FokosStoredPolicy<FokosDbPolicy> = { rangeConfig: pCtx.rangeConfig, policy: pCtx.policy };
-		this.ctx.storage.kv.put<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY, next);
+		this.#sharding.putPolicy(next);
 		this.setIdentity(identity, next);
 		return this.pCtx();
 	}
@@ -1728,8 +1722,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	private ensureTopology(pCtx: FokosDbRouteContext): PartitionTopologySplitter {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
-				? new RangePartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#store, this.#source)
-				: new HashPartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#store, this.#source);
+				? new RangePartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#sharding, this.#source)
+				: new HashPartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#sharding, this.#source);
 		}
 		return this.#_topology;
 	}
@@ -1769,7 +1763,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		// further. Multi-item paths that lack a single sortKey pass undefined and stay on the root.
 		let toCtx: FokosDbRouteContext | null = null;
 		if (sortKey !== undefined) {
-			const learned = this.#store.findDeepestKnownRangeSlice(hashKey, sortKey);
+			const learned = this.#sharding.findDeepestKnownRangeSlice(hashKey, sortKey);
 			if (learned && (learned.startBoundary !== null || learned.endBoundary !== null)) {
 				toCtx = resolveRangePartitionContext(ctx, hashKey, learned.startBoundary, learned.endBoundary);
 			}
@@ -2205,14 +2199,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * the signal. One indexed seek gates it, so an ordinary transaction pays nothing.
 	 */
 	private wakeLockBlockedPromotion(): void {
-		if (!this.#store.hasUnfinishedPromotion()) return;
+		if (!this.#sharding.hasUnfinishedPromotion()) return;
 		this.#source.onLockReleased();
 		this.scheduleBackgroundWork({ delayMs: 10, forceSchedule: true });
 	}
 
 	/** True after `fokosPrepareDestroy` fences this partition. Every transition must then stop. */
 	private isDestroying(): boolean {
-		return this.ctx.storage.kv.get<boolean>(REPARTITION_KV_KEYS.DESTROYING) === true;
+		return this.#sharding.isDestroying();
 	}
 
 	private logJobFailure(job: string, error: unknown): void {
@@ -2314,10 +2308,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 
 	private persistPartialRangeTopology(): void {
 		if (this.#_partialRangeTopology) {
-			this.ctx.storage.kv.put<PartialRangeTopologySnapshot>(
-				PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY,
-				this.#_partialRangeTopology.toSnapshot(),
-			);
+			this.#sharding.putPromotionBloom(this.#_partialRangeTopology.toSnapshot());
 		}
 	}
 

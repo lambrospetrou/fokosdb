@@ -10,7 +10,7 @@ import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { REPARTITION_KV_KEYS } from "../../src/sharding/repartition-flow.js";
+import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
 
@@ -76,11 +76,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 		}));
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const store = new PartitionStore(state.storage);
+			const sharding = new FokosShardingStore(state.storage);
 			const now = Date.now();
-			store.insertRepartition({ id: "r1", seq: 1, kind: "hash_split", state: state_, hashKey: null, queuedAt: now, nextAttemptAt: now });
+			sharding.insertRepartition({ id: "r1", seq: 1, kind: "hash_split", state: state_, hashKey: null, queuedAt: now, nextAttemptAt: now });
 			childPartitionContexts.forEach((child, index) => {
-				store.insertRepartitionTarget({
+				sharding.insertRepartitionTarget({
 					repartitionId: "r1",
 					kind: "hash_split",
 					partitionId: child.partitionId,
@@ -93,7 +93,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 					nextAttemptAt: now,
 				});
 			});
-			insertStalePendingLock(state, transactionId, coordinatorDoId);
+			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -125,8 +125,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
 
 		await runInDurableObject(childStub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const record = state.storage.kv.get<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT)!;
-			state.storage.kv.put<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT, { ...record, state: importState });
+			const record = state.storage.kv.get<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT)!;
+			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: importState });
 			// This test cannot reach the source, so it stubs the import step out. The case is about
 			// recovery staying away, and not about how far the import gets.
 			vi.spyOn(instance as unknown as { runBackgroundWork(): Promise<void> }, "runBackgroundWork");
@@ -136,7 +136,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 			expect(recoverTransaction).not.toHaveBeenCalled();
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
-			state.storage.kv.put<FokosImportRecord>(REPARTITION_KV_KEYS.IMPORT, { ...record, state: "active" });
+			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: "active" });
 			store.deletePendingTx(transactionId);
 			await state.storage.deleteAlarm();
 		});

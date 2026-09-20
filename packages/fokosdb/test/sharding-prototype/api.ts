@@ -8,7 +8,7 @@
  */
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import type { RangeAncestorInfo } from "../../src/sharding/types.js";
-import type { RepartitionKind, RepartitionState } from "../../src/shared/partition/partition-store.js";
+import type { RepartitionKind, RepartitionState } from "../../src/sharding/sharding-store.js";
 import type { FokosSlice } from "../../src/sharding/repartition-slice.js";
 import type { SkInterval } from "../../src/sharding/sk-interval.js";
 
