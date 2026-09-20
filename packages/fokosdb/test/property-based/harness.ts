@@ -39,8 +39,8 @@ import { FokosTransactionCancelledError } from "../../src/shared/errors-operatio
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator } from "../../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
+import { PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { FokosRouter } from "../../src/sharding/router.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
@@ -85,7 +85,7 @@ export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number; rangeSplitMaxSi
 		hashSplitConditions: { maxSizeMb: opts?.hashSplitMaxSizeMb ?? 500 },
 		rangeSplitConditions: { maxSizeMb: opts?.rangeSplitMaxSizeMb ?? 500 },
 	});
-	return new FokosDB({ topology: new PartitionTopologyRouterImpl(base) });
+	return new FokosDB({ topology: new FokosRouter(base.topology, base.rangeConfig, base.policy) });
 }
 
 // ─── The keys and the payloads ────────────────────────────────────────────────

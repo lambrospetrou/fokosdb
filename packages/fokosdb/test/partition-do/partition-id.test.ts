@@ -1,10 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
-import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import { partitionIdentityFrom, PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { HashPartitionTopologyImpl } from "../../src/sharding/split-policy.js";
-import invariant from "../../src/shared/invariant.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { sliceIncludesHashKey } from "../../src/sharding/repartition-slice.js";
 import { kb, makeStub } from "./helpers.js";
@@ -22,7 +21,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		const children = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
 		for (let i = 0; i < children.length; i++) {
 			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
-			expect(children[i].doName).toBe(`${ctx.tableName}.h.0.${i}`);
+			expect(children[i].doName).toBe(`${ctx.topology.shardGroup}.h.0.${i}`);
 		}
 	});
 
@@ -34,73 +33,75 @@ describe("PartitionDO - partitionId encoding", () => {
 			hashSplitN: 4,
 			hashSplitConditions: { maxSizeMb: 100 },
 		});
-		let topology: HashPartitionTopologyImpl;
-		await runInDurableObject(stub, async (instance: PartitionDO, ctx: DurableObjectState) => {
-			topology = new HashPartitionTopologyImpl(pCtx, ctx, new PartitionStore(ctx.storage), {
-				// Routing only. This test never makes the partition a router and gives it no override.
-				routerRole: () => false,
-				splitTargets: () => [],
-				overrideFor: () => undefined,
-				ownedByRangeTree: () => false,
-			});
-		});
-		invariant(topology!, "topology should be initialized in the DO instance");
+		// Routing only. This test never makes the partition a router and gives it no override.
+		const notRepartitioning = {
+			routerRole: () => false,
+			splitTargets: () => [],
+			overrideFor: () => undefined,
+			ownedByRangeTree: () => false,
+		};
 		const hashKey = "routing-consistency-key";
+		// The topology reads its storage, so both picks run inside the Durable Object that owns it.
+		const { child, grandchild } = await runInDurableObject(stub, async (_instance: PartitionDO, ctx: DurableObjectState) => {
+			const store = new PartitionStore(ctx.storage);
+			const topologyOf = (owner: FokosDbRouteContext) =>
+				new HashPartitionTopologyImpl(owner, partitionIdentityFrom(owner), ctx, store, notRepartitioning);
+			const child = topologyOf(pCtx).pickChildPartition(pCtx, kb(hashKey));
+			return { child, grandchild: topologyOf(child).pickChildPartition(child, kb(hashKey)) };
+		});
 
 		// Depth 0 → 1: pickChildPartition must select exactly the sibling that makeIsCorrectChildHashPartition identifies.
-		const { partitionContext: child } = topology.pickChildPartition(pCtx, kb(hashKey));
 		const level1Siblings = PartitionIdHelper.calculateHashChildPartitionIds(pCtx);
 		for (const sib of level1Siblings) {
-			const sibCtx: PartitionContextResolved = {
-				...pCtx,
-				doName: sib.doName,
-				partitionId: sib.partitionIdOpaque,
-				primaryDoIdStr: "",
-			};
+			const sibCtx: FokosDbRouteContext = { ...pCtx, doName: sib.doName, partitionId: sib.partitionIdOpaque };
 			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
 			const slice = {
 				kind: "hash_child" as const,
 				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
 				depth: sliceDepth,
 			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), pCtx.hashSplitN)).toBe(sib.doName === child.doName);
+			expect(sliceIncludesHashKey(slice, kb(hashKey), pCtx.topology.hashSplitN)).toBe(sib.doName === child.doName);
 		}
 
 		// Depth 1 → 2: same invariant one level deeper.
-		const { partitionContext: grandchild } = topology.pickChildPartition(child, kb(hashKey));
 		const level2Siblings = PartitionIdHelper.calculateHashChildPartitionIds(child);
 		for (const sib of level2Siblings) {
-			const sibCtx: PartitionContextResolved = {
-				...child,
-				doName: sib.doName,
-				partitionId: sib.partitionIdOpaque,
-				primaryDoIdStr: "",
-			};
+			const sibCtx: FokosDbRouteContext = { ...child, doName: sib.doName, partitionId: sib.partitionIdOpaque };
 			const sliceDepth = PartitionIdHelper.depth(Uint8Array.fromHex(sibCtx.partitionId));
 			const slice = {
 				kind: "hash_child" as const,
 				childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(sibCtx.partitionId)),
 				depth: sliceDepth,
 			};
-			expect(sliceIncludesHashKey(slice, kb(hashKey), child.hashSplitN)).toBe(sib.doName === grandchild.doName);
+			expect(sliceIncludesHashKey(slice, kb(hashKey), child.topology.hashSplitN)).toBe(sib.doName === grandchild.doName);
 		}
 	});
 
-	it("caches _partitionIdBytes in the DO's stored partition context for root and children", async ({ expect }) => {
+	it("stores the decoded hash identity of the root and of every child", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		// After the first request, ensurePartitionContext stores the context with _partitionIdBytes populated.
+		// The first request bootstraps the root: it stores the identity its route context decodes to.
 		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
 		const rootState = await partition.status();
-		expect(rootState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-		expect(rootState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(partition.ctx.partitionId));
+		expect(rootState.identityStored).toEqual({
+			schema: 1,
+			ref: { partitionId: partition.ctx.partitionId, doName: partition.ctx.doName },
+			kind: "hash",
+			hash: { rootIndex: 0, path: [] },
+			topology: partition.ctx.topology,
+		});
 
-		// Split so children are initialized with their own cached bytes. splitHash drains the whole
-		// tree, rather than only the parent's alarm, so no child is still migrating when this file
-		// ends: background migration work that outlives the test worker breaks its teardown.
-		for (const child of await partition.splitHash()) {
-			const childState = await child.status();
-			expect(childState.partitionContext?._partitionIdBytes).toBeInstanceOf(Uint8Array);
-			expect(childState.partitionContext?._partitionIdBytes).toEqual(Uint8Array.fromHex(child.ctx.partitionId));
+		// Split so children are initialized through fokosInit. splitHash drains the whole tree, rather
+		// than only the parent's alarm, so no child is still migrating when this file ends: background
+		// migration work that outlives the test worker breaks its teardown.
+		const children = await partition.splitHash();
+		for (let i = 0; i < children.length; i++) {
+			const childState = await children[i].status();
+			expect(childState.identityStored).toMatchObject({
+				kind: "hash",
+				hash: { rootIndex: 0, path: [i] },
+				ref: { doName: children[i].doName },
+			});
+			expect(childState.depth).toBe(1);
 		}
 	});
 });

@@ -7,7 +7,7 @@ import {
 	FokosError,
 	FokosTransactionCancelledError,
 	PartitionContextCreator,
-	PartitionTopologyRouterImpl,
+	FokosRouter,
 	type ConditionExpression,
 	type ExpressionReference,
 	type ExpressionValue,
@@ -232,7 +232,7 @@ const DEFAULT_PARTITION_OPTIONS = {
 type PartitionOptionsInput = v.InferOutput<typeof PartitionOptionsSchema>;
 
 function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOptionsInput): FokosDB {
-	const partitionContext = PartitionContextCreator.create({
+	const table = PartitionContextCreator.create({
 		ns: "CUSTOM_PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName,
@@ -242,9 +242,8 @@ function makeFokosDB(env: Env, tableName: string, partitionOptions?: PartitionOp
 		hashSplitConditions: partitionOptions?.hashSplitConditions ?? DEFAULT_PARTITION_OPTIONS.hashSplitConditions,
 		rangeSplitConditions: partitionOptions?.rangeSplitConditions ?? DEFAULT_PARTITION_OPTIONS.rangeSplitConditions,
 	});
-	const topology = new PartitionTopologyRouterImpl(partitionContext);
 	return new FokosDB({
-		topology,
+		topology: new FokosRouter(table.topology, table.rangeConfig, table.policy),
 	});
 }
 

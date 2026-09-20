@@ -6,7 +6,7 @@
 import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
-import type { PartitionContextResolved } from "../sharding/partition-context.js";
+import type { FokosDbRouteContext } from "./partition-context.js";
 import type { IdempotencyToken, RejectionReasonOf, TransactionId } from "./transaction-api-types.js";
 import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 
@@ -276,7 +276,7 @@ export type TCWriteOperation = {
 	update?: CompiledUpdatePlan;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 	/** Resolved partition context for the PartitionDO that owns this key. */
-	partitionContext: PartitionContextResolved;
+	partitionContext: FokosDbRouteContext;
 };
 
 export type InitiateWriteRequest = {
@@ -302,7 +302,7 @@ export type InitiateWriteResponseEncoded =
 // Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).
 export type TCReadItem = TransactionReadItem & {
 	/** Resolved partition context for the PartitionDO that owns this key. */
-	partitionContext: PartitionContextResolved;
+	partitionContext: FokosDbRouteContext;
 };
 
 export type InitiateReadRequest = {

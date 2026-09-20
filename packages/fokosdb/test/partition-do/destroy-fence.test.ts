@@ -9,13 +9,14 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import { FOKOS_IDENTITY_KV_KEY } from "../../src/sharding/route-context.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition, TestPartition } from "./partition-harness.js";
 
 /** Every entry of every page, so a test reads the whole view the traversal would walk. */
-async function allStatusEntries(partition: TestPartition, rootContext?: PartitionContextResolved) {
+async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbRouteContext) {
 	const entries = [];
 	let cursor = null;
 	do {
@@ -33,7 +34,7 @@ describe("PartitionDO — fokosStatus", () => {
 		const page = await stub.fokosStatus({ cursor: null, rootContext: ctx });
 
 		expect(page).toMatchObject({ initialized: true, destroying: false, importState: null, entries: [], nextCursor: null });
-		expect(page.partitionContext?.doName).toBe(ctx.doName);
+		expect(page.ref).toEqual({ partitionId: ctx.partitionId, doName: ctx.doName });
 	});
 
 	it("reports an uninitialized target as a leaf and does not bring it to life", async ({ expect }) => {
@@ -46,14 +47,14 @@ describe("PartitionDO — fokosStatus", () => {
 		expect(page).toEqual({
 			initialized: false,
 			destroying: false,
-			partitionContext: null,
+			ref: null,
 			importState: null,
 			entries: [],
 			nextCursor: null,
 		});
 		// A target request carries no context, so the partition must still have none of its own.
 		await runInDurableObject(stub, (_i: PartitionDO, state: DurableObjectState) => {
-			expect(state.storage.kv.get("__partition_context")).toBeUndefined();
+			expect(state.storage.kv.get(FOKOS_IDENTITY_KV_KEY)).toBeUndefined();
 		});
 		expect(ctx.doName).not.toBe(targetName);
 	});

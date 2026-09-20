@@ -25,9 +25,9 @@ import {
 	SortKey,
 } from "../shared/types.js";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
-import { partitionStub, partitionStubByName, txCoordinatorNamespace } from "../shared/do-stubs.js";
+import { partitionStubByName, txCoordinatorNamespace } from "../shared/do-stubs.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { PartitionTopologyRouter } from "../sharding/router.js";
+import type { FokosRouter } from "../sharding/router.js";
 import type {
 	ExecutionFailureCode,
 	RejectionReason,
@@ -103,8 +103,7 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { PartitionContextResolved } from "../sharding/partition-context.js";
-import type { FokosPartitionRef, FokosStatusCursor, FokosStatusPage } from "../sharding/repartition-types.js";
+import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 const TX_COORDINATOR_DESTROY_BATCH_SIZE = 1_000;
@@ -270,7 +269,8 @@ function validateTtlAt(ttlAt: number | undefined, where: string): void {
 }
 
 export type FokosDBOptions = {
-	topology: PartitionTopologyRouter;
+	/** The router of the table: its topology, range config and policy. */
+	topology: FokosRouter<FokosDbPolicy>;
 
 	/**
 	 * Coordinator pool size. Defaults to two coordinators per root partition. Retries with the same
@@ -307,10 +307,10 @@ export class FokosDB {
 	#staticShardedTCs: StaticShardedDO<TransactionCoordinatorDO>;
 
 	constructor(options: FokosDBOptions) {
-		const partitionContext = options.topology.partitionContext();
+		const { topology, policy } = options.topology;
 		this.#options = {
 			...options,
-			numTxCoordinators: options.numTxCoordinators ?? TX_COORDINATORS_PER_ROOT_TREE * partitionContext.rootTreesN,
+			numTxCoordinators: options.numTxCoordinators ?? TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN,
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
 		if (!Number.isInteger(this.#options.numTxCoordinators) || this.#options.numTxCoordinators <= 0) {
@@ -319,10 +319,10 @@ export class FokosDB {
 				attributes: { numTxCoordinators: this.#options.numTxCoordinators },
 			});
 		}
-		this.#staticShardedTCs = new StaticShardedDO(txCoordinatorNamespace(env, partitionContext), {
+		this.#staticShardedTCs = new StaticShardedDO(txCoordinatorNamespace(env, { topology, policy }), {
 			numShards: this.#options.numTxCoordinators,
-			shardGroupName: `fokos_tc.${partitionContext.tableName}`,
-			...(partitionContext.locationHint === undefined ? {} : { shardLocationHintFn: () => partitionContext.locationHint }),
+			shardGroupName: `fokos_tc.${topology.shardGroup}`,
+			...(policy.locationHint === undefined ? {} : { shardLocationHintFn: () => policy.locationHint }),
 		});
 	}
 
@@ -382,8 +382,8 @@ export class FokosDB {
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
-		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = partitionStub(env, this.#options.topology.partitionContext(), doId);
+		const partitionContext = this.#options.topology.rootContext(hashKey);
+		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
 		const res = await stub.apiPutItem(partitionContext, {
 			hashKey,
 			sortKey,
@@ -404,8 +404,8 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const projection =
 			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
-		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = partitionStub(env, this.#options.topology.partitionContext(), doId);
+		const partitionContext = this.#options.topology.rootContext(hashKey);
+		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
 		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) });
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
@@ -440,8 +440,8 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
-		const { doId, partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
-		const stub = partitionStub(env, this.#options.topology.partitionContext(), doId);
+		const partitionContext = this.#options.topology.rootContext(hashKey);
+		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
 		const res = await stub.apiDeleteItem(partitionContext, {
 			hashKey,
 			sortKey,
@@ -473,7 +473,7 @@ export class FokosDB {
 		const keys = validateTransactWriteOperations(prepared);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
-			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			const partitionContext = this.#options.topology.rootContext(hashKey);
 			return { ...item, opIndex: i, hashKey, sortKey, partitionContext };
 		});
 
@@ -569,7 +569,7 @@ export class FokosDB {
 			const sortKey = encodeSortKey(item.sortKey);
 			const projection =
 				item.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(item.projection!));
-			const { partitionContext } = this.#options.topology.pickPartition(hashKey, sortKey);
+			const partitionContext = this.#options.topology.rootContext(hashKey);
 			return { hashKey, sortKey, partitionContext, ...(projection === undefined ? {} : { projection }) };
 		});
 		validateTransactGetItemKeys(items);
@@ -638,7 +638,7 @@ export class FokosDB {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 
 		// Group items by partition, keeping the context alongside.
-		const partitionMap = new Map<string, { pCtx: PartitionContextResolved; items: TCReadItem[] }>();
+		const partitionMap = new Map<string, { pCtx: FokosDbRouteContext; items: TCReadItem[] }>();
 		for (const item of requestedItems) {
 			const doName = item.partitionContext.doName;
 			let entry = partitionMap.get(doName);
@@ -850,8 +850,8 @@ export class FokosDB {
 					? { hk: startInner.hashKey, sk: startInner.sortKey, inclusive: startInner.inclusive }
 					: null;
 
-			const { doId, partitionContext } = this.#options.topology.pickPartition(query.hashKey, KeyCodec.encodeOptional(undefined));
-			const stub = partitionStub(env, this.#options.topology.partitionContext(), doId);
+			const partitionContext = this.#options.topology.rootContext(query.hashKey);
+			const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
 
 			const rpcResult = await stub.apiQueryItems(partitionContext, {
 				hashKey: query.hashKey,
@@ -943,8 +943,6 @@ export class FokosDB {
 	}
 
 	async #destroy(): Promise<{ ok: true }> {
-		const pCtx = this.#options.topology.partitionContext();
-
 		// Coordinators first, partitions second. A transaction still in flight is driven BY a coordinator,
 		// so wiping the coordinators stops the drivers before the data goes; the reverse order lets a live
 		// coordinator commit into a partition that was just emptied and leave rows behind the traversal has
@@ -965,34 +963,17 @@ export class FokosDB {
 			await this.#staticShardedTCs.some(destroyCoordinator, { filterFn: (shard) => shard >= start && shard < end });
 		}
 
-		// The router owns the traversal, which is the target order and the dedup. FokosDB supplies the
-		// two callbacks that make the RPCs.
-		await this.#options.topology.traverseForDestroy(
-			async (partition, rootContext) => {
-				const stub = partitionStubByName(env, pCtx, partition.doName);
-				console.warn(`Destroying partition DO ${partition.doName} (partitionId=${partition.partitionId})`);
-				// The fence first, and the pages after it. The fence stops every background transition, so
-				// nothing extends the set of target links below while the traversal walks it.
-				await stub.fokosPrepareDestroy({ rootContext });
-				const targets: FokosPartitionRef[] = [];
-				let cursor: FokosStatusCursor | null = null;
-				do {
-					const page: FokosStatusPage = await stub.fokosStatus({ cursor, rootContext });
-					for (const entry of page.entries) {
-						if (entry.target) targets.push(entry.target.ref);
-					}
-					cursor = page.nextCursor;
-				} while (cursor !== null);
-				return targets;
-			},
-			async (partition) => {
-				const stub = partitionStubByName(env, pCtx, partition.doName);
+		// The router owns the traversal: the fence, the target order and the dedup. FokosDB supplies the
+		// stub and the destroy call.
+		await this.#options.topology.walk(
+			(ctx, doName) => partitionStubByName(env, ctx, doName),
+			async (ctx, stub) => {
 				try {
 					await stub.destroyPartition();
 				} catch (e) {
 					if (!isDestroyAbortError(e)) throw e;
 				}
-				console.warn(`Destroyed partition DO ${partition.doName} (partitionId=${partition.partitionId})`);
+				console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 			},
 		);
 

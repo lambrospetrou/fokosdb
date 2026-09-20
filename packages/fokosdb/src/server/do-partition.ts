@@ -21,17 +21,26 @@ import type {
 	TransactionItem,
 } from "../shared/transaction-wire-types.js";
 import {
-	areImmutableOptionsEqual,
-	areMutableOptionsEqual,
-	assertCtxHasIdBytes,
+	FOKOS_IDENTITY_KV_KEY,
+	FOKOS_POLICY_KV_KEY,
 	isHashPartition,
 	isRangePartition,
-	pCtxForLog,
-	PartitionContext,
-	PartitionContextResolved,
-	PartitionContextLivePartition,
-} from "../sharding/partition-context.js";
-import { PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "../sharding/partition-id.js";
+	refOf,
+	structurallyEqual,
+	topologiesEqual,
+	validateRangeConfig,
+	validateTopology,
+	type FokosPartitionIdentity,
+	type FokosStoredPolicy,
+} from "../sharding/route-context.js";
+import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
+import {
+	identityDepth,
+	partitionIdentityFrom,
+	PartitionIdHelper,
+	resolveHashChildPartitionContexts,
+	resolveRangePartitionContext,
+} from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import {
 	HashPartitionTopologyImpl,
@@ -97,7 +106,7 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { partitionStub, partitionStubByName, txCoordinatorStub } from "../shared/do-stubs.js";
+import { partitionStubByName, txCoordinatorStub } from "../shared/do-stubs.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -118,10 +127,10 @@ import {
 } from "../shared/errors.js";
 
 export interface PartitionAPI {
-	apiPutItem(ctx: PartitionContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
-	apiGetItem(ctx: PartitionContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
-	apiDeleteItem(ctx: PartitionContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
-	apiQueryItems(ctx: PartitionContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
+	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
+	apiGetItem(ctx: FokosDbRouteContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
+	apiDeleteItem(ctx: FokosDbRouteContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
+	apiQueryItems(ctx: FokosDbRouteContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 }
 
 // ─── item RPC types ───────────────────────────────────────────────────────────
@@ -249,22 +258,22 @@ export type FokosDbExecuteLocalRequest = Omit<FokosExecuteLocalRequest, "op" | "
 // Minimal structural type used in withSplitForwarding to avoid a recursive type cycle:
 // DurableObjectStub<PartitionDO> → PartitionDO → withSplitForwarding → DurableObjectStub<PartitionDO>.
 export type PartitionDOStub = {
-	apiPutItem(ctx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
-	apiGetItem(ctx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
-	apiDeleteItem(ctx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
-	apiQueryItems(ctx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
+	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse>;
+	apiGetItem(ctx: FokosDbRouteContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse>;
+	apiDeleteItem(ctx: FokosDbRouteContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse>;
+	apiQueryItems(ctx: FokosDbRouteContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse>;
 
-	txPrepare(ctx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse>;
-	txCommit(ctx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse>;
-	txCancel(ctx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse>;
-	txReadForTransaction(ctx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
-	txReadSnapshot(ctx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse>;
-	txExecuteSingleShot(ctx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse>;
+	txPrepare(ctx: FokosDbRouteContext, request: PrepareRequest): Promise<PrepareResponse>;
+	txCommit(ctx: FokosDbRouteContext, request: CommitRequest): Promise<CommitResponse>;
+	txCancel(ctx: FokosDbRouteContext, request: CancelRequest): Promise<CancelResponse>;
+	txReadForTransaction(ctx: FokosDbRouteContext, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse>;
+	txReadSnapshot(ctx: FokosDbRouteContext, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse>;
+	txExecuteSingleShot(ctx: FokosDbRouteContext, request: SingleShotRequest): Promise<SingleShotResponse>;
 	debugForceResolveTransaction(
-		ctx: PartitionContextResolved,
+		ctx: FokosDbRouteContext,
 		request: DebugForceResolveTransactionRequest,
 	): Promise<DebugForceResolveTransactionResponse>;
-	debugForcePromoteKey(ctx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse>;
+	debugForcePromoteKey(ctx: FokosDbRouteContext, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse>;
 };
 
 export type DebugForcePromoteKeyResponse = {
@@ -276,11 +285,6 @@ export type DebugForcePromoteKeyResponse = {
 
 export class PartitionDO extends DurableObject implements PartitionAPI, FokosPartitionStatusRpc {
 	private static readonly KV_KEYS = {
-		PARTITION_CONTEXT: "__partition_context",
-
-		// Updated on splits and key promotions.
-		PARTITION_DEPTH: "__partition_depth",
-
 		PARTIAL_RANGE_TOPOLOGY: "__partial_range_topology",
 	};
 
@@ -302,7 +306,12 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	#target: RepartitionTarget;
 	#ttl: TtlExpiry;
 
-	#_partitionContext?: PartitionContextLivePartition;
+	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
+	#_identity?: FokosPartitionIdentity;
+	/** The mutable part of the last route context this partition received, from `__fokos/policy`. */
+	#_stored?: FokosStoredPolicy<FokosDbPolicy>;
+	/** The identity and the stored policy as one route context, rebuilt when either changes. */
+	#_routeContext?: FokosDbRouteContext;
 	#_topology?: PartitionTopologySplitter;
 	#_partialRangeTopology: PartialRangeTopology | null = null;
 	#_backgroundWorkScheduledAt: number | null = null;
@@ -318,10 +327,6 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	// non-blocking from the constructor, so it may be undefined for the first few
 	// requests after the DO wakes. Never gate correctness on it.
 	#_coloInfo?: ColoInfo;
-
-	// Local-only, per-DO state (never sent as ordinary routing context): applies uniformly to hash
-	// DOs too — they simply keep [] forever, since nothing ever writes this for a hash partition.
-	#_rangeAncestors: RangeAncestorInfo[] = [];
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -339,20 +344,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#store.runMigrations();
 
-			// Load partition context from storage.
-			const pCtx = ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT);
-			if (pCtx) {
-				pCtx._partitionIdBytes = Uint8Array.fromHex(pCtx.partitionId);
-				this.#_partitionContext = pCtx;
-
-				if (isRangePartition(pCtx) && this.depth() > 0) {
-					// Append non-root "self".
-					this.#_rangeAncestors = this.#store.getRangeAncestors(pCtx.rangePartition.hashKey, this.depth()).concat({
-						depth: this.depth(),
-						startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
-						endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
-					});
-				}
+			// Load the identity and the policy from storage. Only this class writes them.
+			const identity = ctx.storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY);
+			const stored = ctx.storage.kv.get<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY);
+			if (identity && stored) {
+				this.setIdentity(identity, stored);
 
 				const prtSnap = ctx.storage.kv.get<PartialRangeTopologySnapshot>(PartitionDO.KV_KEYS.PARTIAL_RANGE_TOPOLOGY);
 				if (prtSnap) {
@@ -414,7 +410,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 
 	async #fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		this.#store.transactionSync(() => {
-			if (req.rootContext) this.ensurePartitionContext(req.rootContext);
+			if (req.rootContext) this.ensurePartitionContext(req.rootContext as FokosDbRouteContext);
 			this.ctx.storage.kv.put<boolean>(REPARTITION_KV_KEYS.DESTROYING, true);
 		});
 		// A failed pass is a stopped pass, and the fence is already durable. Its error must not fail the
@@ -438,14 +434,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	#fokosStatus(req: FokosStatusRequest): FokosStatusPage {
-		if (req.rootContext) this.ensurePartitionContext(req.rootContext);
+		if (req.rootContext) this.ensurePartitionContext(req.rootContext as FokosDbRouteContext);
 		const destroying = this.isDestroying();
-		const pCtx = this.#_partitionContext;
+		const pCtx = this.#_routeContext;
 		if (!pCtx) {
-			return { initialized: false, destroying, partitionContext: null, importState: null, entries: [], nextCursor: null };
+			return { initialized: false, destroying, ref: null, importState: null, entries: [], nextCursor: null };
 		}
 		const { entries, nextCursor } = this.#source.statusEntries(req.cursor, PartitionDO.STATUS_PAGE_ENTRIES, PartitionDO.STATUS_PAGE_BYTES);
-		return { initialized: true, destroying, partitionContext: pCtx, importState: this.#target.importState(), entries, nextCursor };
+		return { initialized: true, destroying, ref: refOf(pCtx), importState: this.#target.importState(), entries, nextCursor };
 	}
 
 	/**
@@ -459,8 +455,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const common: RepartitionCommonDeps = {
 			// Boundary rule: only DO classes and FokosDB hold stubs.
 			getPeer: (ref) => partitionStubByName(this.env, this.pCtx(), ref.doName),
-			host: new FokosMigrationHost({ store: this.#store, hashSplitN: () => this.pCtx().hashSplitN }),
-			identity: () => ({ pCtx: this.pCtx(), depth: this.depth(), rangeAncestors: this.#_rangeAncestors }),
+			host: new FokosMigrationHost({ store: this.#store, hashSplitN: () => this.pCtx().topology.hashSplitN }),
+			identity: () => ({ ctx: this.pCtx(), identity: this.identity() }),
 			// Forced, because the flow calls this when work has just become due: a queued repartition, an
 			// acknowledgement that completed one, or a start notification. The scheduler drops an unforced
 			// request while another one is pending, which leaves the new work until the next alarm.
@@ -469,7 +465,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		};
 		return {
 			...common,
-			hasIdentity: () => this.#_partitionContext !== undefined,
+			hasIdentity: () => this.#_identity !== undefined,
 			applyTargetIdentity: (req) => this.applyTargetIdentity(req),
 			ensureAlarmSet: async (targetMs) => await this.ensureAlarmSet(targetMs),
 
@@ -491,23 +487,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * synchronous by contract: the flow calls it inside the transaction that writes the import record.
 	 */
 	private applyTargetIdentity(req: FokosInitRequest): void {
-		const pCtx = this.ensurePartitionContext(req.target, /* isInit */ true);
-		if (isRangePartition(pCtx)) {
+		const target = req.target as FokosDbRouteContext;
+		let range: { depth: number; ancestors: RangeAncestorInfo[] } | undefined;
+		if (isRangePartition(target)) {
 			invariant(req.rangeDepth !== undefined, "fokos/partition.fokosInit: a range target needs its depth");
-			this.ctx.storage.kv.put<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH, req.rangeDepth);
-			this.#_depth = req.rangeDepth;
-			if (req.rangeAncestors && req.rangeAncestors.length > 0) {
-				invariant(req.rangeDepth > 0, "fokos/partition.fokosInit: only a non-root range partition has ancestors");
-				this.#store.setRangeAncestors(pCtx.rangePartition.hashKey, req.rangeAncestors);
-				// Append non-root "self".
-				this.#_rangeAncestors = req.rangeAncestors.concat({
-					depth: req.rangeDepth,
-					startBoundary: pCtx.rangePartition.startBoundary ?? KeyCodec.encodeOptional(undefined),
-					endBoundary: pCtx.rangePartition.endBoundary ?? KeyCodec.encodeOptional(undefined),
-				});
-			}
+			const ancestors = req.rangeAncestors ?? [];
+			invariant(ancestors.length === 0 || req.rangeDepth > 0, "fokos/partition.fokosInit: only a non-root range partition has ancestors");
+			range = { depth: req.rangeDepth, ancestors };
 		}
-		this.depth(); // populate #_depth
+		this.ensurePartitionContext(target, range);
 	}
 
 	//////////////////////////////
@@ -550,7 +538,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * their own rows. A fenced partition is on its way out and must make no transition.
 	 */
 	private canSweepLocally(): boolean {
-		if (!this.#_partitionContext) return false;
+		if (!this.#_identity) return false;
 		if (this.isDestroying()) return false;
 		return !this.#target.isImporting() && !this.#source.routerRole();
 	}
@@ -570,7 +558,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	/**
 	 * INTERNAL ONLY FOR TESTING.
 	 */
-	async status(pCtx?: PartitionContextLivePartition) {
+	async status(pCtx?: FokosDbRouteContext) {
 		return await this.#rpc("status", async () => await this.#status(pCtx));
 	}
 
@@ -581,14 +569,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * and `__fokos/import`. A destroy traversal reads the paginated `fokosStatus` instead, which
 	 * reports every target row and not only the targets of a split.
 	 */
-	async #status(pCtx?: PartitionContextLivePartition) {
+	async #status(pCtx?: FokosDbRouteContext) {
 		// Only a test passes pCtx. In production the public API initializes the DO before this call.
-		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_partitionContext;
+		pCtx = pCtx ? this.ensurePartitionContext(pCtx) : this.#_routeContext;
 		const importRecord = this.#target.importRecord();
 		return {
 			depth: this.depth(),
 			partitionContext: pCtx,
-			partitionContextStored: this.ctx.storage.kv.get<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT),
+			identityStored: this.ctx.storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY),
 			splitStatus: pCtx ? this.derivedSplitStatus(pCtx) : undefined,
 			migrationStatus: derivedMigrationStatus(importRecord?.state),
 			parentPartitionContext: importRecord?.source,
@@ -598,7 +586,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	/** The split lifecycle, as the old KV record described it. */
-	private derivedSplitStatus(pCtx: PartitionContextLivePartition): SplitStatusView | undefined {
+	private derivedSplitStatus(pCtx: FokosDbRouteContext): SplitStatusView | undefined {
 		const row = this.#source.splitRepartition();
 		if (!row) return undefined;
 		const splitType: SplitType = row.kind === "hash_split" ? "hash" : "range";
@@ -645,7 +633,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	/** Rebuilds one target's context from this partition's CURRENT context and the target's stored slice. */
-	private targetContext(pCtx: PartitionContextLivePartition, target: RepartitionTargetRow): PartitionContextResolved {
+	private targetContext(pCtx: FokosDbRouteContext, target: RepartitionTargetRow): FokosDbRouteContext {
 		if (target.slice.kind === "hash_child") {
 			const child = resolveHashChildPartitionContexts(pCtx).find((c) => c.partitionId === target.partitionId);
 			invariant(child, () => `fokos/partition: no hash child matches target ${target.doName}`);
@@ -654,14 +642,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const slice = target.slice;
 		const start = slice.kind === "range" ? slice.start : null;
 		const end = slice.kind === "range" ? slice.end : null;
-		return resolveRangePartitionContext(pCtx, slice.hashKey, start, end).partitionContext;
+		return resolveRangePartitionContext(pCtx, slice.hashKey, start, end);
 	}
 
-	async apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
+	async apiPutItem(pCtx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
 		return await this.#rpc("apiPutItem", async () => await this.#apiPutItem(pCtx, req));
 	}
 
-	async #apiPutItem(pCtx: PartitionContextResolved, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
+	async #apiPutItem(pCtx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<PutItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("putItem");
 		const { hashKey, sortKey } = req;
@@ -733,11 +721,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		});
 	}
 
-	async apiDeleteItem(pCtx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
+	async apiDeleteItem(pCtx: FokosDbRouteContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
 		return await this.#rpc("apiDeleteItem", async () => await this.#apiDeleteItem(pCtx, req));
 	}
 
-	async #apiDeleteItem(pCtx: PartitionContextResolved, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
+	async #apiDeleteItem(pCtx: FokosDbRouteContext, req: DeleteItemRpcRequest): Promise<DeleteItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("deleteItem");
 		const { hashKey, sortKey } = req;
@@ -785,22 +773,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		});
 	}
 
-	async apiGetItem(pCtx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
+	async apiGetItem(pCtx: FokosDbRouteContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
 		return await this.#rpc("apiGetItem", async () => await this.#apiGetItem(pCtx, req));
 	}
 
-	async #apiGetItem(pCtx: PartitionContextResolved, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
+	async #apiGetItem(pCtx: FokosDbRouteContext, req: GetItemRpcRequest): Promise<GetItemRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 
 		if (await this.ensureMigration("getItem", false)) {
 			// Read through the source while this target still imports its share of the data.
 			const record = this.#target.importRecord();
 			invariant(record, "fokos/partition.getItem: no import record while importing");
-			const sourceStub = partitionStubByName(this.env, record.source, record.source.doName);
+			const sourceStub = partitionStubByName(this.env, pCtx, record.source.doName);
 			const result = (await sourceStub.fokosExecuteLocal({
 				op: "getItem",
 				repartitionId: record.repartitionId,
-				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				caller: refOf(pCtx),
 				request: req,
 			})) as GetItemRpcResponse;
 			// The parent returns its own hashDepth, but the caller forwarded to this child partition.
@@ -846,7 +834,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 
 		if (req.op === "getItem") {
 			const getReq = req.request;
-			assertPointInSlice(slice, getReq.hashKey, getReq.sortKey, pCtx.hashSplitN, "fokosExecuteLocal");
+			assertPointInSlice(slice, getReq.hashKey, getReq.sortKey, pCtx.topology.hashSplitN, "fokosExecuteLocal");
 			// A promoted key's rows live in the range tree; the local copies are stale or already collected.
 			// Follow the promotion with ordinary forwarding rather than reading them. Only a hash-child
 			// caller can reach one — a range or promoted-key slice is itself inside a range tree.
@@ -862,7 +850,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		}
 
 		const queryReq = req.request;
-		const interval = clipQueryToSlice(slice, queryReq, pCtx.hashSplitN, "fokosExecuteLocal");
+		const interval = clipQueryToSlice(slice, queryReq, pCtx.topology.hashSplitN, "fokosExecuteLocal");
 		if (slice.kind === "hash_child" && this.#source.ownedByRangeTree(queryReq.hashKey)) {
 			// A query spans sort keys, so it carries no single key that could resolve a deeper range
 			// slice; it enters at the range root and the routers below it fan out.
@@ -875,22 +863,22 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		return this.queryItemsLocal(pCtx, { ...queryReq, interval });
 	}
 
-	async apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
+	async apiQueryItems(pCtx: FokosDbRouteContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
 		return await this.#rpc("apiQueryItems", async () => await this.#apiQueryItems(pCtx, req));
 	}
 
-	async #apiQueryItems(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
+	async #apiQueryItems(pCtx: FokosDbRouteContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
 		this.ensurePartitionContext(pCtx);
 
 		// If still migrating, read directly from the parent (mirrors getItem / getItemDirect).
 		if (await this.ensureMigration("queryItems", false)) {
 			const record = this.#target.importRecord();
 			invariant(record, "fokos/partition.queryItems: no import record while importing");
-			const sourceStub = partitionStubByName(this.env, record.source, record.source.doName);
+			const sourceStub = partitionStubByName(this.env, pCtx, record.source.doName);
 			const result = (await sourceStub.fokosExecuteLocal({
 				op: "queryItems",
 				repartitionId: record.repartitionId,
-				caller: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				caller: refOf(pCtx),
 				request: req,
 			})) as QueryItemsRpcResponse;
 			if (isHashPartition(pCtx)) {
@@ -921,7 +909,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		});
 	}
 
-	private queryItemsLocal(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
+	private queryItemsLocal(pCtx: FokosDbRouteContext, req: QueryItemsRpcRequest): QueryItemsRpcResponse {
 		const hk = req.hashKey;
 		const { interval, cursor } = req;
 
@@ -961,15 +949,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			rowsRead,
 			rowsWritten,
 			databaseSize: this.#store.databaseSize,
-			servedByActorId: this.ctx.id.toString(),
-			servedByActorName: pCtx.doName,
-			servedByPartitionId: pCtx.partitionId,
-			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-			_internal: {
-				rangeAncestors: this.#_rangeAncestors,
-			},
+			...this.routingMeta(pCtx),
 		};
 
 		return {
@@ -986,18 +966,21 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		};
 	}
 
-	private async queryItemsAsRangeNode(pCtx: PartitionContextResolved, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
+	private async queryItemsAsRangeNode(pCtx: FokosDbRouteContext, req: QueryItemsRpcRequest): Promise<QueryItemsRpcResponse> {
 		if (!this.#source.routerRole()) return this.queryItemsLocal(pCtx, req);
 		// Built from this router's CURRENT context and each target's stored boundaries, in target_index
 		// order, which is ascending boundary order. A stored context would hand the child the split
 		// thresholds of an earlier operator setting, and the child would then persist them as its own.
-		const children = this.#source.splitTargets().map((t) => this.targetContext(this.pCtx(), t));
+		const children = this.#source.splitTargets().map((t) => {
+			invariant(t.slice.kind === "range", "fokos/partition.queryItems: a range split target must carry a range slice");
+			return { ctx: this.targetContext(this.pCtx(), t), start: t.slice.start, end: t.slice.end };
+		});
 		return await this.walkRangeChildren(pCtx, children, req);
 	}
 
 	private async walkRangeChildren(
-		pCtx: PartitionContextResolved,
-		children: PartitionContextResolved[],
+		pCtx: FokosDbRouteContext,
+		children: Array<{ ctx: FokosDbRouteContext; start: KeyBytes | null; end: KeyBytes | null }>,
 		req: QueryItemsRpcRequest,
 	): Promise<QueryItemsRpcResponse> {
 		const { interval, cursor, direction } = req;
@@ -1025,18 +1008,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		// not entirely behind the resume cursor. Selecting them up front — instead of skipping inside the
 		// scan loop — turns "could a later child still contribute?" into a plain index test, which is the
 		// question BOTH budget exits must answer before they emit a continuation cursor.
-		const candidates = orderedChildren.flatMap((childCtx) => {
-			const rp = childCtx.rangePartition;
-			invariant(rp, "fokos/partition.walkRangeChildren: child has no rangePartition context");
-			const childStart = rp.startBoundary ?? KeyCodec.encodeOptional(undefined);
-			const childEnd = rp.endBoundary;
+		const candidates = orderedChildren.flatMap(({ ctx: childCtx, start, end }) => {
+			const childStart = start ?? KeyCodec.encodeOptional(undefined);
+			const childEnd = end;
 			if (!rangeIntersects(childStart, childEnd, interval)) return [];
 			if (cursor && isChildFullyBeforeCursor(childStart, childEnd, cursor, direction)) return [];
-			return [{ childCtx, rp, childStart, childEnd }];
+			return [{ childCtx, start, childStart, childEnd }];
 		});
 
 		for (let i = 0; i < candidates.length; i++) {
-			const { childCtx, rp, childStart, childEnd } = candidates[i];
+			const { childCtx, start, childStart, childEnd } = candidates[i];
 			// A cursor is honest only if a later child still holds rows for this query. Without this, a
 			// budget exhausted by the LAST child — one that drained itself and reported no cursor of its
 			// own — would still hand the client a cursor, buying it one more round trip that returns zero
@@ -1044,7 +1025,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			const hasLaterCandidate = i < candidates.length - 1;
 
 			const childCursor = cursor && cursorFallsInChild(childStart, childEnd, cursor) ? cursor : null;
-			const clippedInterval = clipToChildRange(interval, rp.startBoundary, childEnd);
+			const clippedInterval = clipToChildRange(interval, start, childEnd);
 			const childStub = this.getChildStub(childCtx);
 			const childResult = await childStub.apiQueryItems(childCtx, {
 				...req,
@@ -1097,15 +1078,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			rowsRead: 0,
 			rowsWritten: 0,
 			databaseSize: this.#store.databaseSize,
-			servedByActorId: this.ctx.id.toString(),
-			servedByActorName: pCtx.doName,
-			servedByPartitionId: pCtx.partitionId,
+			...this.routingMeta(pCtx),
 			forwardCount: childrenCalled + descendantForwards,
-			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-			_internal: {
-				rangeAncestors: this.#_rangeAncestors,
-			},
 		};
 
 		return {
@@ -1130,7 +1104,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * A refused request is normal, because an unfinished promotion still owns the move of a key. The
 	 * next write asks again.
 	 */
-	private async checkSplits(pCtx: PartitionContextResolved, hashKey?: KeyBytes, sortKey?: KeyBytes): Promise<void> {
+	private async checkSplits(pCtx: FokosDbRouteContext, hashKey?: KeyBytes, sortKey?: KeyBytes): Promise<void> {
 		const splitType = this.ensureTopology(pCtx).shouldSplit(hashKey, sortKey);
 		if (!splitType) return;
 		await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
@@ -1147,9 +1121,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * of its own. The write has already succeeded, so the caller logs and drops a failure here. The
 	 * next write to the same key asks again.
 	 */
-	private async queuePromotionIfOverThreshold(pCtx: PartitionContextResolved, hashKey: KeyBytes, keyEstBytes: number): Promise<void> {
+	private async queuePromotionIfOverThreshold(pCtx: FokosDbRouteContext, hashKey: KeyBytes, keyEstBytes: number): Promise<void> {
 		if (!isHashPartition(pCtx)) return;
-		const threshold = (pCtx.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
+		const threshold = (pCtx.policy.hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
 		if (threshold <= 0 || keyEstBytes < threshold) return;
 		await this.ensureAlarmSet(Date.now() + PartitionDO.SPLIT_FALLBACK_ALARM_MS);
 		const row = this.#source.queue({ kind: "key_promotion", hashKey });
@@ -1186,7 +1160,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * It keeps the largest candidate per key: one transaction can write many sort keys of one hash
 	 * key, and each upsert reports the running total after its own row.
 	 */
-	private async drainPromotionCandidates(pCtx: PartitionContextResolved, candidates: readonly PromotionCandidate[]): Promise<void> {
+	private async drainPromotionCandidates(pCtx: FokosDbRouteContext, candidates: readonly PromotionCandidate[]): Promise<void> {
 		if (candidates.length === 0) return;
 		const largest = new Map<string, PromotionCandidate>();
 		for (const candidate of candidates) {
@@ -1237,11 +1211,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	// TRANSACTION HELPERS
 	////////////////////////
 
-	async txPrepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
+	async txPrepare(pCtx: FokosDbRouteContext, request: PrepareRequest): Promise<PrepareResponse> {
 		return await this.#rpc("txPrepare", async () => await this.#txPrepare(pCtx, request));
 	}
 
-	async #txPrepare(pCtx: PartitionContextResolved, request: PrepareRequest): Promise<PrepareResponse> {
+	async #txPrepare(pCtx: FokosDbRouteContext, request: PrepareRequest): Promise<PrepareResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("prepare");
 
@@ -1300,11 +1274,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		return response;
 	}
 
-	async txCommit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
+	async txCommit(pCtx: FokosDbRouteContext, request: CommitRequest): Promise<CommitResponse> {
 		return await this.#rpc("txCommit", async () => await this.#txCommit(pCtx, request));
 	}
 
-	async #txCommit(pCtx: PartitionContextResolved, request: CommitRequest): Promise<CommitResponse> {
+	async #txCommit(pCtx: FokosDbRouteContext, request: CommitRequest): Promise<CommitResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("commit"); // reject while this partition is migrating
 
@@ -1364,11 +1338,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * while a key is locked. With no keys (see CancelRequest.items) the cancel is local-only and any
 	 * descendant lock waits for its own stale-tx recovery alarm.
 	 */
-	async txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
+	async txCancel(pCtx: FokosDbRouteContext, request: CancelRequest): Promise<CancelResponse> {
 		return await this.#rpc("txCancel", async () => await this.#txCancel(pCtx, request));
 	}
 
-	async #txCancel(pCtx: PartitionContextResolved, request: CancelRequest): Promise<CancelResponse> {
+	async #txCancel(pCtx: FokosDbRouteContext, request: CancelRequest): Promise<CancelResponse> {
 		this.ensurePartitionContext(pCtx);
 		// reject while this partition is migrating - it will recover it on its own.
 		await this.ensureMigration("cancel");
@@ -1421,7 +1395,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	async debugForceResolveTransaction(
-		pCtx: PartitionContextResolved,
+		pCtx: FokosDbRouteContext,
 		request: DebugForceResolveTransactionRequest,
 	): Promise<DebugForceResolveTransactionResponse> {
 		return await this.#rpc("debugForceResolveTransaction", async () => {
@@ -1458,7 +1432,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * then shadow the live rows in the child. An importing child rejects the call with
 	 * `partition_migrating` and creates no row. The caller can retry after that import completes.
 	 */
-	async debugForcePromoteKey(pCtx: PartitionContextResolved, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse> {
+	async debugForcePromoteKey(pCtx: FokosDbRouteContext, hashKey: KeyBytes): Promise<DebugForcePromoteKeyResponse> {
 		return await this.#rpc("debugForcePromoteKey", async () => {
 			this.ensurePartitionContext(pCtx);
 			await this.ensureMigration("debugForcePromoteKey");
@@ -1490,11 +1464,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		});
 	}
 
-	async txReadForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+	async txReadForTransaction(pCtx: FokosDbRouteContext, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		return await this.#rpc("txReadForTransaction", async () => await this.#txReadForTransaction(pCtx, request));
 	}
 
-	async #txReadForTransaction(pCtx: PartitionContextResolved, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
+	async #txReadForTransaction(pCtx: FokosDbRouteContext, request: ReadForTransactionRequest): Promise<ReadForTransactionResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readForTransaction");
 
@@ -1519,11 +1493,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * result already IS a consistent snapshot — the second phase of the coordinator's read exists
 	 * only to detect interleaving ACROSS partitions, and here there is none to detect.
 	 */
-	async txReadSnapshot(pCtx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
+	async txReadSnapshot(pCtx: FokosDbRouteContext, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
 		return await this.#rpc("txReadSnapshot", async () => await this.#txReadSnapshot(pCtx, request));
 	}
 
-	async #txReadSnapshot(pCtx: PartitionContextResolved, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
+	async #txReadSnapshot(pCtx: FokosDbRouteContext, request: ReadSnapshotRequest): Promise<ReadSnapshotResponse> {
 		this.ensurePartitionContext(pCtx);
 		await this.ensureMigration("readSnapshot");
 
@@ -1553,11 +1527,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * input-gate point, so an unbroken synchronous block closes the split and promotion races: the
 	 * items cannot start belonging to another DO between the check and the write.
 	 */
-	async txExecuteSingleShot(pCtx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse> {
+	async txExecuteSingleShot(pCtx: FokosDbRouteContext, request: SingleShotRequest): Promise<SingleShotResponse> {
 		return await this.#rpc("txExecuteSingleShot", async () => await this.#txExecuteSingleShot(pCtx, request));
 	}
 
-	async #txExecuteSingleShot(pCtx: PartitionContextResolved, request: SingleShotRequest): Promise<SingleShotResponse> {
+	async #txExecuteSingleShot(pCtx: FokosDbRouteContext, request: SingleShotRequest): Promise<SingleShotResponse> {
 		this.ensurePartitionContext(pCtx);
 		invariant(request.items.length > 0, "fokos/partition.executeSingleShot: at least one item is required");
 		await this.ensureMigration("executeSingleShot");
@@ -1613,7 +1587,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		items: T[],
 		intent: OperationIntent,
 		operationName: string,
-	): { destination: "local"; items: T[] } | { destination: "child"; pCtx: PartitionContextResolved; items: T[] } | { destination: "none" } {
+	): { destination: "local"; items: T[] } | { destination: "child"; pCtx: FokosDbRouteContext; items: T[] } | { destination: "none" } {
 		const { local, forwarded } = this.groupItemsByRouting(items, intent, operationName);
 		if (forwarded.size === 0) {
 			return { destination: "local", items: local };
@@ -1640,105 +1614,122 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		await this.runBackgroundWork();
 	}
 
-	// RPC erases the KeyBytes brand: keys reach the DO already-encoded as Uint8Array (db.ts encodes at
-	// the public entry). Re-brand on this trust boundary without re-encoding. A raw string (e.g. a direct
-	// in-process test call) is encoded so the DO always works on canonical KeyBytes.
-	private pCtx(): PartitionContextLivePartition & { _partitionIdBytes: Uint8Array } {
-		const pCtx = this.#_partitionContext;
+	/** The stored route context of this partition: its identity plus the mutable part the last request left. */
+	private pCtx(): FokosDbRouteContext {
+		const pCtx = this.#_routeContext;
 		invariant(pCtx, this.STRING_PCTX_INIT_ERROR);
-		assertCtxHasIdBytes(pCtx);
 		return pCtx;
+	}
+
+	private identity(): FokosPartitionIdentity {
+		const identity = this.#_identity;
+		invariant(identity, this.STRING_PCTX_INIT_ERROR);
+		return identity;
 	}
 
 	// The depth of this partition in the topology tree.
 	// A hash partition: 0 is the root, 1 is a first-level child, and so on.
 	// A range partition: 0 is the root range partition, 1 is a first-level child, and so on.
-	#_depth: number | undefined = undefined;
-
 	private depth(): number {
-		if (this.#_depth !== undefined) return this.#_depth;
-
-		const pCtx = this.pCtx();
-		if (isHashPartition(pCtx)) {
-			this.#_depth = PartitionIdHelper.depth(pCtx._partitionIdBytes);
-		} else {
-			const rangeDepth = this.kvDepth();
-			invariant(
-				rangeDepth !== undefined,
-				"fokos/partition: rangeDepth must be set on a range partition (key promotion or range split did not initialize it)",
-			);
-			this.#_depth = rangeDepth;
-		}
-		return this.#_depth;
+		return identityDepth(this.identity());
 	}
 
-	private kvDepth(): number | undefined {
-		return this.ctx.storage.kv.get<number>(PartitionDO.KV_KEYS.PARTITION_DEPTH);
+	/**
+	 * The bounded ancestor boundaries of this range partition with its own boundaries appended last,
+	 * which every response carries so a router can learn the leaf. Empty for a hash partition, for a
+	 * range root, and for a range child whose `fokosInit` carried no ancestors: the feature is inert
+	 * when the range config selects none.
+	 */
+	#rangeAncestorsWithSelf: RangeAncestorInfo[] = [];
+
+	/** Replaces the in-memory identity, policy and derived state together, so no reader sees one without the other. */
+	private setIdentity(identity: FokosPartitionIdentity, stored: FokosStoredPolicy<FokosDbPolicy>): void {
+		this.#_identity = identity;
+		this.#_stored = stored;
+		this.#_routeContext = { schema: 2, ...identity.ref, topology: identity.topology, ...stored };
+		const range = identity.range;
+		this.#rangeAncestorsWithSelf =
+			range && range.ancestors.length > 0
+				? range.ancestors.concat({
+						depth: range.depth,
+						startBoundary: range.start ?? KeyCodec.encodeOptional(undefined),
+						endBoundary: range.end ?? KeyCodec.encodeOptional(undefined),
+					})
+				: [];
+		this.#_topology?.updatePartitionContext(this.#_routeContext);
 	}
 
-	private ensurePartitionContext(
-		pCtx: PartitionContextResolved | PartitionContextLivePartition,
-		isInit = false,
-	): PartitionContextLivePartition {
-		if (this.ctx.id.jurisdiction !== pCtx.jurisdiction) {
+	/**
+	 * Validates the route context of a request against the stored identity, and stores a changed
+	 * policy. A root hash partition without an identity takes it from its first request. A range
+	 * partition, and a hash target, receive theirs through `fokosInit`, which passes `init`.
+	 *
+	 * Synchronous by contract: `fokosInit` calls it inside the transaction that writes the import
+	 * record, and every KV write here happens in one synchronous block.
+	 */
+	private ensurePartitionContext(pCtx: FokosDbRouteContext, init?: { depth: number; ancestors: RangeAncestorInfo[] }): FokosDbRouteContext {
+		if (this.ctx.id.jurisdiction !== pCtx.topology.jurisdiction) {
 			throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
 				message: "partition context mismatch",
-				attributes: { doName: pCtx.doName, jurisdictionReq: pCtx.jurisdiction, jurisdictionActual: this.ctx.id.jurisdiction },
+				attributes: { doName: pCtx.doName, jurisdictionReq: pCtx.topology.jurisdiction, jurisdictionActual: this.ctx.id.jurisdiction },
 			});
 		}
-		// Phantom-bounce guard: a range DO is born ONLY through initFromSplit (promotion creates the root,
-		// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
-		// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
-		// to the range root and traverses. (A hash DO may still lazy-init, as today.)
-		if (!isInit && !this.#_partitionContext && isRangePartition(pCtx)) {
-			throw new FokosRoutingError(ROUTING_CODES.range_partition_not_initialized, {
-				message: "range partition is not initialized; route via the range root and traverse",
-				attributes: { doName: pCtx.doName },
-			});
-		}
-		if (this.#_partitionContext) {
-			// rangePartition boundaries are KeyBytes — compare by bytes (null = unbounded), never by reference.
-			const keyEq = (a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean =>
-				a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
-			// The given context must match the stored one, or the partition serves data it does not own.
-			if (
-				!areImmutableOptionsEqual(this.#_partitionContext, pCtx) ||
-				this.#_partitionContext.partitionId !== pCtx.partitionId ||
-				this.#_partitionContext.doName !== pCtx.doName ||
-				!keyEq(this.#_partitionContext.rangePartition?.hashKey, pCtx.rangePartition?.hashKey) ||
-				!keyEq(this.#_partitionContext.rangePartition?.startBoundary, pCtx.rangePartition?.startBoundary) ||
-				!keyEq(this.#_partitionContext.rangePartition?.endBoundary, pCtx.rangePartition?.endBoundary)
-			) {
-				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
-					message: "partition context mismatch",
+		if (!this.#_identity) {
+			// Phantom-bounce guard: a range DO is born ONLY through fokosInit (promotion creates the root,
+			// a split creates children). A request reaching an uninitialized range DO means a caller resolved a
+			// fabricated (start,end) name that never existed — never lazy-init it; bounce so the caller falls back
+			// to the range root and traverses. (A hash DO may still lazy-init.)
+			if (!init && isRangePartition(pCtx)) {
+				throw new FokosRoutingError(ROUTING_CODES.range_partition_not_initialized, {
+					message: "range partition is not initialized; route via the range root and traverse",
 					attributes: { doName: pCtx.doName },
 				});
 			}
-			// Fall through to update to the latest version if there are changes.
-			if (areMutableOptionsEqual(this.#_partitionContext, pCtx)) {
-				return this.#_partitionContext;
-			}
+			invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
+			validateTopology(pCtx.topology);
+			validateRangeConfig(pCtx.rangeConfig);
+			const identity = partitionIdentityFrom(pCtx, init);
+			const stored: FokosStoredPolicy<FokosDbPolicy> = { rangeConfig: pCtx.rangeConfig, policy: pCtx.policy };
+			this.ctx.storage.kv.put<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY, identity);
+			this.ctx.storage.kv.put<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY, stored);
+			this.setIdentity(identity, stored);
+			return this.pCtx();
 		}
-		invariant(pCtx.partitionId.length > 0, "fokos/partition.ensurePartitionContext: partitionId must not be empty");
-		this.#_partitionContext = { ...pCtx };
-		this.#_partitionContext._partitionIdBytes = undefined;
-		this.ctx.storage.kv.put<PartitionContextLivePartition>(PartitionDO.KV_KEYS.PARTITION_CONTEXT, this.#_partitionContext);
-		this.#_partitionContext._partitionIdBytes = Uint8Array.fromHex(this.#_partitionContext.partitionId);
-		this.#_topology?.updatePartitionContext(this.#_partitionContext);
-		return this.#_partitionContext;
+
+		// The given identity and topology must match the stored ones, or the partition serves data it does not own.
+		const identity = this.#_identity;
+		if (
+			identity.ref.partitionId !== pCtx.partitionId ||
+			identity.ref.doName !== pCtx.doName ||
+			!topologiesEqual(identity.topology, pCtx.topology)
+		) {
+			throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+				message: "partition context mismatch",
+				attributes: { doName: pCtx.doName },
+			});
+		}
+		const stored = this.#_stored!;
+		if (structurallyEqual(stored.rangeConfig, pCtx.rangeConfig) && structurallyEqual(stored.policy, pCtx.policy)) {
+			return this.pCtx();
+		}
+		validateRangeConfig(pCtx.rangeConfig);
+		const next: FokosStoredPolicy<FokosDbPolicy> = { rangeConfig: pCtx.rangeConfig, policy: pCtx.policy };
+		this.ctx.storage.kv.put<FokosStoredPolicy<FokosDbPolicy>>(FOKOS_POLICY_KV_KEY, next);
+		this.setIdentity(identity, next);
+		return this.pCtx();
 	}
 
-	private ensureHashTopology(pCtx: PartitionContextResolved): HashPartitionTopologyImpl {
+	private ensureHashTopology(pCtx: FokosDbRouteContext): HashPartitionTopologyImpl {
 		const topology = this.ensureTopology(pCtx);
 		invariant(topology instanceof HashPartitionTopologyImpl, "fokos/partition: expected hash partition topology");
 		return topology;
 	}
 
-	private ensureTopology(pCtx: PartitionContextResolved): PartitionTopologySplitter {
+	private ensureTopology(pCtx: FokosDbRouteContext): PartitionTopologySplitter {
 		if (!this.#_topology) {
 			this.#_topology = isRangePartition(pCtx)
-				? new RangePartitionTopologyImpl(pCtx, this.ctx, this.#store, this.#source)
-				: new HashPartitionTopologyImpl(pCtx, this.ctx, this.#store, this.#source);
+				? new RangePartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#store, this.#source)
+				: new HashPartitionTopologyImpl(pCtx, this.identity(), this.ctx, this.#store, this.#source);
 		}
 		return this.#_topology;
 	}
@@ -1766,9 +1757,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	private async forwardToRangeRootPartition<T extends { meta: PartitionInfoInternal }>(
-		ctx: PartitionContextResolved,
+		ctx: FokosDbRouteContext,
 		hashKey: KeyBytes,
-		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+		forward: (stub: PartitionDOStub, pCtx: FokosDbRouteContext) => Promise<T>,
 		sortKey?: KeyBytes,
 	): Promise<T> {
 		// Default entry is the range root (null, null). If this DO has already learned deeper range
@@ -1776,17 +1767,16 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		// slice that contains sortKey, skipping the root router chain. Immutable boundary identity makes
 		// a stale hint safe: the target validates range membership and re-forwards if it has split
 		// further. Multi-item paths that lack a single sortKey pass undefined and stay on the root.
-		let entry: ReturnType<typeof resolveRangePartitionContext> | null = null;
+		let toCtx: FokosDbRouteContext | null = null;
 		if (sortKey !== undefined) {
 			const learned = this.#store.findDeepestKnownRangeSlice(hashKey, sortKey);
 			if (learned && (learned.startBoundary !== null || learned.endBoundary !== null)) {
-				entry = resolveRangePartitionContext(ctx, hashKey, learned.startBoundary, learned.endBoundary);
+				toCtx = resolveRangePartitionContext(ctx, hashKey, learned.startBoundary, learned.endBoundary);
 			}
 		}
-		if (!entry) {
-			entry = resolveRangePartitionContext(ctx, hashKey, null, null);
+		if (!toCtx) {
+			toCtx = resolveRangePartitionContext(ctx, hashKey, null, null);
 		}
-		const { doId, partitionContext: toCtx } = entry;
 		const topology = this.ensureTopology(ctx);
 
 		// Learn the range subtree boundaries from the response so future entries can skip the root chain.
@@ -1798,7 +1788,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const learn = (meta: PartitionInfoInternal) => topology.recordForwardResult(hashKey, ctx, toCtx, meta);
 		// A hash partition answers with its own hash depth: its caller forwarded to it, and checks that depth.
 		const hashDepth = isHashPartition(ctx) ? this.depth() : undefined;
-		const result = await forward(partitionStub(this.env, ctx, doId), toCtx).catch((e: unknown) => {
+		const result = await forward(this.getChildStub(toCtx), toCtx).catch((e: unknown) => {
 			learnFromErrorMeta(e, learn, hashDepth);
 			throw e;
 		});
@@ -1807,9 +1797,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	private async maybeForwardToRangeRootPartition<T extends { meta: PartitionInfoInternal }>(
-		ctx: PartitionContextResolved,
+		ctx: FokosDbRouteContext,
 		hashKey: KeyBytes,
-		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>,
+		forward: (stub: PartitionDOStub, pCtx: FokosDbRouteContext) => Promise<T>,
 		sortKey?: KeyBytes,
 		fallbackOnNotCutOver: boolean = false,
 	): Promise<T | null> {
@@ -1828,11 +1818,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	private async withSplitForwarding<T extends { meta: PartitionInfoInternal }>(opts: {
-		ctx: PartitionContextResolved;
+		ctx: FokosDbRouteContext;
 		keys: { hashKey: KeyBytes; sortKey: KeyBytes };
 		operationName: string;
 		intent: OperationIntent;
-		forward: (stub: PartitionDOStub, pCtx: PartitionContextResolved) => Promise<T>;
+		forward: (stub: PartitionDOStub, pCtx: FokosDbRouteContext) => Promise<T>;
 		local: () => Promise<T>;
 	}): Promise<T> {
 		const {
@@ -1864,8 +1854,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			case "ok":
 				return await local();
 			case "forward": {
-				const { doId, partitionContext } = topology.pickChildPartition(ctx, hashKey, sortKey);
-				const stub = partitionStub(this.env, ctx, doId);
+				const partitionContext = topology.pickChildPartition(ctx, hashKey, sortKey);
+				const stub = this.getChildStub(partitionContext);
 				// The result and the error of the forward both carry the routing meta of the target.
 				const learn = (meta: PartitionInfoInternal) => {
 					topology.recordForwardResult(hashKey, ctx, partitionContext, meta);
@@ -1918,14 +1908,14 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		operationName: string,
 	): {
 		local: T[];
-		forwarded: Map<string, { pCtx: PartitionContextResolved; items: T[] }>;
+		forwarded: Map<string, { pCtx: FokosDbRouteContext; items: T[] }>;
 	} {
 		const pCtx = this.pCtx();
 		const topology = this.ensureTopology(pCtx);
 		const local: T[] = [];
-		const forwarded = new Map<string, { pCtx: PartitionContextResolved; items: T[] }>();
+		const forwarded = new Map<string, { pCtx: FokosDbRouteContext; items: T[] }>();
 
-		const addForwarded = (destPCtx: PartitionContextResolved, item: T) => {
+		const addForwarded = (destPCtx: FokosDbRouteContext, item: T) => {
 			let entry = forwarded.get(destPCtx.doName);
 			if (!entry) {
 				entry = { pCtx: destPCtx, items: [] };
@@ -1937,8 +1927,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		for (const item of items) {
 			// On a hash partition only: forward a key the range tree now owns to its range root.
 			if (isHashPartition(pCtx) && this.#source.ownedByRangeTree(item.hashKey)) {
-				const { partitionContext: rangeRootCtx } = resolveRangePartitionContext(pCtx, item.hashKey, null, null);
-				addForwarded(rangeRootCtx, item);
+				addForwarded(resolveRangePartitionContext(pCtx, item.hashKey, null, null), item);
 				continue;
 			}
 
@@ -1946,8 +1935,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			if (decision === "ok") {
 				local.push(item);
 			} else if (decision === "forward") {
-				const { partitionContext } = topology.pickChildPartition(pCtx, item.hashKey, item.sortKey);
-				addForwarded(partitionContext, item);
+				addForwarded(topology.pickChildPartition(pCtx, item.hashKey, item.sortKey), item);
 			} else if (decision === "reject_over_size") {
 				throw errExceededDatabaseSize(operationName);
 			} else {
@@ -1958,7 +1946,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		return { local, forwarded };
 	}
 
-	private getChildStub(childPCtx: PartitionContextResolved): PartitionDOStub {
+	private getChildStub(childPCtx: FokosDbRouteContext): PartitionDOStub {
 		return partitionStubByName(this.env, this.pCtx(), childPCtx.doName);
 	}
 
@@ -1967,7 +1955,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * node that answers locally forwarded nothing; a router builds its own meta with its fan-out count.
 	 */
 	private localMeta(
-		pCtx: PartitionContextResolved,
+		pCtx: FokosDbRouteContext,
 		counts: { rowsRead: number; rowsWritten: number },
 	): OperationMetrics & PartitionInfoInternal {
 		return {
@@ -1979,41 +1967,29 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	/** The routing part of the meta of this node. `localMeta` adds the metrics of the work, and `#rpc` stamps it on an error. */
-	private routingMeta(pCtx: PartitionContextResolved): PartitionInfoInternal {
+	private routingMeta(pCtx: FokosDbRouteContext): PartitionInfoInternal {
+		const identity = this.identity();
 		return {
 			servedByActorId: this.ctx.id.toString(),
 			servedByActorName: pCtx.doName,
 			servedByPartitionId: pCtx.partitionId,
 			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
+			hashDepth: identity.kind === "hash" ? this.depth() : 0,
+			rangeDepth: identity.kind === "range" ? this.depth() : 0,
 			_internal: {
-				rangeAncestors: this.#_rangeAncestors,
+				rangeAncestors: this.#rangeAncestorsWithSelf,
 			},
 		};
 	}
 
-	private readItemLocally(pCtx: PartitionContextResolved, req: GetItemRpcRequest): GetItemRpcResponse {
+	private readItemLocally(pCtx: FokosDbRouteContext, req: GetItemRpcRequest): GetItemRpcResponse {
 		const res =
 			req.projection === undefined
 				? this.#store.getItem(req.hashKey, req.sortKey)
 				: this.#store.getItemProjected(req.projection, req.hashKey, req.sortKey);
 		const { rowsRead, rowsWritten } = res;
 		const result = res.row;
-		const actorMeta = {
-			rowsRead,
-			rowsWritten,
-			databaseSize: this.#store.databaseSize,
-			servedByActorId: this.ctx.id.toString(),
-			servedByActorName: pCtx.doName,
-			servedByPartitionId: pCtx.partitionId,
-			forwardCount: 0,
-			hashDepth: isHashPartition(pCtx) ? this.depth() : 0,
-			rangeDepth: isRangePartition(pCtx) ? this.depth() : 0,
-			_internal: {
-				rangeAncestors: this.#_rangeAncestors,
-			},
-		};
+		const actorMeta = this.localMeta(pCtx, { rowsRead, rowsWritten });
 		if (!result) {
 			return { found: false, meta: actorMeta };
 		}
@@ -2112,7 +2088,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	}
 
 	async #runBackgroundWorkOnce(): Promise<void> {
-		invariant(this.#_partitionContext, "fokos/partition.runBackgroundWork: partition context not initialized");
+		invariant(this.#_identity, "fokos/partition.runBackgroundWork: partition context not initialized");
 		/**
 		 * INVARIANTS FOR ALL BACKGROUND JOBS:
 		 * - A job must read its durable state before it writes. The in-flight promise above is not
@@ -2375,7 +2351,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * must never replace the error.
 	 */
 	#stampRoutingMeta(err: FokosError): void {
-		const pCtx = this.#_partitionContext;
+		const pCtx = this.#_routeContext;
 		if (!pCtx || routedError(err)) return;
 		try {
 			stampRoutingMeta(err, this.routingMeta(pCtx));
@@ -2389,16 +2365,15 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			// Cloudflare Workers can truncate this to 1024 bytes. partitionContext.doName holds the full name.
 			actorName: this.ctx.id.name,
 			databaseSize: this.#store.databaseSize,
-			depth: this.#_depth,
-			// Always put the partition context in the logs for better debugging, even if it's undefined.
-			// KeyBytes fields are rendered via keyForLog so they never appear as bare Uint8Array.
-			partitionContext: pCtxForLog(this.#_partitionContext),
+			depth: this.#_identity ? this.depth() : undefined,
+			// Always put the route context in the logs for better debugging, even if it's undefined. It
+			// holds no KeyBytes; the range boundaries of the identity are rendered via keyForLog below.
+			partitionContext: this.#_routeContext,
+			range: rangeForLog(this.#_identity),
 		};
 		const importSource = this.#target.importRecord()?.source;
 		if (importSource) {
-			Object.assign(info, {
-				importSource: { actorName: importSource.doName, actorId: importSource.primaryDoIdStr },
-			});
+			Object.assign(info, { importSource: { actorName: importSource.doName } });
 		}
 		return info;
 	}
@@ -2409,21 +2384,33 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
  * rows, and nothing writes it. The partition suites read it.
  */
 export type SplitStatusView =
-	| { status: "split_queued"; splitType: SplitType; createdAt: number; partitionContext: PartitionContextResolved }
+	| { status: "split_queued"; splitType: SplitType; createdAt: number; partitionContext: FokosDbRouteContext }
 	| {
 			status: "split_started" | "split_completed";
 			splitType: SplitType;
 			createdAt: number;
-			partitionContext: PartitionContextResolved;
-			childPartitionContexts: PartitionContextResolved[];
+			partitionContext: FokosDbRouteContext;
+			childPartitionContexts: FokosDbRouteContext[];
 			migratedChildDoNames: string[];
 			history: {
 				status: "split_queued" | "split_started";
 				splitType: SplitType;
 				createdAt: number;
-				partitionContext: PartitionContextResolved;
+				partitionContext: FokosDbRouteContext;
 			}[];
 	  };
+
+/** The range a partition owns, rendered for a log line. KeyBytes never appear as bare Uint8Array. */
+function rangeForLog(identity: FokosPartitionIdentity | undefined): Record<string, unknown> | undefined {
+	const range = identity?.range;
+	if (!range) return undefined;
+	return {
+		hashKey: KeyCodec.keyForLog(range.hashKey),
+		start: range.start === null ? null : KeyCodec.keyForLog(range.start),
+		end: range.end === null ? null : KeyCodec.keyForLog(range.end),
+		depth: range.depth,
+	};
+}
 
 /** The migration status the old KV key reported, taken from the import record that replaced it. */
 function derivedMigrationStatus(

@@ -92,11 +92,11 @@ export { compileConditionExpression, compileUpdateExpression } from "../shared/e
 
 // ─── Partition topology ───────────────────────────────────────────────────────
 
-export { PartitionContextCreator } from "../sharding/partition-context.js";
-export type { PartitionContext, PartitionContextResolved, SplitConditions } from "../sharding/partition-context.js";
+export { PartitionContextCreator } from "../shared/partition-context.js";
+export type { FokosDbPolicy, FokosDbRouteContext, FokosDbTableConfig, SplitConditions } from "../shared/partition-context.js";
 
-export { PartitionTopologyRouterImpl } from "../sharding/router.js";
-export type { PartitionTopologyRouter } from "../sharding/router.js";
+export { FokosRouter } from "../sharding/router.js";
+export type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────
 

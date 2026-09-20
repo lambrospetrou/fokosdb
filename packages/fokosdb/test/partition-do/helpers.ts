@@ -8,9 +8,9 @@ import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
-import { PartitionContextCreator } from "../../src/sharding/partition-context.js";
+import { PartitionContextCreator } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
+import { FokosRouter } from "../../src/sharding/router.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 
@@ -41,7 +41,7 @@ export function makeStub(opts?: PartitionOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 		...opts,
 	});
-	const ctx = new PartitionTopologyRouterImpl(base).pickPartition(kb("dummyHashKey")).partitionContext;
+	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy).rootContext(kb("dummyHashKey"));
 	return { ctx, stub: testPartitionStub(ctx.doName) };
 }
 

@@ -1,17 +1,16 @@
-import { env } from "cloudflare:workers";
-import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
-import { partitionNamespace } from "../shared/do-stubs.js";
 import type { PartitionNodeId } from "./types.js";
+import type { RangeAncestorInfo } from "./types.js";
+import type { FokosPartitionIdentity, FokosRouteContext } from "./route-context.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { assertExists } from "../shared/tsutils.js";
 import invariant from "../shared/invariant.js";
 
 /**
- * Pure partition-identity codec: the opaque partition ID wire formats, DO naming, and
- * deterministic ID resolution. Boundary rule: `idFromName` resolution is allowed here (it is
- * deterministic and performs no I/O); stub acquisition (`.get`) is NOT — only DO classes and
- * FokosDB hold stubs.
+ * Pure partition-identity codec: the opaque partition ID wire formats and DO naming. A route context
+ * for another partition is derived here from the caller's own context, so the immutable identity is
+ * computed and the mutable parts travel unchanged. Nothing here resolves a Durable Object ID or a
+ * stub: `idFromName` recreates the deterministic ID wherever a stub is made.
  */
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
@@ -33,7 +32,7 @@ function isSafeNameByte(b: number): boolean {
 }
 
 // No matching decoder by design: the DO name is identity/serialization ONLY and is never decoded back
-// to keys in business logic — the in-memory rangePartition KeyBytes come from the opaque partitionId.
+// to keys in business logic — the in-memory range identity comes from the opaque partitionId.
 function encodeRangeComponent(bytes: KeyBytes): string {
 	let out = "";
 	for (const b of bytes) {
@@ -45,83 +44,80 @@ function encodeRangeComponent(bytes: KeyBytes): string {
 // Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
 // three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
 // The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
-function rangePartitionDoName(tableName: string, hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): string {
+function rangePartitionDoName(shardGroup: string, hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
 	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
-	return `${tableName}.r.${hk}.${start}.${end}`;
+	return `${shardGroup}.r.${hk}.${start}.${end}`;
 }
 
-/**
- * `ctx` without `_partitionIdBytes`. A context for another partition must not copy them: they cache the
- * id of `ctx`, and the routing code reads them in place of `partitionId`, so the new context would
- * route as `ctx`.
- */
-function withoutIdBytes<C extends PartitionContext>(ctx: C): C {
-	const { _partitionIdBytes: _dropped, ...rest } = ctx as C & { _partitionIdBytes?: Uint8Array };
-	return rest as C;
-}
-
-// Resolves a PartitionContextResolved for a range-structure DO (root or child).
-// Same return shape as pickPartition / pickChildPartition so callers can use the result uniformly.
-export function resolveRangePartitionContext(
-	base: PartitionContext,
+/** The route context of a range partition (root or child) of the same shard group as `base`. */
+export function resolveRangePartitionContext<P>(
+	base: FokosRouteContext<P>,
 	hashKey: KeyBytes,
 	startBoundary: KeyBytes | null,
 	endBoundary: KeyBytes | null,
-): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, startBoundary, endBoundary).encode(true);
-	const doId = partitionNamespace(env, base).idFromName(doName!);
-	return {
-		doId,
-		partitionContext: {
-			...withoutIdBytes(base),
-			doName: doName!,
-			primaryDoIdStr: doId.toString(),
-			partitionId: opaque,
-			rangePartition: { hashKey, startBoundary, endBoundary },
-		},
-	};
+): FokosRouteContext<P> {
+	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base.topology.shardGroup, hashKey, startBoundary, endBoundary).encode(
+		true,
+	);
+	assertExists(doName);
+	return { ...base, doName, partitionId: opaque };
 }
 
-/** Deterministic DO ID resolution (no I/O) through the namespace the context names. */
-export function resolveDoId(ctx: PartitionContext, doName: string): DurableObjectId {
-	return partitionNamespace(env, ctx).idFromName(doName);
+/** The route contexts of the N hash children of a splitting hash parent. */
+export function resolveHashChildPartitionContexts<P>(parent: FokosRouteContext<P>): FokosRouteContext<P>[] {
+	return PartitionIdHelper.calculateHashChildPartitionIds(parent).map(({ doName, partitionIdOpaque }) => ({
+		...parent,
+		doName,
+		partitionId: partitionIdOpaque,
+	}));
 }
 
-// Resolves the N hash child partition contexts of a splitting hash parent.
-export function resolveHashChildPartitionContexts(parentContext: PartitionContextResolved): PartitionContextResolved[] {
-	const childIds = PartitionIdHelper.calculateHashChildPartitionIds(parentContext);
-	return childIds.map(({ doName, partitionIdOpaque }) => {
-		const childDoId = partitionNamespace(env, parentContext).idFromName(doName);
-		return {
-			...withoutIdBytes(parentContext),
-			doName,
-			primaryDoIdStr: childDoId.toString(),
-			partitionId: partitionIdOpaque,
-		};
-	});
-}
-
-// Resolves a descendant hash partition context by appending child indexes to the owner's encoded ID.
-export function resolveDescendantHashPartitionContext(
-	basePartitionContext: PartitionContext,
-	partitionContext: PartitionContextResolved,
+/** The route context of a descendant hash partition: the owner's encoded ID plus the appended child indexes. */
+export function resolveDescendantHashPartitionContext<P>(
+	base: FokosRouteContext<P>,
 	partitionIdBytes: Uint8Array,
 	hashIdxs: number[],
-): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-	const { doName, opaque } = new PartitionIdHelper(basePartitionContext, partitionIdBytes).appendHashIdx(hashIdxs).encode(true);
+): FokosRouteContext<P> {
+	const { doName, opaque } = new PartitionIdHelper(base.topology.shardGroup, partitionIdBytes).appendHashIdx(hashIdxs).encode(true);
 	assertExists(doName);
-	const doId = partitionNamespace(env, basePartitionContext).idFromName(doName);
+	return { ...base, doName, partitionId: opaque };
+}
+
+/**
+ * Decodes the stored identity of a partition from its route context. A range partition also needs
+ * the depth and the ancestors that only its `fokosInit` carries.
+ */
+export function partitionIdentityFrom(
+	ctx: FokosRouteContext<unknown>,
+	range?: { depth: number; ancestors: RangeAncestorInfo[] },
+): FokosPartitionIdentity {
+	const bytes = Uint8Array.fromHex(ctx.partitionId);
+	const decoded = PartitionIdHelper.decode(bytes);
+	const ref = { partitionId: ctx.partitionId, doName: ctx.doName };
+	if (decoded.schema === PartitionIdHelper.SCHEMA_HASH_V1) {
+		return {
+			schema: 1,
+			ref,
+			kind: "hash",
+			hash: { rootIndex: decoded.rootIdx, path: Array.from(bytes.subarray(4, 4 + decoded.depth)) },
+			topology: ctx.topology,
+		};
+	}
+	invariant(range, "fokos/topology.partitionIdentityFrom: a range partition needs its depth and ancestors");
 	return {
-		doId,
-		partitionContext: {
-			...withoutIdBytes(partitionContext),
-			doName,
-			primaryDoIdStr: doId.toString(),
-			partitionId: opaque,
-		},
+		schema: 1,
+		ref,
+		kind: "range",
+		range: { hashKey: decoded.hashKey, start: decoded.startBoundary, end: decoded.endBoundary, ...range },
+		topology: ctx.topology,
 	};
+}
+
+/** The depth of a partition in its tree: the hash child path length, or the range depth its `fokosInit` gave it. */
+export function identityDepth(identity: FokosPartitionIdentity): number {
+	return identity.hash ? identity.hash.path.length : identity.range!.depth;
 }
 
 // Re-exported from hash-primitives.ts (lives there to break the circular dependency with hash-topology.ts).
@@ -156,17 +152,17 @@ export class PartitionIdHelper {
 		return partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR);
 	}
 
-	static doName(basePartitionContext: PartitionContext, bytes: Uint8Array): string {
+	static doName(shardGroup: string, bytes: Uint8Array): string {
 		if (bytes[0] === PartitionIdHelper.SCHEMA_HASH_V1) {
 			const root = (bytes[1] << 8) | bytes[2];
 			const depth = bytes[3];
 			const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
-			return `${basePartitionContext.tableName}.h.${root}${suffix}`;
+			return `${shardGroup}.h.${root}${suffix}`;
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);
 		invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/topology.doName: unreachable");
-		return rangePartitionDoName(basePartitionContext.tableName, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
+		return rangePartitionDoName(shardGroup, decoded.hashKey, decoded.startBoundary, decoded.endBoundary);
 	}
 
 	// Decode a partition ID bytes to a schema-specific representation.
@@ -201,7 +197,7 @@ export class PartitionIdHelper {
 
 	// Creates a PartitionIdHelper for a range-structure DO. null start/end = unbounded edge.
 	static fromRangePartition(
-		base: PartitionContext,
+		shardGroup: string,
 		hashKey: KeyBytes,
 		startBoundary: KeyBytes | null,
 		endBoundary: KeyBytes | null,
@@ -228,10 +224,10 @@ export class PartitionIdHelper {
 		bytes.set(hkBytes, 10);
 		bytes.set(skBytes, 10 + hkLen);
 		bytes.set(endBytes, 10 + hkLen + startLen);
-		return new PartitionIdHelper(base, bytes);
+		return new PartitionIdHelper(shardGroup, bytes);
 	}
 
-	static fromHashIdxs(basePartitionContext: PartitionContext, hashIdxs: number[]): PartitionIdHelper {
+	static fromHashIdxs(shardGroup: string, hashIdxs: number[]): PartitionIdHelper {
 		invariant(hashIdxs.length >= 1, "fokos/topology.fromHashIdxs: hashIdxs must not be empty");
 		// hashIdxs[0] is the root index (u16), hashIdxs[1..] are sub-tree child indexes (u8 each).
 		const depth = hashIdxs.length - 1;
@@ -241,7 +237,7 @@ export class PartitionIdHelper {
 		bytes[2] = hashIdxs[0] & 0xff; // root index low byte
 		bytes[3] = depth; // sub-tree depth (u8)
 		for (let i = 0; i < depth; i++) bytes[4 + i] = hashIdxs[i + 1];
-		return new PartitionIdHelper(basePartitionContext, bytes);
+		return new PartitionIdHelper(shardGroup, bytes);
 	}
 
 	// Readers for the encoded partition ID bytes — SCHEMA_HASH_V1 only.
@@ -264,22 +260,23 @@ export class PartitionIdHelper {
 	 * TODO: Split the hash and the range partition IDs into two classes, so that these helpers need no
 	 * schema check.
 	 */
-	static calculateHashChildPartitionIds(parentContext: PartitionContextResolved): {
+	static calculateHashChildPartitionIds(parent: FokosRouteContext<unknown>): {
 		doName: string;
 		partitionIdOpaque: string;
 	}[] {
-		const parentBytes = Uint8Array.fromHex(parentContext.partitionId);
+		const parentBytes = Uint8Array.fromHex(parent.partitionId);
 		invariant(parentBytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${parentBytes[0]}`);
-		const result = Array.from({ length: parentContext.hashSplitN }, (_, i) => {
-			const { doName, opaque } = new PartitionIdHelper(parentContext, parentBytes).appendHashIdx(i).encode(true);
+		const { shardGroup, hashSplitN } = parent.topology;
+		const result = Array.from({ length: hashSplitN }, (_, i) => {
+			const { doName, opaque } = new PartitionIdHelper(shardGroup, parentBytes).appendHashIdx(i).encode(true);
 			return {
 				doName: doName!,
 				partitionIdOpaque: opaque,
 			};
 		});
 		invariant(
-			result.length === parentContext.hashSplitN,
-			`fokos/topology.calculateChildPartitionIds: expected ${parentContext.hashSplitN} children, got ${result.length}`,
+			result.length === hashSplitN,
+			`fokos/topology.calculateChildPartitionIds: expected ${hashSplitN} children, got ${result.length}`,
 		);
 		return result;
 	}
@@ -288,7 +285,7 @@ export class PartitionIdHelper {
 	#appendedHashIdxs: number[];
 
 	constructor(
-		private readonly basePartitionContext: PartitionContext,
+		private readonly shardGroup: string,
 		// Either the opaque representation as encoded, or the bytes before encoding.
 		partitionIdOpaque?: string | Uint8Array,
 	) {
@@ -339,7 +336,7 @@ export class PartitionIdHelper {
 		}
 		let doName: string | undefined;
 		if (includeDoName) {
-			doName = PartitionIdHelper.doName(this.basePartitionContext, bytes);
+			doName = PartitionIdHelper.doName(this.shardGroup, bytes);
 		}
 		return { bytes, opaque: bytes.toHex(), doName };
 	}

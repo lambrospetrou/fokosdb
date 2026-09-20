@@ -1,6 +1,5 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
-import type { RangeAncestorInfo } from "../../sharding/types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 import { one, tryOne } from "../sql-cursor.js";
@@ -2384,47 +2383,9 @@ export class PartitionStore {
 	// ─── range_hierarchy ────────────────────────────────────────────────────
 
 	/**
-	 * Called exactly once, from initFromSplit, before any concurrent request can reach this DO.
-	 * Boundaries are already decoded to the public wire representation (see `RangeAncestorInfo`).
-	 *
-	 * `hk` is the partition's own hash key. Every row in this table is written under the real hash key
-	 * it describes — ancestors here, learned router boundaries in `insertRangePartitionBoundary` — so
-	 * a single convention covers both.
+	 * Learns one range boundary. Every row is written under the real hash key it describes, so a hash
+	 * partition can hold the boundaries of many promoted keys in one table.
 	 */
-	setRangeAncestors(hk: KeyBytes, ancestors: RangeAncestorInfo[]): void {
-		for (const a of ancestors) {
-			this.#storage.sql.exec(
-				`INSERT OR IGNORE INTO range_hierarchy (hk, depth, sk_start_boundary, sk_end_boundary) VALUES (?, ?, ?, ?)`,
-				hk,
-				a.depth,
-				a.startBoundary,
-				a.endBoundary,
-			);
-		}
-	}
-
-	/**
-	 * Ancestor partitions that own `hk`:
-	 *
-	 * - `hk`: For hash partitions, this table also holds learned router boundaries for other hash keys
-	 * 	 (see `insertRangePartitionBoundary`), which are not ancestors of anything here.
-	 * - `depth < ltDepth`: For range partitions filtering here rather than relying on callers keeps this method correct
-	 *   now that the table also holds descendant-side cache entries (depth >= ltDepth).
-	 *
-	 * Together they match `idx_range_hierarchy_depth (hk, depth, ...)`, so the query is a covering
-	 * seek and needs no sort step. Dropping either one degrades it to a scan plus a temp B-tree.
-	 */
-	getRangeAncestors(hk: KeyBytes, ltDepth: number): RangeAncestorInfo[] {
-		return this.#storage.sql
-			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
-				`SELECT depth, sk_start_boundary, sk_end_boundary FROM range_hierarchy WHERE hk = ? AND depth < ? ORDER BY depth ASC`,
-				hk,
-				ltDepth,
-			)
-			.toArray()
-			.map((r) => ({ depth: r.depth, startBoundary: fromSqlKey(r.sk_start_boundary), endBoundary: fromSqlKey(r.sk_end_boundary) }));
-	}
-
 	insertRangePartitionBoundary(hk: KeyBytes, startBoundary: KeyBytes, endBoundary: KeyBytes, depth: number): void {
 		// FIXME: Bound this table with a size limit, a TTL, or a cleanup policy. A range router learns
 		// more boundaries over time, and nothing removes them.
@@ -2449,8 +2410,7 @@ export class PartitionStore {
 		hk: KeyBytes,
 		sortKey: KeyBytes,
 	): { depth: number; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null } | null {
-		// Boundaries are stored with the empty sentinel `[]` for unbounded edges (consistent with the start
-		// side and `getRangeAncestors`). `[]` is the byte minimum, which is correct for an unbounded start
+		// Boundaries are stored with the empty sentinel `[]` for unbounded edges. `[]` is the byte minimum, which is correct for an unbounded start
 		// (`start <= sortKey` always holds) but NOT for an unbounded end — hence the explicit sentinel check
 		// in the WHERE clause. Real keys are never empty (KeyCodec rejects empty input), so `[]` is an
 		// unambiguous "unbounded" tag. The sentinel semantics stay encapsulated here: the result decodes

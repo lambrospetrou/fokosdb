@@ -2,12 +2,14 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
-import { FokosError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
 import { PartitionStore } from "../shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
-import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
+import { PartitionContextCreator, type FokosDbRouteContext } from "../shared/partition-context.js";
+import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
+import { FokosRouter } from "./router.js";
+import { isRangePartition } from "./route-context.js";
 import { HashPartitionTopologyImpl, RangePartitionTopologyImpl, type OperationIntent } from "./split-policy.js";
 import type { RepartitionRouting } from "./repartition-types.js";
 
@@ -66,8 +68,9 @@ describe("shouldAllow size backpressure applies to growing writes only", () => {
 	});
 });
 
-function baseContext(maxSizeMb: number) {
-	return PartitionContextCreator.create({
+/** The one root of a fresh table whose two split caps are `maxSizeMb`. */
+function hashContext(maxSizeMb: number): FokosDbRouteContext {
+	const cfg = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `splitpolicy-${crypto.randomUUID()}`,
@@ -77,26 +80,21 @@ function baseContext(maxSizeMb: number) {
 		rangeSplitN: 2,
 		rangeSplitConditions: { maxSizeMb },
 	});
+	return new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy).allRoots()[0];
 }
 
-function hashContext(maxSizeMb: number): PartitionContextResolved {
-	const base = baseContext(maxSizeMb);
-	const { opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [0]).encode(true);
-	return { ...base, doName: doName!, primaryDoIdStr: "", partitionId: opaque };
+function rangeContext(maxSizeMb: number, startBoundary: KeyBytes | null = null, endBoundary: KeyBytes | null = null): FokosDbRouteContext {
+	return resolveRangePartitionContext(hashContext(maxSizeMb), HK, startBoundary, endBoundary);
 }
 
-function rangeContext(
-	maxSizeMb: number,
-	startBoundary: KeyBytes | null = null,
-	endBoundary: KeyBytes | null = null,
-): PartitionContextResolved {
-	return resolveRangePartitionContext(baseContext(maxSizeMb), HK, startBoundary, endBoundary).partitionContext;
-}
+/** A range partition here is always a root: the tests never split one. */
+const identityOf = (pCtx: FokosDbRouteContext) =>
+	partitionIdentityFrom(pCtx, isRangePartition(pCtx) ? { depth: 0, ancestors: [] } : undefined);
 
 // Runs `fn` against a topology backed by REAL Durable Object storage, so `sql.databaseSize` is real.
 async function withTopology<T>(
-	make: (pCtx: PartitionContextResolved, state: DurableObjectState, store: PartitionStore) => T,
-	pCtx: PartitionContextResolved,
+	make: (pCtx: FokosDbRouteContext, state: DurableObjectState, store: PartitionStore) => T,
+	pCtx: FokosDbRouteContext,
 	fn: (topology: T) => void,
 ): Promise<void> {
 	const stub = testPartitionStub(`splitpolicy-${crypto.randomUUID()}`);
@@ -114,12 +112,12 @@ const NOT_REPARTITIONING: RepartitionRouting = {
 	ownedByRangeTree: () => false,
 };
 
-function withHashTopology(pCtx: PartitionContextResolved, fn: (t: HashPartitionTopologyImpl) => void): Promise<void> {
-	return withTopology((c, state, store) => new HashPartitionTopologyImpl(c, state, store, NOT_REPARTITIONING), pCtx, fn);
+function withHashTopology(pCtx: FokosDbRouteContext, fn: (t: HashPartitionTopologyImpl) => void): Promise<void> {
+	return withTopology((c, state, store) => new HashPartitionTopologyImpl(c, identityOf(c), state, store, NOT_REPARTITIONING), pCtx, fn);
 }
 
-function withRangeTopology(pCtx: PartitionContextResolved, fn: (t: RangePartitionTopologyImpl) => void): Promise<void> {
-	return withTopology((c, state, store) => new RangePartitionTopologyImpl(c, state, store, NOT_REPARTITIONING), pCtx, fn);
+function withRangeTopology(pCtx: FokosDbRouteContext, fn: (t: RangePartitionTopologyImpl) => void): Promise<void> {
+	return withTopology((c, state, store) => new RangePartitionTopologyImpl(c, identityOf(c), state, store, NOT_REPARTITIONING), pCtx, fn);
 }
 
 describe("updatePartitionContext replaces the mutable options of the context a topology holds", () => {
@@ -127,7 +125,7 @@ describe("updatePartitionContext replaces the mutable options of the context a t
 		const pCtx = hashContext(100);
 		await withHashTopology(pCtx, (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
-			topology.updatePartitionContext({ ...pCtx, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } });
+			topology.updatePartitionContext({ ...pCtx, policy: { ...pCtx.policy, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } } });
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
 		});
 	});
@@ -136,39 +134,18 @@ describe("updatePartitionContext replaces the mutable options of the context a t
 		const pCtx = rangeContext(100);
 		await withRangeTopology(pCtx, (topology) => {
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("ok");
-			topology.updatePartitionContext({ ...pCtx, rangeSplitConditions: { maxSizeMb: OVER_SIZE_MB } });
+			topology.updatePartitionContext({ ...pCtx, policy: { ...pCtx.policy, rangeSplitConditions: { maxSizeMb: OVER_SIZE_MB } } });
 			expect(topology.shouldAllow(HK, SK, "write")).toBe("reject_over_size");
-		});
-	});
-
-	it("a hash topology rejects a changed hashSplitN", async () => {
-		const pCtx = hashContext(100);
-		await withHashTopology(pCtx, (topology) => {
-			expect(() => topology.updatePartitionContext({ ...pCtx, hashSplitN: 4 })).toThrow(
-				invariantFailure("HashPartitionTopologyImpl partition identity changed"),
-			);
 		});
 	});
 
 	it("a hash topology rejects a changed partitionId", async () => {
 		const pCtx = hashContext(100);
-		const otherId = PartitionIdHelper.fromHashIdxs(pCtx, [1]).encode(true).opaque;
+		const otherId = PartitionIdHelper.fromHashIdxs(pCtx.topology.shardGroup, [1]).encode(true).opaque;
 		await withHashTopology(pCtx, (topology) => {
 			expect(() => topology.updatePartitionContext({ ...pCtx, partitionId: otherId })).toThrow(
 				invariantFailure("HashPartitionTopologyImpl partition identity changed"),
 			);
-		});
-	});
-
-	it("a range topology rejects a changed boundary while the partitionId stays the same", async () => {
-		const pCtx = rangeContext(100, KeyCodec.encode("m"), null);
-		await withRangeTopology(pCtx, (topology) => {
-			expect(() =>
-				topology.updatePartitionContext({
-					...pCtx,
-					rangePartition: { ...pCtx.rangePartition!, endBoundary: KeyCodec.encode("z") },
-				}),
-			).toThrow(invariantFailure("RangePartitionTopologyImpl partition identity changed"));
 		});
 	});
 
@@ -190,12 +167,30 @@ describe("updatePartitionContext replaces the mutable options of the context a t
 		let failure: unknown;
 		try {
 			await stub.apiPutItem(
-				{ ...pCtx, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } },
+				{ ...pCtx, policy: { ...pCtx.policy, hashSplitConditions: { maxSizeMb: OVER_SIZE_MB } } },
 				{ hashKey: HK, sortKey: SK, data: "v", kind: "text" },
 			);
 		} catch (error) {
 			failure = error;
 		}
 		expect(FokosError.isCode(failure, UNAVAILABLE_CODES.partition_over_size)).toBe(true);
+	});
+
+	it("a partition rejects a request whose topology differs from the stored one", async () => {
+		const pCtx = hashContext(100);
+		const stub = testPartitionStub(pCtx.doName);
+
+		await stub.apiPutItem(pCtx, { hashKey: HK, sortKey: SK, data: "v", kind: "text" });
+
+		let failure: unknown;
+		try {
+			await stub.apiPutItem(
+				{ ...pCtx, topology: { ...pCtx.topology, hashSplitN: 4 } },
+				{ hashKey: HK, sortKey: SK, data: "v", kind: "text" },
+			);
+		} catch (error) {
+			failure = error;
+		}
+		expect(FokosError.isCode(failure, INTERNAL_CODES.partition_context_mismatch)).toBe(true);
 	});
 });

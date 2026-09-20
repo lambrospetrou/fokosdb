@@ -24,18 +24,8 @@ const SHARDING_FORBIDDEN_SRC = [
 /**
  * The generic `src/shared/` modules that the sharding entry may reach. Every other `src/shared/`
  * module is FokosDB code.
- *
- * `do-stubs.ts` reads the FokosDB binding and location hint, so it is host code. `partition-id.ts` and
- * `router.ts` call it to derive `primaryDoIdStr`, so it stays on the list until that field is dropped
- * and the two modules stop resolving Durable Object IDs.
  */
-const SHARDING_ALLOWED_SHARED = [
-	"src/shared/errors.ts",
-	"src/shared/invariant.ts",
-	"src/shared/tsutils.ts",
-	"src/shared/cache-lru.ts",
-	"src/shared/do-stubs.ts",
-];
+const SHARDING_ALLOWED_SHARED = ["src/shared/errors.ts", "src/shared/invariant.ts", "src/shared/tsutils.ts", "src/shared/cache-lru.ts"];
 
 /**
  * A `src/shared/` module that is not on the allow list. `src/shared/partition/` is exempt while the

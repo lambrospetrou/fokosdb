@@ -7,8 +7,8 @@ import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-p
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
-import { isHashPartition, isRangePartition } from "../../src/sharding/partition-context.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import { isHashPartition, isRangePartition } from "../../src/sharding/route-context.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	PartitionIdHelper,
@@ -17,7 +17,7 @@ import {
 	resolveDescendantHashPartitionContext,
 	resolveRangePartitionContext,
 } from "../../src/sharding/partition-id.js";
-import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
+import { FokosRouter } from "../../src/sharding/router.js";
 import { RANGE_PROMOTION_FRACTION } from "../../src/sharding/split-policy.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
 import type { FokosMigrationPage } from "../../src/sharding/repartition-types.js";
@@ -26,8 +26,8 @@ import { MAX_ITEM_BYTES, validateItemKeys } from "../../src/shared/transaction-l
 import { type PartitionOptions, type SplitStartedOrCompleted, expectSplitStatus, kb, makeStub } from "./helpers.js";
 
 type PartitionWriter = {
-	apiPutItem(ctx: PartitionContextResolved, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
-	status(ctx?: PartitionContextResolved): Promise<{ splitStatus?: SplitStatusView }>;
+	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
+	status(ctx?: FokosDbRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
 // Each hash filler is below the promotion threshold and the write-reject grace band.
@@ -58,16 +58,16 @@ export function makePartition(opts?: PartitionOptions): TestPartition {
 }
 
 export class TestPartition {
-	readonly ctx: PartitionContextResolved;
+	readonly ctx: FokosDbRouteContext;
 	readonly stub: DurableObjectStub<PartitionDO>;
 
-	private constructor(ctx: PartitionContextResolved, stub?: DurableObjectStub<PartitionDO>) {
+	private constructor(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>) {
 		this.ctx = ctx;
 		this.stub = stub ?? testPartitionStub(ctx.doName);
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */
-	static at(ctx: PartitionContextResolved, stub?: DurableObjectStub<PartitionDO>): TestPartition {
+	static at(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>): TestPartition {
 		return new TestPartition(ctx, stub);
 	}
 
@@ -125,7 +125,7 @@ export class TestPartition {
 	async childOwning(hashKey: string): Promise<TestPartition> {
 		const children = await this.children();
 		const idBytes = Uint8Array.fromHex(this.ctx.partitionId);
-		const idx = hashChildIndex(kb(hashKey), PartitionIdHelper.depth(idBytes), this.ctx.hashSplitN);
+		const idx = hashChildIndex(kb(hashKey), PartitionIdHelper.depth(idBytes), this.ctx.topology.hashSplitN);
 		const expected = this.hashChildren()[idx];
 		const owner = children.find((c) => c.doName === expected?.doName);
 		invariant(owner, `${this.doName}: no child owns "${hashKey}"`);
@@ -157,7 +157,7 @@ export class TestPartition {
 
 	/** The range root of `hashKey`: the partition a promotion of that key creates. */
 	rangeRoot(hashKey: string): TestPartition {
-		return TestPartition.at(resolveRangePartitionContext(this.ctx, kb(hashKey), null, null).partitionContext);
+		return TestPartition.at(resolveRangePartitionContext(this.ctx, kb(hashKey), null, null));
 	}
 
 	/** Runs the partition's scheduled alarm once, through the runtime test API. A no-op if none is set. */
@@ -217,17 +217,15 @@ export class TestPartition {
 	private *fillerHashKeys(): Generator<string> {
 		const prefix = `_split_${crypto.randomUUID()}`;
 		const depth = PartitionIdHelper.depth(Uint8Array.fromHex(this.ctx.partitionId));
-		const router = new PartitionTopologyRouterImpl(this.ctx);
+		const { hashSplitN } = this.ctx.topology;
+		const router = new FokosRouter(this.ctx.topology, this.ctx.rangeConfig, this.ctx.policy);
 		let emitted = 0;
 		for (let i = 0; i < 1_000_000; i++) {
 			const key = `${prefix}_${i}`;
-			const root = router.pickPartition(kb(key)).partitionContext;
-			const indices = Array.from({ length: depth }, (_, d) => hashChildIndex(kb(key), d, this.ctx.hashSplitN));
-			const owner = resolveDescendantHashPartitionContext(root, root, Uint8Array.fromHex(root.partitionId), indices).partitionContext;
-			if (
-				owner.partitionId !== this.ctx.partitionId ||
-				hashChildIndex(kb(key), depth, this.ctx.hashSplitN) !== emitted % this.ctx.hashSplitN
-			) {
+			const root = router.rootContext(kb(key));
+			const indices = Array.from({ length: depth }, (_, d) => hashChildIndex(kb(key), d, hashSplitN));
+			const owner = resolveDescendantHashPartitionContext(root, Uint8Array.fromHex(root.partitionId), indices);
+			if (owner.partitionId !== this.ctx.partitionId || hashChildIndex(kb(key), depth, hashSplitN) !== emitted % hashSplitN) {
 				continue;
 			}
 			emitted++;
@@ -247,7 +245,7 @@ export class TestPartition {
 	async triggerRangeSplit(sortKey: (i: number) => string): Promise<string[]> {
 		invariant(isRangePartition(this.ctx), `${this.doName}: not a range partition`);
 		invariant(!(await this.status()).splitStatus, `${this.doName}: already splitting`);
-		const { hashKey, startBoundary, endBoundary } = this.ctx.rangePartition;
+		const { hashKey, startBoundary, endBoundary } = rangeOf(this.ctx);
 		const data = "x".repeat(Math.min(RANGE_ITEM_DATA.length, Math.floor((this.maxSizeMb("range") * 1024 * 1024) / 20)));
 		const sks: string[] = [];
 		for (let i = 0; i < MAX_RANGE_FILLER_WRITES; i++) {
@@ -372,10 +370,17 @@ export class TestPartition {
 	}
 
 	private maxSizeMb(kind: "hash" | "range"): number {
-		const maxSizeMb = kind === "hash" ? this.ctx.hashSplitConditions?.maxSizeMb : this.ctx.rangeSplitConditions?.maxSizeMb;
+		const maxSizeMb = kind === "hash" ? this.ctx.policy.hashSplitConditions.maxSizeMb : this.ctx.policy.rangeSplitConditions.maxSizeMb;
 		invariant(maxSizeMb, `${this.doName}: no ${kind} maxSizeMb configured`);
 		return maxSizeMb;
 	}
+}
+
+/** The immutable range a range partition owns, decoded from its partition ID. */
+export function rangeOf(ctx: FokosDbRouteContext) {
+	const decoded = PartitionIdHelper.decode(Uint8Array.fromHex(ctx.partitionId));
+	invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, `${ctx.doName}: not a range partition`);
+	return decoded;
 }
 
 /**

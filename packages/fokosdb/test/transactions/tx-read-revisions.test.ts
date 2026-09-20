@@ -6,8 +6,7 @@ import { testPartitionStub } from "../stub-helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -19,8 +18,7 @@ const itemExists = () => compileConditionExpression({ op: "exists", args: [{ ref
 
 /** The stub and resolved context of the partition that owns `key`. */
 function owningPartition(db: FokosDB, key: Key) {
-	const topology = db.options().topology as PartitionTopologyRouterImpl;
-	const { partitionContext } = topology.pickPartition(kb(key.hashKey), kb(key.sortKey));
+	const partitionContext = db.options().topology.rootContext(kb(key.hashKey));
 	return { stub: testPartitionStub(partitionContext.doName), pCtx: partitionContext };
 }
 
@@ -51,7 +49,7 @@ async function holdPendingLock(
  * a two-phase `transactGetItems`. The callback calls the DO instance directly — no RPC, no mocked
  * response — so the second phase observes a real committed mutation.
  */
-function betweenPhases(doName: string, between: (this: PartitionDO, pCtx: PartitionContextResolved) => Promise<void>) {
+function betweenPhases(doName: string, between: (this: PartitionDO, pCtx: FokosDbRouteContext) => Promise<void>) {
 	const original = PartitionDO.prototype.txReadForTransaction;
 	const calls = new Map<string, number>();
 	return vi.spyOn(PartitionDO.prototype, "txReadForTransaction").mockImplementation(async function (this: PartitionDO, pCtx, request) {

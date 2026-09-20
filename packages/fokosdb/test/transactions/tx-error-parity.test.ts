@@ -103,7 +103,7 @@ describe.each(PATHS)("transactGetItems on %s", (_path, pathOptions) => {
 async function lockItem(db: ReturnType<typeof makeDB>, key: Key): Promise<() => Promise<void>> {
 	const hashKey = KeyCodec.encode(key.hashKey);
 	const sortKey = KeyCodec.encode(key.sortKey);
-	const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
+	const partitionContext = db.options().topology.rootContext(hashKey);
 	const stub = testPartitionStub(partitionContext.doName);
 	const transactionId = crypto.randomUUID().replaceAll("-", "");
 	await stub.txPrepare(partitionContext, {

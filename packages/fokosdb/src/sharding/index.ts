@@ -17,48 +17,41 @@ export type { BloomFilterSnapshot } from "./bloom-filter.js";
 // ─── Identity and context ─────────────────────────────────────────────────────
 
 export {
-	PartitionContextCreator,
-	areImmutableOptionsEqual,
-	areMutableOptionsEqual,
-	assertCtxHasIdBytes,
+	FOKOS_IDENTITY_KV_KEY,
+	FOKOS_POLICY_KV_KEY,
+	RESERVED_SHARD_GROUP_PREFIX,
 	isHashPartition,
 	isRangePartition,
-	pCtxForLog,
-} from "./partition-context.js";
+	refOf,
+	structurallyEqual,
+	topologiesEqual,
+	validateRangeConfig,
+	validateTopology,
+} from "./route-context.js";
 export type {
-	InitFromSplitOptions,
-	PartitionContext,
-	PartitionContextLivePartition,
-	PartitionContextResolved,
-	PartitionNamespaceKey,
-	SplitConditions,
-	TransactionCoordinatorNamespaceKey,
-} from "./partition-context.js";
+	FokosPartitionIdentity,
+	FokosPartitionRef,
+	FokosRangeConfig,
+	FokosRouteContext,
+	FokosStoredPolicy,
+	FokosTopology,
+} from "./route-context.js";
 export {
 	PartitionIdHelper,
 	RANGE_MAX,
 	RANGE_MIN,
+	identityDepth,
+	partitionIdentityFrom,
 	resolveDescendantHashPartitionContext,
-	resolveDoId,
 	resolveHashChildPartitionContexts,
 	resolveRangePartitionContext,
 } from "./partition-id.js";
-export type {
-	PartitionInfoInternal,
-	PartitionNodeId,
-	RangeAncestorInfo,
-	RegisterSplitOptions,
-	SplitStatus,
-	SplitType,
-	TopologyKVItem,
-	TopologyNode,
-	TopologyTree,
-} from "./types.js";
+export type { PartitionInfoInternal, PartitionNodeId, RangeAncestorInfo, SplitStatus, SplitType } from "./types.js";
 
 // ─── Routing and caches ───────────────────────────────────────────────────────
 
-export { PartitionTopologyRouterImpl } from "./router.js";
-export type { PartitionTopologyRouter } from "./router.js";
+export { FokosRouter } from "./router.js";
+export type { FokosWalkStub } from "./router.js";
 export { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "./forward-meta.js";
 export type { RoutedError } from "./forward-meta.js";
 export { HashTopology } from "./hash-topology.js";
@@ -66,7 +59,14 @@ export type { HashTopologySnapshot } from "./hash-topology.js";
 export { PartialRangeTopology } from "./partial-range-topology.js";
 export type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
 export { HashPartitionTopologyImpl, RangePartitionTopologyImpl, RANGE_PROMOTION_FRACTION, selectRangeAncestors } from "./split-policy.js";
-export type { OperationIntent, PartitionTopologySplitter, RoutingDecision } from "./split-policy.js";
+export type {
+	OperationIntent,
+	PartitionTopologySplitter,
+	RoutingDecision,
+	SplitConditions,
+	SplitPolicyContext,
+	SplitPolicyFields,
+} from "./split-policy.js";
 export {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -99,7 +99,6 @@ export type {
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
 	FokosPartitionControlRpc,
-	FokosPartitionRef,
 	FokosPartitionStatusRpc,
 	FokosPrepareDestroyRequest,
 	FokosRepartitionPeer,

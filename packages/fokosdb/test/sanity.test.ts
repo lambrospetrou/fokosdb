@@ -1,8 +1,8 @@
 import { env, exports } from "cloudflare:workers";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { PartitionContextCreator } from "../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../src/sharding/router.js";
+import { PartitionContextCreator } from "../src/shared/partition-context.js";
+import { FokosRouter } from "../src/sharding/router.js";
 
 describe("fokosdb", async () => {
 	const testSplitOptions = PartitionContextCreator.create({
@@ -18,9 +18,7 @@ describe("fokosdb", async () => {
 
 	it("should route to the right partition DO", async ({ expect }) => {
 		const db = new FokosDB({
-			topology: new PartitionTopologyRouterImpl({
-				...testSplitOptions,
-			}),
+			topology: new FokosRouter(testSplitOptions.topology, testSplitOptions.rangeConfig, testSplitOptions.policy),
 		});
 
 		await expect(

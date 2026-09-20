@@ -3,8 +3,9 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { refOf } from "../../src/sharding/route-context.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
 import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -63,8 +64,8 @@ describe("PartitionDO - splitting", () => {
 		const parentState = await partition.status();
 		expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 		expect(parentState.partitionContext).toMatchObject({
-			ns: "PARTITION_DO",
-			tableName: ctx.tableName,
+			policy: { ns: "PARTITION_DO" },
+			topology: { shardGroup: ctx.topology.shardGroup },
 		});
 
 		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext!).map((c) => c.doName);
@@ -75,14 +76,11 @@ describe("PartitionDO - splitting", () => {
 			const childState = await childStub.status();
 
 			expect(childState.partitionContext).toMatchObject({
-				ns: "PARTITION_DO",
-				tableName: ctx.tableName,
+				policy: { ns: "PARTITION_DO" },
+				topology: { shardGroup: ctx.topology.shardGroup },
 				doName: name,
 			});
-			expect(childState.parentPartitionContext).toMatchObject({
-				doName: ctx.doName,
-				primaryDoIdStr: ctx.primaryDoIdStr,
-			});
+			expect(childState.parentPartitionContext).toEqual({ doName: ctx.doName, partitionId: ctx.partitionId });
 			expect(childState.parentSplitType).toBe("hash");
 			// Children haven't crossed any split threshold of their own.
 			expect(childState.splitStatus).toBeUndefined();
@@ -93,12 +91,12 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.fokosinit-idempotent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 
 		const req = {
 			repartitionId: "r1",
-			source: parentCtx,
+			source: refOf(parentCtx),
 			target: childCtx,
 			slice: { kind: "hash_child" as const, childIndex: 0, depth: 1 },
 		};
@@ -111,8 +109,8 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		const status = await childStub.status();
-		expect(status.partitionContext?.primaryDoIdStr).toBe(childCtx.primaryDoIdStr);
-		expect(status.parentPartitionContext?.primaryDoIdStr).toBe(parentCtx.primaryDoIdStr);
+		expect(status.partitionContext?.doName).toBe(childName);
+		expect(status.parentPartitionContext).toEqual(refOf(parentCtx));
 		expect(status.parentSplitType).toBe("hash");
 		expect(status.migrationStatus).toBe("migration_initialized");
 	});
@@ -121,50 +119,50 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.fokosinit-conflict.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
+		const source = refOf(parentCtx);
 
-		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
+		await childStub.fokosInit({ repartitionId: "r1", source, target: childCtx, slice });
 
 		// runInDurableObject keeps each caught rejection inside the execution context of the DO, so none
 		// of them leaks as an unhandled rejection at the worker level.
 		const { ctx: otherParentCtx } = makeStub();
 		await runInDurableObject(childStub, async (instance: PartitionDO) => {
 			// A different repartition.
-			await expect(instance.fokosInit({ repartitionId: "r2", source: parentCtx, target: childCtx, slice })).rejects.toThrow(
+			await expect(instance.fokosInit({ repartitionId: "r2", source, target: childCtx, slice })).rejects.toThrow(
 				fokosErrorWith("partition_context_mismatch"),
 			);
 			// A different source.
-			await expect(instance.fokosInit({ repartitionId: "r1", source: otherParentCtx, target: childCtx, slice })).rejects.toThrow(
+			await expect(instance.fokosInit({ repartitionId: "r1", source: refOf(otherParentCtx), target: childCtx, slice })).rejects.toThrow(
 				fokosErrorWith("partition_context_mismatch"),
 			);
 			// A different slice.
 			await expect(
-				instance.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice: { ...slice, childIndex: 1 } }),
+				instance.fokosInit({ repartitionId: "r1", source, target: childCtx, slice: { ...slice, childIndex: 1 } }),
 			).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 
-	it("a matching fokosInit retry stores the latest mutable options of both contexts", async ({ expect }) => {
+	it("a matching fokosInit retry stores the latest policy of the target context", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub({ hashSplitConditions: { maxSizeMb: 100 } });
 		const childName = `test.fokosinit-mutable.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: PartitionContextResolved = { ...parentCtx, doName: childName, primaryDoIdStr: childId.toString() };
+		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
-		await childStub.fokosInit({ repartitionId: "r1", source: parentCtx, target: childCtx, slice });
+		await childStub.fokosInit({ repartitionId: "r1", source: refOf(parentCtx), target: childCtx, slice });
 		await childStub.fokosInit({
 			repartitionId: "r1",
-			source: { ...parentCtx, hashSplitConditions: { maxSizeMb: 50 } },
-			target: { ...childCtx, hashSplitConditions: { maxSizeMb: 25 } },
+			source: refOf(parentCtx),
+			target: { ...childCtx, policy: { ...childCtx.policy, hashSplitConditions: { maxSizeMb: 25 } } },
 			slice,
 		});
 
 		const status = await childStub.status();
-		expect(status.partitionContext?.hashSplitConditions.maxSizeMb).toBe(25);
-		expect(status.parentPartitionContext?.hashSplitConditions.maxSizeMb).toBe(50);
+		expect(status.partitionContext?.policy.hashSplitConditions.maxSizeMb).toBe(25);
 	});
 
 	it("exposes split status via status()", async ({ expect }) => {
