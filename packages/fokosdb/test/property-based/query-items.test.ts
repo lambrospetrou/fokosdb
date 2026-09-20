@@ -1,36 +1,32 @@
-// Property-based tests for queryItems. A query page is where the client-side paging logic lives:
-// one budget carries across the sub-queries, a cursor carries the position between pages, and the
-// keys and the json data are decoded at this boundary. Each property seeds a table with a random
-// write sequence, drains every page of a random request, and compares the whole sequence with an
-// in-memory model. A gap, a duplicate, a wrong order, or a lost boundary item fails the run.
+// Property-based tests for queryItems over one partition. A query page is where the paging logic of
+// the client lives: one budget carries across the sub-queries, a cursor carries the position between
+// pages, and this boundary decodes the keys and the json data. Each property seeds a table with a
+// random write sequence, drains every page of a random request, and compares the whole sequence with
+// the model. A gap, a duplicate, a wrong order, or a lost boundary item fails the run.
 //
-// The key oracle and the model live in query-model.ts, and query-items-split.test.ts compares
-// against the same ones.
-//
-// A failure prints `seed` and `path`. See item-crud.test.ts for how to replay them.
+// query-harness.ts holds the key oracle, the model and the drain. query-items-split.test.ts asks the
+// same questions of a key whose partition has split into a range tree.
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { QueryItemsOptions, SortKeyCondition } from "../../src/shared/types.js";
-import { arbItemData, expectedDataKind, makeTestDB, propertyRuns, type ItemData } from "./arbitraries.js";
+import { arbItemData, makeTestDB, propertyRuns, type ItemData } from "./harness.js";
 import {
-	drainQuery,
-	encodeKey,
-	expectedItems,
+	expectDrainedAnswer,
+	expectedAnswer,
 	itemId,
-	pageBudget,
-	publicItem,
-	type Model,
+	recordItem,
 	type OptionalQueryKey,
 	type Query,
 	type QueryKey,
-} from "./query-model.js";
+	type QueryModel,
+} from "./query-harness.js";
 
-// Every property runs many scenarios against real Durable Objects, and shrinking a failure runs
-// many more. The default 5 s vitest timeout would hide the counterexample.
+// Every property runs many scenarios against real Durable Objects, and a shrink runs many more.
+// The default 5 s vitest timeout would hide the counterexample.
 const PROPERTY_TIMEOUT_MS = 300_000;
 
-// ─── The scenario ───────────────────────────────────────────────────────────────
+// ─── The scenario ─────────────────────────────────────────────────────────────
 
 const bin = (...bytes: number[]) => new Uint8Array(bytes);
 
@@ -38,8 +34,9 @@ const bin = (...bytes: number[]) => new Uint8Array(bytes);
 // draws the first one far more often, so one partition holds enough sort keys to fill many pages.
 const HASH_KEYS: QueryKey[] = ["hk-a", "hk-b", bin(0x2a)];
 
-// Sort keys of one partition. They share prefixes and include an absent key (the byte minimum) and
-// binary keys (which the 0xFF tag sorts above every string), so the order of a page is not trivial.
+// The sort keys of one partition. They share prefixes, and they include an absent key (the byte
+// minimum) and binary keys (which the 0xFF tag sorts above every string), so the order of a page is
+// not trivial.
 const SORT_KEYS: OptionalQueryKey[] = [
 	undefined,
 	"a",
@@ -58,8 +55,8 @@ const SORT_KEYS: OptionalQueryKey[] = [
 	bin(0x02),
 ];
 
-// Query bounds. Half of them are stored sort keys and half fall between two of them, so a bound
-// lands on an item as often as it lands in a gap.
+// The bounds of a query. Half of them are stored sort keys and half fall between two of them, so a
+// bound lands on an item as often as it lands in a gap.
 const BOUNDS: QueryKey[] = ["a", "aa", "ab", "b", "b#", "b#1", "c", "d", bin(0x01), bin(0x01, 0x01), bin(0x02)];
 
 const arbHashKey = fc.oneof(
@@ -118,23 +115,15 @@ const arbRequest = fc.record({
 const arbScenario = fc.record({ seed: arbSeed, requests: fc.array(arbRequest, { minLength: 1, maxLength: 4 }) });
 
 /** Runs the write sequence against the database and returns the state it must leave behind. */
-async function applySeed(db: FokosDB, ops: readonly SeedOp[]): Promise<Model> {
-	const model: Model = new Map();
+async function applySeed(db: FokosDB, ops: readonly SeedOp[]): Promise<QueryModel> {
+	const model: QueryModel = new Map();
 	for (const op of ops) {
 		const id = itemId(op.hashKey, op.sortKey);
 		if (op.op === "put") {
 			const version = (model.get(id)?.version ?? 0) + 1;
 			const res = await db.putItem({ hashKey: op.hashKey, sortKey: op.sortKey, data: op.data });
 			expect(res.version).toBe(version);
-			model.set(id, {
-				hashKey: op.hashKey,
-				sortKey: op.sortKey,
-				hashKeyBytes: encodeKey(op.hashKey),
-				sortKeyBytes: encodeKey(op.sortKey),
-				data: op.data,
-				kind: expectedDataKind(op.data),
-				version,
-			});
+			recordItem(model, op.hashKey, op.sortKey, op.data, version);
 		} else {
 			const res = await db.deleteItem({ hashKey: op.hashKey, sortKey: op.sortKey });
 			expect(res.deleted).toBe(model.has(id));
@@ -152,13 +141,7 @@ describe("FokosDB queryItems — model-based properties", () => {
 				const model = await applySeed(db, seed);
 
 				for (const request of requests) {
-					const expected = request.queries.flatMap((query) => expectedItems(model, query));
-					const drained = await drainQuery(db, request, pageBudget(expected.length, request.queries.length));
-
-					expect(drained.items).toEqual(expected.map(publicItem));
-					expect(drained.count).toBe(expected.length);
-					// No filter is sent, so every evaluated candidate is also a matched one.
-					expect(drained.scannedCount).toBe(expected.length);
+					await expectDrainedAnswer(db, expectedAnswer(model, request.queries), request);
 				}
 			}),
 			{ numRuns: propertyRuns(25) },
@@ -172,13 +155,8 @@ describe("FokosDB queryItems — model-based properties", () => {
 				const model = await applySeed(db, seed);
 
 				for (const request of requests) {
-					const expected = request.queries.flatMap((query) => expectedItems(model, query));
 					const opts: QueryItemsOptions = { ...request, select: "count" };
-					const drained = await drainQuery(db, opts, pageBudget(expected.length, request.queries.length));
-
-					expect(drained.items).toHaveLength(0);
-					expect(drained.count).toBe(expected.length);
-					expect(drained.scannedCount).toBe(expected.length);
+					await expectDrainedAnswer(db, expectedAnswer(model, request.queries), opts);
 				}
 			}),
 			{ numRuns: propertyRuns(15) },
