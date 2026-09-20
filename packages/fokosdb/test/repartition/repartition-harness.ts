@@ -17,13 +17,16 @@ import { runInDurableObject } from "cloudflare:test";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
+import { PartitionContextCreator, type FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
+import { FokosRouter } from "../../src/sharding/router.js";
 import {
-	PartitionContextCreator,
-	type PartitionContext,
-	type PartitionContextLivePartition,
-	type PartitionContextResolved,
-} from "../../src/sharding/partition-context.js";
-import { PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
+	FOKOS_IDENTITY_KV_KEY,
+	FOKOS_POLICY_KV_KEY,
+	isRangePartition,
+	type FokosPartitionIdentity,
+	type FokosStoredPolicy,
+} from "../../src/sharding/route-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import {
@@ -49,9 +52,6 @@ export const kb = (s: string) => KeyCodec.encode(s);
  */
 export const T0 = 4_000_000_000_000;
 
-const CTX_KEY = "__partition_context";
-const DEPTH_KEY = "__partition_depth";
-
 /**
  * What a test sees once it is inside a node. One partition is both halves: a hash child is a target
  * first and a source later, and the two share the store but never call each other.
@@ -61,11 +61,11 @@ export type NodeEnv = {
 	target: RepartitionTarget;
 	store: PartitionStore;
 	storage: DurableObjectStorage;
-	ctx: PartitionContextLivePartition;
+	ctx: FokosDbRouteContext;
 };
 
 export type Node = {
-	ctx: PartitionContextResolved;
+	ctx: FokosDbRouteContext;
 	ref: FokosPartitionRef;
 	doName: string;
 	/** Runs `fn` inside this node, against its own real storage. */
@@ -75,11 +75,12 @@ export type Node = {
 };
 
 export type Cluster = {
-	base: PartitionContext;
+	/** The root context of the one-root table every node of the cluster belongs to. */
+	base: FokosDbRouteContext;
 	/** The node for a context, created on first use so a target exists before it is initialized. */
-	node(ctx: PartitionContextResolved): Node;
+	node(ctx: FokosDbRouteContext): Node;
 	hashNode(idxs: number[]): Node;
-	rangeNode(from: PartitionContextResolved, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Node;
+	rangeNode(from: FokosDbRouteContext, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Node;
 	/** Per-node counts of the side effects the flow asks its DO for. */
 	scheduled(doName: string): number;
 	alarms(doName: string): number[];
@@ -97,7 +98,7 @@ export type ClusterOptions = {
 };
 
 export function makeCluster(opts: ClusterOptions = {}): Cluster {
-	const base = PartitionContextCreator.create({
+	const cfg = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: opts.tableName ?? `repartition-${crypto.randomUUID()}`,
@@ -107,6 +108,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
+	const base = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy).allRoots()[0];
 
 	const nodes = new Map<string, Node>();
 	const scheduled = new Map<string, number>();
@@ -125,11 +127,11 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			return node;
 		},
 		hashNode(idxs) {
-			const { opaque, doName } = PartitionIdHelper.fromHashIdxs(base, idxs).encode(true);
-			return cluster.node({ ...base, doName: doName!, primaryDoIdStr: "", partitionId: opaque });
+			const { opaque, doName } = PartitionIdHelper.fromHashIdxs(base.topology.shardGroup, idxs).encode(true);
+			return cluster.node({ ...base, doName: doName!, partitionId: opaque });
 		},
 		rangeNode(from, hashKey, start, end) {
-			return cluster.node(resolveRangePartitionContext(from, hashKey, start, end).partitionContext);
+			return cluster.node(resolveRangePartitionContext(from, hashKey, start, end));
 		},
 		scheduled: (doName) => scheduled.get(doName) ?? 0,
 		alarms: (doName) => alarms.get(doName) ?? [],
@@ -137,7 +139,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		nextPullPage: (doName, page) => cannedPages.set(doName, page),
 	};
 
-	function makeNode(ctx: PartitionContextResolved): Node {
+	function makeNode(ctx: FokosDbRouteContext): Node {
 		// The DO name carries a per-cluster suffix so two clusters in one test file never share storage.
 		const stubName = `rf.${suffix}.${ctx.doName}`;
 
@@ -150,15 +152,12 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				const storage = state.storage;
 				const store = new PartitionStore(storage);
 				store.runMigrations();
-				// The stored context is what the flow reads back, so a target has none until fokosInit.
-				const stored = storage.kv.get<PartitionContextLivePartition>(CTX_KEY);
-				const live: PartitionContextLivePartition = stored ?? { ...ctx };
-				live._partitionIdBytes = Uint8Array.fromHex(live.partitionId);
-
-				const deps = makeDeps(ctx.doName, storage, store, live);
+				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
+				// node that has none yet answers with the identity its context decodes to, as a root does.
+				const deps = makeDeps(ctx.doName, storage, store, ctx);
 				const source = new RepartitionSource(store, storage, deps);
 				const target = new RepartitionTarget(store, storage, deps);
-				return await fn({ source, target, store, storage, ctx: live });
+				return await fn({ source, target, store, storage, ctx });
 			});
 
 		return {
@@ -199,31 +198,23 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		doName: string,
 		storage: DurableObjectStorage,
 		store: PartitionStore,
-		live: PartitionContextLivePartition,
+		ctx: FokosDbRouteContext,
 	): RepartitionSourceDeps & RepartitionTargetDeps {
-		const depthOf = (): number => {
-			if (live.rangePartition) return storage.kv.get<number>(DEPTH_KEY) ?? 0;
-			return PartitionIdHelper.depth(Uint8Array.fromHex(live.partitionId));
-		};
+		const storedIdentity = () => storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY);
+		const identity = (): FokosPartitionIdentity =>
+			storedIdentity() ?? partitionIdentityFrom(ctx, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
 		return {
 			// A target exists as soon as its source names it, exactly as a real DO does: a Durable Object
 			// is created by the first call that reaches it, not registered in advance.
-			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, primaryDoIdStr: "", partitionId: ref.partitionId }).peer,
-			host: new FokosMigrationHost({ store, hashSplitN: () => live.hashSplitN }),
-			identity: () => ({
-				pCtx: live,
-				depth: depthOf(),
-				rangeAncestors: live.rangePartition ? store.getRangeAncestors(live.rangePartition.hashKey, depthOf()) : [],
-			}),
-			hasIdentity: () => storage.kv.get<PartitionContextLivePartition>(CTX_KEY) !== undefined,
+			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
+			host: new FokosMigrationHost({ store, hashSplitN: () => ctx.topology.hashSplitN }),
+			identity: () => ({ ctx, identity: identity() }),
+			hasIdentity: () => storedIdentity() !== undefined,
 			applyTargetIdentity: (req: FokosInitRequest) => {
-				const next: PartitionContextLivePartition = { ...req.target };
-				delete next._partitionIdBytes;
-				storage.kv.put<PartitionContextLivePartition>(CTX_KEY, next);
-				if (req.rangeDepth !== undefined) storage.kv.put<number>(DEPTH_KEY, req.rangeDepth);
-				if (req.rangeAncestors?.length && req.target.rangePartition) {
-					store.setRangeAncestors(req.target.rangePartition.hashKey, req.rangeAncestors);
-				}
+				const target = req.target as FokosDbRouteContext;
+				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
+				storage.kv.put<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY, partitionIdentityFrom(target, range));
+				storage.kv.put<FokosStoredPolicy<unknown>>(FOKOS_POLICY_KV_KEY, { rangeConfig: target.rangeConfig, policy: target.policy });
 			},
 			computeRangeBoundaries: (hashKey, start, end, n) => store.computeRangeSplitBoundaries(hashKey, start, end, n),
 			lockCountForKey: (hashKey) => store.pendingLockCountForHashKey(hashKey),

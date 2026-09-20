@@ -13,7 +13,7 @@ import type { StoredItem } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb } from "./helpers.js";
-import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld } from "./partition-harness.js";
+import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld, rangeOf } from "./partition-harness.js";
 
 const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 	hashKey: kb(hashKey),
@@ -162,7 +162,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		// The split source keeps its item rows, so the router can still answer for every one of them —
 		// which is exactly why it has to narrow the answer to the caller's slice.
 		const caller = children[0];
-		const end = caller.ctx.rangePartition!.endBoundary;
+		const end = rangeOf(caller.ctx).endBoundary;
 		expect(end, "the leftmost child must have a bounded upper edge").not.toBeNull();
 
 		const page = (await root.stub.fokosExecuteLocal({

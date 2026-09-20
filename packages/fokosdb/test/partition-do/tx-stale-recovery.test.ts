@@ -5,8 +5,9 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
 import { testCoordinatorStub, testPartitionStub } from "../stub-helpers.js";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { refOf } from "../../src/sharding/route-context.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { REPARTITION_KV_KEYS } from "../../src/sharding/repartition-flow.js";
@@ -68,11 +69,10 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
-		const childPartitionContexts: PartitionContextResolved[] = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((child) => ({
+		const childPartitionContexts: FokosDbRouteContext[] = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((child) => ({
 			...ctx,
 			doName: child.doName,
 			partitionId: child.partitionIdOpaque,
-			primaryDoIdStr: env.PARTITION_DO.idFromName(child.doName).toString(),
 		}));
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
@@ -108,16 +108,15 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const { ctx: parentCtx } = makeStub({ hashSplitN: 2 });
 		const child = PartitionIdHelper.calculateHashChildPartitionIds(parentCtx)[0];
 		const childId = env.PARTITION_DO.idFromName(child.doName);
-		const childCtx: PartitionContextResolved = {
+		const childCtx: FokosDbRouteContext = {
 			...parentCtx,
 			doName: child.doName,
 			partitionId: child.partitionIdOpaque,
-			primaryDoIdStr: childId.toString(),
 		};
 		const childStub = testPartitionStub(childId);
 		await childStub.fokosInit({
 			repartitionId: "r1",
-			source: parentCtx,
+			source: refOf(parentCtx),
 			target: childCtx,
 			slice: { kind: "hash_child", childIndex: 0, depth: 1 },
 		});

@@ -6,8 +6,8 @@ import { env } from "cloudflare:workers";
 import { expect } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator } from "../../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../../src/sharding/router.js";
+import { PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { FokosRouter } from "../../src/sharding/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 
@@ -68,13 +68,13 @@ export function makeDB(opts?: MakeDBOptions) {
 		hashSplitConditions: { maxSizeMb: maxSizeMb ?? 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
-	const topology = new PartitionTopologyRouterImpl(base);
+	const topology = new FokosRouter(base.topology, base.rangeConfig, base.policy);
 	return new FokosDB({ topology, ...dbOptions });
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
-	const topology = db.options().topology as PartitionTopologyRouterImpl;
-	return topology.pickPartition(KeyCodec.encode(key.hashKey), KeyCodec.encodeOptional(key.sortKey)).partitionContext.doName;
+	const topology = db.options().topology;
+	return topology.rootContext(KeyCodec.encode(key.hashKey)).doName;
 }
 
 export function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sortKey?: string }>): number {

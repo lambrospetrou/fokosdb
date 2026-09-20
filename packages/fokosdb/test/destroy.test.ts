@@ -2,8 +2,8 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { PartitionContextCreator } from "../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../src/sharding/router.js";
+import { PartitionContextCreator } from "../src/shared/partition-context.js";
+import { FokosRouter } from "../src/sharding/router.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // 3 root partitions, each splits into 2 children.
@@ -26,7 +26,7 @@ function makeDB(tableName: string) {
 		...PARTITION_OPTIONS,
 	});
 	return new FokosDB({
-		topology: new PartitionTopologyRouterImpl(base),
+		topology: new FokosRouter(base.topology, base.rangeConfig, base.policy),
 	});
 }
 
@@ -35,7 +35,7 @@ describe.skip("FokosDB.destroy()", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
 		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(tableName);
-		const topology = db.options().topology as PartitionTopologyRouterImpl;
+		const topology = db.options().topology;
 
 		// Write 50 × 50 KB items to each root partition.
 		const doNamesSet = new Set<string>();
@@ -69,8 +69,8 @@ describe.skip("FokosDB.destroy()", () => {
 
 		for (const doName of doNamesSet) {
 			const stub = testPartitionStub(doName);
-			const { partitionContextStored } = await stub.status();
-			expect(partitionContextStored).toBeFalsy();
+			const { identityStored } = await stub.status();
+			expect(identityStored).toBeFalsy();
 		}
 
 		// All written items must be gone (verifies roots were destroyed).

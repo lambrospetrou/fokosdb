@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
-import type { PartitionContextResolved } from "../sharding/partition-context.js";
+import type { FokosDbRouteContext } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
@@ -84,7 +84,7 @@ type TcParticipantRow = {
 /** One participant of the prepare fan-out: the partition and the items of the transaction it owns. */
 type PrepareParticipant = {
 	doName: string;
-	context: PartitionContextResolved;
+	context: FokosDbRouteContext;
 	items: TransactionItem[];
 };
 
@@ -1152,8 +1152,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 }
 
-function deserializePartitionContext(json: string): PartitionContextResolved {
-	return JSON.parse(json) as PartitionContextResolved;
+function deserializePartitionContext(json: string): FokosDbRouteContext {
+	return JSON.parse(json) as FokosDbRouteContext;
 }
 
 function groupByPartition<T extends Pick<TcItemRow, "partition_do_name">>(items: T[]): Map<string, T[]> {

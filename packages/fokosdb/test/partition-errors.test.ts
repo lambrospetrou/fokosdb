@@ -5,8 +5,8 @@ import { testPartitionStub } from "./stub-helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
-import { PartitionContextCreator, type PartitionNamespaceKey } from "../src/sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../src/sharding/router.js";
+import { PartitionContextCreator, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import { FokosRouter } from "../src/sharding/router.js";
 import { MAX_ITEM_BYTES } from "../src/shared/transaction-limits.js";
 import { makeDB } from "./transactions/tx-helpers.js";
 
@@ -31,7 +31,7 @@ describe("the errors of a partition, through the public API", () => {
 		const key = { hashKey: `locked-${crypto.randomUUID()}`, sortKey: "s" };
 		const hashKey = KeyCodec.encode(key.hashKey);
 		const sortKey = KeyCodec.encode(key.sortKey);
-		const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
+		const partitionContext = db.options().topology.rootContext(hashKey);
 		const stub = testPartitionStub(partitionContext.doName);
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		await stub.txPrepare(partitionContext, {
@@ -74,7 +74,7 @@ describe("the errors of a partition, through the public API", () => {
 	it("wraps an error that a partition does not classify as foreign_error, and keeps it as the cause", async () => {
 		const db = makeDB();
 		const hashKey = KeyCodec.encode("malformed");
-		const { partitionContext } = db.options().topology.pickPartition(hashKey, KeyCodec.encodeOptional(undefined));
+		const partitionContext = db.options().topology.rootContext(hashKey);
 		const stub = testPartitionStub(partitionContext.doName);
 
 		// A request without a partition context fails inside the partition with a plain TypeError.
@@ -88,10 +88,13 @@ describe("the errors of a partition, through the public API", () => {
 		const db = makeDB();
 		const hashKey = KeyCodec.encode("k");
 		const sortKey = KeyCodec.encodeOptional(undefined);
-		const { partitionContext } = db.options().topology.pickPartition(hashKey, sortKey);
+		const partitionContext = db.options().topology.rootContext(hashKey);
 		const stub = testPartitionStub(partitionContext.doName);
 
-		const mismatchedCtx = { ...partitionContext, jurisdiction: "eu" as DurableObjectJurisdiction };
+		const mismatchedCtx = {
+			...partitionContext,
+			topology: { ...partitionContext.topology, jurisdiction: "eu" as DurableObjectJurisdiction },
+		};
 		const err = await errorOf(() => stub.apiGetItem(mismatchedCtx, { hashKey, sortKey }));
 
 		expect(FokosInternalError.is(err)).toBe(true);
@@ -101,17 +104,15 @@ describe("the errors of a partition, through the public API", () => {
 
 describe("the public methods of FokosDB", () => {
 	it("wrap an error from outside the library as foreign_error", async () => {
-		const topology = new PartitionTopologyRouterImpl(
-			PartitionContextCreator.create({
-				ns: "NO_SUCH_BINDING" as PartitionNamespaceKey,
-				nsTx: "TRANSACTION_COORDINATOR_DO",
-				tableName: `unbound.${crypto.randomUUID()}`,
-				rootTreesN: 1,
-				hashSplitN: 2,
-				hashSplitConditions: { maxSizeMb: 100 },
-			}),
-		);
-		const db = new FokosDB({ topology });
+		const cfg = PartitionContextCreator.create({
+			ns: "NO_SUCH_BINDING" as PartitionNamespaceKey,
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			tableName: `unbound.${crypto.randomUUID()}`,
+			rootTreesN: 1,
+			hashSplitN: 2,
+			hashSplitConditions: { maxSizeMb: 100 },
+		});
+		const db = new FokosDB({ topology: new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy) });
 
 		const err = await errorOf(() => db.getItem({ hashKey: "k" }));
 

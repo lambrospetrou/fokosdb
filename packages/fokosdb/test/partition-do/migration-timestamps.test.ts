@@ -4,9 +4,8 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import invariant from "../../src/shared/invariant.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { isRangePartition } from "../../src/sharding/partition-context.js";
 import { kb } from "./helpers.js";
-import { makePartition, makeRangeRoot, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-harness.js";
+import { makePartition, makeRangeRoot, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition, rangeOf } from "./partition-harness.js";
 
 // The seeded state migration has to carry: a marker item whose read watermark is above its write
 // watermark (so the two columns are visibly different), and one real user delete so both deletion
@@ -113,8 +112,7 @@ describe("PartitionDO — migration carries item timestamps and deletion metadat
 
 		// The marker lands in exactly one child, by the sort-key boundaries of the split.
 		const owners = children.filter((child) => {
-			invariant(isRangePartition(child.ctx), `${child.doName}: not a range partition`);
-			const { startBoundary: start, endBoundary: end } = child.ctx.rangePartition;
+			const { startBoundary: start, endBoundary: end } = rangeOf(child.ctx);
 			return (start === null || KeyCodec.compare(marker.sk, start) >= 0) && (end === null || KeyCodec.compare(marker.sk, end) < 0);
 		});
 		expect(owners).toHaveLength(1);

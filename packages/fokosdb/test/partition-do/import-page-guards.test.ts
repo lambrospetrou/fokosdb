@@ -92,7 +92,7 @@ async function moveImportOn(target: TestPartition, change: Partial<FokosImportRe
  */
 function ownerOf(parent: TestPartition, hashKey: string): TestPartition {
 	const depth = PartitionIdHelper.depth(Uint8Array.fromHex(parent.ctx.partitionId));
-	return parent.hashChildren()[hashChildIndex(kb(hashKey), depth, parent.ctx.hashSplitN)];
+	return parent.hashChildren()[hashChildIndex(kb(hashKey), depth, parent.ctx.topology.hashSplitN)];
 }
 
 /** A parent holding one item under `HELD_KEY`, ready to split, plus the child that will own the key. */

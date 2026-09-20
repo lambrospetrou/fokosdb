@@ -31,8 +31,8 @@
 import { collectBatch } from "./batch-scan.js";
 import invariant from "../shared/invariant.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import { isHashPartition, isRangePartition, type PartitionContextLivePartition } from "./partition-context.js";
-import { PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
+import { refOf, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
+import { identityDepth, PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
 import type { RangeAncestorInfo } from "./types.js";
 import { selectRangeAncestors } from "./split-policy.js";
 import { FokosInternalError, FokosUnavailableError, FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
@@ -112,10 +112,10 @@ export type RepartitionPlan = {
 	rangeAncestors?: RangeAncestorInfo[];
 };
 
+/** This partition's own route context, as the last request left it, and its immutable identity. */
 export type RepartitionIdentity = {
-	pCtx: PartitionContextLivePartition;
-	depth: number;
-	rangeAncestors: RangeAncestorInfo[];
+	ctx: FokosRouteContext<unknown>;
+	identity: FokosPartitionIdentity;
 };
 
 /** What both halves need: the peer factory, the application host, and this partition's own identity. */
@@ -123,7 +123,7 @@ export type RepartitionCommonDeps = {
 	/** Resolves a peer for one remote participant. Only the DO acquires stubs. */
 	getPeer: (ref: FokosPartitionRef) => FokosRepartitionPeer;
 	host: MigrationHost;
-	/** This partition's own context, depth and range ancestors. */
+	/** This partition's own route context and identity. */
 	identity: () => RepartitionIdentity;
 	scheduleWork: () => void;
 	logParams: () => Record<string, unknown>;
@@ -223,22 +223,22 @@ export class RepartitionSource implements RepartitionRouting {
 	 * target cancellation protocol and for transaction-wide key-size reservations.
 	 */
 	queue(request: { kind: RepartitionKind; hashKey?: KeyBytes }, now = Date.now()): RepartitionRow | undefined {
-		const { pCtx } = this.deps.identity();
+		const { identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
 			if (this.store.getSplitRepartition()) return undefined;
 
 			switch (request.kind) {
 				case "hash_split":
-					if (!isHashPartition(pCtx)) return undefined;
+					if (identity.kind !== "hash") return undefined;
 					// A promotion that has not finished still owns its key's move; a split would have to
 					// abandon or carry it, and neither is possible without a cancellation fence.
 					if (this.store.hasUnfinishedPromotion()) return undefined;
 					break;
 				case "range_split":
-					if (!isRangePartition(pCtx)) return undefined;
+					if (identity.kind !== "range") return undefined;
 					break;
 				case "key_promotion":
-					if (!isHashPartition(pCtx)) return undefined;
+					if (identity.kind !== "hash") return undefined;
 					invariant(request.hashKey, "fokos/repartition.queue: a key promotion needs its hash key");
 					if (this.store.hasRouteOverride(request.hashKey)) return undefined;
 					break;
@@ -285,14 +285,15 @@ export class RepartitionSource implements RepartitionRouting {
 
 	/** Writes the plan, every target row, and `planned`, in one transaction. */
 	#plan(row: RepartitionRow, now: number): StepOutcome {
-		const { pCtx, depth, rangeAncestors } = this.deps.identity();
-		const plan: RepartitionPlan = { schema: 1, source: { partitionId: pCtx.partitionId, doName: pCtx.doName } };
+		const { ctx, identity } = this.deps.identity();
+		const depth = identityDepth(identity);
+		const plan: RepartitionPlan = { schema: 1, source: refOf(ctx) };
 		let targets: Array<{ ref: FokosPartitionRef; slice: RepartitionSlice }>;
 
 		switch (row.kind) {
 			case "hash_split": {
-				const children = resolveHashChildPartitionContexts(pCtx);
-				invariant(children.length === pCtx.hashSplitN, "fokos/repartition.plan: unexpected hash child count");
+				const children = resolveHashChildPartitionContexts(ctx);
+				invariant(children.length === ctx.topology.hashSplitN, "fokos/repartition.plan: unexpected hash child count");
 				targets = children.map((child) => ({
 					ref: { partitionId: child.partitionId, doName: child.doName },
 					slice: { kind: "hash_child", childIndex: PartitionIdHelper.lastChildIdx(Uint8Array.fromHex(child.partitionId)) },
@@ -300,32 +301,32 @@ export class RepartitionSource implements RepartitionRouting {
 				break;
 			}
 			case "range_split": {
-				const rp = pCtx.rangePartition;
+				const rp = identity.range;
 				invariant(rp, "fokos/repartition.plan: a range split needs a range identity");
-				const n = pCtx.rangeSplitN;
-				invariant(n != null && n >= 2, "fokos/repartition.plan: rangeSplitN must be at least 2");
-				const boundaries = this.deps.computeRangeBoundaries(rp.hashKey, rp.startBoundary, rp.endBoundary, n);
+				const n = ctx.rangeConfig.rangeSplitN;
+				invariant(n >= 2, "fokos/repartition.plan: rangeSplitN must be at least 2");
+				const boundaries = this.deps.computeRangeBoundaries(rp.hashKey, rp.start, rp.end, n);
 				if (!boundaries) {
 					// A size-triggered split can find fewer than N items in its interval, because each child
 					// needs one. Only a new write can change that, so the retry backs off to five minutes.
 					this.#deferSource(row, now, jitterBackoff(row.attempts, SOURCE_RETRY_BASE_MS, SOURCE_RETRY_MAX_MS));
 					return "progressed";
 				}
-				const starts: (KeyBytes | null)[] = [rp.startBoundary, ...boundaries];
-				const ends: (KeyBytes | null)[] = [...boundaries, rp.endBoundary];
+				const starts: (KeyBytes | null)[] = [rp.start, ...boundaries];
+				const ends: (KeyBytes | null)[] = [...boundaries, rp.end];
 				plan.rangeDepth = depth + 1;
 				plan.rangeAncestors = selectRangeAncestors(
 					depth,
-					rangeAncestors,
+					rp.ancestors,
 					{
 						depth,
-						startBoundary: rp.startBoundary ?? KeyCodec.encodeOptional(undefined),
-						endBoundary: rp.endBoundary ?? KeyCodec.encodeOptional(undefined),
+						startBoundary: rp.start ?? KeyCodec.encodeOptional(undefined),
+						endBoundary: rp.end ?? KeyCodec.encodeOptional(undefined),
 					},
-					pCtx.rangeAncestorsConfig,
+					ctx.rangeConfig.rangeAncestors,
 				);
 				targets = starts.map((start, i) => {
-					const child = resolveRangePartitionContext(pCtx, rp.hashKey, start, ends[i]).partitionContext;
+					const child = resolveRangePartitionContext(ctx, rp.hashKey, start, ends[i]);
 					return {
 						ref: { partitionId: child.partitionId, doName: child.doName },
 						slice: { kind: "range", hashKey: rp.hashKey, start, end: ends[i] },
@@ -336,7 +337,7 @@ export class RepartitionSource implements RepartitionRouting {
 			case "key_promotion": {
 				const hashKey = row.hashKey;
 				invariant(hashKey, "fokos/repartition.plan: a key promotion needs its hash key");
-				const root = resolveRangePartitionContext(pCtx, hashKey, null, null).partitionContext;
+				const root = resolveRangePartitionContext(ctx, hashKey, null, null);
 				plan.rangeDepth = 0;
 				plan.rangeAncestors = [];
 				targets = [{ ref: { partitionId: root.partitionId, doName: root.doName }, slice: { kind: "promoted_key", hashKey } }];
@@ -399,7 +400,7 @@ export class RepartitionSource implements RepartitionRouting {
 
 		const plan = this.storage.kv.get<RepartitionPlan>(REPARTITION_KV_KEYS.plan(row.id));
 		invariant(plan, () => `fokos/repartition.initializeTargets: no plan for ${row.id}`);
-		const { pCtx } = this.deps.identity();
+		const { ctx } = this.deps.identity();
 
 		this.store.transactionSync(() => {
 			for (const target of due) {
@@ -415,8 +416,8 @@ export class RepartitionSource implements RepartitionRouting {
 				const peer = this.deps.getPeer({ partitionId: target.partitionId, doName: target.doName });
 				await peer.fokosInit({
 					repartitionId: row.id,
-					source: pCtx,
-					target: this.#targetContext(pCtx, target),
+					source: refOf(ctx),
+					target: this.#targetContext(ctx, target),
 					slice: this.materializeSlice(target.slice),
 					...(plan.rangeDepth === undefined ? {} : { rangeDepth: plan.rangeDepth }),
 					...(plan.rangeAncestors === undefined ? {} : { rangeAncestors: plan.rangeAncestors }),
@@ -479,8 +480,7 @@ export class RepartitionSource implements RepartitionRouting {
 			this.store.transactionSync(() => this.store.refreshRepartitionDue(row.id, now));
 			return "idle";
 		}
-		const { pCtx } = this.deps.identity();
-		const sourceRef: FokosPartitionRef = { partitionId: pCtx.partitionId, doName: pCtx.doName };
+		const sourceRef = refOf(this.deps.identity().ctx);
 
 		// The retry moves forward before the calls, so a crash in the middle of the fan-out still leaves
 		// a deadline that is later than now and the pass cannot spin on the same targets.
@@ -563,7 +563,7 @@ export class RepartitionSource implements RepartitionRouting {
 	 */
 	materializeSlice(stored: RepartitionSlice): FokosSlice {
 		if (stored.kind !== "hash_child") return stored;
-		return { kind: "hash_child", childIndex: stored.childIndex, depth: this.deps.identity().depth + 1 };
+		return { kind: "hash_child", childIndex: stored.childIndex, depth: identityDepth(this.deps.identity().identity) + 1 };
 	}
 
 	/**
@@ -571,16 +571,16 @@ export class RepartitionSource implements RepartitionRouting {
 	 * slice. A stored context is a snapshot: forwarding it would hand the target split thresholds an
 	 * operator has since changed, and the target would persist those stale values as its own.
 	 */
-	#targetContext(pCtx: PartitionContextLivePartition, target: RepartitionTargetRow) {
+	#targetContext(ctx: FokosRouteContext<unknown>, target: RepartitionTargetRow): FokosRouteContext<unknown> {
 		if (target.slice.kind === "hash_child") {
-			const child = resolveHashChildPartitionContexts(pCtx).find((c) => c.partitionId === target.partitionId);
+			const child = resolveHashChildPartitionContexts(ctx).find((c) => c.partitionId === target.partitionId);
 			invariant(child, () => `fokos/repartition: no hash child matches target ${target.partitionId}`);
 			return child;
 		}
 		const slice = target.slice;
 		const start = slice.kind === "range" ? slice.start : null;
 		const end = slice.kind === "range" ? slice.end : null;
-		return resolveRangePartitionContext(pCtx, slice.hashKey, start, end).partitionContext;
+		return resolveRangePartitionContext(ctx, slice.hashKey, start, end);
 	}
 
 	#deferSource(row: RepartitionRow, now: number, delayMs: number): void {
@@ -754,7 +754,7 @@ export class RepartitionSource implements RepartitionRouting {
 	#buildOverridesPage(row: RepartitionRow, slice: FokosSlice, inner: PromotedKeyCursor | null): FokosMigrationPage {
 		if (row.kind !== "hash_split") return { phase: "overrides", overrides: [], nextCursor: { phase: "host", inner: null } };
 
-		const n = this.deps.identity().pCtx.hashSplitN;
+		const n = this.deps.identity().ctx.topology.hashSplitN;
 		const { rows, nextCursor } = collectBatch<{ hashKey: KeyBytes }, PromotedKeyCursor>({
 			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
 			advanceCursor: (r) => ({ hashKey: r.hashKey }),
@@ -799,13 +799,12 @@ export class RepartitionTarget {
 		if (!rec || rec.state === "imported" || rec.state === "active") return "idle";
 		if (rec.nextAttemptAt > now) return "idle";
 
-		const { pCtx } = this.deps.identity();
-		const peer = this.deps.getPeer({ partitionId: rec.source.partitionId, doName: rec.source.doName });
+		const peer = this.deps.getPeer(rec.source);
 		let page: FokosMigrationPage;
 		try {
 			page = await peer.fokosMigrationPull({
 				repartitionId: rec.repartitionId,
-				target: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				target: refOf(this.deps.identity().ctx),
 				cursor: rec.cursor,
 			});
 		} catch (error) {
@@ -876,7 +875,7 @@ export class RepartitionTarget {
 	 */
 	#applyOverrides(overrides: readonly { hashKey: KeyBytes }[], now: number): void {
 		if (overrides.length === 0) return;
-		const { pCtx } = this.deps.identity();
+		const { ctx } = this.deps.identity();
 		for (const { hashKey } of overrides) {
 			if (this.store.hasRouteOverride(hashKey)) continue;
 			const seq = this.store.nextRepartitionSeq();
@@ -892,7 +891,7 @@ export class RepartitionTarget {
 				completedAt: now,
 				nextAttemptAt: now,
 			});
-			const root = resolveRangePartitionContext(pCtx, hashKey, null, null).partitionContext;
+			const root = resolveRangePartitionContext(ctx, hashKey, null, null);
 			this.store.insertRepartitionTarget({
 				repartitionId: id,
 				kind: "key_promotion",
@@ -950,7 +949,7 @@ export class RepartitionTarget {
 			this.store.transactionSync(() => {
 				this.deps.applyTargetIdentity(req);
 				this.#putImport({
-					schema: 1,
+					schema: 2,
 					state: "awaiting_data",
 					repartitionId: req.repartitionId,
 					source: req.source,
@@ -1025,12 +1024,11 @@ export class RepartitionTarget {
 		if (!rec || rec.state !== "imported") return "idle";
 		if (rec.nextAttemptAt > now) return "idle";
 
-		const { pCtx } = this.deps.identity();
-		const peer = this.deps.getPeer({ partitionId: rec.source.partitionId, doName: rec.source.doName });
+		const peer = this.deps.getPeer(rec.source);
 		try {
 			await peer.fokosMigrationAck({
 				repartitionId: rec.repartitionId,
-				target: { partitionId: pCtx.partitionId, doName: pCtx.doName },
+				target: refOf(this.deps.identity().ctx),
 			});
 		} catch (error) {
 			this.#deferImport(rec, now, error);

@@ -9,7 +9,7 @@
  * encoding are one step and cannot drift apart.
  */
 
-import type { PartitionContextResolved } from "../sharding/partition-context.js";
+import type { FokosDbRouteContext } from "./partition-context.js";
 import type {
 	ParticipantOperationResultEncoded,
 	RejectionReasonEncoded,
@@ -353,9 +353,9 @@ export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[])
  * still spread the items over several DOs. The partition itself is the authority and raises a
  * fallback error when it cannot execute the whole set alone.
  */
-export function singlePartitionTarget<T extends { partitionContext: PartitionContextResolved }>(
+export function singlePartitionTarget<T extends { partitionContext: FokosDbRouteContext }>(
 	items: readonly T[],
-): PartitionContextResolved | null {
+): FokosDbRouteContext | null {
 	if (items.length === 0) return null;
 	const target = items[0].partitionContext;
 	for (const item of items) {

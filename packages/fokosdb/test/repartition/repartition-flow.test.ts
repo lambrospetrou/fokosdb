@@ -300,8 +300,8 @@ describe("Repartition — the migration protocol", () => {
 	it("runs a hash split end to end: pages, imported, ack, completed, cleaned", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const keyA = keyForChild(0, c.base.hashSplitN, "a");
-		const keyB = keyForChild(1, c.base.hashSplitN, "b");
+		const keyA = keyForChild(0, c.base.topology.hashSplitN, "a");
+		const keyB = keyForChild(1, c.base.topology.hashSplitN, "b");
 
 		await root.enter(({ source, store }) => {
 			putItem(store, keyA, "s1");
@@ -313,8 +313,8 @@ describe("Repartition — the migration protocol", () => {
 		await cutOver(root);
 
 		const targets = await root.enter(({ store }) => store.listRepartitionTargets("r1", "hash_split"));
-		const childA = c.node({ ...c.base, doName: targets[0].doName, primaryDoIdStr: "", partitionId: targets[0].partitionId });
-		const childB = c.node({ ...c.base, doName: targets[1].doName, primaryDoIdStr: "", partitionId: targets[1].partitionId });
+		const childA = c.node({ ...c.base, doName: targets[0].doName, partitionId: targets[0].partitionId });
+		const childB = c.node({ ...c.base, doName: targets[1].doName, partitionId: targets[1].partitionId });
 
 		// Each child pulls one page at a time until its own record says imported.
 		for (const child of [childA, childB]) await drainImport(child);
@@ -423,7 +423,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -433,7 +433,7 @@ describe("Repartition — the migration protocol", () => {
 		await child.enter(async ({ target, store }) => {
 			expect(target.importState()).toBe("imported");
 			// A user delete lands on the finished copy.
-			store.deleteItem({ hk: kb(keyForChild(0, c.base.hashSplitN, "a")), sk: kb("s1"), txOrderTs: 99 });
+			store.deleteItem({ hk: kb(keyForChild(0, c.base.topology.hashSplitN, "a")), sk: kb("s1"), txOrderTs: 99 });
 			// A page that arrives now must not put the row back: the record says the import is over, and
 			// the ingest inserts an absent row rather than failing on it.
 			expect(await target.importOnePage()).toBe("idle");
@@ -445,7 +445,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -475,7 +475,7 @@ describe("Repartition — the migration protocol", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			putItem(store, keyForChild(0, c.base.hashSplitN, "a"), "s1");
+			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
@@ -604,8 +604,8 @@ describe("Repartition — promotions", () => {
 	it("hands a finished promotion to the hash child that inherits the key, with no item copy", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const promoted = keyForChild(0, c.base.hashSplitN, "p");
-		const plain = keyForChild(0, c.base.hashSplitN, "q");
+		const promoted = keyForChild(0, c.base.topology.hashSplitN, "p");
+		const plain = keyForChild(0, c.base.topology.hashSplitN, "q");
 
 		await root.enter(({ source, store }) => {
 			putItem(store, promoted, "s1");
@@ -641,8 +641,8 @@ describe("Repartition — promotions", () => {
 	it("gives a hash child only the overrides inside its own slice", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
-		const mine = keyForChild(0, c.base.hashSplitN, "m");
-		const sibling = keyForChild(1, c.base.hashSplitN, "s");
+		const mine = keyForChild(0, c.base.topology.hashSplitN, "m");
+		const sibling = keyForChild(1, c.base.topology.hashSplitN, "s");
 
 		await root.enter(({ source, store }) => {
 			source.queue({ kind: "key_promotion", hashKey: kb(mine) });
@@ -786,7 +786,7 @@ async function targetNode(c: ReturnType<typeof makeCluster>, source: Node, index
 		const split = store.getSplitRepartition()!;
 		return store.listRepartitionTargets(split.id, split.kind)[index];
 	});
-	return c.node({ ...c.base, doName: row.doName, primaryDoIdStr: "", partitionId: row.partitionId });
+	return c.node({ ...c.base, doName: row.doName, partitionId: row.partitionId });
 }
 
 /** The request the source would send, rebuilt from its own rows. */

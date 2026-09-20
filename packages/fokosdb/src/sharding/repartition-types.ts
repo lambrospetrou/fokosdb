@@ -8,7 +8,7 @@
  * application defines its own streams.
  */
 import type { KeyBytes } from "./key-codec.js";
-import type { PartitionContextLivePartition, PartitionContextResolved } from "./partition-context.js";
+import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
 import type {
 	PromotedKeyCursor,
@@ -19,13 +19,7 @@ import type {
 } from "../shared/partition/partition-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
 
-export type { FokosSlice };
-
-/** The immutable identity of one remote participant of a repartition. A name alone is a value the caller chose. */
-export type FokosPartitionRef = {
-	partitionId: string;
-	doName: string;
-};
+export type { FokosPartitionRef, FokosSlice };
 
 // ─── the target import record ────────────────────────────────────────────────
 
@@ -35,12 +29,15 @@ export type FokosPartitionRef = {
  * `imported` is persisted BEFORE the target acknowledges its source, so a crash or a lost reply
  * causes another acknowledgement attempt rather than a silent loss. `active` means the source
  * accepted that acknowledgement.
+ *
+ * `source` is a reference: the target reaches the source through its own stored route context, so
+ * it needs no stored remote context.
  */
 export type FokosImportRecord = {
-	schema: 1;
+	schema: 2;
 	state: FokosImportState;
 	repartitionId: string;
-	source: PartitionContextLivePartition;
+	source: FokosPartitionRef;
 	slice: FokosSlice;
 	cursor: FokosMigrationCursor | null;
 	attempts: number;
@@ -64,8 +61,9 @@ export type FokosMigrationCursor = { phase: "overrides"; inner: PromotedKeyCurso
 
 export type FokosInitRequest = {
 	repartitionId: string;
-	source: PartitionContextLivePartition;
-	target: PartitionContextResolved;
+	source: FokosPartitionRef;
+	/** The full route context of the target: its identity plus the source's topology, range config and policy. */
+	target: FokosRouteContext<unknown>;
 	slice: FokosSlice;
 	rangeDepth?: number;
 	rangeAncestors?: RangeAncestorInfo[];
@@ -161,7 +159,8 @@ export type FokosStatusEntry = {
 export type FokosStatusPage = {
 	initialized: boolean;
 	destroying: boolean;
-	partitionContext: PartitionContextLivePartition | null;
+	/** The identity of this partition, or null before it has one. */
+	ref: FokosPartitionRef | null;
 	importState: FokosImportState | null;
 	entries: FokosStatusEntry[];
 	nextCursor: FokosStatusCursor | null;
@@ -169,11 +168,11 @@ export type FokosStatusPage = {
 
 export type FokosStatusRequest = {
 	cursor: FokosStatusCursor | null;
-	rootContext?: PartitionContextResolved;
+	rootContext?: FokosRouteContext<unknown>;
 };
 
 export type FokosPrepareDestroyRequest = {
-	rootContext?: PartitionContextResolved;
+	rootContext?: FokosRouteContext<unknown>;
 };
 
 /** What a destroy traversal calls on every partition it reaches, in this order. */

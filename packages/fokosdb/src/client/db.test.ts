@@ -14,8 +14,8 @@ import {
 	MAX_PARTITION_VISITS_PER_PAGE,
 	MAX_RESPONSE_BYTES_PER_PAGE,
 } from "../shared/query/page-budget.js";
-import { PartitionContextCreator, type PartitionNamespaceKey } from "../sharding/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../sharding/router.js";
+import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-context.js";
+import { FokosRouter } from "../sharding/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
@@ -113,7 +113,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDBFor(ns, { rootTreesN: 501 });
 			const some = vi.spyOn(StaticShardedDO.prototype, "some").mockResolvedValue([]);
 			const all = vi.spyOn(StaticShardedDO.prototype, "all");
-			const traverse = vi.spyOn(db.options().topology, "traverseForDestroy").mockResolvedValue();
+			const traverse = vi.spyOn(db.options().topology, "walk").mockResolvedValue();
 			try {
 				await expect(db.destroy()).resolves.toEqual({ ok: true });
 				expect(all).not.toHaveBeenCalled();
@@ -1233,7 +1233,7 @@ function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; n
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	return new FokosDB({
-		topology: new PartitionTopologyRouterImpl(base),
+		topology: new FokosRouter(base.topology, base.rangeConfig, base.policy),
 		numTxCoordinators: options?.numTxCoordinators,
 	});
 }

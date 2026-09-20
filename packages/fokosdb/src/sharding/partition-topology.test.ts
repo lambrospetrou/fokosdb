@@ -1,9 +1,8 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { PartitionContextCreator } from "./partition-context.js";
-import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
-import { PartitionIdHelper } from "./partition-id.js";
+import { PartitionContextCreator, type FokosDbRouteContext } from "../shared/partition-context.js";
+import { partitionIdentityFrom, resolveRangePartitionContext } from "./partition-id.js";
+import { FokosRouter } from "./router.js";
 import { RangePartitionTopologyImpl } from "./split-policy.js";
 import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
@@ -13,9 +12,11 @@ import type { RepartitionRouting } from "./repartition-types.js";
 
 const kb = (s?: string) => KeyCodec.encodeOptional(s);
 
-// Each test uses a unique base so its Durable Object names never collide with another test's.
-function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext {
-	return PartitionContextCreator.create({
+type CreateOptions = Parameters<typeof PartitionContextCreator.create>[0];
+
+// Each test uses a unique table so its Durable Object names never collide with another test's.
+function makeUniqueBase(overrides?: Partial<CreateOptions>): FokosDbRouteContext {
+	const cfg = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",
 		tableName: `testdb-${crypto.randomUUID()}`,
@@ -24,26 +25,21 @@ function makeUniqueBase(overrides?: Partial<PartitionContext>): PartitionContext
 		hashSplitConditions: { maxSizeMb: 100 },
 		...overrides,
 	});
+	return new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy).allRoots()[0];
 }
 
 function makeRangeCtx(
-	base: PartitionContext,
+	base: FokosDbRouteContext,
 	hashKey: string,
 	startBoundary: string | null,
 	endBoundary: string | null,
-): PartitionContextResolved {
-	const hashKeyBytes = kb(hashKey);
-	const startBytes = startBoundary === null ? null : kb(startBoundary);
-	const endBytes = endBoundary === null ? null : kb(endBoundary);
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKeyBytes, startBytes, endBytes).encode(true);
-	const doId = env.PARTITION_DO.idFromName(doName!);
-	return {
-		...base,
-		doName: doName!,
-		primaryDoIdStr: doId.toString(),
-		partitionId: opaque,
-		rangePartition: { hashKey: hashKeyBytes, startBoundary: startBytes, endBoundary: endBytes },
-	};
+): FokosDbRouteContext {
+	return resolveRangePartitionContext(
+		base,
+		kb(hashKey),
+		startBoundary === null ? null : kb(startBoundary),
+		endBoundary === null ? null : kb(endBoundary),
+	);
 }
 
 /**
@@ -58,7 +54,7 @@ function makeRangeCtx(
  * targets it holds, is state of the flow, and `repartition-flow.test.ts` drives the real rows.
  */
 async function withRangeTopology(
-	rangeCtx: PartitionContextResolved,
+	rangeCtx: FokosDbRouteContext,
 	body: (topology: RangePartitionTopologyImpl, store: PartitionStore) => void | Promise<void>,
 	routing: Partial<RepartitionRouting> = {},
 ): Promise<void> {
@@ -72,7 +68,8 @@ async function withRangeTopology(
 			ownedByRangeTree: () => false,
 			...routing,
 		};
-		await body(new RangePartitionTopologyImpl(rangeCtx, state, store, stubRouting), store);
+		const identity = partitionIdentityFrom(rangeCtx, { depth: 0, ancestors: [] });
+		await body(new RangePartitionTopologyImpl(rangeCtx, identity, state, store, stubRouting), store);
 	});
 }
 

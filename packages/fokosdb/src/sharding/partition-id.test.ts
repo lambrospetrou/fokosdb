@@ -1,31 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { PartitionContextCreator, type PartitionContext } from "./partition-context.js";
 import { KeyCodec } from "./key-codec.js";
 import {
+	identityDepth,
+	partitionIdentityFrom,
 	PartitionIdHelper,
 	resolveDescendantHashPartitionContext,
 	resolveHashChildPartitionContexts,
 	resolveRangePartitionContext,
 } from "./partition-id.js";
-import { PartitionTopologyRouterImpl } from "./router.js";
+import { FokosRouter } from "./router.js";
+import type { FokosRouteContext } from "./route-context.js";
 import { invariantFailure } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 
-function makeBase(): PartitionContext {
-	return PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: "iddb",
-		rootTreesN: 4,
-		hashSplitN: 4,
-		hashSplitConditions: { maxSizeMb: 100 },
-	});
+const base = "iddb";
+const HASH_SPLIT_N = 4;
+
+function makeRouter(): FokosRouter<{ tier: string }> {
+	return new FokosRouter(
+		{ shardGroup: base, rootTreesN: 4, hashSplitN: HASH_SPLIT_N },
+		{ rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } },
+		{ tier: "t" },
+	);
 }
 
 describe("PartitionIdHelper — hash codec round-trips", () => {
 	it("encodes a root (depth 0) and reads it back", () => {
-		const base = makeBase();
 		const { bytes, opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [3]).encode(true);
 		expect(doName).toBe("iddb.h.3");
 		expect(PartitionIdHelper.rootIdx(bytes)).toBe(3);
@@ -37,14 +38,12 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("encodes a u16 root index (> 255) correctly", () => {
-		const base = makeBase();
 		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [4097]).encode(true);
 		expect(doName).toBe("iddb.h.4097");
 		expect(PartitionIdHelper.rootIdx(bytes)).toBe(4097);
 	});
 
 	it("fromHashIdxs with child indexes sets depth and lastChildIdx", () => {
-		const base = makeBase();
 		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [1, 2, 0]).encode(true);
 		expect(doName).toBe("iddb.h.1.2.0");
 		expect(PartitionIdHelper.rootIdx(bytes)).toBe(1);
@@ -53,7 +52,6 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("appendHashIdx on existing bytes extends the depth (single and array forms)", () => {
-		const base = makeBase();
 		const root = PartitionIdHelper.fromHashIdxs(base, [0]).encode(false);
 
 		const single = new PartitionIdHelper(base, root.bytes).appendHashIdx(1).encode(true);
@@ -68,7 +66,6 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("accepts the opaque hex string as constructor input (same result as bytes)", () => {
-		const base = makeBase();
 		const root = PartitionIdHelper.fromHashIdxs(base, [2]).encode(false);
 		const fromHex = new PartitionIdHelper(base, root.opaque).appendHashIdx(1).encode(true);
 		const fromBytes = new PartitionIdHelper(base, root.bytes).appendHashIdx(1).encode(true);
@@ -77,7 +74,6 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("encode throws with nothing to encode and when appending to a range ID", () => {
-		const base = makeBase();
 		expect(() => new PartitionIdHelper(base).encode(false)).toThrow(invariantFailure(/no bytes or appended hash indexes/));
 		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(
@@ -86,16 +82,14 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 	});
 
 	it("calculateHashChildPartitionIds produces hashSplitN distinct children one level deeper", () => {
-		const base = makeBase();
 		const parent = PartitionIdHelper.fromHashIdxs(base, [1]).encode(true);
 		const children = PartitionIdHelper.calculateHashChildPartitionIds({
-			...base,
+			...makeRouter().allRoots()[1],
 			doName: parent.doName!,
-			primaryDoIdStr: "",
 			partitionId: parent.opaque,
 		});
-		expect(children).toHaveLength(base.hashSplitN);
-		expect(new Set(children.map((c) => c.doName)).size).toBe(base.hashSplitN);
+		expect(children).toHaveLength(HASH_SPLIT_N);
+		expect(new Set(children.map((c) => c.doName)).size).toBe(HASH_SPLIT_N);
 		for (let i = 0; i < children.length; i++) {
 			expect(children[i].doName).toBe(`iddb.h.1.${i}`);
 			const bytes = Uint8Array.fromHex(children[i].partitionIdOpaque);
@@ -107,7 +101,6 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 
 describe("PartitionIdHelper — range codec round-trips", () => {
 	it("round-trips all boundary combinations", () => {
-		const base = makeBase();
 		for (const [start, end] of [
 			[null, null],
 			[null, "m"],
@@ -124,14 +117,12 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 	});
 
 	it("doName formats range IDs via rangePartitionDoName", () => {
-		const base = makeBase();
 		const { bytes, doName } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), null).encode(true);
 		expect(doName).toBe("iddb.r.alice.b1.~max");
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.alice.b1.~max");
 	});
 
 	it("hash-only readers reject range IDs", () => {
-		const base = makeBase();
 		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow(invariantFailure(/expected hash schema/));
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow(invariantFailure(/expected hash schema/));
@@ -141,7 +132,6 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 
 describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	it("fromRangePartition root: encode then decode round-trips (both boundaries null)", () => {
-		const base = makeBase();
 		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), null, null);
 		const { bytes, opaque, doName } = helper.encode(true);
 
@@ -162,7 +152,6 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	});
 
 	it("fromRangePartition child: encode then decode round-trips with both boundaries", () => {
-		const base = makeBase();
 		const helper = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), kb("b2"));
 		const { bytes, doName } = helper.encode(true);
 
@@ -179,7 +168,6 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	});
 
 	it("round-trips half-bounded edges (leftmost: null start; rightmost: null end)", () => {
-		const base = makeBase();
 		for (const [start, end, name] of [
 			[null, kb("m"), "iddb.r.x.~min.m"],
 			[kb("m"), null, "iddb.r.x.m.~max"],
@@ -196,7 +184,6 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	});
 
 	it("handles unicode in hashKey and boundaries", () => {
-		const base = makeBase();
 		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("café☕"), kb("töst"), kb("zünd")).encode(false);
 		const decoded = PartitionIdHelper.decode(bytes);
 		expect(decoded.schema).toBe(1);
@@ -208,7 +195,6 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 	});
 
 	it("doName dispatches correctly for range ID loaded from opaque hex", () => {
-		const base = makeBase();
 		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("mykey"), kb("start1"), kb("end1")).encode(false);
 		const bytes = Uint8Array.fromHex(opaque);
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.mykey.start1.end1");
@@ -217,7 +203,6 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 
 describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	it("fromHashIdxs root: encode then decode", () => {
-		const base = makeBase();
 		const { bytes, opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [0]).encode(true);
 
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_HASH_V1);
@@ -235,7 +220,6 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	});
 
 	it("fromHashIdxs child: appendHashIdx extends depth", () => {
-		const base = makeBase();
 		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [2]).appendHashIdx(1).encode(true);
 
 		expect(bytes[0]).toBe(PartitionIdHelper.SCHEMA_HASH_V1);
@@ -245,7 +229,6 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	});
 
 	it("rootIdx, depth, lastChildIdx assert SCHEMA_HASH_V1", () => {
-		const base = makeBase();
 		const { bytes } = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => PartitionIdHelper.rootIdx(bytes)).toThrow();
 		expect(() => PartitionIdHelper.depth(bytes)).toThrow();
@@ -272,7 +255,6 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	});
 
 	it("doName builds the correct DO name from hand-written wire bytes", () => {
-		const base = makeBase();
 		// Root-only (rootIdx=5, depth=0)
 		expect(PartitionIdHelper.doName(base, new Uint8Array([0, 0, 5, 0]))).toBe("iddb.h.5");
 		// rootIdx > 255 (rootIdx=256, depth=0) — validates u16 encoding
@@ -282,7 +264,6 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 	});
 
 	it("doName and decode throw for unknown schema bytes (>1)", () => {
-		const base = makeBase();
 		const unknownSchema = new Uint8Array([2, 0, 0, 0]);
 		expect(() => PartitionIdHelper.doName(base, unknownSchema)).toThrow();
 		expect(() => PartitionIdHelper.decode(unknownSchema)).toThrow();
@@ -291,12 +272,9 @@ describe("PartitionIdHelper — hash schema (SCHEMA_HASH_V1)", () => {
 
 describe("rangePartitionDoName", () => {
 	function makeName(hashKey: string, start: string | null, end: string | null) {
-		return PartitionIdHelper.fromRangePartition(
-			makeBase(),
-			kb(hashKey),
-			start === null ? null : kb(start),
-			end === null ? null : kb(end),
-		).encode(true).doName!;
+		return PartitionIdHelper.fromRangePartition(base, kb(hashKey), start === null ? null : kb(start), end === null ? null : kb(end)).encode(
+			true,
+		).doName!;
 	}
 
 	it("produces root name (null start/end → ~min/~max sentinels)", () => {
@@ -337,21 +315,61 @@ describe("rangePartitionDoName", () => {
 	});
 });
 
-describe("the contexts built from a live partition context", () => {
-	it("do not copy its cached _partitionIdBytes, which would route the new partition as the source", () => {
-		const root = new PartitionTopologyRouterImpl(makeBase()).pickPartition(kb("hk")).partitionContext;
+describe("the contexts derived from a route context", () => {
+	it("keep the topology, range config and policy of the source and change only the identity", () => {
+		const router = makeRouter();
+		const root: FokosRouteContext<{ tier: string }> = router.rootContext(kb("hk"));
 		const bytes = Uint8Array.fromHex(root.partitionId);
-		const live = { ...root, _partitionIdBytes: bytes };
 
 		const built = [
-			...resolveHashChildPartitionContexts(live),
-			resolveDescendantHashPartitionContext(live, live, bytes, [1, 2]).partitionContext,
-			resolveRangePartitionContext(live, kb("hk"), null, null).partitionContext,
+			...resolveHashChildPartitionContexts(root),
+			resolveDescendantHashPartitionContext(root, bytes, [1, 2]),
+			resolveRangePartitionContext(root, kb("hk"), null, null),
 		];
 
 		for (const ctx of built) {
 			expect(ctx.partitionId).not.toBe(root.partitionId);
-			expect(Object.hasOwn(ctx, "_partitionIdBytes"), ctx.doName).toBe(false);
+			expect(ctx.doName).not.toBe(root.doName);
+			expect(ctx.topology).toBe(root.topology);
+			expect(ctx.rangeConfig).toBe(root.rangeConfig);
+			expect(ctx.policy).toBe(root.policy);
+			expect(Object.keys(ctx).sort()).toEqual(["doName", "partitionId", "policy", "rangeConfig", "schema", "topology"]);
 		}
+		expect(built.slice(0, HASH_SPLIT_N).map((c) => c.doName)).toEqual(
+			Array.from({ length: HASH_SPLIT_N }, (_, i) => `${root.doName}.${i}`),
+		);
+		expect(built[HASH_SPLIT_N].doName).toBe(`${root.doName}.1.2`);
+		expect(built[HASH_SPLIT_N + 1].doName).toBe(`${base}.r.hk.~min.~max`);
+	});
+});
+
+describe("partitionIdentityFrom", () => {
+	it("decodes a hash identity with its root index and child path", () => {
+		const root = makeRouter().allRoots()[2];
+		const child = resolveDescendantHashPartitionContext(root, Uint8Array.fromHex(root.partitionId), [3, 1]);
+
+		const identity = partitionIdentityFrom(child);
+		expect(identity).toEqual({
+			schema: 1,
+			ref: { partitionId: child.partitionId, doName: `${base}.h.2.3.1` },
+			kind: "hash",
+			hash: { rootIndex: 2, path: [3, 1] },
+			topology: root.topology,
+		});
+		expect(identityDepth(identity)).toBe(2);
+		expect(identityDepth(partitionIdentityFrom(root))).toBe(0);
+	});
+
+	it("decodes a range identity and takes the depth and ancestors from fokosInit", () => {
+		const root = makeRouter().allRoots()[0];
+		const range = resolveRangePartitionContext(root, kb("alice"), kb("b1"), null);
+		const ancestors = [{ depth: 0, startBoundary: kb("a"), endBoundary: kb("z") }];
+
+		const identity = partitionIdentityFrom(range, { depth: 1, ancestors });
+		expect(identity.kind).toBe("range");
+		expect(identity.hash).toBeUndefined();
+		expect(identity.range).toEqual({ hashKey: kb("alice"), start: kb("b1"), end: null, depth: 1, ancestors });
+		expect(identityDepth(identity)).toBe(1);
+		expect(() => partitionIdentityFrom(range)).toThrow(invariantFailure(/needs its depth and ancestors/));
 	});
 });

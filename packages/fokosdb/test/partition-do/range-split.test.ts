@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import type { PartitionContextResolved } from "../../src/sharding/partition-context.js";
+import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { kb } from "./helpers.js";
-import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot } from "./partition-harness.js";
+import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot, rangeOf } from "./partition-harness.js";
 
 describe("PartitionDO — range split", () => {
 	it("splits a populated leaf into N contiguous children covering [−∞, +∞); the node becomes a pure router", async () => {
@@ -18,17 +18,17 @@ describe("PartitionDO — range split", () => {
 
 		// Children tile [−∞, +∞): sorted by start, first.start = null, last.end = null, end[i] === start[i+1].
 		const children = [...status.childPartitionContexts].sort((a, b) =>
-			(a.rangePartition!.startBoundary ?? "") < (b.rangePartition!.startBoundary ?? "") ? -1 : 1,
+			(rangeOf(a).startBoundary ?? "") < (rangeOf(b).startBoundary ?? "") ? -1 : 1,
 		);
-		expect(children[0].rangePartition!.startBoundary).toBeNull();
-		expect(children[N - 1].rangePartition!.endBoundary).toBeNull();
+		expect(rangeOf(children[0]).startBoundary).toBeNull();
+		expect(rangeOf(children[N - 1]).endBoundary).toBeNull();
 		for (let i = 0; i < N - 1; i++) {
-			expect(children[i].rangePartition!.endBoundary).not.toBeNull();
+			expect(rangeOf(children[i]).endBoundary).not.toBeNull();
 			// Compared by value. A router builds each child context from its current context on every
 			// call, so adjacent boundaries are equal bytes and not one shared object.
-			expect(children[i].rangePartition!.endBoundary).toStrictEqual(children[i + 1].rangePartition!.startBoundary);
+			expect(rangeOf(children[i]).endBoundary).toStrictEqual(rangeOf(children[i + 1]).startBoundary);
 		}
-		expect(children.map((c) => c.rangePartition!.endBoundary)).toEqual([kb("sk004"), kb("sk009"), kb("sk014"), null]);
+		expect(children.map((c) => rangeOf(c).endBoundary)).toEqual([kb("sk004"), kb("sk009"), kb("sk014"), null]);
 
 		// Every item is still readable through the router, and each read forwards exactly once.
 		for (const sk of sks) {
@@ -46,13 +46,13 @@ describe("PartitionDO — range split", () => {
 		await root.awaitSplitCompleted();
 
 		const child = (await root.children())[0];
-		const splitTimeMaxSizeMb = child.ctx.rangeSplitConditions!.maxSizeMb!;
+		const splitTimeMaxSizeMb = child.ctx.policy.rangeSplitConditions.maxSizeMb!;
 		const raisedMaxSizeMb = splitTimeMaxSizeMb * 4;
 
 		// An operator raises the range split threshold; the new value travels with every request.
-		const updatedCtx: PartitionContextResolved = {
+		const updatedCtx: FokosDbRouteContext = {
 			...root.ctx,
-			rangeSplitConditions: { ...root.ctx.rangeSplitConditions!, maxSizeMb: raisedMaxSizeMb },
+			policy: { ...root.ctx.policy, rangeSplitConditions: { ...root.ctx.policy.rangeSplitConditions, maxSizeMb: raisedMaxSizeMb } },
 		};
 		const ownedSk = [...sks].sort()[0];
 		const read = await root.stub.apiGetItem(updatedCtx, { hashKey: kb("alice"), sortKey: kb(ownedSk) });
@@ -62,7 +62,7 @@ describe("PartitionDO — range split", () => {
 		// Read the child's stored context WITHOUT passing one, so the assertion observes what the
 		// router forwarded rather than writing the threshold itself.
 		const stored = await child.stub.status();
-		expect(stored.partitionContext!.rangeSplitConditions!.maxSizeMb).toBe(raisedMaxSizeMb);
+		expect(stored.partitionContext!.policy.rangeSplitConditions.maxSizeMb).toBe(raisedMaxSizeMb);
 	});
 
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
@@ -74,8 +74,8 @@ describe("PartitionDO — range split", () => {
 		for (const sk of sks) {
 			// The N children form a total partition of the sort-key axis: each written sk is owned by exactly one.
 			const owners = status.childPartitionContexts.filter((c) => {
-				const start = c.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
-				const end = c.rangePartition!.endBoundary;
+				const start = rangeOf(c).startBoundary ?? KeyCodec.encodeOptional(undefined);
+				const end = rangeOf(c).endBoundary;
 				return KeyCodec.compare(kb(sk), start) >= 0 && (end === null || KeyCodec.compare(kb(sk), end) < 0);
 			});
 			expect(owners, `sk ${sk} must be owned by exactly one child`).toHaveLength(1);
@@ -92,7 +92,7 @@ describe("PartitionDO — range split", () => {
 		await root.awaitSplitCompleted();
 		const status = await root.splitStatus();
 
-		const leftmost = status.childPartitionContexts.find((c) => c.rangePartition!.startBoundary === null);
+		const leftmost = status.childPartitionContexts.find((c) => rangeOf(c).startBoundary === null);
 		expect(leftmost, "a leftmost child [−∞, B1) must exist").toBeDefined();
 		// The router keeps no slice: the leftmost child is a different DO than the splitting node.
 		expect(leftmost!.doName).not.toBe(root.doName);
@@ -109,7 +109,7 @@ describe("PartitionDO — range split", () => {
 			for (const child of children) {
 				const childRead = await child.get({
 					hashKey: kb("alice"),
-					sortKey: child.ctx.rangePartition!.startBoundary ?? kb(),
+					sortKey: rangeOf(child.ctx).startBoundary ?? kb(),
 				});
 				expect(childRead.meta.rangeDepth).toBe(1);
 				expect(childRead.meta._internal.rangeAncestors).toEqual([]);
@@ -118,16 +118,16 @@ describe("PartitionDO — range split", () => {
 			// A depth-2 grandchild's expected ancestor is its depth-1 parent's own boundaries, decoded to
 			// wire form. Split both the leftmost child (start=null) and a non-leftmost one (start=KeyBytes)
 			// so both the null and the decode-from-KeyBytes startBoundary paths are exercised.
-			const expectAncestor = (childCtx: PartitionContextResolved) => {
+			const expectAncestor = (childCtx: FokosDbRouteContext) => {
 				return {
 					depth: 1,
-					startBoundary: childCtx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined),
-					endBoundary: childCtx.rangePartition!.endBoundary ?? KeyCodec.encodeOptional(undefined),
+					startBoundary: rangeOf(childCtx).startBoundary ?? KeyCodec.encodeOptional(undefined),
+					endBoundary: rangeOf(childCtx).endBoundary ?? KeyCodec.encodeOptional(undefined),
 				};
 			};
 
 			for (const child of children) {
-				const start = child.ctx.rangePartition!.startBoundary;
+				const start = rangeOf(child.ctx).startBoundary;
 				// Keys keyed to the child's own start land inside it; '~' (0x7E) sorts after alnum so they
 				// stay >= a non-null start. The leftmost child (start=null) takes plain "aa…" keys.
 				const keyPrefix = start === null ? "aa" : `${KeyCodec.decode(start) as string}~`;
@@ -151,7 +151,7 @@ describe("PartitionDO — range split", () => {
 			await root.awaitSplitCompleted();
 
 			const children = await root.children();
-			const leftChild = children.find((c) => c.ctx.rangePartition!.startBoundary === null)!;
+			const leftChild = children.find((c) => rangeOf(c.ctx).startBoundary === null)!;
 			await leftChild.splitRange("aa");
 
 			// Depth-2 grandchild reached through the root: rangeDepth is still tracked, but rangeAncestors

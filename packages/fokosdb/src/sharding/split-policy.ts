@@ -2,19 +2,28 @@ import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
 import { hashChildIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
-import {
-	areImmutableOptionsEqual,
-	isHashPartition,
-	isRangePartition,
-	PartitionContextLivePartition,
-	type PartitionContextResolved,
-} from "./partition-context.js";
+import { isHashPartition, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { PartitionIdHelper, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import invariant from "../shared/invariant.js";
 import type { PartitionInfoInternal, RangeAncestorInfo } from "./types.js";
-import { PartitionStore } from "../shared/partition/partition-store.js";
+import type { PartitionStore } from "../shared/partition/partition-store.js";
 // Type-only. The emit erases it, so the topology and the repartition flow make no runtime cycle.
 import type { RepartitionRouting } from "./repartition-types.js";
+
+export type SplitConditions = {
+	/** The size in megabytes that makes the partition split. */
+	maxSizeMb?: number;
+	/**
+	 * The number of items that makes the partition split.
+	 * FIXME: Nothing reads this value. Remove it, or make the split policy use it.
+	 */
+	maxItems?: number;
+};
+
+/** The policy fields the two split policies read. The FokosDB policy carries them. */
+export type SplitPolicyFields = { hashSplitConditions: SplitConditions; rangeSplitConditions?: SplitConditions };
+
+export type SplitPolicyContext = FokosRouteContext<SplitPolicyFields>;
 
 /**
  * What the operation asking to be routed does to the partition's size. Size backpressure gates on
@@ -78,23 +87,20 @@ export interface PartitionTopologySplitter {
 	 * Picks the child partition that owns the keys. A parent uses it during a lazy split migration, so
 	 * it can serve requests while the data moves.
 	 */
-	pickChildPartition(
-		partitionContext: PartitionContextResolved,
-		hashKey: KeyBytes,
-		sortKey?: KeyBytes,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved };
+	pickChildPartition<P>(partitionContext: FokosRouteContext<P>, hashKey: KeyBytes, sortKey?: KeyBytes): FokosRouteContext<P>;
 
 	/**
 	 * Called after a forwarded request returns. Updates the topology cache from the response.
 	 */
 	recordForwardResult(
 		hashKey: KeyBytes,
-		fromCtx: PartitionContextResolved,
-		toCtx: PartitionContextResolved,
+		fromCtx: FokosRouteContext<unknown>,
+		toCtx: FokosRouteContext<unknown>,
 		responsePartitionInfo: PartitionInfoInternal,
 	): void;
 
-	updatePartitionContext(partitionContext: PartitionContextLivePartition): void;
+	/** Replaces the mutable part of the context. The identity of the partition cannot change. */
+	updatePartitionContext(partitionContext: SplitPolicyContext): void;
 }
 
 // The fraction of hashSplitConditions.maxSizeMb that one key must reach to become a promotion candidate.
@@ -104,40 +110,41 @@ export const RANGE_PROMOTION_FRACTION = 0.25;
  * Used by the Partition Durable Objects.
  */
 export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
-	private partitionContext: PartitionContextLivePartition;
+	private partitionContext: SplitPolicyContext;
 
 	#storage: DurableObjectStorage;
 	#routing: RepartitionRouting;
 	#partitionStore: PartitionStore;
+	/** The own partition ID bytes, decoded once: every forward appends child indexes to them. */
+	#ownerIdBytes: Uint8Array;
 	#ownerAbsDepth: number;
 	#_hashTopology: HashTopology | null = null;
 
 	constructor(
-		partitionContext: PartitionContextLivePartition,
+		partitionContext: SplitPolicyContext,
+		identity: FokosPartitionIdentity,
 		doCtx: DurableObjectState,
 		partitionStore: PartitionStore,
 		routing: RepartitionRouting,
 	) {
+		invariant(identity.kind === "hash", "fokos/topology: HashPartitionTopologyImpl requires a hash partition identity");
 		this.partitionContext = partitionContext;
 		this.#partitionStore = partitionStore;
 		this.#storage = doCtx.storage;
 		this.#routing = routing;
+		this.#ownerIdBytes = Uint8Array.fromHex(identity.ref.partitionId);
+		this.#ownerAbsDepth = identity.hash!.path.length;
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
 		// first request, after blockConcurrencyWhile has completed, so synchronous KV reads are safe.
-		const ownerAbsDepth = PartitionIdHelper.depth(partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId));
-		this.#ownerAbsDepth = ownerAbsDepth;
 		const snapshot = doCtx.storage.kv.get<HashTopologySnapshot>("__topo_cache");
 		if (snapshot) {
 			this.#_hashTopology = HashTopology.fromSnapshot(snapshot);
 		}
 	}
 
-	updatePartitionContext(partitionContext: PartitionContextLivePartition): void {
-		invariant(isHashPartition(partitionContext), "fokos/topology: HashPartitionTopologyImpl requires a hash partition context");
+	updatePartitionContext(partitionContext: SplitPolicyContext): void {
 		invariant(
-			areImmutableOptionsEqual(this.partitionContext, partitionContext) &&
-				this.partitionContext.partitionId === partitionContext.partitionId &&
-				this.partitionContext.doName === partitionContext.doName,
+			this.partitionContext.partitionId === partitionContext.partitionId && this.partitionContext.doName === partitionContext.doName,
 			"fokos/topology: HashPartitionTopologyImpl partition identity changed",
 		);
 		this.partitionContext = partitionContext;
@@ -153,7 +160,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	#hashTopology(): HashTopology | null {
 		if (this.#_hashTopology) return this.#_hashTopology;
 		if (!this.#routing.routerRole()) return null;
-		this.#_hashTopology = HashTopology.create(this.partitionContext.hashSplitN, this.#ownerAbsDepth);
+		this.#_hashTopology = HashTopology.create(this.partitionContext.topology.hashSplitN, this.#ownerAbsDepth);
 		return this.#_hashTopology;
 	}
 
@@ -167,11 +174,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		// stops the decision from flapping at the threshold, and it lets the requests that trigger the
 		// split complete.
 		// Writes only — see OperationIntent for why no other intent can grow the partition.
-		if (
-			intent === "write" &&
-			this.partitionContext.hashSplitConditions.maxSizeMb &&
-			dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
-		) {
+		const { hashSplitConditions } = this.partitionContext.policy;
+		if (intent === "write" && hashSplitConditions.maxSizeMb && dbSize > hashSplitConditions.maxSizeMb * 1.1 * 1024 * 1024) {
 			return "reject_over_size";
 		}
 
@@ -180,7 +184,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	shouldSplit(_hashKey?: KeyBytes, _sortKey?: KeyBytes): SplitType | null {
 		const dbSize = this.#storage.sql.databaseSize;
-		if (this.partitionContext.hashSplitConditions.maxSizeMb && dbSize > this.partitionContext.hashSplitConditions.maxSizeMb * 1024 * 1024) {
+		const { hashSplitConditions } = this.partitionContext.policy;
+		if (hashSplitConditions.maxSizeMb && dbSize > hashSplitConditions.maxSizeMb * 1024 * 1024) {
 			// This method does NOT decide mutual exclusion with an unfinished promotion. That question is
 			// about the durable repartition rows, and only the arbitration transaction answers it without
 			// a race against another queue request.
@@ -199,27 +204,24 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	 * Skips `relativeDepthToLeaf` levels in one shot, computing the descendant partition ID deterministically from the hash key and the owner's depth.
 	 * Used by the topology cache to skip known intermediate router hops.
 	 */
-	pickDescendantHashPartition(
-		partitionContext: PartitionContextLivePartition,
+	pickDescendantHashPartition<P>(
+		partitionContext: FokosRouteContext<P>,
 		hashKey: KeyBytes,
 		relativeDepthToLeaf: number,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
-		const partitionIdBytes = partitionContext._partitionIdBytes ?? Uint8Array.fromHex(partitionContext.partitionId);
-		const parentDepth = PartitionIdHelper.depth(partitionIdBytes);
-
+	): FokosRouteContext<P> {
+		invariant(
+			partitionContext.partitionId === this.partitionContext.partitionId,
+			"fokos/topology: pickDescendantHashPartition routes from this partition only",
+		);
 		const hashIdxs: number[] = [];
 		for (let i = 0; i < relativeDepthToLeaf; i++) {
-			hashIdxs.push(hashChildIndex(hashKey, parentDepth + i, partitionContext.hashSplitN));
+			hashIdxs.push(hashChildIndex(hashKey, this.#ownerAbsDepth + i, partitionContext.topology.hashSplitN));
 		}
 
-		return resolveDescendantHashPartitionContext(this.partitionContext, partitionContext, partitionIdBytes, hashIdxs);
+		return resolveDescendantHashPartitionContext(partitionContext, this.#ownerIdBytes, hashIdxs);
 	}
 
-	pickChildPartition(
-		partitionContext: PartitionContextLivePartition,
-		hashKey: KeyBytes,
-		_sortKey?: KeyBytes,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+	pickChildPartition<P>(partitionContext: FokosRouteContext<P>, hashKey: KeyBytes, _sortKey?: KeyBytes): FokosRouteContext<P> {
 		const cache = this.#hashTopology();
 		if (cache) {
 			// Returns the relative depth of the descendant partition that is non-split according to our cached topology,
@@ -235,8 +237,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	recordForwardResult(
 		hashKey: KeyBytes,
-		fromCtx: PartitionContextLivePartition,
-		toCtx: PartitionContextLivePartition,
+		fromCtx: FokosRouteContext<unknown>,
+		toCtx: FokosRouteContext<unknown>,
 		responsePartitionInfo: PartitionInfoInternal,
 	): void {
 		if (responsePartitionInfo._internal.rangeAncestors.length > 0) {
@@ -254,8 +256,8 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		// targetRelDepth: how many hash-tree levels this single RPC hop crossed.
 		// pickChildPartition may have skipped the cache (e.g. depth-2 skip goes straight to the
 		// grandchild), so we derive the actual skip from the partition IDs rather than assuming 1.
-		const fromAbsDepth = PartitionIdHelper.depth(fromCtx._partitionIdBytes ?? Uint8Array.fromHex(fromCtx.partitionId));
-		const toAbsDepth = PartitionIdHelper.depth(toCtx._partitionIdBytes ?? Uint8Array.fromHex(toCtx.partitionId));
+		const fromAbsDepth = PartitionIdHelper.depth(Uint8Array.fromHex(fromCtx.partitionId));
+		const toAbsDepth = PartitionIdHelper.depth(Uint8Array.fromHex(toCtx.partitionId));
 		invariant(
 			toAbsDepth > fromAbsDepth,
 			`fokos/topology.recordForwardResult: toCtx must be a descendant of fromCtx, got fromAbsDepth ${fromAbsDepth} and toAbsDepth ${toAbsDepth}`,
@@ -280,10 +282,6 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 }
 
-function sameOptionalKey(a: KeyBytes | null | undefined, b: KeyBytes | null | undefined): boolean {
-	return a == null || b == null ? a == b : KeyCodec.compare(a, b) === 0;
-}
-
 /**
  * Topology splitter for range-structure DOs. A range DO owns exactly one hashKey and a fixed,
  * immutable [startBoundary, endBoundary) slice of the sortKey axis. On split it becomes a pure
@@ -295,27 +293,31 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	#routing: RepartitionRouting;
 	#partitionStore: PartitionStore;
 
-	private partitionContext: PartitionContextLivePartition & {
-		rangePartition: NonNullable<PartitionContextLivePartition["rangePartition"]>;
-	};
+	private partitionContext: SplitPolicyContext;
+	/** The immutable range this partition owns. */
+	readonly #range: NonNullable<FokosPartitionIdentity["range"]>;
 
-	constructor(pCtx: PartitionContextLivePartition, ctx: DurableObjectState, partitionStore: PartitionStore, routing: RepartitionRouting) {
-		invariant(isRangePartition(pCtx), "fokos/topology: RangePartitionTopologyImpl must be initialized with a range partition context");
-		this.partitionContext = pCtx;
+	constructor(
+		partitionContext: SplitPolicyContext,
+		identity: FokosPartitionIdentity,
+		ctx: DurableObjectState,
+		partitionStore: PartitionStore,
+		routing: RepartitionRouting,
+	) {
+		invariant(
+			identity.kind === "range" && identity.range,
+			"fokos/topology: RangePartitionTopologyImpl requires a range partition identity",
+		);
+		this.partitionContext = partitionContext;
+		this.#range = identity.range;
 		this.#storage = ctx.storage;
 		this.#partitionStore = partitionStore;
 		this.#routing = routing;
 	}
 
-	updatePartitionContext(partitionContext: PartitionContextLivePartition): void {
-		invariant(isRangePartition(partitionContext), "fokos/topology: RangePartitionTopologyImpl requires a range partition context");
+	updatePartitionContext(partitionContext: SplitPolicyContext): void {
 		invariant(
-			areImmutableOptionsEqual(this.partitionContext, partitionContext) &&
-				this.partitionContext.partitionId === partitionContext.partitionId &&
-				this.partitionContext.doName === partitionContext.doName &&
-				sameOptionalKey(this.partitionContext.rangePartition.hashKey, partitionContext.rangePartition.hashKey) &&
-				sameOptionalKey(this.partitionContext.rangePartition.startBoundary, partitionContext.rangePartition.startBoundary) &&
-				sameOptionalKey(this.partitionContext.rangePartition.endBoundary, partitionContext.rangePartition.endBoundary),
+			this.partitionContext.partitionId === partitionContext.partitionId && this.partitionContext.doName === partitionContext.doName,
 			"fokos/topology: RangePartitionTopologyImpl partition identity changed",
 		);
 		this.partitionContext = partitionContext;
@@ -328,8 +330,8 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		if (this.#routing.routerRole()) return "forward";
 
 		// Boundaries are immutable identity. null = unbounded edge.
-		const start = this.partitionContext.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
-		const end = this.partitionContext.rangePartition!.endBoundary;
+		const start = this.#range.start ?? KeyCodec.encodeOptional(undefined);
+		const end = this.#range.end;
 		const inRange = KeyCodec.compare(sk, start) >= 0 && (end === null || KeyCodec.compare(sk, end) < 0);
 		if (!inRange) {
 			// Out of the owned range. Correct routing never reaches this, so it is a routing defect.
@@ -337,10 +339,11 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		}
 
 		// Size-based backpressure (10% overage allowed, writes only — consistent with the hash partition).
+		const { rangeSplitConditions } = this.partitionContext.policy;
 		if (
 			intent === "write" &&
-			this.partitionContext.rangeSplitConditions?.maxSizeMb &&
-			this.#storage.sql.databaseSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
+			rangeSplitConditions?.maxSizeMb &&
+			this.#storage.sql.databaseSize > rangeSplitConditions.maxSizeMb * 1.1 * 1024 * 1024
 		) {
 			return "reject_over_size";
 		}
@@ -349,22 +352,16 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	}
 
 	shouldSplit(_hashKey?: KeyBytes, _sortKey?: KeyBytes): SplitType | null {
-		if (!this.partitionContext.rangeSplitConditions) return null;
+		const { rangeSplitConditions } = this.partitionContext.policy;
+		if (!rangeSplitConditions) return null;
 		const dbSize = this.#storage.sql.databaseSize;
-		if (
-			this.partitionContext.rangeSplitConditions.maxSizeMb &&
-			dbSize > this.partitionContext.rangeSplitConditions.maxSizeMb * 1024 * 1024
-		) {
+		if (rangeSplitConditions.maxSizeMb && dbSize > rangeSplitConditions.maxSizeMb * 1024 * 1024) {
 			return "range";
 		}
 		return null;
 	}
 
-	pickChildPartition(
-		partitionContext: PartitionContextResolved,
-		_hashKey: KeyBytes,
-		sortKey?: KeyBytes,
-	): { doId: DurableObjectId; partitionContext: PartitionContextResolved } {
+	pickChildPartition<P>(partitionContext: FokosRouteContext<P>, _hashKey: KeyBytes, sortKey?: KeyBytes): FokosRouteContext<P> {
 		const sk = sortKey ?? KeyCodec.encodeOptional(undefined);
 		const targets = this.#routing.splitTargets();
 		invariant(targets.length > 0, "fokos/range: pickChildPartition called without an active split");
@@ -391,7 +388,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		// that is a strict sub-slice of the immediate child and still contains sk, jump straight to it.
 		// Boundaries are immutable identity, so a stale hint at worst lands on a router that forwards on;
 		// the target's shouldAllow validates range membership, so a bad hint can never corrupt data.
-		const hashKey = this.partitionContext.rangePartition.hashKey;
+		const hashKey = this.#range.hashKey;
 		const learned = this.#partitionStore.findDeepestKnownRangeSlice(hashKey, sk);
 		if (learned && isStrictSubSlice(learned, best.start, best.end)) {
 			return resolveRangePartitionContext(partitionContext, hashKey, learned.startBoundary, learned.endBoundary);
@@ -407,25 +404,19 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 	recordForwardResult(
 		hashKey: KeyBytes,
-		_fromCtx: PartitionContextResolved,
-		_toCtx: PartitionContextResolved,
+		_fromCtx: FokosRouteContext<unknown>,
+		_toCtx: FokosRouteContext<unknown>,
 		responsePartitionInfo: PartitionInfoInternal,
 	): void {
 		// TODO(perf) Remove for optimization.
-		invariant(
-			KeyCodec.compare(hashKey, this.partitionContext.rangePartition.hashKey) === 0,
-			"fokos/range.recordForwardResult: hashKey mismatch",
-		);
+		invariant(KeyCodec.compare(hashKey, this.#range.hashKey) === 0, "fokos/range.recordForwardResult: hashKey mismatch");
 
 		// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
 		for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
 			this.#partitionStore.insertRangePartitionBoundary(
-				// Always the real hash key, never the empty sentinel — `setRangeAncestors` writes ancestors
-				// under the same key, so the two writers share one convention and the primary key dedupes
-				// a learned boundary against the identical ancestor row. Storing this tree under the empty
-				// key to save bytes would put one keyspace under two labels, and `getRangeAncestors` could
-				// no longer tell its own ancestors from learned rows.
-				this.partitionContext.rangePartition.hashKey,
+				// Always the real hash key, never the empty sentinel: a hash partition learns boundaries of
+				// many hash keys into the same table, so every row names the key it describes.
+				this.#range.hashKey,
 				ancestor.startBoundary,
 				ancestor.endBoundary,
 				ancestor.depth,

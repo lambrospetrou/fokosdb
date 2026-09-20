@@ -18,6 +18,7 @@ import {
 	makeTriggeredRangeRoot,
 	PROMOTION_TEST_MAX_SIZE_MB,
 	withMigrationHeld,
+	rangeOf,
 } from "./partition-harness.js";
 
 describe("PartitionDO — range split", () => {
@@ -42,7 +43,7 @@ describe("PartitionDO — range split", () => {
 	 * reads through its parent, which still holds every row of the key and answers only for this slice.
 	 */
 	const ownedByChild = (sks: string[], child: TestPartition): string[] => {
-		const { startBoundary, endBoundary } = child.ctx.rangePartition!;
+		const { startBoundary, endBoundary } = rangeOf(child.ctx);
 		return [...sks]
 			.sort()
 			.filter(
@@ -402,8 +403,8 @@ describe("PartitionDO — range split", () => {
 		const byBoundary = (children: TestPartition[]) =>
 			[...children].sort((a, b) =>
 				KeyCodec.compare(
-					a.ctx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined),
-					b.ctx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined),
+					rangeOf(a.ctx).startBoundary ?? KeyCodec.encodeOptional(undefined),
+					rangeOf(b.ctx).startBoundary ?? KeyCodec.encodeOptional(undefined),
 				),
 			);
 
@@ -540,7 +541,7 @@ describe("PartitionDO — range split", () => {
 
 				// The router's own DB still holds every item (parent rows are never deleted during a split),
 				// but it answers only for the slice the calling child owns.
-				const end = caller.ctx.rangePartition!.endBoundary;
+				const end = rangeOf(caller.ctx).endBoundary;
 				const ownedByCaller = [...sks].sort().filter((sk) => end === null || KeyCodec.compare(kb(sk), end) < 0);
 				expect(ownedByCaller.length, "the leftmost child should own part of the seeded range").toBeGreaterThan(0);
 				expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(ownedByCaller);
@@ -577,7 +578,7 @@ describe("PartitionDO — range split", () => {
 			const children = (await root.splitStatus()).childPartitionContexts;
 			// Children are in ascending boundary order, so an exclusive upper bound at the third child's
 			// start boundary leaves exactly the first two intersecting the query.
-			const upper = children[2].rangePartition!.startBoundary!;
+			const upper = rangeOf(children[2]).startBoundary!;
 
 			// The visit cap is spent by those two leaves. The two children beyond the bound are skipped by
 			// the interval, so there is nothing left to resume into — the old code counted them anyway and
@@ -659,7 +660,7 @@ describe("PartitionDO — range split", () => {
 			// The same oversized first item is admitted when it starts the page.
 			const res2 = await queryPage(root, {
 				remainingResponseBytes: 1,
-				interval: { lower: { value: c1.ctx.rangePartition!.startBoundary!, inclusive: true } },
+				interval: { lower: { value: rangeOf(c1.ctx).startBoundary!, inclusive: true } },
 			});
 			expect(res2.items).toHaveLength(1);
 		});
@@ -668,7 +669,7 @@ describe("PartitionDO — range split", () => {
 			const N = 4;
 			const { root, sks } = await buildSplitTree(N);
 			const children = byBoundary(await root.children());
-			const B = children[2].ctx.rangePartition!.startBoundary!;
+			const B = rangeOf(children[2].ctx).startBoundary!;
 			// Boundaries are separators between keys, not keys: an item exactly on the boundary is new.
 			await root.put({ hashKey: kb("alice"), sortKey: B, data: "x", kind: "text" });
 			sks.push(KeyCodec.decode(B) as string);
@@ -694,8 +695,8 @@ describe("PartitionDO — range split", () => {
 			const { root, sks } = await buildSplitTree(N);
 			const children = byBoundary(await root.children());
 			const owns = (child: TestPartition, sk: string) => {
-				const start = child.ctx.rangePartition!.startBoundary ?? KeyCodec.encodeOptional(undefined);
-				const end = child.ctx.rangePartition!.endBoundary;
+				const start = rangeOf(child.ctx).startBoundary ?? KeyCodec.encodeOptional(undefined);
+				const end = rangeOf(child.ctx).endBoundary;
 				return KeyCodec.compare(kb(sk), start) >= 0 && (end === null || KeyCodec.compare(kb(sk), end) < 0);
 			};
 
@@ -722,9 +723,9 @@ describe("PartitionDO — range split", () => {
 			const { root } = await makeTriggeredRangeRoot(2);
 			await root.awaitSplitCompleted();
 			const children = await root.children();
-			const left = children.find((c) => c.ctx.rangePartition!.startBoundary === null)!;
+			const left = children.find((c) => rangeOf(c.ctx).startBoundary === null)!;
 			const grandchildren = byBoundary(await left.splitRange("aa"));
-			const g2Start = grandchildren[1].ctx.rangePartition!.startBoundary!;
+			const g2Start = rangeOf(grandchildren[1].ctx).startBoundary!;
 
 			// Delete every item the right grandchild owns; it must then drain empty on the next page.
 			const under = await left.stub.apiQueryItems(left.ctx, fullRequest());
