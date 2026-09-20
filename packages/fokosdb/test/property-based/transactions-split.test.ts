@@ -11,7 +11,7 @@
 import fc from "fast-check";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import { arbItemData, makeTestDB, poolKeys, type ItemData } from "./arbitraries.js";
+import { arbItemData, makeTestDB, poolKeys, propertyRuns, type ItemData } from "./arbitraries.js";
 import { commandArbitraries, expectModelMatches, untilAvailable, type Model } from "./model.js";
 
 const SUITE_TIMEOUT_MS = 600_000;
@@ -77,7 +77,7 @@ describe("FokosDB transactions over splitting partitions — model-based propert
 					await fc.asyncModelRun(() => ({ model, real: db }), cmds);
 					await expectModelMatches(db, model, keys);
 				}),
-				{ numRuns: 25 },
+				{ numRuns: propertyRuns(25) },
 			);
 
 			expect(await expectSeedIntact(db)).toBeGreaterThanOrEqual(1);

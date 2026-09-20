@@ -6,7 +6,7 @@
 // A failure prints `seed`, `path` and `replayPath`. See item-crud.test.ts for how to replay them.
 import fc from "fast-check";
 import { describe, it } from "vitest";
-import { arbItemData, arbPoolKey, makeTestDB, POOL_KEYS } from "./arbitraries.js";
+import { arbItemData, arbPoolKey, makeTestDB, POOL_KEYS, propertyRuns } from "./arbitraries.js";
 import { commandArbitraries, expectModelMatches, type Model } from "./model.js";
 
 const PROPERTY_TIMEOUT_MS = 180_000;
@@ -24,7 +24,7 @@ describe("FokosDB transactions — model-based property", () => {
 				// that no read command observed still fails the run.
 				await expectModelMatches(db, model, POOL_KEYS);
 			}),
-			{ numRuns: 25 },
+			{ numRuns: propertyRuns(25) },
 		);
 	});
 });
