@@ -10,7 +10,7 @@
 // `{ seed: 42, path: "3:1:0" }`, to replay the shrunk counterexample. A command sequence also
 // prints `replayPath`; pass it to `fc.commands` as `{ replayPath: "..." }` next to the seed.
 import fc from "fast-check";
-import { describe, expect, it } from "vitest";
+import { assert, describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import {
 	arbItemData,
@@ -39,10 +39,10 @@ describe("FokosDB item CRUD — stateless properties", () => {
 				expect(put.version).toBe(1);
 
 				const get = await db.getItem(key);
-				expect(get).toMatchObject({
-					found: true,
-					item: { ...key, data, kind: expectedDataKind(data), version: 1 },
-				});
+				assert(get.found);
+				expect(get.item).toMatchObject({ ...key, kind: expectedDataKind(data), version: 1 });
+				// `toMatchObject` matches a SUBSET of an object value, so the data is compared exactly.
+				expect(get.item.data).toEqual(data);
 
 				const del = await db.deleteItem(key);
 				expect(del.deleted).toBe(true);
@@ -92,8 +92,14 @@ class GetItem extends ItemCommand {
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const res = await db.getItem(this.key);
 		const expected = m.items.get(keyId(this.key));
-		if (expected === undefined) expect(res).toMatchObject({ found: false, item: this.key });
-		else expect(res).toMatchObject({ found: true, item: { ...this.key, ...expected } });
+		if (expected === undefined) {
+			expect(res).toMatchObject({ found: false, item: this.key });
+			return;
+		}
+		assert(res.found);
+		expect(res.item).toMatchObject({ ...this.key, kind: expected.kind, version: expected.version });
+		// `toMatchObject` matches a SUBSET of an object value, so the data is compared exactly.
+		expect(res.item.data).toEqual(expected.data);
 	}
 }
 

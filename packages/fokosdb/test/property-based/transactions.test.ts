@@ -7,7 +7,7 @@
 import fc from "fast-check";
 import { describe, it } from "vitest";
 import { arbItemData, arbPoolKey, makeTestDB, POOL_KEYS, propertyRuns } from "./arbitraries.js";
-import { commandArbitraries, expectModelMatches, type Model } from "./model.js";
+import { commandArbitraries, expectModelMatches, seedPool, type Model } from "./model.js";
 
 const PROPERTY_TIMEOUT_MS = 180_000;
 
@@ -19,6 +19,7 @@ describe("FokosDB transactions — model-based property", () => {
 			fc.asyncProperty(arbCommands, async (cmds) => {
 				const model: Model = { items: new Map() };
 				const db = makeTestDB();
+				await seedPool(db, model, POOL_KEYS);
 				await fc.asyncModelRun(() => ({ model, real: db }), cmds);
 				// The final state must agree on every key the run could have touched, so a divergence
 				// that no read command observed still fails the run.
