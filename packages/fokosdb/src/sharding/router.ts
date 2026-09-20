@@ -9,6 +9,7 @@ import {
 	type FokosTopology,
 } from "./route-context.js";
 import type { FokosPrepareDestroyRequest, FokosStatusCursor, FokosStatusPage, FokosStatusRequest } from "./repartition-types.js";
+import type { FokosEnvelope, FokosPublicRoute, FokosPublicRouting, FokosRouteNode } from "./runtime-types.js";
 import { assertExists } from "../shared/tsutils.js";
 
 /** What `walk` calls on every partition it reaches. A host stub has these two methods and its own. */
@@ -62,6 +63,15 @@ export class FokosRouter<TPolicy> {
 	}
 
 	/**
+	 * Opens an envelope at the Worker boundary. The internal hints stop here: they are
+	 * partition-to-partition routing state, and a client has no use for them.
+	 */
+	unwrap<T>(envelope: FokosEnvelope<T>): { value: T; routing: FokosPublicRouting } {
+		const { servedBy, forwardCount } = envelope.routing;
+		return { value: envelope.value, routing: { servedBy: servedBy.map(publicRoute), forwardCount } };
+	}
+
+	/**
 	 * The destroy traversal. For every root, and then post-order for every target: fence the partition
 	 * with `fokosPrepareDestroy` (with the root context on a root only), read every `fokosStatus` page
 	 * after the fence is set, visit each target, then call `visit` on the partition.
@@ -97,4 +107,9 @@ export class FokosRouter<TPolicy> {
 			await walkPartition(root, root);
 		}
 	}
+}
+
+function publicRoute(node: FokosRouteNode): FokosPublicRoute {
+	const { ref, actorId, hashDepth, rangeDepth, role } = node;
+	return { ref, actorId, hashDepth, rangeDepth, role };
 }

@@ -13,6 +13,7 @@ import {
 	JsonComposite,
 	JsonValue,
 	OperationMetrics,
+	PartitionInfo,
 	PutItemOptions,
 	PutItemResult,
 	ProjectedItem,
@@ -81,10 +82,12 @@ import {
 	withExpressionErrors,
 } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
-import type { PartitionInfoInternal } from "../sharding/types.js";
-import { routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
+import { attachRouting, routedError } from "../sharding/envelope.js";
+import type { FokosPublicRouting } from "../sharding/runtime-types.js";
 import { normalizeSkInterval } from "../sharding/sk-interval.js";
+import { leafPartitionInfo, partitionInfoOf } from "./partition-info.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import {
@@ -180,7 +183,8 @@ function decodeRejectionReason(reason: RejectionReasonEncoded): RejectionReason 
 /** The error `putItem` and `deleteItem` raise when the partition rejects the condition. */
 function conditionCheckError(
 	keys: { hashKey: HashKey; sortKey?: SortKey },
-	res: { reason: RejectionReasonEncoded; meta: OperationMetrics & PartitionInfoInternal },
+	res: { reason: RejectionReasonEncoded; meta: OperationMetrics },
+	routing: FokosPublicRouting,
 ): FokosConditionCheckError {
 	const reason = decodeRejectionReason(res.reason);
 	invariant(reason.code === "condition_failed", "an item RPC rejects only a failed condition");
@@ -188,7 +192,7 @@ function conditionCheckError(
 		message: "condition failed",
 		attributes: { hashKey: keys.hashKey, sortKey: keys.sortKey },
 		reason,
-		meta: publicMeta(res.meta),
+		meta: publicMeta(res.meta, routing),
 	});
 }
 
@@ -226,10 +230,13 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 		return await fn();
 	} catch (e) {
 		const err = mapInternalErrorToPublic(FokosError.wrap(e));
-		// A partition stamps its routing meta on its error. The routing state stops here, as it does on a result.
+		// A partition attaches its routing to its error. The routing state stops here, as it does on a
+		// result: the public error carries the same `meta` a result would, and the internal hints go.
 		const routed = routedError(err);
 		if (routed) {
-			Object.assign(routed, { meta: publicMeta(routed.meta) });
+			const meta = partitionInfoOf(routed.routing);
+			delete (routed as { routing?: unknown }).routing;
+			Object.assign(routed, { meta });
 		}
 		throw err;
 	}
@@ -245,17 +252,17 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
  * and the error keeps its original `error_id`, so one log line still joins the two ends.
  */
 function mapInternalErrorToPublic(err: FokosError): FokosError {
-	if (err.code !== UNAVAILABLE_CODES.repartition_not_cut_over.code) return err;
+	if (err.code !== SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code) return err;
 	const mapped = new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
 		message: "partition split in progress, please retry later",
 		error_id: err.error_id,
 		cause: err.cause,
 		attributes: { ...err.attributes, runtimeCode: err.code },
 	});
-	// The routing meta is an own property of the error object, so a new object loses it. It must move
-	// with the mapping. This code would otherwise be the only one that reaches a client with no meta.
+	// The routing is an own property of the error object, so a new object loses it. It must move with
+	// the mapping. This code would otherwise be the only one that reaches a client with no meta.
 	const routed = routedError(err);
-	return routed ? stampRoutingMeta(mapped, routed.meta) : mapped;
+	return routed ? attachRouting(mapped, routed.routing) : mapped;
 }
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
@@ -290,16 +297,9 @@ export type FokosDBOptions = {
 	singlePartitionFastPath?: boolean;
 };
 
-/**
- * Drops `_internal` from a partition meta. This is where partition-to-partition routing state stops:
- * every DO response carries the serving leaf's `rangeAncestors` so routers can cache them, and none of
- * that is meaningful to a client.
- * Public results are typed `PartitionInfo`, which has no such field, but structural typing accepts an
- * object that carries extra properties, so the removal has to happen at runtime as well.
- */
-function publicMeta<T extends PartitionInfoInternal>(meta: T): Omit<T, "_internal"> {
-	const { _internal: _dropped, ...rest } = meta;
-	return rest;
+/** The public meta of one result: the metrics of the work, and the partition that produced it. */
+function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): OperationMetrics & PartitionInfo {
+	return { ...metrics, ...partitionInfoOf(routing) };
 }
 
 export class FokosDB {
@@ -384,18 +384,20 @@ export class FokosDB {
 		validateItemDataSize(encoded.data, "putItem");
 		const partitionContext = this.#options.topology.rootContext(hashKey);
 		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const res = await stub.apiPutItem(partitionContext, {
-			hashKey,
-			sortKey,
-			data: encoded.data,
-			kind: encoded.kind,
-			ttlAt: opts.ttlAt,
-			condition,
-			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
-		});
-		if (res.outcome === "rejected") throw conditionCheckError(opts, res);
+		const { value: res, routing } = this.#options.topology.unwrap(
+			await stub.apiPutItem(partitionContext, {
+				hashKey,
+				sortKey,
+				data: encoded.data,
+				kind: encoded.kind,
+				ttlAt: opts.ttlAt,
+				condition,
+				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
+			}),
+		);
+		if (res.outcome === "rejected") throw conditionCheckError(opts, res, routing);
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta) };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta, routing) };
 	}
 
 	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
@@ -406,7 +408,10 @@ export class FokosDB {
 			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
 		const partitionContext = this.#options.topology.rootContext(hashKey);
 		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const res = await stub.apiGetItem(partitionContext, { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) });
+		const { value: res, routing } = this.#options.topology.unwrap(
+			await stub.apiGetItem(partitionContext, { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) }),
+		);
+		const meta = publicMeta(res.meta, routing);
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
@@ -422,16 +427,16 @@ export class FokosDB {
 						...(res.item.ttlAt === undefined ? {} : { ttlAt: res.item.ttlAt }),
 						version: res.item.version,
 					},
-					meta: publicMeta(res.meta),
+					meta,
 				};
 			}
 			return {
 				found: true,
 				item: { hashKey: opts.hashKey, sortKey: opts.sortKey, ...res.item, ...decodeItemData(res.item.kind, res.item.data) },
-				meta: publicMeta(res.meta),
+				meta,
 			};
 		}
-		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta: publicMeta(res.meta) };
+		return { found: false, item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, meta };
 	}
 
 	async #deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
@@ -442,15 +447,17 @@ export class FokosDB {
 		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
 		const partitionContext = this.#options.topology.rootContext(hashKey);
 		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const res = await stub.apiDeleteItem(partitionContext, {
-			hashKey,
-			sortKey,
-			condition,
-			returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
-		});
-		if (res.outcome === "rejected") throw conditionCheckError(opts, res);
+		const { value: res, routing } = this.#options.topology.unwrap(
+			await stub.apiDeleteItem(partitionContext, {
+				hashKey,
+				sortKey,
+				condition,
+				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
+			}),
+		);
+		if (res.outcome === "rejected") throw conditionCheckError(opts, res, routing);
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
-		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta) };
+		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta, routing) };
 	}
 
 	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
@@ -528,7 +535,7 @@ export class FokosDB {
 		let response: SingleShotResponse;
 		try {
 			// No retry, matching the coordinator path, which does not retry a write either.
-			response = await stub.txExecuteSingleShot(target, request);
+			response = (await stub.txExecuteSingleShot(target, request)).value;
 		} catch (err) {
 			// The partition does not throw after its apply commits, so an error that partition code raised
 			// means nothing applied: the transaction cancelled, and that one partition owns every operation,
@@ -625,7 +632,7 @@ export class FokosDB {
 		};
 		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
 		const response = await tryWhile(
-			async () => await stub.txReadSnapshot(target, request),
+			async () => (await stub.txReadSnapshot(target, request)).value,
 			(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
 		);
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
@@ -673,7 +680,7 @@ export class FokosDB {
 		for (const r of phase1Settled) {
 			// A read applies nothing, so the error of a failed phase call is the answer, as the partition raised it.
 			if (r.status === "rejected") throw r.reason;
-			phase1Flat.push(...r.value.items);
+			phase1Flat.push(...r.value.value.items);
 		}
 
 		if (phase1Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
@@ -700,7 +707,7 @@ export class FokosDB {
 		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase2Settled) {
 			if (r.status === "rejected") throw r.reason;
-			phase2Flat.push(...r.value.items);
+			phase2Flat.push(...r.value.value.items);
 		}
 
 		if (phase2Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
@@ -839,6 +846,10 @@ export class FokosDB {
 		let scannedCount = 0;
 		let rowsReturned = 0;
 		let forwardCount = 0;
+		// The aggregates count every leaf that answered, and never only the leaves that `partitionMetas`
+		// could name: the route list is capped, so naming a leaf is best effort while its counters are not.
+		let rowsRead = 0;
+		let partitionsVisited = 0;
 		let cursor: string | undefined;
 
 		for (let qi = startQueryIdx; qi < normalizedQueries.length; qi++) {
@@ -853,19 +864,21 @@ export class FokosDB {
 			const partitionContext = this.#options.topology.rootContext(query.hashKey);
 			const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
 
-			const rpcResult = await stub.apiQueryItems(partitionContext, {
-				hashKey: query.hashKey,
-				interval: query.interval,
-				direction: query.direction,
-				remainingEvaluatedItems: budget.remainingEvaluatedItems,
-				remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
-				remainingResponseBytes: budget.remainingResponseBytes,
-				remainingPartitionVisits: budget.remainingPartitionVisits,
-				allowOversizedFirstItem: budget.allowOversizedFirstItem,
-				cursor: rpcCursor,
-				select,
-				plan,
-			});
+			const { value: rpcResult, routing } = this.#options.topology.unwrap(
+				await stub.apiQueryItems(partitionContext, {
+					hashKey: query.hashKey,
+					interval: query.interval,
+					direction: query.direction,
+					remainingEvaluatedItems: budget.remainingEvaluatedItems,
+					remainingEvaluatedBytes: budget.remainingEvaluatedBytes,
+					remainingResponseBytes: budget.remainingResponseBytes,
+					remainingPartitionVisits: budget.remainingPartitionVisits,
+					allowOversizedFirstItem: budget.allowOversizedFirstItem,
+					cursor: rpcCursor,
+					select,
+					plan,
+				}),
+			);
 
 			count += rpcResult.count;
 			scannedCount += rpcResult.scannedCount;
@@ -889,8 +902,13 @@ export class FokosDB {
 					}
 				}
 			}
-			partitionMetas.push(...rpcResult.partitionMetas.map(publicMeta));
-			forwardCount += rpcResult.meta.forwardCount;
+			for (const leaf of rpcResult.partitionMetas) {
+				rowsRead += leaf.rowsRead;
+				partitionsVisited += 1;
+				const info = leafPartitionInfo(leaf, routing);
+				if (info) partitionMetas.push(info);
+			}
+			forwardCount += routing.forwardCount;
 			budget.consume(rpcResult);
 
 			if (rpcResult.nextCursor !== null) {
@@ -932,12 +950,7 @@ export class FokosDB {
 			}
 		}
 
-		const meta: QueryItemsMeta = {
-			rowsRead: partitionMetas.reduce((s, m) => s + m.rowsRead, 0),
-			rowsReturned,
-			forwardCount,
-			partitionsVisited: partitionMetas.length,
-		};
+		const meta: QueryItemsMeta = { rowsRead, rowsReturned, forwardCount, partitionsVisited };
 
 		return { items, count, scannedCount, cursor, meta, partitionMetas } as QueryItemsResult | QueryItemsProjectedResult;
 	}
@@ -969,7 +982,7 @@ export class FokosDB {
 			(ctx, doName) => partitionStubByName(env, ctx, doName),
 			async (ctx, stub) => {
 				try {
-					await stub.destroyPartition();
+					await stub.fokosDestroy();
 				} catch (e) {
 					if (!isDestroyAbortError(e)) throw e;
 				}

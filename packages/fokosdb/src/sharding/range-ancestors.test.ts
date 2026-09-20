@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { RangeAncestorInfo } from "./types.js";
 import { KeyCodec } from "./key-codec.js";
-import { selectRangeAncestors } from "./split-policy.js";
+import { selectRangeAncestors } from "./range-ancestors.js";
 
 describe("selectRangeAncestors", () => {
 	it("reproduces the doc's fromRoot=2,fromLeaf=2 worked table for depths 1..10", () => {

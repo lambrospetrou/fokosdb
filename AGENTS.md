@@ -35,9 +35,11 @@ A cohesive folder stays whole inside `shared/` even when only one side uses it. 
 
 ## Architecture
 
-- **`PartitionDO`** (`src/server/do-partition.ts`) — holds items in SQLite, one DO per partition shard. It serves single-item reads and writes, acts as a resource manager in 2PC, and splits itself when it grows past its cap.
+- **`PartitionDO`** (`src/server/do-partition.ts`) — holds items in SQLite, one DO per partition shard. It serves single-item reads and writes, acts as a resource manager in 2PC, and splits itself when it grows past its cap. It is a host of `FokosShardingRuntime` (`src/sharding/runtime.ts`): the runtime owns identity, routing, the route caches, the repartition flow, the read-through and the alarm; the class owns its SQLite schema, its operations, its admission and split policy, its migration pages and its TTL timer.
 - **`TransactionCoordinatorDO`** (`src/server/do-transaction-coordinator.ts`) — one DO per write transaction, named by the idempotency token. It drives 2PC. A read transaction runs in the Worker instead.
-- **`FokosDB`** (`src/client/db.ts`) — the client entry point. It routes with `PartitionTopologyRouterImpl`, sends a multi-partition write to a coordinator, and drives a multi-partition read itself.
+- **`FokosDB`** (`src/client/db.ts`) — the client entry point. It routes with `FokosRouter`, sends a multi-partition write to a coordinator, and drives a multi-partition read itself.
+
+Every partition RPC answers a `FokosEnvelope<T>`: `value` is the operation result and `routing` is the route evidence. `FokosRouter.unwrap` opens it, and `client/partition-info.ts` builds the public `PartitionInfo` from `routing.servedBy`, `routing.forwardCount` and the same list. An error a partition raises carries its `routing` as an own property, and `withFokosErrors` in `db.ts` turns it into the same public `meta` and drops the routing.
 
 An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Array | string`, a `version` that every write increments, and an optional TTL.
 
@@ -46,6 +48,7 @@ An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Arr
 ## Partitions
 
 - `rootTreesN` root partitions exist at startup, and a hash of the hash key selects one. A partition ID is opaque: read it only through `PartitionIdHelper`.
+- `FokosRouter` picks the root partition of a hash key on the client. Inside a DO the runtime resolves the owner of every key (`resolveOwner`, `owns`), plans the range frontier (`rangeVisits`) and forwards (`forward`, `forwardRangeVisit`). A host never makes a stub to a peer of its own class.
 - **Hash split** — a partition past `hashSplitConditions.maxSizeMb` queues a split, creates `hashSplitN` children, becomes a forwarding router, and the children import their share in the background. Its states are `split_queued`, `split_started` and `split_completed`.
 - **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION` moves into a range tree of its own, which then splits by sort key.
 - **`splitN` must never change after initialization.** A change breaks routing and loses data.
@@ -55,7 +58,7 @@ An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Arr
 
 `queryItems` returns one bounded page. A caller follows `cursor` until it is absent, and a page can hold no items and still carry a cursor. `select` is `"projection"` or `"count"`. A request can also carry a `filter` and a `projection`; SQLite evaluates both and JavaScript evaluates neither.
 
-Four budgets bound one page: evaluated items (`limit`), evaluated bytes, response bytes (`maxResponseBytes`), and partition visits. `QueryPageBudget` (`shared/query/page-budget.ts`) carries them across the sub-queries in `FokosDB` and across the children in `walkRangeChildren`.
+Four budgets bound one page: evaluated items (`limit`), evaluated bytes, response bytes (`maxResponseBytes`), and partition visits. `QueryPageBudget` (`shared/query/page-budget.ts`) carries them across the sub-queries in `FokosDB` and across the planned visits in the host `walk` of `apiQueryItems` (`walkRangeVisits` in `do-partition.ts`).
 
 ## Transactions (2PC)
 
@@ -70,12 +73,23 @@ The model follows the DynamoDB papers: [ATC 2023, Idziorek et al.](https://www.u
 
 ## Rules for PartitionDO operations
 
-Every write or transaction RPC meets two concurrent state machines: **migration** (a child that still imports) and **split** (a parent that now routes). A mistake here loses data or leaks a lock forever.
+Every public RPC method of `PartitionDO` is one `this.fokos.dispatch(op, ctx, req)` call, and the operation name is the method name: the runtime forwards by calling the method named after the operation on the target stub. The operations are declared once in `PartitionOps` and registered in `operations()`, so a call that names one operation and passes the request of another does not compile.
 
-- **Migration guard** — call `await this.ensureMigration("<op>")` near the top of every write and transaction RPC, after `ensurePartitionContext`. A read that tolerates stale data uses `ensureMigration("<op>", false)`, which reads through to the parent. Never guard the migration RPCs themselves (`getItemsBatch`, `getPartitionTransactionMetadata`, `acknowledgeChildMigrationComplete`), because they are what moves the migration forward.
-- **Split routing** — `putItem`, `deleteItem` and `getItem` use `withSplitForwarding`. `prepare`, `commit` and `readForTransaction` use `groupItemsByRouting` and then fan out. `cancel` must reach the children at `split_started` AND at `split_completed`, or their pending rows stay forever.
-- **Never swallow a child error** — try every child, collect the failures, then rethrow, so the coordinator stays non-terminal and retries until every child answers.
-- **Background recovery** — a split parent and an importing child must skip stale-transaction recovery; use the `txPendingCanSweep` guard. Apply a terminal outcome through the PUBLIC `commit()` and `cancel()`, never through inline SQL or a private helper, because only the public methods hold the migration guard and the split routing.
+The runtime runs the two concurrent state machines: **import** (a target that catches up from its source) and **repartition** (a source that routes to its targets). A descriptor states what the runtime must do, and the host never examines either state itself.
+
+- `whileMigrating: "retry"` answers `partition_migrating` while this partition imports. `"read_source"` (with `readOnly: true`, and only a `point` or a `range` shape) runs the same operation on the source through `fokosExecuteLocal`. Only `apiGetItem` and `apiQueryItems` read through.
+- The shape routes the request: `point` (the item RPCs), `group` (`txPrepare`, `txCommit`, `txCancel`, `txReadForTransaction`), `single_owner` (`txReadSnapshot`, `txExecuteSingleShot`), `range` (`apiQueryItems`) and `local` (`status` and the two debug operations). A `group` with `failurePolicy: "attempt_all"` runs every remote group and throws `partition_fanout_failed` when one failed, so the coordinator stays non-terminal and retries. `txPrepare` and `txReadForTransaction` are `fail_fast`.
+- `txCancel` releases by transaction id in `beforeForward`, which runs on every hop before the remote groups start, so a router between cutover and completion clears its own pre-cutover lock rows.
+- A `local` handler of a `point`, `group`, `single_owner` or `range` operation is synchronous, and every local write is committed before the first `await` of `dispatch`. A handler reports what its response does not carry with `call.signal(...)`: `evaluateSplit`, `promotionCandidates`, `repartitionUnblocked` and `jobs`.
+- The host reaches its own facts through `this.fokos.identity()`, `policy()`, `routeContext()`, `lifecycle()` and `owns(key)`. It reads no `fokos_` table and no `__fokos/` key.
+
+### Background recovery (stale-TX job)
+
+Stale-transaction recovery is the host job `stale_tx_recovery` in `hooks().jobs`. Its `canRun` is `canSweepLocally()`: false on a router, on a target that is `awaiting_data` or `importing`, and behind the destroy fence, because these partitions do not own complete lock state. Its `deadline()` is the oldest unguarded lock plus `fokosStaleTransactionMs()`, so the alarm covers a lock that a restart left behind. The TTL sweep uses the same guard, stays an in-memory timer that every RPC arms, and registers no job.
+
+A `not_found` result has three paths. Delete directly when all keys route away. Cancel an owned lock that is no older than `IDEMPOTENCY_WINDOW_MS`. Quarantine an older owned lock with `guarded_at`, log the lock-age guard error once, and wait for `debugForceResolveTransaction`. A guarded transaction stays out of the stale scan and its alarm scheduling.
+
+Apply a terminal outcome through `this.fokos.dispatch("txCommit" | "txCancel", this.fokos.routeContext(), ...)`, never with inline SQL and never against the participant directly, because `dispatch` resolves the owner of every key again and applies a key that moved to a child there. `debugForceResolveTransaction` follows the same rule.
 
 ## Testing
 

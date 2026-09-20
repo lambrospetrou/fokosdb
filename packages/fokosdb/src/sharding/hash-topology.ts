@@ -115,6 +115,26 @@ export class HashTopology {
 	}
 
 	/**
+	 * Forgets the deepest hint on the path of `hashKey`, after the partition at `relDepth` answered
+	 * that it does not exist. The next `findLeaf` stops one level higher, at the nearest known
+	 * ancestor. The orphaned block keeps its slots: the arena never frees, and the loss is bounded.
+	 * @return true if the cache was modified (caller should persist).
+	 */
+	invalidate(hashKey: KeyBytes, relDepth: number): boolean {
+		if (relDepth < 1) return false;
+		let block = 0;
+		for (let rd = 0; rd < relDepth - 1; rd++) {
+			const ptr = this.arena[block + hashChildIndex(hashKey, this.ownerAbsDepth + rd, this.K)];
+			if (ptr === 0) return false;
+			block = ptr;
+		}
+		const slot = block + hashChildIndex(hashKey, this.ownerAbsDepth + relDepth - 1, this.K);
+		if (this.arena[slot] === 0) return false;
+		this.arena[slot] = 0;
+		return true;
+	}
+
+	/**
 	 * True when the root block is allocated but no children have been recorded.
 	 * @return boolean indicating if the topology is empty.
 	 */

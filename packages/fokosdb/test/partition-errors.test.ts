@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { testPartitionStub } from "./stub-helpers.js";
+import { openedRpc } from "./partition-do/helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
 import { KeyCodec } from "../src/sharding/key-codec.js";
@@ -32,9 +33,9 @@ describe("the errors of a partition, through the public API", () => {
 		const hashKey = KeyCodec.encode(key.hashKey);
 		const sortKey = KeyCodec.encode(key.sortKey);
 		const partitionContext = db.options().topology.rootContext(hashKey);
-		const stub = testPartitionStub(partitionContext.doName);
+		const rpc = openedRpc(testPartitionStub(partitionContext.doName));
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-		await stub.txPrepare(partitionContext, {
+		await rpc.txPrepare(partitionContext, {
 			transactionId,
 			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
 			transactionTimestamp: Date.now(),
@@ -57,7 +58,7 @@ describe("the errors of a partition, through the public API", () => {
 			expect(err.message).not.toContain(transactionId);
 		}
 
-		await stub.txCancel(partitionContext, { transactionId, items: [{ hashKey, sortKey }] });
+		await rpc.txCancel(partitionContext, { transactionId, items: [{ hashKey, sortKey }] });
 		await expect(db.putItem({ ...key, data: "free" })).resolves.toMatchObject({ version: 1 });
 	});
 
@@ -75,10 +76,10 @@ describe("the errors of a partition, through the public API", () => {
 		const db = makeDB();
 		const hashKey = KeyCodec.encode("malformed");
 		const partitionContext = db.options().topology.rootContext(hashKey);
-		const stub = testPartitionStub(partitionContext.doName);
+		const rpc = openedRpc(testPartitionStub(partitionContext.doName));
 
 		// A request without a partition context fails inside the partition with a plain TypeError.
-		const err = await errorOf(() => stub.apiGetItem(null as never, { hashKey, sortKey: KeyCodec.encodeOptional(undefined) }));
+		const err = await errorOf(() => rpc.apiGetItem(null as never, { hashKey, sortKey: KeyCodec.encodeOptional(undefined) }));
 
 		expect(err).toMatchObject({ _tag: "FokosInternalError", code: "foreign_error" });
 		expect(err.cause).toBeInstanceOf(Error);
@@ -89,13 +90,13 @@ describe("the errors of a partition, through the public API", () => {
 		const hashKey = KeyCodec.encode("k");
 		const sortKey = KeyCodec.encodeOptional(undefined);
 		const partitionContext = db.options().topology.rootContext(hashKey);
-		const stub = testPartitionStub(partitionContext.doName);
+		const rpc = openedRpc(testPartitionStub(partitionContext.doName));
 
 		const mismatchedCtx = {
 			...partitionContext,
 			topology: { ...partitionContext.topology, jurisdiction: "eu" as DurableObjectJurisdiction },
 		};
-		const err = await errorOf(() => stub.apiGetItem(mismatchedCtx, { hashKey, sortKey }));
+		const err = await errorOf(() => rpc.apiGetItem(mismatchedCtx, { hashKey, sortKey }));
 
 		expect(FokosInternalError.is(err)).toBe(true);
 		expect(err).toMatchObject({ code: "partition_context_mismatch" });

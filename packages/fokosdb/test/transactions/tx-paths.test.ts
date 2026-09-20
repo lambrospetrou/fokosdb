@@ -6,8 +6,18 @@ import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { countDistinctPartitions, keysInOnePartition, makeDB, writeOutcome } from "./tx-helpers.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 
-/** The answer a partition gives when it cannot execute the whole item set alone. */
-const fastPathNotApplicable = { outcome: "not_applicable" as const };
+/** The answer a partition gives when it cannot execute the whole item set alone, in its envelope. */
+const self = {
+	ref: { partitionId: "00", doName: "stand-in" },
+	actorId: "stand-in",
+	hashDepth: 0,
+	rangeDepth: 0,
+	role: "executed" as const,
+};
+const fastPathNotApplicable = {
+	value: { outcome: "not_applicable" as const },
+	routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false },
+};
 
 /**
  * The single-partition fast path answers a transaction from the owning partition in one round trip,

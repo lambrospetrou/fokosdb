@@ -32,6 +32,7 @@ const SHARDING_ALLOWED_SHARED = [
 	"src/shared/tsutils.ts",
 	"src/shared/cache-lru.ts",
 	"src/shared/sql-cursor.ts",
+	"src/shared/cf-utils.ts",
 ];
 
 /** A `src/shared/` module that is not on the allow list. */

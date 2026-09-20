@@ -152,15 +152,26 @@ describe("FokosShardingStore - KV records", () => {
 	it("stores the import record, the plan, and the destroy fence under __fokos/ keys", async () => {
 		await withStore((store, state) => {
 			expect(store.getImport()).toBeUndefined();
-			expect(store.getPlan("r1")).toBeUndefined();
+			expect(store.getPlanHead("r1")).toBeUndefined();
 			expect(store.isDestroying()).toBe(false);
 
 			const source = { partitionId: "00", doName: "t.h.0" };
-			store.putPlan("r1", { schema: 1, source, rangeDepth: 0, rangeAncestors: [] });
-			expect(store.getPlan("r1")).toEqual({ schema: 1, source, rangeDepth: 0, rangeAncestors: [] });
-			expect(state.storage.kv.get(FOKOS_KV_KEYS.plan("r1"))).toBeDefined();
-			store.deletePlan("r1");
-			expect(store.getPlan("r1")).toBeUndefined();
+			const head = { schema: 1 as const, queue: { policy: { maxSizeMb: 1 }, data: { reason: "test" } }, planned: null, nextKey: null };
+			store.putPlanHead("r1", head);
+			expect(store.getPlanHead("r1")).toEqual(head);
+			expect(state.storage.kv.get(FOKOS_KV_KEYS.planHead("r1"))).toBeDefined();
+			// The chain deletes every linked item, so a head that names a second key leaves nothing behind.
+			state.storage.kv.put("__fokos/repartition/r1/plan/00000002", { nextKey: null });
+			store.putPlanHead("r1", { ...head, nextKey: "__fokos/repartition/r1/plan/00000002" });
+			store.deletePlanChain("r1");
+			expect(store.getPlanHead("r1")).toBeUndefined();
+			expect(state.storage.kv.get("__fokos/repartition/r1/plan/00000002")).toBeUndefined();
+
+			expect(store.getJobs()).toEqual({});
+			store.putJobs({ stale_tx_recovery: { nextRunAt: 5 } });
+			expect(store.getJobs()).toEqual({ stale_tx_recovery: { nextRunAt: 5 } });
+			store.putJobs({});
+			expect(state.storage.kv.get(FOKOS_KV_KEYS.JOBS)).toBeUndefined();
 
 			store.putImport({
 				schema: 2,

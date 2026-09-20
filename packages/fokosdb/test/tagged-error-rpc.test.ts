@@ -9,6 +9,7 @@ import {
 	FokosValidationError,
 } from "../src/shared/errors.js";
 import { isFokosAnyError, type FokosAnyError, type FokosErrorCode } from "../src/shared/errors-operations.js";
+import { FOKOS_SHARDING_CODE_TABLES } from "../src/sharding/errors.js";
 import { CODE_DEFS } from "./worker-entry.js";
 
 /**
@@ -33,8 +34,8 @@ async function catchOverRpc(name: string, call: (stub: ReturnType<typeof probeSt
 	throw new Error("the probe did not throw");
 }
 
-/** One code of each category. */
-const ONE_CODE_PER_CATEGORY = FOKOS_CODE_TABLES.map((table) => Object.keys(table)[0] as FokosErrorCode);
+/** One code of each table whose category is a generic one, so the probe can build the error through its class. */
+const ONE_CODE_PER_CATEGORY = [...FOKOS_CODE_TABLES, ...FOKOS_SHARDING_CODE_TABLES].map((table) => Object.keys(table)[0] as FokosErrorCode);
 
 describe("a FokosError across an RPC hop", () => {
 	it("keeps the category, the code, the error_id, the origin, the hint and the attributes of every category", async () => {

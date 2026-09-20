@@ -19,7 +19,7 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { HashTopologySnapshot } from "./hash-topology.js";
 import type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
 import type { FokosPartitionIdentity, FokosStoredPolicy } from "./route-context.js";
-import type { FokosImportRecord, RepartitionPlan } from "./repartition-types.js";
+import type { FokosImportRecord, FokosStoredRepartitionPlan } from "./repartition-types.js";
 
 // ---------------------------------------------------------------------------
 // KV keys
@@ -34,15 +34,20 @@ export const FOKOS_KV_KEYS = {
 	IMPORT: "__fokos/import",
 	/** `true` after `fokosPrepareDestroy` fences the partition. */
 	DESTROYING: "__fokos/destroying",
+	/** `FokosJobsRecord`: the next run of every job that a request or a pass scheduled. */
+	JOBS: "__fokos/jobs",
 	/** The byte-bounded hash topology cache of a hash router. */
 	HASH_ARENA: "__fokos/cache/hash_arena",
 	/** The byte-bounded Bloom filter of promoted keys a hash partition has learned. */
 	PROMOTION_BLOOM: "__fokos/cache/promotion_bloom",
 	/** The last sharding schema migration that ran. */
 	SCHEMA_VERSION: "__fokos/schema_version",
-	/** The immutable plan of one repartition, written with its targets and deleted at cutover. */
-	plan: (repartitionId: string) => `__fokos/repartition/${repartitionId}/plan`,
+	/** The head of the plan chain of one repartition, written at queue time and deleted by the final cleanup. */
+	planHead: (repartitionId: string) => `__fokos/repartition/${repartitionId}/plan/00000001`,
 } as const;
+
+/** `__fokos/jobs`: the next durable run of each job by name. A job without an entry has no scheduled run. */
+export type FokosJobsRecord = Record<string, { nextRunAt: number }>;
 
 // ---------------------------------------------------------------------------
 // Row and cursor types
@@ -113,6 +118,8 @@ export type RepartitionStatusRow = {
 	seq: number;
 	kind: RepartitionKind;
 	state: RepartitionState;
+	/** The key a promotion moves. Null for a split. */
+	hashKey: KeyBytes | null;
 	targetIndex: number;
 	partitionId: string | null;
 	doName: string | null;
@@ -433,16 +440,22 @@ export class FokosShardingStore {
 		this.#storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, record);
 	}
 
-	getPlan(repartitionId: string): RepartitionPlan | undefined {
-		return this.#storage.kv.get<RepartitionPlan>(FOKOS_KV_KEYS.plan(repartitionId));
+	getPlanHead<TPolicy = unknown>(repartitionId: string): FokosStoredRepartitionPlan<TPolicy> | undefined {
+		return this.#storage.kv.get<FokosStoredRepartitionPlan<TPolicy>>(FOKOS_KV_KEYS.planHead(repartitionId));
 	}
 
-	putPlan(repartitionId: string, plan: RepartitionPlan): void {
-		this.#storage.kv.put<RepartitionPlan>(FOKOS_KV_KEYS.plan(repartitionId), plan);
+	putPlanHead(repartitionId: string, head: FokosStoredRepartitionPlan): void {
+		this.#storage.kv.put<FokosStoredRepartitionPlan>(FOKOS_KV_KEYS.planHead(repartitionId), head);
 	}
 
-	deletePlan(repartitionId: string): void {
-		this.#storage.kv.delete(FOKOS_KV_KEYS.plan(repartitionId));
+	/** Deletes the head and every item it links to through `nextKey`. */
+	deletePlanChain(repartitionId: string): void {
+		let key: string | null = FOKOS_KV_KEYS.planHead(repartitionId);
+		while (key !== null) {
+			const item: { nextKey: string | null } | undefined = this.#storage.kv.get(key);
+			this.#storage.kv.delete(key);
+			key = item?.nextKey ?? null;
+		}
 	}
 
 	/** True after `fokosPrepareDestroy` fences this partition. Every transition must then stop. */
@@ -452,6 +465,17 @@ export class FokosShardingStore {
 
 	setDestroying(): void {
 		this.#storage.kv.put<boolean>(FOKOS_KV_KEYS.DESTROYING, true);
+	}
+
+	// ─── KV: jobs ───────────────────────────────────────────────────────────
+
+	getJobs(): FokosJobsRecord {
+		return this.#storage.kv.get<FokosJobsRecord>(FOKOS_KV_KEYS.JOBS) ?? {};
+	}
+
+	putJobs(record: FokosJobsRecord): void {
+		if (Object.keys(record).length === 0) this.#storage.kv.delete(FOKOS_KV_KEYS.JOBS);
+		else this.#storage.kv.put<FokosJobsRecord>(FOKOS_KV_KEYS.JOBS, record);
 	}
 
 	// ─── KV: route caches ───────────────────────────────────────────────────
@@ -518,6 +542,17 @@ export class FokosShardingStore {
 	getSplitRepartition(): RepartitionRow | undefined {
 		const row = tryOne(
 			this.#storage.sql.exec<SqlRepartitionRow>(`${REPARTITION_SELECT} WHERE r.kind IN ('hash_split', 'range_split') LIMIT 1`),
+		);
+		return row && toRepartitionRow(row);
+	}
+
+	/** The earliest repartition that has not cut over and completed: the split row first, else the oldest promotion. */
+	firstActiveRepartition(): RepartitionRow | undefined {
+		const row = tryOne(
+			this.#storage.sql.exec<SqlRepartitionRow>(
+				`${REPARTITION_SELECT} WHERE r.state IN ('queued', 'planned', 'cutover')
+				  ORDER BY (r.kind = 'key_promotion'), r.seq LIMIT 1`,
+			),
 		);
 		return row && toRepartitionRow(row);
 	}
@@ -851,6 +886,7 @@ export class FokosShardingStore {
 				seq: number;
 				kind: RepartitionKind;
 				state: RepartitionState;
+				hash_key: ArrayBuffer | null;
 				target_index: number;
 				partition_id: string | null;
 				do_name: string | null;
@@ -858,12 +894,12 @@ export class FokosShardingStore {
 				acknowledged: number | null;
 			}>(
 				`SELECT * FROM (
-				    SELECT r.id, r.seq, r.kind, r.state, -1 AS target_index,
+				    SELECT r.id, r.seq, r.kind, r.state, r.hash_key, -1 AS target_index,
 				           NULL AS partition_id, NULL AS do_name, NULL AS initialization, NULL AS acknowledged
 				      FROM fokos_repartitions r
 				     WHERE NOT EXISTS (SELECT 1 FROM fokos_repartition_targets t WHERE t.repartition_id = r.id)
 				    UNION ALL
-				    SELECT r.id, r.seq, r.kind, r.state, t.target_index,
+				    SELECT r.id, r.seq, r.kind, r.state, r.hash_key, t.target_index,
 				           t.partition_id, t.do_name, t.initialization, t.acknowledged
 				      FROM fokos_repartitions r
 				      JOIN fokos_repartition_targets t ON t.repartition_id = r.id
@@ -877,6 +913,7 @@ export class FokosShardingStore {
 				seq: r.seq,
 				kind: r.kind,
 				state: r.state,
+				hashKey: r.hash_key === null ? null : fromSqlKey(r.hash_key),
 				targetIndex: r.target_index,
 				partitionId: r.partition_id,
 				doName: r.do_name,
@@ -924,6 +961,32 @@ export class FokosShardingStore {
 	/** The number of learned rows. For tests and status views; the bound is enforced on every learn. */
 	countRangeHierarchyRows(): number {
 		return one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n;
+	}
+
+	/** Every learned slice of one hash key, so the frontier planner can overlay them on its base cover. */
+	listLearnedRangeSlices(hk: KeyBytes): LearnedRangeSlice[] {
+		return this.#storage.sql
+			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
+				`SELECT depth, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy WHERE hk = ? ORDER BY depth, sk_start_boundary`,
+				hk,
+			)
+			.toArray()
+			.map((row) => {
+				const start = fromSqlKey(row.sk_start_boundary);
+				const end = fromSqlKey(row.sk_end_boundary);
+				return { depth: row.depth, startBoundary: start.length === 0 ? null : start, endBoundary: end.length === 0 ? null : end };
+			});
+	}
+
+	/** Forgets one learned slice, after the partition it names answered that it does not exist. */
+	deleteLearnedRangeSlice(hk: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): void {
+		const unbounded = KeyCodec.encodeOptional(undefined);
+		this.#storage.sql.exec(
+			`DELETE FROM fokos_range_hierarchy WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3`,
+			hk,
+			startBoundary ?? unbounded,
+			endBoundary ?? unbounded,
+		);
 	}
 
 	/**

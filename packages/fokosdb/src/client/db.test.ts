@@ -22,8 +22,9 @@ import type { ConditionExpression, ProjectionExpression } from "../shared/expres
 import type { JsonValue } from "../shared/json-types.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
-import { routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
-import { FokosUnavailableError, UNAVAILABLE_CODES, type FokosError } from "../shared/errors.js";
+import { attachRouting } from "../sharding/envelope.js";
+import { FokosUnavailableError, type FokosError } from "../shared/errors.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
@@ -32,11 +33,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	const makeDB = () => makeDBFor(ns);
 
 	describe("FokosDB — public results carry no internal routing state", () => {
-		// `_internal.rangeAncestors` is partition-to-partition routing state whose boundaries are
-		// KeyBytes, so leaking it also serialized them as {"0":97,"1":98} over HTTP. db.ts is the
-		// boundary where it stops. Asserted on every method that returns a meta, and on the
-		// per-partition metas, since each is a separate exit that has to strip it.
-		it("strips _internal from every meta a public method returns", async () => {
+		// The envelope's route evidence and its `_hint.rangeAncestors` are partition-to-partition routing
+		// state whose boundaries are KeyBytes, so leaking them would also serialize as {"0":97,"1":98}
+		// over HTTP. db.ts is the boundary where they stop. Asserted on every method that returns a
+		// meta, and on the per-partition metas, since each is a separate exit that has to build it.
+		it("returns a public meta on every method, and no routing evidence", async () => {
 			const db = makeDB();
 
 			const put = await db.putItem({ hashKey: "alice", sortKey: "sk1", data: "x" });
@@ -46,9 +47,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const del = await db.deleteItem({ hashKey: "alice", sortKey: "sk1" });
 
 			for (const meta of [put.meta, get.meta, missing.meta, del.meta, ...query.partitionMetas]) {
-				expect(meta).not.toHaveProperty("_internal");
-				// The rest of the meta must survive the strip.
+				expect(meta).not.toHaveProperty("_rangeAncestors");
+				expect(meta).not.toHaveProperty("servedBy");
 				expect(meta.servedByActorName).toBeTypeOf("string");
+				expect(meta.servedByPartitionId).toBeTypeOf("string");
 			}
 			expect(query.partitionMetas).not.toHaveLength(0);
 		});
@@ -59,20 +61,13 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			// The repartition protocol tells a target that its source still owns the slice. A client has
 			// no repartitions in its vocabulary, and the condition means "retry shortly" to it.
-			const internal = stampRoutingMeta(
-				new FokosUnavailableError(UNAVAILABLE_CODES.repartition_not_cut_over, {
+			const leaf = { ref: { partitionId: "01", doName: "leaf" }, actorId: "actor", hashDepth: 1, rangeDepth: 0, role: "executed" as const };
+			const internal = attachRouting(
+				new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over, {
 					message: "the source still owns this slice",
 					attributes: { repartitionId: "r1" },
 				}),
-				{
-					servedByActorId: "actor",
-					servedByActorName: "leaf",
-					servedByPartitionId: "01",
-					forwardCount: 1,
-					hashDepth: 1,
-					rangeDepth: 0,
-					_internal: { rangeAncestors: [] },
-				},
+				{ servedBy: [{ ...leaf, _rangeAncestors: [] }], forwardCount: 1, servedByTruncated: false },
 			);
 			const spy = vi.spyOn(PartitionDO.prototype, "apiGetItem").mockRejectedValue(internal);
 			try {
@@ -84,12 +79,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					(e: FokosError) => e,
 				);
 				expect(raised.error_id).toBe(internal.error_id);
-				expect(raised.attributes.runtimeCode).toBe(UNAVAILABLE_CODES.repartition_not_cut_over.code);
-				// The mapping builds a new error object, so the routing meta must move with it. The public
-				// boundary must still strip the internal half of that meta.
-				const meta = routedError(raised)?.meta;
-				expect(meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1 });
-				expect(meta).not.toHaveProperty("_internal");
+				expect(raised.attributes.runtimeCode).toBe(SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code);
+				// The mapping builds a new error object, so the routing must move with it. The public
+				// boundary then turns it into the meta a result would carry, and drops the routing itself.
+				expect((raised as { meta?: unknown }).meta).toMatchObject({ servedByActorName: "leaf", forwardCount: 1, hashDepth: 1 });
+				expect(raised).not.toHaveProperty("routing");
 			} finally {
 				spy.mockRestore();
 			}

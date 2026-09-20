@@ -1,8 +1,7 @@
-// Primitive types shared across the partition-topology modules.
+// Primitive types shared across the sharding modules.
 // This file must not import from those modules, because that makes a circular dependency.
 
 import type { KeyBytes } from "./key-codec.js";
-import type { PartitionInfo } from "../shared/types.js";
 
 /**
  * INTERNAL ONLY - never reaches a public response.
@@ -14,21 +13,6 @@ export type RangeAncestorInfo = {
 	depth: number;
 	startBoundary: KeyBytes;
 	endBoundary: KeyBytes;
-};
-
-/**
- * INTERNAL ONLY - the partition-to-partition form of PartitionInfo.
- *
- * `_internal` is routing state, not an observability field: each response carries the serving leaf's
- * ancestor boundaries up through every router so `recordForwardResult` can cache them. It is declared
- * only on the RPC types, and `db.ts` drops it at the public boundary.
- */
-export type PartitionInfoInternal = PartitionInfo & {
-	/**
-	 * Bounded set of this range partition's ancestor boundaries (excludes root) including self (last).
-	 * Always empty for hash partitions.
-	 */
-	_internal: { rangeAncestors: RangeAncestorInfo[] };
 };
 
 // PartitionNodeId is an opaque identifier for a partition node in the topology.

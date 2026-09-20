@@ -64,8 +64,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 	// A source that has cut over is a router. Its targets own the keys and hold the true locks.
 	it.each(["cutover", "completed"] as const)("skips stale recovery on a source in %s", async (state_) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2 });
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2 });
+		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
@@ -127,9 +127,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(childStub, async (instance: PartitionDO, state: DurableObjectState) => {
 			const record = state.storage.kv.get<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT)!;
 			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: importState });
-			// This test cannot reach the source, so it stubs the import step out. The case is about
+			// This test cannot reach the source, so the import step fails and logs. The case is about
 			// recovery staying away, and not about how far the import gets.
-			vi.spyOn(instance as unknown as { runBackgroundWork(): Promise<void> }, "runBackgroundWork");
 			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
@@ -145,8 +144,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 	it("releases a not_found lock at the exact idempotency-window boundary", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
@@ -162,8 +161,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 	it("quarantines an over-age owned lock and logs the transition once", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
@@ -205,8 +204,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 	it("does not quarantine or release a lock when the coordinator RPC fails", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		const recoverTransaction = vi.fn(async () => {
 			throw new Error("coordinator unavailable");
 		});
@@ -234,24 +233,18 @@ describe("PartitionDO — stale transaction recovery", () => {
 	it("deletes a not_found lock directly when all its keys route away", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 			const store = insertStalePendingLock(state, transactionId, "missing-tc", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
-			const routing = vi
-				.spyOn(
-					instance as unknown as {
-						groupItemsByRouting(): { local: unknown[]; forwarded: Map<string, unknown> };
-					},
-					"groupItemsByRouting",
-				)
-				.mockReturnValue({ local: [], forwarded: new Map() });
+			// Every key of the lock now belongs to another partition.
+			const owns = vi.spyOn(instance.fokos, "owns").mockReturnValue(false);
 			const cancel = vi.spyOn(instance, "txCancel");
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
-			expect(routing).toHaveBeenCalled();
+			expect(owns).toHaveBeenCalled();
 			expect(cancel).not.toHaveBeenCalled();
 			expect(store.pendingTxCountFor(transactionId)).toBe(0);
 		});
@@ -260,8 +253,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 	it("quarantined transactions do not starve a younger stale transaction", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionIds = Array.from({ length: 11 }, () => crypto.randomUUID());
@@ -292,8 +285,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 	it.each(["commit", "cancel"] as const)("debugForceResolveTransaction resolves a quarantined transaction with %s", async (outcome) => {
 		const now = Date.now();
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		const transactionId = crypto.randomUUID();
 		const hashKey = `debug-${outcome}-${transactionId}`;
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
@@ -307,21 +300,21 @@ describe("PartitionDO — stale transaction recovery", () => {
 			expect(store.listPendingTxItems(transactionId)[0].guarded_at).toBe(now);
 		});
 
-		await expect(stub.debugForceResolveTransaction(ctx, { transactionId, outcome })).resolves.toEqual({
+		await expect(rpc.debugForceResolveTransaction(ctx, { transactionId, outcome })).resolves.toEqual({
 			outcome: outcome === "commit" ? "committed" : "cancelled",
 		});
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			expect(new PartitionStore(state.storage).pendingTxCountFor(transactionId)).toBe(0);
 		});
-		expect(await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") })).toMatchObject({
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") })).toMatchObject({
 			found: outcome === "commit",
 			...(outcome === "commit" ? { item: { data: "resolved-value" } } : {}),
 		});
 	});
 
 	it("recovers by stored coordinator ID and commits the TTL in a stale pending row", async () => {
-		const { ctx, stub } = makeStub();
-		await stub.status(ctx);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now() - 10_000;
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
@@ -362,7 +355,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		await runDurableObjectAlarm(stub);
 		await vi.waitFor(async () => {
 			expect(getCoordinatorById).toHaveBeenCalledWith(env, expect.objectContaining({ doName: ctx.doName }), tcId.toString());
-			expect(await stub.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
+			expect(await rpc.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
 				found: true,
 				item: { data: "value", ttlAt },
 			});

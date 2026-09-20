@@ -37,6 +37,8 @@ import type {
 	FokosPartitionRef,
 	FokosRepartitionPeer,
 } from "../../src/sharding/repartition-types.js";
+import type { FokosRepartitionPlan } from "../../src/sharding/runtime-types.js";
+import invariant from "../../src/shared/invariant.js";
 
 export const kb = (s: string) => KeyCodec.encode(s);
 
@@ -206,7 +208,24 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			// A target exists as soon as its source names it, exactly as a real DO does: a Durable Object
 			// is created by the first call that reaches it, not registered in advance.
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
-			host: new FokosMigrationHost({ store }),
+			hooks: {
+				evaluateSplit: () => false,
+				migration: new FokosMigrationHost({ store }),
+				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
+				beforeCutover: (plan) => plan.kind !== "key_promotion" || store.pendingLockCountForHashKey(promotedKeyOf(plan)) === 0,
+				beforeComplete: (plan) => {
+					if (plan.kind !== "key_promotion") store.deleteAllPendingTx();
+				},
+				cleanupSourceStep: (plan) => {
+					if (plan.kind !== "key_promotion") return true;
+					const hashKey = promotedKeyOf(plan);
+					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
+					store.deletePendingTxForHashKey(hashKey);
+					if (store.hasItemsForHashKey(hashKey)) return false;
+					store.deleteKeySizeEstimate(hashKey);
+					return true;
+				},
+			},
 			identity: () => ({ ctx, identity: identity() }),
 			hasIdentity: () => sharding.getIdentity() !== undefined,
 			applyTargetIdentity: (req: FokosInitRequest) => {
@@ -215,16 +234,6 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				sharding.putIdentity(partitionIdentityFrom(target, range));
 				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy });
 			},
-			computeRangeBoundaries: (hashKey, start, end, n) => store.computeRangeSplitBoundaries(hashKey, start, end, n),
-			lockCountForKey: (hashKey) => store.pendingLockCountForHashKey(hashKey),
-			cleanupStep: (hashKey) => {
-				store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
-				store.deletePendingTxForHashKey(hashKey);
-				if (store.hasItemsForHashKey(hashKey)) return false;
-				store.deleteKeySizeEstimate(hashKey);
-				return true;
-			},
-			onSplitCompleted: () => store.deleteAllPendingTx(),
 			scheduleWork: () => scheduled.set(doName, (scheduled.get(doName) ?? 0) + 1),
 			ensureAlarmSet: async (targetMs) => {
 				alarms.set(doName, [...(alarms.get(doName) ?? []), targetMs]);
@@ -238,6 +247,13 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 
 /** Small enough that a promotion with a handful of rows needs more than one cleanup step. */
 export const CLEANUP_BATCH = 2;
+
+/** The one key of a promotion plan: its single target carries a `promoted_key` slice. */
+function promotedKeyOf(plan: FokosRepartitionPlan): KeyBytes {
+	const slice = plan.targets[0]?.slice;
+	invariant(slice?.kind === "promoted_key", "a promotion plan carries one promoted_key slice");
+	return slice.hashKey;
+}
 
 /** Writes one committed item straight into a node's store, as a user write would leave it. */
 export function putItem(store: PartitionStore, hk: string, sk: string, data = `d-${hk}-${sk}`): void {

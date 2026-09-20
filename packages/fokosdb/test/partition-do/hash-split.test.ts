@@ -4,9 +4,10 @@ import { describe, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
-import { compiledCondition, expectSplitStatus, kb, makeStub } from "./helpers.js";
+import { compiledCondition, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
 import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
@@ -20,11 +21,11 @@ import {
 
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
+		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
-		await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "small", kind: "text" as const });
+		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "small", kind: "text" as const });
 
-		const { splitStatus } = await stub.status();
+		const { splitStatus } = await rpc.status(ctx);
 		expect(splitStatus).toBeUndefined();
 	});
 
@@ -43,10 +44,14 @@ describe("PartitionDO - splitting", () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		try {
 			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
-				await partition.triggerHashSplit(instance);
-				expect((await instance.status()).splitStatus?.status).toBe("split_queued");
+				const status = async () => opened(await instance.status(partition.ctx));
+				await partition.triggerHashSplit({
+					apiPutItem: async (ctx, req) => opened(await instance.apiPutItem(ctx, req)),
+					status,
+				});
+				expect((await status()).splitStatus?.status).toBe("split_queued");
 				await instance.apiPutItem(partition.ctx, { hashKey: kb("extra"), sortKey: kb("sk2"), data: "small", kind: "text" });
-				expect((await instance.status()).splitStatus?.status).toBe("split_queued");
+				expect((await status()).splitStatus?.status).toBe("split_queued");
 			});
 		} finally {
 			await partition.awaitSplitCompleted();
@@ -55,7 +60,7 @@ describe("PartitionDO - splitting", () => {
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub } = partition;
+		const { ctx, stub, rpc } = partition;
 
 		await partition.triggerHashSplit();
 		await partition.runAlarm();
@@ -68,12 +73,11 @@ describe("PartitionDO - splitting", () => {
 			topology: { shardGroup: ctx.topology.shardGroup },
 		});
 
-		const childNames = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext!).map((c) => c.doName);
+		const children = PartitionIdHelper.calculateHashChildPartitionIds(parentState.partitionContext);
 
 		// Each child should have been initialized with the parent's context and a child-specific partition context.
-		for (const name of childNames) {
-			const childStub = testPartitionStub(name);
-			const childState = await childStub.status();
+		for (const { doName: name, partitionIdOpaque } of children) {
+			const childState = await openedRpc(testPartitionStub(name)).status({ ...ctx, doName: name, partitionId: partitionIdOpaque });
 
 			expect(childState.partitionContext).toMatchObject({
 				policy: { ns: "PARTITION_DO" },
@@ -108,7 +112,7 @@ describe("PartitionDO - splitting", () => {
 			expect(await state.storage.getAlarm()).not.toBeNull();
 		});
 
-		const status = await childStub.status();
+		const status = await openedRpc(childStub).status(childCtx);
 		expect(status.partitionContext?.doName).toBe(childName);
 		expect(status.parentPartitionContext).toEqual(refOf(parentCtx));
 		expect(status.parentSplitType).toBe("hash");
@@ -161,8 +165,10 @@ describe("PartitionDO - splitting", () => {
 			slice,
 		});
 
-		const status = await childStub.status();
-		expect(status.partitionContext?.policy.hashSplitConditions.maxSizeMb).toBe(25);
+		// Read the stored policy WITHOUT a request, so the assertion observes what fokosInit stored rather
+		// than writing the threshold itself.
+		const stored = await runInDurableObject(childStub, (instance: PartitionDO) => instance.fokos.policy());
+		expect(stored.hashSplitConditions.maxSizeMb).toBe(25);
 	});
 
 	it("exposes split status via status()", async ({ expect }) => {
@@ -174,17 +180,17 @@ describe("PartitionDO - splitting", () => {
 		expect(splitStatus).toBeDefined();
 		// Background work may advance split past split_queued before status() is called.
 		expect(["split_queued", "split_started", "split_completed"]).toContain(splitStatus?.status);
-		expect(splitStatus?.createdAt).toBeTypeOf("number");
+		expect(splitStatus?.splitType).toBe("hash");
 	});
 
 	it("alarm with no split queued and no migration in progress does nothing", async ({ expect }) => {
-		const { ctx, stub } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
+		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
 		// Write something small — well below the split threshold — to initialize the partition context.
-		await stub.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "small", kind: "text" as const });
+		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "small", kind: "text" as const });
 
 		// No split should have been queued.
-		const { splitStatus: before } = await stub.status();
+		const { splitStatus: before } = await rpc.status(ctx);
 		expect(before).toBeUndefined();
 
 		// Manually schedule an alarm to simulate a stale alarm (e.g. after a crash with no pending work).
@@ -195,7 +201,7 @@ describe("PartitionDO - splitting", () => {
 		// The alarm must complete without throwing, and leave the partition unchanged.
 		await expect(runDurableObjectAlarm(stub)).resolves.not.toThrow();
 
-		const { splitStatus: after } = await stub.status();
+		const { splitStatus: after } = await rpc.status(ctx);
 		expect(after).toBeUndefined();
 	});
 
@@ -204,7 +210,7 @@ describe("PartitionDO - splitting", () => {
 			expect,
 		}) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			// Trigger the split condition and drain the tree so all migrations complete.
 			await partition.splitHash();
@@ -212,7 +218,7 @@ describe("PartitionDO - splitting", () => {
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
 			const hashKey = "forwarded-key";
-			const putResult = await stub.apiPutItem(ctx, {
+			const putResult = await rpc.apiPutItem(ctx, {
 				hashKey: kb(hashKey),
 				sortKey: kb("sk"),
 				data: "val",
@@ -223,7 +229,7 @@ describe("PartitionDO - splitting", () => {
 			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
 			expect(childNames).toContain(putResult.meta.servedByActorName);
 
-			const getResult = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const getResult = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(getResult.found).toBe(true);
 			expect(getResult.meta.forwardCount).toBe(1);
 			// Same child serves both the write and the subsequent read.
@@ -232,11 +238,11 @@ describe("PartitionDO - splitting", () => {
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			await partition.splitHash();
 
-			const result = await stub.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
+			const result = await rpc.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
 			expect(result.meta.forwardCount).toBe(1);
 			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
@@ -244,12 +250,12 @@ describe("PartitionDO - splitting", () => {
 
 		it("forwards a projected getItem to the owning child after split", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			await partition.splitHash();
 
 			const hashKey = "projected-key";
-			await stub.apiPutItem(ctx, {
+			await rpc.apiPutItem(ctx, {
 				hashKey: kb(hashKey),
 				sortKey: kb("sk"),
 				data: JSON.stringify({ n: 3 }),
@@ -257,7 +263,7 @@ describe("PartitionDO - splitting", () => {
 			});
 
 			const projection = compileProjectionExpression([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
-			const result = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
+			const result = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
 			expect(result).toMatchObject({ found: true, item: { projected: [3, 1], kind: "projected" } });
 			expect(result.meta.forwardCount).toBe(1);
 			expect(result.meta.servedByActorName).not.toBe(ctx.doName);
@@ -274,7 +280,7 @@ describe("PartitionDO - splitting", () => {
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.25 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
 
@@ -288,7 +294,7 @@ describe("PartitionDO - splitting", () => {
 				let written = false;
 				for (let attempt = 0; attempt < 20; attempt++) {
 					try {
-						await stub.apiPutItem(ctx, { hashKey: kb(hashKey), sortKey: kb(sortKey), data: dummyData, kind: "text" as const });
+						await rpc.apiPutItem(ctx, { hashKey: kb(hashKey), sortKey: kb(sortKey), data: dummyData, kind: "text" as const });
 						written = true;
 						break;
 					} catch (e: unknown) {
@@ -310,7 +316,7 @@ describe("PartitionDO - splitting", () => {
 			// and record the actor name that actually served each read.
 			const servedByActorNames = new Set<string>();
 			for (const item of allItems) {
-				const result = await stub.apiGetItem(ctx, { hashKey: kb(item.hashKey), sortKey: kb(item.sortKey) });
+				const result = await rpc.apiGetItem(ctx, { hashKey: kb(item.hashKey), sortKey: kb(item.sortKey) });
 				expect(result).toMatchObject({
 					found: true,
 					item: { data: dummyData },
@@ -344,13 +350,13 @@ describe("PartitionDO - splitting", () => {
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			// Root splits into two children.
 			await partition.splitHash();
 
 			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
-			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r1.meta.hashDepth).toBe(1);
 			expect(r1.meta.forwardCount).toBe(1);
 
@@ -358,25 +364,25 @@ describe("PartitionDO - splitting", () => {
 			await (await partition.childOwning(hashKey)).splitHash();
 
 			// root → child → grandchild: hashDepth=2. Cache is cold so forwardCount=2 (two RPC hops).
-			const r2 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r2.meta.hashDepth).toBe(2);
 			expect(r2.meta.forwardCount).toBe(2);
 		});
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			await partition.splitHash();
 			await (await partition.childOwning(hashKey)).splitHash();
 
 			// First request: cold cache — root→child→grandchild (two hops). Root learns depth=2.
-			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r1.meta.hashDepth).toBe(2);
 			expect(r1.meta.forwardCount).toBe(2);
 
 			// Second request: warm cache — root skips directly to grandchild (one hop).
-			const r2 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r2.meta.hashDepth).toBe(2);
 			expect(r2.meta.forwardCount).toBe(1);
 		});
@@ -399,14 +405,14 @@ describe("PartitionDO - splitting", () => {
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			// Build a two-level tree: root → child → grandchild.
 			await partition.splitHash();
 			await (await partition.childOwning(hashKey)).splitHash();
 
 			// Warm root's cache to depth=2 with one request (root→child→grandchild).
-			const r1 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r1.meta.hashDepth).toBe(2);
 
 			// Now split the grandchild, making it a router for great-grandchildren.
@@ -415,12 +421,12 @@ describe("PartitionDO - splitting", () => {
 			// Stale-cache request: root targets grandchild (cached depth=2) but it is now a router.
 			// Grandchild forwards one more level → root receives hashDepth=1, updates cache to depth=3,
 			// and returns hashDepth=3. forwardCount=2: one RPC root→grandchild + grandchild→great-grandchild.
-			const r2 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r2 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r2.meta.hashDepth).toBe(3);
 			expect(r2.meta.forwardCount).toBe(2);
 
 			// Subsequent request: root skips directly to great-grandchild (one RPC hop).
-			const r3 = await stub.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
+			const r3 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
 			expect(r3.meta.hashDepth).toBe(3);
 			expect(r3.meta.forwardCount).toBe(1);
 		});
@@ -429,7 +435,7 @@ describe("PartitionDO - splitting", () => {
 	describe("migration", () => {
 		it("migrates each item to exactly one child and preserves reads through the parent", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
@@ -441,7 +447,7 @@ describe("PartitionDO - splitting", () => {
 				{ hashKey: kb("echo"), sortKey: kb("s1"), data: "data-echo-1", kind: "text" as const },
 			];
 			for (const item of seedItems) {
-				await stub.apiPutItem(ctx, item);
+				await rpc.apiPutItem(ctx, item);
 			}
 
 			// Trigger the split condition.
@@ -449,7 +455,7 @@ describe("PartitionDO - splitting", () => {
 			await partition.runAlarm();
 			await partition.awaitSplitStarted();
 
-			const parentState = await stub.status();
+			const parentState = await rpc.status(ctx);
 			expect(["split_started", "split_completed"]).toContain(parentState.splitStatus?.status);
 			const childContexts = expectSplitStatus(parentState.splitStatus).childPartitionContexts;
 			expect(childContexts).toHaveLength(10);
@@ -459,22 +465,21 @@ describe("PartitionDO - splitting", () => {
 			// may already be running or complete by the time we reach here. awaitMigrationCompleted
 			// handles both.
 			for (const childCtx of childContexts) {
-				const childStub = testPartitionStub(childCtx.doName);
-				await TestPartition.at(childCtx).awaitMigrationCompleted();
-				const state = await childStub.status();
-				expect(state.migrationStatus).toBe("migration_completed");
+				const child = TestPartition.at(childCtx);
+				await child.awaitMigrationCompleted();
+				expect((await child.status()).migrationStatus).toBe("migration_completed");
 			}
 
 			// Parent acknowledges all children and transitions to split_completed.
 			await partition.awaitSplitCompleted();
-			const finalParent = await stub.status();
+			const finalParent = await rpc.status(ctx);
 			expect(finalParent.splitStatus?.status).toBe("split_completed");
 			const finalSplit = expectSplitStatus(finalParent.splitStatus);
 			expect(finalSplit.migratedChildDoNames).toHaveLength(10);
 
 			// All migrations complete: root successfully forwards each item to the correct child.
 			for (const item of seedItems) {
-				const result = await stub.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				const result = await rpc.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
 				expect(result).toMatchObject({
 					found: true,
 					item: { data: item.data },
@@ -482,16 +487,15 @@ describe("PartitionDO - splitting", () => {
 				});
 			}
 
-			// Every seed item is found in exactly one child with the correct data.
+			// Every seed item is found in exactly one child with the correct data. A child refuses a key it
+			// cannot own as a routing defect, so each child is asked only for the keys that hash to it.
 			const foundIds = new Set<string>();
 			for (const item of seedItems) {
 				let foundInDoName: string | undefined;
 				for (const childCtx of childContexts) {
-					const childStub = testPartitionStub(childCtx.doName);
-					const result = await childStub.apiGetItem(childCtx, {
-						hashKey: item.hashKey,
-						sortKey: item.sortKey,
-					});
+					const child = TestPartition.at(childCtx);
+					if ((await partition.childOwning(KeyCodec.decode(item.hashKey) as string)).doName !== child.doName) continue;
+					const result = await child.get({ hashKey: item.hashKey, sortKey: item.sortKey });
 					if (result.found) {
 						expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" found in multiple children`).toBeUndefined();
 						expect(result).toMatchObject({ item: { data: item.data } });
@@ -566,7 +570,7 @@ describe("PartitionDO - splitting", () => {
 							data: "new-value",
 							kind: "text",
 						}),
-					).rejects.toThrow(fokosErrorWith("partition_migrating", { operation: "putItem" }));
+					).rejects.toThrow(fokosErrorWith("partition_migrating", { operation: "apiPutItem" }));
 				});
 			});
 			expect((await (await partition.childOwning("key1")).status()).migrationStatus).toBe("migration_completed");
@@ -574,14 +578,14 @@ describe("PartitionDO - splitting", () => {
 
 		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			const seedItems = [
 				{ name: "alpha", item: { hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-1", kind: "text" as const } },
 				{ name: "banana", item: { hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const } },
 			];
 			for (const { item } of seedItems) {
-				await stub.apiPutItem(ctx, item);
+				await rpc.apiPutItem(ctx, item);
 			}
 
 			// Install the migration RPC delay before triggering the split.
@@ -598,20 +602,27 @@ describe("PartitionDO - splitting", () => {
 				// While migration is in progress, getItem on the child must read through to the parent so
 				// callers can read data that has not yet been copied to the child. Each key is read on the
 				// child that owns it: the parent serves a read-through only for the slice the calling child
-				// is importing, so a child asking for a sibling's key is a routing defect, not a lookup.
+				// is importing, so a child asking for a sibling's key is a routing defect, not a lookup. The
+				// parent executed the read, so it is the serving partition; the child is listed beside it as
+				// the owner it read through for.
 				for (const { name, item } of seedItems) {
 					const owner = await partition.childOwning(name);
 					const result = await owner.get(item);
-					expect(result).toMatchObject({ found: true, item: { data: item.data }, meta: { servedByActorName: partition.doName } });
+					expect(result).toMatchObject({
+						found: true,
+						item: { data: item.data },
+						meta: { servedByActorName: partition.doName, forwardCount: 1 },
+					});
 				}
 
 				// A projected read takes the same fallback: the parent answers the wire cells.
 				const projection = compileProjectionExpression([{ expr: { ref: "data" } }]);
-				const projected = await (await partition.childOwning("alpha")).get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
+				const alphaOwner = await partition.childOwning("alpha");
+				const projected = await alphaOwner.get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
 				expect(projected).toMatchObject({
 					found: true,
 					item: { projected: ["data-alpha-1"], kind: "projected" },
-					meta: { servedByActorName: partition.doName },
+					meta: { servedByActorName: partition.doName, forwardCount: 1 },
 				});
 			});
 			await assertSplitTreeComplete(partition);
@@ -619,7 +630,7 @@ describe("PartitionDO - splitting", () => {
 
 		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub } = partition;
+			const { ctx, stub, rpc } = partition;
 
 			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
 			const seedItems = [
@@ -630,7 +641,7 @@ describe("PartitionDO - splitting", () => {
 				{ hashKey: kb("delta"), sortKey: kb("s1"), data: "data-delta-1", kind: "text" as const },
 			];
 			for (const item of seedItems) {
-				await stub.apiPutItem(ctx, item);
+				await rpc.apiPutItem(ctx, item);
 			}
 
 			// One row per batch response forces a cursor-paginated round trip per item on every
@@ -642,7 +653,7 @@ describe("PartitionDO - splitting", () => {
 
 			// Every item is reachable through root via forwarding.
 			for (const item of seedItems) {
-				const result = await stub.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+				const result = await rpc.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
 				expect(result).toMatchObject({
 					found: true,
 					meta: { forwardCount: 1 },

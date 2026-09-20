@@ -29,7 +29,7 @@ async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbR
 
 describe("PartitionDO — fokosStatus", () => {
 	it("bootstraps an empty root from its context and reports no repartition", async ({ expect }) => {
-		const { ctx, stub } = makeStub();
+		const { ctx, stub, rpc } = makeStub();
 
 		const page = await stub.fokosStatus({ cursor: null, rootContext: ctx });
 
@@ -82,7 +82,7 @@ describe("PartitionDO — fokosStatus", () => {
 
 	it("reports the range root a promotion created, so destroy reaches a tree no context names", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2 });
-		await partition.stub.debugForcePromoteKey(partition.ctx, kb("alice"));
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
 		const entries = await allStatusEntries(partition);
@@ -165,7 +165,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 	});
 
 	it("bootstraps a root from its context, so an empty database can still be destroyed", async ({ expect }) => {
-		const { ctx, stub } = makeStub();
+		const { ctx, stub, rpc } = makeStub();
 
 		await stub.fokosPrepareDestroy({ rootContext: ctx });
 

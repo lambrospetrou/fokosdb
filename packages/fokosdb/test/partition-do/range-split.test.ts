@@ -1,7 +1,9 @@
+import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
+import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { kb } from "./helpers.js";
+import { executedBy, kb, rangeAncestorsOf } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot, rangeOf } from "./partition-harness.js";
 
 describe("PartitionDO — range split", () => {
@@ -55,14 +57,14 @@ describe("PartitionDO — range split", () => {
 			policy: { ...root.ctx.policy, rangeSplitConditions: { ...root.ctx.policy.rangeSplitConditions, maxSizeMb: raisedMaxSizeMb } },
 		};
 		const ownedSk = [...sks].sort()[0];
-		const read = await root.stub.apiGetItem(updatedCtx, { hashKey: kb("alice"), sortKey: kb(ownedSk) });
+		const read = await root.rpc.apiGetItem(updatedCtx, { hashKey: kb("alice"), sortKey: kb(ownedSk) });
 		expect(read.found, "the read must actually reach the child").toBe(true);
 		expect(read.meta.servedByActorName).toBe(child.doName);
 
-		// Read the child's stored context WITHOUT passing one, so the assertion observes what the
-		// router forwarded rather than writing the threshold itself.
-		const stored = await child.stub.status();
-		expect(stored.partitionContext!.policy.rangeSplitConditions.maxSizeMb).toBe(raisedMaxSizeMb);
+		// Read the child's stored policy WITHOUT a request, so the assertion observes what the router
+		// forwarded rather than writing the threshold itself.
+		const stored = await runInDurableObject(child.stub, (instance: PartitionDO) => instance.fokos.policy());
+		expect(stored.rangeSplitConditions.maxSizeMb).toBe(raisedMaxSizeMb);
 	});
 
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
@@ -107,12 +109,12 @@ describe("PartitionDO — range split", () => {
 			// Every depth-1 child: rangeDepth=1, rangeAncestors=[] (a depth-1 partition has no ancestor entry).
 			const children = await root.children();
 			for (const child of children) {
-				const childRead = await child.get({
+				const childRead = await child.stub.apiGetItem(child.ctx, {
 					hashKey: kb("alice"),
 					sortKey: rangeOf(child.ctx).startBoundary ?? kb(),
 				});
-				expect(childRead.meta.rangeDepth).toBe(1);
-				expect(childRead.meta._internal.rangeAncestors).toEqual([]);
+				expect(executedBy(childRead).rangeDepth).toBe(1);
+				expect(rangeAncestorsOf(childRead)).toEqual([]);
 			}
 
 			// A depth-2 grandchild's expected ancestor is its depth-1 parent's own boundaries, decoded to
@@ -136,12 +138,12 @@ describe("PartitionDO — range split", () => {
 				}
 
 				// Reading through the root router surfaces the serving grandchild's own rangeDepth/rangeAncestors.
-				const g = await root.get({ hashKey: kb("alice"), sortKey: kb(`${keyPrefix}0000`) });
-				expect(g.found).toBe(true);
-				expect(g.meta.rangeDepth).toBe(2);
-				expect(g.meta._internal.rangeAncestors[0]).toEqual(expectAncestor(child.ctx));
+				const g = await root.stub.apiGetItem(root.ctx, { hashKey: kb("alice"), sortKey: kb(`${keyPrefix}0000`) });
+				expect(g.value.found).toBe(true);
+				expect(executedBy(g).rangeDepth).toBe(2);
+				expect(rangeAncestorsOf(g)[0]).toEqual(expectAncestor(child.ctx));
 				// The last ancestor is the grandchild itself.
-				expect(g.meta._internal.rangeAncestors).toHaveLength(2);
+				expect(rangeAncestorsOf(g)).toHaveLength(2);
 			}
 		}, 30_000);
 
@@ -156,10 +158,10 @@ describe("PartitionDO — range split", () => {
 
 			// Depth-2 grandchild reached through the root: rangeDepth is still tracked, but rangeAncestors
 			// stays [] regardless of depth — the feature is fully inert when the config is zeroed out.
-			const g = await root.get({ hashKey: kb("alice"), sortKey: kb("aa0000") });
-			expect(g.found).toBe(true);
-			expect(g.meta.rangeDepth).toBe(2);
-			expect(g.meta._internal.rangeAncestors).toEqual([]);
+			const g = await root.stub.apiGetItem(root.ctx, { hashKey: kb("alice"), sortKey: kb("aa0000") });
+			expect(g.value.found).toBe(true);
+			expect(executedBy(g).rangeDepth).toBe(2);
+			expect(rangeAncestorsOf(g)).toEqual([]);
 		});
 	});
 

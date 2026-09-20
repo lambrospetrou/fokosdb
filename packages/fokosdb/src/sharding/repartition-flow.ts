@@ -33,8 +33,9 @@ import invariant from "../shared/invariant.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { refOf, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { identityDepth, PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
-import { selectRangeAncestors } from "./split-policy.js";
-import { FokosInternalError, FokosUnavailableError, FokosError, INTERNAL_CODES, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { selectRangeAncestors } from "./range-ancestors.js";
+import { FokosInternalError, FokosUnavailableError, FokosError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type {
 	FokosShardingStore,
 	PromotedKeyCursor,
@@ -59,11 +60,10 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusCursor,
 	FokosStatusEntry,
-	MigrationHost,
-	RepartitionPlan,
-	RepartitionRouting,
+	FokosStoredRepartitionPlan,
 	RouteKey,
 } from "./repartition-types.js";
+import type { FokosRepartitionPlan, FokosShardingHooks } from "./runtime-types.js";
 import { jitterBackoff } from "durable-utils/retries";
 
 /**
@@ -72,12 +72,15 @@ import { jitterBackoff } from "durable-utils/retries";
  */
 export const REPARTITION_RPC_CONCURRENCY = 6;
 
-/** The page budgets of the overrides phase. The host owns its own. */
-const PAGE_BYTES = 20 * 1024 * 1024;
+/**
+ * The page budgets of the overrides phase, and the values a host can adopt for its own pages: the
+ * serialized bytes of one page, the rows it holds, and the source rows one scan reads to fill it.
+ */
+export const FOKOS_PAGE_BYTES = 20 * 1024 * 1024;
+export const FOKOS_PAGE_ROWS = 1_000;
+export const FOKOS_SCAN_ROWS = 10_000;
 /** The same ceiling over an administration page, measured with the estimator below. */
-const STATUS_PAGE_BYTES = 20 * 1024 * 1024;
-const PAGE_ROWS = 1_000;
-const SCAN_ROWS = 10_000;
+const STATUS_PAGE_BYTES = FOKOS_PAGE_BYTES;
 
 const SOURCE_RETRY_BASE_MS = 5_000;
 const SOURCE_RETRY_MAX_MS = 5 * 60_000;
@@ -97,27 +100,24 @@ export type RepartitionIdentity = {
 	identity: FokosPartitionIdentity;
 };
 
-/** What both halves need: the peer factory, the application host, and this partition's own identity. */
+/**
+ * What both halves need: the peer factory, the host hooks, and this partition's own identity.
+ *
+ * The source reads `hooks.computeRangeBoundaries`, `beforeCutover`, `beforeComplete`,
+ * `cleanupSourceStep`, and `migration.buildPage`. The target reads `migration.applyPage` and
+ * `migration.validatePage`. Every hook is synchronous, and four of them run inside a transaction.
+ */
 export type RepartitionCommonDeps = {
-	/** Resolves a peer for one remote participant. Only the DO acquires stubs. */
+	/** Resolves a peer for one remote participant. Only the host acquires stubs. */
 	getPeer: (ref: FokosPartitionRef) => FokosRepartitionPeer;
-	host: MigrationHost;
+	hooks: FokosShardingHooks<unknown>;
 	/** This partition's own route context and identity. */
 	identity: () => RepartitionIdentity;
 	scheduleWork: () => void;
 	logParams: () => Record<string, unknown>;
 };
 
-export type RepartitionSourceDeps = RepartitionCommonDeps & {
-	/** The boundaries of a range split, or null when the interval cannot yield N non-empty children. */
-	computeRangeBoundaries: (hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, n: number) => KeyBytes[] | null;
-	/** Pending locks on one hash key. A promotion must not move a locked key. */
-	lockCountForKey: (hashKey: KeyBytes) => number;
-	/** Deletes one bounded batch of a promoted key's source rows. Returns whether they are all gone. */
-	cleanupStep: (hashKey: KeyBytes) => boolean;
-	/** Deletes the source's pending transaction rows once every split target holds its own copies. */
-	onSplitCompleted: () => void;
-};
+export type RepartitionSourceDeps = RepartitionCommonDeps;
 
 export type RepartitionTargetDeps = RepartitionCommonDeps & {
 	/** Whether this partition has a stored context at all. A target with one and no import record is a conflict. */
@@ -138,7 +138,7 @@ export type StepOutcome = "idle" | "progressed" | "stopped";
  * serves the three requests a target makes of it while that target catches up — a migration page, an
  * acknowledgement, and a read of the slice the target does not hold yet.
  */
-export class RepartitionSource implements RepartitionRouting {
+export class RepartitionSource {
 	constructor(
 		private readonly store: FokosShardingStore,
 		private readonly deps: RepartitionSourceDeps,
@@ -193,15 +193,35 @@ export class RepartitionSource implements RepartitionRouting {
 	}
 
 	/**
+	 * Says whether a queue request can pass arbitration now, without a write. The queue transaction
+	 * repeats the check, so a request that passes here can still be refused there.
+	 */
+	canQueue(request: { kind: RepartitionKind; hashKey?: KeyBytes }): boolean {
+		const { identity } = this.deps.identity();
+		if (this.store.getSplitRepartition()) return false;
+		switch (request.kind) {
+			case "hash_split":
+				return identity.kind === "hash" && !this.store.hasUnfinishedPromotion();
+			case "range_split":
+				return identity.kind === "range";
+			case "key_promotion":
+				return identity.kind === "hash" && request.hashKey !== undefined && !this.store.hasRouteOverride(request.hashKey);
+		}
+	}
+
+	/**
 	 * Decides one queue request and writes it, in one transaction that reads every row the decision
 	 * depends on. Returns the new repartition, or undefined when arbitration refused it.
 	 *
 	 * An unfinished promotion blocks a hash split, and a split row in ANY state blocks every later
 	 * promotion on that source. Keeping the two mutually exclusive is what removes the need for a
 	 * target cancellation protocol and for transaction-wide key-size reservations.
+	 *
+	 * The transaction also writes the plan head with the host policy and data of this moment, so every
+	 * later hook reads the values of queue time.
 	 */
-	queue(request: { kind: RepartitionKind; hashKey?: KeyBytes }, now = Date.now()): RepartitionRow | undefined {
-		const { identity } = this.deps.identity();
+	queue(request: { kind: RepartitionKind; hashKey?: KeyBytes; data?: unknown }, now = Date.now()): RepartitionRow | undefined {
+		const { ctx, identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
 			if (this.store.getSplitRepartition()) return undefined;
 
@@ -236,9 +256,49 @@ export class RepartitionSource implements RepartitionRouting {
 			// The override exists from the moment the promotion is queued, so a second request for the
 			// same key finds it and no key is ever queued twice.
 			if (request.kind === "key_promotion") this.store.insertRouteOverride(request.hashKey!, id);
+			this.store.putPlanHead(id, {
+				schema: 1,
+				queue: { policy: ctx.policy, ...(request.data === undefined ? {} : { data: request.data }) },
+				planned: null,
+				nextKey: null,
+			});
 			return this.store.getRepartition(id);
 		});
 		return row;
+	}
+
+	/**
+	 * The plan a hook receives: the head of queue time, the row, and the target rows, read again on
+	 * every call. The hook plan is never stored whole, because the target rows already hold the
+	 * references and the slices. A row with no head takes the live policy, so a missing head cannot
+	 * hold a repartition at `completed` for ever.
+	 */
+	#hookPlan(row: RepartitionRow): FokosRepartitionPlan {
+		const { ctx } = this.deps.identity();
+		const head = this.store.getPlanHead(row.id);
+		return {
+			id: row.id,
+			kind: row.kind,
+			source: refOf(ctx),
+			targets: this.store.listRepartitionTargets(row.id, row.kind).map((t) => ({
+				ref: { partitionId: t.partitionId, doName: t.doName },
+				slice: this.materializeSlice(t.slice),
+			})),
+			sourceAfterCutover: row.kind === "key_promotion" ? "retains_others" : "router",
+			policy: head ? head.queue.policy : ctx.policy,
+			...(head?.queue.data === undefined ? {} : { data: head.queue.data }),
+		};
+	}
+
+	#head(repartitionId: string): FokosStoredRepartitionPlan {
+		const head = this.store.getPlanHead(repartitionId);
+		invariant(head, () => `fokos/repartition: no plan head for ${repartitionId}`);
+		return head;
+	}
+
+	/** `beforeCutover` holds a plan when it returns false. An absent hook holds nothing. */
+	#cutoverAllowed(row: RepartitionRow): boolean {
+		return this.deps.hooks.beforeCutover?.(this.#hookPlan(row)) ?? true;
 	}
 
 	/**
@@ -261,11 +321,12 @@ export class RepartitionSource implements RepartitionRouting {
 		}
 	}
 
-	/** Writes the plan, every target row, and `planned`, in one transaction. */
+	/** Fills the plan head, writes every target row, and moves the row to `planned`, in one transaction. */
 	#plan(row: RepartitionRow, now: number): StepOutcome {
 		const { ctx, identity } = this.deps.identity();
 		const depth = identityDepth(identity);
-		const plan: RepartitionPlan = { schema: 1, source: refOf(ctx) };
+		const head = this.#head(row.id);
+		const planned: NonNullable<FokosStoredRepartitionPlan["planned"]> = {};
 		let targets: Array<{ ref: FokosPartitionRef; slice: RepartitionSlice }>;
 
 		switch (row.kind) {
@@ -283,7 +344,14 @@ export class RepartitionSource implements RepartitionRouting {
 				invariant(rp, "fokos/repartition.plan: a range split needs a range identity");
 				const n = ctx.rangeConfig.rangeSplitN;
 				invariant(n >= 2, "fokos/repartition.plan: rangeSplitN must be at least 2");
-				const boundaries = this.deps.computeRangeBoundaries(rp.hashKey, rp.start, rp.end, n);
+				const boundaries =
+					this.deps.hooks.computeRangeBoundaries?.({
+						hashKey: rp.hashKey,
+						start: rp.start,
+						end: rp.end,
+						childCount: n,
+						policy: head.queue.policy,
+					}) ?? null;
 				if (!boundaries) {
 					// A size-triggered split can find fewer than N items in its interval, because each child
 					// needs one. Only a new write can change that, so the retry backs off to five minutes.
@@ -292,8 +360,8 @@ export class RepartitionSource implements RepartitionRouting {
 				}
 				const starts: (KeyBytes | null)[] = [rp.start, ...boundaries];
 				const ends: (KeyBytes | null)[] = [...boundaries, rp.end];
-				plan.rangeDepth = depth + 1;
-				plan.rangeAncestors = selectRangeAncestors(
+				planned.rangeDepth = depth + 1;
+				planned.rangeAncestors = selectRangeAncestors(
 					depth,
 					rp.ancestors,
 					{
@@ -316,8 +384,8 @@ export class RepartitionSource implements RepartitionRouting {
 				const hashKey = row.hashKey;
 				invariant(hashKey, "fokos/repartition.plan: a key promotion needs its hash key");
 				const root = resolveRangePartitionContext(ctx, hashKey, null, null);
-				plan.rangeDepth = 0;
-				plan.rangeAncestors = [];
+				planned.rangeDepth = 0;
+				planned.rangeAncestors = [];
 				targets = [{ ref: { partitionId: root.partitionId, doName: root.doName }, slice: { kind: "promoted_key", hashKey } }];
 				break;
 			}
@@ -329,7 +397,7 @@ export class RepartitionSource implements RepartitionRouting {
 		this.store.transactionSync(() => {
 			const current = this.store.getRepartition(row.id);
 			if (current?.state !== "queued") return;
-			this.store.putPlan(row.id, plan);
+			this.store.putPlanHead(row.id, { ...head, planned });
 			targets.forEach((t, index) => {
 				this.store.insertRepartitionTarget({
 					repartitionId: row.id,
@@ -359,15 +427,11 @@ export class RepartitionSource implements RepartitionRouting {
 	 * the retry repeats the same idempotent `fokosInit`.
 	 */
 	async #initializeTargets(row: RepartitionRow, now: number): Promise<StepOutcome> {
-		if (row.kind === "key_promotion") {
-			const hashKey = row.hashKey;
-			invariant(hashKey, "fokos/repartition.initializeTargets: a key promotion needs its hash key");
-			if (this.deps.lockCountForKey(hashKey) > 0) {
-				// The target stays `pending`. A guarded lock counts too: skipping it would route the key to
-				// the range root, and a later forced commit would find no pending row there and lose the write.
-				this.#deferTargets(row, now, LOCK_RETRY_MS);
-				return "progressed";
-			}
+		// Consulted before the FIRST target exists, so a key that cannot move yet gets no range root. The
+		// targets stay `pending` and the plan waits at the flat interval, until a signal wakes it.
+		if (this.store.countRepartitionTargets(row.id).initialized === 0 && !this.#cutoverAllowed(row)) {
+			this.#deferTargets(row, now, LOCK_RETRY_MS);
+			return "progressed";
 		}
 
 		const due = this.store.selectDueTargets(row.id, row.kind, "init", now, REPARTITION_RPC_CONCURRENCY);
@@ -376,8 +440,8 @@ export class RepartitionSource implements RepartitionRouting {
 			return "idle";
 		}
 
-		const plan = this.store.getPlan(row.id);
-		invariant(plan, () => `fokos/repartition.initializeTargets: no plan for ${row.id}`);
+		const planned = this.#head(row.id).planned;
+		invariant(planned, () => `fokos/repartition.initializeTargets: ${row.id} has no planned head`);
 		const { ctx } = this.deps.identity();
 
 		this.store.transactionSync(() => {
@@ -397,8 +461,8 @@ export class RepartitionSource implements RepartitionRouting {
 					source: refOf(ctx),
 					target: this.#targetContext(ctx, target),
 					slice: this.materializeSlice(target.slice),
-					...(plan.rangeDepth === undefined ? {} : { rangeDepth: plan.rangeDepth }),
-					...(plan.rangeAncestors === undefined ? {} : { rangeAncestors: plan.rangeAncestors }),
+					...(planned.rangeDepth === undefined ? {} : { rangeDepth: planned.rangeDepth }),
+					...(planned.rangeAncestors === undefined ? {} : { rangeAncestors: planned.rangeAncestors }),
 				});
 			}),
 		);
@@ -420,8 +484,8 @@ export class RepartitionSource implements RepartitionRouting {
 	}
 
 	/**
-	 * Moves routing to the targets. Every target is `initialized` at this point, and the target rows
-	 * hold every routing slice, so the plan is spent and the transaction deletes it.
+	 * Moves routing to the targets. Every target is `initialized` at this point. The plan head stays,
+	 * because the completion and cleanup hooks read the policy and data of queue time from it.
 	 */
 	#cutover(row: RepartitionRow, now: number): StepOutcome {
 		const outcome = this.store.transactionSync((): StepOutcome => {
@@ -430,18 +494,15 @@ export class RepartitionSource implements RepartitionRouting {
 			const counts = this.store.countRepartitionTargets(row.id);
 			if (counts.total === 0 || counts.initialized !== counts.total) return "idle";
 
-			if (current.kind === "key_promotion") {
-				// Checked again here, not only before initialization: a lock can appear while the range root
-				// is being created, and moving the key then would strand that lock on the wrong partition.
-				invariant(current.hashKey, "fokos/repartition.cutover: a key promotion needs its hash key");
-				if (this.deps.lockCountForKey(current.hashKey) > 0) {
-					this.store.setRepartitionAttempt(row.id, current.attempts, now + LOCK_RETRY_MS);
-					return "progressed";
-				}
+			// Consulted again here, not only before initialization: the condition the hook tests can
+			// change while the targets are created, and moving ownership then would strand host state on
+			// the wrong partition.
+			if (!this.#cutoverAllowed(current)) {
+				this.store.setRepartitionAttempt(row.id, current.attempts, now + LOCK_RETRY_MS);
+				return "progressed";
 			}
 
 			this.store.setRepartitionState(row.id, "cutover", { cutoverAt: now });
-			this.store.deletePlan(row.id);
 			this.store.refreshRepartitionDue(row.id, now);
 			return "progressed";
 		});
@@ -496,17 +557,20 @@ export class RepartitionSource implements RepartitionRouting {
 		return "progressed";
 	}
 
-	/** Runs one cleanup step for one completed repartition, whatever its kind. */
+	/**
+	 * Runs one cleanup step for one completed repartition, whatever its kind. The host decides what a
+	 * step reclaims; a host without the hook keeps its data, so the step finishes at once. The last
+	 * step deletes the plan chain before it writes `cleaned`.
+	 */
 	sourceCleanupStep(now = Date.now()): StepOutcome {
 		const row = this.store.selectDueCleanup(now);
 		if (!row) return "idle";
 		return this.store.transactionSync((): StepOutcome => {
 			const current = this.store.getRepartition(row.id);
 			if (current?.state !== "completed") return "idle";
-			// A split keeps its item rows, so its step reclaims nothing and finishes at once. Only a
-			// promotion has rows to give back: its key moved, and the rest of its keys stay here.
-			const done = current.kind === "key_promotion" ? this.deps.cleanupStep(current.hashKey!) : true;
+			const done = this.deps.hooks.cleanupSourceStep?.(this.#hookPlan(current)) ?? true;
 			if (done) {
+				this.store.deletePlanChain(row.id);
 				this.store.setRepartitionState(row.id, "cleaned");
 			} else {
 				this.store.setRepartitionAttempt(row.id, current.attempts, now + CLEANUP_RETRY_MS);
@@ -516,14 +580,16 @@ export class RepartitionSource implements RepartitionRouting {
 	}
 
 	/**
-	 * Tells the source that a pending lock has just gone.
+	 * Tells the source that a condition `beforeCutover` tests has changed.
 	 *
-	 * A promotion cannot move a locked key, so it parks its targets 5 seconds out and asks again. Only
-	 * a commit and a cancel change that answer, so only they are worth a signal. Without this call, a
-	 * key that is ready to move waits out an interval chosen for polling.
+	 * A held promotion parks itself at a flat interval and asks again. Only the host knows which event
+	 * changes the answer, so it signals it. Without this call, a key that is ready to move waits out
+	 * an interval chosen for polling. Returns false when no promotion was waiting.
 	 */
-	onLockReleased(now = Date.now()): void {
+	onRepartitionUnblocked(now = Date.now()): boolean {
+		if (!this.store.hasUnfinishedPromotion()) return false;
 		this.store.transactionSync(() => this.store.markPromotionsDueNow(now));
+		return true;
 	}
 
 	/** The earliest durable deadline of any source work, or null when the source has none left. */
@@ -607,7 +673,7 @@ export class RepartitionSource implements RepartitionRouting {
 		let bytes = 0;
 		for (const r of rows) {
 			const entry: FokosStatusEntry = {
-				repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state },
+				repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashKey: r.hashKey },
 				target:
 					r.targetIndex < 0 || r.partitionId === null || r.doName === null || r.initialization === null
 						? null
@@ -647,9 +713,8 @@ export class RepartitionSource implements RepartitionRouting {
 			if (counts.acknowledged < counts.total) return;
 
 			this.store.setRepartitionState(row.id, "completed", { completedAt: now });
-			// Every target now holds the authoritative copy of its own locks, so the source's are
-			// redundant. A promotion moved one key of many and must not touch the rest.
-			if (row.kind !== "key_promotion") this.deps.onSplitCompleted();
+			// Every target now holds its own copy of the slice, so the host can drop what it kept for them.
+			this.deps.hooks.beforeComplete?.(this.#hookPlan(row));
 			this.store.setRepartitionAttempt(row.id, 0, now);
 		});
 		this.deps.scheduleWork();
@@ -673,7 +738,7 @@ export class RepartitionSource implements RepartitionRouting {
 		// silent. The error is internal and not retryable, because a reclaimed slice never comes back
 		// and a caller that retried would loop until it gave up.
 		if (row.kind === "key_promotion" && (row.state === "completed" || row.state === "cleaned")) {
-			throw new FokosInternalError(INTERNAL_CODES.repartition_slice_reclaimed, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.repartition_slice_reclaimed, {
 				message: "the promoted key's rows have been reclaimed; read it through the range tree",
 				attributes: { repartitionId: row.id, state: row.state },
 			});
@@ -684,7 +749,7 @@ export class RepartitionSource implements RepartitionRouting {
 	#requireTarget(repartitionId: string, ref: FokosPartitionRef): { row: RepartitionRow; target: RepartitionTargetRow } {
 		const row = this.store.getRepartition(repartitionId);
 		if (!row) {
-			throw new FokosInternalError(INTERNAL_CODES.repartition_unknown, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.repartition_unknown, {
 				message: "no repartition with this id on this partition",
 				attributes: { repartitionId, caller: ref.doName },
 			});
@@ -693,7 +758,7 @@ export class RepartitionSource implements RepartitionRouting {
 		// Both halves must match. A doName alone is a value the caller chose, and an id alone does not
 		// prove which DO is asking.
 		if (!target || target.doName !== ref.doName) {
-			throw new FokosInternalError(INTERNAL_CODES.repartition_target_unknown, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.repartition_target_unknown, {
 				message: "the caller is not a target of this repartition",
 				attributes: { repartitionId, caller: ref.doName, callerPartitionId: ref.partitionId },
 			});
@@ -721,7 +786,7 @@ export class RepartitionSource implements RepartitionRouting {
 		const cursor: FokosMigrationCursor = req.cursor ?? { phase: "overrides", inner: null };
 		if (cursor.phase === "overrides") return this.#buildOverridesPage(row, slice, cursor.inner);
 
-		const { page, nextCursor } = this.deps.host.buildPage(cursor.inner, slice, this.belongsToTarget(slice));
+		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice));
 		return { phase: "host", page, nextCursor: nextCursor === null ? null : { phase: "host", inner: nextCursor } };
 	}
 
@@ -750,10 +815,10 @@ export class RepartitionSource implements RepartitionRouting {
 			advanceCursor: (r) => ({ hashKey: r.hashKey }),
 			include: (r) => sliceIncludesHashKey(slice, r.hashKey, n),
 			estimateBytes: (r) => r.hashKey.byteLength + 64,
-			budgetBytes: PAGE_BYTES,
-			maxItems: PAGE_ROWS,
-			maxScannedRows: SCAN_ROWS,
-			pageSize: PAGE_ROWS,
+			budgetBytes: FOKOS_PAGE_BYTES,
+			maxItems: FOKOS_PAGE_ROWS,
+			maxScannedRows: FOKOS_SCAN_ROWS,
+			pageSize: FOKOS_PAGE_ROWS,
 			startCursor: inner,
 		});
 		return {
@@ -814,7 +879,11 @@ export class RepartitionTarget {
 		}
 		if (page.phase === "host") {
 			try {
-				this.deps.host.validatePage(requested.inner, page.page, page.nextCursor?.phase === "host" ? page.nextCursor.inner : null);
+				this.deps.hooks.migration.validatePage(
+					requested.inner,
+					page.page,
+					page.nextCursor?.phase === "host" ? page.nextCursor.inner : null,
+				);
 			} catch (error) {
 				this.#deferImport(rec, now, error);
 				return "stopped";
@@ -830,7 +899,7 @@ export class RepartitionTarget {
 			if (current.repartitionId !== rec.repartitionId || !cursorsEqual(current.cursor, rec.cursor)) return false;
 
 			if (page.phase === "overrides") this.#applyOverrides(page.overrides, now);
-			else this.deps.host.applyPage(page.page, current.slice);
+			else this.deps.hooks.migration.applyPage(page.page, current.slice);
 
 			this.#putImport({
 				...current,
@@ -930,7 +999,7 @@ export class RepartitionTarget {
 			});
 		} else {
 			if (this.deps.hasIdentity()) {
-				throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_context_mismatch, {
 					message: "this partition already has a context and is not a target of any import",
 					attributes: { repartitionId: req.repartitionId, target: req.target.doName },
 				});
@@ -965,7 +1034,7 @@ export class RepartitionTarget {
 			existing.source.doName !== req.source.doName ||
 			!sameSlice
 		) {
-			throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_context_mismatch, {
 				message: "fokosInit conflicts with the import this partition already holds",
 				attributes: {
 					repartitionId: [existing.repartitionId, req.repartitionId],
@@ -980,13 +1049,13 @@ export class RepartitionTarget {
 	async startImport(req: FokosStartImportRequest, now = Date.now()): Promise<void> {
 		const rec = this.importRecord();
 		if (!rec || rec.repartitionId !== req.repartitionId) {
-			throw new FokosInternalError(INTERNAL_CODES.repartition_unknown, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.repartition_unknown, {
 				message: "this partition holds no import for that repartition",
 				attributes: { repartitionId: req.repartitionId },
 			});
 		}
 		if (rec.source.partitionId !== req.source.partitionId || rec.source.doName !== req.source.doName) {
-			throw new FokosInternalError(INTERNAL_CODES.partition_context_mismatch, {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_context_mismatch, {
 				message: "fokosStartImport came from a different source than the stored one",
 				attributes: { repartitionId: req.repartitionId, stored: rec.source.doName, received: req.source.doName },
 			});
@@ -1065,10 +1134,13 @@ export class RepartitionTarget {
 }
 
 function retryDelay(error: unknown, attempts: number, base = SOURCE_RETRY_BASE_MS, max = SOURCE_RETRY_MAX_MS, flat?: number): number {
-	if (flat !== undefined && FokosError.isCode(error, UNAVAILABLE_CODES.repartition_not_cut_over)) return flat;
+	if (flat !== undefined && FokosError.isCode(error, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over)) return flat;
 	// A protocol defect no retry can fix still keeps its state and its identifiers; it simply waits
 	// long enough that it costs nothing while an operator looks at the log.
-	if (FokosError.isCode(error, INTERNAL_CODES.repartition_unknown) || FokosError.isCode(error, INTERNAL_CODES.repartition_target_unknown)) {
+	if (
+		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_unknown) ||
+		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_target_unknown)
+	) {
 		return NON_RETRYABLE_RETRY_MS;
 	}
 	return jitterBackoff(attempts, base, max);
@@ -1077,7 +1149,7 @@ function retryDelay(error: unknown, attempts: number, base = SOURCE_RETRY_BASE_M
 const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 0, host: 1 };
 
 function notCutOver(repartitionId: string): FokosUnavailableError {
-	return new FokosUnavailableError(UNAVAILABLE_CODES.repartition_not_cut_over, {
+	return new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over, {
 		message: "the repartition source still owns this slice; retry after cutover",
 		attributes: { repartitionId },
 	});
@@ -1090,7 +1162,7 @@ function notCutOver(repartitionId: string): FokosUnavailableError {
  */
 function statusEntryBytes(entry: FokosStatusEntry): number {
 	const ids = entry.repartition.id.length + (entry.target ? entry.target.ref.doName.length + entry.target.ref.partitionId.length : 0);
-	return 256 + 2 * ids;
+	return 256 + 2 * ids + (entry.repartition.hashKey?.byteLength ?? 0);
 }
 
 /** Compares two migration cursors by value. Both ends survive a KV structured-clone round trip. */

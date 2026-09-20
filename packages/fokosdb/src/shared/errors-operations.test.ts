@@ -33,8 +33,9 @@ describe("the code tables of the library", () => {
 		expect(new Set(DEFS.map((def) => def.segment)).size).toBe(DEFS.length);
 	});
 
-	it("hold one table for each category of the library", () => {
-		const tags = FOKOS_LIBRARY_CODE_TABLES.map((table) => Object.values(table)[0].tag).sort();
+	it("hold at least one table for each category of the library, and one category per table", () => {
+		for (const table of FOKOS_LIBRARY_CODE_TABLES) expect(new Set(Object.values(table).map((def) => def.tag)).size).toBe(1);
+		const tags = [...new Set(FOKOS_LIBRARY_CODE_TABLES.map((table) => Object.values(table)[0].tag))].sort();
 		const categories = [...FOKOS_ERROR_CATEGORIES.keys(), FokosConditionCheckError.tag, FokosTransactionCancelledError.tag];
 		expect(tags).toEqual(categories.sort());
 	});

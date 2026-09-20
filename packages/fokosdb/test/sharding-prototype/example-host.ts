@@ -106,7 +106,7 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 					const rows: Array<{ sk: KeyBytes; body: string }> = [];
 					for (const visit of visits) {
 						const sub = { ...request, limit: request.limit - rows.length };
-						const page = visit.target === "local" ? await local(sub) : (await forward(visit, sub)).value;
+						const page = visit.target === "local" ? await local(sub) : await forward(visit, sub);
 						rows.push(...page.rows);
 						if (page.more || rows.length >= request.limit) return { rows: rows.slice(0, request.limit), more: true };
 					}

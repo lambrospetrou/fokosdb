@@ -17,9 +17,14 @@ import {
 	type FokosCodeDef,
 	type FokosErrorOptions,
 } from "./errors.js";
-import { isFokosAnyError, type FokosAnyError } from "./errors-operations.js";
+import { FOKOS_LIBRARY_CODE_TABLES, isFokosAnyError, type FokosAnyError } from "./errors-operations.js";
+import { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES } from "../sharding/errors.js";
 
-const DEFS: FokosCodeDef[] = FOKOS_CODE_TABLES.flatMap((table) => Object.values(table));
+/** Every code of the library, the sharding and the operation tables included, so the uniqueness checks cover them all. */
+const ALL_DEFS: FokosCodeDef[] = FOKOS_LIBRARY_CODE_TABLES.flatMap((table) => Object.values(table));
+
+/** Every code whose category is a class of this module, so `errorOf` can build it. */
+const DEFS: FokosCodeDef[] = [...FOKOS_CODE_TABLES, ...FOKOS_SHARDING_CODE_TABLES].flatMap((table) => Object.values(table));
 
 /** One error of `def`, built through the class of its category. */
 function errorOf(def: FokosCodeDef, options: Partial<FokosErrorOptions> = {}): FokosError {
@@ -44,25 +49,28 @@ function contractOf(e: FokosError) {
 
 describe("the code tables", () => {
 	it("give every code a unique segment", () => {
-		const segments = DEFS.map((def) => def.segment);
+		const segments = ALL_DEFS.map((def) => def.segment);
 		expect(new Set(segments).size).toBe(segments.length);
 	});
 
 	it("define every code once, under its own name", () => {
-		expect(new Set(DEFS.map((def) => def.code)).size).toBe(DEFS.length);
-		for (const table of FOKOS_CODE_TABLES) {
+		expect(new Set(ALL_DEFS.map((def) => def.code)).size).toBe(ALL_DEFS.length);
+		for (const table of FOKOS_LIBRARY_CODE_TABLES) {
 			for (const [key, def] of Object.entries(table)) expect(def.code).toBe(key);
 		}
 	});
 
 	it("take every segment from the unambiguous alphabet", () => {
-		for (const def of DEFS) expect(def.segment, def.code).toMatch(/^[a-hjkmnp-z2-9]{6}$/);
+		for (const def of ALL_DEFS) expect(def.segment, def.code).toMatch(/^[a-hjkmnp-z2-9]{6}$/);
 	});
 
-	it("give each category of this module one table, and each table one category", () => {
+	it("give each table of this module one category, and every category a class", () => {
 		const tagsOfTables = FOKOS_CODE_TABLES.map((table) => [...new Set(Object.values(table).map((def) => def.tag))]);
 		for (const tags of tagsOfTables) expect(tags).toHaveLength(1);
-		expect(tagsOfTables.flat().sort()).toEqual([...FOKOS_ERROR_CATEGORIES.keys()].sort());
+		const categories = [...FOKOS_ERROR_CATEGORIES.keys()];
+		for (const tag of tagsOfTables.flat()) expect(categories).toContain(tag);
+		// The routing category has no code of its own here: every routing code is a sharding code.
+		expect(categories.filter((tag) => !tagsOfTables.flat().includes(tag))).toEqual(["FokosRoutingError"]);
 	});
 
 	it("give clock_skew the service origin, not the one of its category", () => {
@@ -338,7 +346,7 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 
 	it("store the cause as plain data", () => {
 		const inner = Object.assign(new Error("inner"), { status: 7 });
-		const wire = FokosError.toWire(errorOf(INTERNAL_CODES.partition_fanout_failed, { cause: inner }));
+		const wire = FokosError.toWire(errorOf(SHARDING_INTERNAL_CODES.partition_fanout_failed, { cause: inner }));
 		expect(wire.cause).toEqual({ error: "Error: inner", errorProps: { status: 7 } });
 		expect(FokosError.fromWire(wire).cause).toEqual(wire.cause);
 	});

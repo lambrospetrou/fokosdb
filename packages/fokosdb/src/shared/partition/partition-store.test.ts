@@ -1192,7 +1192,7 @@ describe("PartitionStore - pending transactions", () => {
 			expect(store.guardPendingTx("tx-guarded", 3000)).toBe(false);
 			expect(store.listPendingTxItems("tx-guarded")[0].guarded_at).toBe(2000);
 			expect(store.hasAnyPendingTx()).toBe(true);
-			expect(store.hasAnyUnguardedPendingTx()).toBe(false);
+			expect(store.earliestUnguardedPendingTxCreatedAt()).toBeNull();
 			expect(store.listStalePendingTx(5000, 10)).toEqual([]);
 
 			store.clearPendingTxGuard("tx-guarded");

@@ -1415,14 +1415,17 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Does this partition hold any unguarded lock? The alarm scheduler asks once per background pass to
-	 * decide whether to arm stale-transaction recovery.
+	 * When the oldest unguarded lock was written, or null when this partition holds none. The scheduler
+	 * asks once per background pass to arm stale-transaction recovery at the moment that lock turns stale.
 	 *
-	 * `LIMIT 1` is intentional. A count walks every matching entry, while this query stops at the first
-	 * unguarded row.
+	 * The query walks `pending_transactions_created_at` from its start and stops at the first unguarded
+	 * row, so it costs one seek in the common case where the oldest lock is not guarded.
 	 */
-	hasAnyUnguardedPendingTx(): boolean {
-		return this.#storage.sql.exec(`SELECT 1 FROM pending_transactions WHERE guarded_at IS NULL LIMIT 1`).toArray().length > 0;
+	earliestUnguardedPendingTxCreatedAt(): number | null {
+		const rows = this.#storage.sql
+			.exec<{ created_at: number }>(`SELECT created_at FROM pending_transactions WHERE guarded_at IS NULL ORDER BY created_at LIMIT 1`)
+			.toArray();
+		return rows[0]?.created_at ?? null;
 	}
 
 	pendingLockCountForHashKey(hk: KeyBytes): number {

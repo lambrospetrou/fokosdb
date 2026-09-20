@@ -44,27 +44,56 @@ export {
 	resolveHashChildPartitionContexts,
 	resolveRangePartitionContext,
 } from "./partition-id.js";
-export type { PartitionInfoInternal, PartitionNodeId, RangeAncestorInfo, SplitStatus, SplitType } from "./types.js";
+export type { PartitionNodeId, RangeAncestorInfo, SplitStatus, SplitType } from "./types.js";
+
+// ─── The runtime ──────────────────────────────────────────────────────────────
+
+export { FokosShardingRuntime } from "./runtime.js";
+export type { FokosRuntimeConstructorOptions } from "./runtime.js";
+export type {
+	FokosChild,
+	FokosEnvelope,
+	FokosGroupPart,
+	FokosJob,
+	FokosLifecycle,
+	FokosLocalCall,
+	FokosOperation,
+	FokosOperationBase,
+	FokosOperationSpec,
+	FokosOperations,
+	FokosOwner,
+	FokosPublicRoute,
+	FokosPublicRouting,
+	FokosRangeInput,
+	FokosRangeVisit,
+	FokosRepartitionPlan,
+	FokosRequestPromotionResult,
+	FokosRouteNode,
+	FokosRouting,
+	FokosServedRole,
+	FokosRuntimeConfigOverrides,
+	FokosRuntimeOptions,
+	FokosShardingHooks,
+	FokosSignals,
+} from "./runtime-types.js";
+export { ROUTE_EVIDENCE_MAX_BYTES, RouteCollector, attachRouting, routedError, routeNodeBytes } from "./envelope.js";
+export type { FokosRoutedError } from "./envelope.js";
+export { planRangeFrontier } from "./range-frontier.js";
+export type { FrontierBase, PlannedVisit } from "./range-frontier.js";
+export { FokosScheduler } from "./scheduler.js";
+export type { FokosSchedulerDeps } from "./scheduler.js";
+export { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
+export type { FokosShardingError } from "./errors.js";
 
 // ─── Routing and caches ───────────────────────────────────────────────────────
 
 export { FokosRouter } from "./router.js";
 export type { FokosWalkStub } from "./router.js";
-export { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "./forward-meta.js";
-export type { RoutedError } from "./forward-meta.js";
 export { HashTopology } from "./hash-topology.js";
 export type { HashTopologySnapshot } from "./hash-topology.js";
 export { PartialRangeTopology } from "./partial-range-topology.js";
 export type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
-export { HashPartitionTopologyImpl, RangePartitionTopologyImpl, RANGE_PROMOTION_FRACTION, selectRangeAncestors } from "./split-policy.js";
-export type {
-	OperationIntent,
-	PartitionTopologySplitter,
-	RoutingDecision,
-	SplitConditions,
-	SplitPolicyContext,
-	SplitPolicyFields,
-} from "./split-policy.js";
+export { selectRangeAncestors } from "./range-ancestors.js";
 export {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -95,7 +124,14 @@ export type {
 
 // ─── Repartition flow ─────────────────────────────────────────────────────────
 
-export { REPARTITION_RPC_CONCURRENCY, RepartitionSource, RepartitionTarget } from "./repartition-flow.js";
+export {
+	FOKOS_PAGE_BYTES,
+	FOKOS_PAGE_ROWS,
+	FOKOS_SCAN_ROWS,
+	REPARTITION_RPC_CONCURRENCY,
+	RepartitionSource,
+	RepartitionTarget,
+} from "./repartition-flow.js";
 export type {
 	RepartitionCommonDeps,
 	RepartitionIdentity,
@@ -103,7 +139,7 @@ export type {
 	RepartitionTargetDeps,
 	StepOutcome,
 } from "./repartition-flow.js";
-export { assertPointInSlice, clipQueryToSlice, sliceIncludesHashKey, sliceIncludesItem } from "./repartition-slice.js";
+export { sliceIncludesHashKey, sliceIncludesItem } from "./repartition-slice.js";
 export type {
 	FokosExecuteLocalRequest,
 	FokosImportRecord,
@@ -114,18 +150,18 @@ export type {
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
 	FokosPartitionControlRpc,
-	FokosPartitionStatusRpc,
 	FokosPrepareDestroyRequest,
 	FokosRepartitionPeer,
+	FokosRequestPromotionRequest,
+	FokosShardingRpc,
 	FokosSlice,
 	FokosStartImportRequest,
+	FokosStoredRepartitionPlan,
 	FokosStatusCursor,
 	FokosStatusEntry,
 	FokosStatusPage,
 	FokosStatusRequest,
 	MigrationHost,
-	RepartitionPlan,
-	RepartitionRouting,
 	RouteKey,
 } from "./repartition-types.js";
 export { collectBatch } from "./batch-scan.js";

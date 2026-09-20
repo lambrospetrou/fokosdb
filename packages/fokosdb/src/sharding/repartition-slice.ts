@@ -1,8 +1,5 @@
 import { hashChildIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import type { ScanCursor } from "../shared/partition/partition-store.js";
-import { clipToChildRange, cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
-import { FokosRoutingError, ROUTING_CODES } from "../shared/errors.js";
 
 /**
  * The part of a source partition's keyspace that one repartition target owns.
@@ -19,14 +16,6 @@ export type FokosSlice =
 	| { kind: "hash_child"; childIndex: number; depth: number }
 	| { kind: "range"; hashKey: KeyBytes; start: KeyBytes | null; end: KeyBytes | null }
 	| { kind: "promoted_key"; hashKey: KeyBytes };
-
-/** Never transient: the key reached a source that does not serve it for this caller. */
-function misrouted(operationName: string, reason: string): FokosRoutingError {
-	return new FokosRoutingError(ROUTING_CODES.partition_misrouted, {
-		message: "read-through key is outside the caller's slice",
-		attributes: { operation: operationName, reason },
-	});
-}
 
 /** The lower edge of a range slice as a comparable key; a null start is the unbounded edge. */
 function sliceStart(start: KeyBytes | null): KeyBytes {
@@ -61,44 +50,4 @@ export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey:
 /** Says whether one hash key belongs to the slice, ignoring the sort-key axis. */
 export function sliceIncludesHashKey(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number): boolean {
 	return hashKeyInSlice(slice, hashKey, hashSplitN);
-}
-
-/** Throws `partition_misrouted` when the point is outside the slice. */
-export function assertPointInSlice(
-	slice: FokosSlice,
-	hashKey: KeyBytes,
-	sortKey: KeyBytes,
-	hashSplitN: number,
-	operationName: string,
-): void {
-	if (!hashKeyInSlice(slice, hashKey, hashSplitN)) throw misrouted(operationName, "hash key outside slice");
-	if (slice.kind !== "range") return;
-	const inInterval =
-		KeyCodec.compare(sortKey, sliceStart(slice.start)) >= 0 && (slice.end === null || KeyCodec.compare(sortKey, slice.end) < 0);
-	if (!inInterval) throw misrouted(operationName, "sort key outside slice interval");
-}
-
-/**
- * Clips a query interval to the slice and returns the interval the source may actually scan.
- *
- * A caller can legitimately ask for more than it owns — a range child inherits the client's whole
- * interval and relies on its router to clip — so an overlapping interval is narrowed rather than
- * rejected. An interval that shares nothing with the slice, or a resume cursor that sits outside it,
- * is a routing defect and throws.
- */
-export function clipQueryToSlice(
-	slice: FokosSlice,
-	req: { hashKey: KeyBytes; interval: SkInterval; cursor: ScanCursor | null },
-	hashSplitN: number,
-	operationName: string,
-): SkInterval {
-	if (!hashKeyInSlice(slice, req.hashKey, hashSplitN)) throw misrouted(operationName, "hash key outside slice");
-	// A hash-child or promoted-key slice owns the whole sort-key axis of its keys, so there is
-	// nothing to clip and every cursor under those keys is in range.
-	if (slice.kind !== "range") return req.interval;
-
-	const start = sliceStart(slice.start);
-	if (!rangeIntersects(start, slice.end, req.interval)) throw misrouted(operationName, "interval disjoint from slice");
-	if (req.cursor && !cursorFallsInChild(start, slice.end, req.cursor)) throw misrouted(operationName, "cursor outside slice interval");
-	return clipToChildRange(req.interval, slice.start, slice.end);
 }

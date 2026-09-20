@@ -679,12 +679,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			participants.map(async (p) => {
 				const result = await tryWhile(
 					async () => {
-						const r = await partitionStubByName(this.env, p.context, p.doName).txPrepare(p.context, {
-							transactionId,
-							coordinatorDoId,
-							transactionTimestamp: transactionTs,
-							items: p.items,
-						});
+						const r = (
+							await partitionStubByName(this.env, p.context, p.doName).txPrepare(p.context, {
+								transactionId,
+								coordinatorDoId,
+								transactionTimestamp: transactionTs,
+								items: p.items,
+							})
+						).value;
 						this.storePrepareAnswer(transactionId, p.doName, r);
 						return r;
 					},
@@ -871,12 +873,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				await tryWhile(
 					async () => {
-						const r = await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
-							transactionId,
-							coordinatorDoId,
-							transactionTimestamp: stateRow.transaction_ts,
-							items: toTransactionItems(partitionItems),
-						});
+						const r = (
+							await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
+								transactionId,
+								coordinatorDoId,
+								transactionTimestamp: stateRow.transaction_ts,
+								items: toTransactionItems(partitionItems),
+							})
+						).value;
 						this.storePrepareAnswer(transactionId, p.partition_do_name, r);
 						return r;
 					},

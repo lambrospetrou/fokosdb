@@ -7,18 +7,12 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { PartitionDO } from "../src/server/do-partition.js";
-import {
-	FOKOS_CODE_TABLES,
-	FOKOS_ERROR_CATEGORIES,
-	FokosError,
-	FokosInternalError,
-	INTERNAL_CODES,
-	type FokosCodeDef,
-} from "../src/shared/errors.js";
-import type { FokosErrorCode } from "../src/shared/errors-operations.js";
+import { FOKOS_ERROR_CATEGORIES, FokosError, FokosInternalError, type FokosCodeDef } from "../src/shared/errors.js";
+import { FOKOS_LIBRARY_CODE_TABLES, type FokosErrorCode } from "../src/shared/errors-operations.js";
+import { SHARDING_INTERNAL_CODES } from "../src/sharding/errors.js";
 
 /** Every code definition of the library by its code. */
-export const CODE_DEFS: Record<FokosErrorCode, FokosCodeDef> = Object.assign({}, ...FOKOS_CODE_TABLES);
+export const CODE_DEFS: Record<FokosErrorCode, FokosCodeDef> = Object.assign({}, ...FOKOS_LIBRARY_CODE_TABLES);
 
 export { PartitionDO } from "../src/server/do-partition.js";
 export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
@@ -45,7 +39,7 @@ export class ErrorProbeDO extends DurableObject<Env> {
 	}
 
 	async raiseWithCause(): Promise<never> {
-		throw new FokosInternalError(INTERNAL_CODES.partition_fanout_failed, { message: "outer", cause: new Error("inner") });
+		throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_fanout_failed, { message: "outer", cause: new Error("inner") });
 	}
 
 	async raiseForeign(): Promise<never> {
