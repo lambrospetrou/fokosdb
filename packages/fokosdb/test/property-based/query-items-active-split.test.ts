@@ -18,10 +18,11 @@
 //
 // query-harness.ts holds the fixture, the request arbitrary, the model and the key oracle.
 //
-// THE SUITE IS SKIPPED. It fails against the routing of this branch: a queryItems of a promoted key
-// can enter its range tree below the root and then answer for one leaf of it. The symptom, the
-// measurement and the reasoning are in docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md.
-// Remove the `.skip` below once a query enters a range tree at its root.
+// The suite ran against the routing that `FokosShardingRuntime` replaced and found a defect there: a
+// queryItems of a promoted key entered its range tree below the root and answered for one leaf of
+// it. `docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md` holds the symptom, the
+// measurement and the reasoning. The runtime routes a range operation by its interval and never by a
+// point key, so a query now enters at the root and the suite runs.
 import fc from "fast-check";
 import { beforeAll, describe, expect, it } from "vitest";
 import { FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
@@ -182,7 +183,7 @@ const readsThroughToSource = (names: readonly string[]) => new Set(names).size <
 
 // ─── The suite ────────────────────────────────────────────────────────────────
 
-describe.skip("FokosDB queryItems while a range tree splits — model-based properties", () => {
+describe("FokosDB queryItems while a range tree splits — model-based properties", () => {
 	let fixture: Fixture;
 	let churn: Churn;
 

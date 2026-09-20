@@ -1,9 +1,11 @@
 # A Query Must Enter a Range Tree at Its Root
 
-Status: **defect report + invariant to keep**. Found on 2026-09-20 in the routing that
-`PartitionDO.withSplitForwarding` implements today. That routing is being replaced, so this document
-records the defect, the measurement, the mechanism, and the reasoning for the fix. The new routing
-must satisfy the invariant in section 6, whatever its own structure is.
+Status: **closed**. Found on 2026-09-20 in the routing that `PartitionDO.withSplitForwarding`
+implemented. `FokosShardingRuntime` replaced that routing and holds the invariants of section 6: a
+`range` operation routes by its interval and never by a point key, so a query enters a range tree at
+its root. `test/property-based/query-items-active-split.test.ts` is the suite that found the defect
+and it now runs. This document stays as the record of the defect, the measurement, the mechanism and
+the reasoning.
 
 ## 1. The symptom
 
@@ -141,9 +143,8 @@ recipe with a middle leaf shows nothing, which is the reason the defect survived
 
 ## 8. How the fix ports to FokosShardingRuntime
 
-`docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` replaces the routing that holds this defect. Nothing in
-that document is built yet. This section records how the fix maps onto the proposed API, and what that document
-must still say. Move subsection 8.3 into the RFC when the work starts.
+`docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` replaced the routing that held this defect. This
+section records how the fix maps onto that API.
 
 ### 8.1 The fix becomes a shape
 
