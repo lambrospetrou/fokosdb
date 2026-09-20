@@ -83,9 +83,7 @@ Tests run in the real Workers runtime through `@cloudflare/vitest-pool-workers`.
 
 - `test/partition-do/` holds one file per `PartitionDO` behaviour, `test/transactions/` the transaction suites, and `test/repartition/` the repartition flows.
 - Use `makeStub` (`test/partition-do/helpers.ts`) for an ordinary test. Use `TestPartition` (`partition-harness.ts`) only when the test drives a split, a migration, or a promotion, with `triggerHashSplit`, `triggerRangeSplit`, `splitHash`, `splitRange`, `makeRangeRoot`, `runAlarm` and `drainUntil`.
-- Property-based suites are in `test/property-based/` and use `fast-check`. `arbitraries.ts` holds the shared arbitraries, `model.ts` the stateful model and its commands, and `query-model.ts` the key oracle of the query suites. Every arbitrary produces input that the public API accepts, so a failure is a library bug.
-- A suite whose fixture is expensive builds it once in `beforeAll` and shares it across the runs. `transactions-split.test.ts` gives each run its own key prefix because its runs write; `query-items-split.test.ts` needs neither, because a query changes nothing.
-- Give every property `it` a large explicit timeout, because shrinking reruns the scenario many times. `propertyRuns(default)` sets the run count, `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/` searches deeper, and a failure replays from the printed `seed`, `path` and `replayPath`.
+- Property-based suites are in `test/property-based/` and use `fast-check`. Read that directory before you add or change one: each suite says at its top what it covers, and its shared modules say how a run is sized and how a failure replays.
 - Global fake timers can run a DO background callback in the wrong I/O context. Lifecycle tests use real timers and the scheduled-alarm test APIs instead.
 
 ## Where the detail lives
