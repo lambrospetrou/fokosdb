@@ -7,6 +7,7 @@ import { RangePartitionTopologyImpl } from "./split-policy.js";
 import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { PartitionStore } from "../shared/partition/partition-store.js";
+import { FokosShardingStore } from "./sharding-store.js";
 import { KeyCodec } from "./key-codec.js";
 import type { RepartitionRouting } from "./repartition-types.js";
 
@@ -60,7 +61,6 @@ async function withRangeTopology(
 ): Promise<void> {
 	const stub = testPartitionStub(rangeCtx.doName);
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
-		const store = new PartitionStore(state.storage);
 		const stubRouting: RepartitionRouting = {
 			routerRole: () => false,
 			splitTargets: () => [],
@@ -69,7 +69,8 @@ async function withRangeTopology(
 			...routing,
 		};
 		const identity = partitionIdentityFrom(rangeCtx, { depth: 0, ancestors: [] });
-		await body(new RangePartitionTopologyImpl(rangeCtx, identity, state, store, stubRouting), store);
+		const topology = new RangePartitionTopologyImpl(rangeCtx, identity, state, new FokosShardingStore(state.storage), stubRouting);
+		await body(topology, new PartitionStore(state.storage));
 	});
 }
 

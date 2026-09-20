@@ -26,13 +26,15 @@ import {
 	type PendingTransactionRow,
 	type ScanCursor,
 } from "./partition-store.js";
-import { sliceIncludesItem, type FokosSlice } from "../../sharding/repartition-slice.js";
-import type { MigrationHost } from "../../sharding/repartition-types.js";
+import type { FokosSlice } from "../../sharding/repartition-slice.js";
+import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
 
 /** The page budgets of one pull. The source owns them; the request carries no budget. */
 const PAGE_BYTES = 20 * 1024 * 1024;
 const PAGE_ROWS = 1_000;
 const SCAN_ROWS = 10_000;
+
+type BelongsToTarget = (key: RouteKey) => boolean;
 
 /** Where the host has got to. The flow stores it verbatim and never reads inside it. */
 export type FokosDbHostCursor =
@@ -49,16 +51,21 @@ export type FokosDbHostPage =
 
 export type FokosMigrationHostDeps = {
 	store: PartitionStore;
-	/** The source's own `hashSplitN`, which decides which hash child owns a key. */
-	hashSplitN: () => number;
 };
 
 export class FokosMigrationHost implements MigrationHost {
 	constructor(private readonly deps: FokosMigrationHostDeps) {}
 
-	buildPage(cursor: unknown, slice: FokosSlice): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
+	/** `belongsToTarget` is the ownership function of the slice; the flow owns it and every row passes through it. */
+	buildPage(
+		cursor: unknown,
+		_slice: FokosSlice,
+		belongsToTarget: BelongsToTarget,
+	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
 		const from = asHostCursor(cursor);
-		return from.stream === "items" ? this.#buildItemsPage(from.cursor, slice) : this.#buildPendingTxPage(from.cursor, slice);
+		return from.stream === "items"
+			? this.#buildItemsPage(from.cursor, belongsToTarget)
+			: this.#buildPendingTxPage(from.cursor, belongsToTarget);
 	}
 
 	/**
@@ -80,15 +87,15 @@ export class FokosMigrationHost implements MigrationHost {
 
 	// ─── items ────────────────────────────────────────────────────────────────
 
-	#buildItemsPage(cursor: ScanCursor | null, slice: FokosSlice): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
-		const { store, hashSplitN } = this.deps;
-		const n = hashSplitN();
+	#buildItemsPage(
+		cursor: ScanCursor | null,
+		belongsToTarget: BelongsToTarget,
+	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
+		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
 			fetchPage: (c, pageSize) => store.queryItemsPage(c, pageSize),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
-			// A terminal override's rows belong to a range tree, not to the hash child that inherits the
-			// override. The child receives the forward pointer in the overrides phase and no item copy.
-			include: (row) => sliceIncludesItem(slice, row.hk, row.sk, n) && !store.hasTerminalRouteOverride(row.hk),
+			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimateItemBytes,
 			budgetBytes: PAGE_BYTES,
 			maxItems: PAGE_ROWS,
@@ -138,14 +145,13 @@ export class FokosMigrationHost implements MigrationHost {
 
 	#buildPendingTxPage(
 		cursor: PendingTransactionCursor | null,
-		slice: FokosSlice,
+		belongsToTarget: BelongsToTarget,
 	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
-		const { store, hashSplitN } = this.deps;
-		const n = hashSplitN();
+		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
 			fetchPage: (c, pageSize) => store.queryPendingTxPage(c, pageSize),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
-			include: (row) => sliceIncludesItem(slice, row.hk, row.sk, n),
+			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimatePendingTxBytes,
 			budgetBytes: PAGE_BYTES,
 			maxItems: PAGE_ROWS,

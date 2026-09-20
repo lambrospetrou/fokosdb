@@ -10,16 +10,31 @@
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
-import type {
-	PromotedKeyCursor,
-	RepartitionKind,
-	RepartitionState,
-	RepartitionTargetRow,
-	TargetInitialization,
-} from "../shared/partition/partition-store.js";
+import type { PromotedKeyCursor, RepartitionKind, RepartitionState, RepartitionTargetRow, TargetInitialization } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
 
 export type { FokosPartitionRef, FokosSlice };
+
+/** A point route key. The sharding layer routes on these two values only. */
+export type RouteKey = { hashKey: KeyBytes; sortKey: KeyBytes };
+
+// ─── the source plan ─────────────────────────────────────────────────────────
+
+/**
+ * The immutable part of a repartition, written once with the target rows and deleted at cutover.
+ *
+ * It holds only what the target rows cannot: the source identity and the range ancestors selected for
+ * this split. The computed boundaries are the target slices themselves, so the plan does not repeat
+ * them, and the mutable split thresholds are never stored — a router rebuilds every forwarded context
+ * from its own current context instead.
+ */
+export type RepartitionPlan = {
+	schema: 1;
+	source: FokosPartitionRef;
+	/** The depth the targets receive. A range split's children, or 0 for a promotion's range root. */
+	rangeDepth?: number;
+	rangeAncestors?: RangeAncestorInfo[];
+};
 
 // ─── the target import record ────────────────────────────────────────────────
 
@@ -135,9 +150,14 @@ export interface RepartitionRouting {
  *
  * Both the cursor and the page are opaque to the flow. The host decides how many streams it has and
  * what each page carries; it ends the phase by answering with a null cursor.
+ *
+ * `belongsToTarget` is the ownership function of the slice, and the host must filter its rows with
+ * it. For a `hash_child` slice it returns false for a hash key with a terminal route override, because
+ * a range tree owns that key; the child receives the override pointer and no data copy. For a `range`
+ * slice it tests the hash key and `[start, end)`. For a `promoted_key` slice it tests the hash key only.
  */
 export interface MigrationHost {
-	buildPage(cursor: unknown, slice: FokosSlice): { page: unknown; nextCursor: unknown | null };
+	buildPage(cursor: unknown, slice: FokosSlice, belongsToTarget: (key: RouteKey) => boolean): { page: unknown; nextCursor: unknown | null };
 	applyPage(page: unknown, slice: FokosSlice): void;
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown | null): void;
 }

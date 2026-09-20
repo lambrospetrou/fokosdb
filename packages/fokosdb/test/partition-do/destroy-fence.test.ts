@@ -10,7 +10,7 @@ import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
-import { FOKOS_IDENTITY_KV_KEY } from "../../src/sharding/route-context.js";
+import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { makePartition, TestPartition } from "./partition-harness.js";
@@ -54,7 +54,7 @@ describe("PartitionDO — fokosStatus", () => {
 		});
 		// A target request carries no context, so the partition must still have none of its own.
 		await runInDurableObject(stub, (_i: PartitionDO, state: DurableObjectState) => {
-			expect(state.storage.kv.get(FOKOS_IDENTITY_KV_KEY)).toBeUndefined();
+			expect(state.storage.kv.get(FOKOS_KV_KEYS.IDENTITY)).toBeUndefined();
 		});
 		expect(ctx.doName).not.toBe(targetName);
 	});

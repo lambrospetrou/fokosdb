@@ -15,12 +15,12 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosImportRecord, FokosMigrationPullRequest } from "../../src/sharding/repartition-types.js";
-import { REPARTITION_KV_KEYS } from "../../src/sharding/repartition-flow.js";
+import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { PartitionIdHelper, hashChildIndex } from "../../src/sharding/partition-id.js";
 import { kb } from "./helpers.js";
 import { makePartition, TestPartition } from "./partition-harness.js";
 
-const IMPORT_KEY = REPARTITION_KV_KEYS.IMPORT;
+const IMPORT_KEY = FOKOS_KV_KEYS.IMPORT;
 const HELD_KEY = "alice";
 
 /** The stream a pull is asking for, read back out of the flow's opaque cursor. */

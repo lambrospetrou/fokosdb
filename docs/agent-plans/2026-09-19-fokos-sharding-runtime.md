@@ -4,10 +4,11 @@
 **Date:** 2026-09-19
 **Author:** Lambros Petrou
 
-**Status:** Nothing in this document is built. The repartition flow, the migration protocol, the control RPCs, and
-the read-through that this document reuses are built inside `PartitionDO` by
-`docs/agent-plans/2026-09-17-unified-repartition-flow.md`. A type-only prototype of the public surface, with
-three hosts written against it, is in `packages/fokosdb/test/sharding-prototype/`. `pnpm check` type-checks it.
+**Status:** M1, M2 and M3 are built (section 3 records what each one changed). `FokosShardingRuntime`, `dispatch`,
+the shapes, the example host, and the coordinator host (M4 to M6) are not built. The repartition flow, the
+migration protocol, the control RPCs, and the read-through that this document reuses run inside `PartitionDO`,
+over `FokosShardingStore`. A type-only prototype of the public surface, with three hosts written against it, is
+in `packages/fokosdb/test/sharding-prototype/`. `pnpm check` type-checks it.
 
 ## Table of contents
 
@@ -144,6 +145,8 @@ builds, type checks, and keeps the whole test suite green.
 
 ### M1 — Move the sharding code into `src/sharding/` and add the entry
 
+**Done.** The moved modules live flat in `packages/fokosdb/src/sharding/`, and the entry is `fokosdb/sharding`.
+
 Deliverables:
 
 - The directory `packages/fokosdb/src/sharding/` with the entry `packages/fokosdb/src/sharding/index.ts`,
@@ -164,6 +167,8 @@ Deliverables:
 
 ### M2 — Split `PartitionContext` into identity, topology, and policy
 
+**Done.** `packages/fokosdb/src/sharding/route-context.ts` holds the types and the compare helpers.
+
 Deliverables:
 
 - `FokosRouteContext<TPolicy>`, `FokosTopology`, `FokosRangeConfig`, and `FokosPartitionRef` (section 4.2.2).
@@ -183,6 +188,31 @@ Deliverables:
 - `RepartitionSource`, `RepartitionTarget`, `HashPartitionTopologyImpl`, and `RangePartitionTopologyImpl` take
   the sharding store, not `PartitionStore`.
 - The build guard adds `src/shared/partition/` to the forbidden list of the sharding entry.
+
+**Done.** `packages/fokosdb/src/sharding/sharding-store.ts` is the store. These decisions were made during the
+implementation and differ from, or add to, the text above and in section 4.2:
+
+- The store owns every `__fokos/` key too, through typed accessors (`FOKOS_KV_KEYS`): identity, policy, import,
+  plan, destroying, `cache/hash_arena`, `cache/promotion_bloom`, and `schema_version`. `PartitionDO`, the flow, and
+  the split policies reach KV only through them. The old keys `__topo_cache` and `__partial_range_topology` are
+  gone. The plan key stays `__fokos/repartition/<id>/plan`; the `/plan/00000001` chain of section 4.2.3 arrives with
+  `FokosStoredRepartitionPlan` in M4.
+- The sharding migrations are tracked under `__fokos/schema_version`, separate from the host's tracker. One
+  migration (id 1) creates the four tables. `PartitionStore` migrations are renumbered 1..3 (items, transaction
+  tables, `key_size_estimates`). A partition created before M3 keeps its data tables and loses both route caches
+  and the learned `range_hierarchy` rows; section 4.2.19 rules that upgrade out.
+- `fokos_range_hierarchy` adds `learned_at`. `learnRangeBoundary` inserts a new row, or refreshes the stamp of a
+  known row only when it is older than 60 seconds, so a hot forwarded request costs one seek and no write. A
+  write that can have grown the table counts the rows and evicts the excess by oldest `learned_at`, deepest first.
+  The count on every such write is a known cost to optimize later.
+- `MigrationHost.buildPage(cursor, slice, belongsToTarget)` has the shape of section 4.2.5 already. The flow builds
+  `belongsToTarget` from the slice and `hasTerminalRouteOverride`, and applies it to both host streams. The host
+  reads no `fokos_` table and no longer receives `hashSplitN`.
+- `PartitionStore.deleteExpiredItems` no longer excludes keys with a route override. Section 4.2.17 states why the
+  sweep needs no per-row ownership check. Before M3 the TTL sweep skipped every key with a promotion row.
+- `RepartitionSource` and `RepartitionTarget` take `(store, deps)` and no `DurableObjectStorage`.
+- `RouteKey` and `RepartitionPlan` live in `repartition-types.ts`. `src/shared/sql-cursor.ts` joins the allow list
+  of the sharding entry.
 
 ### M4 — The runtime object, `dispatch`, and the shapes
 

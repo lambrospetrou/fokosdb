@@ -1,6 +1,7 @@
 /**
  * The test harness for the repartition flow: several partitions, each with its own real
- * `PartitionStore` and its own source and target halves, driven step by step from one test.
+ * `FokosShardingStore` and `PartitionStore` and its own source and target halves, driven step by
+ * step from one test.
  *
  * Each node is a real Durable Object, so every store call runs against real SQLite and real KV. A
  * node is entered through `runInDurableObject`, which is also what makes a peer call work: the peer
@@ -20,19 +21,13 @@ import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { PartitionContextCreator, type FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import {
-	FOKOS_IDENTITY_KV_KEY,
-	FOKOS_POLICY_KV_KEY,
-	isRangePartition,
-	type FokosPartitionIdentity,
-	type FokosStoredPolicy,
-} from "../../src/sharding/route-context.js";
+import { isRangePartition, type FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import {
 	RepartitionSource,
 	RepartitionTarget,
-	REPARTITION_KV_KEYS,
 	type RepartitionSourceDeps,
 	type RepartitionTargetDeps,
 } from "../../src/sharding/repartition-flow.js";
@@ -59,6 +54,9 @@ export const T0 = 4_000_000_000_000;
 export type NodeEnv = {
 	source: RepartitionSource;
 	target: RepartitionTarget;
+	/** The `fokos_` tables and `__fokos/` keys the flow reads and writes. */
+	sharding: FokosShardingStore;
+	/** The FokosDB data tables the migration host moves. */
 	store: PartitionStore;
 	storage: DurableObjectStorage;
 	ctx: FokosDbRouteContext;
@@ -150,14 +148,16 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		const enter = async <T>(fn: (e: NodeEnv) => T | Promise<T>): Promise<T> =>
 			await runInDurableObject(testPartitionStub(stubName), async (_i: PartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
+				const sharding = new FokosShardingStore(storage);
 				const store = new PartitionStore(storage);
+				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
 				// node that has none yet answers with the identity its context decodes to, as a root does.
-				const deps = makeDeps(ctx.doName, storage, store, ctx);
-				const source = new RepartitionSource(store, storage, deps);
-				const target = new RepartitionTarget(store, storage, deps);
-				return await fn({ source, target, store, storage, ctx });
+				const deps = makeDeps(ctx.doName, sharding, store, ctx);
+				const source = new RepartitionSource(sharding, deps);
+				const target = new RepartitionTarget(sharding, deps);
+				return await fn({ source, target, sharding, store, storage, ctx });
 			});
 
 		return {
@@ -196,25 +196,24 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 
 	function makeDeps(
 		doName: string,
-		storage: DurableObjectStorage,
+		sharding: FokosShardingStore,
 		store: PartitionStore,
 		ctx: FokosDbRouteContext,
 	): RepartitionSourceDeps & RepartitionTargetDeps {
-		const storedIdentity = () => storage.kv.get<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY);
 		const identity = (): FokosPartitionIdentity =>
-			storedIdentity() ?? partitionIdentityFrom(ctx, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
+			sharding.getIdentity() ?? partitionIdentityFrom(ctx, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
 		return {
 			// A target exists as soon as its source names it, exactly as a real DO does: a Durable Object
 			// is created by the first call that reaches it, not registered in advance.
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
-			host: new FokosMigrationHost({ store, hashSplitN: () => ctx.topology.hashSplitN }),
+			host: new FokosMigrationHost({ store }),
 			identity: () => ({ ctx, identity: identity() }),
-			hasIdentity: () => storedIdentity() !== undefined,
+			hasIdentity: () => sharding.getIdentity() !== undefined,
 			applyTargetIdentity: (req: FokosInitRequest) => {
 				const target = req.target as FokosDbRouteContext;
 				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
-				storage.kv.put<FokosPartitionIdentity>(FOKOS_IDENTITY_KV_KEY, partitionIdentityFrom(target, range));
-				storage.kv.put<FokosStoredPolicy<unknown>>(FOKOS_POLICY_KV_KEY, { rangeConfig: target.rangeConfig, policy: target.policy });
+				sharding.putIdentity(partitionIdentityFrom(target, range));
+				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy });
 			},
 			computeRangeBoundaries: (hashKey, start, end, n) => store.computeRangeSplitBoundaries(hashKey, start, end, n),
 			lockCountForKey: (hashKey) => store.pendingLockCountForHashKey(hashKey),
@@ -272,5 +271,3 @@ export function keySizeEstimate(storage: DurableObjectStorage, hk: string): numb
 export function storedBytes(storage: DurableObjectStorage, hk: string): number {
 	return storage.sql.exec<{ n: number }>(`SELECT COALESCE(SUM(est_row_bytes), 0) AS n FROM items WHERE hk = ?`, kb(hk)).one().n;
 }
-
-export { REPARTITION_KV_KEYS };

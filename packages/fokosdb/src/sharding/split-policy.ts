@@ -1,4 +1,4 @@
-import { HashTopology, HashTopologySnapshot } from "./hash-topology.js";
+import { HashTopology } from "./hash-topology.js";
 import { hashChildIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { SplitType } from "./types.js";
@@ -6,7 +6,7 @@ import { isHashPartition, type FokosPartitionIdentity, type FokosRouteContext } 
 import { PartitionIdHelper, resolveDescendantHashPartitionContext, resolveRangePartitionContext } from "./partition-id.js";
 import invariant from "../shared/invariant.js";
 import type { PartitionInfoInternal, RangeAncestorInfo } from "./types.js";
-import type { PartitionStore } from "../shared/partition/partition-store.js";
+import type { FokosShardingStore } from "./sharding-store.js";
 // Type-only. The emit erases it, so the topology and the repartition flow make no runtime cycle.
 import type { RepartitionRouting } from "./repartition-types.js";
 
@@ -114,7 +114,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 
 	#storage: DurableObjectStorage;
 	#routing: RepartitionRouting;
-	#partitionStore: PartitionStore;
+	#shardingStore: FokosShardingStore;
 	/** The own partition ID bytes, decoded once: every forward appends child indexes to them. */
 	#ownerIdBytes: Uint8Array;
 	#ownerAbsDepth: number;
@@ -124,19 +124,19 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		partitionContext: SplitPolicyContext,
 		identity: FokosPartitionIdentity,
 		doCtx: DurableObjectState,
-		partitionStore: PartitionStore,
+		shardingStore: FokosShardingStore,
 		routing: RepartitionRouting,
 	) {
 		invariant(identity.kind === "hash", "fokos/topology: HashPartitionTopologyImpl requires a hash partition identity");
 		this.partitionContext = partitionContext;
-		this.#partitionStore = partitionStore;
+		this.#shardingStore = shardingStore;
 		this.#storage = doCtx.storage;
 		this.#routing = routing;
 		this.#ownerIdBytes = Uint8Array.fromHex(identity.ref.partitionId);
 		this.#ownerAbsDepth = identity.hash!.path.length;
 		// Load the topology cache eagerly. The constructor is called from ensureTopology() on the
 		// first request, after blockConcurrencyWhile has completed, so synchronous KV reads are safe.
-		const snapshot = doCtx.storage.kv.get<HashTopologySnapshot>("__topo_cache");
+		const snapshot = shardingStore.getHashArena();
 		if (snapshot) {
 			this.#_hashTopology = HashTopology.fromSnapshot(snapshot);
 		}
@@ -244,7 +244,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		if (responsePartitionInfo._internal.rangeAncestors.length > 0) {
 			// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
 			for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
-				this.#partitionStore.insertRangePartitionBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
+				this.#shardingStore.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
 			}
 		}
 
@@ -276,7 +276,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 		const cache = this.#hashTopology();
 		if (cache && targetRelDepth > 0) {
 			if (cache.updateFromHint(hashKey, targetRelDepth)) {
-				this.#storage.kv.put<HashTopologySnapshot>("__topo_cache", cache.toSnapshot());
+				this.#shardingStore.putHashArena(cache.toSnapshot());
 			}
 		}
 	}
@@ -291,7 +291,7 @@ export class HashPartitionTopologyImpl implements PartitionTopologySplitter {
 export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 	#storage: DurableObjectStorage;
 	#routing: RepartitionRouting;
-	#partitionStore: PartitionStore;
+	#shardingStore: FokosShardingStore;
 
 	private partitionContext: SplitPolicyContext;
 	/** The immutable range this partition owns. */
@@ -301,7 +301,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		partitionContext: SplitPolicyContext,
 		identity: FokosPartitionIdentity,
 		ctx: DurableObjectState,
-		partitionStore: PartitionStore,
+		shardingStore: FokosShardingStore,
 		routing: RepartitionRouting,
 	) {
 		invariant(
@@ -311,7 +311,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		this.partitionContext = partitionContext;
 		this.#range = identity.range;
 		this.#storage = ctx.storage;
-		this.#partitionStore = partitionStore;
+		this.#shardingStore = shardingStore;
 		this.#routing = routing;
 	}
 
@@ -389,7 +389,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 		// Boundaries are immutable identity, so a stale hint at worst lands on a router that forwards on;
 		// the target's shouldAllow validates range membership, so a bad hint can never corrupt data.
 		const hashKey = this.#range.hashKey;
-		const learned = this.#partitionStore.findDeepestKnownRangeSlice(hashKey, sk);
+		const learned = this.#shardingStore.findDeepestKnownRangeSlice(hashKey, sk);
 		if (learned && isStrictSubSlice(learned, best.start, best.end)) {
 			return resolveRangePartitionContext(partitionContext, hashKey, learned.startBoundary, learned.endBoundary);
 		}
@@ -413,7 +413,7 @@ export class RangePartitionTopologyImpl implements PartitionTopologySplitter {
 
 		// TODO(perf) Keep in-memory cache of the range ancestor tree so we don't have to re-insert every ancestor on every forward result.
 		for (const ancestor of responsePartitionInfo._internal.rangeAncestors) {
-			this.#partitionStore.insertRangePartitionBoundary(
+			this.#shardingStore.learnRangeBoundary(
 				// Always the real hash key, never the empty sentinel: a hash partition learns boundaries of
 				// many hash keys into the same table, so every row names the key it describes.
 				this.#range.hashKey,

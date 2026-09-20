@@ -17,6 +17,7 @@ const SHARDING_FORBIDDEN_SRC = [
 	"src/server/",
 	"src/client/",
 	"src/shared/expression/",
+	"src/shared/partition/",
 	"src/shared/query/",
 	/src\/shared\/transaction-[^/]*\.ts$/,
 ];
@@ -25,17 +26,17 @@ const SHARDING_FORBIDDEN_SRC = [
  * The generic `src/shared/` modules that the sharding entry may reach. Every other `src/shared/`
  * module is FokosDB code.
  */
-const SHARDING_ALLOWED_SHARED = ["src/shared/errors.ts", "src/shared/invariant.ts", "src/shared/tsutils.ts", "src/shared/cache-lru.ts"];
+const SHARDING_ALLOWED_SHARED = [
+	"src/shared/errors.ts",
+	"src/shared/invariant.ts",
+	"src/shared/tsutils.ts",
+	"src/shared/cache-lru.ts",
+	"src/shared/sql-cursor.ts",
+];
 
-/**
- * A `src/shared/` module that is not on the allow list. `src/shared/partition/` is exempt while the
- * split policies and the repartition flow take `PartitionStore`; it joins `SHARDING_FORBIDDEN_SRC`
- * when they take the sharding store instead.
- */
+/** A `src/shared/` module that is not on the allow list. */
 function isUnlistedShared(id: string): boolean {
-	return (
-		id.includes("src/shared/") && !id.includes("src/shared/partition/") && !SHARDING_ALLOWED_SHARED.some((allowed) => id.endsWith(allowed))
-	);
+	return id.includes("src/shared/") && !SHARDING_ALLOWED_SHARED.some((allowed) => id.endsWith(allowed));
 }
 
 /**
