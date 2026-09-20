@@ -4,17 +4,18 @@
 import fc from "fast-check";
 import { expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import { FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
+import { CONFLICT_CODES, FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
 import type { TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
+import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
 import { expectedDataKind, keyId, type DataKind, type ItemData, type ItemKey } from "./arbitraries.js";
 
 export type ModelItem = { data: ItemData; kind: DataKind; version: number };
 export type Model = { items: Map<string, ModelItem> };
 
-/** The one place that applies a put to the model. A new item starts at version 1, an overwrite adds one. */
+/** Applies the put of a command to the model. A new item starts at version 1, an overwrite adds one. */
 export function applyPut(m: Model, key: ItemKey, data: ItemData): number {
 	const id = keyId(key);
 	const version = (m.items.get(id)?.version ?? 0) + 1;
@@ -58,6 +59,29 @@ export async function untilAvailable<T>(fn: () => Promise<T>): Promise<T> {
 	}
 }
 
+// A cancelled transaction answers its caller as soon as it is decided, and the last participants of
+// its fan-out can still hold their locks, which an alarm of the coordinator then clears. So a lock
+// that clears on its own is acceptable and only one that stays is a leak.
+const LOCK_WAIT_TIMEOUT_MS = 15_000;
+const LOCK_WAIT_DELAY_MS = 50;
+
+/**
+ * Runs one non-transactional write and repeats it while a transaction holds the lock of its item. A
+ * write to a locked item is REFUSED and not delayed, so the caller waits here. It reports whether it
+ * had to wait, and it raises the refusal when the lock stays.
+ */
+async function untilUnlocked<T>(fn: () => Promise<T>): Promise<{ value: T; waited: boolean }> {
+	const deadlineMs = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+	for (let attempt = 0; ; attempt++) {
+		try {
+			return { value: await untilAvailable(fn), waited: attempt > 0 };
+		} catch (e) {
+			if (!FokosError.isCode(e, CONFLICT_CODES.item_locked_by_transaction) || Date.now() > deadlineMs) throw e;
+			await sleep(LOCK_WAIT_DELAY_MS);
+		}
+	}
+}
+
 // One pre-image kind per pool key, so a run starts with a text, a bytes, an object and an array item
 // and an update meets every applicability rule from its first command on. Without it a run begins on
 // an empty table and nearly every update lands on an absent key.
@@ -70,15 +94,24 @@ const SEED_DATA: readonly ItemData[] = [
 ];
 
 /**
- * Writes one item for every pool key but the last, and records them in the model. The last key stays
- * absent, so a run still covers the paths that create an item.
+ * Puts the pool in a known state and records it in the model: one item for every key but the last,
+ * which stays absent so a run still covers the paths that create an item.
+ *
+ * The pool can already hold these keys, because a suite whose runs share one table meets them again
+ * when fast-check shrinks a failure and runs the shrunk value over the same keys. The seed therefore
+ * deletes the last key instead of assuming it absent, and takes the version each write reports
+ * instead of the first version an empty pool would give. A repeated run then starts from the same
+ * state as the first one, and the counterexample it prints is the real one.
  */
 export async function seedPool(db: FokosDB, m: Model, keys: readonly ItemKey[], seedData: readonly ItemData[] = SEED_DATA): Promise<void> {
 	for (const [index, key] of keys.slice(0, -1).entries()) {
 		const data = seedData[index % seedData.length];
-		await untilAvailable(() => db.putItem({ ...key, data }));
-		applyPut(m, key, data);
+		const { value } = await untilUnlocked(() => db.putItem({ ...key, data }));
+		m.items.set(keyId(key), { data, kind: expectedDataKind(data), version: value.version });
 	}
+	const last = keys[keys.length - 1];
+	await untilUnlocked(() => db.deleteItem(last));
+	m.items.delete(keyId(last));
 }
 
 /** Reads every key of the pool in one transaction and compares each answer with the model. */
@@ -127,11 +160,35 @@ export function applyUpdate(m: Model, key: ItemKey, actions: readonly ModelUpdat
 	m.items.set(id, { data: document, kind: "json", version: (m.items.get(id)?.version ?? 0) + 1 });
 }
 
+/** Applies the operations of a committed transaction to the model. */
+export function applyTxOps(m: Model, ops: readonly TxOp[]): void {
+	for (const op of ops) {
+		if (op.operation === "put") applyPut(m, op.key, op.data);
+		else if (op.operation === "delete") m.items.delete(keyId(op.key));
+		else if (op.operation === "update") applyUpdate(m, op.key, op.actions);
+	}
+}
+
+/** The operations of a transaction as one line, for the name of a command and for a failure message. */
+export function describeTxOps(ops: readonly TxOp[]): string {
+	return ops
+		.map((op) => {
+			const condition = op.expectExists === undefined ? "" : op.expectExists ? "?exists" : "?absent";
+			// The actions decide the document, so a counterexample must print them.
+			const actions =
+				op.operation === "update"
+					? ` [${op.actions.map((a) => (a.action === "set" ? `set ${a.field}=${JSON.stringify(a.value)}` : `remove ${a.field}`)).join(", ")}]`
+					: "";
+			return `${op.operation}${condition}(${keyId(op.key)})${actions}`;
+		})
+		.join(", ");
+}
+
 function existsCondition(expectExists: boolean): ConditionExpression {
 	return { op: expectExists ? "exists" : "not_exists", args: [{ ref: "hashKey" }] };
 }
 
-function toTransactWriteItem(op: TxOp): TransactWriteItem {
+export function toTransactWriteItem(op: TxOp): TransactWriteItem {
 	const condition = op.expectExists === undefined ? undefined : existsCondition(op.expectExists);
 	if (op.operation === "put") return { operation: "put", ...op.key, data: op.data, condition };
 	if (op.operation === "delete") return { operation: "delete", ...op.key, condition };
@@ -163,7 +220,7 @@ const premiseCode = (r: TransactWriteOperationResult): string | undefined =>
  * Both premises can fail on one operation, and the participant reports the first one it evaluates, so
  * the answer is the set of acceptable codes and not one code.
  */
-function expectedRejection(m: Model, op: TxOp): string[] | null {
+export function expectedRejection(m: Model, op: TxOp): string[] | null {
 	const codes: string[] = [];
 	if (op.expectExists !== undefined && op.expectExists !== m.items.has(keyId(op.key))) codes.push("condition_failed");
 	if (op.operation === "update" && updatedDocument(m.items.get(keyId(op.key)), op.actions) === null) {
@@ -238,7 +295,10 @@ export class TransactGet extends ModelCommand {
 }
 
 export class TransactWrite extends ModelCommand {
-	constructor(readonly ops: TxOp[]) {
+	constructor(
+		readonly ops: TxOp[],
+		readonly stats?: TransactionStats,
+	) {
 		super();
 	}
 	async run(m: Model, db: FokosDB): Promise<void> {
@@ -248,12 +308,14 @@ export class TransactWrite extends ModelCommand {
 
 		const rejections = this.ops.map((op) => expectedRejection(m, op));
 		// `results` is undefined on a commit and holds the positional answers on a cancel.
-		const results = await untilAvailable(() => db.transactWriteItems({ items: this.ops.map(toTransactWriteItem) })).then(
-			() => undefined,
-			(e: unknown) => {
-				if (FokosTransactionCancelledError.is(e)) return e.results;
-				throw e;
-			},
+		const results = await recordTransaction(this.stats, () =>
+			untilAvailable(() => db.transactWriteItems({ items: this.ops.map(toTransactWriteItem) })).then(
+				() => undefined,
+				(e: unknown) => {
+					if (FokosTransactionCancelledError.is(e)) return e.results;
+					throw e;
+				},
+			),
 		);
 
 		if (rejections.some((codes) => codes !== null)) {
@@ -279,23 +341,10 @@ export class TransactWrite extends ModelCommand {
 			return;
 		}
 
-		for (const op of this.ops) {
-			if (op.operation === "put") applyPut(m, op.key, op.data);
-			else if (op.operation === "delete") m.items.delete(keyId(op.key));
-			else if (op.operation === "update") applyUpdate(m, op.key, op.actions);
-		}
+		applyTxOps(m, this.ops);
 	}
 	toString(): string {
-		const ops = this.ops.map((op) => {
-			const condition = op.expectExists === undefined ? "" : op.expectExists ? "?exists" : "?absent";
-			// The actions decide the document, so a counterexample must print them.
-			const actions =
-				op.operation === "update"
-					? ` [${op.actions.map((a) => (a.action === "set" ? `set ${a.field}=${JSON.stringify(a.value)}` : `remove ${a.field}`)).join(", ")}]`
-					: "";
-			return `${op.operation}${condition}(${keyId(op.key)})${actions}`;
-		});
-		return `TransactWrite(${ops.join(", ")})`;
+		return `TransactWrite(${describeTxOps(this.ops)})`;
 	}
 }
 
@@ -315,15 +364,9 @@ const arbUpdateAction: fc.Arbitrary<ModelUpdateAction> = fc.oneof(
 );
 export const arbUpdateActions = fc.uniqueArray(arbUpdateAction, { minLength: 1, maxLength: 3, selector: (action) => action.field });
 
-/**
- * The command arbitraries of a stateful run over `keys`. The key arbitrary must draw from a small
- * pool, so commands hit the same keys again; `data` is the payload of every put.
- */
-export function commandArbitraries(
-	keys: fc.Arbitrary<ItemKey>,
-	data: fc.Arbitrary<ItemData>,
-): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
-	const arbTxOp: fc.Arbitrary<TxOp> = fc
+/** One operation of a write transaction, over a key that `keys` draws and a payload that `data` draws. */
+export function txOpArbitrary(keys: fc.Arbitrary<ItemKey>, data: fc.Arbitrary<ItemData>): fc.Arbitrary<TxOp> {
+	return fc
 		.tuple(
 			keys,
 			fc.oneof(
@@ -341,6 +384,17 @@ export function commandArbitraries(
 			),
 		)
 		.map(([key, spec]) => ({ key, ...spec }));
+}
+
+/**
+ * The command arbitraries of a stateful run over `keys`. The key arbitrary must draw from a small
+ * pool, so commands hit the same keys again; `data` is the payload of every put.
+ */
+export function commandArbitraries(
+	keys: fc.Arbitrary<ItemKey>,
+	data: fc.Arbitrary<ItemData>,
+): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
+	const arbTxOp = txOpArbitrary(keys, data);
 	// A transaction rejects two operations on one key, so the keys of a set are unique.
 	const arbTxOps = fc.uniqueArray(arbTxOp, { minLength: 1, maxLength: 4, selector: (op) => keyId(op.key) });
 	const arbReadKeys = fc.uniqueArray(keys, { minLength: 1, maxLength: 4, selector: keyId });
@@ -352,4 +406,145 @@ export function commandArbitraries(
 		arbTxOps.map((ops) => new TransactWrite(ops)),
 		arbReadKeys.map((ks) => new TransactGet(ks)),
 	];
+}
+
+// ─── Concurrent transactions ──────────────────────────────────────────────────
+
+/**
+ * What a run observed over the transactions it sent. Under contention a suite where every
+ * transaction cancels passes every assertion of the model and proves nothing, so a suite asserts
+ * on these counts once its property has run.
+ */
+export type TransactionStats = {
+	started: number;
+	committed: number;
+	cancelled: number;
+	/** The largest number of transactions that were in flight at one time. */
+	peakInFlight: number;
+	/** How many are in flight at this moment. `peakInFlight` is the one a suite asserts on. */
+	inFlight: number;
+	/** How many rejected operation entries carried each code. */
+	rejections: Map<string, number>;
+	/** Probes that found a key unlocked after a batch had drained. */
+	lockProbes: number;
+	/** Lock probes that met a lock and had to wait for it to clear. */
+	lockProbeWaits: number;
+};
+
+export function newTransactionStats(): TransactionStats {
+	return { started: 0, committed: 0, cancelled: 0, peakInFlight: 0, inFlight: 0, rejections: new Map(), lockProbes: 0, lockProbeWaits: 0 };
+}
+
+/** One line of the counts, for the message of a coverage assertion. */
+export function describeTransactionStats(s: TransactionStats): string {
+	const rejections = [...s.rejections].map(([code, n]) => `${code}=${n}`).join(" ") || "none";
+	return [
+		`${s.started} transactions: ${s.committed} committed, ${s.cancelled} cancelled`,
+		`${s.peakInFlight} at most in flight`,
+		`${s.lockProbes} lock probes, ${s.lockProbeWaits} of them waited`,
+		`rejections: ${rejections}`,
+	].join("; ");
+}
+
+/** Runs one transaction and counts how many ran at one time and how each one ended. */
+export async function recordTransaction(
+	stats: TransactionStats | undefined,
+	send: () => Promise<TransactWriteOperationResult[] | undefined>,
+): Promise<TransactWriteOperationResult[] | undefined> {
+	if (stats === undefined) return await send();
+	stats.started++;
+	stats.inFlight++;
+	stats.peakInFlight = Math.max(stats.peakInFlight, stats.inFlight);
+	try {
+		const results = await send();
+		if (results === undefined) stats.committed++;
+		else {
+			stats.cancelled++;
+			for (const r of results) {
+				if (r.outcome === "rejected") stats.rejections.set(r.reason.code, (stats.rejections.get(r.reason.code) ?? 0) + 1);
+			}
+		}
+		return results;
+	} finally {
+		stats.inFlight--;
+	}
+}
+
+/**
+ * Proves that a key a drained batch touched carries no lock. A non-transactional write to a locked
+ * item is REFUSED, so a write that lands is the evidence. A present key is written with the data it
+ * already holds and an absent key is deleted again, so the probe keeps the kind and the existence
+ * that the model expects and only the version moves.
+ */
+export async function expectKeyUnlocked(m: Model, db: FokosDB, key: ItemKey, stats: TransactionStats): Promise<void> {
+	const item = m.items.get(keyId(key));
+	const { value, waited } = await untilUnlocked<PutItemResult | DeleteItemResult>(() =>
+		item === undefined ? db.deleteItem(key) : db.putItem({ ...key, data: item.data }),
+	);
+	if (item === undefined) expect(value).toMatchObject({ item: key, deleted: false });
+	else expect(value).toMatchObject({ item: key, version: applyPut(m, key, item.data) });
+	stats.lockProbes++;
+	if (waited) stats.lockProbeWaits++;
+}
+
+/**
+ * A batch of transactions that the run sends at one time. Their key sets are disjoint, so no two of
+ * them meet on one item and the model still predicts every outcome exactly, while many coordinators
+ * drive one table and one partition serves several transactions at once.
+ *
+ * Once the batch has drained, every key it touched must take a non-transactional write, which
+ * proves that the batch left no lock behind.
+ */
+export class ConcurrentTransactWrites extends ModelCommand {
+	constructor(
+		readonly transactions: TransactWrite[],
+		readonly stats: TransactionStats,
+	) {
+		super();
+	}
+
+	async run(m: Model, db: FokosDB): Promise<void> {
+		// Every transaction is awaited before the first failure is raised, so a failing batch never
+		// leaves the next command with a request of this one still in flight.
+		const settled = await Promise.allSettled(this.transactions.map((tx) => tx.run(m, db)));
+		for (const outcome of settled) if (outcome.status === "rejected") throw outcome.reason;
+
+		for (const tx of this.transactions) {
+			for (const op of tx.ops) await expectKeyUnlocked(m, db, op.key, this.stats);
+		}
+	}
+
+	toString(): string {
+		return `Concurrent(${this.transactions.map((tx) => tx.toString()).join(" || ")})`;
+	}
+}
+
+const MAX_CONCURRENT_TRANSACTIONS = 4;
+
+/**
+ * A batch of 2 to `MAX_CONCURRENT_TRANSACTIONS` transactions over disjoint key sets. The keys come
+ * from the pool in a random order and are dealt round-robin, so every transaction of the batch holds
+ * at least one key and no key reaches two of them.
+ */
+export function arbConcurrentBatch(
+	keys: readonly ItemKey[],
+	data: fc.Arbitrary<ItemData>,
+	stats: TransactionStats,
+): fc.Arbitrary<ConcurrentTransactWrites> {
+	return fc
+		.shuffledSubarray([...keys], { minLength: 2 })
+		.chain((pool) =>
+			fc.record({
+				ops: fc.tuple(...pool.map((key) => txOpArbitrary(fc.constant(key), data))),
+				count: fc.integer({ min: 2, max: Math.min(MAX_CONCURRENT_TRANSACTIONS, pool.length) }),
+			}),
+		)
+		.map(({ ops, count }) => {
+			const groups: TxOp[][] = Array.from({ length: count }, () => []);
+			ops.forEach((op, i) => groups[i % count].push(op));
+			return new ConcurrentTransactWrites(
+				groups.map((groupOps) => new TransactWrite(groupOps, stats)),
+				stats,
+			);
+		});
 }
