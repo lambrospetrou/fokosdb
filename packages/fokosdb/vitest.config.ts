@@ -5,7 +5,7 @@ export default defineConfig({
 	define: {
 		// The suites run inside the Workers runtime and cannot read the shell environment. This
 		// substitutes the run count of the property-based suites into the test modules at build time;
-		// `propertyRuns` in test/property-based/arbitraries.ts reads it and falls back to its default.
+		// `propertyRuns` in test/property-based/harness.ts reads it and falls back to its default.
 		__FOKOS_PROPERTY_RUNS__: JSON.stringify(process.env.FOKOS_PROPERTY_RUNS ?? ""),
 	},
 	test: {

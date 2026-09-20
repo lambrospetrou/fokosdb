@@ -1,28 +1,33 @@
-// Model-based property for the `update` operation of transactWriteItems. The mixed transaction suite
-// runs an update next to a put, a delete and a check, which is the interaction coverage. This suite
-// runs updates and reads alone, so one run applies about ten updates instead of one, and a
-// counterexample is a sequence of updates that is short enough to read.
+// Model-based property for the `update` operation of transactWriteItems. transactions.test.ts runs
+// an update next to a put, a delete and a check, which is the interaction coverage. This suite runs
+// updates and reads alone, so one run applies about ten updates instead of one, and a counterexample
+// is a sequence of updates short enough to read.
 //
-// The model, the commands and the update arbitraries live in model.ts. An update is applied to the
-// model only on a commit, and the model predicts every rejection it can evaluate: a text or bytes
-// pre-image, and a `set` over an array pre-image.
+// The model applies an update only on a commit, and it predicts every rejection it can evaluate: a
+// text or bytes pre-image, and a `set` over an array pre-image.
 //
-// A failure prints `seed`, `path` and `replayPath`. See item-crud.test.ts for how to replay them.
+// The model, the commands and the update arbitraries live in harness.ts, which also says how to
+// replay a failure.
 import fc from "fast-check";
 import { describe, it } from "vitest";
-import { arbJsonData, arbItemData, arbPoolKey, keyId, makeTestDB, POOL_KEYS, propertyRuns, type ItemData } from "./arbitraries.js";
 import {
+	arbItemData,
+	arbJsonData,
 	arbOptionalCondition,
+	arbPoolKey,
 	arbUpdateActions,
-	expectModelMatches,
 	GetItem,
+	keyId,
+	makeTestDB,
+	POOL_KEYS,
+	propertyRuns,
 	PutItem,
-	seedPool,
+	runCommands,
 	TransactGet,
 	TransactWrite,
-	type Model,
+	type ItemData,
 	type TxOp,
-} from "./model.js";
+} from "./harness.js";
 
 const PROPERTY_TIMEOUT_MS = 180_000;
 
@@ -45,7 +50,7 @@ const arbUpdateOps = fc.oneof(
 const arbReadKeys = fc.uniqueArray(arbPoolKey, { minLength: 1, maxLength: 3, selector: keyId });
 
 // A put is rare and favours a document, because its job here is to change the KIND of a pre-image
-// under a later update — an item that a put turns into text stops accepting updates.
+// under a later update: an item that a put turns into text stops taking updates.
 const arbPutData = fc.oneof({ arbitrary: arbJsonData, weight: 3 }, { arbitrary: arbItemData, weight: 1 });
 
 // One arbitrary draws every command, so the weights decide how dense the updates are.
@@ -62,13 +67,7 @@ describe("FokosDB update operations — model-based property", () => {
 
 		await fc.assert(
 			fc.asyncProperty(arbCommands, async (cmds) => {
-				const model: Model = { items: new Map() };
-				const db = makeTestDB();
-				await seedPool(db, model, POOL_KEYS, SEED_DATA);
-				await fc.asyncModelRun(() => ({ model, real: db }), cmds);
-				// The final state must agree on every key the run could have touched, so a divergence that
-				// no read command observed still fails the run.
-				await expectModelMatches(db, model, POOL_KEYS);
+				await runCommands(makeTestDB(), { keys: POOL_KEYS, cmds }, SEED_DATA);
 			}),
 			{ numRuns: propertyRuns(25) },
 		);
