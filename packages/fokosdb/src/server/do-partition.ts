@@ -98,7 +98,7 @@ import {
 	type SkInterval,
 } from "../shared/query/sk-interval.js";
 import { QueryPageBudget } from "../shared/query/page-budget.js";
-import { collectQueryPage } from "../shared/query/query-collector.js";
+import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { partitionStub, partitionStubByName, txCoordinatorStub } from "../shared/do-stubs.js";
 import {
@@ -930,27 +930,29 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		const upper = interval.upper?.value ?? null;
 		const upperInclusive = interval.upper?.inclusive ?? false;
 
-		const scan = this.#store.scanQueryPage({
-			hk,
-			lower,
-			lowerInclusive,
-			upper,
-			upperInclusive,
-			cursor,
-			direction: req.direction,
-			// One row beyond the budget tells a stopped page from a drained interval.
-			limit: Math.max(0, req.remainingEvaluatedItems) + 1,
-			select: req.select,
-			plan: req.plan,
-		});
-		const page = collectQueryPage({
-			rows: scan.rows,
+		const collector = createQueryPageCollector({
 			hashKey: hk,
 			select: req.select,
 			budget: req,
 			estimateResponseBytes: (item) => (Array.isArray(item) ? estimateProjectedRowBytes(item) : estimateItemBytes(item)),
 		});
-		const { rowsRead, rowsWritten } = scan.sqlMetrics();
+		const { rowsRead, rowsWritten } = this.#store.scanQueryPage(
+			{
+				hk,
+				lower,
+				lowerInclusive,
+				upper,
+				upperInclusive,
+				cursor,
+				direction: req.direction,
+				// One row beyond the budget tells a stopped page from a drained interval.
+				limit: Math.max(0, req.remainingEvaluatedItems) + 1,
+				select: req.select,
+				plan: req.plan,
+			},
+			collector.consume,
+		);
+		const page = collector.state;
 
 		// A leaf (hash leaf or non-split range partition) is the only kind of DO that scans rows, so it
 		// is the only kind that contributes a `partitionMetas` entry. Routers (hash or range) are

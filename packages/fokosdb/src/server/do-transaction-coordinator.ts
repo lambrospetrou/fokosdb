@@ -31,6 +31,7 @@ import {
 	type FokosErrorWire,
 } from "../shared/errors.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
+import { one, tryOne } from "../shared/sql-cursor.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
 import {
@@ -78,6 +79,18 @@ type TcParticipantRow = {
 	answer_json: string | null;
 	/** The FokosErrorWire of a prepare that threw after its retries, read only while prepare_outcome is NULL. */
 	error_json: string | null;
+};
+
+/** One participant of the prepare fan-out: the partition and the items of the transaction it owns. */
+type PrepareParticipant = {
+	doName: string;
+	context: PartitionContextResolved;
+	items: TransactionItem[];
+};
+
+type PrepareFanout = {
+	transactionTs: number;
+	participants: PrepareParticipant[];
 };
 
 type TcItemRow = {
@@ -308,10 +321,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		// The low three decimal digits stay zero; a later change can allocate them to tie-breaking.
 		const transactionTs = txOrderTimestampNow();
 
-		// Collect one partitionContext per distinct partition (doName → context).
-		const partitionContextByDoName = new Map<string, PartitionContextResolved>();
+		// Group the operations by partition (doName → context and items). The same grouping feeds the
+		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it
+		// has just written back from SQLite.
+		const participantsByDoName = new Map<string, PrepareParticipant>();
 		for (const op of request.items) {
-			partitionContextByDoName.set(op.partitionContext.doName, op.partitionContext);
+			let participant = participantsByDoName.get(op.partitionContext.doName);
+			if (!participant) {
+				participant = { doName: op.partitionContext.doName, context: op.partitionContext, items: [] };
+				participantsByDoName.set(participant.doName, participant);
+			}
+			const { partitionContext: _, ...item } = op;
+			participant.items.push(item);
 		}
 
 		this.ctx.storage.transactionSync(() => {
@@ -343,19 +364,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					op.returnValuesOnConditionCheckFailure === "all_old" ? 1 : 0,
 				);
 			}
-			for (const [partitionDoName, pCtx] of partitionContextByDoName) {
+			for (const p of participantsByDoName.values()) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?)`,
 					transactionId,
-					partitionDoName,
-					JSON.stringify(pCtx),
+					p.doName,
+					JSON.stringify(p.context),
 				);
 			}
 		});
 
 		await this.ensureAlarmAt(Date.now() + STALE_THRESHOLD_MS);
 
-		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs());
+		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs(), {
+			transactionTs,
+			participants: [...participantsByDoName.values()],
+		});
 	}
 
 	private async resumeTransaction(existingRow: TcStateRow, idempotencyToken: string): Promise<InitiateWriteResponseEncoded> {
@@ -634,32 +658,34 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		);
 	}
 
+	/**
+	 * `fanout` is the in-memory form of the rows `initiateWrite` has just written. It is passed only
+	 * on that path, where the rows are already durable and identical to it, so the prepare does not
+	 * read them back and parse every plan and context again. Every other caller (a resumed CREATED
+	 * transaction, the alarm, recovery) has no in-memory copy and loads the fan-out from SQLite.
+	 */
 	private async drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
 		coordinatorDoId: string,
 		requestBudgetMs?: number,
+		fanout?: PrepareFanout,
 	): Promise<InitiateWriteResponseEncoded> {
 		this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId);
 
-		const stateRow = this.loadStateRow(transactionId)!;
-		const items = this.loadItems(transactionId);
-		const participants = this.loadParticipants(transactionId);
-		const itemsByPartition = groupByPartition(items);
+		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
-				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
 				const result = await tryWhile(
 					async () => {
-						const r = await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
+						const r = await partitionStubByName(this.env, p.context, p.doName).txPrepare(p.context, {
 							transactionId,
 							coordinatorDoId,
-							transactionTimestamp: stateRow.transaction_ts,
-							items: toTransactionItems(partitionItems),
+							transactionTimestamp: transactionTs,
+							items: p.items,
 						});
-						this.storePrepareAnswer(transactionId, p.partition_do_name, r);
+						this.storePrepareAnswer(transactionId, p.doName, r);
 						return r;
 					},
 					// Backpressure is deterministic for the life of this transaction: the partition is over
@@ -668,10 +694,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 3,
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				).catch((err: unknown) => {
-					this.storePrepareError(transactionId, p.partition_do_name, err);
+					this.storePrepareError(transactionId, p.doName, err);
 					throw err;
 				});
-				return { partitionDoName: p.partition_do_name, result };
+				return { partitionDoName: p.doName, result };
 			}),
 		);
 
@@ -756,10 +782,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		);
 
 		// Defensive: only advance to COMMITTED when all participants confirmed.
-		const uncommitted =
-			this.ctx.storage.sql
-				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`, transactionId)
-				.toArray()[0]?.n ?? 0;
+		const uncommitted = one(
+			this.ctx.storage.sql.exec<{ n: number }>(
+				`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`,
+				transactionId,
+			),
+		).n;
 		if (uncommitted === 0) {
 			const completedAt = this.completeTransaction(transactionId, "COMMITTED");
 			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
@@ -813,15 +841,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		// Only advance to CANCELLED once every eligible participant is confirmed — otherwise leave
 		// in CANCELLING so the alarm retries the remaining ones.
-		const stillPending =
-			this.ctx.storage.sql
-				.exec<{
-					n: number;
-				}>(
-					`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
-					transactionId,
-				)
-				.toArray()[0]?.n ?? 0;
+		const stillPending = one(
+			this.ctx.storage.sql.exec<{ n: number }>(
+				`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
+				transactionId,
+			),
+		).n;
 		if (stillPending === 0) {
 			const completedAt = this.completeTransaction(transactionId, "CANCELLED");
 			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
@@ -961,16 +986,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		}
 
 		const hasExpiredRows =
-			this.ctx.storage.sql
-				.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)
-				.toArray()[0] !== undefined;
+			tryOne(this.ctx.storage.sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)) !==
+			undefined;
 		const hasNonTerminalRows =
-			this.ctx.storage.sql
-				.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`)
-				.toArray()[0] !== undefined;
-		const earliestCompletedAt = this.ctx.storage.sql
-			.exec<{ completed_at: number | null }>(`SELECT MIN(completed_at) AS completed_at FROM tc_state WHERE completed_at IS NOT NULL`)
-			.toArray()[0]?.completed_at;
+			tryOne(
+				this.ctx.storage.sql.exec<{ found: number }>(
+					`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`,
+				),
+			) !== undefined;
+		const earliestCompletedAt = one(
+			this.ctx.storage.sql.exec<{ completed_at: number | null }>(
+				`SELECT MIN(completed_at) AS completed_at FROM tc_state WHERE completed_at IS NOT NULL`,
+			),
+		).completed_at;
 
 		let nextAlarmAt: number | null = hasNonTerminalRows ? now + STALE_THRESHOLD_MS : null;
 		if (earliestCompletedAt != null) {
@@ -1010,12 +1038,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	async recoverTransaction(transactionId: string): Promise<RecoverTransactionResult> {
-		const row = this.ctx.storage.sql
-			.exec<{
+		const row = tryOne(
+			this.ctx.storage.sql.exec<{
 				idempotency_token: string;
 				state: TCState;
-			}>(`SELECT idempotency_token, state FROM tc_state WHERE transaction_id = ?`, transactionId)
-			.toArray()[0];
+			}>(`SELECT idempotency_token, state FROM tc_state WHERE transaction_id = ?`, transactionId),
+		);
 
 		if (!row) return { state: "not_found" };
 		if (row.state === "COMMITTED" || row.state === "CANCELLED") return { state: row.state };
@@ -1051,23 +1079,37 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	}
 
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
-		return this.ctx.storage.sql
-			.exec<TcStateRow>(
+		return tryOne(
+			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
                  FROM tc_state WHERE transaction_id = ?`,
 				transactionId,
-			)
-			.toArray()[0];
+			),
+		);
 	}
 
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
-		return this.ctx.storage.sql
-			.exec<TcStateRow>(
+		return tryOne(
+			this.ctx.storage.sql.exec<TcStateRow>(
 				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
-			)
-			.toArray()[0];
+			),
+		);
+	}
+
+	/** The prepare fan-out of a stored transaction: the state, the participants, and their items. */
+	private loadPrepareFanout(transactionId: string): PrepareFanout {
+		const stateRow = this.loadStateRow(transactionId)!;
+		const itemsByPartition = groupByPartition(this.loadItems(transactionId));
+		return {
+			transactionTs: stateRow.transaction_ts,
+			participants: this.loadParticipants(transactionId).map((p) => ({
+				doName: p.partition_do_name,
+				context: deserializePartitionContext(p.partition_context_json),
+				items: toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []),
+			})),
+		};
 	}
 
 	private loadItems(transactionId: string): TcItemRow[] {

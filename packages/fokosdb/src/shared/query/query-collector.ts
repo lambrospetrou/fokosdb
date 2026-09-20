@@ -1,9 +1,8 @@
 import type { KeyBytes } from "../partition-topology/key-codec.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
-import type { QueryScanRow, ScanCursor, StoredItem } from "../partition/partition-store.js";
+import type { QueryCandidateConsumer, ScanCursor, StoredItem } from "../partition/partition-store.js";
 import type { QuerySelect } from "../types.js";
 import type { QueryPageBudgetState } from "./page-budget.js";
-import invariant from "../invariant.js";
 
 export type QueryCollectionState = {
 	items: Array<StoredItem | ProjectedWireRow>;
@@ -18,19 +17,20 @@ export type QueryCollectionState = {
 };
 
 /**
- * Builds one logical query page from a synchronous row stream.
+ * Builds one logical query page from the candidates a scan hands to `consume`. The caller runs the
+ * scan with `consume` and then reads `state`.
  *
- * Every row that the stream yields counts in `rowsReturned` first. A candidate then enters the page
- * only when the evaluated-item budget has room and its stored size fits the evaluated-byte budget;
- * a matched candidate in projection mode must also fit the response budget, unless
- * `allowOversizedFirstItem` still holds. A candidate that a budget rejects stops the page with an
- * inclusive `nextCursor` at that candidate, so the next page evaluates it. `nextCursor` stays null
- * when the stream drains. The stream is not consumed past the rejected candidate. A candidate the
- * plan's filter rejected (`matched: false`) consumes both evaluated budgets, advances the cursor,
- * and consumes zero response bytes.
+ * Every candidate counts in `rowsReturned` first. A candidate then enters the page only when the
+ * evaluated-item budget has room and its stored size fits the evaluated-byte budget; a matched
+ * candidate in projection mode must also fit the response budget, unless `allowOversizedFirstItem`
+ * still holds. The payload of a candidate is decoded only after the evaluated budgets admitted it,
+ * so a candidate that stops the page is never materialized. A candidate that a budget rejects stops
+ * the page with an inclusive `nextCursor` at that candidate, so the next page evaluates it.
+ * `nextCursor` stays null when the scan drains. The scan does not run past the rejected candidate. A
+ * candidate the plan's filter rejected (`matched: false`) consumes both evaluated budgets, advances
+ * the cursor, and consumes zero response bytes.
  */
-export function collectQueryPage(opts: {
-	rows: Iterable<QueryScanRow>;
+export function createQueryPageCollector(opts: {
 	hashKey: KeyBytes;
 	select: QuerySelect;
 	budget: Pick<
@@ -38,8 +38,8 @@ export function collectQueryPage(opts: {
 		"remainingEvaluatedItems" | "remainingEvaluatedBytes" | "remainingResponseBytes" | "allowOversizedFirstItem"
 	>;
 	estimateResponseBytes: (item: StoredItem | ProjectedWireRow) => number;
-}): QueryCollectionState {
-	const { rows, hashKey, select, budget, estimateResponseBytes } = opts;
+}): { consume: QueryCandidateConsumer; state: QueryCollectionState } {
+	const { hashKey, select, budget, estimateResponseBytes } = opts;
 
 	const state: QueryCollectionState = {
 		items: [],
@@ -57,35 +57,29 @@ export function collectQueryPage(opts: {
 	let remainingResponseBytes = budget.remainingResponseBytes;
 
 	// A budget rejects the candidate BEFORE it enters the page: the next page resumes at it.
-	const stopBefore = (sk: KeyBytes) => {
+	const stopBefore = (sk: KeyBytes): false => {
 		state.nextCursor = { hk: hashKey, sk, inclusive: true };
+		return false;
 	};
 
-	for (const row of rows) {
+	const consume: QueryCandidateConsumer = (sk, estRowBytes, matched, decodePayload) => {
 		state.rowsReturned++;
-		if (remainingItems <= 0 || row.estRowBytes > remainingEvaluatedBytes) {
-			stopBefore(row.sk);
-			break;
-		}
+		if (remainingItems <= 0 || estRowBytes > remainingEvaluatedBytes) return stopBefore(sk);
 
 		let materialized: StoredItem | ProjectedWireRow | null = null;
 		let materializedBytes = 0;
-		if (row.matched && select === "projection") {
-			materialized = row.projected ?? row.item;
-			invariant(materialized !== null, "fokos/query-collector: projection scan row has no item");
+		if (matched && select === "projection") {
+			materialized = decodePayload();
 			materializedBytes = estimateResponseBytes(materialized);
-			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) {
-				stopBefore(row.sk);
-				break;
-			}
+			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) return stopBefore(sk);
 		}
 
 		state.scannedCount++;
-		state.evaluatedBytes += row.estRowBytes;
+		state.evaluatedBytes += estRowBytes;
 		remainingItems--;
-		remainingEvaluatedBytes -= row.estRowBytes;
-		state.lastEvaluatedCursor = { hk: hashKey, sk: row.sk };
-		if (row.matched) {
+		remainingEvaluatedBytes -= estRowBytes;
+		state.lastEvaluatedCursor = { hk: hashKey, sk };
+		if (matched) {
 			state.count++;
 		}
 		if (materialized !== null) {
@@ -94,7 +88,8 @@ export function collectQueryPage(opts: {
 			remainingResponseBytes -= materializedBytes;
 			state.allowOversizedFirstItem = false;
 		}
-	}
+		return true;
+	};
 
-	return state;
+	return { consume, state };
 }

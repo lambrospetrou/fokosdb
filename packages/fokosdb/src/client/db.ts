@@ -728,8 +728,10 @@ export class FokosDB {
 		// the caller reads result[i] as the answer to items[i] instead of re-matching on keys. Neither
 		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
 		// request order is restored here, once, from the same pairKey identity.
-		const phase1ByKey = new Map(phase1Flat.map((r) => [itemIdentity(r), r]));
-		const phase2ByKey = new Map(phase2Flat.map((r) => [itemIdentity(r), r]));
+		const phase1ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
+		for (const r of phase1Flat) phase1ByKey.set(itemIdentity(r), r);
+		const phase2ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
+		for (const r of phase2Flat) phase2ByKey.set(itemIdentity(r), r);
 		const items: ReadForTransactionItemResultEncoded[] = [];
 		for (const requested of requestedItems) {
 			const key = KeyCodec.pairKey(requested.hashKey, requested.sortKey);

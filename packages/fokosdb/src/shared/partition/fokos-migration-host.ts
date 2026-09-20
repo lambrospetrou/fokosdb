@@ -14,7 +14,7 @@
  * The two never merge into one page: `items` holds committed state only, and a pending lock is a
  * separate row that commit or cancel resolves later.
  */
-import type { KeyBytes } from "../partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
 import { collectBatch } from "./batch-scan.js";
 import {
@@ -107,18 +107,31 @@ export class FokosMigrationHost implements MigrationHost {
 		// The exact stored sizes, added per page, are what removes the whole-table estimate rebuild that
 		// used to close an import. A row already present contributes nothing, so a retried page cannot
 		// count its rows twice.
-		// Keyed by the exact encoding, as the TTL sweep does. KeyCodec.mapKey is a hash, so two distinct
-		// hash keys can share one value, and their byte totals would merge into whichever key won.
-		const bytesByKey = new Map<string, { hk: KeyBytes; bytes: number }>();
+		// Keyed by the KeyCodec.mapKey hash so no text is built per row. The hash is not an identity:
+		// two distinct hash keys can share one value, so a bucket holds every key of one hash and the
+		// raw bytes decide which entry a row joins. A bucket has one entry except on a collision.
+		const bytesByKey = new Map<bigint, { hk: KeyBytes; bytes: number }[]>();
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
 			if (!inserted) continue;
-			const id = item.hk.toBase64({ alphabet: "base64url" });
-			const entry = bytesByKey.get(id);
-			if (entry) entry.bytes += estRowBytes;
-			else bytesByKey.set(id, { hk: item.hk, bytes: estRowBytes });
+			const id = KeyCodec.mapKey(item.hk);
+			const bucket = bytesByKey.get(id);
+			if (bucket === undefined) {
+				bytesByKey.set(id, [{ hk: item.hk, bytes: estRowBytes }]);
+				continue;
+			}
+			const entry = bucket.find((e) => KeyCodec.compare(e.hk, item.hk) === 0);
+			if (entry) {
+				entry.bytes += estRowBytes;
+			} else {
+				bucket.push({ hk: item.hk, bytes: estRowBytes });
+			}
 		}
-		for (const { hk, bytes } of bytesByKey.values()) store.addKeySizeEstimate(hk, bytes);
+		for (const bucket of bytesByKey.values()) {
+			for (const { hk, bytes } of bucket) {
+				store.addKeySizeEstimate(hk, bytes);
+			}
+		}
 	}
 
 	// ─── pending transactions ─────────────────────────────────────────────────

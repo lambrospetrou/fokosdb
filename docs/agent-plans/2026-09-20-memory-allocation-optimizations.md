@@ -1,10 +1,21 @@
 # RFC — Memory Allocation Optimizations across FokosDB
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-20
 **Author:** Lambros Petrou
 
-**Status:** Nothing in this document is built.
+**Status:** All six milestones are built. Three details differ from the text below, on purpose:
+
+- 4.2.5: the materialized bindings are not stored on the plan. A plan is JSON that crosses RPC and is persisted by
+  the coordinator, and direct-layout values hold `Uint8Array` keys that do not survive `JSON.stringify`. Instead,
+  `materializedPlanBindings` in `shared/expression/bindings.ts` memoizes the values in a `WeakMap` keyed by the
+  plan's `bindings` array, so every statement of one request shares one materialization and the plan shape is
+  unchanged.
+- 4.2.6: `drivePrepare` receives a `PrepareFanout` (the transaction timestamp plus one entry per participant with
+  its context and its decoded `TransactionItem`s), not raw `TcItemRow`/`TcParticipantRow` rows, because row shapes
+  would still need a JSON parse per plan on the happy path. Recovery builds the same shape with `loadPrepareFanout`.
+- 4.2.8: `collectQueryPage` became `createQueryPageCollector`, which returns the `QueryCandidateConsumer` and the
+  page state; `scanQueryPage` returns `SqlMetrics` directly. One `decodePayload` closure serves the whole scan.
 
 ## Table of contents
 

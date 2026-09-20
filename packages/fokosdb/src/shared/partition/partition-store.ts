@@ -3,6 +3,7 @@ import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
 import type { RangeAncestorInfo } from "../partition-topology/types.js";
 import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
 import invariant from "../invariant.js";
+import { one, tryOne } from "../sql-cursor.js";
 import {
 	composeQueryStatement,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
@@ -11,7 +12,7 @@ import {
 	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
 } from "../expression/plan.js";
-import { materializeExpressionBindings } from "../expression/bindings.js";
+import { materializedPlanBindings } from "../expression/bindings.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "../expression/projection.js";
 import {
 	evaluateConditionPlan,
@@ -50,12 +51,12 @@ const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(d
  */
 class StatementTail {
 	readonly #offset: number;
-	readonly #planBindings: unknown[];
+	readonly #planBindings: readonly unknown[];
 	readonly #values: unknown[] = [];
 
 	constructor(plan: CompiledUpdatePlan) {
 		this.#offset = plan.completeBindingCount;
-		this.#planBindings = materializeExpressionBindings(plan.bindings);
+		this.#planBindings = materializedPlanBindings(plan);
 	}
 
 	/** Reserves the next parameter for `value` and returns its `?N` reference. */
@@ -199,17 +200,18 @@ export type RangeScanBounds = {
 };
 
 /**
- * One row of a queryItems leaf scan. `matched` is false when the plan's filter rejected the
- * candidate. A count row and a rejected candidate carry neither `item` nor `projected`; a matched
- * row carries `item` when the request has no projection and `projected` when it has one.
+ * Receives one candidate of a queryItems leaf scan and returns `false` to stop the scan. `matched`
+ * is false when the plan's filter rejected the candidate. `decodePayload` builds the payload of a
+ * matched candidate on demand: the complete item when the request has no projection, the projected
+ * wire row when it has one. It must be called at most once per candidate, only for a matched
+ * candidate of a `"projection"` selection, and only before the consumer returns.
  */
-export type QueryScanRow = {
-	sk: KeyBytes;
-	estRowBytes: number;
-	matched: boolean;
-	item: StoredItem | null;
-	projected: ProjectedWireRow | null;
-};
+export type QueryCandidateConsumer = (
+	sk: KeyBytes,
+	estRowBytes: number,
+	matched: boolean,
+	decodePayload: () => StoredItem | ProjectedWireRow,
+) => boolean;
 
 /** Scan checkpoint of the route-override stream, in `hash_key` order. */
 export type PromotedKeyCursor = { hashKey: KeyBytes };
@@ -546,7 +548,7 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 	if (opts.plan !== null) {
 		return {
 			sql: composeQueryStatement(opts.plan, { select: opts.select, direction: opts.direction, scanConditions: conds }),
-			params: [...materializeExpressionBindings(opts.plan.bindings, "pool"), ...params, opts.limit],
+			params: [...materializedPlanBindings(opts.plan, "pool"), ...params, opts.limit],
 		};
 	}
 	const order = `ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`;
@@ -874,7 +876,7 @@ export class PartitionStore {
 			hk,
 			sk,
 		);
-		const row = res.toArray()[0];
+		const row = tryOne(res);
 		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
 		const { data_kind, ...rest } = row; // data_kind → the readable `kind`; don't leak the raw code
 		return {
@@ -907,7 +909,7 @@ export class PartitionStore {
 			hk,
 			sk,
 		);
-		const row = res.toArray()[0];
+		const row = tryOne(res);
 		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
 		return {
 			row: {
@@ -936,7 +938,7 @@ export class PartitionStore {
 			hk,
 			sk,
 		);
-		const row = res.toArray()[0];
+		const row = tryOne(res);
 		return { row, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
 	}
 
@@ -981,9 +983,13 @@ export class PartitionStore {
 	 * deleteKeySizeEstimate). It would add one row WRITE per row on those paths to save one row READ here.
 	 */
 	#storedEstRowBytes(hk: KeyBytes, sk: KeyBytes): number {
-		const row = this.#storage.sql
-			.exec<{ est_row_bytes: number }>(`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
-			.toArray()[0];
+		const row = tryOne(
+			this.#storage.sql.exec<{ est_row_bytes: number }>(
+				`SELECT est_row_bytes FROM items INDEXED BY idx_items_scan WHERE hk = ? AND sk = ? LIMIT 1`,
+				hk,
+				sk,
+			),
+		);
 		return row?.est_row_bytes ?? 0;
 	}
 
@@ -1078,16 +1084,16 @@ export class PartitionStore {
 		// Exact stored size, measured by SQLite in the statement above (drives the key_size_estimates delta).
 		const newEst = rows[0].est_row_bytes;
 
-		const kseRow = this.#storage.sql
-			.exec<{ est_bytes: number }>(
+		const kseRow = tryOne(
+			this.#storage.sql.exec<{ est_bytes: number }>(
 				`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
 				 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
 				 RETURNING est_bytes`,
 				opts.hk,
 				newEst,
 				oldEst,
-			)
-			.toArray()[0];
+			),
+		);
 
 		return { version, keyEstBytes: kseRow?.est_bytes ?? newEst, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
@@ -1197,8 +1203,8 @@ export class PartitionStore {
 		// Migration copies the stored representation verbatim: for json rows `item.data` is the raw
 		// JSONB blob, bound directly (no jsonb() re-encode). data binds last (?9) so est_row_bytes can
 		// measure the same parameter.
-		const row = this.#storage.sql
-			.exec<{ est_row_bytes: number }>(
+		const row = tryOne(
+			this.#storage.sql.exec<{ est_row_bytes: number }>(
 				`INSERT INTO items (item_id, hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
 			 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ${estRowBytesExpr("?9", "?2", "?3")}, ?9)
 			 ON CONFLICT (hk, sk) DO NOTHING
@@ -1212,8 +1218,8 @@ export class PartitionStore {
 				item.last_read_ts,
 				item.last_write_ts,
 				item.data,
-			)
-			.toArray()[0];
+			),
+		);
 		return row ? { inserted: true, estRowBytes: row.est_row_bytes } : { inserted: false, estRowBytes: 0 };
 	}
 
@@ -1247,23 +1253,29 @@ export class PartitionStore {
 
 			// Total bytes in O(1) from the maintained per-hk estimate. Nothing to split ⇒ null.
 			const B =
-				this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey).toArray()[0]
+				tryOne(this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey))
 					?.est_bytes ?? 0;
 			if (B <= 0) return null;
 
 			// Cheap "≥ N items" guard, O(N) not O(cnt): each child needs ≥ 1 item, so probe with a bounded
 			// count rather than a full pass. Fewer than N items ⇒ cannot split into N non-empty children.
-			const guardRow =
+			const guardRow = one(
 				end === null
-					? this.#storage.sql
-							.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? LIMIT ?)`, hashKey, lower, N)
-							.toArray()[0]
-					: this.#storage.sql
-							.exec<{
-								n: number;
-							}>(`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? AND sk < ? LIMIT ?)`, hashKey, lower, end, N)
-							.toArray()[0];
-			if ((guardRow?.n ?? 0) < N) {
+					? this.#storage.sql.exec<{ n: number }>(
+							`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? LIMIT ?)`,
+							hashKey,
+							lower,
+							N,
+						)
+					: this.#storage.sql.exec<{ n: number }>(
+							`SELECT COUNT(*) AS n FROM (SELECT 1 FROM items WHERE hk = ? AND sk >= ? AND sk < ? LIMIT ?)`,
+							hashKey,
+							lower,
+							end,
+							N,
+						),
+			);
+			if (guardRow.n < N) {
 				console.warn({
 					message: "fokos/partition-store.computeRangeSplitBoundaries: cannot split, fewer than N items",
 					hashKey: KeyCodec.keyForLog(hashKey),
@@ -1457,62 +1469,66 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Streams the rows of one queryItems leaf scan in scan order. The caller consumes `rows` synchronously
-	 * and can stop early; `sqlMetrics()` reports the physical reads of the statement up to that point.
-	 * A plan statement selects `matched` plus the gated columns its mode needs; QueryScanRow documents
-	 * which payload a row carries.
+	 * Runs one queryItems leaf scan in scan order and hands every candidate to `consumer`, which stops
+	 * the scan by returning `false`. The loop allocates nothing per row on its own: the payload of a
+	 * candidate is built only when the consumer calls `decodePayload`, after its budgets admitted the
+	 * candidate. The returned metrics are the physical reads of the statement up to the stop. A plan
+	 * statement selects `matched` plus the gated columns its mode needs.
 	 */
-	scanQueryPage(opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null }): {
-		rows: Iterable<QueryScanRow>;
-		sqlMetrics: () => SqlMetrics;
-	} {
+	scanQueryPage(
+		opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null },
+		consumer: QueryCandidateConsumer,
+	): SqlMetrics {
 		const plan = opts.plan;
 		if (plan !== null) {
 			withExpressionErrors(() => validateQueryPlan(plan));
 		}
 		const { sql, params } = queryScanStatement(opts);
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
-		const select = opts.select;
 		const entryCount = plan?.projection?.names.length ?? 0;
-		// The mode is fixed per request. Count rows carry nothing, a complete-item scan carries `item`,
-		// and a projected scan carries `projected`. Each payload appears on a matched row only.
-		const mode: "none" | "item" | "projected" = select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
-		function* rows(): Generator<QueryScanRow> {
-			for (const row of cursor) {
-				const sk = fromSqlKey(row.sk as ArrayBuffer);
-				// Without a plan the statement yields no `matched` column; every candidate matches.
-				const matched = plan === null ? true : row.matched === 1;
-				let item: StoredItem | null = null;
-				let projected: ProjectedWireRow | null = null;
-				if (matched && mode === "projected") {
-					projected = decodeProjectedRow(row, entryCount);
-				} else if (matched && mode === "item") {
-					item = {
-						hk: fromSqlKey(row.hk as ArrayBuffer),
-						sk,
-						data: fromSqlData(row.data as string | ArrayBuffer),
-						kind: kindFromCode(row.data_kind as number),
-						ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds as number | null,
-						v: row.v as number,
-						last_read_ts: row.last_read_ts as number,
-						last_write_ts: row.last_write_ts as number,
-					};
-				}
-				yield { sk, estRowBytes: row.est_row_bytes as number, matched, item, projected };
-			}
+		// The mode is fixed per request. A count scan carries no payload, a complete-item scan carries
+		// the item, and a projected scan carries the projected row. A payload exists on a matched row only.
+		const mode: "none" | "item" | "projected" = opts.select !== "projection" ? "none" : plan?.projection ? "projected" : "item";
+
+		// One closure for the whole scan reads the row the loop is on, so a consumer that never asks for
+		// a payload (count mode, a rejected candidate, a full budget) costs no allocation per row.
+		let current: Record<string, SqlStorageValue> | undefined;
+		let currentSk: KeyBytes | undefined;
+		const decodePayload = (): StoredItem | ProjectedWireRow => {
+			const row = current!;
+			invariant(mode !== "none", "fokos/partition-store.scanQueryPage: a count scan has no payload to decode");
+			if (mode === "projected") return decodeProjectedRow(row, entryCount);
+			return {
+				hk: fromSqlKey(row.hk as ArrayBuffer),
+				sk: currentSk!,
+				data: fromSqlData(row.data as string | ArrayBuffer),
+				kind: kindFromCode(row.data_kind as number),
+				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds as number | null,
+				v: row.v as number,
+				last_read_ts: row.last_read_ts as number,
+				last_write_ts: row.last_write_ts as number,
+			};
+		};
+
+		for (const row of cursor) {
+			current = row;
+			currentSk = fromSqlKey(row.sk as ArrayBuffer);
+			// Without a plan the statement yields no `matched` column; every candidate matches.
+			const matched = plan === null ? true : row.matched === 1;
+			if (!consumer(currentSk, row.est_row_bytes as number, matched, decodePayload)) break;
 		}
-		return { rows: rows(), sqlMetrics: () => ({ rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten }) };
+		return { rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
 	}
 
 	// ─── pending_transactions ───────────────────────────────────────────────
 
 	pendingLockFor(hk: KeyBytes, sk: KeyBytes): { transaction_id: string; operation: string } | undefined {
-		return this.#storage.sql
-			.exec<{
+		return tryOne(
+			this.#storage.sql.exec<{
 				transaction_id: string;
 				operation: string;
-			}>(`SELECT transaction_id, operation FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk)
-			.toArray()[0];
+			}>(`SELECT transaction_id, operation FROM pending_transactions WHERE hk = ? AND sk = ? LIMIT 1`, hk, sk),
+		);
 	}
 
 	/** Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. */
@@ -1654,16 +1670,16 @@ export class PartitionStore {
 			`fokos/partition-store.updateItemSingleShot: unexpected version value: ${version}`,
 		);
 		const newEst = rows[0].est_row_bytes;
-		const kseRow = this.#storage.sql
-			.exec<{ est_bytes: number }>(
+		const kseRow = tryOne(
+			this.#storage.sql.exec<{ est_bytes: number }>(
 				`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
 				 ON CONFLICT(hk) DO UPDATE SET est_bytes = MAX(0, est_bytes + excluded.est_bytes - ?)
 				 RETURNING est_bytes`,
 				opts.hk,
 				newEst,
 				oldEst,
-			)
-			.toArray()[0];
+			),
+		);
 
 		return {
 			version,
@@ -1674,11 +1690,9 @@ export class PartitionStore {
 	}
 
 	pendingTxCountFor(transactionId: string): number {
-		return (
-			this.#storage.sql
-				.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, transactionId)
-				.toArray()[0]?.n ?? 0
-		);
+		return one(
+			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, transactionId),
+		).n;
 	}
 
 	/** Does this partition hold any pending lock? */
@@ -1698,7 +1712,7 @@ export class PartitionStore {
 	}
 
 	pendingLockCountForHashKey(hk: KeyBytes): number {
-		return this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hk).toArray()[0]?.n ?? 0;
+		return one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hk)).n;
 	}
 
 	listPendingTxKeys(transactionId: string): { hk: KeyBytes; sk: KeyBytes }[] {
@@ -1713,8 +1727,8 @@ export class PartitionStore {
 		sk: KeyBytes,
 		transactionId: string,
 	): { operation: string; data: string | Uint8Array | null; kind: DataKind | null; ttl_epoch_utc_seconds: number | null } | undefined {
-		const row = this.#storage.sql
-			.exec<{
+		const row = tryOne(
+			this.#storage.sql.exec<{
 				operation: string;
 				data: string | ArrayBuffer | null;
 				data_kind: number | null;
@@ -1724,8 +1738,8 @@ export class PartitionStore {
 				hk,
 				sk,
 				transactionId,
-			)
-			.toArray()[0];
+			),
+		);
 		return row
 			? {
 					operation: row.operation,
@@ -1889,9 +1903,9 @@ export class PartitionStore {
 
 	getMaxDeleteTxOrderTs(): number {
 		return (
-			this.#storage.sql
-				.exec<{ max_delete_tx_order_ts: number }>(`SELECT max_delete_tx_order_ts FROM deletion_metadata WHERE id = 1`)
-				.toArray()[0]?.max_delete_tx_order_ts ?? 0
+			tryOne(
+				this.#storage.sql.exec<{ max_delete_tx_order_ts: number }>(`SELECT max_delete_tx_order_ts FROM deletion_metadata WHERE id = 1`),
+			)?.max_delete_tx_order_ts ?? 0
 		);
 	}
 
@@ -1906,19 +1920,19 @@ export class PartitionStore {
 	 */
 	deleteRevisionFor(_hk: KeyBytes): number {
 		return (
-			this.#storage.sql.exec<{ delete_revision: number }>(`SELECT delete_revision FROM deletion_metadata WHERE id = 1`).toArray()[0]
+			tryOne(this.#storage.sql.exec<{ delete_revision: number }>(`SELECT delete_revision FROM deletion_metadata WHERE id = 1`))
 				?.delete_revision ?? 0
 		);
 	}
 
 	/** Both deletion-metadata values in one read: the migration metadata RPC serves them together. */
 	getDeletionMetadata(): { maxDeleteTxOrderTs: number; deleteRevision: number } {
-		const row = this.#storage.sql
-			.exec<{
+		const row = tryOne(
+			this.#storage.sql.exec<{
 				max_delete_tx_order_ts: number;
 				delete_revision: number;
-			}>(`SELECT max_delete_tx_order_ts, delete_revision FROM deletion_metadata WHERE id = 1`)
-			.toArray()[0];
+			}>(`SELECT max_delete_tx_order_ts, delete_revision FROM deletion_metadata WHERE id = 1`),
+		);
 		return { maxDeleteTxOrderTs: row?.max_delete_tx_order_ts ?? 0, deleteRevision: row?.delete_revision ?? 0 };
 	}
 
@@ -1988,7 +2002,7 @@ export class PartitionStore {
 	}
 
 	getRepartition(id: string): RepartitionRow | undefined {
-		const row = this.#storage.sql.exec<SqlRepartitionRow>(`${REPARTITION_SELECT} WHERE r.id = ?`, id).toArray()[0];
+		const row = tryOne(this.#storage.sql.exec<SqlRepartitionRow>(`${REPARTITION_SELECT} WHERE r.id = ?`, id));
 		return row && toRepartitionRow(row);
 	}
 
@@ -1997,9 +2011,9 @@ export class PartitionStore {
 	 * owns nothing, so it never queues a second split.
 	 */
 	getSplitRepartition(): RepartitionRow | undefined {
-		const row = this.#storage.sql
-			.exec<SqlRepartitionRow>(`${REPARTITION_SELECT} WHERE r.kind IN ('hash_split', 'range_split') LIMIT 1`)
-			.toArray()[0];
+		const row = tryOne(
+			this.#storage.sql.exec<SqlRepartitionRow>(`${REPARTITION_SELECT} WHERE r.kind IN ('hash_split', 'range_split') LIMIT 1`),
+		);
 		return row && toRepartitionRow(row);
 	}
 
@@ -2071,23 +2085,22 @@ export class PartitionStore {
 
 	/** The earliest due repartition that has a source step. Ordered so a failed row falls behind another. */
 	selectDueRepartition(now: number): RepartitionRow | undefined {
-		const row = this.#storage.sql
-			.exec<SqlRepartitionRow>(
+		const row = tryOne(
+			this.#storage.sql.exec<SqlRepartitionRow>(
 				`${REPARTITION_SELECT} WHERE ${REPARTITION_HAS_STEP} AND r.next_attempt_at <= ?1 ORDER BY r.next_attempt_at, r.seq LIMIT 1`,
 				now,
-			)
-			.toArray()[0];
+			),
+		);
 		return row && toRepartitionRow(row);
 	}
 
 	/** The earliest deadline of any repartition that has a source step, now or later. */
 	earliestRepartitionDeadline(): number | null {
-		const row = this.#storage.sql
-			.exec<{
+		return one(
+			this.#storage.sql.exec<{
 				deadline: number | null;
-			}>(`SELECT MIN(r.next_attempt_at) AS deadline FROM fokos_repartitions r WHERE ${REPARTITION_HAS_STEP}`)
-			.toArray()[0];
-		return row?.deadline ?? null;
+			}>(`SELECT MIN(r.next_attempt_at) AS deadline FROM fokos_repartitions r WHERE ${REPARTITION_HAS_STEP}`),
+		).deadline;
 	}
 
 	/**
@@ -2095,20 +2108,21 @@ export class PartitionStore {
 	 * item rows, so its step reports itself done at once and the caller needs no branch on the kind.
 	 */
 	selectDueCleanup(now: number): RepartitionRow | undefined {
-		const row = this.#storage.sql
-			.exec<SqlRepartitionRow>(
+		const row = tryOne(
+			this.#storage.sql.exec<SqlRepartitionRow>(
 				`${REPARTITION_SELECT} WHERE r.state = 'completed' AND r.next_attempt_at <= ?1 ORDER BY r.next_attempt_at, r.seq LIMIT 1`,
 				now,
-			)
-			.toArray()[0];
+			),
+		);
 		return row && toRepartitionRow(row);
 	}
 
 	earliestCleanupDeadline(): number | null {
-		const row = this.#storage.sql
-			.exec<{ deadline: number | null }>(`SELECT MIN(next_attempt_at) AS deadline FROM fokos_repartitions WHERE state = 'completed'`)
-			.toArray()[0];
-		return row?.deadline ?? null;
+		return one(
+			this.#storage.sql.exec<{ deadline: number | null }>(
+				`SELECT MIN(next_attempt_at) AS deadline FROM fokos_repartitions WHERE state = 'completed'`,
+			),
+		).deadline;
 	}
 
 	// ─── fokos_repartition_targets ──────────────────────────────────────────
@@ -2164,9 +2178,9 @@ export class PartitionStore {
 	}
 
 	getRepartitionTarget(repartitionId: string, partitionId: string, kind: RepartitionKind): RepartitionTargetRow | undefined {
-		const row = this.#storage.sql
-			.exec<SqlTargetRow>(`${TARGET_SELECT} WHERE repartition_id = ?1 AND partition_id = ?2`, repartitionId, partitionId)
-			.toArray()[0];
+		const row = tryOne(
+			this.#storage.sql.exec<SqlTargetRow>(`${TARGET_SELECT} WHERE repartition_id = ?1 AND partition_id = ?2`, repartitionId, partitionId),
+		);
 		return row && toTargetRow(row, kind);
 	}
 
@@ -2272,14 +2286,14 @@ export class PartitionStore {
 	 * lookup had.
 	 */
 	routeOverrideFor(hashKey: KeyBytes): { repartitionId: string; state: RepartitionState } | undefined {
-		const row = this.#storage.sql
-			.exec<{ repartition_id: string; state: RepartitionState }>(
+		const row = tryOne(
+			this.#storage.sql.exec<{ repartition_id: string; state: RepartitionState }>(
 				`SELECT o.repartition_id, r.state FROM fokos_route_overrides o
 				   JOIN fokos_repartitions r ON r.id = o.repartition_id
 				  WHERE o.hash_key = ?`,
 				hashKey,
-			)
-			.toArray()[0];
+			),
+		);
 		return row && { repartitionId: row.repartition_id, state: row.state };
 	}
 
@@ -2442,8 +2456,8 @@ export class PartitionStore {
 		// unambiguous "unbounded" tag. The sentinel semantics stay encapsulated here: the result decodes
 		// `[]` back to `null` for both edges, so callers can feed `resolveRangePartitionContext` directly.
 		const unbounded = KeyCodec.encodeOptional(undefined);
-		const row = this.#storage.sql
-			.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
+		const row = tryOne(
+			this.#storage.sql.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
 				`SELECT depth, sk_start_boundary, sk_end_boundary
 				 FROM range_hierarchy
 				 WHERE hk = ?
@@ -2455,8 +2469,8 @@ export class PartitionStore {
 				sortKey,
 				sortKey,
 				unbounded,
-			)
-			.toArray()[0];
+			),
+		);
 		if (!row) return null;
 
 		const start = fromSqlKey(row.sk_start_boundary);

@@ -1,9 +1,10 @@
 import { type KeyBytes } from "../partition-topology/key-codec.js";
-import { materializeExpressionBindings } from "./bindings.js";
+import { materializedPlanBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
+import { tryOne } from "../sql-cursor.js";
 import {
 	composeConditionStatement,
 	composeProjectionStatement,
@@ -69,7 +70,7 @@ export function evaluateConditionPlan(
 			condition_ok: number;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
-		}>(statement, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings));
+		}>(statement, hashKey, sortKey, ...materializedPlanBindings(plan));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,
@@ -100,11 +101,11 @@ export function readProjectedItem(
 	try {
 		const cursor = storage.sql.exec<Record<string, SqlStorageValue>>(
 			statement,
-			...materializeExpressionBindings(plan.bindings, "pool"),
+			...materializedPlanBindings(plan, "pool"),
 			hashKey,
 			sortKey,
 		);
-		const row = cursor.toArray()[0];
+		const row = tryOne(cursor);
 		if (row === undefined) return { row: undefined, rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
 		return {
 			row: {
@@ -254,7 +255,7 @@ export function probeUpdatePlan(
 			new_size: number | null;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
-		}>(statement, hashKey, sortKey, ...materializeExpressionBindings(plan.bindings));
+		}>(statement, hashKey, sortKey, ...materializedPlanBindings(plan));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,

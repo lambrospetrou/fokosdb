@@ -15,8 +15,11 @@ import {
 	type RepartitionKind,
 	type RepartitionState,
 	type ScanCursor,
+	type SqlMetrics,
+	type StoredItem,
 	type TargetInitialization,
 } from "./partition-store.js";
+import type { ProjectedWireRow } from "../expression/projection.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
@@ -43,6 +46,25 @@ async function withStore(fn: (store: PartitionStore, state: DurableObjectState) 
 	await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		await fn(new PartitionStore(state.storage), state);
 	});
+}
+
+// One candidate of a scan as the consumer received it, with its payload decoded when the selection
+// materializes one.
+type ScanRow = { sk: KeyBytes; estRowBytes: number; matched: boolean; payload: StoredItem | ProjectedWireRow | null };
+
+// Runs a query scan and records every candidate; `take` bounds how many candidates the consumer
+// accepts before it stops the scan. Returns the rows and the metrics the scan reported.
+function scanRows(
+	store: PartitionStore,
+	opts: Parameters<PartitionStore["scanQueryPage"]>[0],
+	take = Number.POSITIVE_INFINITY,
+): { rows: ScanRow[]; metrics: SqlMetrics } {
+	const rows: ScanRow[] = [];
+	const metrics = store.scanQueryPage(opts, (sk, estRowBytes, matched, decodePayload) => {
+		rows.push({ sk, estRowBytes, matched, payload: matched && opts.select === "projection" ? decodePayload() : null });
+		return rows.length < take;
+	});
+	return { rows, metrics };
 }
 
 function kseBytes(state: DurableObjectState, hk: string): number | undefined {
@@ -441,25 +463,22 @@ describe("PartitionStore - items", () => {
 			const storedEst = (sk: string) =>
 				state.storage.sql.exec<{ e: number }>(`SELECT est_row_bytes AS e FROM items WHERE hk = ? AND sk = ?`, hk, kb(sk)).toArray()[0]!.e;
 
-			const rows = [
-				...store.scanQueryPage({
-					hk,
-					lower: KeyCodec.encodeOptional(undefined),
-					lowerInclusive: true,
-					upper: null,
-					upperInclusive: false,
-					cursor: null,
-					direction: "asc",
-					limit: 100,
-					select: "count",
-					plan: null,
-				}).rows,
-			];
+			const { rows } = scanRows(store, {
+				hk,
+				lower: KeyCodec.encodeOptional(undefined),
+				lowerInclusive: true,
+				upper: null,
+				upperInclusive: false,
+				cursor: null,
+				direction: "asc",
+				limit: 100,
+				select: "count",
+				plan: null,
+			});
 			expect(rows.map((r) => KeyCodec.decode(r.sk))).toEqual(["b", "j", "t"]);
 			for (const r of rows) {
-				expect(r.item).toBeNull();
+				expect(r.payload).toBeNull();
 				expect(r.matched).toBe(true);
-				expect(r.projected).toBeNull();
 				expect(r.estRowBytes).toBe(storedEst(KeyCodec.decode(r.sk) as string));
 			}
 			expect(rows[0].estRowBytes).toBe(expectedRowBytes(new Uint8Array([1, 2, 3]), hk, kb("b")));
@@ -475,8 +494,8 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk, sk: kb("b"), data: new Uint8Array([1, 2, 3]), kind: "bytes", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({ hk, sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
-			const scan = (select: "count" | "projection") => [
-				...store.scanQueryPage({
+			const scan = (select: "count" | "projection") =>
+				scanRows(store, {
 					hk,
 					lower: KeyCodec.encodeOptional(undefined),
 					lowerInclusive: true,
@@ -487,19 +506,18 @@ describe("PartitionStore - items", () => {
 					limit: 100,
 					select,
 					plan: null,
-				}).rows,
-			];
+				}).rows;
 			const countRows = scan("count");
 			const projRows = scan("projection");
 
 			expect(projRows.map((r) => r.estRowBytes)).toEqual(countRows.map((r) => r.estRowBytes));
-			const items = new Map(projRows.map((r) => [KeyCodec.decode(r.sk) as string, r.item]));
+			const items = new Map(projRows.map((r) => [KeyCodec.decode(r.sk) as string, r.payload as StoredItem]));
 			expect(items.get("t")).toMatchObject({ data: "hello", kind: "text" });
 			expect(items.get("b")?.data).toEqual(new Uint8Array([1, 2, 3]));
 			// The public-read projection decodes JSONB back to JSON text.
 			expect(items.get("j")).toMatchObject({ data: jsonText, kind: "json" });
 			// The items.item_id link key stays inside the store: a query result never carries it.
-			for (const r of projRows) expect(r.item).not.toHaveProperty("item_id");
+			for (const r of projRows) expect(r.payload).not.toHaveProperty("item_id");
 		});
 	});
 
@@ -519,20 +537,18 @@ describe("PartitionStore - items", () => {
 					upperInclusive?: boolean;
 					cursor?: ScanCursor | null;
 				}) =>
-					[
-						...store.scanQueryPage({
-							hk,
-							direction,
-							limit: 100,
-							select: "count",
-							plan: null,
-							lower: opts.lower ?? EMPTY,
-							lowerInclusive: opts.lowerInclusive ?? true,
-							upper: opts.upper ?? null,
-							upperInclusive: opts.upperInclusive ?? false,
-							cursor: opts.cursor ?? null,
-						}).rows,
-					].map((r) => (r.sk.byteLength === 0 ? "" : (KeyCodec.decode(r.sk) as string)));
+					scanRows(store, {
+						hk,
+						direction,
+						limit: 100,
+						select: "count",
+						plan: null,
+						lower: opts.lower ?? EMPTY,
+						lowerInclusive: opts.lowerInclusive ?? true,
+						upper: opts.upper ?? null,
+						upperInclusive: opts.upperInclusive ?? false,
+						cursor: opts.cursor ?? null,
+					}).rows.map((r) => (r.sk.byteLength === 0 ? "" : (KeyCodec.decode(r.sk) as string)));
 
 				if (direction === "asc") {
 					expect(sksOf({ lower: kb("b"), lowerInclusive: true, upper: kb("d"), upperInclusive: false })).toEqual(["b", "c"]);
@@ -568,19 +584,19 @@ describe("PartitionStore - items", () => {
 				plan: null,
 			};
 
-			const limited = store.scanQueryPage({ ...bounds, limit: 3, select: "count" });
-			expect([...limited.rows]).toHaveLength(3);
+			const limited = scanRows(store, { ...bounds, limit: 3, select: "count" });
+			expect(limited.rows).toHaveLength(3);
 
-			const full = store.scanQueryPage({ ...bounds, limit: 10, select: "count" });
-			expect([...full.rows]).toHaveLength(10);
-			const fullReads = full.sqlMetrics().rowsRead;
+			const full = scanRows(store, { ...bounds, limit: 10, select: "count" });
+			expect(full.rows).toHaveLength(10);
+			const fullReads = full.metrics.rowsRead;
 			expect(fullReads).toBeGreaterThanOrEqual(10);
 
 			// The consumer stops after one row; the statement reads no further.
-			const partial = store.scanQueryPage({ ...bounds, limit: 10, select: "count" });
-			partial.rows[Symbol.iterator]().next();
-			expect(partial.sqlMetrics().rowsRead).toBeGreaterThanOrEqual(1);
-			expect(partial.sqlMetrics().rowsRead).toBeLessThan(fullReads);
+			const partial = scanRows(store, { ...bounds, limit: 10, select: "count" }, 1);
+			expect(partial.rows).toHaveLength(1);
+			expect(partial.metrics.rowsRead).toBeGreaterThanOrEqual(1);
+			expect(partial.metrics.rowsRead).toBeLessThan(fullReads);
 		});
 	});
 

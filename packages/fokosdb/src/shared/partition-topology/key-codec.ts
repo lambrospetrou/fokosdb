@@ -70,22 +70,29 @@ function encode(key: string | Uint8Array): KeyBytes {
 	return asKeyBytes(out);
 }
 
+// The one shared instance of the absent sentinel. A frozen zero-length view cannot be mutated, so
+// every caller can hold the same instance and no point read or range bound allocates one.
+const EMPTY_KEY_BYTES: KeyBytes = Object.freeze(asKeyBytes(new Uint8Array(0)));
+
 /**
  * Maps an optional public key to KeyBytes: `undefined` → `[]` (the absent sentinel, the global byte
  * minimum), anything else → `encode(key)`. This is the ONLY producer of `[]`.
  */
 function encodeOptional(key: string | Uint8Array | undefined): KeyBytes {
-	return key === undefined ? asKeyBytes(new Uint8Array(0)) : encode(key);
+	return key === undefined ? EMPTY_KEY_BYTES : encode(key);
 }
 
 /**
  * Canonical bytes → original-typed key. First byte `0xFF` ⇒ binary (the rest, untagged); else UTF-8.
  * `decode(encode(k)) === k` for every well-formed input. `decode([])` is `""` (the absent sentinel
  * never carries a meaningful decoded value; callers treat absent specially).
+ *
+ * A binary key decodes to a view over the input bytes, not a copy: the view shares the buffer with
+ * `k`, so a write through either one is visible in the other.
  */
 function decode(k: KeyBytes): string | Uint8Array {
 	if (k.length > 0 && k[0] === BINARY_TAG) {
-		return k.slice(1);
+		return k.subarray(1);
 	}
 	return textDecoder.decode(k);
 }
