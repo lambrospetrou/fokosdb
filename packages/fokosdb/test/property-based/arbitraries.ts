@@ -10,6 +10,25 @@ import { PartitionContextCreator } from "../../src/shared/partition-topology/par
 import { PartitionTopologyRouterImpl } from "../../src/shared/partition-topology/router.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 
+// A suite runs inside the Workers runtime and cannot read the shell environment, so
+// `vitest.config.ts` substitutes FOKOS_PROPERTY_RUNS into this constant when it builds the module.
+declare const __FOKOS_PROPERTY_RUNS__: string;
+
+/**
+ * The run count of one property: FOKOS_PROPERTY_RUNS when the shell sets it, else `defaultRuns`.
+ * Keep the default small enough for every run of the test suite, and give a deeper search the
+ * variable: `FOKOS_PROPERTY_RUNS=500 pnpm vitest run test/property-based/`.
+ */
+export function propertyRuns(defaultRuns: number): number {
+	const configured = __FOKOS_PROPERTY_RUNS__;
+	if (configured === "") return defaultRuns;
+	const runs = Number(configured);
+	if (!Number.isSafeInteger(runs) || runs <= 0) {
+		throw new Error(`FOKOS_PROPERTY_RUNS must be a positive integer, got ${JSON.stringify(configured)}`);
+	}
+	return runs;
+}
+
 export type ItemKey = { hashKey: string | Uint8Array; sortKey?: string | Uint8Array };
 export type ItemData = string | Uint8Array | JsonComposite;
 export type DataKind = "text" | "bytes" | "json";

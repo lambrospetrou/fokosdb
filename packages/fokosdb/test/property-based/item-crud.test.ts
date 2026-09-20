@@ -19,6 +19,7 @@ import {
 	expectedDataKind,
 	keyId,
 	makeTestDB,
+	propertyRuns,
 	type DataKind,
 	type ItemData,
 	type ItemKey,
@@ -47,7 +48,7 @@ describe("FokosDB item CRUD — stateless properties", () => {
 				expect(del.deleted).toBe(true);
 				expect(await db.getItem(key)).toMatchObject({ found: false, item: key });
 			}),
-			{ numRuns: 30 },
+			{ numRuns: propertyRuns(30) },
 		);
 	});
 });
@@ -122,7 +123,7 @@ describe("FokosDB item CRUD — model-based property", () => {
 				const setup = () => ({ model: { items: new Map() } as Model, real: makeTestDB() });
 				await fc.asyncModelRun(setup, cmds);
 			}),
-			{ numRuns: 30 },
+			{ numRuns: propertyRuns(30) },
 		);
 	});
 });
