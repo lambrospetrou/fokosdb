@@ -7,6 +7,7 @@ import { expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { QueryItemsOptions, QueryItemsResult, SortKeyCondition } from "../../src/shared/types.js";
 import type { DataKind, ItemData } from "./arbitraries.js";
+import { untilAvailable } from "./model.js";
 
 export type QueryKey = string | Uint8Array;
 export type OptionalQueryKey = QueryKey | undefined;
@@ -128,9 +129,12 @@ export async function drainQuery(db: FokosDB, opts: QueryItemsOptions, maxPages:
 	let count = 0;
 	let scannedCount = 0;
 	let pages = 0;
-	let cursor: string | undefined;
+	// A caller can hand the drain a cursor of its own, to follow an answer it started elsewhere.
+	let cursor = opts.cursor;
 	do {
-		const page: QueryItemsResult = await db.queryItems({ ...opts, cursor });
+		// A partition that splits, or a child that still imports its share, can answer 503. A client
+		// retries that, and a query changes nothing, so asking for the same page again is safe.
+		const page: QueryItemsResult = await untilAvailable(() => db.queryItems({ ...opts, cursor }));
 		pages++;
 		expectPageInvariants(page, opts);
 		onPage?.(page);

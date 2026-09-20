@@ -1,0 +1,306 @@
+// Property-based tests for queryItems while the range tree under it is still splitting.
+//
+// query-items-split.test.ts settles the tree first, so its walk always reads a topology that stands
+// still. This suite keeps writing to the same fixture: before each run it fills one leaf past its
+// cap, which queues a split, and the run then reads the tree while that leaf turns into a router and
+// its two children import their share. Two paths exist only inside that window.
+//
+//   - An importing child answers from its SOURCE, and the source keeps the rows of the WHOLE parent
+//     range. The interval the walk clips to each child is therefore the only thing that stops a
+//     child from returning rows its sibling owns, and a clip that is too wide shows up as a
+//     duplicate or an out-of-order item.
+//   - A cursor is minted under one topology and redeemed under another: the child it stopped in has
+//     become two children by the time the next page resumes from it.
+//
+// The answer itself must not move. A split relocates rows between partitions and changes nothing
+// about what the table holds, and the churn stops before each drain, so the model stays exact even
+// though a migration runs in the background while the pages arrive.
+//
+// A failure prints `seed` and `path`. See item-crud.test.ts for how to replay them.
+//
+// THE SUITE IS SKIPPED. It fails against the routing of this branch: a queryItems of a promoted key
+// can enter its range tree below the root and then answer for one leaf of it. The symptom, the
+// measurement and the reasoning are in docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md.
+// Remove the `.skip` below once a query enters a range tree at its root.
+import fc from "fast-check";
+import { beforeAll, describe, expect, it } from "vitest";
+import { FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
+import type { PutItemResult, QueryItemsOptions } from "../../src/shared/types.js";
+import { expectedDataKind, propertyRuns } from "./arbitraries.js";
+import { untilAvailable } from "./model.js";
+import { drainQuery, encodeKey, expectedItems, itemId, pageBudget, publicItem, type QueryKey } from "./query-model.js";
+import {
+	budgetFor,
+	buildFixture,
+	hotSortKey,
+	leavesOf,
+	makeArbRequest,
+	HOT_HASH_KEY,
+	HOT_ITEMS,
+	RANGE_SPLIT_MAX_SIZE_MB,
+	type Fixture,
+} from "./range-tree-fixture.js";
+
+const SUITE_TIMEOUT_MS = 600_000;
+
+// ─── The churn ──────────────────────────────────────────────────────────────────
+
+// A churn item is large, so few writes carry one leaf from half full to past its cap: a split costs
+// about a third of a megabyte of writes, and a run that pays for a whole megabyte would spend more
+// time writing than reading.
+const CHURN_ITEM_BYTES = 32 * 1024;
+// The live churn items a query has to read. SQLite keeps the space of a deleted row, so the leaf
+// still grows towards its cap and still splits, while the answer a property compares stays small.
+const CHURN_LIVE_MAX = 24;
+const MAX_PUTS_PER_PUSH = 20;
+// The whole suite writes no more than this, which is about a dozen splits. Every split adds two
+// partitions and every partition adds a hop to a scan, so an unbounded churn would spend the whole
+// suite walking a tree instead of checking it — and a deep search (FOKOS_PROPERTY_RUNS) even more.
+const CHURN_PUT_BUDGET = 200;
+const RANGE_CAP_BYTES = RANGE_SPLIT_MAX_SIZE_MB * 1024 * 1024;
+// One second. A write meets `partition_migrating` while a child imports, and that clears in a moment.
+const CHURN_RETRY_LIMIT = 40;
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** A churn sort key sits between two stable ones, so the writes land inside the tree and not above it. */
+const churnSortKey = (region: number, seq: number) => `${hotSortKey(region)}.w${String(seq).padStart(4, "0")}`;
+const churnData = (sortKey: string) => `${sortKey}:`.padEnd(CHURN_ITEM_BYTES, "x");
+
+/** The outcome of one push. Only `queued` promises that a split is on its way. */
+type PushResult = "queued" | "refused" | "budget" | "under_cap";
+
+/**
+ * The writer that keeps the tree splitting. One push fills a single region of the hot key until the
+ * leaf that owns it reports a database past the range cap: that write queued the split, so the walk
+ * the caller runs next crosses a router whose children still import.
+ *
+ * Each key is written once and never again, so the model knows every version without reading it back.
+ */
+class Churn {
+	#seq = 0;
+	#puts = 0;
+	#pushes = 0;
+	readonly #live: string[] = [];
+
+	constructor(
+		private readonly fixture: Fixture,
+		private readonly regions: readonly number[],
+	) {}
+
+	get puts(): number {
+		return this.#puts;
+	}
+
+	/** The bounds a request may draw. Some of these keys exist by then and some never will. */
+	bounds(): QueryKey[] {
+		return this.regions.flatMap((region) => [
+			hotSortKey(region),
+			`${hotSortKey(region)}.`,
+			churnSortKey(region, 1),
+			churnSortKey(region, 9999),
+		]);
+	}
+
+	async push(): Promise<PushResult> {
+		// The regions rotate, so the splits happen over the whole tree and not in one stretch of it.
+		const region = this.regions[this.#pushes++ % this.regions.length];
+		for (let i = 0; i < MAX_PUTS_PER_PUSH; i++) {
+			if (this.#puts >= CHURN_PUT_BUDGET) return "budget";
+			const result = await this.#put(churnSortKey(region, this.#seq++));
+			if (result === "refused") return "refused";
+			this.#puts++;
+			await this.#trim();
+			if (result.meta.databaseSize > RANGE_CAP_BYTES) return "queued";
+		}
+		return "under_cap";
+	}
+
+	/** Writes one churn item and records it in the model. */
+	async #put(sortKey: string): Promise<PutItemResult | "refused"> {
+		const data = churnData(sortKey);
+		const res = await this.#write(() => this.fixture.db.putItem({ hashKey: HOT_HASH_KEY, sortKey, data }));
+		if (res === "refused") return res;
+		this.fixture.model.set(itemId(HOT_HASH_KEY, sortKey), {
+			hashKey: HOT_HASH_KEY,
+			sortKey,
+			hashKeyBytes: encodeKey(HOT_HASH_KEY),
+			sortKeyBytes: encodeKey(sortKey),
+			data,
+			kind: expectedDataKind(data),
+			version: res.version,
+		});
+		this.#live.push(sortKey);
+		return res;
+	}
+
+	/**
+	 * Deletes the oldest churn items once too many are live. A refused delete leaves its key live and
+	 * a later trim removes it: the model only ever holds what the table answered for.
+	 */
+	async #trim(): Promise<void> {
+		while (this.#live.length > CHURN_LIVE_MAX) {
+			const sortKey = this.#live[0];
+			const res = await this.#write(() => this.fixture.db.deleteItem({ hashKey: HOT_HASH_KEY, sortKey }));
+			if (res === "refused") return;
+			this.#live.shift();
+			this.fixture.model.delete(itemId(HOT_HASH_KEY, sortKey));
+		}
+	}
+
+	/**
+	 * Runs one write and reports a refusal instead of waiting for it to clear. A partition above 1.1
+	 * times its cap refuses every write, including a delete, until its split makes room, and waiting
+	 * for that would close the very window this suite reads in. A key the table refused is never
+	 * written again and never enters the model, so the model still knows every version it holds.
+	 */
+	async #write<T>(op: () => Promise<T>): Promise<T | "refused"> {
+		for (let attempt = 0; ; attempt++) {
+			try {
+				return await op();
+			} catch (e) {
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) return "refused";
+				if (!FokosUnavailableError.is(e) || attempt >= CHURN_RETRY_LIMIT) throw e;
+				await sleep(25);
+			}
+		}
+	}
+}
+
+/**
+ * The stable sort keys the churn writes around: spread over the tree, and never inside the stretch
+ * the fixture emptied, which has to stay empty to keep covering the child that carries no rows.
+ */
+function churnRegions(fixture: Fixture): number[] {
+	const emptied = new Set(fixture.emptiedKeys.filter((key): key is string => typeof key === "string"));
+	return [0.1, 0.35, 0.6, 0.85].map((fraction) => {
+		let index = Math.floor(fraction * HOT_ITEMS);
+		while (index < HOT_ITEMS - 1 && emptied.has(hotSortKey(index))) index++;
+		return index;
+	});
+}
+
+/**
+ * Whether one page shows a child answering from its source. A leaf is listed once per sub-query that
+ * reaches it, so this is read off a request of ONE sub-query only: there, a name that appears twice
+ * is one source answering for two importing children of the same split.
+ */
+const readsThroughToSource = (names: readonly string[]) => new Set(names).size < names.length;
+
+// ─── The suite ──────────────────────────────────────────────────────────────────
+
+describe.skip("FokosDB queryItems while a range tree splits — model-based properties", () => {
+	let fixture: Fixture;
+	let churn: Churn;
+
+	/** Counts the whole hot key and says whether a page came from a source instead of its child. */
+	async function probeHotKey(): Promise<{ count: number; readThrough: boolean }> {
+		let count = 0;
+		let readThrough = false;
+		let cursor: string | undefined;
+		do {
+			const page = await untilAvailable(() =>
+				fixture.db.queryItems({ queries: [{ hashKey: HOT_HASH_KEY }], select: "count", limit: 100_000, cursor }),
+			);
+			count += page.count;
+			readThrough ||= readsThroughToSource(page.partitionMetas.map((meta) => meta.servedByActorName));
+			cursor = page.cursor;
+		} while (cursor !== undefined);
+		return { count, readThrough };
+	}
+
+	/** Waits until the leaves of the hot key differ from `before`, and returns whether they did. */
+	async function awaitLeafChange(before: readonly string[]): Promise<boolean> {
+		for (let attempt = 0; attempt < 20; attempt++) {
+			const now = await leavesOf(fixture.db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+			if (now.join() !== before.join()) return true;
+			await sleep(25);
+		}
+		return false;
+	}
+
+	const hotCount = () => expectedItems(fixture.model, { hashKey: HOT_HASH_KEY }).length;
+
+	beforeAll(async () => {
+		fixture = await buildFixture();
+		expect(new Set(fixture.leaves).size, "the hot key must be spread over several range leaves").toBeGreaterThanOrEqual(4);
+		churn = new Churn(fixture, churnRegions(fixture));
+	}, SUITE_TIMEOUT_MS);
+
+	// This runs first, and it is the one test that proves the window exists. If a query never meets an
+	// importing child, the properties below still pass and cover nothing new, so the suite says so here
+	// instead of reporting a silent success.
+	it("a query answers from the source while the children of a split still import", { timeout: SUITE_TIMEOUT_MS }, async () => {
+		for (let split = 0; split < 6; split++) {
+			const pushed = await churn.push();
+			expect(pushed, "the churn must be able to fill a leaf past its cap").not.toBe("budget");
+			// A tight loop of probes covers the window between the children being created and the last of
+			// them completing its import. Every probe must also agree with the model: an importing child
+			// answers from its source, and that answer is the same answer.
+			for (let probe = 0; probe < 80; probe++) {
+				const { count, readThrough } = await probeHotKey();
+				expect(count, "the count of the hot key must not change while its leaves split").toBe(hotCount());
+				if (readThrough) return;
+			}
+		}
+		throw new Error("no page ever showed a child reading through its source; the suite covers nothing new");
+	});
+
+	it("a drained request returns exactly the model's items, in key order", { timeout: SUITE_TIMEOUT_MS }, async () => {
+		await fc.assert(
+			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
+				await churn.push();
+				const expected = queries.flatMap((query) => expectedItems(fixture.model, query));
+				const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture) };
+				const drained = await drainQuery(fixture.db, opts, pageBudget(expected.length, queries.length));
+
+				expect(drained.items).toEqual(expected.map(publicItem));
+				expect(drained.count).toBe(expected.length);
+				// No filter is sent, so every evaluated candidate is also a matched one.
+				expect(drained.scannedCount).toBe(expected.length);
+			}),
+			{ numRuns: propertyRuns(20) },
+		);
+	});
+
+	it("count mode counts the same items and materializes none", { timeout: SUITE_TIMEOUT_MS }, async () => {
+		await fc.assert(
+			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
+				await churn.push();
+				const expected = queries.flatMap((query) => expectedItems(fixture.model, query));
+				const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture), select: "count" };
+				const drained = await drainQuery(fixture.db, opts, pageBudget(expected.length, queries.length));
+
+				expect(drained.items).toHaveLength(0);
+				expect(drained.count).toBe(expected.length);
+				expect(drained.scannedCount).toBe(expected.length);
+			}),
+			{ numRuns: propertyRuns(10) },
+		);
+	});
+
+	it("a cursor minted before a split resumes exactly after it", { timeout: SUITE_TIMEOUT_MS }, async () => {
+		await fc.assert(
+			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
+				await churn.push();
+				const expected = queries.flatMap((query) => expectedItems(fixture.model, query));
+				const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture) };
+
+				const before = await leavesOf(fixture.db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+				const first = await untilAvailable(() => fixture.db.queryItems(opts));
+				if (first.cursor === undefined) return;
+				// The cursor names a position in the topology the first page walked. Waiting for the leaves
+				// to change redeems it in another one, where the child it stopped in is two children and the
+				// position it carries has to resolve to the same place. A window that closes before the
+				// leaves move leaves the rest of the property just as valid, so nothing is asserted here.
+				await awaitLeafChange(before);
+
+				const rest = await drainQuery(fixture.db, { ...opts, cursor: first.cursor }, pageBudget(expected.length, queries.length));
+				const expectedPublic = expected.map(publicItem);
+				expect(first.items).toEqual(expectedPublic.slice(0, first.items.length));
+				expect([...first.items, ...rest.items]).toEqual(expectedPublic);
+			}),
+			{ numRuns: propertyRuns(10) },
+		);
+	});
+});
