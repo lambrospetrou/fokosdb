@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { CONFLICT_CODES, FokosConflictError } from "../errors.js";
-import invariant from "../invariant.js";
+import { CONFLICT_CODES, FokosConflictError } from "../shared/errors.js";
+import invariant from "../shared/invariant.js";
 import { KeyCodec } from "./key-codec.js";
 import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "./forward-meta.js";
 import type { PartitionInfoInternal } from "./types.js";

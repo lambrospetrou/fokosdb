@@ -2,8 +2,8 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { PartitionContextCreator } from "../src/shared/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../src/shared/partition-topology/router.js";
+import { PartitionContextCreator } from "../src/sharding/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../src/sharding/router.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // 3 root partitions, each splits into 2 children.

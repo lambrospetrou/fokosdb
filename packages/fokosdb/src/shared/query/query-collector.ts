@@ -1,4 +1,4 @@
-import type { KeyBytes } from "../partition-topology/key-codec.js";
+import type { KeyBytes } from "../../sharding/key-codec.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
 import type { QueryCandidateConsumer, ScanCursor, StoredItem } from "../partition/partition-store.js";
 import type { QuerySelect } from "../types.js";

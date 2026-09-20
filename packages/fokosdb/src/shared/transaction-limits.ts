@@ -9,7 +9,7 @@
  * encoding are one step and cannot drift apart.
  */
 
-import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
+import type { PartitionContextResolved } from "../sharding/partition-context.js";
 import type {
 	ParticipantOperationResultEncoded,
 	RejectionReasonEncoded,
@@ -19,7 +19,7 @@ import type {
 } from "./transaction-wire-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
-import { KeyCodec, type KeyBytes } from "./partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 import invariant from "./invariant.js";
 

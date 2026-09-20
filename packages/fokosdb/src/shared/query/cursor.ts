@@ -1,6 +1,6 @@
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
-import { hash64 } from "../hash-primitives.js";
-import type { SkInterval } from "./sk-interval.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { hash64 } from "../../sharding/hash-primitives.js";
+import type { SkInterval } from "../../sharding/sk-interval.js";
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 
 const encoder = new TextEncoder();

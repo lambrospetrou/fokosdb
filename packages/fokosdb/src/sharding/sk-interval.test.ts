@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "./key-codec.js";
 import {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -8,7 +8,7 @@ import {
 	rangeIntersects,
 	type SkInterval,
 } from "./sk-interval.js";
-import type { ScanCursor } from "../partition/partition-store.js";
+import type { ScanCursor } from "../shared/partition/partition-store.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const sentinel = () => KeyCodec.encodeOptional(undefined);

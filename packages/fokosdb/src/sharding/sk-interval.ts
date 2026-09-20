@@ -1,6 +1,6 @@
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
-import type { ScanCursor } from "../partition/partition-store.js";
-import type { SortKeyCondition } from "../types.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
+import type { ScanCursor } from "../shared/partition/partition-store.js";
+import type { SortKeyCondition } from "../shared/types.js";
 
 /** Byte-space sort-key interval. Both ends are optional (absent = unbounded). */
 export type SkInterval = {

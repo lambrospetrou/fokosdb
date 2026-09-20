@@ -14,9 +14,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import type { FokosImportRecord, FokosMigrationPullRequest } from "../../src/shared/partition/repartition/repartition-types.js";
-import { REPARTITION_KV_KEYS } from "../../src/shared/partition/repartition/repartition-flow.js";
-import { PartitionIdHelper, hashChildIndex } from "../../src/shared/partition-topology/partition-id.js";
+import type { FokosImportRecord, FokosMigrationPullRequest } from "../../src/sharding/repartition-types.js";
+import { REPARTITION_KV_KEYS } from "../../src/sharding/repartition-flow.js";
+import { PartitionIdHelper, hashChildIndex } from "../../src/sharding/partition-id.js";
 import { kb } from "./helpers.js";
 import { makePartition, TestPartition } from "./partition-harness.js";
 

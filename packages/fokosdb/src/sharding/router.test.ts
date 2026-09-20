@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { PartitionContextCreator } from "./partition-context.js";
 import { PartitionTopologyRouterImpl } from "./router.js";
 import { KeyCodec } from "./key-codec.js";
-import type { FokosPartitionRef } from "../partition/repartition/repartition-types.js";
+import type { FokosPartitionRef } from "./repartition-types.js";
 
 function makeRouter(rootTreesN: number, jurisdiction?: DurableObjectJurisdiction) {
 	return new PartitionTopologyRouterImpl(

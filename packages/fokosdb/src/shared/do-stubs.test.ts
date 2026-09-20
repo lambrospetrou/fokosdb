@@ -3,7 +3,7 @@
  * every call, so a test proves which binding a helper resolved and whether `jurisdiction()` ran.
  */
 import { describe, expect, it, vi } from "vitest";
-import { PartitionContextCreator, type PartitionContext } from "./partition-topology/partition-context.js";
+import { PartitionContextCreator, type PartitionContext } from "../sharding/partition-context.js";
 import { partitionNamespace, partitionStub, partitionStubByName, txCoordinatorNamespace, txCoordinatorStub } from "./do-stubs.js";
 
 function fakeNamespace() {

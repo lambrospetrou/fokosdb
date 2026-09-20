@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { computeCursorFingerprint } from "./cursor.js";
 
 const queries = () => [

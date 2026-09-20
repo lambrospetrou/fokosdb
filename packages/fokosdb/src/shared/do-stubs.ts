@@ -12,7 +12,7 @@
  */
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { PartitionContext } from "./partition-topology/partition-context.js";
+import type { PartitionContext } from "../sharding/partition-context.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.

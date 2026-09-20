@@ -1,11 +1,11 @@
 import { env } from "cloudflare:workers";
 import type { PartitionContext, PartitionContextResolved } from "./partition-context.js";
-import { partitionNamespace } from "../do-stubs.js";
+import { partitionNamespace } from "../shared/do-stubs.js";
 import type { PartitionNodeId } from "./types.js";
-import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "../hash-primitives.js";
+import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import { assertExists } from "../tsutils.js";
-import invariant from "../invariant.js";
+import { assertExists } from "../shared/tsutils.js";
+import invariant from "../shared/invariant.js";
 
 /**
  * Pure partition-identity codec: the opaque partition ID wire formats, DO naming, and

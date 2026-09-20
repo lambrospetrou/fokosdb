@@ -7,18 +7,16 @@
  * without reading, which is what lets a later runtime package keep the flow unchanged while an
  * application defines its own streams.
  */
-import type { KeyBytes } from "../../partition-topology/key-codec.js";
-import type { PartitionContextLivePartition, PartitionContextResolved } from "../../partition-topology/partition-context.js";
-import type { RangeAncestorInfo } from "../../partition-topology/types.js";
+import type { KeyBytes } from "./key-codec.js";
+import type { PartitionContextLivePartition, PartitionContextResolved } from "./partition-context.js";
+import type { RangeAncestorInfo } from "./types.js";
 import type {
 	PromotedKeyCursor,
 	RepartitionKind,
 	RepartitionState,
 	RepartitionTargetRow,
 	TargetInitialization,
-} from "../partition-store.js";
-// Type-only import: the emit erases it, so it makes NO runtime module cycle with do-partition.ts.
-import type { GetItemRpcRequest, GetItemRpcResponse, QueryItemsRpcRequest, QueryItemsRpcResponse } from "../../../server/do-partition.js";
+} from "../shared/partition/partition-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
 
 export type { FokosSlice };
@@ -94,10 +92,12 @@ export type FokosMigrationPage =
 	| { phase: "overrides"; overrides: { hashKey: KeyBytes }[]; nextCursor: FokosMigrationCursor | null }
 	| { phase: "host"; page: unknown; nextCursor: FokosMigrationCursor | null };
 
-/** One read a still-importing target asks its source to serve, for the slice that target owns. */
-export type FokosExecuteLocalRequest =
-	| { op: "getItem"; repartitionId: string; caller: FokosPartitionRef; request: GetItemRpcRequest }
-	| { op: "queryItems"; repartitionId: string; caller: FokosPartitionRef; request: QueryItemsRpcRequest };
+/**
+ * One read a still-importing target asks its source to serve, for the slice that target owns. The
+ * operation name and the request are opaque here: the source knows which operations it serves and
+ * narrows both.
+ */
+export type FokosExecuteLocalRequest = { op: string; repartitionId: string; caller: FokosPartitionRef; request: unknown };
 
 /** Everything one partition calls on another to run a repartition. */
 export interface FokosPartitionControlRpc {
@@ -105,7 +105,7 @@ export interface FokosPartitionControlRpc {
 	fokosStartImport(req: FokosStartImportRequest): Promise<void>;
 	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage>;
 	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void>;
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse>;
+	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<unknown>;
 }
 
 /** The four methods the flow itself calls. It never reads through a peer; the DO owns that path. */

@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { JsonValue } from "../json-types.js";
 import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind, QuerySelect } from "../types.js";
 import { materializeExpressionBindings } from "./bindings.js";

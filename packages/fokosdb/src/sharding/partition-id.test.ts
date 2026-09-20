@@ -8,7 +8,7 @@ import {
 	resolveRangePartitionContext,
 } from "./partition-id.js";
 import { PartitionTopologyRouterImpl } from "./router.js";
-import { invariantFailure } from "../../../test/errors-matchers.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 

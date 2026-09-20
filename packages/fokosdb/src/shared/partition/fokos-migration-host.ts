@@ -14,9 +14,9 @@
  * The two never merge into one page: `items` holds committed state only, and a pending lock is a
  * separate row that commit or cancel resolves later.
  */
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
-import { collectBatch } from "./batch-scan.js";
+import { collectBatch } from "../../sharding/batch-scan.js";
 import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
@@ -26,8 +26,8 @@ import {
 	type PendingTransactionRow,
 	type ScanCursor,
 } from "./partition-store.js";
-import { sliceIncludesItem, type FokosSlice } from "./repartition/repartition-slice.js";
-import type { MigrationHost } from "./repartition/repartition-types.js";
+import { sliceIncludesItem, type FokosSlice } from "../../sharding/repartition-slice.js";
+import type { MigrationHost } from "../../sharding/repartition-types.js";
 
 /** The page budgets of one pull. The source owns them; the request carries no budget. */
 const PAGE_BYTES = 20 * 1024 * 1024;

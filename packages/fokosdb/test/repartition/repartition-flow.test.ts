@@ -7,12 +7,12 @@
  * call on the receiving half directly.
  */
 import { describe, expect, it } from "vitest";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import { hashChildIndex } from "../../src/shared/hash-primitives.js";
-import { REPARTITION_KV_KEYS, type RepartitionPlan } from "../../src/shared/partition/repartition/repartition-flow.js";
+import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
+import { REPARTITION_KV_KEYS, type RepartitionPlan } from "../../src/sharding/repartition-flow.js";
 import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node } from "./repartition-harness.js";
-import type { KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
+import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import type { PartitionStore, RepartitionKind } from "../../src/shared/partition/partition-store.js";
 
 /**

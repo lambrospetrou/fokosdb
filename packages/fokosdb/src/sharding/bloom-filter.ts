@@ -1,5 +1,5 @@
 import { hash32 } from "./hash-primitives.js";
-import invariant from "./invariant.js";
+import invariant from "../shared/invariant.js";
 
 /**
  * Layered Bloom Filter

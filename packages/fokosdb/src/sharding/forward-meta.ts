@@ -1,4 +1,4 @@
-import { FokosError } from "../errors.js";
+import { FokosError } from "../shared/errors.js";
 import type { PartitionInfoInternal } from "./types.js";
 
 /**

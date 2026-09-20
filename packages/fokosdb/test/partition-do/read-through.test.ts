@@ -10,7 +10,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import type { GetItemRpcResponse, QueryItemsRpcRequest, QueryItemsRpcResponse } from "../../src/server/do-partition.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
 import type { StoredItem } from "../../src/shared/partition/partition-store.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb } from "./helpers.js";
 import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld } from "./partition-harness.js";

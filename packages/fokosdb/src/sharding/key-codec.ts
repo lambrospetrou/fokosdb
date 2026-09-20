@@ -14,8 +14,8 @@
  * from RPC and BLOB reads — a zero-cost cast).
  */
 
-import { hash64 } from "../hash-primitives.js";
-import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
+import { hash64 } from "./hash-primitives.js";
+import { FokosValidationError, VALIDATION_CODES } from "../shared/errors.js";
 
 declare const KEY_BRAND: unique symbol;
 export type KeyBytes = Uint8Array & { readonly [KEY_BRAND]: true };

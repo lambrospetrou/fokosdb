@@ -6,7 +6,7 @@
 import { DurableObject } from "cloudflare:workers";
 import type { CompiledQueryPlan } from "../../src/shared/expression/plan.js";
 import type { ProjectedWireRow } from "../../src/shared/expression/projection.js";
-import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { PartitionStore, PromotedKeyStatus, ScanCursor, StoredItem } from "../../src/shared/partition/partition-store.js";
 import type { PromotionCandidate, TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
 import { QueryPageBudget } from "../../src/shared/query/page-budget.js";
@@ -16,7 +16,7 @@ import {
 	isChildFullyBeforeCursor,
 	makeBoundaryCursor,
 	rangeIntersects,
-} from "../../src/shared/query/sk-interval.js";
+} from "../../src/sharding/sk-interval.js";
 import type {
 	CancelRequest,
 	CancelResponse,

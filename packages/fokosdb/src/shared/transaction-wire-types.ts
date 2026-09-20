@@ -5,8 +5,8 @@
  */
 import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ProjectedWireRow } from "./expression/projection.js";
-import type { KeyBytes } from "./partition-topology/key-codec.js";
-import type { PartitionContextResolved } from "./partition-topology/partition-context.js";
+import type { KeyBytes } from "../sharding/key-codec.js";
+import type { PartitionContextResolved } from "../sharding/partition-context.js";
 import type { IdempotencyToken, RejectionReasonOf, TransactionId } from "./transaction-api-types.js";
 import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 

@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import type { ProjectedWireRow } from "../expression/projection.js";
 import type { StoredItem } from "../partition/partition-store.js";
 import type { QueryPageBudgetState } from "./page-budget.js";

@@ -27,7 +27,7 @@ import {
 import { isDestroyAbortError } from "../shared/cf-utils.js";
 import { partitionStub, partitionStubByName, txCoordinatorNamespace } from "../shared/do-stubs.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { PartitionTopologyRouter } from "../shared/partition-topology/router.js";
+import type { PartitionTopologyRouter } from "../sharding/router.js";
 import type {
 	ExecutionFailureCode,
 	RejectionReason,
@@ -81,10 +81,10 @@ import {
 	withExpressionErrors,
 } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
-import { KeyCodec } from "../shared/partition-topology/key-codec.js";
-import type { PartitionInfoInternal } from "../shared/partition-topology/types.js";
-import { routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
-import { normalizeSkInterval } from "../shared/query/sk-interval.js";
+import { KeyCodec } from "../sharding/key-codec.js";
+import type { PartitionInfoInternal } from "../sharding/types.js";
+import { routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
+import { normalizeSkInterval } from "../sharding/sk-interval.js";
 import type { ScanCursor, StoredItem } from "../shared/partition/partition-store.js";
 import { CURSOR_VERSION, encodeCursor, decodeCursor, computeCursorFingerprint, type DecodedCursor } from "../shared/query/cursor.js";
 import {
@@ -103,8 +103,8 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { PartitionContextResolved } from "../shared/partition-topology/partition-context.js";
-import type { FokosPartitionRef, FokosStatusCursor, FokosStatusPage } from "../shared/partition/repartition/repartition-types.js";
+import { PartitionContextResolved } from "../sharding/partition-context.js";
+import type { FokosPartitionRef, FokosStatusCursor, FokosStatusPage } from "../sharding/repartition-types.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 const TX_COORDINATOR_DESTROY_BATCH_SIZE = 1_000;

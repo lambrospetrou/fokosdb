@@ -1,15 +1,15 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import type { PartitionDO } from "../../server/do-partition.js";
-import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { FokosError, UNAVAILABLE_CODES } from "../errors.js";
-import { invariantFailure } from "../../../test/errors-matchers.js";
-import { PartitionStore } from "../partition/partition-store.js";
+import type { PartitionDO } from "../server/do-partition.js";
+import { testPartitionStub } from "../../test/stub-helpers.js";
+import { FokosError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
+import { PartitionStore } from "../shared/partition/partition-store.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartitionContextCreator, type PartitionContextResolved } from "./partition-context.js";
 import { PartitionIdHelper, resolveRangePartitionContext } from "./partition-id.js";
 import { HashPartitionTopologyImpl, RangePartitionTopologyImpl, type OperationIntent } from "./split-policy.js";
-import type { RepartitionRouting } from "../partition/repartition/repartition-types.js";
+import type { RepartitionRouting } from "./repartition-types.js";
 
 // An empty SQLite database already occupies several KB, so any partition built with this cap is
 // over its 10% backpressure threshold from the first request — no data has to be written.

@@ -1,4 +1,4 @@
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { decodeBase64Bytes } from "./byte-literal.js";
 import type { ExpressionBindingDescriptor, ExpressionBindingLayout } from "./plan.js";
 

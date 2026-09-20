@@ -1,7 +1,7 @@
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
-import type { RangeAncestorInfo } from "../partition-topology/types.js";
-import { KeyCodec, type KeyBytes } from "../partition-topology/key-codec.js";
+import type { RangeAncestorInfo } from "../../sharding/types.js";
+import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
 import { one, tryOne } from "../sql-cursor.js";
 import {

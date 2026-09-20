@@ -1,4 +1,4 @@
-import { AddResult, BloomFilter, type BloomFilterSnapshot } from "../bloom-filter.js";
+import { AddResult, BloomFilter, type BloomFilterSnapshot } from "./bloom-filter.js";
 import type { KeyBytes } from "./key-codec.js";
 
 export type PartialRangeTopologySnapshot = {

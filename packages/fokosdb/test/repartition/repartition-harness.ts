@@ -16,14 +16,14 @@
 import { runInDurableObject } from "cloudflare:test";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import { KeyCodec, type KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import {
 	PartitionContextCreator,
 	type PartitionContext,
 	type PartitionContextLivePartition,
 	type PartitionContextResolved,
-} from "../../src/shared/partition-topology/partition-context.js";
-import { PartitionIdHelper, resolveRangePartitionContext } from "../../src/shared/partition-topology/partition-id.js";
+} from "../../src/sharding/partition-context.js";
+import { PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import {
@@ -32,13 +32,13 @@ import {
 	REPARTITION_KV_KEYS,
 	type RepartitionSourceDeps,
 	type RepartitionTargetDeps,
-} from "../../src/shared/partition/repartition/repartition-flow.js";
+} from "../../src/sharding/repartition-flow.js";
 import type {
 	FokosInitRequest,
 	FokosMigrationPage,
 	FokosPartitionRef,
 	FokosRepartitionPeer,
-} from "../../src/shared/partition/repartition/repartition-types.js";
+} from "../../src/sharding/repartition-types.js";
 
 export const kb = (s: string) => KeyCodec.encode(s);
 

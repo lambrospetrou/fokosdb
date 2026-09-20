@@ -6,11 +6,11 @@
  * Where this file departs from the RFC text, the departure is what a consumer needed to compile. Each such
  * place has a comment that starts with "Departure:".
  */
-import type { KeyBytes } from "../../src/shared/partition-topology/key-codec.js";
-import type { RangeAncestorInfo } from "../../src/shared/partition-topology/types.js";
+import type { KeyBytes } from "../../src/sharding/key-codec.js";
+import type { RangeAncestorInfo } from "../../src/sharding/types.js";
 import type { RepartitionKind, RepartitionState } from "../../src/shared/partition/partition-store.js";
-import type { FokosSlice } from "../../src/shared/partition/repartition/repartition-slice.js";
-import type { SkInterval } from "../../src/shared/query/sk-interval.js";
+import type { FokosSlice } from "../../src/sharding/repartition-slice.js";
+import type { SkInterval } from "../../src/sharding/sk-interval.js";
 
 export type { FokosSlice, KeyBytes, RangeAncestorInfo, RepartitionKind, RepartitionState, SkInterval };
 

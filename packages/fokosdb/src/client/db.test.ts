@@ -14,15 +14,15 @@ import {
 	MAX_PARTITION_VISITS_PER_PAGE,
 	MAX_RESPONSE_BYTES_PER_PAGE,
 } from "../shared/query/page-budget.js";
-import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-topology/partition-context.js";
-import { PartitionTopologyRouterImpl } from "../shared/partition-topology/router.js";
+import { PartitionContextCreator, type PartitionNamespaceKey } from "../sharding/partition-context.js";
+import { PartitionTopologyRouterImpl } from "../sharding/router.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
-import { KeyCodec } from "../shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
 import type { JsonValue } from "../shared/json-types.js";
 import { EST_ROW_BYTES_K } from "../shared/partition/item-size.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
-import { routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
+import { routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
 import { FokosUnavailableError, UNAVAILABLE_CODES, type FokosError } from "../shared/errors.js";
 
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided

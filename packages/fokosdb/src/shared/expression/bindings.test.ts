@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyCodec } from "../partition-topology/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { materializedPlanBindings, materializeExpressionBindings } from "./bindings.js";
 import type { ExpressionBindingDescriptor } from "./plan.js";
 

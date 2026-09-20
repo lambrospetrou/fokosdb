@@ -1,4 +1,4 @@
-import { KeyCodec } from "../shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../sharding/key-codec.js";
 import { validateKeyContent } from "../shared/transaction-limits.js";
 import type { HashKey, QueryItemsOptions, SortKey } from "../shared/types.js";
 

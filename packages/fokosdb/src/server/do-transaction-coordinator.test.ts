@@ -5,7 +5,7 @@ import type { PartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
 import { testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
-import { KeyCodec } from "../shared/partition-topology/key-codec.js";
+import { KeyCodec } from "../sharding/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {

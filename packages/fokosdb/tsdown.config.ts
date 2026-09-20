@@ -9,6 +9,46 @@ const CLIENT_FORBIDDEN_SRC = "src/server/";
 const CLIENT_ALLOWED_EXTERNALS = [/^cloudflare:workers$/, /^xxhash-wasm$/, /^durable-utils\//];
 
 /**
+ * Source directories and files that the sharding entry must never reach: the FokosDB data model. The
+ * sharding layer moves ownership between partitions and knows nothing about items, expressions, or
+ * transactions.
+ */
+const SHARDING_FORBIDDEN_SRC = [
+	"src/server/",
+	"src/client/",
+	"src/shared/expression/",
+	"src/shared/query/",
+	/src\/shared\/transaction-[^/]*\.ts$/,
+];
+
+/**
+ * The generic `src/shared/` modules that the sharding entry may reach. Every other `src/shared/`
+ * module is FokosDB code.
+ *
+ * `do-stubs.ts` reads the FokosDB binding and location hint, so it is host code. `partition-id.ts` and
+ * `router.ts` call it to derive `primaryDoIdStr`, so it stays on the list until that field is dropped
+ * and the two modules stop resolving Durable Object IDs.
+ */
+const SHARDING_ALLOWED_SHARED = [
+	"src/shared/errors.ts",
+	"src/shared/invariant.ts",
+	"src/shared/tsutils.ts",
+	"src/shared/cache-lru.ts",
+	"src/shared/do-stubs.ts",
+];
+
+/**
+ * A `src/shared/` module that is not on the allow list. `src/shared/partition/` is exempt while the
+ * split policies and the repartition flow take `PartitionStore`; it joins `SHARDING_FORBIDDEN_SRC`
+ * when they take the sharding store instead.
+ */
+function isUnlistedShared(id: string): boolean {
+	return (
+		id.includes("src/shared/") && !id.includes("src/shared/partition/") && !SHARDING_ALLOWED_SHARED.some((allowed) => id.endsWith(allowed))
+	);
+}
+
+/**
  * Upper bound for the client entry and every chunk that it imports, in MINIFIED bytes.
  *
  * Minified, because that is the size a consumer ships: their bundler merges the entry with its chunks
@@ -22,6 +62,7 @@ export default defineConfig({
 	entry: {
 		"client/index": "src/client/index.ts",
 		"server/index": "src/server/index.ts",
+		"sharding/index": "src/sharding/index.ts",
 	},
 	format: ["esm"],
 	dts: true,
@@ -65,6 +106,22 @@ export default defineConfig({
 				if (graphs.length === 0) return;
 
 				for (const { entry, chunks, externals } of graphs) {
+					if (entry.name === "sharding/index") {
+						const fokosModules = chunks
+							.flatMap((chunk) => chunk.moduleIds)
+							.filter(
+								(id) =>
+									SHARDING_FORBIDDEN_SRC.some((rule) => (typeof rule === "string" ? id.includes(rule) : rule.test(id))) ||
+									isUnlistedShared(id),
+							)
+							.sort();
+						if (fokosModules.length > 0) {
+							this.error(
+								`The sharding bundle contains FokosDB modules. Import them with \`import type\` only, or move the generic part behind a hook:\n  ${fokosModules.join("\n  ")}`,
+							);
+						}
+						continue;
+					}
 					if (entry.name !== "client/index") continue;
 
 					const serverModules = chunks

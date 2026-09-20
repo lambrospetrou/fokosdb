@@ -30,25 +30,21 @@ import {
 	PartitionContext,
 	PartitionContextResolved,
 	PartitionContextLivePartition,
-} from "../shared/partition-topology/partition-context.js";
-import {
-	PartitionIdHelper,
-	resolveHashChildPartitionContexts,
-	resolveRangePartitionContext,
-} from "../shared/partition-topology/partition-id.js";
-import { KeyCodec, type KeyBytes } from "../shared/partition-topology/key-codec.js";
+} from "../sharding/partition-context.js";
+import { PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "../sharding/partition-id.js";
+import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import {
 	HashPartitionTopologyImpl,
 	PartitionTopologySplitter,
 	RANGE_PROMOTION_FRACTION,
 	RangePartitionTopologyImpl,
 	type OperationIntent,
-} from "../shared/partition-topology/split-policy.js";
-import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "../shared/partition-topology/types.js";
-import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "../shared/partition-topology/forward-meta.js";
+} from "../sharding/split-policy.js";
+import type { PartitionInfoInternal, RangeAncestorInfo, SplitType } from "../sharding/types.js";
+import { forwardedMeta, learnFromErrorMeta, routedError, stampRoutingMeta } from "../sharding/forward-meta.js";
 import { tryWhile } from "durable-utils/retries";
 import invariant from "../shared/invariant.js";
-import { collectBatch } from "../shared/partition/batch-scan.js";
+import { collectBatch } from "../sharding/batch-scan.js";
 import type { CompiledProjectionPlan, CompiledQueryPlan } from "../shared/expression/plan.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import {
@@ -65,7 +61,7 @@ import {
 import { TransactionParticipant } from "../shared/partition/transaction-participant.js";
 import type { PromotionCandidate } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
-import { assertPointInSlice, clipQueryToSlice } from "../shared/partition/repartition/repartition-slice.js";
+import { assertPointInSlice, clipQueryToSlice } from "../sharding/repartition-slice.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import {
 	RepartitionSource,
@@ -74,9 +70,10 @@ import {
 	type RepartitionCommonDeps,
 	type RepartitionSourceDeps,
 	type RepartitionTargetDeps,
-} from "../shared/partition/repartition/repartition-flow.js";
+} from "../sharding/repartition-flow.js";
 import type {
 	FokosImportState,
+	FokosExecuteLocalRequest,
 	FokosInitRequest,
 	FokosMigrationAckRequest,
 	FokosMigrationPage,
@@ -86,9 +83,9 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusPage,
 	FokosStatusRequest,
-} from "../shared/partition/repartition/repartition-types.js";
-import { AddResult } from "../shared/bloom-filter.js";
-import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "../shared/partition-topology/partial-range-topology.js";
+} from "../sharding/repartition-types.js";
+import { AddResult } from "../sharding/bloom-filter.js";
+import { PartialRangeTopology, type PartialRangeTopologySnapshot } from "../sharding/partial-range-topology.js";
 import {
 	clipToChildRange,
 	cursorFallsInChild,
@@ -96,7 +93,7 @@ import {
 	makeBoundaryCursor,
 	rangeIntersects,
 	type SkInterval,
-} from "../shared/query/sk-interval.js";
+} from "../sharding/sk-interval.js";
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { DESTROY_ABORT_SENTINEL, getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
@@ -192,7 +189,7 @@ export type GetItemRpcResponse =
 
 // ─── queryItems internal types ────────────────────────────────────────────────
 
-export type { SkInterval } from "../shared/query/sk-interval.js";
+export type { SkInterval } from "../sharding/sk-interval.js";
 export type { ScanCursor } from "../shared/partition/partition-store.js";
 export type { ProjectedWireRow } from "../shared/expression/projection.js";
 
@@ -241,8 +238,11 @@ export type QueryItemsRpcResponse = {
 
 // ─── read-through types ───────────────────────────────────────────────────────
 
-export type { FokosPartitionRef, FokosExecuteLocalRequest } from "../shared/partition/repartition/repartition-types.js";
-import type { FokosExecuteLocalRequest } from "../shared/partition/repartition/repartition-types.js";
+export type { FokosPartitionRef } from "../sharding/repartition-types.js";
+
+/** The two reads a FokosDB source serves through `fokosExecuteLocal`. Narrows the opaque sharding wire type. */
+export type FokosDbExecuteLocalRequest = Omit<FokosExecuteLocalRequest, "op" | "request"> &
+	({ op: "getItem"; request: GetItemRpcRequest } | { op: "queryItems"; request: QueryItemsRpcRequest });
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -836,11 +836,11 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	 * target could read a sibling's keys, or read keys this partition has already promoted away, whose
 	 * local rows are stale or already collected. A caller it cannot place is rejected outright.
 	 */
-	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
+	async fokosExecuteLocal(req: FokosDbExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
 		return await this.#rpc("fokosExecuteLocal", async () => await this.#fokosExecuteLocal(req));
 	}
 
-	async #fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
+	async #fokosExecuteLocal(req: FokosDbExecuteLocalRequest): Promise<GetItemRpcResponse | QueryItemsRpcResponse> {
 		const pCtx = this.pCtx();
 		const slice = this.#source.resolveCallerSlice(req.repartitionId, req.caller);
 
