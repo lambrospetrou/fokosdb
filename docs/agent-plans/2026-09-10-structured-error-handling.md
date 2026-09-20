@@ -578,11 +578,10 @@ failure. A row marked "no" for one path is a failure that path cannot have.
 | The decision is not final yet | no | yes | `FokosTransactionPendingError` | `transaction_undecided` or `transaction_commit_pending` |
 | The token was used for another set of operations | no. The fast path takes no token | yes | `FokosValidationError` | `idempotent_parameter_mismatch` |
 | The coordinator is over its storage cap | no | yes | `FokosUnavailableError` | `coordinator_over_size` |
-| The items span more than one partition | yes | no | Not raised. `db.ts` runs the two-phase path | `single_partition_fast_path_not_applicable`, internal only |
+| The items span more than one partition | yes | no | Not raised. The partition answers `{ outcome: "not_applicable" }` and `db.ts` runs the two-phase path | none |
 
 On the fast path, `db.ts` converts a thrown error into `FokosTransactionCancelledError` when
-`FokosError.is(err)` holds and its code is neither `foreign_error` nor
-`single_partition_fast_path_not_applicable`. One partition owns every operation of this path, so
+`FokosError.is(err)` holds and its code is not `foreign_error`. One partition owns every operation of this path, so
 every operation is rejected with the code and the `error_id` of that error. Two rules make this safe:
 
 1. `txExecuteSingleShot` does not throw after its apply commits. Today it calls `checkSplitsNoKey`
@@ -606,7 +605,7 @@ where the data is.
 | A write changed an item between the two phases | no. One partition reads a snapshot | yes | `FokosConflictError` | `read_conflict` |
 | A partition read fails after the retries of the path | yes | yes | The error as the partition raised it | For example `partition_migrating`, `partition_misrouted`, or `foreign_error` |
 | A participant drops a requested key | no | yes | `FokosInternalError` | `invariant_failed` |
-| The items span more than one partition | yes | no | Not raised. `db.ts` runs the two-phase path | `single_partition_fast_path_not_applicable`, internal only |
+| The items span more than one partition | yes | no | Not raised. The partition answers `{ outcome: "not_applicable" }` and `db.ts` runs the two-phase path | none |
 
 A read applies nothing, so a failed read never has an unknown outcome. `db.ts` rethrows the error of a
 failed phase call in place of the `transient_error` collapse in `#readTransaction`. The
@@ -991,7 +990,6 @@ defaults that section 4.2.1 describes.
 | `prepare_unanswered` | Unavailable | `mpncbz` | s | 503 |
 | `partition_misrouted` | Routing | `6ddzyj` | i | 500 |
 | `range_partition_not_initialized` | Routing | `6ue24c` | i | 500 |
-| `single_partition_fast_path_not_applicable` | Routing | `7647dt` | i | 500 |
 | `invariant_failed` | Internal | `85quf8` | i | 500 |
 | `partition_context_mismatch` | Internal | `8hv63q` | i | 500 |
 | `item_data_parse_failed` | Internal | `dx9mht` | i | 500 |

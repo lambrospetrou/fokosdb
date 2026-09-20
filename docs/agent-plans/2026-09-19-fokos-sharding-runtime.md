@@ -637,7 +637,12 @@ type FokosOperation<Req, Res> =
 			/** "fail_fast": stop at the first failure. "attempt_all": run every group, then throw if any failed. */
 			failurePolicy: "fail_fast" | "attempt_all";
 		})
-	| (FokosOperationBase<Req, Res> & { shape: "single_owner"; items(req: Req): Array<{ key: RouteKey }> })
+	| (FokosOperationBase<Req, Res> & {
+			shape: "single_owner";
+			items(req: Req): Array<{ key: RouteKey }>;
+			/** The answer when the items span more than one partition. Returned, never thrown. */
+			notApplicable: Res;
+		})
 	| (FokosOperationBase<Req, Res> & {
 			shape: "scan";
 			whileMigrating: "read_source";
@@ -661,12 +666,15 @@ type FokosOperation<Req, Res> =
 | -------------- | -------------------------------------------- | -------------------------------------------------------------------------------- |
 | `point`        | One key                                      | Local, or forward to one partition. Learns caches from the envelope.             |
 | `group`        | Every item                                   | Local group plus one group per remote partition. Host merges.                    |
-| `single_owner` | Every item                                   | Exactly one destination. Otherwise throw `single_partition_fast_path_not_applicable`. |
+| `single_owner` | Every item                                   | Exactly one destination. Otherwise return the host's `notApplicable` value.      |
 | `scan`         | Hash key to a leaf, then ordered range visit | Visits the kept range children in order until `fold` stops.                      |
 | `local`        | None                                         | Never forwarded, never gated. Used by `fokosExecuteLocal`, by admin, and by host traversals. |
 
-`single_owner` throws instead of returning a host value. The error has no side effects and passes unchanged
-through every forwarding hop, so the caller runs its multi-partition path.
+When the items of a `single_owner` operation span more than one partition, the runtime returns the value the
+host names as `notApplicable` instead of an error. Today that value is `{ outcome: "not_applicable" }` on
+`SingleShotResponse` and `ReadSnapshotResponse`. It has no side effects and passes unchanged through every
+forwarding hop, so the caller runs its multi-partition path. On a split table it is the ordinary answer for
+such a set, so it is not an error.
 
 A `group` operation on a router has an empty local group. The host `merge` receives zero or more parts. When
 `items(req)` returns an empty list, the runtime runs `local(req)` on this partition, owner or router, with no
@@ -1022,7 +1030,6 @@ traversal read its last page.
 | `partition_context_mismatch`                | `FokosInternalError`     | The route context disagrees with the stored identity.          |
 | `partition_misrouted`                       | `FokosRoutingError`      | The key cannot belong to this partition, or is outside a slice.|
 | `range_partition_not_initialized`           | `FokosRoutingError`      | A range partition has no identity. Speculative callers fall back. |
-| `single_partition_fast_path_not_applicable` | `FokosRoutingError`      | `single_owner` items span more than one partition.             |
 | `partition_fanout_failed`                   | `FokosInternalError`     | An `attempt_all` group had a failed remote group.              |
 | `repartition_not_cut_over`                  | `FokosUnavailableError`  | The source still owns the slice. Retryable.                    |
 | `repartition_unknown`                       | `FokosInternalError`     | Pull, ack, or start for an unknown repartition.                |

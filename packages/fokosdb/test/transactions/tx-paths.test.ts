@@ -4,13 +4,10 @@ import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordi
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { countDistinctPartitions, keysInOnePartition, makeDB, writeOutcome } from "./tx-helpers.js";
-import { FokosRoutingError, ROUTING_CODES } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 
-/** The error a partition raises when it cannot execute the whole item set alone. */
-function fastPathNotApplicable(): FokosRoutingError {
-	return new FokosRoutingError(ROUTING_CODES.single_partition_fast_path_not_applicable, { message: "items span more than one partition" });
-}
+/** The answer a partition gives when it cannot execute the whole item set alone. */
+const fastPathNotApplicable = { outcome: "not_applicable" as const };
 
 /**
  * The single-partition fast path answers a transaction from the owning partition in one round trip,
@@ -131,11 +128,11 @@ describe("transactions - single-partition fast path", () => {
 		const keys = keysInOnePartition(db, 2, "fast-fallback");
 		for (const key of keys) await db.putItem({ ...key, data: `data-${key.hashKey}` });
 
-		// A partition raises this when the items straddle a split or a promotion below it. Standing in
-		// for that setup here keeps the test on what db.ts owns: recognising the code and finishing the
-		// read through the two-phase path. The raise itself is covered in test/partition-do/.
+		// A partition answers this when the items straddle a split or a promotion below it. Standing in
+		// for that setup here keeps the test on what db.ts owns: recognising the answer and finishing the
+		// read through the two-phase path. The answer itself is covered in test/partition-do/.
 		const { snapshotCalls, transactionCalls } = countReadPathCalls();
-		snapshotCalls.mockRejectedValue(fastPathNotApplicable());
+		snapshotCalls.mockResolvedValue(fastPathNotApplicable);
 
 		const result = await db.transactGetItems({ items: keys });
 
@@ -255,11 +252,11 @@ describe("transactions - single-partition fast path", () => {
 		const db = makeDB();
 		const keys = keysInOnePartition(db, 2, "fast-write-fallback");
 
-		// A partition raises this when the items straddle a split or a promotion below it. The raise
+		// A partition answers this when the items straddle a split or a promotion below it. The answer
 		// itself is covered in test/partition-do/; what matters here is that db.ts recognises it and
 		// finishes the write on the coordinator path.
 		const { partitionCalls, coordinatorCalls } = countWritePathCalls();
-		partitionCalls.mockRejectedValue(fastPathNotApplicable());
+		partitionCalls.mockResolvedValue(fastPathNotApplicable);
 
 		const result = await writeOutcome(
 			db.transactWriteItems({

@@ -201,6 +201,10 @@ export type SingleShotRequest = {
  * its prepare and its commit, and this path has no such window — one DO validates and applies the
  * whole set serially inside one storage transaction, so serializability comes from the execution
  * order.
+ *
+ * `not_applicable` says no single DO owns every item, so no DO touched anything and the caller must
+ * run the coordinator path. It is a value, not an error: on a split table it is the ordinary answer to
+ * a set that straddles two children, and every forwarding hop passes it up unchanged.
  */
 export type SingleShotResponse =
 	| { outcome: "committed" }
@@ -211,7 +215,8 @@ export type SingleShotResponse =
 			 * rejection comes from its check pass, which answers for every operation it looked at.
 			 */
 			results: ParticipantOperationResultEncoded[];
-	  };
+	  }
+	| { outcome: "not_applicable" };
 
 // ─── PartitionDO — ReadSnapshot (single-partition fast path) ─────────────────
 
@@ -230,10 +235,14 @@ export type ReadSnapshotRequest = {
  * `await` in between, so the result already IS a consistent snapshot and no second phase can
  * disagree with the first. `pending_write` stays, so a lock held by an in-progress two-phase
  * transaction aborts the read exactly as it does on the two-phase path.
+ *
+ * `not_applicable` has the meaning it has on `SingleShotResponse`: no single DO owns every key, nothing
+ * was read, and the caller runs the two-phase path.
  */
 export type ReadSnapshotResponse =
 	| { outcome: "committed"; items: ReadForTransactionItemResultEncoded[] }
-	| { outcome: "aborted"; reason: "pending_write" };
+	| { outcome: "aborted"; reason: "pending_write" }
+	| { outcome: "not_applicable" };
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 

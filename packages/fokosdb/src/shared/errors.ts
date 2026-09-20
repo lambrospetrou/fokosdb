@@ -363,7 +363,6 @@ export const UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "service",
 export const ROUTING_CODES = defineCodes("FokosRoutingError", "internal", 500, {
 	partition_misrouted: "6ddzyj",
 	range_partition_not_initialized: "6ue24c",
-	single_partition_fast_path_not_applicable: "7647dt",
 });
 
 export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {

@@ -1526,6 +1526,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		await this.ensureMigration("readSnapshot");
 
 		const route = this.routeSingleDestination(request.items, "read", "readSnapshot");
+		if (route.destination === "none") {
+			return { outcome: "not_applicable" };
+		}
 		if (route.destination === "child") {
 			return await this.getChildStub(route.pCtx).txReadSnapshot(route.pCtx, { items: route.items });
 		}
@@ -1558,6 +1561,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		await this.ensureMigration("executeSingleShot");
 
 		const route = this.routeSingleDestination(request.items, "write", "executeSingleShot");
+		if (route.destination === "none") {
+			return { outcome: "not_applicable" };
+		}
 		if (route.destination === "child") {
 			return await this.getChildStub(route.pCtx).txExecuteSingleShot(route.pCtx, request);
 		}
@@ -1591,8 +1597,8 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 	/**
 	 * The server-side authority for the single-partition fast paths. One DO must execute every item:
 	 * either this one owns them all, or exactly one child does and the whole request is handed over.
-	 * Anything else raises the fallback error and touches nothing, so the caller can run the
-	 * two-phase path.
+	 * Anything else is `none`: the caller answers `not_applicable` and touches nothing, so db.ts runs
+	 * the two-phase path.
 	 *
 	 * Forwarding hops cost latency but not correctness — the nodes in between own nothing and do
 	 * nothing.
@@ -1605,7 +1611,7 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 		items: T[],
 		intent: OperationIntent,
 		operationName: string,
-	): { destination: "local"; items: T[] } | { destination: "child"; pCtx: PartitionContextResolved; items: T[] } {
+	): { destination: "local"; items: T[] } | { destination: "child"; pCtx: PartitionContextResolved; items: T[] } | { destination: "none" } {
 		const { local, forwarded } = this.groupItemsByRouting(items, intent, operationName);
 		if (forwarded.size === 0) {
 			return { destination: "local", items: local };
@@ -1614,12 +1620,9 @@ export class PartitionDO extends DurableObject implements PartitionAPI, FokosPar
 			const [entry] = [...forwarded.values()];
 			return { destination: "child", pCtx: entry.pCtx, items: entry.items };
 		}
-		// It carries zero side effects, so it is safe to raise from any depth of a forwarding chain: it
-		// propagates up through the routers untouched, and db.ts runs the two-phase path instead.
-		throw new FokosRoutingError(ROUTING_CODES.single_partition_fast_path_not_applicable, {
-			message: "items span more than one partition",
-			attributes: { operation: operationName },
-		});
+		// The items span more than one partition. A value and not an error: on a split table this is the
+		// ordinary answer for such a set, and it carries no side effects at any depth of a forwarding chain.
+		return { destination: "none" };
 	}
 
 	/////////////////////////////////////////

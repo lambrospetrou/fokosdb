@@ -41,7 +41,6 @@ import type {
 import type {
 	InitiateReadResponseEncoded,
 	ReadForTransactionItemResultEncoded,
-	ReadSnapshotResponse,
 	RejectionReasonEncoded,
 	SingleShotResponse,
 	TCReadItem,
@@ -70,7 +69,6 @@ import {
 	FokosUnavailableError,
 	FokosValidationError,
 	INTERNAL_CODES,
-	ROUTING_CODES,
 	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
 	isRuntimeRetryableError,
@@ -512,7 +510,7 @@ export class FokosDB {
 	 * One round trip to the owning partition when it owns every item, which applies the whole set
 	 * atomically. Returns null when the fast path does not apply, so the caller runs the coordinator
 	 * path: the option is off, the transaction carries a token, the client hint says the items span
-	 * partitions, or the partition itself answered that they do.
+	 * partitions, or the partition itself answered `not_applicable` because they do.
 	 *
 	 * `transactionId` is generated here, as the coordinator would generate it: nothing on this path
 	 * stores it, and it exists only so the public response shape is the same on both paths.
@@ -532,9 +530,6 @@ export class FokosDB {
 			// No retry, matching the coordinator path, which does not retry a write either.
 			response = await stub.txExecuteSingleShot(target, request);
 		} catch (err) {
-			// The fallback is the ONE error that means "run the coordinator path instead". It carries no
-			// side effects, so nothing was written and nothing has to be undone.
-			if (FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) return null;
 			// The partition does not throw after its apply commits, so an error that partition code raised
 			// means nothing applied: the transaction cancelled, and that one partition owns every operation,
 			// as the coordinator reports the same refusal of a prepare. A foreign error can be a reply lost
@@ -552,6 +547,10 @@ export class FokosDB {
 			throw err;
 		}
 
+		// No single partition owns every item. Nothing was written, so the coordinator path runs instead.
+		if (response.outcome === "not_applicable") {
+			return null;
+		}
 		if (response.outcome === "committed") {
 			return { transactionId, idempotencyToken: transactionId };
 		}
@@ -613,7 +612,7 @@ export class FokosDB {
 	/**
 	 * One round trip to the owning partition when every requested key resolves to it. Returns null
 	 * when the fast path does not apply, so the caller runs the two-phase path: either the client hint
-	 * says the keys span partitions, or the partition itself answered that they do.
+	 * says the keys span partitions, or the partition itself answered `not_applicable` because they do.
 	 */
 	async #readSnapshotFastPath(items: TCReadItem[]): Promise<InitiateReadResponseEncoded | null> {
 		if (!this.#options.singlePartitionFastPath) return null;
@@ -624,19 +623,13 @@ export class FokosDB {
 		const request = {
 			items: items.map(({ hashKey, sortKey, projection }) => ({ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) })),
 		};
-		let response: ReadSnapshotResponse;
-		try {
-			response = await tryWhile(
-				async () => await stub.txReadSnapshot(target, request),
-				(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
-			);
-		} catch (err) {
-			// The fallback is the ONE error that means "run the two-phase path instead". It carries no
-			// side effects, so nothing was read and nothing has to be undone. Every other error — a
-			// transport failure included — is the caller's, exactly as on the two-phase path.
-			if (!FokosError.isCode(err, ROUTING_CODES.single_partition_fast_path_not_applicable)) throw err;
-			return null;
-		}
+		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
+		const response = await tryWhile(
+			async () => await stub.txReadSnapshot(target, request),
+			(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
+		);
+		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
+		if (response.outcome === "not_applicable") return null;
 		if (response.outcome === "aborted") throw pendingWriteError();
 		return response;
 	}

@@ -2,7 +2,7 @@ import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import { FokosError, ROUTING_CODES, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
+import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PartitionContextResolved } from "../../src/shared/partition-topology/partition-context.js";
 import { KeyCodec } from "../../src/shared/partition-topology/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
@@ -430,21 +430,20 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			invariant(oneChild.outcome === "committed");
 			expect(oneChild.items.map((i) => KeyCodec.decode(i.hashKey))).toEqual(childA.slice(0, 2));
 
-			// Two destinations: no single DO can answer, so the fallback error comes back with nothing
-			// touched. It crosses a real RPC hop here, which keeps the message but drops the class —
-			// which is what makes the sentinel predicate the thing under test.
-			const error = await stub
-				.txReadSnapshot(ctx, {
-					items: [
-						{ hashKey: kb(childA[0]), sortKey: kb("sk") },
-						{ hashKey: kb(childB[0]), sortKey: kb("sk") },
-					],
-				})
-				.then(
-					() => null,
-					(e: unknown) => e,
-				);
-			expect(FokosError.isCode(error, ROUTING_CODES.single_partition_fast_path_not_applicable)).toBe(true);
+			// Two destinations: no single DO can answer, so the split root answers `not_applicable` with
+			// nothing touched, as a value and not an error. The write path gives the same answer and
+			// writes nothing.
+			const spanning = [
+				{ hashKey: kb(childA[0]), sortKey: kb("sk") },
+				{ hashKey: kb(childB[0]), sortKey: kb("sk") },
+			];
+			expect(await stub.txReadSnapshot(ctx, { items: spanning })).toEqual({ outcome: "not_applicable" });
+			expect(
+				await stub.txExecuteSingleShot(ctx, {
+					items: withOpIndex(spanning.map((key) => ({ ...key, operation: "put" as const, data: "never", kind: "text" as const }))),
+				}),
+			).toEqual({ outcome: "not_applicable" });
+			for (const key of spanning) expect(await stub.apiGetItem(ctx, key)).toMatchObject({ found: false });
 		});
 	});
 });
