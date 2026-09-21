@@ -152,9 +152,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 				).rejects.toThrow(fokosErrorWith("partition_misrouted"));
 			});
 		});
-		// The promotion, its cleanup and the split after it all run as background passes, so this case
-		// needs more than the default 5 seconds.
-	}, 20_000);
+	});
 
 	it("clips a range child's query to the slice it owns", async () => {
 		const { root, sks } = await makeTriggeredRangeRoot(2);

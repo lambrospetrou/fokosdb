@@ -507,7 +507,7 @@ describe("PartitionDO - splitting", () => {
 			}
 			// The split spreads the items over more than one child. A very skewed hash can make this flaky.
 			expect(foundIds.size).toBeGreaterThan(1);
-		}, 15_000);
+		});
 
 		it("arms TTL deletion after child migration completes", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
@@ -542,7 +542,7 @@ describe("PartitionDO - splitting", () => {
 				expect(await countExpired()).toBe(1);
 			});
 			await drainUntil(children, async () => (await countExpired()) === 0, "TTL sweep after migration", 10_000);
-		}, 15_000);
+		});
 
 		it("putItem is rejected while migration is in progress", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });

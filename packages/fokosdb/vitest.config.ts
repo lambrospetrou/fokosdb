@@ -12,6 +12,13 @@ export default defineConfig({
 		// Several suites spy on Date.now, console.error and PartitionStore.prototype. Restoring
 		// globally keeps a spy from leaking out of the test that installed it.
 		restoreMocks: true,
+		// The Durable Object suites drive real splits, migrations, alarms and 2PC fan-out. Their
+		// duration follows the scheduling and the parallel load, not the code under test: one case has
+		// run 1.5 s on its own and 5.9 s inside the full suite. A wedged split is caught by the
+		// `vi.waitFor` deadlines in test/partition-do/partition-harness.ts, which report the state the
+		// partition stopped in; this bound only stops a run that is slow and healthy. A test that needs
+		// longer still sets its own.
+		testTimeout: 20_000,
 	},
 	plugins: [
 		cloudflareTest({

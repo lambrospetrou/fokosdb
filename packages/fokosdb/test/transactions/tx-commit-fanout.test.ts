@@ -37,7 +37,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		return vi.spyOn(PartitionDO.prototype, "fokosStaleTransactionMs").mockReturnValue(SHORT_BUDGET_MS);
 	}
 
-	it("commits a multi-megabyte transaction with commit RPCs that carry keys only", { timeout: 60_000 }, async () => {
+	it("commits a multi-megabyte transaction with commit RPCs that carry keys only", async () => {
 		const db = makeDB();
 		// 10 items x 350 KB ≈ 3.4 MB: well over a megabyte on the wire if the payload were re-sent.
 		const keys = keysAcrossPartitions(db, 10, "keys-only");
@@ -195,7 +195,10 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	 * or a call site that lost its budget argument, would still pass them. This one runs the whole
 	 * path on the shipped constant and pays the wall-clock cost to prove it.
 	 */
-	it("waits out the shipped fan-out budget, and stops there", { timeout: 60_000 }, async () => {
+	// The budget below is paid in wall-clock time, so this case cannot use the global bound: its floor is
+	// the shipped constant and its own assertion caps it at the constant plus 3 s. Deriving the timeout
+	// keeps it above that ceiling if the constant ever changes.
+	it("waits out the shipped fan-out budget, and stops there", { timeout: TX_FANOUT_REQUEST_BUDGET_MS * 4 + 10_000 }, async () => {
 		const db = makeDB();
 		const keys = keysAcrossPartitions(db, 2, "shipped-budget");
 		const unreachable = partitionNameOf(db, keys[1]);
