@@ -384,8 +384,20 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		this.#ttl.disarm();
 		return this.fokos.fokosDestroy();
 	}
-	alarm(info: AlarmInvocationInfo): Promise<void> {
-		return this.fokos.alarm(info);
+
+	/**
+	 * The background pass, and then the TTL sweep.
+	 *
+	 * The sweep runs from a timer, and its cycle stops without re-arming when it cannot sweep. A target
+	 * that woke while it was still importing therefore holds no timer once its import finishes, and a
+	 * partition that serves no public request would keep its expired rows until one arrived. The pass
+	 * runs first, so the state the sweep reads is the state the pass left.
+	 */
+	async alarm(info: AlarmInvocationInfo): Promise<void> {
+		await this.fokos.alarm(info);
+		if (!this.fokos.isFenced()) {
+			this.#ttl.arm();
+		}
 	}
 
 	/**

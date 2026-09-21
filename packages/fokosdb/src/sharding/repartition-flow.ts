@@ -122,8 +122,12 @@ export type RepartitionSourceDeps = RepartitionCommonDeps;
 export type RepartitionTargetDeps = RepartitionCommonDeps & {
 	/** Whether this partition has a stored context at all. A target with one and no import record is a conflict. */
 	hasIdentity: () => boolean;
-	/** Writes this partition's identity, depth and ancestors. Synchronous: it runs inside the init transaction. */
-	applyTargetIdentity: (req: FokosInitRequest) => void;
+	/**
+	 * Writes this partition's identity, depth and ancestors. Synchronous: it runs inside the init
+	 * transaction. It returns the step that puts the new identity in memory, which the caller takes
+	 * after that transaction commits.
+	 */
+	applyTargetIdentity: (req: FokosInitRequest) => () => void;
 	ensureAlarmSet: (targetMs: number) => Promise<void>;
 };
 
@@ -989,12 +993,16 @@ export class RepartitionTarget {
 	 */
 	async initAsTarget(req: FokosInitRequest, now = Date.now()): Promise<void> {
 		const existing = this.importRecord();
+		// `applyTargetIdentity` hands back the step that puts the new identity in memory, and this call
+		// takes it only after the transaction commits: a rollback must not leave a partition that
+		// believes it has an identity its storage does not hold.
+		let commitIdentity: () => void = () => {};
 		if (existing) {
 			this.#assertInitMatches(existing, req);
 			// The policy inside the context is mutable and the source may have newer values; the identity
 			// and the slice are not, and the check above has already proved they are unchanged.
 			this.store.transactionSync(() => {
-				this.deps.applyTargetIdentity(req);
+				commitIdentity = this.deps.applyTargetIdentity(req);
 				this.#putImport({ ...existing, source: req.source, updatedAt: now });
 			});
 		} else {
@@ -1005,7 +1013,7 @@ export class RepartitionTarget {
 				});
 			}
 			this.store.transactionSync(() => {
-				this.deps.applyTargetIdentity(req);
+				commitIdentity = this.deps.applyTargetIdentity(req);
 				this.#putImport({
 					schema: 2,
 					state: "awaiting_data",
@@ -1019,6 +1027,7 @@ export class RepartitionTarget {
 				});
 			});
 		}
+		commitIdentity();
 		// The alarm only. The source is still `planned` here, because it cuts over after EVERY target is
 		// initialized. A pull now would earn a `repartition_not_cut_over` and put this target behind a
 		// retry deadline for no reason. `fokosStartImport` starts the import, and the alarm starts it

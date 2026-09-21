@@ -91,6 +91,8 @@ const MAX_FORWARD_RETRIES = 8;
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const NOOP_CALL: FokosLocalCall = { signal: () => {} };
+/** The in-memory step of an identity check that changed nothing. */
+const NO_COMMIT = (): void => {};
 
 /** The names of the built-in jobs. They run first, in this order. */
 const BUILTIN_JOBS = ["target_import", "target_ack", "source_repartition", "source_cleanup"] as const;
@@ -215,7 +217,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return await this.#guard(
 			op,
 			async () => {
-				this.#ensureIdentity(routeCtx);
+				this.#ensureIdentity(routeCtx)();
 				collector = new RouteCollector();
 				return (await this.#dispatch(op, descriptor, req, collector)) as FokosEnvelope<Ops[K]["res"]>;
 			},
@@ -431,9 +433,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			} else remote.set(resolution.target.partitionId, { target: resolution.target, items: [entry.item], keys: [entry.key.hashKey] });
 		}
 
-		// Admission, `beforeForward`, and the local work run in the same synchronous block as the
-		// resolution above, before the first await, so a cutover cannot interleave between the
-		// ownership decision and the write. The remote calls start right after the local one.
+		// Admission, `beforeForward`, the local work, and the start of every remote call run in the same
+		// synchronous block as the resolution above: an outbound RPC yields only at the await below, so
+		// a cutover cannot interleave between the ownership decision and the write.
 		if (local.length > 0) {
 			this.#admit(
 				op,
@@ -442,7 +444,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			);
 		}
 		const signals: FokosSignals[] = this.#beforeForward(descriptor, req);
+		const attemptAll = descriptor.failurePolicy === "attempt_all";
 		let localCall: { request: unknown; value: unknown; signals: FokosSignals[] } | undefined;
+		// An `attempt_all` group runs every group before it reports a failure, and that includes the
+		// case where the local handler is the part that failed. The throw waits until the remote groups
+		// have settled, so a decided transaction still reaches every partition that holds a piece of it.
+		let localFailure: { error: unknown } | undefined;
 		if (local.length > 0) {
 			const { call, signals: own } = this.#localCall();
 			const request = descriptor.subRequest(
@@ -450,7 +457,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				local.map((entry) => entry.item),
 			);
 			collector.add(this.#selfNode("executed"));
-			localCall = { request, value: this.#runLocal(descriptor, request, call), signals: own };
+			try {
+				localCall = { request, value: this.#runLocal(descriptor, request, call), signals: own };
+			} catch (error) {
+				if (!attemptAll) throw error;
+				localFailure = { error };
+			}
 		}
 		const remoteCalls = [...remote.values()].map((group) => {
 			const request = descriptor.subRequest(req, group.items);
@@ -463,8 +475,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		const parts: Array<FokosGroupPart<unknown, unknown>> = [];
 		if (localCall) {
-			localCall.value = await localCall.value;
-			signals.push(...localCall.signals);
+			try {
+				localCall.value = await localCall.value;
+				signals.push(...localCall.signals);
+			} catch (error) {
+				if (!attemptAll) throw error;
+				localFailure = { error };
+				localCall = undefined;
+			}
 		}
 		await this.#applySignals(signals);
 
@@ -477,11 +495,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		} else {
 			const settled = await Promise.allSettled(remoteCalls.map((c) => c.promise));
 			const failures = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
+			// The local part is the more specific answer, and every remote group has been attempted by now.
+			if (localFailure) throw localFailure.error;
 			if (failures.length > 0) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_fanout_failed, {
 					message: "a remote group of the operation failed",
 					cause: failures[0].reason,
-					attributes: { operation: op, failureCount: failures.length, groupCount: remoteCalls.length },
+					attributes: {
+						operation: op,
+						failureCount: failures.length,
+						groupCount: remoteCalls.length,
+						// `cause` is a non-enumerable own property, so it does not cross an RPC hop. The
+						// caller still needs the failure it stands for, and `attributes` does cross.
+						...causeAttributes(failures[0].reason),
+					},
 				});
 			}
 			settled.forEach((result, i) => {
@@ -855,7 +882,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return await this.#guard("fokosStatus", async () => {
-			if (req.rootContext) this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
+			if (req.rootContext) this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>)();
 			const destroying = this.#store.isDestroying();
 			if (!this.#identity) return { initialized: false, destroying, ref: null, importState: null, entries: [], nextCursor: null };
 			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, STATUS_PAGE_ENTRIES, STATUS_PAGE_BYTES);
@@ -871,10 +898,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		return await this.#guard("fokosPrepareDestroy", async () => {
+			let commitIdentity = NO_COMMIT;
 			this.#store.transactionSync(() => {
-				if (req.rootContext) this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
+				if (req.rootContext) commitIdentity = this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
 				this.#store.setDestroying();
 			});
+			commitIdentity();
 			await this.#scheduler.inFlight();
 			this.#scheduler.stop();
 			await this.#ctx.storage.deleteAlarm();
@@ -911,10 +940,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/**
 	 * Validates the route context of a request against the stored identity, and stores a changed
 	 * policy. A root hash partition without an identity takes it from its first request. Every other
-	 * partition is created by `fokosInit` only. Synchronous: `fokosPrepareDestroy` calls it inside the
-	 * transaction that writes the fence.
+	 * partition is created by `fokosInit` only. Synchronous: `fokosPrepareDestroy` and `fokosInit` call
+	 * it inside the transaction that writes the fence, or the import record.
+	 *
+	 * It returns the step that puts the new state in memory, and never takes that step itself. A caller
+	 * inside a transaction takes it after that transaction commits, so a rollback cannot leave the
+	 * memory of this instance ahead of its storage.
 	 */
-	#ensureIdentity(routeCtx: FokosRouteContext<TPolicy>): void {
+	#ensureIdentity(routeCtx: FokosRouteContext<TPolicy>): () => void {
 		if (this.#ctx.id.jurisdiction !== routeCtx.topology.jurisdiction) {
 			throw contextMismatch({
 				doName: routeCtx.doName,
@@ -926,8 +959,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (isRangePartition(routeCtx)) throw this.#notInitialized(routeCtx);
 			invariant(routeCtx.partitionId.length > 0, "fokos/runtime: partitionId must not be empty");
 			if (PartitionIdHelper.depth(Uint8Array.fromHex(routeCtx.partitionId)) > 0) throw this.#notInitialized(routeCtx);
-			this.#writeIdentity(routeCtx);
-			return;
+			return this.#writeIdentity(routeCtx);
 		}
 		const identity = this.#identity;
 		if (
@@ -938,20 +970,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			throw contextMismatch({ doName: routeCtx.doName, expected: identity.ref.doName });
 		}
 		const stored = this.#stored!;
-		if (structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) && structurallyEqual(stored.policy, routeCtx.policy)) return;
+		if (structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) && structurallyEqual(stored.policy, routeCtx.policy)) return NO_COMMIT;
 		validateRangeConfig(routeCtx.rangeConfig);
 		const next: FokosStoredPolicy<TPolicy> = { rangeConfig: routeCtx.rangeConfig, policy: routeCtx.policy };
 		this.#store.transactionSync(() => this.#store.putPolicy(next));
-		this.#setIdentity(identity, next);
+		return () => this.#setIdentity(identity, next);
 	}
 
-	/** Writes the identity of a target from its `fokosInit`. It runs inside the transaction that writes the import record. */
-	#applyTargetIdentity(req: FokosInitRequest): void {
+	/**
+	 * Writes the identity of a target from its `fokosInit`. It runs inside the transaction that writes
+	 * the import record, so it returns the in-memory step for `initAsTarget` to take after the commit.
+	 */
+	#applyTargetIdentity(req: FokosInitRequest): () => void {
 		const target = req.target as FokosRouteContext<TPolicy>;
-		if (this.#identity) {
-			this.#ensureIdentity(target);
-			return;
-		}
+		if (this.#identity) return this.#ensureIdentity(target);
 		let range: { depth: number; ancestors: RangeAncestorInfo[] } | undefined;
 		if (isRangePartition(target)) {
 			invariant(req.rangeDepth !== undefined, "fokos/runtime.fokosInit: a range target needs its depth");
@@ -959,10 +991,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			invariant(ancestors.length === 0 || req.rangeDepth > 0, "fokos/runtime.fokosInit: only a non-root range partition has ancestors");
 			range = { depth: req.rangeDepth, ancestors };
 		}
-		this.#writeIdentity(target, range);
+		return this.#writeIdentity(target, range);
 	}
 
-	#writeIdentity(routeCtx: FokosRouteContext<TPolicy>, range?: { depth: number; ancestors: RangeAncestorInfo[] }): void {
+	#writeIdentity(routeCtx: FokosRouteContext<TPolicy>, range?: { depth: number; ancestors: RangeAncestorInfo[] }): () => void {
 		validateTopology(routeCtx.topology);
 		validateRangeConfig(routeCtx.rangeConfig);
 		const identity = partitionIdentityFrom(routeCtx, range);
@@ -971,7 +1003,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#store.putIdentity(identity);
 			this.#store.putPolicy(stored);
 		});
-		this.#setIdentity(identity, stored);
+		return () => this.#setIdentity(identity, stored);
 	}
 
 	/** Replaces the in-memory identity, policy and derived state together, so no reader sees one without the other. */
@@ -1262,10 +1294,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// with this hop added, so an error and a result that take one route carry one routing.
 			const routed = routedError(e);
 			if (routed) {
+				// The head of the child's list is the partition that raised the error. It keeps the head
+				// here too, so the byte cap can never drop it and a caller reads it from one place,
+				// whatever this partition had already collected.
+				const raiser = routed.routing.servedBy[0];
 				try {
 					this.#learn(routed.routing.servedBy, hashKeys);
 				} catch {}
 				collector.mergeForwarded(routed.routing, stamp);
+				if (raiser) collector.addRaiser(stamp ? stamp(raiser) : raiser);
 				routed.routing = collector.build();
 			}
 			throw e;
@@ -1549,6 +1586,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	#validateOperations(): void {
 		for (const [name, descriptor] of Object.entries(this.#ops)) {
+			// The runtime reserves the prefix for its control RPCs, and `#guard` answers three of them
+			// behind the destroy fence. A host operation that took one of those names would answer there
+			// too, and `forward` would call the control method of the peer instead of the operation.
+			if (name.startsWith("fokos")) {
+				throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
+					message: "a host operation must not use the fokos prefix, which the runtime reserves for its control RPCs",
+					attributes: { operation: name },
+				});
+			}
 			if (descriptor.shape === "local") continue;
 			if (descriptor.whileMigrating !== "read_source") continue;
 			if (descriptor.readOnly !== true || (descriptor.shape !== "point" && descriptor.shape !== "range")) {
@@ -1612,6 +1658,16 @@ function misrouted(operation: string, reason: string): FokosRoutingError {
 		message: "mis-routed key this partition can neither own nor route",
 		attributes: { operation, reason },
 	});
+}
+
+/**
+ * The identity of a failure, as attributes of the error that reports it. `cause` holds the object
+ * itself for a log line in this isolate, but it is a non-enumerable own property of `Error` and an
+ * RPC hop drops it, so the code and the error id of the original travel here instead.
+ */
+function causeAttributes(reason: unknown): Record<string, unknown> {
+	if (!FokosError.is(reason)) return { causeMessage: String(reason) };
+	return { causeCode: reason.code, causeErrorId: reason.error_id, causeMessage: reason.message };
 }
 
 function contextMismatch(attributes: Record<string, unknown>): FokosInternalError {

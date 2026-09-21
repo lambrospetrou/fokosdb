@@ -233,6 +233,8 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
 				sharding.putIdentity(partitionIdentityFrom(target, range));
 				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy });
+				// This harness keeps its identity in the store only, so it has no in-memory step to take.
+				return () => {};
 			},
 			scheduleWork: () => scheduled.set(doName, (scheduled.get(doName) ?? 0) + 1),
 			ensureAlarmSet: async (targetMs) => {

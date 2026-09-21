@@ -20,7 +20,7 @@ export type FokosSchedulerDeps = {
 	fastPathDelayMs: number;
 	/** True after the destroy fence. A fenced pass runs nothing and arms nothing. */
 	isFenced: () => boolean;
-	/** Built-in jobs first, then host jobs. Read at the start of every pass. */
+	/** Built-in jobs first, then host jobs. Read at the start of every pass, and again at its end. */
 	jobs: () => readonly FokosJob[];
 	logParams: () => Record<string, unknown>;
 };
@@ -109,8 +109,7 @@ export class FokosScheduler {
 	async #pass(): Promise<void> {
 		if (this.#deps.isFenced()) return;
 		const now = Date.now();
-		const jobs = this.#deps.jobs();
-		const runnable = jobs.filter((job) => job.canRun());
+		const runnable = this.#runnable();
 		const due = this.#deadlines(runnable).filter(({ at }) => at <= now);
 
 		const earliest = this.#earliest(runnable);
@@ -157,13 +156,21 @@ export class FokosScheduler {
 		if (this.#deps.isFenced()) return;
 		// This write REPLACES the fallback the pass armed, and it can move the alarm later. The pass is
 		// over here, so the earlier fallback protects nothing.
-		const next = this.#earliest(runnable);
+		//
+		// `canRun` is asked again, and never read from the list this pass started with: a step can make
+		// another job runnable, and a job left out here loses its deadline and the alarm with it.
+		const next = this.#earliest(this.#runnable());
 		if (next === null) {
 			await this.#deps.storage.deleteAlarm();
 			return;
 		}
 		await this.#deps.storage.setAlarm(next);
 		if (next <= Date.now()) this.wake();
+	}
+
+	/** The jobs that can run now, built-ins first. Asked again whenever the answer can have changed. */
+	#runnable(): FokosJob[] {
+		return this.#deps.jobs().filter((job) => job.canRun());
 	}
 
 	/** The earliest durable deadline of each runnable job: its scheduled run, or its own durable work. */

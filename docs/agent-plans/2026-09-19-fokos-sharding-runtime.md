@@ -291,12 +291,15 @@ implementation and differ from, or add to, the text of section 4.2:
   never reads it.
   `FokosStatusEntry.repartition` gains `hashKey`, the key a promotion moves. The host `status()` view and the
   host TTL sweep are built from these and read no `fokos_` table.
-  TODO: the TTL sweep arms only on the host's public operations. The internal calls of the runtime
-  (`fokosExecuteLocal`, `fokosStatus`, `fokosMigrationPull`, `fokosInit`, `fokosStartImport`,
-  `fokosMigrationAck`, `fokosRequestPromotion`) do not re-arm a sweep whose timer already ran out, so a
-  partition that serves only migration or traversal traffic can hold expired rows longer than before. Fix
-  either by arming the sweep in those entry points too, or by moving the arm into a wrapper that every
-  operation, internal or public, passes through.
+  The host arms the TTL sweep on its public operations, and again in `alarm()` after the runtime pass. The
+  second site replaces the arm the old background pass took when an import finished: a sweep cycle that
+  cannot sweep does not re-arm itself, so a target that woke while it was still importing would otherwise
+  hold no timer once its import completed.
+  TODO: the internal calls of the runtime (`fokosExecuteLocal`, `fokosStatus`, `fokosMigrationPull`,
+  `fokosInit`, `fokosStartImport`, `fokosMigrationAck`, `fokosRequestPromotion`) still do not re-arm a sweep
+  whose timer already ran out. The answer is to register the sweep as a host `FokosJob`, with
+  `canSweepLocally` as its `canRun` and the earliest expiry as its `deadline`. The timer and both arm sites
+  then go, and the sweep takes the fence and the one-pass rule of every other job.
 - The host registers `status` as a `local` operation with a `null` request, so it goes through identity
   validation and the destroy fence like every other operation, except that a `local` descriptor can set
   `allowedWhileDestroying` to answer behind the fence, which `status` does. It no longer bootstraps a root on its own or
@@ -328,7 +331,9 @@ implementation and differ from, or add to, the text of section 4.2:
   visits out first, so only a read-through caller that names a sibling's cursor reaches the throw, and a
   target cannot receive rows it has already consumed.
 - `txCommit` throws `partition_fanout_failed` when a remote group fails, as every `attempt_all` group does.
-  Before this stage it rethrew the first child error as it arrived.
+  Before this stage it rethrew the first child error as it arrived. The failure it stands for travels in
+  `attributes` as `causeCode`, `causeErrorId`, and `causeMessage`, because `cause` is a non-enumerable own
+  property of `Error` and an RPC hop drops it.
 - `debugForcePromoteKey` takes `{ hashKey }` as its request, like every other operation.
 - `PartitionStore.hasAnyUnguardedPendingTx` becomes `earliestUnguardedPendingTxCreatedAt`, the value the
   stale-recovery job reports as its `deadline()`.
@@ -338,6 +343,19 @@ implementation and differ from, or add to, the text of section 4.2:
   same `partition-info.ts` functions `db.ts` uses, so a suite that reads `meta.forwardCount` or
   `partitionMetas[i].servedByActorName` keeps its assertions; the suites that assert on route evidence read
   `routing` directly.
+- A forwarding partition keeps the head of the child list at the head of its own when it passes an error on.
+  Section 4.2.9 gives the head to the partition that raised the error, and `#guard` cannot supply it there,
+  because the error already carries routing. Without this the head is whichever node reached the collector
+  first, and a wide fan-out can lose the raiser to the byte cap.
+- `#ensureIdentity`, `#applyTargetIdentity`, and `#writeIdentity` return the step that puts the new identity
+  and policy in memory, and never take it themselves. `fokosPrepareDestroy` and `initAsTarget` call them
+  inside a transaction, so they take that step after the commit: a rollback must not leave a partition that
+  believes it has an identity its storage does not hold.
+- The scheduler asks `canRun()` again at the end of a pass, and never reuses the list the pass started with.
+  A step can make another job runnable, and a job left out of that list loses its deadline and the alarm
+  with it, because the closing write can delete the alarm.
+- The registry refuses a host operation whose name starts with `fokos`. The runtime reserves the prefix for
+  its control RPCs, three of which answer behind the destroy fence.
 
 ### M5 — The example host and the independence tests
 
@@ -1031,6 +1049,12 @@ The prototype in `packages/fokosdb/test/sharding-prototype/fokosdb-partition-hos
    `single_owner` operation is already committed at that point. A cutover therefore cannot interleave between
    owner resolution and the local write, for any shape. Remote groups run in parallel. For a `range`
    operation, call the host's `walk` callback with the frontier and tracked functions.
+
+   A `group` operation with `failurePolicy: "attempt_all"` keeps this order but not its early exit: a local
+   handler that throws holds its error, the remote groups still start, and the throw waits until they have
+   settled. The policy says that every group runs before a failure is reported, and the local group is one of
+   them. Starting an outbound RPC is synchronous up to its own first `await`, so nothing yields between the
+   ownership decision and the local write either way. A `fail_fast` group throws at once, as before.
 6. **Learning.** Learn every route-evidence entry from each successful remote envelope. Add each outbound
    partition RPC to the envelope-level `forwardCount`.
 7. **Signals.** Collect the signals that `beforeForward` reported, and those that `local` reported when it
