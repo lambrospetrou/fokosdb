@@ -34,7 +34,7 @@ function keyForChild(childIndex: number, hashSplitN: number, prefix = "k"): stri
 	throw new Error("no key found for child");
 }
 
-describe("Repartition — arbitration", () => {
+describe.concurrent("Repartition — arbitration", () => {
 	it("queues a hash split, and refuses a second one", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -98,7 +98,7 @@ describe("Repartition — arbitration", () => {
 	});
 });
 
-describe("Repartition — planning", () => {
+describe.concurrent("Repartition — planning", () => {
 	it("writes the plan, every target and planned, in target_index order", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
@@ -176,7 +176,7 @@ describe("Repartition — planning", () => {
 	});
 });
 
-describe("Repartition — initialization and cutover", () => {
+describe.concurrent("Repartition — initialization and cutover", () => {
 	it("marks a target initializing before its call and initialized after it", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -297,7 +297,7 @@ describe("Repartition — initialization and cutover", () => {
 	});
 });
 
-describe("Repartition — the migration protocol", () => {
+describe.concurrent("Repartition — the migration protocol", () => {
 	it("runs a hash split end to end: pages, imported, ack, completed, cleaned", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -527,7 +527,7 @@ describe("Repartition — the migration protocol", () => {
 	});
 });
 
-describe("Repartition — fokosInit and fokosStartImport", () => {
+describe.concurrent("Repartition — fokosInit and fokosStartImport", () => {
 	it("is idempotent and restores the fallback alarm on every call", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -571,7 +571,7 @@ describe("Repartition — fokosInit and fokosStartImport", () => {
 	});
 });
 
-describe("Repartition — promotions", () => {
+describe.concurrent("Repartition — promotions", () => {
 	it("moves one key to its range root, then reclaims the source rows in batches", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -666,7 +666,7 @@ describe("Repartition — promotions", () => {
 	});
 });
 
-describe("Repartition — the paginated status view", () => {
+describe.concurrent("Repartition — the paginated status view", () => {
 	it("orders every repartition and target by (seq, target_index), with -1 for a repartition with none", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);

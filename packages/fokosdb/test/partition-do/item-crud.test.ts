@@ -4,7 +4,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
 import { kb, makeStub } from "./helpers.js";
 
-describe("PartitionDO - putItem / getItem", () => {
+describe.concurrent("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub();
 
@@ -276,7 +276,7 @@ describe("PartitionDO - putItem / getItem", () => {
 	});
 });
 
-describe("PartitionDO - deleteItem", () => {
+describe.concurrent("PartitionDO - deleteItem", () => {
 	it("returns deleted:false for a missing key", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub();
 

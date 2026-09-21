@@ -204,6 +204,8 @@ export class TestPartition {
 				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) throw e;
 				if (!(await writer.status(this.ctx)).splitStatus) throw e;
 			}
+			// Stop on the exact write that queues the split: the stored size at that moment decides
+			// which further writes a test can still land under the overage band.
 			const state = await writer.status(this.ctx);
 			if (state.splitStatus) {
 				invariant(state.splitStatus.splitType === "hash", `${this.doName}: expected a hash split`);
@@ -270,6 +272,8 @@ export class TestPartition {
 			);
 			await this.put({ hashKey, sortKey: kb(sk), data, kind: "text" });
 			sks.push(sk);
+			// Stop on the exact write that queues the split: the byte-quantile boundaries depend on
+			// the stored rows, so extra writes would move them.
 			if ((await this.status()).splitStatus) return sks;
 		}
 		throw new Error(`${this.doName}: no range split after ${MAX_RANGE_FILLER_WRITES} writes; ${JSON.stringify(await this.status())}`);
@@ -362,7 +366,14 @@ export class TestPartition {
 	async awaitTreeSettled(): Promise<void> {
 		await vi.waitFor(
 			async () => {
-				await this.runTreeAlarms();
+				// A settled tree needs no alarm pass at all; nudge the tree only when the
+				// completeness check still fails.
+				try {
+					await assertSplitTreeComplete(this);
+					return;
+				} catch {
+					await this.runTreeAlarms();
+				}
 				await assertSplitTreeComplete(this);
 			},
 			{ timeout: 5000, interval: 100 },

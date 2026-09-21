@@ -27,7 +27,7 @@ async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbR
 	return entries;
 }
 
-describe("PartitionDO — fokosStatus", () => {
+describe.concurrent("PartitionDO — fokosStatus", () => {
 	it("bootstraps an empty root from its context and reports no repartition", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub();
 

@@ -58,7 +58,7 @@ async function expectSameRouting(node: TestPartition, keys: ItemKeys): Promise<v
 	expect(await erroredRouting(node, keys), node.doName).toEqual(await readRouting(node, keys));
 }
 
-describe("PartitionDO — routing on errors", () => {
+describe.concurrent("PartitionDO — routing on errors", () => {
 	it("matches the result routing at each hash forwarding level, and the root learns the leaf depth from an error", async () => {
 		const hashKey = "probe-key";
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });

@@ -29,30 +29,746 @@ import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 // Run the whole suite against every partition DO namespace so a divergence in a customer-provided
 // class (e.g. CUSTOM_PARTITION_DO) is caught as a regression. makeDB is the only namespace-coupled
 // point, so binding it once per case via closure keeps every test body untouched.
+// Every case under "isolated-fixture cases" builds its own table, so they all run concurrently.
+// A describe that installs a prototype or module spy stays outside the block: a sequential
+// describe is a barrier the runner never overlaps with the concurrent tests.
 describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s", (ns) => {
 	const makeDB = () => makeDBFor(ns);
 
-	describe("FokosDB — public results carry no internal routing state", () => {
-		// The envelope's route evidence and its `_hint.rangeAncestors` are partition-to-partition routing
-		// state whose boundaries are KeyBytes, so leaking them would also serialize as {"0":97,"1":98}
-		// over HTTP. db.ts is the boundary where they stop. Asserted on every method that returns a
-		// meta, and on the per-partition metas, since each is a separate exit that has to build it.
-		it("returns a public meta on every method, and no routing evidence", async () => {
-			const db = makeDB();
+	// Every case here builds its own table, so all of them run concurrently.
+	describe.concurrent("isolated-fixture cases", () => {
+		describe("FokosDB — public results carry no internal routing state", () => {
+			// The envelope's route evidence and its `_hint.rangeAncestors` are partition-to-partition routing
+			// state whose boundaries are KeyBytes, so leaking them would also serialize as {"0":97,"1":98}
+			// over HTTP. db.ts is the boundary where they stop. Asserted on every method that returns a
+			// meta, and on the per-partition metas, since each is a separate exit that has to build it.
+			it("returns a public meta on every method, and no routing evidence", async () => {
+				const db = makeDB();
 
-			const put = await db.putItem({ hashKey: "alice", sortKey: "sk1", data: "x" });
-			const get = await db.getItem({ hashKey: "alice", sortKey: "sk1" });
-			const missing = await db.getItem({ hashKey: "alice", sortKey: "nope" });
-			const query = await db.queryItems({ queries: [{ hashKey: "alice" }] });
-			const del = await db.deleteItem({ hashKey: "alice", sortKey: "sk1" });
+				const put = await db.putItem({ hashKey: "alice", sortKey: "sk1", data: "x" });
+				const get = await db.getItem({ hashKey: "alice", sortKey: "sk1" });
+				const missing = await db.getItem({ hashKey: "alice", sortKey: "nope" });
+				const query = await db.queryItems({ queries: [{ hashKey: "alice" }] });
+				const del = await db.deleteItem({ hashKey: "alice", sortKey: "sk1" });
 
-			for (const meta of [put.meta, get.meta, missing.meta, del.meta, ...query.partitionMetas]) {
-				expect(meta).not.toHaveProperty("_rangeAncestors");
-				expect(meta).not.toHaveProperty("servedBy");
-				expect(meta.servedByActorName).toBeTypeOf("string");
-				expect(meta.servedByPartitionId).toBeTypeOf("string");
+				for (const meta of [put.meta, get.meta, missing.meta, del.meta, ...query.partitionMetas]) {
+					expect(meta).not.toHaveProperty("_rangeAncestors");
+					expect(meta).not.toHaveProperty("servedBy");
+					expect(meta.servedByActorName).toBeTypeOf("string");
+					expect(meta.servedByPartitionId).toBeTypeOf("string");
+				}
+				expect(query.partitionMetas).not.toHaveLength(0);
+			});
+		});
+
+		describe("FokosDB — TTL", () => {
+			it("stores, returns, and clears ttlAt", async () => {
+				const db = makeDB();
+				const ttlAt = Math.floor(Date.now() / 1000) + 3600;
+
+				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v1", ttlAt });
+				expect(await db.getItem({ hashKey: "ttl", sortKey: "item" })).toMatchObject({ found: true, item: { ttlAt } });
+				expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0].ttlAt).toBe(ttlAt);
+
+				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
+				const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
+				expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
+				if (cleared.found) expect(cleared.item.ttlAt).toBeUndefined();
+			});
+
+			it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {
+				const db = makeDB();
+				await expect(db.putItem({ hashKey: "invalid-ttl", data: "v", ttlAt })).rejects.toThrow(fokosErrorWith("ttl_at_invalid"));
+				await expect(db.transactWriteItems({ items: [{ hashKey: "invalid-ttl-tx", operation: "put", data: "v", ttlAt }] })).rejects.toThrow(
+					fokosErrorWith("ttl_at_invalid"),
+				);
+			});
+
+			it("accepts a past ttlAt and deletes the item in a later cycle", async () => {
+				const db = makeDB();
+				const ttlAt = Math.max(1, Math.floor(Date.now() / 1000) - 1);
+				await db.putItem({ hashKey: "past-ttl", data: "v", ttlAt });
+				expect(await db.getItem({ hashKey: "past-ttl" })).toMatchObject({ found: true, item: { ttlAt } });
+
+				await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).found).toBe(false), {
+					timeout: 3_000,
+					interval: 100,
+				});
+			});
+		});
+
+		describe("FokosDB.queryItems — projections", () => {
+			it("returns flat projected records by resolved name", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "alice", sortKey: "a1", data: { n: 1, s: "x" } });
+				await db.putItem({ hashKey: "alice", sortKey: "a2", data: { s: "y" } });
+				await db.putItem({ hashKey: "alice", sortKey: "a3", data: { n: 3, s: "z", k: [1, 2] } });
+				await db.putItem({ hashKey: "alice", sortKey: "a4", data: "text-item" });
+
+				const res = await db.queryItems({
+					queries: [{ hashKey: "alice" }],
+					projection: [
+						{ expr: { ref: "sortKey" }, as: "id" },
+						{ expr: { ref: "data", path: "$.n" } },
+						{ expr: { ref: "data", path: "$.k" }, as: "k" },
+						{ expr: { fn: "sqlite.upper", args: [{ ref: "data", path: "$.s" }] }, as: "S" },
+						{ expr: { ref: "data" } },
+					],
+				});
+
+				expect(res.items).toEqual([
+					{ id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } },
+					{ id: "a2", S: "Y", data: { s: "y" } },
+					{ id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } },
+					// A path over a text item is missing. A function over a missing argument sees NULL.
+					{ id: "a4", S: null, data: "text-item" },
+				]);
+				// A missing cell leaves the key absent, not undefined.
+				expect(Object.keys(res.items[1])).not.toContain("$.n");
+				expect(res.count).toBe(4);
+				expect(res.scannedCount).toBe(4);
+			});
+
+			it("rejects a projection with count selection", async () => {
+				const db = makeDB();
+				await expect(
+					db.queryItems({ queries: [{ hashKey: "alice" }], select: "count", projection: [{ expr: { ref: "sortKey" } }] }),
+				).rejects.toThrow(fokosErrorWith("query_projection_with_count"));
+			});
+
+			it("rejects a cursor resumed with another projection or none", async () => {
+				const db = makeDB();
+				for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				const projectionA: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
+				const projectionB: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "sk" }];
+
+				const first = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, limit: 2 });
+				expect(first.items).toEqual([{ id: "a1" }, { id: "a2" }]);
+				expect(first.cursor).toBeDefined();
+
+				await expect(db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionB, cursor: first.cursor })).rejects.toThrow(
+					fokosErrorWith("cursor_fingerprint_mismatch"),
+				);
+				await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
+					fokosErrorWith("cursor_fingerprint_mismatch"),
+				);
+
+				// The same projection resumes without a gap or a duplicate.
+				const got: unknown[] = first.items.map((item) => item.id);
+				let cursor = first.cursor;
+				for (;;) {
+					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, cursor });
+					got.push(...res.items.map((item) => item.id));
+					if (res.cursor === undefined) break;
+					cursor = res.cursor;
+				}
+				expect(got).toEqual(["a1", "a2", "a3", "a4"]);
+			});
+
+			it("paginates projected rows across sub-queries without gaps or duplicates", async () => {
+				const db = makeDB();
+				for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+
+				const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
+				const projection: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
+				const got: unknown[] = [];
+				let cursor: string | undefined;
+				let pages = 0;
+				for (;;) {
+					const res = await db.queryItems({ queries, projection, limit: 2, cursor });
+					got.push(...res.items.map((item) => item.id));
+					pages++;
+					if (res.cursor === undefined) break;
+					cursor = res.cursor;
+					expect(pages).toBeLessThan(50);
+				}
+
+				expect(got).toEqual(["a1", "a2", "a3", "b1", "b2", "b3"]);
+				expect(pages).toBeGreaterThan(1);
+			});
+		});
+
+		describe("FokosDB.getItem — projections", () => {
+			it("returns a flat projected record for a found item, across cell kinds", async () => {
+				const db = makeDB();
+				await db.putItem({
+					hashKey: "alice",
+					sortKey: "j1",
+					data: { n: 1, s: "alpha", none: null, k: [1, 2] },
+				});
+
+				const res = await db.getItem({
+					hashKey: "alice",
+					sortKey: "j1",
+					projection: [
+						{ expr: { ref: "sortKey" }, as: "id" },
+						{ expr: { ref: "data", path: "$.n" } },
+						{ expr: { ref: "data", path: "$.s" }, as: "name" },
+						{ expr: { ref: "data", path: "$.none" } },
+						{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
+						{ expr: { ref: "data", path: "$.k" }, as: "k" },
+						{ expr: { ref: "v" }, as: "ver" },
+					],
+				});
+
+				expect(res).toEqual({
+					found: true,
+					item: {
+						hashKey: "alice",
+						sortKey: "j1",
+						data: { id: "j1", "$.n": 1, name: "alpha", "$.none": null, k: [1, 2], ver: 1 },
+						kind: "projected",
+						version: 1,
+					},
+					meta: expect.anything(),
+				});
+				// The projected record sits in `data` inside the normal envelope, tagged `kind: "projected"`.
+				invariant(res.found && res.item.kind === "projected");
+				expect(Object.keys(res)).toEqual(["found", "item", "meta"]);
+				expect(Object.keys(res.item)).toEqual(["hashKey", "sortKey", "data", "kind", "version"]);
+				expect(Object.keys(res.item.data)).not.toContain("missing");
+			});
+
+			it("projects a bytes cell as a Uint8Array", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
+
+				const res = await db.getItem({ hashKey: "alice", sortKey: "b1", projection: [{ expr: { ref: "data" }, as: "bytes" }] });
+				invariant(res.found && res.item.kind === "projected");
+				expect(res.item.data.bytes).toEqual(new Uint8Array([1, 2, 3]));
+			});
+
+			it("returns found:false with the caller's keys for a missing item", async () => {
+				const db = makeDB();
+				const res = await db.getItem({ hashKey: "alice", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
+				expect(res).toMatchObject({ found: false, item: { hashKey: "alice", sortKey: "nope" } });
+			});
+		});
+
+		describe("FokosDB reads — the caller's own type", () => {
+			type Player = { name: string; score: number };
+
+			it("types the json value and the projected record of every read", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "alice", sortKey: "p1", data: { name: "alpha", score: 3 } });
+
+				const whole = await db.getItem<Player>({ hashKey: "alice", sortKey: "p1" });
+				invariant(whole.found && whole.item.kind === "json");
+				expect(whole.item.data.name).toBe("alpha");
+
+				const projected = await db.getItem<Pick<Player, "name">>({
+					hashKey: "alice",
+					sortKey: "p1",
+					projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }],
+				});
+				invariant(projected.found && projected.item.kind === "projected");
+				expect(projected.item.data.name).toBe("alpha");
+
+				const page = await db.queryItems<Pick<Player, "score">>({
+					queries: [{ hashKey: "alice", sortKeyCondition: { op: "eq", value: "p1" } }],
+					projection: [{ expr: { ref: "data", path: "$.score" }, as: "score" }],
+				});
+				expect(page.items[0].score).toBe(3);
+
+				// One request, two unrelated items: each position is typed by its own member of the tuple.
+				await db.putItem({ hashKey: "alice", sortKey: "p2", data: { label: "beta" } });
+				const read = await db.transactGetItems<[Player, { label: string }]>({
+					items: [
+						{ hashKey: "alice", sortKey: "p1" },
+						{ hashKey: "alice", sortKey: "p2" },
+					],
+				});
+				const [first, second] = read.items;
+				invariant(first.found && first.kind === "json");
+				expect(first.data.score).toBe(3);
+				invariant(second.found && second.kind === "json");
+				expect(second.data.label).toBe("beta");
+			});
+
+			// Type-level contract, never executed: the tuple fixes the item count in both directions, and a
+			// call that names no type keeps the widest types.
+			async function _transactGetItemsArity(db: FokosDB) {
+				// @ts-expect-error two types named, one item passed
+				await db.transactGetItems<[Player, Player]>({ items: [{ hashKey: "a" }] });
+				// @ts-expect-error one type named, two items passed
+				await db.transactGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
+				const wide = await db.transactGetItems({ items: [{ hashKey: "a" }] });
+				if (wide.items[0].found && wide.items[0].kind === "json") {
+					const value: JsonValue = wide.items[0].data;
+					void value;
+				}
 			}
-			expect(query.partitionMetas).not.toHaveLength(0);
+			void _transactGetItemsArity;
+		});
+
+		describe("FokosDB.queryItems — filters", () => {
+			// Mixed data kinds under one hash key: the filter must evaluate per candidate and must not
+			// change candidate selection, so every case scans all four items. A missing operand makes a
+			// comparison false, which is what keeps the text and bytes items out of the numeric cases.
+			it.each<{ name: string; filter: ConditionExpression; expected: string[] }>([
+				{ name: "eq", filter: { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1"] },
+				{ name: "ne", filter: { op: "ne", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
+				{ name: "eq on a boolean", filter: { op: "eq", args: [{ ref: "data", path: "$.flag" }, { val: true }] }, expected: ["j1"] },
+				// A stored JSON null equals a null literal, and a path that is absent does not.
+				{ name: "eq on a JSON null", filter: { op: "eq", args: [{ ref: "data", path: "$.none" }, { val: null }] }, expected: ["j1"] },
+				{ name: "lt", filter: { op: "lt", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1"] },
+				{ name: "lte", filter: { op: "lte", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1", "j2"] },
+				{ name: "gt", filter: { op: "gt", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
+				{ name: "gte", filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1", "j2"] },
+				{
+					name: "between",
+					filter: { op: "between", args: [{ ref: "data", path: "$.n" }, { val: 2 }, { val: 5 }] },
+					expected: ["j2"],
+				},
+				{
+					name: "in",
+					filter: { op: "in", args: [{ ref: "data", path: "$.s" }, { val: "alpha" }, { val: "gamma" }] },
+					expected: ["j1"],
+				},
+				{
+					name: "and",
+					filter: {
+						op: "and",
+						args: [
+							{ op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
+							{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
+						],
+					},
+					expected: ["j2"],
+				},
+				{
+					name: "or",
+					filter: {
+						op: "or",
+						args: [
+							{ op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
+							{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
+						],
+					},
+					expected: ["j1", "j2"],
+				},
+				{
+					name: "not",
+					filter: { op: "not", args: [{ op: "exists", args: [{ ref: "data", path: "$.n" }] }] },
+					expected: ["b1", "t1"],
+				},
+				{ name: "exists", filter: { op: "exists", args: [{ ref: "data", path: "$.tags" }] }, expected: ["j1", "j2"] },
+				{ name: "not_exists", filter: { op: "not_exists", args: [{ ref: "data", path: "$.s" }] }, expected: ["b1", "t1"] },
+				{
+					name: "begins_with on a path",
+					filter: { op: "begins_with", args: [{ ref: "data", path: "$.s" }, { val: "al" }] },
+					expected: ["j1"],
+				},
+				{
+					name: "begins_with on whole text data",
+					filter: { op: "begins_with", args: [{ ref: "data" }, { val: "text-" }] },
+					expected: ["t1"],
+				},
+				{
+					name: "contains on a JSON array",
+					filter: { op: "contains", args: [{ ref: "data", path: "$.tags" }, { val: "x" }] },
+					expected: ["j1"],
+				},
+				{
+					name: "contains on byte data",
+					filter: { op: "contains", args: [{ ref: "data" }, { b64: "Ag==" }] },
+					expected: ["b1"],
+				},
+				{
+					name: "sort-key reference",
+					filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "j2" }] },
+					expected: ["j2", "t1"],
+				},
+			])("every condition operator as a filter, on mixed data kinds: $name", async ({ filter, expected }) => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "alice", sortKey: "j1", data: { n: 1, s: "alpha", tags: ["x", "y"], flag: true, none: null } });
+				await db.putItem({ hashKey: "alice", sortKey: "j2", data: { n: 2, s: "beta", tags: ["y"] } });
+				await db.putItem({ hashKey: "alice", sortKey: "t1", data: "text-value" });
+				await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
+
+				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter });
+
+				expect(sksOf(res)).toEqual(expected);
+				expect(res.count).toBe(expected.length);
+				expect(res.scannedCount).toBe(4);
+			});
+
+			it("a filter that rejects every candidate pages the whole interval", async () => {
+				const db = makeDB();
+				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				const filter: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 999 }] };
+
+				const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2 });
+				expect(first.items).toEqual([]);
+				expect(first.count).toBe(0);
+				expect(first.scannedCount).toBe(2);
+				expect(first.cursor).toBeDefined();
+
+				let count = first.count;
+				let scannedCount = first.scannedCount;
+				let cursor = first.cursor;
+				let pages = 1;
+				for (;;) {
+					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2, cursor });
+					expect(res.items).toEqual([]);
+					count += res.count;
+					scannedCount += res.scannedCount;
+					pages++;
+					if (res.cursor === undefined) break;
+					cursor = res.cursor;
+					expect(pages).toBeLessThan(50);
+				}
+				expect(count).toBe(0);
+				expect(scannedCount).toBe(5);
+			});
+
+			it("count mode with a filter returns the matched count of the page", async () => {
+				const db = makeDB();
+				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				const filter: ConditionExpression = { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] };
+
+				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, select: "count" });
+				expect(res.items).toEqual([]);
+				expect(res.count).toBe(2);
+				expect(res.scannedCount).toBe(5);
+				expect(res.count).toBeLessThan(res.scannedCount);
+			});
+
+			it("rejects a filtered cursor resumed with another filter or none", async () => {
+				const db = makeDB();
+				for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				const filterA: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a2" }] };
+				const filterB: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a1" }] };
+
+				// limit 2 evaluates two candidates: a1 is rejected and a2 is matched, so one item returns.
+				const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, limit: 2 });
+				expect(sksOf(first)).toEqual(["a2"]);
+				expect(first.cursor).toBeDefined();
+
+				await expect(db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterB, cursor: first.cursor })).rejects.toThrow(
+					fokosErrorWith("cursor_fingerprint_mismatch"),
+				);
+				await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
+					fokosErrorWith("cursor_fingerprint_mismatch"),
+				);
+
+				// The same filter resumes without a gap or a duplicate.
+				const got: Array<string | Uint8Array | undefined> = sksOf(first);
+				let cursor = first.cursor;
+				let pages = 1;
+				for (;;) {
+					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, cursor });
+					got.push(...sksOf(res));
+					pages++;
+					if (res.cursor === undefined) break;
+					cursor = res.cursor;
+					expect(pages).toBeLessThan(50);
+				}
+				expect(got).toEqual(["a2", "a3", "a4"]);
+			});
+
+			it("a filter and a projection compose in one request", async () => {
+				const db = makeDB();
+				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i, s: `v${i}` } });
+
+				const res = await db.queryItems({
+					queries: [{ hashKey: "alice" }],
+					filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] },
+					projection: [{ expr: { ref: "sortKey" }, as: "id" }, { expr: { ref: "data", path: "$.n" } }],
+				});
+
+				expect(res.items).toEqual([
+					{ id: "s3", "$.n": 3 },
+					{ id: "s4", "$.n": 4 },
+				]);
+				expect(res.count).toBe(2);
+				expect(res.scannedCount).toBe(5);
+			});
+		});
+
+		describe("FokosDB.queryItems — sort-key condition operators", () => {
+			const ALL_SKS = ["a", "ab", "abc", "b", "ba", "c", "d"];
+
+			async function populateAndQuery(sortKeyCondition: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sortKeyCondition"]) {
+				const db = makeDB();
+				for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				return db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
+			}
+
+			it("eq: returns only the exact match", async () => {
+				const res = await populateAndQuery({ op: "eq", value: "b" });
+				expect(sksOf(res)).toEqual(["b"]);
+			});
+
+			it("gt: returns items strictly greater", async () => {
+				const res = await populateAndQuery({ op: "gt", value: "b" });
+				expect(sksOf(res)).toEqual(["ba", "c", "d"]);
+			});
+
+			it("gte: returns items greater or equal", async () => {
+				const res = await populateAndQuery({ op: "gte", value: "b" });
+				expect(sksOf(res)).toEqual(["b", "ba", "c", "d"]);
+			});
+
+			it("lt: returns items strictly less", async () => {
+				const res = await populateAndQuery({ op: "lt", value: "b" });
+				expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
+			});
+
+			it("lte: returns items less or equal", async () => {
+				const res = await populateAndQuery({ op: "lte", value: "b" });
+				expect(sksOf(res)).toEqual(["a", "ab", "abc", "b"]);
+			});
+
+			it("between: returns items in the inclusive range", async () => {
+				const res = await populateAndQuery({ op: "between", lower: "ab", upper: "c" });
+				expect(sksOf(res)).toEqual(["ab", "abc", "b", "ba", "c"]);
+			});
+
+			it("between: empty when lower > upper", async () => {
+				const res = await populateAndQuery({ op: "between", lower: "z", upper: "a" });
+				expect(sksOf(res)).toEqual([]);
+			});
+
+			it("begins_with: matches the prefix", async () => {
+				const res = await populateAndQuery({ op: "begins_with", prefix: "a" });
+				expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
+			});
+
+			it("begins_with: single-character prefix that is also an exact key", async () => {
+				const res = await populateAndQuery({ op: "begins_with", prefix: "b" });
+				expect(sksOf(res)).toEqual(["b", "ba"]);
+			});
+
+			it("begins_with: multi-character prefix", async () => {
+				const res = await populateAndQuery({ op: "begins_with", prefix: "ab" });
+				expect(sksOf(res)).toEqual(["ab", "abc"]);
+			});
+
+			it("begins_with: empty prefix matches all", async () => {
+				const res = await populateAndQuery({ op: "begins_with", prefix: "" });
+				expect(sksOf(res)).toEqual(ALL_SKS);
+			});
+
+			it("begins_with: no matching prefix returns empty", async () => {
+				const res = await populateAndQuery({ op: "begins_with", prefix: "zzz" });
+				expect(sksOf(res)).toEqual([]);
+			});
+
+			it("range: exclusive lower, inclusive upper", async () => {
+				const res = await populateAndQuery({
+					op: "range",
+					lower: { value: "a", inclusive: false },
+					upper: { value: "b", inclusive: true },
+				});
+				expect(sksOf(res)).toEqual(["ab", "abc", "b"]);
+			});
+
+			it("range: open-ended (lower only)", async () => {
+				const res = await populateAndQuery({ op: "range", lower: { value: "c", inclusive: true } });
+				expect(sksOf(res)).toEqual(["c", "d"]);
+			});
+
+			it("range: open-ended (upper only)", async () => {
+				const res = await populateAndQuery({ op: "range", upper: { value: "b", inclusive: false } });
+				expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
+			});
+
+			it("no sort condition: returns all items for the hash key", async () => {
+				const res = await populateAndQuery(undefined);
+				expect(sksOf(res)).toEqual(ALL_SKS);
+			});
+
+			it("begins_with works correctly with scanIndexForward=false", async () => {
+				const db = makeDB();
+				for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				const res = await db.queryItems({
+					queries: [{ hashKey: "k", sortKeyCondition: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
+				});
+				expect(sksOf(res)).toEqual(["abc", "ab", "a"]);
+			});
+		});
+
+		describe("FokosDB.queryItems — negative prefix match with FokosStd.notBeginsWith", () => {
+			// The complement of a prefix is two ranges, one sub-query each. The fixture covers every
+			// boundary: an item with no sort key (sorts first), the bare prefix, keys under the prefix, the
+			// successor key itself, a later string key, and a binary key (sorts after every string).
+			const BIN = new Uint8Array([1]);
+			const EXPECTED_ASC = [undefined, "a", "order$", "p", BIN];
+
+			async function populate() {
+				const db = makeDB();
+				await db.putItem({ hashKey: "k", data: "x" });
+				for (const sk of ["a", "order#", "order#1", "order$", "p"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				await db.putItem({ hashKey: "k", sortKey: BIN, data: "x" });
+				return db;
+			}
+
+			it("returns every item whose sort key does not begin with the prefix, in sort order", async () => {
+				const db = await populate();
+				const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#") });
+				expect(sksOf(res)).toEqual(EXPECTED_ASC);
+				expect(res.count).toBe(EXPECTED_ASC.length);
+			});
+
+			it("keeps the order reversed with scanIndexForward=false", async () => {
+				const db = await populate();
+				const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#", { scanIndexForward: false }) });
+				expect(sksOf(res)).toEqual([...EXPECTED_ASC].reverse());
+			});
+
+			it("pages across the boundary between the two ranges without a gap or a duplicate", async () => {
+				const db = await populate();
+				const queries = FokosStd.notBeginsWith("k", "order#");
+				const seen: Array<string | Uint8Array | undefined> = [];
+				let cursor: string | undefined;
+				let pages = 0;
+				for (;;) {
+					const res = await db.queryItems({ queries, limit: 2, cursor });
+					seen.push(...sksOf(res));
+					pages++;
+					if (res.cursor === undefined) break;
+					cursor = res.cursor;
+					expect(pages).toBeLessThan(50);
+				}
+				expect(seen).toEqual(EXPECTED_ASC);
+				expect(pages).toBeGreaterThan(1);
+			});
+
+			it("mixes with other sub-queries and count mode", async () => {
+				const db = await populate();
+				await db.putItem({ hashKey: "other", sortKey: "z", data: "x" });
+				const res = await db.queryItems({
+					queries: [...FokosStd.notBeginsWith("k", "order#"), { hashKey: "other" }],
+					select: "count",
+				});
+				expect(res.items).toEqual([]);
+				expect(res.count).toBe(EXPECTED_ASC.length + 1);
+			});
+		});
+
+		describe("FokosDB — item data kinds (bytes / text / json)", () => {
+			it("round-trips each kind through put→get, exposing the reconstructed value and its kind", async () => {
+				const db = makeDB();
+				const bytes = new Uint8Array([0, 1, 2, 255]);
+				const obj = { a: 1, nested: { b: [true, "x", null] }, list: [1, 2, 3] };
+
+				await db.putItem({ hashKey: "k", sortKey: "bytes", data: bytes });
+				await db.putItem({ hashKey: "k", sortKey: "text", data: "hello" });
+				await db.putItem({ hashKey: "k", sortKey: "json", data: obj });
+
+				const gotBytes = await db.getItem({ hashKey: "k", sortKey: "bytes" });
+				const gotText = await db.getItem({ hashKey: "k", sortKey: "text" });
+				const gotJson = await db.getItem({ hashKey: "k", sortKey: "json" });
+
+				expect(gotBytes).toMatchObject({ found: true, item: { kind: "bytes", data: bytes } });
+				expect(gotText).toMatchObject({ found: true, item: { kind: "text", data: "hello" } });
+				expect(gotJson).toMatchObject({ found: true, item: { kind: "json" } });
+				if (gotJson.found) expect(gotJson.item.data).toEqual(obj); // deep structural equality after JSONB round-trip
+			});
+
+			it("keeps a bare string as opaque text (not JSON-wrapped), byte-identical on read", async () => {
+				const db = makeDB();
+				const jsonText = '{"a":1}'; // legitimate JSON *text* stored as a string stays a string
+				await db.putItem({ hashKey: "k", sortKey: "s", data: jsonText });
+				const got = await db.getItem({ hashKey: "k", sortKey: "s" });
+				expect(got).toMatchObject({ found: true, item: { kind: "text", data: jsonText } });
+			});
+
+			it("exposes kind on queryItems results and parses json rows", async () => {
+				const db = makeDB();
+				await db.putItem({ hashKey: "q", sortKey: "1", data: "plain" });
+				await db.putItem({ hashKey: "q", sortKey: "2", data: { n: 42 } });
+
+				const res = await db.queryItems({ queries: [{ hashKey: "q" }] });
+				expect(res.items).toMatchObject([
+					{ sortKey: "1", kind: "text", data: "plain" },
+					{ sortKey: "2", kind: "json", data: { n: 42 } },
+				]);
+			});
+
+			it("round-trips a json value written and read through a transaction", async () => {
+				const db = makeDB();
+				const obj = { status: "active", tags: ["a", "b"] };
+				const write = await db.transactWriteItems({
+					items: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
+				});
+				// A cancelled write raises, so the returned token is the commit.
+				expect(write.idempotencyToken).toEqual(expect.any(String));
+
+				const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
+				expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
+				const item = read.items[0];
+				if (item.found) expect(item.data).toEqual(obj);
+			});
+
+			it("rejects data that is not JSON-serializable", async () => {
+				const db = makeDB();
+				const circular: Record<string, unknown> = {};
+				circular.self = circular;
+				// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
+				await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(
+					fokosErrorWith("item_data_not_json_serializable"),
+				);
+			});
+
+			// `JsonComposite` accepts arrays and objects only. TypeScript says so, and these pin that the
+			// runtime agrees, which is what a JS caller meets. A primitive stored silently as json would make
+			// the declared type a lie.
+			it.each([
+				["a number", 5],
+				["a boolean", true],
+				["null", null],
+				["a function", () => {}],
+			])("rejects %s as top-level data, in putItem and transactWriteItems alike", async (_name, data) => {
+				const db = makeDB();
+				const expected = fokosErrorWith("item_data_wrong_type");
+
+				await expect(db.putItem({ hashKey: "k", sortKey: "prim", data: data as never })).rejects.toThrow(expected);
+				await expect(
+					db.transactWriteItems({ items: [{ hashKey: "k", sortKey: "prim", operation: "put", data: data as never }] }),
+				).rejects.toThrow(expected);
+			});
+
+			// The one value the guard above lets through that JSON.stringify still drops: a toJSON that
+			// returns undefined makes the WHOLE document undefined, not just that field.
+			it("rejects an object whose toJSON() returns undefined, and says so", async () => {
+				const db = makeDB();
+				const data = { toJSON: () => undefined };
+				await expect(db.putItem({ hashKey: "k", sortKey: "tojson", data: data as never })).rejects.toThrow(
+					fokosErrorWith("item_data_not_json_serializable"),
+				);
+			});
+		});
+
+		describe("FokosDB — results carry the caller's own keys", () => {
+			it("reports an absent sortKey as undefined on put, get and delete", async () => {
+				const db = makeDB();
+
+				expect((await db.putItem({ hashKey: "no-sk", data: "v" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+
+				const got = await db.getItem({ hashKey: "no-sk" });
+				expect(got.found).toBe(true);
+				expect(got.item.hashKey).toBe("no-sk");
+				expect(got.item.sortKey).toBeUndefined();
+
+				expect((await db.deleteItem({ hashKey: "no-sk" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
+			});
+
+			it("returns a binary key as the bytes the caller passed, not the encoded form", async () => {
+				const db = makeDB();
+				// KeyCodec 0xFF-tags a binary key, so the stored form differs from this one.
+				const hashKey = new Uint8Array([1, 2, 3]);
+				const sortKey = new Uint8Array([9]);
+
+				expect((await db.putItem({ hashKey, sortKey, data: "v" })).item).toEqual({ hashKey, sortKey });
+
+				const got = await db.getItem({ hashKey, sortKey });
+				expect(got.found).toBe(true);
+				expect(got.item.hashKey).toEqual(hashKey);
+				expect(got.item.sortKey).toEqual(sortKey);
+			});
 		});
 	});
 
@@ -123,42 +839,6 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				all.mockRestore();
 				traverse.mockRestore();
 			}
-		});
-	});
-
-	describe("FokosDB — TTL", () => {
-		it("stores, returns, and clears ttlAt", async () => {
-			const db = makeDB();
-			const ttlAt = Math.floor(Date.now() / 1000) + 3600;
-
-			await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v1", ttlAt });
-			expect(await db.getItem({ hashKey: "ttl", sortKey: "item" })).toMatchObject({ found: true, item: { ttlAt } });
-			expect((await db.queryItems({ queries: [{ hashKey: "ttl" }] })).items[0].ttlAt).toBe(ttlAt);
-
-			await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
-			const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
-			expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
-			if (cleared.found) expect(cleared.item.ttlAt).toBeUndefined();
-		});
-
-		it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {
-			const db = makeDB();
-			await expect(db.putItem({ hashKey: "invalid-ttl", data: "v", ttlAt })).rejects.toThrow(fokosErrorWith("ttl_at_invalid"));
-			await expect(db.transactWriteItems({ items: [{ hashKey: "invalid-ttl-tx", operation: "put", data: "v", ttlAt }] })).rejects.toThrow(
-				fokosErrorWith("ttl_at_invalid"),
-			);
-		});
-
-		it("accepts a past ttlAt and deletes the item in a later cycle", async () => {
-			const db = makeDB();
-			const ttlAt = Math.max(1, Math.floor(Date.now() / 1000) - 1);
-			await db.putItem({ hashKey: "past-ttl", data: "v", ttlAt });
-			expect(await db.getItem({ hashKey: "past-ttl" })).toMatchObject({ found: true, item: { ttlAt } });
-
-			await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).found).toBe(false), {
-				timeout: 3_000,
-				interval: 100,
-			});
 		});
 	});
 
@@ -444,687 +1124,6 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		});
 	});
 
-	describe("FokosDB.queryItems — projections", () => {
-		it("returns flat projected records by resolved name", async () => {
-			const db = makeDB();
-			await db.putItem({ hashKey: "alice", sortKey: "a1", data: { n: 1, s: "x" } });
-			await db.putItem({ hashKey: "alice", sortKey: "a2", data: { s: "y" } });
-			await db.putItem({ hashKey: "alice", sortKey: "a3", data: { n: 3, s: "z", k: [1, 2] } });
-			await db.putItem({ hashKey: "alice", sortKey: "a4", data: "text-item" });
-
-			const res = await db.queryItems({
-				queries: [{ hashKey: "alice" }],
-				projection: [
-					{ expr: { ref: "sortKey" }, as: "id" },
-					{ expr: { ref: "data", path: "$.n" } },
-					{ expr: { ref: "data", path: "$.k" }, as: "k" },
-					{ expr: { fn: "sqlite.upper", args: [{ ref: "data", path: "$.s" }] }, as: "S" },
-					{ expr: { ref: "data" } },
-				],
-			});
-
-			expect(res.items).toEqual([
-				{ id: "a1", "$.n": 1, S: "X", data: { n: 1, s: "x" } },
-				{ id: "a2", S: "Y", data: { s: "y" } },
-				{ id: "a3", "$.n": 3, k: [1, 2], S: "Z", data: { n: 3, s: "z", k: [1, 2] } },
-				// A path over a text item is missing. A function over a missing argument sees NULL.
-				{ id: "a4", S: null, data: "text-item" },
-			]);
-			// A missing cell leaves the key absent, not undefined.
-			expect(Object.keys(res.items[1])).not.toContain("$.n");
-			expect(res.count).toBe(4);
-			expect(res.scannedCount).toBe(4);
-		});
-
-		it("rejects a projection with count selection", async () => {
-			const db = makeDB();
-			await expect(
-				db.queryItems({ queries: [{ hashKey: "alice" }], select: "count", projection: [{ expr: { ref: "sortKey" } }] }),
-			).rejects.toThrow(fokosErrorWith("query_projection_with_count"));
-		});
-
-		it("rejects a cursor resumed with another projection or none", async () => {
-			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			const projectionA: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
-			const projectionB: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "sk" }];
-
-			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, limit: 2 });
-			expect(first.items).toEqual([{ id: "a1" }, { id: "a2" }]);
-			expect(first.cursor).toBeDefined();
-
-			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionB, cursor: first.cursor })).rejects.toThrow(
-				fokosErrorWith("cursor_fingerprint_mismatch"),
-			);
-			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
-				fokosErrorWith("cursor_fingerprint_mismatch"),
-			);
-
-			// The same projection resumes without a gap or a duplicate.
-			const got: unknown[] = first.items.map((item) => item.id);
-			let cursor = first.cursor;
-			for (;;) {
-				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, cursor });
-				got.push(...res.items.map((item) => item.id));
-				if (res.cursor === undefined) break;
-				cursor = res.cursor;
-			}
-			expect(got).toEqual(["a1", "a2", "a3", "a4"]);
-		});
-
-		it("paginates projected rows across sub-queries without gaps or duplicates", async () => {
-			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
-
-			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
-			const projection: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
-			const got: unknown[] = [];
-			let cursor: string | undefined;
-			let pages = 0;
-			for (;;) {
-				const res = await db.queryItems({ queries, projection, limit: 2, cursor });
-				got.push(...res.items.map((item) => item.id));
-				pages++;
-				if (res.cursor === undefined) break;
-				cursor = res.cursor;
-				expect(pages).toBeLessThan(50);
-			}
-
-			expect(got).toEqual(["a1", "a2", "a3", "b1", "b2", "b3"]);
-			expect(pages).toBeGreaterThan(1);
-		});
-	});
-
-	describe("FokosDB.getItem — projections", () => {
-		it("returns a flat projected record for a found item, across cell kinds", async () => {
-			const db = makeDB();
-			await db.putItem({
-				hashKey: "alice",
-				sortKey: "j1",
-				data: { n: 1, s: "alpha", none: null, k: [1, 2] },
-			});
-
-			const res = await db.getItem({
-				hashKey: "alice",
-				sortKey: "j1",
-				projection: [
-					{ expr: { ref: "sortKey" }, as: "id" },
-					{ expr: { ref: "data", path: "$.n" } },
-					{ expr: { ref: "data", path: "$.s" }, as: "name" },
-					{ expr: { ref: "data", path: "$.none" } },
-					{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
-					{ expr: { ref: "data", path: "$.k" }, as: "k" },
-					{ expr: { ref: "v" }, as: "ver" },
-				],
-			});
-
-			expect(res).toEqual({
-				found: true,
-				item: {
-					hashKey: "alice",
-					sortKey: "j1",
-					data: { id: "j1", "$.n": 1, name: "alpha", "$.none": null, k: [1, 2], ver: 1 },
-					kind: "projected",
-					version: 1,
-				},
-				meta: expect.anything(),
-			});
-			// The projected record sits in `data` inside the normal envelope, tagged `kind: "projected"`.
-			invariant(res.found && res.item.kind === "projected");
-			expect(Object.keys(res)).toEqual(["found", "item", "meta"]);
-			expect(Object.keys(res.item)).toEqual(["hashKey", "sortKey", "data", "kind", "version"]);
-			expect(Object.keys(res.item.data)).not.toContain("missing");
-		});
-
-		it("projects a bytes cell as a Uint8Array", async () => {
-			const db = makeDB();
-			await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
-
-			const res = await db.getItem({ hashKey: "alice", sortKey: "b1", projection: [{ expr: { ref: "data" }, as: "bytes" }] });
-			invariant(res.found && res.item.kind === "projected");
-			expect(res.item.data.bytes).toEqual(new Uint8Array([1, 2, 3]));
-		});
-
-		it("returns found:false with the caller's keys for a missing item", async () => {
-			const db = makeDB();
-			const res = await db.getItem({ hashKey: "alice", sortKey: "nope", projection: [{ expr: { ref: "data" } }] });
-			expect(res).toMatchObject({ found: false, item: { hashKey: "alice", sortKey: "nope" } });
-		});
-	});
-
-	// Every property access below also fails to compile when the type parameter stops reaching the
-	// json value or the projected record of a result.
-	describe("FokosDB reads — the caller's own type", () => {
-		type Player = { name: string; score: number };
-
-		it("types the json value and the projected record of every read", async () => {
-			const db = makeDB();
-			await db.putItem({ hashKey: "alice", sortKey: "p1", data: { name: "alpha", score: 3 } });
-
-			const whole = await db.getItem<Player>({ hashKey: "alice", sortKey: "p1" });
-			invariant(whole.found && whole.item.kind === "json");
-			expect(whole.item.data.name).toBe("alpha");
-
-			const projected = await db.getItem<Pick<Player, "name">>({
-				hashKey: "alice",
-				sortKey: "p1",
-				projection: [{ expr: { ref: "data", path: "$.name" }, as: "name" }],
-			});
-			invariant(projected.found && projected.item.kind === "projected");
-			expect(projected.item.data.name).toBe("alpha");
-
-			const page = await db.queryItems<Pick<Player, "score">>({
-				queries: [{ hashKey: "alice", sortKeyCondition: { op: "eq", value: "p1" } }],
-				projection: [{ expr: { ref: "data", path: "$.score" }, as: "score" }],
-			});
-			expect(page.items[0].score).toBe(3);
-
-			// One request, two unrelated items: each position is typed by its own member of the tuple.
-			await db.putItem({ hashKey: "alice", sortKey: "p2", data: { label: "beta" } });
-			const read = await db.transactGetItems<[Player, { label: string }]>({
-				items: [
-					{ hashKey: "alice", sortKey: "p1" },
-					{ hashKey: "alice", sortKey: "p2" },
-				],
-			});
-			const [first, second] = read.items;
-			invariant(first.found && first.kind === "json");
-			expect(first.data.score).toBe(3);
-			invariant(second.found && second.kind === "json");
-			expect(second.data.label).toBe("beta");
-		});
-
-		// Type-level contract, never executed: the tuple fixes the item count in both directions, and a
-		// call that names no type keeps the widest types.
-		async function _transactGetItemsArity(db: FokosDB) {
-			// @ts-expect-error two types named, one item passed
-			await db.transactGetItems<[Player, Player]>({ items: [{ hashKey: "a" }] });
-			// @ts-expect-error one type named, two items passed
-			await db.transactGetItems<[Player]>({ items: [{ hashKey: "a" }, { hashKey: "b" }] });
-			const wide = await db.transactGetItems({ items: [{ hashKey: "a" }] });
-			if (wide.items[0].found && wide.items[0].kind === "json") {
-				const value: JsonValue = wide.items[0].data;
-				void value;
-			}
-		}
-		void _transactGetItemsArity;
-	});
-
-	describe("FokosDB.queryItems — filters", () => {
-		// Mixed data kinds under one hash key: the filter must evaluate per candidate and must not
-		// change candidate selection, so every case scans all four items. A missing operand makes a
-		// comparison false, which is what keeps the text and bytes items out of the numeric cases.
-		it.each<{ name: string; filter: ConditionExpression; expected: string[] }>([
-			{ name: "eq", filter: { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1"] },
-			{ name: "ne", filter: { op: "ne", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
-			{ name: "eq on a boolean", filter: { op: "eq", args: [{ ref: "data", path: "$.flag" }, { val: true }] }, expected: ["j1"] },
-			// A stored JSON null equals a null literal, and a path that is absent does not.
-			{ name: "eq on a JSON null", filter: { op: "eq", args: [{ ref: "data", path: "$.none" }, { val: null }] }, expected: ["j1"] },
-			{ name: "lt", filter: { op: "lt", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1"] },
-			{ name: "lte", filter: { op: "lte", args: [{ ref: "data", path: "$.n" }, { val: 2 }] }, expected: ["j1", "j2"] },
-			{ name: "gt", filter: { op: "gt", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j2"] },
-			{ name: "gte", filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, expected: ["j1", "j2"] },
-			{
-				name: "between",
-				filter: { op: "between", args: [{ ref: "data", path: "$.n" }, { val: 2 }, { val: 5 }] },
-				expected: ["j2"],
-			},
-			{
-				name: "in",
-				filter: { op: "in", args: [{ ref: "data", path: "$.s" }, { val: "alpha" }, { val: "gamma" }] },
-				expected: ["j1"],
-			},
-			{
-				name: "and",
-				filter: {
-					op: "and",
-					args: [
-						{ op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
-						{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
-					],
-				},
-				expected: ["j2"],
-			},
-			{
-				name: "or",
-				filter: {
-					op: "or",
-					args: [
-						{ op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] },
-						{ op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "beta" }] },
-					],
-				},
-				expected: ["j1", "j2"],
-			},
-			{
-				name: "not",
-				filter: { op: "not", args: [{ op: "exists", args: [{ ref: "data", path: "$.n" }] }] },
-				expected: ["b1", "t1"],
-			},
-			{ name: "exists", filter: { op: "exists", args: [{ ref: "data", path: "$.tags" }] }, expected: ["j1", "j2"] },
-			{ name: "not_exists", filter: { op: "not_exists", args: [{ ref: "data", path: "$.s" }] }, expected: ["b1", "t1"] },
-			{
-				name: "begins_with on a path",
-				filter: { op: "begins_with", args: [{ ref: "data", path: "$.s" }, { val: "al" }] },
-				expected: ["j1"],
-			},
-			{
-				name: "begins_with on whole text data",
-				filter: { op: "begins_with", args: [{ ref: "data" }, { val: "text-" }] },
-				expected: ["t1"],
-			},
-			{
-				name: "contains on a JSON array",
-				filter: { op: "contains", args: [{ ref: "data", path: "$.tags" }, { val: "x" }] },
-				expected: ["j1"],
-			},
-			{
-				name: "contains on byte data",
-				filter: { op: "contains", args: [{ ref: "data" }, { b64: "Ag==" }] },
-				expected: ["b1"],
-			},
-			{
-				name: "sort-key reference",
-				filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "j2" }] },
-				expected: ["j2", "t1"],
-			},
-		])("every condition operator as a filter, on mixed data kinds: $name", async ({ filter, expected }) => {
-			const db = makeDB();
-			await db.putItem({ hashKey: "alice", sortKey: "j1", data: { n: 1, s: "alpha", tags: ["x", "y"], flag: true, none: null } });
-			await db.putItem({ hashKey: "alice", sortKey: "j2", data: { n: 2, s: "beta", tags: ["y"] } });
-			await db.putItem({ hashKey: "alice", sortKey: "t1", data: "text-value" });
-			await db.putItem({ hashKey: "alice", sortKey: "b1", data: new Uint8Array([1, 2, 3]) });
-
-			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter });
-
-			expect(sksOf(res)).toEqual(expected);
-			expect(res.count).toBe(expected.length);
-			expect(res.scannedCount).toBe(4);
-		});
-
-		it("a filter that rejects every candidate pages the whole interval", async () => {
-			const db = makeDB();
-			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
-			const filter: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 999 }] };
-
-			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2 });
-			expect(first.items).toEqual([]);
-			expect(first.count).toBe(0);
-			expect(first.scannedCount).toBe(2);
-			expect(first.cursor).toBeDefined();
-
-			let count = first.count;
-			let scannedCount = first.scannedCount;
-			let cursor = first.cursor;
-			let pages = 1;
-			for (;;) {
-				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2, cursor });
-				expect(res.items).toEqual([]);
-				count += res.count;
-				scannedCount += res.scannedCount;
-				pages++;
-				if (res.cursor === undefined) break;
-				cursor = res.cursor;
-				expect(pages).toBeLessThan(50);
-			}
-			expect(count).toBe(0);
-			expect(scannedCount).toBe(5);
-		});
-
-		it("count mode with a filter returns the matched count of the page", async () => {
-			const db = makeDB();
-			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
-			const filter: ConditionExpression = { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] };
-
-			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, select: "count" });
-			expect(res.items).toEqual([]);
-			expect(res.count).toBe(2);
-			expect(res.scannedCount).toBe(5);
-			expect(res.count).toBeLessThan(res.scannedCount);
-		});
-
-		it("rejects a filtered cursor resumed with another filter or none", async () => {
-			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			const filterA: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a2" }] };
-			const filterB: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a1" }] };
-
-			// limit 2 evaluates two candidates: a1 is rejected and a2 is matched, so one item returns.
-			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, limit: 2 });
-			expect(sksOf(first)).toEqual(["a2"]);
-			expect(first.cursor).toBeDefined();
-
-			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterB, cursor: first.cursor })).rejects.toThrow(
-				fokosErrorWith("cursor_fingerprint_mismatch"),
-			);
-			await expect(db.queryItems({ queries: [{ hashKey: "alice" }], cursor: first.cursor })).rejects.toThrow(
-				fokosErrorWith("cursor_fingerprint_mismatch"),
-			);
-
-			// The same filter resumes without a gap or a duplicate.
-			const got: Array<string | Uint8Array | undefined> = sksOf(first);
-			let cursor = first.cursor;
-			let pages = 1;
-			for (;;) {
-				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, cursor });
-				got.push(...sksOf(res));
-				pages++;
-				if (res.cursor === undefined) break;
-				cursor = res.cursor;
-				expect(pages).toBeLessThan(50);
-			}
-			expect(got).toEqual(["a2", "a3", "a4"]);
-		});
-
-		it("a filter and a projection compose in one request", async () => {
-			const db = makeDB();
-			for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i, s: `v${i}` } });
-
-			const res = await db.queryItems({
-				queries: [{ hashKey: "alice" }],
-				filter: { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] },
-				projection: [{ expr: { ref: "sortKey" }, as: "id" }, { expr: { ref: "data", path: "$.n" } }],
-			});
-
-			expect(res.items).toEqual([
-				{ id: "s3", "$.n": 3 },
-				{ id: "s4", "$.n": 4 },
-			]);
-			expect(res.count).toBe(2);
-			expect(res.scannedCount).toBe(5);
-		});
-	});
-
-	describe("FokosDB.queryItems — sort-key condition operators", () => {
-		const ALL_SKS = ["a", "ab", "abc", "b", "ba", "c", "d"];
-
-		async function populateAndQuery(sortKeyCondition: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sortKeyCondition"]) {
-			const db = makeDB();
-			for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
-			return db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
-		}
-
-		it("eq: returns only the exact match", async () => {
-			const res = await populateAndQuery({ op: "eq", value: "b" });
-			expect(sksOf(res)).toEqual(["b"]);
-		});
-
-		it("gt: returns items strictly greater", async () => {
-			const res = await populateAndQuery({ op: "gt", value: "b" });
-			expect(sksOf(res)).toEqual(["ba", "c", "d"]);
-		});
-
-		it("gte: returns items greater or equal", async () => {
-			const res = await populateAndQuery({ op: "gte", value: "b" });
-			expect(sksOf(res)).toEqual(["b", "ba", "c", "d"]);
-		});
-
-		it("lt: returns items strictly less", async () => {
-			const res = await populateAndQuery({ op: "lt", value: "b" });
-			expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
-		});
-
-		it("lte: returns items less or equal", async () => {
-			const res = await populateAndQuery({ op: "lte", value: "b" });
-			expect(sksOf(res)).toEqual(["a", "ab", "abc", "b"]);
-		});
-
-		it("between: returns items in the inclusive range", async () => {
-			const res = await populateAndQuery({ op: "between", lower: "ab", upper: "c" });
-			expect(sksOf(res)).toEqual(["ab", "abc", "b", "ba", "c"]);
-		});
-
-		it("between: empty when lower > upper", async () => {
-			const res = await populateAndQuery({ op: "between", lower: "z", upper: "a" });
-			expect(sksOf(res)).toEqual([]);
-		});
-
-		it("begins_with: matches the prefix", async () => {
-			const res = await populateAndQuery({ op: "begins_with", prefix: "a" });
-			expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
-		});
-
-		it("begins_with: single-character prefix that is also an exact key", async () => {
-			const res = await populateAndQuery({ op: "begins_with", prefix: "b" });
-			expect(sksOf(res)).toEqual(["b", "ba"]);
-		});
-
-		it("begins_with: multi-character prefix", async () => {
-			const res = await populateAndQuery({ op: "begins_with", prefix: "ab" });
-			expect(sksOf(res)).toEqual(["ab", "abc"]);
-		});
-
-		it("begins_with: empty prefix matches all", async () => {
-			const res = await populateAndQuery({ op: "begins_with", prefix: "" });
-			expect(sksOf(res)).toEqual(ALL_SKS);
-		});
-
-		it("begins_with: no matching prefix returns empty", async () => {
-			const res = await populateAndQuery({ op: "begins_with", prefix: "zzz" });
-			expect(sksOf(res)).toEqual([]);
-		});
-
-		it("range: exclusive lower, inclusive upper", async () => {
-			const res = await populateAndQuery({
-				op: "range",
-				lower: { value: "a", inclusive: false },
-				upper: { value: "b", inclusive: true },
-			});
-			expect(sksOf(res)).toEqual(["ab", "abc", "b"]);
-		});
-
-		it("range: open-ended (lower only)", async () => {
-			const res = await populateAndQuery({ op: "range", lower: { value: "c", inclusive: true } });
-			expect(sksOf(res)).toEqual(["c", "d"]);
-		});
-
-		it("range: open-ended (upper only)", async () => {
-			const res = await populateAndQuery({ op: "range", upper: { value: "b", inclusive: false } });
-			expect(sksOf(res)).toEqual(["a", "ab", "abc"]);
-		});
-
-		it("no sort condition: returns all items for the hash key", async () => {
-			const res = await populateAndQuery(undefined);
-			expect(sksOf(res)).toEqual(ALL_SKS);
-		});
-
-		it("begins_with works correctly with scanIndexForward=false", async () => {
-			const db = makeDB();
-			for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
-			const res = await db.queryItems({
-				queries: [{ hashKey: "k", sortKeyCondition: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
-			});
-			expect(sksOf(res)).toEqual(["abc", "ab", "a"]);
-		});
-	});
-
-	describe("FokosDB.queryItems — negative prefix match with FokosStd.notBeginsWith", () => {
-		// The complement of a prefix is two ranges, one sub-query each. The fixture covers every
-		// boundary: an item with no sort key (sorts first), the bare prefix, keys under the prefix, the
-		// successor key itself, a later string key, and a binary key (sorts after every string).
-		const BIN = new Uint8Array([1]);
-		const EXPECTED_ASC = [undefined, "a", "order$", "p", BIN];
-
-		async function populate() {
-			const db = makeDB();
-			await db.putItem({ hashKey: "k", data: "x" });
-			for (const sk of ["a", "order#", "order#1", "order$", "p"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
-			await db.putItem({ hashKey: "k", sortKey: BIN, data: "x" });
-			return db;
-		}
-
-		it("returns every item whose sort key does not begin with the prefix, in sort order", async () => {
-			const db = await populate();
-			const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#") });
-			expect(sksOf(res)).toEqual(EXPECTED_ASC);
-			expect(res.count).toBe(EXPECTED_ASC.length);
-		});
-
-		it("keeps the order reversed with scanIndexForward=false", async () => {
-			const db = await populate();
-			const res = await db.queryItems({ queries: FokosStd.notBeginsWith("k", "order#", { scanIndexForward: false }) });
-			expect(sksOf(res)).toEqual([...EXPECTED_ASC].reverse());
-		});
-
-		it("pages across the boundary between the two ranges without a gap or a duplicate", async () => {
-			const db = await populate();
-			const queries = FokosStd.notBeginsWith("k", "order#");
-			const seen: Array<string | Uint8Array | undefined> = [];
-			let cursor: string | undefined;
-			let pages = 0;
-			for (;;) {
-				const res = await db.queryItems({ queries, limit: 2, cursor });
-				seen.push(...sksOf(res));
-				pages++;
-				if (res.cursor === undefined) break;
-				cursor = res.cursor;
-				expect(pages).toBeLessThan(50);
-			}
-			expect(seen).toEqual(EXPECTED_ASC);
-			expect(pages).toBeGreaterThan(1);
-		});
-
-		it("mixes with other sub-queries and count mode", async () => {
-			const db = await populate();
-			await db.putItem({ hashKey: "other", sortKey: "z", data: "x" });
-			const res = await db.queryItems({
-				queries: [...FokosStd.notBeginsWith("k", "order#"), { hashKey: "other" }],
-				select: "count",
-			});
-			expect(res.items).toEqual([]);
-			expect(res.count).toBe(EXPECTED_ASC.length + 1);
-		});
-	});
-
-	describe("FokosDB — item data kinds (bytes / text / json)", () => {
-		it("round-trips each kind through put→get, exposing the reconstructed value and its kind", async () => {
-			const db = makeDB();
-			const bytes = new Uint8Array([0, 1, 2, 255]);
-			const obj = { a: 1, nested: { b: [true, "x", null] }, list: [1, 2, 3] };
-
-			await db.putItem({ hashKey: "k", sortKey: "bytes", data: bytes });
-			await db.putItem({ hashKey: "k", sortKey: "text", data: "hello" });
-			await db.putItem({ hashKey: "k", sortKey: "json", data: obj });
-
-			const gotBytes = await db.getItem({ hashKey: "k", sortKey: "bytes" });
-			const gotText = await db.getItem({ hashKey: "k", sortKey: "text" });
-			const gotJson = await db.getItem({ hashKey: "k", sortKey: "json" });
-
-			expect(gotBytes).toMatchObject({ found: true, item: { kind: "bytes", data: bytes } });
-			expect(gotText).toMatchObject({ found: true, item: { kind: "text", data: "hello" } });
-			expect(gotJson).toMatchObject({ found: true, item: { kind: "json" } });
-			if (gotJson.found) expect(gotJson.item.data).toEqual(obj); // deep structural equality after JSONB round-trip
-		});
-
-		it("keeps a bare string as opaque text (not JSON-wrapped), byte-identical on read", async () => {
-			const db = makeDB();
-			const jsonText = '{"a":1}'; // legitimate JSON *text* stored as a string stays a string
-			await db.putItem({ hashKey: "k", sortKey: "s", data: jsonText });
-			const got = await db.getItem({ hashKey: "k", sortKey: "s" });
-			expect(got).toMatchObject({ found: true, item: { kind: "text", data: jsonText } });
-		});
-
-		it("exposes kind on queryItems results and parses json rows", async () => {
-			const db = makeDB();
-			await db.putItem({ hashKey: "q", sortKey: "1", data: "plain" });
-			await db.putItem({ hashKey: "q", sortKey: "2", data: { n: 42 } });
-
-			const res = await db.queryItems({ queries: [{ hashKey: "q" }] });
-			expect(res.items).toMatchObject([
-				{ sortKey: "1", kind: "text", data: "plain" },
-				{ sortKey: "2", kind: "json", data: { n: 42 } },
-			]);
-		});
-
-		it("round-trips a json value written and read through a transaction", async () => {
-			const db = makeDB();
-			const obj = { status: "active", tags: ["a", "b"] };
-			const write = await db.transactWriteItems({
-				items: [{ hashKey: "t", sortKey: "j", operation: "put", data: obj }],
-			});
-			// A cancelled write raises, so the returned token is the commit.
-			expect(write.idempotencyToken).toEqual(expect.any(String));
-
-			const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
-			expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
-			const item = read.items[0];
-			if (item.found) expect(item.data).toEqual(obj);
-		});
-
-		it("rejects data that is not JSON-serializable", async () => {
-			const db = makeDB();
-			const circular: Record<string, unknown> = {};
-			circular.self = circular;
-			// Intentionally passing a non-serializable value; cast past the JsonComposite type to reach the runtime guard.
-			await expect(db.putItem({ hashKey: "k", sortKey: "bad", data: circular as never })).rejects.toThrow(
-				fokosErrorWith("item_data_not_json_serializable"),
-			);
-		});
-
-		// `JsonComposite` accepts arrays and objects only. TypeScript says so, and these pin that the
-		// runtime agrees, which is what a JS caller meets. A primitive stored silently as json would make
-		// the declared type a lie.
-		it.each([
-			["a number", 5],
-			["a boolean", true],
-			["null", null],
-			["a function", () => {}],
-		])("rejects %s as top-level data, in putItem and transactWriteItems alike", async (_name, data) => {
-			const db = makeDB();
-			const expected = fokosErrorWith("item_data_wrong_type");
-
-			await expect(db.putItem({ hashKey: "k", sortKey: "prim", data: data as never })).rejects.toThrow(expected);
-			await expect(
-				db.transactWriteItems({ items: [{ hashKey: "k", sortKey: "prim", operation: "put", data: data as never }] }),
-			).rejects.toThrow(expected);
-		});
-
-		// The one value the guard above lets through that JSON.stringify still drops: a toJSON that
-		// returns undefined makes the WHOLE document undefined, not just that field.
-		it("rejects an object whose toJSON() returns undefined, and says so", async () => {
-			const db = makeDB();
-			const data = { toJSON: () => undefined };
-			await expect(db.putItem({ hashKey: "k", sortKey: "tojson", data: data as never })).rejects.toThrow(
-				fokosErrorWith("item_data_not_json_serializable"),
-			);
-		});
-	});
-
-	// The DO returns no keys — db.ts answers with the caller's own. These pin that mapping, which no
-	// DO-level test can cover.
-	describe("FokosDB — results carry the caller's own keys", () => {
-		it("reports an absent sortKey as undefined on put, get and delete", async () => {
-			const db = makeDB();
-
-			expect((await db.putItem({ hashKey: "no-sk", data: "v" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
-
-			const got = await db.getItem({ hashKey: "no-sk" });
-			expect(got.found).toBe(true);
-			expect(got.item.hashKey).toBe("no-sk");
-			expect(got.item.sortKey).toBeUndefined();
-
-			expect((await db.deleteItem({ hashKey: "no-sk" })).item).toEqual({ hashKey: "no-sk", sortKey: undefined });
-		});
-
-		it("returns a binary key as the bytes the caller passed, not the encoded form", async () => {
-			const db = makeDB();
-			// KeyCodec 0xFF-tags a binary key, so the stored form differs from this one.
-			const hashKey = new Uint8Array([1, 2, 3]);
-			const sortKey = new Uint8Array([9]);
-
-			expect((await db.putItem({ hashKey, sortKey, data: "v" })).item).toEqual({ hashKey, sortKey });
-
-			const got = await db.getItem({ hashKey, sortKey });
-			expect(got.found).toBe(true);
-			expect(got.item.hashKey).toEqual(hashKey);
-			expect(got.item.sortKey).toEqual(sortKey);
-		});
-	});
-
-	// Every write path caps one item's data at the same value, and every key-taking path runs the same
-	// key rules. A limit or a rule that applies through one API and not another is a bug in itself:
-	// the caller cannot know which of two equivalent calls will be accepted.
 	describe("FokosDB — limits and key validation are uniform across the APIs", () => {
 		it("rejects an over-size clientRequestToken before the coordinator RPC", async () => {
 			const db = makeDB();

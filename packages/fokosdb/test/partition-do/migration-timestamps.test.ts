@@ -37,7 +37,7 @@ async function storeStateOf(node: TestPartition, marker: { hk: KeyBytes; sk: Key
 	});
 }
 
-describe("PartitionDO — migration carries item timestamps and deletion metadata", () => {
+describe.concurrent("PartitionDO — migration carries item timestamps and deletion metadata", () => {
 	it("a hash split copies both item timestamps and both deletion-metadata values", async () => {
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const marker = { hk: kb("marker"), sk: kb("sk") };

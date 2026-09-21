@@ -15,7 +15,7 @@ import {
 	makePartition,
 } from "./partition-harness.js";
 
-describe("PartitionDO — promotion detection and queuing", () => {
+describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 	it("detects a heavy key and immediately cuts over to 'promoting' when no locks are held", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
@@ -71,7 +71,7 @@ describe("PartitionDO — promotion detection and queuing", () => {
 	});
 });
 
-describe("PartitionDO — promotion cutover deferral and routing", () => {
+describe.concurrent("PartitionDO — promotion cutover deferral and routing", () => {
 	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 
@@ -134,7 +134,7 @@ describe("PartitionDO — promotion cutover deferral and routing", () => {
 	});
 });
 
-describe("PartitionDO — hash-child migration excludes promoted keys", () => {
+describe.concurrent("PartitionDO — hash-child migration excludes promoted keys", () => {
 	it("items belonging to a promoted key are not migrated to hash split children", async () => {
 		// Use maxSizeMb=1 so the per-child reject threshold (1.1MB) stays well above what any
 		// child receives after migration, avoiding fragile databaseSize comparisons.
@@ -190,7 +190,7 @@ describe("PartitionDO — hash-child migration excludes promoted keys", () => {
 	});
 });
 
-describe("PartitionDO — debugForcePromoteKey", () => {
+describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 	it("forwards to the owning child on a split parent", async () => {
 		const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await root.splitHash();
