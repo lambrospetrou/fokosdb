@@ -88,7 +88,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const db = makeDB();
 				const ttlAt = Math.max(1, Math.floor(Date.now() / 1000) - 1);
 				await db.putItem({ hashKey: "past-ttl", data: "v", ttlAt });
-				expect(await db.getItem({ hashKey: "past-ttl" })).toMatchObject({ found: true, item: { ttlAt } });
+				// The sweep can legally run before this read, so only a row that survived is checked.
+				const first = await db.getItem({ hashKey: "past-ttl" });
+				if (first.found) {
+					expect(first.item.ttlAt).toBe(ttlAt);
+				}
 
 				await vi.waitFor(async () => expect((await db.getItem({ hashKey: "past-ttl" })).found).toBe(false), {
 					timeout: 3_000,

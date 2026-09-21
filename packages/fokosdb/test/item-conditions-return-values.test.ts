@@ -217,7 +217,9 @@ describe("ReturnValuesOnConditionCheckFailure for putItem and deleteItem", () =>
 		it("deleteItem failure returns stored image for each data kind", async () => {
 			const db = makeDB();
 			const keyText = { hashKey: `del-text-${crypto.randomUUID()}` };
-			const ttl = 12345;
+			// A past instant makes the row expired from the moment it is written, and the background
+			// sweep can delete it before the deleteItem lands.
+			const ttl = Math.floor(Date.now() / 1000) + 3600;
 			await db.putItem({ ...keyText, data: "text item", ttlAt: ttl });
 
 			let errText: FokosConditionCheckError | undefined;
