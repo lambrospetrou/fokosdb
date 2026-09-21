@@ -1,9 +1,17 @@
 # A Query Must Enter a Range Tree at Its Root
 
-Status: **defect report + invariant to keep**. Found on 2026-09-20 in the routing that
-`PartitionDO.withSplitForwarding` implements today. That routing is being replaced, so this document
-records the defect, the measurement, the mechanism, and the reasoning for the fix. The new routing
-must satisfy the invariant in section 6, whatever its own structure is.
+Status: **fixed**. Found on 2026-09-20 in the routing that `PartitionDO.withSplitForwarding`
+implemented. `FokosShardingRuntime` replaced that routing and satisfies every invariant of section 6:
+`apiQueryItems` declares `shape: "range"`, which carries no entry-point key, and the interval planner
+in `sharding/range-frontier.ts` selects a learned slice per segment and only when the slice contains
+that segment whole. This document stays as the reasoning behind those invariants and as the record of
+what breaks without them.
+
+The guards are `src/sharding/range-frontier.test.ts` ("keeps the base cover beside a left-edge slice
+that a point read taught" and its deeper companion) and
+`test/partition-do/query-items.test.ts` ("queryItems after a point read taught the range hierarchy").
+Both fail when the entry point becomes key-based again. Section 8.3 is ported into
+`docs/agent-plans/2026-09-19-fokos-sharding-runtime.md`, sections 4.2.10 and 4.2.20.
 
 ## 1. The symptom
 
@@ -141,9 +149,9 @@ recipe with a middle leaf shows nothing, which is the reason the defect survived
 
 ## 8. How the fix ports to FokosShardingRuntime
 
-`docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` replaces the routing that holds this defect. Nothing in
-that document is built yet. This section records how the fix maps onto the proposed API, and what that document
-must still say. Move subsection 8.3 into the RFC when the work starts.
+`docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` replaced the routing that held this defect, and the
+runtime is built. This section records how the fix maps onto that API. Subsection 8.3 is ported into the RFC and
+is kept here only as the reasoning for those three additions.
 
 ### 8.1 The fix becomes a shape
 
@@ -186,7 +194,7 @@ In the FokosDB host, in the descriptor of `queryItems`: `shape: "range"`, `while
 
 The `spansSortKeys` flag has no successor. Delete it with the code it patches.
 
-### 8.3 What the RFC must still add
+### 8.3 What the RFC must still add — ported
 
 1. **The empty sort key is a real key.** `RouteKey` is `{ hashKey, sortKey }` as `KeyBytes`, and an item with no
    sort key holds the empty sort key. The RFC invents no placeholder today, but the collision in rule 2 of

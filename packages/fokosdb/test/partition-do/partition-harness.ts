@@ -518,7 +518,15 @@ export async function withMigrationBatchCap<T>(
 }
 
 /** Creates an empty range root so range tests do not also test promotion detection. */
-export async function makeRangeRoot(rangeSplitN: number, overrides?: PartitionOptions): Promise<{ root: TestPartition; sks: string[] }> {
+/**
+ * A promoted range root. `hashPartition` is the hash partition that promoted the key, and it is the
+ * partition a client reaches first: a test that must route into the range tree from outside sends
+ * its request there rather than to the root.
+ */
+export async function makeRangeRoot(
+	rangeSplitN: number,
+	overrides?: PartitionOptions,
+): Promise<{ root: TestPartition; sks: string[]; hashPartition: TestPartition }> {
 	const hashPartition = makePartition({
 		tableName: `rangesplit.${crypto.randomUUID()}`,
 		rangeSplitN,
@@ -526,17 +534,17 @@ export async function makeRangeRoot(rangeSplitN: number, overrides?: PartitionOp
 		...overrides,
 	});
 	await hashPartition.rpc.debugForcePromoteKey(hashPartition.ctx, { hashKey: kb("alice") });
-	return { root: await hashPartition.awaitPromoted("alice"), sks: [] };
+	return { root: await hashPartition.awaitPromoted("alice"), sks: [], hashPartition };
 }
 
 export async function makeTriggeredRangeRoot(
 	rangeSplitN: number,
 	overrides?: PartitionOptions,
-): Promise<{ root: TestPartition; sks: string[] }> {
-	const { root, sks } = await makeRangeRoot(rangeSplitN, overrides);
+): Promise<{ root: TestPartition; sks: string[]; hashPartition: TestPartition }> {
+	const { root, sks, hashPartition } = await makeRangeRoot(rangeSplitN, overrides);
 	const start = sks.length;
 	sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
-	return { root, sks };
+	return { root, sks, hashPartition };
 }
 
 /**

@@ -923,6 +923,11 @@ type FokosSignals = {
 	jobs?: Array<{ name: string; runAt: number }>;
 };
 
+/**
+ * `RouteKey` is `{ hashKey, sortKey }` as `KeyBytes`. The empty sort key is the sort key of an item that has
+ * none: it is a value, never a placeholder for "no sort key". A shape that names one key therefore names a real
+ * one, and an operation that spans the sort-key axis takes the `range` shape, which has no `key` member at all.
+ */
 type FokosOperation<Req, Res> =
 	| (FokosOperationBase<Req, Res> & { shape: "point"; key(req: Req): RouteKey })
 	| (FokosOperationBase<Req, Res> & {
@@ -1192,6 +1197,12 @@ The runtime uses three caches:
   the hash key that node's `partitionId` decodes to. `caches.rangeHierarchyMaxRows` bounds it.
 - The Promotion Bloom cache uses KV `__fokos/cache/promotion_bloom`. A hash partition learns the hash key of
   every range node in the list. Its filter size bounds it, and it does not remove entries.
+
+A point route and a range request fill the range hierarchy from one source: `_rangeAncestors` arrives on any
+range node of any route list, and a point read of a promoted key returns such a node. The input is therefore
+asymmetric by design, and the table must never be read by a single key on behalf of a request that spans the
+sort-key axis. Only an interval lookup reads it: the frontier below selects a row per segment, and only a row
+that contains that segment whole. Whatever fills the cache, that reader keeps a partial answer impossible.
 
 The range hierarchy table holds learned rows only. A learn writes or refreshes `learned_at`. When full, the
 runtime evicts the rows with the oldest `learned_at`, deepest first. A partition's own ancestors are in its
@@ -1651,6 +1662,12 @@ not readable by the old code.
 - Range integration tests warm all leaves with one broad request and prove that the next request bypasses the
   range root. A partial cache test proves that cache gaps use the base target without a gap or duplicate. A
   learned partition that split again must plan and forward to its current leaves.
+- A cross-feed test warms the cache with a POINT read and then proves a broad range request still returns every
+  item. The left edge is the case that matters: a slice with an unbounded start is the only one a byte-minimum
+  key matches, so a reader that entered by a single key would enter there and answer for it alone, with no
+  cursor to show the answer was cut short. The tree needs a left edge deeper than the rest — a range root split
+  into N leaves whose leftmost leaf then splits again — and the request must arrive from the hash partition, so
+  that the entry into the range tree is what the test exercises.
 - Route-list tests cover one point, grouped points at different depths, and one range request across three leaves.
   They check the roles, the leaf identities, the internal hints, and total `forwardCount`. A grouped request
   with many keys on one leaf yields one node. A read-through yields the owner as `read_through` and the source

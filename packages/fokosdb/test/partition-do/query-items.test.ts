@@ -910,6 +910,59 @@ describe("PartitionDO — range split", () => {
 		});
 	});
 
+	// A point read and a range request share one learned-boundary table: an `apiGetItem` that reaches a
+	// range partition answers with its ancestors, and the hash partition stores them. Only the range
+	// planner's reader keeps the two apart, because it selects a learned slice per segment and only
+	// when the slice contains that segment whole. These tests drive that cross-feed from outside, so a
+	// reader that entered by a single key instead would answer for one slice and lose the rest.
+	//
+	// The LEFT edge is the case that matters. A slice with an unbounded start is the only one a
+	// byte-minimum key matches, so a request that carries no sort key lands there and nowhere else.
+	describe("queryItems after a point read taught the range hierarchy", () => {
+		// A promoted key whose range tree has a deeper left edge than the rest: the root splits into N
+		// leaves, and the leftmost leaf — the one with the unbounded start — then splits again.
+		const buildDeepLeftEdge = async (N: number) => {
+			const { root, sks, hashPartition } = await makeTriggeredRangeRoot(N);
+			await root.awaitSplitCompleted();
+
+			const leftmost = (await root.children()).find((c) => rangeOf(c.ctx).startBoundary === null);
+			invariant(leftmost, "the range root has a child with an unbounded start");
+			// "sa" sorts below every "sk" filler, so these land inside the leftmost leaf whatever its
+			// end boundary is. triggerRangeSplit asserts that for each key it writes.
+			const deepSks = await leftmost.triggerRangeSplit((i) => `sa${String(i).padStart(4, "0")}`);
+			await leftmost.awaitSplitCompleted();
+
+			return { hashPartition, root, all: [...sks, ...deepSks].sort(), deepSks };
+		};
+
+		it("returns every item after a point read of the left edge taught a deep slice", async () => {
+			const { hashPartition, all, deepSks } = await buildDeepLeftEdge(4);
+
+			// The point read teaches the hash partition the deep left-edge slice that holds this key.
+			const read = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb(deepSks[0]) });
+			expect(read.found).toBe(true);
+
+			// The query must still cover the whole key, not the one slice the point read taught.
+			const res = await hashPartition.rpc.apiQueryItems(hashPartition.ctx, fullRequest());
+			expect(res.nextCursor).toBeNull();
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(all);
+		});
+
+		it("returns every item when a point read of each left-edge slice taught the whole left chain", async () => {
+			const { hashPartition, all, deepSks } = await buildDeepLeftEdge(4);
+
+			// Teach both sides of the deepest split, so the cache holds the entire left chain and not
+			// just its outermost slice.
+			for (const sk of [deepSks[0], deepSks[deepSks.length - 1]]) {
+				expect((await hashPartition.get({ hashKey: kb("alice"), sortKey: kb(sk) })).found).toBe(true);
+			}
+
+			const res = await hashPartition.rpc.apiQueryItems(hashPartition.ctx, fullRequest());
+			expect(res.nextCursor).toBeNull();
+			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(all);
+		});
+	});
+
 	describe("queryItems through a hash split", () => {
 		it("count mode reports the forwarded leaf's counters", async () => {
 			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });

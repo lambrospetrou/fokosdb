@@ -127,6 +127,35 @@ describe("planRangeFrontier", () => {
 		expect(visits.every((v) => v.base.speculative)).toBe(true);
 	});
 
+	// A point read fills the same learned table that this planner reads, and it teaches only the one
+	// slice that holds its own key. The two cases below are that cross-feed on the LEFT edge, which is
+	// the shape that matters: a slice with an unbounded start is the only one a byte-minimum key
+	// matches, so a planner that entered by a single key would enter there and answer for it alone.
+	// The reader is interval-based instead, and a slice narrower than the request can only ever
+	// overlay its own segment.
+	it("keeps the base cover beside a left-edge slice that a point read taught", () => {
+		const visits = planRangeFrontier([base(null, null)], [learned(null, "c", 2)], ALL, false, refOf);
+		expect(shape(visits)).toEqual([
+			["r.min.c", null, "c"],
+			["r.min.max", "c", null],
+		]);
+		// The learned slice serves its own segment and nothing above it.
+		expect(visits[0].learned).toEqual(learned(null, "c", 2));
+		expect(visits[1].learned).toBeNull();
+	});
+
+	it("picks the deepest left-edge slice that fully contains each segment, and covers the rest from the base", () => {
+		// Two levels on the left edge, as a tree whose first leaf split again would teach them.
+		const visits = planRangeFrontier([base(null, null)], [learned(null, "f", 1), learned(null, "c", 2)], ALL, false, refOf);
+		expect(shape(visits)).toEqual([
+			["r.min.c", null, "c"],
+			["r.min.f", "c", "f"],
+			["r.min.max", "f", null],
+		]);
+		// [c, f) is not inside the depth-2 slice, so the deeper slice must not claim it.
+		expect(visits[1].learned).toEqual(learned(null, "f", 1));
+	});
+
 	it("plans one local visit for a leaf", () => {
 		expect(shape(planRangeFrontier([base("c", "k", "local")], [], ALL, false, refOf))).toEqual([["local", "c", "k"]]);
 	});
