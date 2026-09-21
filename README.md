@@ -13,6 +13,12 @@ Read the article introducing FokosDB and explaining the reasoning behind its arc
 >
 > **You have been warned!**
 
+## Personal learning
+
+This fork contains a [learning curriculum](fokosdb-learning/00-curriculum-overview.md).
+Start with [exercise 0.1: request flow](fokosdb-learning/exercises/01-request-flow.md).
+Exercise code and solutions live in `packages/fokosdb/test/learning/`.
+
 ## Project structure
 
 This is a pnpm workspace.
