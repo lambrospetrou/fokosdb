@@ -1,18 +1,25 @@
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { executedBy, kb, rangeAncestorsOf } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot, rangeOf } from "./partition-harness.js";
 
-describe("PartitionDO — range split", () => {
+describe.concurrent("PartitionDO — range split", () => {
+	// The read-only tests walk the same settled N=4 tree, so it is built once. A test that needs
+	// another N, another config, or that changes a child's stored policy builds its own.
+	let shared: Awaited<ReturnType<typeof makeTriggeredRangeRoot>>;
+	beforeAll(async () => {
+		const built = await makeTriggeredRangeRoot(4);
+		await built.root.awaitSplitCompleted();
+		shared = built;
+	});
+
 	it("splits a populated leaf into N contiguous children covering [−∞, +∞); the node becomes a pure router", async () => {
 		const N = 4;
-		const { root, sks } = await makeTriggeredRangeRoot(N);
+		const { root, sks } = shared;
 		expect(sks.length).toBeGreaterThanOrEqual(N);
-
-		await root.awaitSplitCompleted();
 
 		const status = await root.splitStatus();
 		expect(status.status).toBe("split_completed");
@@ -69,8 +76,7 @@ describe("PartitionDO — range split", () => {
 
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
 		const N = 4;
-		const { root, sks } = await makeTriggeredRangeRoot(N);
-		await root.awaitSplitCompleted();
+		const { root, sks } = shared;
 		const status = await root.splitStatus();
 
 		for (const sk of sks) {
@@ -90,8 +96,7 @@ describe("PartitionDO — range split", () => {
 	});
 
 	it("creates a brand-new leftmost child distinct from the router (no retain-leftmost)", async () => {
-		const { root } = await makeTriggeredRangeRoot(4);
-		await root.awaitSplitCompleted();
+		const { root } = shared;
 		const status = await root.splitStatus();
 
 		const leftmost = status.childPartitionContexts.find((c) => rangeOf(c).startBoundary === null);

@@ -1,6 +1,12 @@
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
-import { PartitionDO, QueryItemsRpcRequest, QueryItemsRpcResponse, type ProjectedWireRow } from "../../src/server/do-partition.js";
+import { beforeAll, describe, expect, it } from "vitest";
+import {
+	PartitionDO,
+	QueryItemsRpcRequest,
+	QueryItemsRpcResponse,
+	type ProjectedWireRow,
+	type PutItemRpcRequest,
+} from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { clipToChildRange } from "../../src/sharding/sk-interval.js";
 import invariant from "../../src/shared/invariant.js";
@@ -23,7 +29,9 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 
-describe("PartitionDO — range split", () => {
+// Tests build their own leaf partitions or only read the shared fixtures, so they run
+// concurrently. A test that holds a migration through a prototype spy is marked sequential.
+describe.concurrent("PartitionDO — range split", () => {
 	// One request with every budget wide open; tests override the budget they exercise.
 	const fullRequest = (overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 		hashKey: kb("alice"),
@@ -403,6 +411,13 @@ describe("PartitionDO — range split", () => {
 			return { root, sks };
 		};
 
+		// Every read-only test walks the same settled N=4 tree, so it is built once. A test that
+		// writes items or freezes a migration mid-flight builds a tree of its own.
+		let sharedTree: { root: TestPartition; sks: string[] };
+		beforeAll(async () => {
+			sharedTree = await buildSplitTree(4);
+		});
+
 		// Children in ascending boundary order; the leftmost child has a null start boundary.
 		const byBoundary = (children: TestPartition[]) =>
 			[...children].sort((a, b) =>
@@ -459,7 +474,7 @@ describe("PartitionDO — range split", () => {
 
 		it("returns every item across all N leaves in a single page (regression: must not stop at the leftmost leaf)", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const res = await queryPage(root);
 			expect(res.nextCursor).toBeNull();
@@ -476,7 +491,7 @@ describe("PartitionDO — range split", () => {
 
 		it("paginates across leaves under a tight byte budget without dropping or duplicating items", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const { sks: got, leaves, pages } = await collect(root, { remainingResponseBytes: 130 * 1024 });
 			expect(pages).toBeGreaterThan(1); // genuinely multi-page
@@ -486,7 +501,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("walks leaves in descending order for scanIndexForward=false", async () => {
-			const { root, sks } = await buildSplitTree(4);
+			const { root, sks } = sharedTree;
 
 			const { sks: got, leaves } = await collect(root, { direction: "desc", remainingResponseBytes: 130 * 1024 });
 			expect(leaves.size).toBe(4);
@@ -494,7 +509,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("honors remainingEvaluatedItems across the walk (stops mid-fan-out with a resumable cursor)", async () => {
-			const { root, sks } = await buildSplitTree(4);
+			const { root, sks } = sharedTree;
 			expect(sks.length).toBeGreaterThanOrEqual(6);
 
 			const res = await queryPage(root, { remainingEvaluatedItems: 5 });
@@ -504,7 +519,7 @@ describe("PartitionDO — range split", () => {
 
 		it("caps the fan-out per page (remainingPartitionVisits) and resumes via a boundary cursor without gaps or duplicates", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			// One leaf per page forces the boundary continuation cursor on every page but the last; a
 			// generous byte/limit budget ensures only the partition-visit cap drives pagination.
@@ -517,7 +532,7 @@ describe("PartitionDO — range split", () => {
 
 		it("caps the fan-out per page for descending scans too", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const { sks: got, leaves, pages } = await collect(root, { direction: "desc", remainingPartitionVisits: 1 });
 			expect(pages).toBeGreaterThanOrEqual(N);
@@ -526,57 +541,61 @@ describe("PartitionDO — range split", () => {
 			expect(new Set(got.map(String)).size).toBe(got.length);
 		});
 
-		it("fokosExecuteLocal reads the router's own local rows and never fans out to children (regression: infinite loop when children are migrating)", async () => {
-			// Scenario: a migrating range child reads through its parent. Before the fix, the direct-read
-			// RPC on a range router called queryItemsAsRangeNode → walkRangeChildren → child.queryItems()
-			// → child detects it's still migrating → parent direct read → … (infinite loop until the
-			// subrequest depth limit is hit).
-			//
-			// fokosExecuteLocal always calls queryItemsLocal and bypasses the child routing. forwardCount=0
-			// asserts that: a walk of the children would report one forward per child, migrated or not.
-			const N = 2;
-			const { root, sks } = await makeRangeRoot(N);
+		it(
+			"fokosExecuteLocal reads the router's own local rows and never fans out to children (regression: infinite loop when children are migrating)",
+			{ concurrent: false },
+			async () => {
+				// Scenario: a migrating range child reads through its parent. Before the fix, the direct-read
+				// RPC on a range router called queryItemsAsRangeNode → walkRangeChildren → child.queryItems()
+				// → child detects it's still migrating → parent direct read → … (infinite loop until the
+				// subrequest depth limit is hit).
+				//
+				// fokosExecuteLocal always calls queryItemsLocal and bypasses the child routing. forwardCount=0
+				// asserts that: a walk of the children would report one forward per child, migrated or not.
+				const N = 2;
+				const { root, sks } = await makeRangeRoot(N);
 
-			// Start the real split with child transaction-metadata responses held at the parent.
-			// Check the migration state instead of assuming that child alarms have not run.
-			await withMigrationHeld(root, async (waitForAllChildRequests) => {
-				const start = sks.length;
-				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
-				await root.awaitSplitStarted();
-				await waitForAllChildRequests();
-				const children = await root.children();
-				for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				// Start the real split with child transaction-metadata responses held at the parent.
+				// Check the migration state instead of assuming that child alarms have not run.
+				await withMigrationHeld(root, async (waitForAllChildRequests) => {
+					const start = sks.length;
+					sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
+					await root.awaitSplitStarted();
+					await waitForAllChildRequests();
+					const children = await root.children();
+					for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
 
-				const caller = children[0];
-				const result = opened(
-					(await root.stub.fokosExecuteLocal({
-						op: "apiQueryItems",
-						repartitionId: await root.splitRepartitionId(),
-						caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
-						request: fullRequest(),
-					})) as FokosEnvelope<QueryItemsRpcResponse>,
-				);
+					const caller = children[0];
+					const result = opened(
+						(await root.stub.fokosExecuteLocal({
+							op: "apiQueryItems",
+							repartitionId: await root.splitRepartitionId(),
+							caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+							request: fullRequest(),
+						})) as FokosEnvelope<QueryItemsRpcResponse>,
+					);
 
-				// The router's own DB still holds every item (parent rows are never deleted during a split),
-				// but it answers only for the slice the calling child owns.
-				const end = rangeOf(caller.ctx).endBoundary;
-				const ownedByCaller = [...sks].sort().filter((sk) => end === null || KeyCodec.compare(kb(sk), end) < 0);
-				expect(ownedByCaller.length, "the leftmost child should own part of the seeded range").toBeGreaterThan(0);
-				expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(ownedByCaller);
-				// Local read only: no forwarding to children.
-				expect(result.meta.forwardCount).toBe(0);
-			});
+					// The router's own DB still holds every item (parent rows are never deleted during a split),
+					// but it answers only for the slice the calling child owns.
+					const end = rangeOf(caller.ctx).endBoundary;
+					const ownedByCaller = [...sks].sort().filter((sk) => end === null || KeyCodec.compare(kb(sk), end) < 0);
+					expect(ownedByCaller.length, "the leftmost child should own part of the seeded range").toBeGreaterThan(0);
+					expect(result.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(ownedByCaller);
+					// Local read only: no forwarding to children.
+					expect(result.meta.forwardCount).toBe(0);
+				});
 
-			// Drain pending child migrations so their background work does not outlive the test.
-			await root.awaitSplitCompleted();
-		});
+				// Drain pending child migrations so their background work does not outlive the test.
+				await root.awaitSplitCompleted();
+			},
+		);
 
 		// A cursor promises more rows, so neither budget exit emits one after the walk covers every child
 		// that can contribute. A cursor there costs the client a round trip that returns nothing.
 		// `db.ts:queryItems` follows the same rule: it emits a cursor only when a later sub-query remains.
 		it("emits no cursor when the byte budget lands on zero at the last leaf", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			// The exact bytes the whole scan consumes. Replayed as the budget, every leaf still drains
 			// itself (each reports no cursor of its own) and the router's remaining bytes reach zero as the
@@ -592,7 +611,7 @@ describe("PartitionDO — range split", () => {
 
 		it("emits no cursor when the partition-visit cap is reached but every remaining child is outside the interval", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 			const children = (await root.splitStatus()).childPartitionContexts;
 			// Children are in ascending boundary order, so an exclusive upper bound at the third child's
 			// start boundary leaves exactly the first two intersecting the query.
@@ -614,7 +633,7 @@ describe("PartitionDO — range split", () => {
 
 		it.each(["asc", "desc"] as const)("count mode walks every leaf in %s order and returns no items", async (direction) => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const { count, scannedCount, leaves } = await collect(root, { select: "count", direction }, (res) => {
 				expect(res.items).toHaveLength(0);
@@ -627,7 +646,7 @@ describe("PartitionDO — range split", () => {
 
 		it("the evaluated-byte budget paginates across leaves without gaps or duplicates", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const full = await queryPage(root);
 			expect(full.evaluatedBytes).toBeGreaterThan(0);
@@ -640,7 +659,7 @@ describe("PartitionDO — range split", () => {
 
 		it("the evaluated-item budget that lands on zero at the last leaf emits no cursor", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const res = await queryPage(root, { remainingEvaluatedItems: sks.length });
 			expect(res.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual([...sks].sort());
@@ -653,7 +672,7 @@ describe("PartitionDO — range split", () => {
 
 		it("the first-item exception applies once per page, not once per leaf", async () => {
 			const N = 4;
-			const { root } = await buildSplitTree(N);
+			const { root } = sharedTree;
 			const children = byBoundary(await root.children());
 			const c0 = children[0];
 			const c1 = children[1];
@@ -684,6 +703,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a descending page that stops on a child start boundary evaluates the boundary item on the next page", async () => {
 			const N = 4;
+			// Writes its own boundary item, so it cannot use the shared tree.
 			const { root, sks } = await buildSplitTree(N);
 			const children = byBoundary(await root.children());
 			const B = rangeOf(children[2].ctx).startBoundary!;
@@ -709,6 +729,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a count page that spends the visit budget on empty leaves returns count 0 with a cursor", async () => {
 			const N = 4;
+			// Deletes most items, so it cannot use the shared tree.
 			const { root, sks } = await buildSplitTree(N);
 			const children = byBoundary(await root.children());
 			const owns = (child: TestPartition, sk: string) => {
@@ -765,7 +786,7 @@ describe("PartitionDO — range split", () => {
 			expect(r.scannedCount).toBe(g1Sks.length);
 		}, 30_000);
 
-		it("a migrating range child answers a count query from its parent", async () => {
+		it("a migrating range child answers a count query from its parent", { concurrent: false }, async () => {
 			const N = 2;
 			const { root, sks } = await makeRangeRoot(N);
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
@@ -800,7 +821,7 @@ describe("PartitionDO — range split", () => {
 
 		it("returns projected rows from every leaf, with missing cells intact", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 			// The seeded items are text, so the $.opt cell is missing on every row.
 			const plan = compileQueryExpression({
 				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
@@ -822,7 +843,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a filter marks only matched rows across every leaf", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 			const sorted = [...sks].sort();
 			const median = sorted[Math.floor(sorted.length / 2)];
 			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
@@ -837,7 +858,7 @@ describe("PartitionDO — range split", () => {
 			expect(res.partitionMetas).toHaveLength(N);
 		});
 
-		it("a migrating range child answers a projected query from its parent", async () => {
+		it("a migrating range child answers a projected query from its parent", { concurrent: false }, async () => {
 			const N = 2;
 			const { root, sks } = await makeRangeRoot(N);
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
@@ -864,7 +885,7 @@ describe("PartitionDO — range split", () => {
 			await root.awaitSplitCompleted();
 		});
 
-		it("a migrating range child answers a filtered query from its parent", async () => {
+		it("a migrating range child answers a filtered query from its parent", { concurrent: false }, async () => {
 			const N = 2;
 			const { root, sks } = await makeRangeRoot(N);
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
@@ -899,7 +920,7 @@ describe("PartitionDO — range split", () => {
 
 		it("sums SQL result rows across range leaves", async () => {
 			const N = 4;
-			const { root, sks } = await buildSplitTree(N);
+			const { root, sks } = sharedTree;
 
 			const res = await queryPage(root);
 			// Every leaf drains its interval, so its one extra read returns no row.
@@ -935,8 +956,14 @@ describe("PartitionDO — range split", () => {
 			return { hashPartition, root, all: [...sks, ...deepSks].sort(), deepSks };
 		};
 
+		// Both tests read through the same deep tree and only warm its route cache, so it is built once.
+		let sharedDeep: Awaited<ReturnType<typeof buildDeepLeftEdge>>;
+		beforeAll(async () => {
+			sharedDeep = await buildDeepLeftEdge(4);
+		});
+
 		it("returns every item after a point read of the left edge taught a deep slice", async () => {
-			const { hashPartition, all, deepSks } = await buildDeepLeftEdge(4);
+			const { hashPartition, all, deepSks } = sharedDeep;
 
 			// The point read teaches the hash partition the deep left-edge slice that holds this key.
 			const read = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb(deepSks[0]) });
@@ -949,7 +976,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("returns every item when a point read of each left-edge slice taught the whole left chain", async () => {
-			const { hashPartition, all, deepSks } = await buildDeepLeftEdge(4);
+			const { hashPartition, all, deepSks } = sharedDeep;
 
 			// Teach both sides of the deepest split, so the cache holds the entire left chain and not
 			// just its outermost slice.
@@ -964,11 +991,17 @@ describe("PartitionDO — range split", () => {
 	});
 
 	describe("queryItems through a hash split", () => {
-		it("count mode reports the forwarded leaf's counters", async () => {
+		// All three tests query the same completed two-child split; only the query differs.
+		let shared: { root: TestPartition; writes: PutItemRpcRequest[] };
+		beforeAll(async () => {
 			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 			const writes = await root.triggerHashSplit();
 			await root.awaitSplitCompleted();
+			shared = { root, writes };
+		});
 
+		it("count mode reports the forwarded leaf's counters", async () => {
+			const { root, writes } = shared;
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, select: "count" }));
@@ -980,10 +1013,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("a filter that matches nothing still reports the forwarded leaf's evaluated count", async () => {
-			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-			const writes = await root.triggerHashSplit();
-			await root.awaitSplitCompleted();
-
+			const { root, writes } = shared;
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			// The seeded rows carry no TTL, so exists(ttlAt) matches no candidate.
@@ -998,10 +1028,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("projection mode returns the forwarded leaf's projected rows", async () => {
-			const root = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-			const writes = await root.triggerHashSplit();
-			await root.awaitSplitCompleted();
-
+			const { root, writes } = shared;
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
@@ -1015,11 +1042,17 @@ describe("PartitionDO — range split", () => {
 	});
 
 	describe("queryItems through a promoted key", () => {
-		it("serves a filtered page from the range root", async () => {
+		// Both tests run read-only queries on the same promoted range root, so it is built once.
+		let shared: { partition: TestPartition; writes: PutItemRpcRequest[]; rangeRoot: TestPartition };
+		beforeAll(async () => {
 			const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 			const writes = await partition.triggerPromotion("alice", (i) => `sk${String(i).padStart(3, "0")}`);
 			const rangeRoot = await partition.awaitPromoted("alice");
+			shared = { partition, writes, rangeRoot };
+		});
 
+		it("serves a filtered page from the range root", async () => {
+			const { partition, writes, rangeRoot } = shared;
 			const sorted = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
 			const median = sorted[Math.floor(sorted.length / 2)];
 			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
@@ -1033,10 +1066,7 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("serves a projected page from the range root", async () => {
-			const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-			const writes = await partition.triggerPromotion("alice", (i) => `sk${String(i).padStart(3, "0")}`);
-			const rangeRoot = await partition.awaitPromoted("alice");
-
+			const { partition, writes, rangeRoot } = shared;
 			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
 			const res = await partition.rpc.apiQueryItems(partition.ctx, fullRequest({ plan }));
 

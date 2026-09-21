@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { describe, it } from "vitest";
+import { beforeAll, describe, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
@@ -19,7 +19,9 @@ import {
 	withMigrationHeld,
 } from "./partition-harness.js";
 
-describe("PartitionDO - splitting", () => {
+// Every test drives its own partition stubs, so they all run concurrently. Only a test that
+// holds a migration through a prototype spy is marked sequential.
+describe.concurrent("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
@@ -206,14 +208,18 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	describe("forwarding during splits", async () => {
+		// One completed two-child split serves all three tests; each writes or reads a key of its own.
+		let partition: TestPartition;
+		beforeAll(async () => {
+			partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			// Trigger the split condition and drain the tree so all migrations complete.
+			await partition.splitHash();
+		});
+
 		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,
 		}) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
-
-			// Trigger the split condition and drain the tree so all migrations complete.
-			await partition.splitHash();
 
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
@@ -237,10 +243,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
-
-			await partition.splitHash();
 
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
@@ -249,10 +252,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("forwards a projected getItem to the owning child after split", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
-
-			await partition.splitHash();
 
 			const hashKey = "projected-key";
 			await rpc.apiPutItem(ctx, {
@@ -271,7 +271,7 @@ describe("PartitionDO - splitting", () => {
 	});
 
 	describe("multi-level splits", async () => {
-		it("keeps all items accessible after splits at multiple tree depths", async ({ expect }) => {
+		it("keeps all items accessible after splits at multiple tree depths", { concurrent: false }, async ({ expect }) => {
 			// The threshold must clear the empty schema — its tables and indexes are ~100 KB of pages
 			// before a single item lands, and a partition that starts over its cap rejects every write.
 			// The item size keeps the cadence: about ten writes fill the headroom and queue each split,
@@ -509,7 +509,7 @@ describe("PartitionDO - splitting", () => {
 			expect(foundIds.size).toBeGreaterThan(1);
 		});
 
-		it("arms TTL deletion after child migration completes", async ({ expect }) => {
+		it("arms TTL deletion after child migration completes", { concurrent: false }, async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			await partition.put({ hashKey: kb("ttl-migration"), sortKey: kb("sk"), data: "value", kind: "text" });
 
@@ -544,7 +544,7 @@ describe("PartitionDO - splitting", () => {
 			await drainUntil(children, async () => (await countExpired()) === 0, "TTL sweep after migration", 10_000);
 		});
 
-		it("putItem is rejected while migration is in progress", async ({ expect }) => {
+		it("putItem is rejected while migration is in progress", { concurrent: false }, async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			await partition.put({ hashKey: kb("key1"), sortKey: kb("sk"), data: "value1", kind: "text" });
 
@@ -576,7 +576,7 @@ describe("PartitionDO - splitting", () => {
 			expect((await (await partition.childOwning("key1")).status()).migrationStatus).toBe("migration_completed");
 		});
 
-		it("getItem on a child reads through to the parent while migration is in progress", async ({ expect }) => {
+		it("getItem on a child reads through to the parent while migration is in progress", { concurrent: false }, async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
 
@@ -628,40 +628,44 @@ describe("PartitionDO - splitting", () => {
 			await assertSplitTreeComplete(partition);
 		});
 
-		it("migrates all items correctly when the parent sends data in multiple cursor-paginated batches", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub, rpc } = partition;
+		it(
+			"migrates all items correctly when the parent sends data in multiple cursor-paginated batches",
+			{ concurrent: false },
+			async ({ expect }) => {
+				const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+				const { ctx, stub, rpc } = partition;
 
-			// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
-			const seedItems = [
-				{ hashKey: kb("alpha"), sortKey: kb(), data: "data-alpha-nosort", kind: "text" as const },
-				{ hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-s1", kind: "text" as const },
-				{ hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const },
-				{ hashKey: kb("cherry"), sortKey: kb("s1"), data: "data-cherry-1", kind: "text" as const },
-				{ hashKey: kb("delta"), sortKey: kb("s1"), data: "data-delta-1", kind: "text" as const },
-			];
-			for (const item of seedItems) {
-				await rpc.apiPutItem(ctx, item);
-			}
+				// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
+				const seedItems = [
+					{ hashKey: kb("alpha"), sortKey: kb(), data: "data-alpha-nosort", kind: "text" as const },
+					{ hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-s1", kind: "text" as const },
+					{ hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const },
+					{ hashKey: kb("cherry"), sortKey: kb("s1"), data: "data-cherry-1", kind: "text" as const },
+					{ hashKey: kb("delta"), sortKey: kb("s1"), data: "data-delta-1", kind: "text" as const },
+				];
+				for (const item of seedItems) {
+					await rpc.apiPutItem(ctx, item);
+				}
 
-			// One row per batch response forces a cursor-paginated round trip per item on every
-			// migration stream (items, pending transactions, promoted keys).
-			await withMigrationBatchCap(partition, 1, async ({ truncated }) => {
-				await partition.splitHash();
-				expect(truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
-			});
-
-			// Every item is reachable through root via forwarding.
-			for (const item of seedItems) {
-				const result = await rpc.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-				expect(result).toMatchObject({
-					found: true,
-					meta: { forwardCount: 1 },
-					item: { data: item.data },
+				// One row per batch response forces a cursor-paginated round trip per item on every
+				// migration stream (items, pending transactions, promoted keys).
+				await withMigrationBatchCap(partition, 1, async ({ truncated }) => {
+					await partition.splitHash();
+					expect(truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
 				});
-			}
 
-			await assertSplitTreeComplete(partition);
-		});
+				// Every item is reachable through root via forwarding.
+				for (const item of seedItems) {
+					const result = await rpc.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
+					expect(result).toMatchObject({
+						found: true,
+						meta: { forwardCount: 1 },
+						item: { data: item.data },
+					});
+				}
+
+				await assertSplitTreeComplete(partition);
+			},
+		);
 	});
 });

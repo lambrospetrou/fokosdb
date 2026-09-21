@@ -5,7 +5,7 @@
  * not own.
  */
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { beforeAll, describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import type { GetItemRpcResponse, QueryItemsRpcRequest, QueryItemsRpcResponse } from "../../src/server/do-partition.js";
 import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
@@ -14,7 +14,7 @@ import type { StoredItem } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, opened } from "./helpers.js";
-import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld, rangeOf } from "./partition-harness.js";
+import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld, rangeOf, type TestPartition } from "./partition-harness.js";
 
 const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 	hashKey: kb(hashKey),
@@ -31,12 +31,20 @@ const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> 
 	...overrides,
 });
 
-describe("PartitionDO — fokosExecuteLocal", () => {
-	it("rejects a caller that is not a target of any repartition it owns", async () => {
-		const partition = makePartition({ hashSplitConditions: { maxSizeMb: 1 } });
+describe.concurrent("PartitionDO — fokosExecuteLocal", () => {
+	// The two hash-split tests exercise the same two-child topology, so the split runs once.
+	let shared: { partition: TestPartition; children: TestPartition[]; repartitionId: string };
+	beforeAll(async () => {
+		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.put({ hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
+		await partition.put({ hashKey: kb("alpha"), sortKey: kb("s1"), data: "alpha-value", kind: "text" as const });
 		const children = await partition.splitHash();
 		const repartitionId = await partition.splitRepartitionId();
+		shared = { partition, children, repartitionId };
+	});
+
+	it("rejects a caller that is not a target of any repartition it owns", async () => {
+		const { partition, children, repartitionId } = shared;
 
 		// A name alone is a value the caller chose, so a real child's name with someone else's identity
 		// must not pass either.
@@ -65,11 +73,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 	});
 
 	it("serves a hash child only the keys that hash to it", async () => {
-		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		await partition.put({ hashKey: kb("alpha"), sortKey: kb("s1"), data: "alpha-value", kind: "text" as const });
-		await partition.splitHash();
-		const repartitionId = await partition.splitRepartitionId();
-
+		const { partition, repartitionId } = shared;
 		const owner = await partition.childOwning("alpha");
 		const sibling = (await partition.children()).find((c) => c.doName !== owner.doName);
 		expect(sibling, "a two-way split should have a sibling").toBeDefined();
@@ -96,7 +100,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		});
 	});
 
-	it("follows a completed promotion to the range tree instead of reading its own stale rows", async () => {
+	it("follows a completed promotion to the range tree instead of reading its own stale rows", { concurrent: false }, async () => {
 		// The defect: a hash child importing from its parent read a promoted key out of the parent's
 		// local rows. Promotion GC makes those rows stale and then deletes them, so the child served a
 		// stale value and later an empty answer, for a key whose data lives in the range tree.
