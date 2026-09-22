@@ -29,9 +29,11 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 
-// Tests work on a hash key of their own or only read the shared fixtures, so they run
-// concurrently. A test that holds a migration through a prototype spy is marked sequential.
-describe.concurrent("PartitionDO — range split", () => {
+// The tests in this file operate one after the other. Some tests hold a migration open, and to do
+// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
+// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
+// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+describe("PartitionDO — range split", () => {
 	// One request with every budget wide open; tests override the budget they exercise.
 	const fullRequest = (overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 		hashKey: kb("alice"),

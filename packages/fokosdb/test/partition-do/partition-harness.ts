@@ -472,6 +472,45 @@ async function migrationProbe(child: TestPartition): Promise<string> {
 	return await Promise.race([probe(), blocked]);
 }
 
+type MigrationPull = PartitionDO["fokosMigrationPull"];
+
+/**
+ * Puts a different `fokosMigrationPull` on the class of `instance` for the time of one test.
+ *
+ * `make` receives the initial method and gives back the method to install. `restore()` puts the
+ * initial method back. `installed()` tells you if the replacement is still in place.
+ *
+ * The replacement MUST go on the prototype, which is the class. The RPC dispatcher looks for the
+ * method there. If you put the method on the DO object, the dispatcher refuses it ("receiver does
+ * not implement the method"). All partitions of the test use the same class. Thus the new method
+ * must compare `this` with `instance`, and it must send each other call to the initial method.
+ *
+ * The replacement is a plain property write, and not `vi.spyOn`. `restoreMocks` is on in
+ * vitest.config.ts, thus vitest calls `vi.restoreAllMocks()` around each test. That call removes
+ * all spies, also a spy that a different test installed and still uses. A test that holds a
+ * migration keeps its replacement for many seconds, and a spy is not safe for that time. Vitest
+ * does not know a plain property write, thus this replacement stays until `restore()`.
+ *
+ * Only one test can hold a replacement at one time. Two installs on the same class make a chain,
+ * and each install keeps the other install as its initial method. Thus the suites that use this
+ * helper are sequential, and `installed()` finds a condition that must not occur.
+ */
+function replaceMigrationPull(
+	instance: PartitionDO,
+	make: (original: MigrationPull) => MigrationPull,
+): { restore: () => void; installed: () => boolean } {
+	const prototype: PartitionDO = Object.getPrototypeOf(instance);
+	const descriptor = Object.getOwnPropertyDescriptor(prototype, "fokosMigrationPull");
+	invariant(descriptor?.value, "fokosMigrationPull is not a data property of the PartitionDO prototype");
+	const patched = make(descriptor.value as MigrationPull);
+	// A class method is not enumerable. The descriptor keeps that property, and an assignment does not.
+	Object.defineProperty(prototype, "fokosMigrationPull", { ...descriptor, value: patched });
+	return {
+		restore: () => Object.defineProperty(prototype, "fokosMigrationPull", descriptor),
+		installed: () => prototype.fokosMigrationPull === patched,
+	};
+}
+
 /** Holds every child transaction-metadata request, then releases and completes the split. */
 export async function withMigrationHeld<T>(
 	parent: TestPartition,
@@ -482,26 +521,22 @@ export async function withMigrationHeld<T>(
 	const held = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const { restore, installed } = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
-		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
-		// property on the DO instance ("receiver does not implement the method"). The guard keeps the
-		// mock on the shared prototype scoped to this one instance, and it also covers a stray
-		// background RPC from another partition. Never call this from `it.concurrent`: two installs
-		// compose spies on one prototype, and each one captures the mock of the other as its original.
-		const prototype: PartitionDO = Object.getPrototypeOf(instance);
-		const original = prototype.fokosMigrationPull;
-		const spy = vi.spyOn(prototype, "fokosMigrationPull").mockImplementation(async function (this: PartitionDO, req) {
-			// Held in the pending-transaction stream, which is the last stream an import runs. Every
-			// target has pulled its items by then, so the whole tree migrates when the wait returns.
-			const inPendingTx = req.cursor?.phase === "host" && (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx";
-			if (this === instance && inPendingTx) {
-				requestedBy.add(req.target.doName);
-				await held;
-			}
-			return await original.call(this, req);
-		});
-		return { restore: () => spy.mockRestore(), installed: () => prototype.fokosMigrationPull === spy };
-	});
+	const { restore, installed } = await runInDurableObject(parent.stub, (instance: PartitionDO) =>
+		replaceMigrationPull(
+			instance,
+			(original) =>
+				async function (this: PartitionDO, req) {
+					// Held in the pending-transaction stream, which is the last stream an import runs. Every
+					// target has pulled its items by then, so the whole tree migrates when the wait returns.
+					const inPendingTx = req.cursor?.phase === "host" && (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx";
+					if (this === instance && inPendingTx) {
+						requestedBy.add(req.target.doName);
+						await held;
+					}
+					return await original.call(this, req);
+				},
+		),
+	);
 	try {
 		return await run(async () => {
 			// The probe reads the children. A read can also start a child that waits for its alarm. This
@@ -512,10 +547,9 @@ export async function withMigrationHeld<T>(
 				async () => {
 					const missing = (await parent.children()).filter((child) => !requestedBy.has(child.doName));
 					if (missing.length === 0) return;
-					// `restoreMocks` removes each spy at the start and at the end of each test. The tests in one
-					// file operate at the same time. Thus a different test can remove this spy while the hold
-					// is active. The pulls then go to the initial method, and this function records no child.
-					// The deadline below would then report the children, but the hold is no longer installed.
+					// All partitions use the same class. If a different test replaces `fokosMigrationPull`
+					// while this hold is active, the pulls go to the other method, and this function records
+					// no child. The report below then names the children, but the cause is the lost hold.
 					invariant(installed(), `${parent.doName}: a different test removed the migration hold while it was active`);
 					const names = missing.map((child) => child.doName).join(", ");
 					if (Date.now() < probeAfter) {
@@ -549,28 +583,24 @@ export async function withMigrationBatchCap<T>(
 	invariant(maxRows >= 1, "withMigrationBatchCap: maxRows must be >= 1");
 	let calls = 0;
 	let truncated = 0;
-	const restore = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
-		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
-		// property on the DO instance ("receiver does not implement the method"). The guard keeps the
-		// mock on the shared prototype scoped to this one instance, and it also covers a stray
-		// background RPC from another partition. Never call this from `it.concurrent`: two installs
-		// compose spies on one prototype, and each one captures the mock of the other as its original.
-		const prototype: PartitionDO = Object.getPrototypeOf(instance);
-		const original = prototype.fokosMigrationPull;
-		const spy = vi.spyOn(prototype, "fokosMigrationPull").mockImplementation(async function (this: PartitionDO, req) {
-			const page = await original.call(this, req);
-			if (this !== instance) return page;
-			calls++;
-			const capped = capPage(page, maxRows);
-			if (capped) truncated++;
-			return capped ?? page;
-		});
-		return () => spy.mockRestore();
-	});
+	const { restore } = await runInDurableObject(parent.stub, (instance: PartitionDO) =>
+		replaceMigrationPull(
+			instance,
+			(original) =>
+				async function (this: PartitionDO, req) {
+					const page = await original.call(this, req);
+					if (this !== instance) return page;
+					calls++;
+					const capped = capPage(page, maxRows);
+					if (capped) truncated++;
+					return capped ?? page;
+				},
+		),
+	);
 	try {
 		return await run({ calls: () => calls, truncated: () => truncated });
 	} finally {
-		await restore();
+		restore();
 		if ((await parent.status()).splitStatus) await parent.awaitSplitCompleted();
 	}
 }

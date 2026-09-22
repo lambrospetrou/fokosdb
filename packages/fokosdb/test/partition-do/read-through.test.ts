@@ -31,7 +31,11 @@ const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> 
 	...overrides,
 });
 
-describe.concurrent("PartitionDO — fokosExecuteLocal", () => {
+// The tests in this file operate one after the other. Some tests hold a migration open, and to do
+// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
+// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
+// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+describe("PartitionDO — fokosExecuteLocal", () => {
 	// The two hash-split tests exercise the same two-child topology, so the split runs once.
 	let shared: { partition: TestPartition; children: TestPartition[]; repartitionId: string };
 	beforeAll(async () => {

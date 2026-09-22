@@ -19,9 +19,11 @@ import {
 	withMigrationHeld,
 } from "./partition-harness.js";
 
-// Every test drives its own partition stubs, so they all run concurrently. Only a test that
-// holds a migration through a prototype spy is marked sequential.
-describe.concurrent("PartitionDO - splitting", () => {
+// The tests in this file operate one after the other. Some tests hold a migration open, and to do
+// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
+// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
+// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
