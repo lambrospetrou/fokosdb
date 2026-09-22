@@ -14,7 +14,7 @@ function aRejection(reason: Record<string, unknown>) {
 	return expect.arrayContaining([expect.objectContaining({ outcome: "rejected", reason: expect.objectContaining(reason) })]);
 }
 
-describe.concurrent("PartitionDO — transactions spanning local and promoted keys", () => {
+describe("PartitionDO — transactions spanning local and promoted keys", () => {
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
@@ -105,7 +105,7 @@ describe.concurrent("PartitionDO — transactions spanning local and promoted ke
 	});
 });
 
-describe.concurrent("PartitionDO — transaction routing separates backpressure from mis-routing", () => {
+describe("PartitionDO — transaction routing separates backpressure from mis-routing", () => {
 	// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 	// written and every "write" is refused for size.
 	const OVER_SIZE = { hashSplitConditions: { maxSizeMb: 0.000_001 } };
@@ -157,7 +157,7 @@ describe.concurrent("PartitionDO — transaction routing separates backpressure 
 	});
 });
 
-describe.concurrent("PartitionDO — single-shot transaction", () => {
+describe("PartitionDO — single-shot transaction", () => {
 	/** Counts the lock rows this partition holds, whatever transaction owns them. */
 	async function pendingLockCount(stub: DurableObjectStub<PartitionDO>): Promise<number> {
 		return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
@@ -294,7 +294,7 @@ describe.concurrent("PartitionDO — single-shot transaction", () => {
 	});
 });
 
-describe.concurrent("PartitionDO — two-phase commit queues splits", () => {
+describe("PartitionDO — two-phase commit queues splits", () => {
 	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const { ctx, stub, rpc } = partition;
