@@ -54,13 +54,14 @@ const SUITE_TIMEOUT_MS = 600_000;
 
 // ─── The churn ────────────────────────────────────────────────────────────────
 
-// A churn item is large, so few writes carry one leaf from half full to past its cap: a split costs
-// about a third of a megabyte of writes, and a run that paid for a whole megabyte would spend more
-// time on writes than on reads. It must also stay below a tenth of the range cap: the write that
-// crosses the cap then leaves the leaf inside the 1.1x band, and the next push can still write to it
-// while the split it queued runs. A larger item carries the leaf straight past the band, where every
-// write is refused until the split completes, and a push that is refused queues no split at all —
-// the properties then read a tree that stands still, which is what the settled suite already covers.
+// A churn item is large. Thus few writes fill one leaf from half full to more than its cap. A split
+// costs approximately one third of a megabyte of writes. A larger cost gives more time to the writes
+// than to the reads.
+// The item must also stay below one tenth of the range cap. The write that goes past the cap then
+// keeps the leaf in the 1.1x band, and the next push can write to the leaf while its split operates.
+// A larger item puts the leaf above the band. The partition then refuses each write until the split
+// is complete, and a push that gets a refusal queues no split. The properties then read a tree that
+// does not change, and the settled suite already does that test.
 const CHURN_ITEM_BYTES = 32 * 1024;
 // The live churn items a query has to read. SQLite keeps the space of a deleted row, so the leaf
 // still grows towards its cap and still splits, while the answer a property compares stays small.

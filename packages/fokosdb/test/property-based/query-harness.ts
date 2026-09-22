@@ -339,6 +339,49 @@ async function findBoundaries(db: FokosDB, leaves: readonly string[], sorted: re
 	return boundaries;
 }
 
+/**
+ * Returns the leaves of the hot key after the tree stops the changes to them.
+ *
+ * A split in the queue waits for its alarm. Thus two reads with the same result do not show that the
+ * tree is stable. The list must stay the same for a time that is longer than this wait. If it does
+ * not, the caller reads a topology that changes immediately after.
+ */
+async function settledLeaves(db: FokosDB): Promise<string[]> {
+	const stablePolls = 15;
+	let leaves = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+	let stable = 0;
+	for (let attempt = 0; attempt < 200 && stable < stablePolls; attempt++) {
+		await sleep(100);
+		const now = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+		stable = now.join() === leaves.join() ? stable + 1 : 0;
+		leaves = now;
+	}
+	expect(stable, "the tree must settle before the properties run").toBeGreaterThanOrEqual(stablePolls);
+	return leaves;
+}
+
+/**
+ * Returns the leaves of the hot key and the boundaries between them from one topology.
+ *
+ * The search for the boundaries does many reads. A split during the search makes all the ranks that
+ * it collected incorrect. The owner of a key is then a leaf that the list of leaves does not hold.
+ * In this condition the function does the search again with the new leaves.
+ */
+async function scanBoundaries(db: FokosDB, sorted: readonly OptionalQueryKey[]): Promise<{ leaves: string[]; boundaries: QueryKey[] }> {
+	const attempts = 5;
+	for (let attempt = 1; ; attempt++) {
+		const leaves = await settledLeaves(db);
+		try {
+			const boundaries = await findBoundaries(db, leaves, sorted);
+			const after = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+			if (after.join() === leaves.join()) return { leaves, boundaries };
+		} catch (e) {
+			if (attempt >= attempts) throw e;
+		}
+		if (attempt >= attempts) throw new Error("the range tree did not stop its splits during the boundary scans");
+	}
+}
+
 export async function buildFixture(): Promise<Fixture> {
 	const db = makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
 	const model: QueryModel = new Map();
@@ -369,18 +412,11 @@ export async function buildFixture(): Promise<Fixture> {
 
 	// The tree must grow past its root, and it must stop growing before the properties read it: a
 	// split that runs under a property makes a page race the topology it walks.
-	let leaves = await awaitLeaves(db, (names) => new Set(names).size >= 4, "the range tree has four leaves");
-	let previous: string[] = [];
-	for (let attempt = 0; attempt < 40 && previous.join() !== leaves.join(); attempt++) {
-		previous = leaves;
-		await sleep(100);
-		leaves = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
-	}
-	expect(leaves.join(), "the tree must settle before the properties run").toBe(previous.join());
+	await awaitLeaves(db, (names) => new Set(names).size >= 4, "the range tree has four leaves");
 
 	const hotSortKeys: OptionalQueryKey[] = [...Array.from({ length: HOT_ITEMS }, (_, i) => hotSortKey(i)), ...BINARY_SORT_KEYS];
 	const sorted = [...hotSortKeys].sort((a, b) => compareBytes(encodeKey(a), encodeKey(b)));
-	const boundaries = await findBoundaries(db, leaves, sorted);
+	const { leaves, boundaries } = await scanBoundaries(db, sorted);
 
 	// The fixture empties one middle leaf. A split only ever creates children that hold rows, so an
 	// empty leaf in the middle of the walk comes from deletes. It is the child that returns no cursor

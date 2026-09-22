@@ -206,10 +206,11 @@ export class TestPartition {
 					continue;
 				}
 			} catch (e) {
-				// A size rejection is normal once a split is already queued — a prior write crossed the
-				// threshold. Any other error, or a rejection with no split queued (e.g. mutual exclusion
-				// with a queued promotion), is a real failure: the rest of the writes would be refused
-				// too, so the loop would spend every attempt before it reported the cause.
+				// A size rejection is usual when a split is already in the queue: a write before this one went
+				// past the threshold. A different error is a failure. A rejection with no split in the queue
+				// is also a failure, for example when a promotion in the queue prevents the split. The
+				// writes after it get the same rejection. Thus the loop reports the cause now, and not
+				// after all of its attempts.
 				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) throw e;
 				if (!(await writer.status(this.ctx)).splitStatus) throw e;
 			}
@@ -448,6 +449,29 @@ export async function assertSplitTreeComplete(node: TestPartition): Promise<numb
 	return count;
 }
 
+/**
+ * Gives the reason that a child did not ask for its migration data.
+ *
+ * A child starts its import when its alarm occurs. There are two possible causes: the child did not
+ * change its state, or the alarm did not occur. The deadline of `withMigrationHeld` must show which
+ * cause applies.
+ *
+ * This probe can stop before it gets an answer. A child that does its import now waits in the held
+ * RPC, and it does not reply. The probe reports this condition also.
+ */
+async function migrationProbe(child: TestPartition): Promise<string> {
+	const probe = async () => {
+		const migration = (await child.status()).migrationStatus ?? "none";
+		const inner = await runInDurableObject(child.stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const alarmAt = await state.storage.getAlarm();
+			return { import: instance.fokos.lifecycle().import, alarmInMs: alarmAt === null ? null : alarmAt - Date.now() };
+		});
+		return `${child.doName}: migration=${migration} import=${JSON.stringify(inner.import)} alarmInMs=${inner.alarmInMs}`;
+	};
+	const blocked = new Promise<string>((resolve) => setTimeout(() => resolve(`${child.doName}: probe blocked, the child is busy`), 2000));
+	return await Promise.race([probe(), blocked]);
+}
+
 /** Holds every child transaction-metadata request, then releases and completes the split. */
 export async function withMigrationHeld<T>(
 	parent: TestPartition,
@@ -458,7 +482,7 @@ export async function withMigrationHeld<T>(
 	const held = new Promise<void>((resolve) => {
 		release = resolve;
 	});
-	const restore = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
+	const { restore, installed } = await runInDurableObject(parent.stub, (instance: PartitionDO) => {
 		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
 		// property on the DO instance ("receiver does not implement the method"). The guard keeps the
 		// mock on the shared prototype scoped to this one instance, and it also covers a stray
@@ -476,14 +500,28 @@ export async function withMigrationHeld<T>(
 			}
 			return await original.call(this, req);
 		});
-		return () => spy.mockRestore();
+		return { restore: () => spy.mockRestore(), installed: () => prototype.fokosMigrationPull === spy };
 	});
 	try {
 		return await run(async () => {
+			// The probe reads the children. A read can also start a child that waits for its alarm. This
+			// changes the condition that the probe must measure. Thus the probe operates only near the end
+			// of the deadline. At that time its result is a failure report, and not a poll.
+			const probeAfter = Date.now() + 25_000;
 			await vi.waitFor(
 				async () => {
 					const missing = (await parent.children()).filter((child) => !requestedBy.has(child.doName));
-					if (missing.length > 0) throw new Error(`migration RPC not received from ${missing.map((child) => child.doName).join(", ")}`);
+					if (missing.length === 0) return;
+					// `restoreMocks` removes each spy at the start and at the end of each test. The tests in one
+					// file operate at the same time. Thus a different test can remove this spy while the hold
+					// is active. The pulls then go to the initial method, and this function records no child.
+					// The deadline below would then report the children, but the hold is no longer installed.
+					invariant(installed(), `${parent.doName}: a different test removed the migration hold while it was active`);
+					const names = missing.map((child) => child.doName).join(", ");
+					if (Date.now() < probeAfter) {
+						throw new Error(`migration RPC not received from ${names}`);
+					}
+					throw new Error(`migration RPC not received from ${(await Promise.all(missing.map(migrationProbe))).join("; ")}`);
 				},
 				{ timeout: 30_000, interval: 10 },
 			);

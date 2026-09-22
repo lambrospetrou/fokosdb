@@ -12,18 +12,20 @@ export default defineConfig({
 		// Several suites spy on Date.now, console.error and PartitionStore.prototype. Restoring
 		// globally keeps a spy from leaking out of the test that installed it.
 		restoreMocks: true,
-		// The Durable Object suites drive real splits, migrations, alarms and 2PC fan-out. Their
-		// duration follows the scheduling and the parallel load, not the code under test: one case has
-		// run 1.5 s on its own and 5.9 s inside the full suite. A wedged split is caught by the
-		// `vi.waitFor` deadlines in test/partition-do/partition-harness.ts, which report the state the
-		// partition stopped in; this bound only stops a run that is slow and healthy. It must therefore
-		// stay above the longest of those deadlines (30 s, the migration hold) plus the setup a test
-		// runs before it, or the bare timeout arrives first and takes the state report with it — and the
-		// `finally` that releases the hold never runs. A test that needs longer still sets its own.
+		// The Durable Object suites do real splits, migrations, alarms and 2PC fan-out. Their duration
+		// comes from the schedule and the parallel load, and not from the code under test. One test
+		// operated in 1.5 s alone, and in 5.9 s in the full suite. The `vi.waitFor` deadlines in
+		// test/partition-do/partition-harness.ts find a split that stopped, and they report the state of
+		// the partition. This limit stops only a run that is slow and correct.
+		// Thus this limit must be more than the longest deadline (30 s, the migration hold) plus the
+		// setup time of a test. If it is not more, the timeout occurs first. The report of the state is
+		// then lost, and the `finally` that releases the hold does not operate. A test that needs more
+		// time sets its own limit.
 		testTimeout: 45_000,
-		// The same bound for the hooks. The suites build their shared split trees in `beforeAll`, so a
-		// hook runs the same waits a test does and needs the same room: the default 10 s sits under the
-		// 15 s harness deadlines, which kills the setup of a whole file before it can report a state.
+		// The hooks get the same limit. The suites build their shared split trees in `beforeAll`. Thus a
+		// hook does the same waits as a test, and it needs the same time. The default limit is 10 s,
+		// which is less than the 15 s deadlines of the harness. That limit stops the setup of a full
+		// file before the file can report a state.
 		hookTimeout: 45_000,
 	},
 	plugins: [
