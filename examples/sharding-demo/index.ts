@@ -1,13 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import { Hono } from "hono";
 import { FokosDB, PartitionContextCreator, FokosRouter } from "fokosdb/client";
-import { PartitionDO } from "fokosdb/server";
+import { KeyCodec } from "fokosdb/sharding";
+import type { CounterPolicy, CounterStats } from "./counter-host.js";
 
 export { PartitionDO } from "fokosdb/server";
+export { CounterPartitionDO } from "./counter-host.js";
 
 export type RouteHop = {
 	doName: string;
-	role: "root" | "router" | "leaf";
+	role: string;
 	partitionId: string;
 };
 
@@ -39,213 +41,87 @@ export type TileTopology = {
 		leafCount: number;
 		splitCount: number;
 	};
+	reconciliation?: {
+		acknowledgedWrites: number;
+		presentWrites: number;
+		presentKeys: number;
+		reconciled: boolean;
+	};
 };
 
-// ── Demo 1: Counter Partition DO ─────────────────────────────────────────────
+// ── Demo 1: Counter host ─────────────────────────────────────────────────────
 
-type ChildTarget = {
-	index: number;
-	partitionId: string;
-	doName: string;
-	acknowledged: boolean;
+const counterRouter = new FokosRouter<CounterPolicy>(
+	{ shardGroup: "counter_demo", rootTreesN: 1, hashSplitN: 4 },
+	{ rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } },
+	{ maxRequests: 5 },
+);
+const counterRoot = counterRouter.allRoots()[0];
+
+function counterStub(env: Env, doName: string) {
+	return env.COUNTER_PARTITION_DO.get(env.COUNTER_PARTITION_DO.idFromName(doName));
+}
+
+type CounterNode = {
+	ref: { doName: string; partitionId: string };
+	stats: CounterStats;
+	depth: number;
 };
 
-export class CounterPartitionDO extends DurableObject<Env> {
-	private requestCount = 0;
-	private writeCount = 0;
-	private isRouter = false;
-	private isKilled = false;
-	private childrenList: ChildTarget[] = [];
-	private splitState: string = "active";
-	private counterStore: Map<string, number> = new Map();
+/** Every partition of the counter tree, each parent before its children. */
+async function collectCounterTree(env: Env): Promise<CounterNode[]> {
+	const nodes: CounterNode[] = [];
+	const walk = async (ref: CounterNode["ref"], depth: number): Promise<void> => {
+		const stats = await counterStub(env, ref.doName).getCounterStats();
+		nodes.push({ ref, stats, depth });
+		for (const child of stats.children) await walk(child, depth + 1);
+	};
+	await walk(counterRoot, 0);
+	return nodes;
+}
 
-	constructor(ctx: DurableObjectState, env: Env) {
-		super(ctx, env);
-		this.ctx.blockConcurrencyWhile(async () => {
-			this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, val TEXT)");
-			this.ctx.storage.sql.exec("CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, val INTEGER NOT NULL)");
-			this.ctx.storage.sql.exec(
-				"CREATE TABLE IF NOT EXISTS children (idx INTEGER PRIMARY KEY, partition_id TEXT NOT NULL, do_name TEXT NOT NULL, acked INTEGER NOT NULL)",
-			);
+/**
+ * Compares the writes the Worker saw succeed with the sum of the rows in the tree. A router keeps a
+ * stale copy of its rows until every child acknowledged its import, and a child comes after its
+ * parent in the list, so the last value seen for a key is the current one.
+ */
+async function reconcileCounters(env: Env, nodes: CounterNode[]) {
+	const acknowledgedWrites = await counterStub(env, counterRoot.doName).getAcknowledged();
+	const values = new Map<string, number>();
+	for (const node of nodes) for (const r of node.stats.rows) values.set(r.key, r.val);
+	const presentWrites = [...values.values()].reduce((a, b) => a + b, 0);
+	return { acknowledgedWrites, presentWrites, presentKeys: values.size, reconciled: acknowledgedWrites === presentWrites };
+}
 
-			const metaRows = this.ctx.storage.sql.exec<{ key: string; val: string }>("SELECT key, val FROM meta").toArray();
-			for (const row of metaRows) {
-				if (row.key === "requestCount") this.requestCount = Number(row.val);
-				if (row.key === "writeCount") this.writeCount = Number(row.val);
-				if (row.key === "isRouter") this.isRouter = row.val === "true";
-				if (row.key === "splitState") this.splitState = row.val;
-			}
-
-			const counterRows = this.ctx.storage.sql.exec<{ key: string; val: number }>("SELECT key, val FROM counters").toArray();
-			for (const row of counterRows) {
-				this.counterStore.set(row.key, row.val);
-			}
-
-			const childRows = this.ctx.storage.sql
-				.exec<{
-					idx: number;
-					partition_id: string;
-					do_name: string;
-					acked: number;
-				}>("SELECT idx, partition_id, do_name, acked FROM children ORDER BY idx")
-				.toArray();
-			this.childrenList = childRows.map((r) => ({
-				index: r.idx,
-				partitionId: r.partition_id,
-				doName: r.do_name,
-				acknowledged: r.acked === 1,
-			}));
-		});
-	}
-
-	private saveMeta(): void {
-		this.ctx.storage.sql.exec(
-			"INSERT OR REPLACE INTO meta (key, val) VALUES ('requestCount', ?), ('writeCount', ?), ('isRouter', ?), ('splitState', ?)",
-			String(this.requestCount),
-			String(this.writeCount),
-			String(this.isRouter),
-			this.splitState,
-		);
-	}
-
-	async fokosStatus() {
-		const entries = this.childrenList.map((target) => ({
-			repartition: {
-				id: `split-${target.index}`,
-				seq: 1,
-				kind: "hash_split" as const,
-				state: this.splitState as "queued" | "planned" | "cutover" | "completed",
-				hashKey: null,
-			},
-			target: {
-				index: target.index,
-				ref: { partitionId: target.partitionId, doName: target.doName },
-				initialization: { kind: "hash_child" as const, index: target.index },
-				acknowledged: target.acknowledged,
-			},
-		}));
-
-		return {
-			initialized: true,
-			destroying: false,
-			ref: { partitionId: "counter-root", doName: "counter-root" },
-			importState: null,
-			entries,
-			nextCursor: null,
-			requestCount: this.requestCount,
-			writeCount: this.writeCount,
-			isRouter: this.isRouter,
-			splitState: this.splitState,
-		};
-	}
-
-	async increment(key: string, amount = 1, callingHop?: RouteHop): Promise<{ key: string; val: number; trace: ActionTrace }> {
-		this.requestCount += 1;
-
-		if (this.isRouter && this.childrenList.length > 0) {
-			this.saveMeta();
-			// Route to target child based on key hash
-			let hash = 0;
-			for (let i = 0; i < key.length; i++) hash = (hash * 31 + key.charCodeAt(i)) >>> 0;
-			const targetIdx = hash % this.childrenList.length;
-			const childTarget = this.childrenList[targetIdx];
-			const childStub = this.env.COUNTER_PARTITION_DO.get(this.env.COUNTER_PARTITION_DO.idFromName(childTarget.doName));
-			const currentHop: RouteHop = {
-				doName: "counter-root",
-				role: "router",
-				partitionId: "counter-root",
-			};
-			const res = await childStub.increment(key, amount, currentHop);
+/**
+ * One counter write through the root. A partition that still imports refuses the write with
+ * `partition_migrating`; the runtime moves the import on by itself, so the write waits and tries again.
+ * After a kill, the runtime's fallback alarm restarts the partition within 5 seconds, so the write
+ * tries for 15 seconds.
+ */
+async function sendCounterIncrement(
+	env: Env,
+	key: string,
+	amount: number,
+): Promise<{ value: { key: string; val: number }; trace: ActionTrace }> {
+	const hashKey = KeyCodec.encode(key);
+	const ctx = counterRouter.rootContext(hashKey);
+	for (let attempt = 1; ; attempt++) {
+		try {
+			const envelope = await counterStub(env, ctx.doName).increment(ctx, { hashKey, amount });
+			const { value, routing } = counterRouter.unwrap<{ key: string; val: number }>(envelope);
+			await counterStub(env, counterRoot.doName).recordAcknowledged(amount);
+			// A router does not list itself in `servedBy`, so the entry hop is added here.
+			const executors = routing.servedBy.map((s) => ({ doName: s.ref.doName, partitionId: s.ref.partitionId, role: s.role }));
+			const entry = { doName: ctx.doName, partitionId: ctx.partitionId, role: "router" };
 			return {
-				key: res.key,
-				val: res.val,
-				trace: {
-					servedBy: [currentHop, ...res.trace.servedBy],
-					forwardCount: res.trace.forwardCount + 1,
-				},
+				value,
+				trace: { servedBy: routing.forwardCount > 0 ? [entry, ...executors] : executors, forwardCount: routing.forwardCount },
 			};
+		} catch (err) {
+			if (attempt >= 150 || !String(err).includes("partition_migrating")) throw err;
+			await scheduler.wait(100);
 		}
-
-		// Local leaf increment
-		const prev = this.counterStore.get(key) ?? 0;
-		const next = prev + amount;
-		this.counterStore.set(key, next);
-		this.writeCount += 1;
-		this.ctx.storage.sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", key, next);
-		this.saveMeta();
-
-		const selfHop: RouteHop = {
-			doName: callingHop ? "counter-child" : "counter-root",
-			role: "leaf",
-			partitionId: callingHop ? "counter-child" : "counter-root",
-		};
-		return {
-			key,
-			val: next,
-			trace: {
-				servedBy: [selfHop],
-				forwardCount: 0,
-			},
-		};
-	}
-
-	async triggerSplit(childCount = 4): Promise<{ split: boolean; children: ChildTarget[] }> {
-		if (this.isRouter) {
-			return { split: false, children: this.childrenList };
-		}
-		this.isRouter = true;
-		this.splitState = "cutover";
-		this.childrenList = [];
-
-		this.ctx.storage.sql.exec("DELETE FROM children");
-		for (let i = 0; i < childCount; i++) {
-			const target: ChildTarget = {
-				index: i,
-				partitionId: `counter-c-${i}`,
-				doName: `counter-c-${i}`,
-				acknowledged: true,
-			};
-			this.childrenList.push(target);
-			this.ctx.storage.sql.exec(
-				"INSERT INTO children (idx, partition_id, do_name, acked) VALUES (?, ?, ?, 1)",
-				target.index,
-				target.partitionId,
-				target.doName,
-			);
-		}
-		this.saveMeta();
-		return { split: true, children: this.childrenList };
-	}
-
-	async debugAbort(): Promise<{ aborted: true }> {
-		this.isKilled = true;
-		// Evicts the Durable Object instance from memory.
-		this.ctx.abort();
-		return { aborted: true };
-	}
-
-	async reset(): Promise<{ reset: boolean }> {
-		this.requestCount = 0;
-		this.writeCount = 0;
-		this.isRouter = false;
-		this.splitState = "active";
-		this.childrenList = [];
-		this.counterStore.clear();
-		this.ctx.storage.sql.exec("DELETE FROM meta");
-		this.ctx.storage.sql.exec("DELETE FROM counters");
-		this.ctx.storage.sql.exec("DELETE FROM children");
-		return { reset: true };
-	}
-
-	async getStats() {
-		return {
-			requestCount: this.requestCount,
-			writeCount: this.writeCount,
-			isRouter: this.isRouter,
-			isKilled: this.isKilled,
-			childCount: this.childrenList.length,
-			itemCount: this.counterStore.size,
-		};
 	}
 }
 
@@ -394,7 +270,12 @@ export class SearchPartitionDO extends DurableObject<Env> {
 				id: string;
 				title: string;
 				body: string;
-			}>("SELECT id, title, body FROM docs WHERE tenant_id = ? AND (title LIKE ? OR body LIKE ?) LIMIT 10", tenantId, `%${query}%`, `%${query}%`)
+			}>(
+				"SELECT id, title, body FROM docs WHERE tenant_id = ? AND (title LIKE ? OR body LIKE ?) LIMIT 10",
+				tenantId,
+				`%${query}%`,
+				`%${query}%`,
+			)
 			.toArray();
 
 		const selfHop: RouteHop = {
@@ -475,57 +356,31 @@ app.get("/api/topology/:tile", async (c) => {
 	const tile = c.req.param("tile");
 
 	if (tile === "demo1") {
-		const stub = c.env.COUNTER_PARTITION_DO.get(c.env.COUNTER_PARTITION_DO.idFromName("counter-root"));
-		const status = await stub.fokosStatus();
-		const stats = await stub.getStats();
-
-		const rootNode: TopologyItem = {
-			id: "counter-root",
-			doName: "counter-root",
-			role: status.isRouter ? "router" : "leaf",
+		const nodes = await collectCounterTree(c.env);
+		const toItem = (node: CounterNode): TopologyItem => ({
+			id: node.ref.partitionId,
+			doName: node.ref.doName,
+			role: node.stats.role === "router" ? "router" : "leaf",
 			kind: "hash",
-			depth: 0,
-			status: status.splitState,
-			importState: status.importState,
+			depth: node.depth,
+			status: node.stats.repartitionState ?? "active",
+			importState: node.stats.importState,
 			hashKey: null,
-			itemCount: stats.itemCount,
-			requestCount: stats.requestCount,
-			children: [],
-		};
-
-		if (status.isRouter && status.entries.length > 0) {
-			for (const entry of status.entries) {
-				if (entry.target) {
-					rootNode.children.push({
-						id: entry.target.ref.partitionId,
-						doName: entry.target.ref.doName,
-						role: "leaf",
-						kind: "hash",
-						depth: 1,
-						status: "active",
-						importState: null,
-						hashKey: null,
-						itemCount: Math.round(stats.itemCount / status.entries.length),
-						requestCount: Math.round(stats.requestCount / status.entries.length),
-						children: [],
-					});
-				}
-			}
-		}
-
-		const totalPartitions = 1 + rootNode.children.length;
-		const routerCount = status.isRouter ? 1 : 0;
-		const leafCount = status.isRouter ? rootNode.children.length : 1;
-
+			itemCount: node.stats.rows.length,
+			requestCount: node.stats.requestCount,
+			children: nodes.filter((n) => node.stats.children.some((ch) => ch.doName === n.ref.doName)).map(toItem),
+		});
+		const routerCount = nodes.filter((n) => n.stats.role === "router").length;
 		const response: TileTopology = {
 			tile: "demo1",
-			roots: [rootNode],
+			roots: [toItem(nodes[0])],
 			summary: {
-				totalPartitions,
+				totalPartitions: nodes.length,
 				routerCount,
-				leafCount,
-				splitCount: status.isRouter ? 1 : 0,
+				leafCount: nodes.length - routerCount,
+				splitCount: routerCount,
 			},
+			reconciliation: await reconcileCounters(c.env, nodes),
 		};
 		return c.json(response);
 	}
@@ -725,61 +580,42 @@ app.post("/api/action/:tile/:action", async (c) => {
 	}
 
 	if (tile === "demo1") {
-		const stub = c.env.COUNTER_PARTITION_DO.get(c.env.COUNTER_PARTITION_DO.idFromName("counter-root"));
-
 		if (action === "increment") {
-			const key = (body.key as string) ?? `counter-${Math.floor(Math.random() * 20)}`;
-			const amount = (body.amount as number) ?? 1;
-			const res = await stub.increment(key, amount);
-			const stats = await stub.getStats();
-			return c.json({
-				success: true,
-				action,
-				result: res,
-				trace: res.trace,
-				stats,
-			});
+			const key = (body.key as string) ?? `counter-${Math.floor(Math.random() * 8)}`;
+			const { value, trace } = await sendCounterIncrement(c.env, key, (body.amount as number) ?? 1);
+			return c.json({ success: true, action, result: value, trace });
 		}
 
 		if (action === "batch-increment") {
-			const count = (body.count as number) ?? 10;
-			const traces: ActionTrace[] = [];
-			for (let i = 0; i < count; i++) {
-				const key = `counter-${Math.floor(Math.random() * 20)}`;
-				const res = await stub.increment(key, 1);
-				traces.push(res.trace);
-			}
-			const stats = await stub.getStats();
-			return c.json({
-				success: true,
-				action,
-				count,
-				trace: traces[traces.length - 1],
-				allTraces: traces,
-				stats,
-			});
-		}
-
-		if (action === "split") {
-			const childCount = (body.childCount as number) ?? 4;
-			const res = await stub.triggerSplit(childCount);
-			const stats = await stub.getStats();
-			return c.json({ success: true, action, ...res, stats });
+			const count = (body.count as number) ?? 5;
+			let trace: ActionTrace | undefined;
+			for (let i = 0; i < count; i++) ({ trace } = await sendCounterIncrement(c.env, `counter-${i % 8}`, 1));
+			return c.json({ success: true, action, result: { count }, trace });
 		}
 
 		if (action === "kill") {
-			// Forces Cloudflare to evict the Durable Object
-			try {
-				await stub.debugAbort();
-			} catch {
-				// abort terminates the DO execution context
-			}
-			return c.json({ success: true, action, killed: true });
+			// The source of a split holds the pages its children still pull, so it is the partition to crash.
+			const nodes = await collectCounterTree(c.env);
+			const victim = nodes.find((n) => n.stats.repartitionState !== null);
+			if (!victim) return c.json({ success: false, action, error: "no partition is splitting now" });
+			// The abort ends the call with an error, so the error means success.
+			await counterStub(c.env, victim.ref.doName)
+				.debugAbort()
+				.catch(() => {});
+			return c.json({ success: true, action, result: { killed: victim.ref.doName } });
 		}
 
 		if (action === "reset") {
-			const res = await stub.reset();
-			return c.json({ success: true, action, ...res });
+			// Read the tree first, because a reset parent forgets its children.
+			const nodes = await collectCounterTree(c.env);
+			// Reset each parent before its children: a split source that is still alive can initialize a
+			// child again after that child was reset. Each reset ends its call with an error, so the error
+			// means success.
+			for (const node of nodes)
+				await counterStub(c.env, node.ref.doName)
+					.resetAll()
+					.catch(() => {});
+			return c.json({ success: true, action });
 		}
 	}
 
