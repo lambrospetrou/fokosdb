@@ -7,7 +7,7 @@ import {
 	type ProjectedWireRow,
 	type PutItemRpcRequest,
 } from "../../src/server/do-partition.js";
-import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { clipToChildRange } from "../../src/sharding/sk-interval.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
@@ -29,7 +29,7 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 
-// Tests build their own leaf partitions or only read the shared fixtures, so they run
+// Tests work on a hash key of their own or only read the shared fixtures, so they run
 // concurrently. A test that holds a migration through a prototype spy is marked sequential.
 describe.concurrent("PartitionDO — range split", () => {
 	// One request with every budget wide open; tests override the budget they exercise.
@@ -66,11 +66,17 @@ describe.concurrent("PartitionDO — range split", () => {
 	describe("queryItems leaf pages", () => {
 		const request = (direction: "asc" | "desc", overrides: Partial<QueryItemsRpcRequest> = {}) => fullRequest({ direction, ...overrides });
 
-		const seed45 = (state: DurableObjectState) => {
+		// Every test reads a hash key of its own on one partition, so the partition is built once.
+		let leaf: ReturnType<typeof makeStub>;
+		beforeAll(() => {
+			leaf = makeStub();
+		});
+
+		const seed45 = (state: DurableObjectState, hk: KeyBytes) => {
 			const store = new PartitionStore(state.storage);
 			for (let i = 0; i < 45; i++) {
 				store.upsertItem({
-					hk: kb("alice"),
+					hk,
 					sk: kb(String(i).padStart(3, "0")),
 					data: "x",
 					kind: "text",
@@ -81,11 +87,12 @@ describe.concurrent("PartitionDO — range split", () => {
 		};
 
 		it("reads one candidate beyond a full evaluated-item budget and returns an inclusive cursor", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-eval");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 
-				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 })));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 10 })));
 
 				expect(result.items).toHaveLength(10);
 				expect(result.count).toBe(10);
@@ -97,11 +104,12 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("returns no cursor when the evaluated-item budget ends on the last candidate", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-last");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 
-				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 45 })));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 45 })));
 
 				expect(result.items).toHaveLength(45);
 				expect(result.count).toBe(45);
@@ -111,11 +119,14 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("count mode returns no items, zero response bytes, and the same page counters", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-count");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 
-				const result = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 10 })));
+				const result = opened(
+					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 10 })),
+				);
 
 				expect(result.items).toEqual([]);
 				expect(result.responseBytes).toBe(0);
@@ -129,12 +140,13 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("count mode with a filter returns the matched count below scannedCount", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-count-filter");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 				const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
 
-				const result = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", plan })));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", plan })));
 
 				expect(result.items).toEqual([]);
 				expect(result.responseBytes).toBe(0);
@@ -146,12 +158,13 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("a rejected candidate consumes the evaluated budgets and advances the cursor", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-rejected");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
 
-				const first = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10 })));
+				const first = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingEvaluatedItems: 10 })));
 				expect(first.count).toBe(0);
 				expect(first.items).toEqual([]);
 				expect(first.scannedCount).toBe(10);
@@ -165,7 +178,7 @@ describe.concurrent("PartitionDO — range split", () => {
 				let cursor = first.nextCursor;
 				let pages = 0;
 				while (cursor !== null) {
-					const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingEvaluatedItems: 10, cursor })));
+					const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingEvaluatedItems: 10, cursor })));
 					count += res.count;
 					scannedCount += res.scannedCount;
 					seen.push(...res.items.map((it) => KeyCodec.decode((it as StoredItem).sk) as string));
@@ -179,12 +192,13 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("a rejected candidate spends zero response bytes", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-bigzero");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
-						hk: kb("alice"),
+						hk: hashKey,
 						sk: kb(`big${i}`),
 						data: new Uint8Array(100 * 1024),
 						kind: "bytes",
@@ -196,7 +210,7 @@ describe.concurrent("PartitionDO — range split", () => {
 
 				// 250 KiB admits two 100 KiB items but not six. The page drains only because the five
 				// rejected candidates charged nothing to the response budget.
-				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 })));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingResponseBytes: 250 * 1024 })));
 				expect(res.nextCursor).toBeNull();
 				expect(res.scannedCount).toBe(6);
 				expect(res.items).toHaveLength(1);
@@ -205,12 +219,13 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("count and projection pages can stop at different positions and exchange cursors", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-exchange");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({
-						hk: kb("alice"),
+						hk: hashKey,
 						sk: kb(`big${i}`),
 						data: new Uint8Array(100 * 1024),
 						kind: "bytes",
@@ -220,26 +235,32 @@ describe.concurrent("PartitionDO — range split", () => {
 				}
 
 				// Projection stops when the response budget rejects the third item.
-				const proj = opened(await instance.apiQueryItems(ctx, request("asc", { remainingResponseBytes: 250 * 1024 })));
+				const proj = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingResponseBytes: 250 * 1024 })));
 				expect(proj.items).toHaveLength(2);
 				expect(proj.nextCursor).not.toBeNull();
 
 				// Count ignores the response budget and drains the same interval.
-				const cnt = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingResponseBytes: 250 * 1024 })));
+				const cnt = opened(
+					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingResponseBytes: 250 * 1024 })),
+				);
 				expect(cnt.items).toEqual([]);
 				expect(cnt.count).toBe(6);
 				expect(cnt.nextCursor).toBeNull();
 
 				// The projection cursor resumes under count at the rejected candidate.
-				const cntResume = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", cursor: proj.nextCursor })));
+				const cntResume = opened(
+					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", cursor: proj.nextCursor })),
+				);
 				expect(cntResume.count).toBe(4);
 				expect(cntResume.nextCursor).toBeNull();
 
 				// The count cursor resumes under projection and materializes the rest.
-				const cnt3 = opened(await instance.apiQueryItems(ctx, request("asc", { select: "count", remainingEvaluatedItems: 3 })));
+				const cnt3 = opened(
+					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 3 })),
+				);
 				expect(cnt3.count).toBe(3);
 				expect(cnt3.nextCursor).not.toBeNull();
-				const projResume = opened(await instance.apiQueryItems(ctx, request("asc", { cursor: cnt3.nextCursor })));
+				const projResume = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, cursor: cnt3.nextCursor })));
 				expect(projResume.items).toHaveLength(3);
 				expect(projResume.items.map((it) => KeyCodec.decode((it as StoredItem).sk))).toEqual(["big3", "big4", "big5"]);
 				expect(projResume.nextCursor).toBeNull();
@@ -247,11 +268,12 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("physical rowsRead is reported from SQLite and is not derived from the logical counters", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-rowsread");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-				seed45(state);
+				seed45(state, hashKey);
 
-				const result = opened(await instance.apiQueryItems(ctx, request("asc", { remainingEvaluatedItems: 10 })));
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, remainingEvaluatedItems: 10 })));
 
 				expect(result.meta.rowsRead).toBeGreaterThan(0);
 				expect(result.partitionMetas[0].rowsRead).toBe(result.meta.rowsRead);
@@ -261,14 +283,15 @@ describe.concurrent("PartitionDO — range split", () => {
 		it.each(["asc", "desc"] as const)(
 			"a projection returns positional rows in %s order with the complete-item counters",
 			async (direction) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, stub } = leaf;
+				const hashKey = kb(`lp-projection-${direction}`);
 				await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-					seed45(state);
+					seed45(state, hashKey);
 					const plan = compileQueryExpression({
 						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
 					});
 
-					const result = opened(await instance.apiQueryItems(ctx, request(direction, { plan, remainingEvaluatedItems: 10 })));
+					const result = opened(await instance.apiQueryItems(ctx, request(direction, { hashKey, plan, remainingEvaluatedItems: 10 })));
 
 					const expected = Array.from({ length: 10 }, (_, i) => [String(direction === "asc" ? i : 44 - i).padStart(3, "0"), 1]);
 					expect(result.items).toEqual(expected);
@@ -282,17 +305,18 @@ describe.concurrent("PartitionDO — range split", () => {
 		);
 
 		it("a projection page stops on the response budget over the projected rows", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-projbudget");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				// A 60 KiB text cell estimates at 64 + 120 KiB, so two rows fit a 250 KiB page.
 				const doc = JSON.stringify({ big: "x".repeat(60 * 1024) });
 				for (let i = 0; i < 6; i++) {
-					store.upsertItem({ hk: kb("alice"), sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
+					store.upsertItem({ hk: hashKey, sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
 				}
 				const plan = compileQueryExpression({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
 
-				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 250 * 1024 })));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingResponseBytes: 250 * 1024 })));
 				expect(res.items).toHaveLength(2);
 				expect(res.count).toBe(2);
 				expect(res.nextCursor?.inclusive).toBe(true);
@@ -301,7 +325,7 @@ describe.concurrent("PartitionDO — range split", () => {
 				expect(res.responseBytes).toBe(res.items.reduce((sum, item) => sum + estimateProjectedRowBytes(item as ProjectedWireRow), 0));
 
 				// The first oversized projected row of a page is still admitted once.
-				const oversized = opened(await instance.apiQueryItems(ctx, request("asc", { plan, remainingResponseBytes: 1 })));
+				const oversized = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingResponseBytes: 1 })));
 				expect(oversized.items).toHaveLength(1);
 				expect(oversized.responseBytes).toBe(estimateProjectedRowBytes(oversized.items[0] as ProjectedWireRow));
 				expect(oversized.nextCursor?.inclusive).toBe(true);
@@ -310,14 +334,15 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("keeps undefined projected cells across the RPC hop", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub, rpc } = leaf;
+			const hashKey = kb("lp-undefined");
 			await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (let i = 0; i < 6; i++) {
 					// `opt` exists on every other item, so every other wire row has a missing first cell.
 					const doc = i % 2 === 0 ? { opt: i } : { other: i };
 					store.upsertItem({
-						hk: kb("alice"),
+						hk: hashKey,
 						sk: kb(String(i).padStart(3, "0")),
 						data: JSON.stringify(doc),
 						kind: "json",
@@ -331,7 +356,7 @@ describe.concurrent("PartitionDO — range split", () => {
 			const plan = compileQueryExpression({
 				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
 			});
-			const result = await rpc.apiQueryItems(ctx, request("asc", { plan }));
+			const result = await rpc.apiQueryItems(ctx, request("asc", { hashKey, plan }));
 
 			expect(result.items).toHaveLength(6);
 			for (const [i, item] of result.items.entries()) {
@@ -349,17 +374,18 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it("runs a projection at the entry limit through the leaf", async () => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb("lp-limit");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				const doc = Object.fromEntries(Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => [`f${k}`, k]));
-				store.upsertItem({ hk: kb("alice"), sk: kb("s"), data: JSON.stringify(doc), kind: "json", ttlAt: null, txOrderTs: 0 });
+				store.upsertItem({ hk: hashKey, sk: kb("s"), data: JSON.stringify(doc), kind: "json", ttlAt: null, txOrderTs: 0 });
 				const projection: ProjectionExpression[] = Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => ({
 					expr: { ref: "data", path: `$.f${k}` },
 				}));
 				const plan = compileQueryExpression({ projection });
 
-				const res = opened(await instance.apiQueryItems(ctx, request("asc", { plan })));
+				const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan })));
 				expect(res.items).toHaveLength(1);
 				expect(res.items[0]).toHaveLength(EXPRESSION_LIMITS.projectionEntries);
 				expect((res.items[0] as ProjectedWireRow)[17]).toBe(17);
@@ -367,13 +393,14 @@ describe.concurrent("PartitionDO — range split", () => {
 		});
 
 		it.each(["asc", "desc"] as const)("pages 400 KiB items without gaps or duplicates in %s order", async (direction) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = leaf;
+			const hashKey = kb(`lp-huge-${direction}`);
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				const store = new PartitionStore(state.storage);
 				for (const sk of ["a", "b", "c"]) {
-					const dataBytes = MAX_ITEM_BYTES - kb("alice").byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;
+					const dataBytes = MAX_ITEM_BYTES - hashKey.byteLength - kb(sk).byteLength - EST_ROW_BYTES_K;
 					store.upsertItem({
-						hk: kb("alice"),
+						hk: hashKey,
 						sk: kb(sk),
 						data: new Uint8Array(dataBytes),
 						kind: "bytes",
@@ -388,7 +415,7 @@ describe.concurrent("PartitionDO — range split", () => {
 					const result: Opened<QueryItemsRpcResponse> = opened(
 						await instance.apiQueryItems(
 							ctx,
-							request(direction, { remainingResponseBytes: MAX_ITEM_BYTES + 100, remainingEvaluatedItems: 2, cursor }),
+							request(direction, { hashKey, remainingResponseBytes: MAX_ITEM_BYTES + 100, remainingEvaluatedItems: 2, cursor }),
 						),
 					);
 					seen.push(...result.items.map((item) => KeyCodec.decode((item as StoredItem).sk) as string));

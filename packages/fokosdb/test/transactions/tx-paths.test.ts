@@ -3,7 +3,7 @@ import { PartitionDO } from "../../src/server/do-partition.js";
 import { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
-import { countDistinctPartitions, keysInOnePartition, makeDB, writeOutcome } from "./tx-helpers.js";
+import { countDistinctPartitions, keysAcrossPartitions, keysInOnePartition, makeDB, writeOutcome } from "./tx-helpers.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 
 /** The answer a partition gives when it cannot execute the whole item set alone, in its envelope. */
@@ -25,6 +25,13 @@ const fastPathNotApplicable = {
  * key bytes, so it is fixed, never flaky — and assert that both paths give the same answer.
  */
 describe("transactions - single-partition fast path", () => {
+	// One table per write path serves the whole file: every test writes keys of its own, so the
+	// partition DOs stay warm instead of cold-starting a fresh set per test. The root count stays
+	// small so the keys keep landing on those warm roots; a test that needs a different size cap
+	// creates a database of its own below.
+	const sharedDb = makeDB({ rootTreesN: 8 });
+	const sharedSlowDb = makeDB({ rootTreesN: 8, singlePartitionFastPath: false });
+
 	// The DO classes run in this same isolate, so a spy on their prototype counts the real RPC
 	// dispatches — and stays installed until it is restored.
 	afterEach(() => {
@@ -46,8 +53,8 @@ describe("transactions - single-partition fast path", () => {
 	}
 
 	it("reads a single-partition key set in one round trip, and answers exactly as the two-phase driver does", async () => {
-		const db = makeDB();
-		const slowDb = makeDB({ singlePartitionFastPath: false });
+		const db = sharedDb;
+		const slowDb = sharedSlowDb;
 
 		const keys = keysInOnePartition(db, 3, "fast-read");
 		expect(countDistinctPartitions(db, keys)).toBe(1);
@@ -71,8 +78,8 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("reads projected items in one round trip, and answers exactly as the two-phase driver does", async () => {
-		const db = makeDB();
-		const slowDb = makeDB({ singlePartitionFastPath: false });
+		const db = sharedDb;
+		const slowDb = sharedSlowDb;
 
 		const keys = keysInOnePartition(db, 2, "fast-read-proj");
 		expect(countDistinctPartitions(db, keys)).toBe(1);
@@ -104,7 +111,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("rejects a request in which two items name the same key", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const key = keysInOnePartition(db, 1, "dup-read")[0];
 		await db.putItem({ ...key, data: "v" });
 
@@ -117,11 +124,8 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("drives a multi-partition read from the Worker in two phases", async () => {
-		const db = makeDB();
-		const keys = [
-			{ hashKey: "span-a", sortKey: "sk" },
-			{ hashKey: "span-b", sortKey: "sk" },
-		];
+		const db = sharedDb;
+		const keys = keysAcrossPartitions(db, 2, "span");
 		expect(countDistinctPartitions(db, keys)).toBe(2);
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
@@ -134,7 +138,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("runs the Worker two-phase path when the partition cannot execute the whole set", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-fallback");
 		for (const key of keys) await db.putItem({ ...key, data: `data-${key.hashKey}` });
 
@@ -153,7 +157,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("surfaces a fast-path transport failure instead of starting the two-phase path", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-transport");
 		for (const key of keys) await db.putItem({ ...key, data: "v" });
 
@@ -168,7 +172,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("writes a single-partition transaction in one round trip, with no coordinator", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 3, "fast-write");
 		await db.putItem({ ...keys[1], data: "to-delete" });
 		await db.putItem({ ...keys[2], data: "to-check" });
@@ -195,7 +199,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("reports a failed condition as a cancelled transaction, writing nothing", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-condition");
 
 		const { partitionCalls } = countWritePathCalls();
@@ -217,7 +221,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("keeps a transaction that carries a clientRequestToken on the coordinator path", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-token");
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "tokened" }));
 		const clientRequestToken = `fast-token-${crypto.randomUUID()}`;
@@ -259,7 +263,7 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("runs the coordinator path for a write when the partition cannot execute the whole set", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-write-fallback");
 
 		// A partition answers this when the items straddle a split or a promotion below it. The answer
@@ -291,12 +295,19 @@ describe("transactions - single-partition fast path", () => {
  * transactionSync keeps what a returning callback wrote.
  */
 describe("transactions - the item size limit is enforced before any write", () => {
+	// One table per write path serves the whole describe: every test writes keys of its own, so the
+	// partition DOs stay warm instead of cold-starting a fresh set per test. The root count stays
+	// small so the keys keep landing on those warm roots; a test that needs a different size cap
+	// creates a database of its own below.
+	const sharedDb = makeDB({ rootTreesN: 8 });
+	const sharedSlowDb = makeDB({ rootTreesN: 8, singlePartitionFastPath: false });
+
 	// The client counts data bytes; the store measures the data plus the keys plus the fixed per-row
 	// overhead. This value sits between the two, so validation passes it to the partition.
 	const overRow = () => new Uint8Array(MAX_ITEM_BYTES);
 
 	it("rejects an oversized put at prepare and writes nothing on the two-phase path", async () => {
-		const db = makeDB({ singlePartitionFastPath: false });
+		const db = sharedSlowDb;
 		const fits = { hashKey: `fits-${crypto.randomUUID()}` };
 		const over = { hashKey: `over-${crypto.randomUUID()}` };
 
@@ -318,7 +329,7 @@ describe("transactions - the item size limit is enforced before any write", () =
 	});
 
 	it("rejects an oversized put in the check pass and writes nothing on the single-shot path", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		// One hash key, so the whole set lands in one partition and takes the single-shot path.
 		const hashKey = `single-${crypto.randomUUID()}`;
 		const fits = { hashKey, sortKey: "fits" };
@@ -350,7 +361,7 @@ describe("transactions - the item size limit is enforced before any write", () =
 		const value = "\\".repeat(230_000);
 
 		for (const singlePartitionFastPath of [true, false]) {
-			const db = makeDB({ singlePartitionFastPath });
+			const db = singlePartitionFastPath ? sharedDb : sharedSlowDb;
 			const key = { hashKey: `escape-${crypto.randomUUID()}` };
 			await db.putItem({ ...key, data: { k: "small" } });
 

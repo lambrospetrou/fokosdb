@@ -10,7 +10,7 @@ import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { QueryItemsOptions, SortKeyCondition } from "../../src/shared/types.js";
-import { arbItemData, makeTestDB, propertyRuns, type ItemData } from "./harness.js";
+import { arbItemData, makeTestDB, prefixHashKey, propertyRuns, type ItemData } from "./harness.js";
 import {
 	expectDrainedAnswer,
 	expectedAnswer,
@@ -24,7 +24,9 @@ import {
 
 // Every property runs many scenarios against real Durable Objects, and a shrink runs many more.
 // The default 5 s vitest timeout would hide the counterexample.
-const PROPERTY_TIMEOUT_MS = 300_000;
+const PROPERTY_RUNS = propertyRuns(30);
+// 4s roughly per run should be more than enough.
+const PROPERTY_TIMEOUT_MS = PROPERTY_RUNS * 5_000;
 
 // ─── The scenario ─────────────────────────────────────────────────────────────
 
@@ -134,32 +136,46 @@ async function applySeed(db: FokosDB, ops: readonly SeedOp[]): Promise<QueryMode
 }
 
 describe("FokosDB queryItems — model-based properties", () => {
+	// One table serves every run. The prefix is drawn outside the arbitrary, so a shrink replay
+	// gets a fresh key space too, and the versions `applySeed` asserts stay honest.
+	const db = makeTestDB();
+	const prefixedScenario = (seed: SeedOp[], requests: readonly QueryItemsOptions[]) => {
+		const prefix = crypto.randomUUID();
+		return {
+			seed: seed.map((op) => ({ ...op, hashKey: prefixHashKey(prefix, op.hashKey) })),
+			requests: requests.map((request) => ({
+				...request,
+				queries: request.queries.map((q) => ({ ...q, hashKey: prefixHashKey(prefix, q.hashKey) })),
+			})),
+		};
+	};
+
 	it("a drained request returns exactly the model's items, in key order", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		await fc.assert(
 			fc.asyncProperty(arbScenario, async ({ seed, requests }) => {
-				const db = makeTestDB();
-				const model = await applySeed(db, seed);
+				const scenario = prefixedScenario(seed, requests);
+				const model = await applySeed(db, scenario.seed);
 
-				for (const request of requests) {
+				for (const request of scenario.requests) {
 					await expectDrainedAnswer(db, expectedAnswer(model, request.queries), request);
 				}
 			}),
-			{ numRuns: propertyRuns(25) },
+			{ numRuns: PROPERTY_RUNS },
 		);
 	});
 
 	it("count mode counts the same items and materializes none", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		await fc.assert(
 			fc.asyncProperty(arbScenario, async ({ seed, requests }) => {
-				const db = makeTestDB();
-				const model = await applySeed(db, seed);
+				const scenario = prefixedScenario(seed, requests);
+				const model = await applySeed(db, scenario.seed);
 
-				for (const request of requests) {
+				for (const request of scenario.requests) {
 					const opts: QueryItemsOptions = { ...request, select: "count" };
 					await expectDrainedAnswer(db, expectedAnswer(model, request.queries), opts);
 				}
 			}),
-			{ numRuns: propertyRuns(15) },
+			{ numRuns: PROPERTY_RUNS },
 		);
 	});
 });

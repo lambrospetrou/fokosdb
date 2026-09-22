@@ -40,8 +40,14 @@ const passingConditions: readonly ConditionExpression[] = [
 ];
 
 describe("write conditions", () => {
+	// One table per write path serves the whole describe: every test writes keys of its own, so the
+	// partition DOs stay warm instead of cold-starting a fresh set per test. The root count stays
+	// small so the keys keep landing on those warm roots; a test that needs a different size cap
+	// creates a database of its own below.
+	const sharedDb = makeDB({ rootTreesN: 8 });
+
 	it.each(passingConditions)("applies $op conditions to putItem and deleteItem", async (condition) => {
-		const db = makeDB();
+		const db = sharedDb;
 		const key = { hashKey: `condition-${condition.op}-${crypto.randomUUID()}` };
 		const data = { status: "active", score: 5, tags: ["blue", "green"] };
 
@@ -51,7 +57,7 @@ describe("write conditions", () => {
 	});
 
 	it("does not write when a JSON condition fails", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const key = { hashKey: `condition-failure-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { status: "active" } });
 		const condition = {
@@ -66,6 +72,13 @@ describe("write conditions", () => {
 });
 
 describe("transactions - end-to-end", () => {
+	// One table per write path serves the whole describe: every test writes keys of its own, so the
+	// partition DOs stay warm instead of cold-starting a fresh set per test. The root count stays
+	// small so the keys keep landing on those warm roots; a test that needs a different size cap
+	// creates a database of its own below.
+	const sharedDb = makeDB({ rootTreesN: 8 });
+	const sharedSlowDb = makeDB({ rootTreesN: 8, singlePartitionFastPath: false });
+
 	beforeEach(async () => {
 		vi.useFakeTimers({ shouldAdvanceTime: true });
 	});
@@ -77,7 +90,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("commits 100 puts across many partitions, including 10 pre-existing items", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		const preExistingKeys = Array.from({ length: 10 }, (_, i) => ({
 			hashKey: `pre-hk-${i}`,
@@ -145,7 +158,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("atomicity: condition failure on one item rolls back the entire transaction", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		// Seed 5 items across different partitions.
 		for (let i = 0; i < 5; i++) {
@@ -193,7 +206,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("atomicity: condition failure across partitions — no partial writes", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		// Create 10 items that span multiple partitions.
 		const keys = Array.from({ length: 10 }, (_, i) => ({ hashKey: `cross-${i}` }));
@@ -231,7 +244,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("isolation: concurrent non-tx putItem and transaction on the same item", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		// Seed the shared key so both operations can conflict on an existing item.
 		await db.putItem({ hashKey: "iso-shared", data: "original" });
@@ -294,7 +307,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("conflict: concurrent transactions on overlapping keys — loser's writes are fully rolled back", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		// No seeds — items are created by the transactions. This isolates the test
 		// to pure pending-lock contention without timestamp races from prior writes.
@@ -372,7 +385,7 @@ describe("transactions - end-to-end", () => {
 		// would take it, and there the premise below stops existing — the fast path holds no lock, so
 		// both transactions serialize inside the partition and neither loses. The fast-path counterpart
 		// is the next test.
-		const db = makeDB({ singlePartitionFastPath: false });
+		const db = sharedSlowDb;
 
 		let firstRetries = 0,
 			secondRetries = 0;
@@ -443,7 +456,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("serializability: concurrent single-partition transactions both commit with no retry", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		const write = async (data: string) =>
 			await writeOutcome(db.transactWriteItems({ items: [{ hashKey: "ser-fast-key", operation: "put", data }] }));
@@ -462,7 +475,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("transactGetItems returns consistent snapshot across partitions", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		const keys = Array.from({ length: 10 }, (_, i) => ({
 			hashKey: `read-${i}`,
@@ -525,7 +538,7 @@ describe("transactions - end-to-end", () => {
 			return out;
 		}
 
-		const db = makeDB();
+		const db = sharedDb;
 
 		// 3 partitions x 4 keys, asked for in interleaved order: the answer can only come back in this
 		// order if the TC restores the request order after its per-partition grouping.
@@ -565,7 +578,7 @@ describe("transactions - end-to-end", () => {
 		});
 
 		it("raises pending_write after phase one when a participant reports a pending write", async () => {
-			const db = makeDB();
+			const db = sharedDb;
 			const keys = keysAcrossPartitions(db, 2, "read-pending");
 			const pendingPartition = partitionNameOf(db, keys[0]);
 			const original = PartitionDO.prototype.txReadForTransaction;
@@ -584,7 +597,7 @@ describe("transactions - end-to-end", () => {
 		});
 
 		it("raises read_conflict when committed item state changes between the two phases", async () => {
-			const db = makeDB();
+			const db = sharedDb;
 			const keys = keysAcrossPartitions(db, 2, "read-conflict");
 			for (const key of keys) await db.putItem({ ...key, data: "value" });
 			const changingPartition = partitionNameOf(db, keys[0]);
@@ -617,7 +630,7 @@ describe("transactions - end-to-end", () => {
 		["single-shot", true],
 		["coordinator", false],
 	] as const)("stores ttlAt on the %s transaction path", async (_path, singlePartitionFastPath) => {
-		const db = makeDB({ singlePartitionFastPath });
+		const db = singlePartitionFastPath ? sharedDb : sharedSlowDb;
 		const key = { hashKey: `ttl-${crypto.randomUUID()}` };
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 
@@ -630,7 +643,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("includes ttlAt in idempotent transaction identity", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const key = { hashKey: `ttl-token-${crypto.randomUUID()}` };
 		const token = `ttl-token-${crypto.randomUUID()}`;
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
@@ -645,7 +658,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("idempotency: retrying transactWriteItems with same clientRequestToken returns same result", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		const token = `idemp-token-${crypto.randomUUID()}`;
 		const operations = [
@@ -670,7 +683,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("persists a JSON condition plan through two-phase commit and replays it idempotently", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 		const key = { hashKey: `condition-plan-${crypto.randomUUID()}` };
 		const token = `condition-plan-token-${crypto.randomUUID()}`;
 		await db.putItem({ ...key, data: { status: "active" } });
@@ -693,7 +706,7 @@ describe("transactions - end-to-end", () => {
 	// outcome would acknowledge writes that never execute, so the coordinator compares an
 	// operation-set fingerprint and refuses.
 	it("idempotency: reusing a clientRequestToken for different operations is rejected", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		const token = `idemp-mismatch-${crypto.randomUUID()}`;
 		const operations = [{ hashKey: "mismatch-1", operation: "put" as const, data: "original" }];
@@ -732,7 +745,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("delete operations in a transaction remove items atomically", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		for (let i = 0; i < 5; i++) {
 			await db.putItem({ hashKey: `del-${i}`, data: `data-${i}` });
@@ -772,7 +785,7 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("atomicity: failed condition on a delete rolls back puts in the same transaction", async () => {
-		const db = makeDB();
+		const db = sharedDb;
 
 		await db.putItem({ hashKey: "rollback-put", data: "original" });
 

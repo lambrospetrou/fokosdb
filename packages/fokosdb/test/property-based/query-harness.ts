@@ -11,7 +11,7 @@ import fc from "fast-check";
 import { expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import type { QueryItemsOptions, QueryItemsResult, SortKeyCondition } from "../../src/shared/types.js";
-import { expectedDataKind, makeTestDB, sleep, untilAvailable, type DataKind, type ItemData } from "./harness.js";
+import { expectedDataKind, makeTestDB, sleep, textEncoder, untilAvailable, type DataKind, type ItemData } from "./harness.js";
 
 export type QueryKey = string | Uint8Array;
 export type OptionalQueryKey = QueryKey | undefined;
@@ -22,7 +22,7 @@ export type Query = QueryItemsOptions["queries"][number];
 /** The canonical bytes of a key: raw UTF-8 for a string, a 0xFF tag ahead of a binary key, empty for an absent one. */
 function encodeKey(key: OptionalQueryKey): Uint8Array {
 	if (key === undefined) return new Uint8Array(0);
-	if (typeof key === "string") return new TextEncoder().encode(key);
+	if (typeof key === "string") return textEncoder.encode(key);
 	const out = new Uint8Array(key.byteLength + 1);
 	out[0] = 0xff;
 	out.set(key, 1);

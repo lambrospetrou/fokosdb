@@ -66,6 +66,9 @@ export function propertyRuns(defaultRuns: number): number {
 	return runs;
 }
 
+export const textEncoder = new TextEncoder();
+export const textDecoder = new TextDecoder();
+
 // ─── The table ────────────────────────────────────────────────────────────────
 
 /**
@@ -123,6 +126,16 @@ const arbHashKey = fc.oneof(arbStringKey(MAX_HASH_KEY_BYTES), arbBinaryKey(MAX_H
 const arbSortKey = fc.oneof(arbStringKey(MAX_SORT_KEY_BYTES), arbBinaryKey(MAX_SORT_KEY_BYTES), fc.constant(undefined));
 export const arbItemKey: fc.Arbitrary<ItemKey> = fc.record({ hashKey: arbHashKey, sortKey: arbSortKey });
 
+/** `hashKey` with `prefix` in front, so a run on a shared table writes in a key space of its own. */
+export function prefixHashKey(prefix: string, hashKey: string | Uint8Array): string | Uint8Array {
+	if (typeof hashKey === "string") return `${prefix}:${hashKey}`;
+	const head = textEncoder.encode(`${prefix}:`);
+	const out = new Uint8Array(head.length + hashKey.byteLength);
+	out.set(head);
+	out.set(hashKey, head.length);
+	return out;
+}
+
 const arbJsonLeaf: fc.Arbitrary<JsonPrimitive> = fc.oneof(fc.string({ maxLength: 32 }), fc.integer(), fc.boolean(), fc.constant(null));
 
 // A stored json value comes back through JSON.parse. The same round trip over the generated value
@@ -149,7 +162,7 @@ export const arbItemData: fc.Arbitrary<ItemData> = fc.oneof(
  * gives each run its own prefix, so the runs never see the items of each other.
  */
 function poolKeys(prefix: string): ItemKey[] {
-	const bin = (...bytes: number[]) => new Uint8Array([...new TextEncoder().encode(prefix), ...bytes]);
+	const bin = (...bytes: number[]) => new Uint8Array([...textEncoder.encode(prefix), ...bytes]);
 	return [
 		{ hashKey: `${prefix}user:1`, sortKey: "profile" },
 		{ hashKey: `${prefix}user:1`, sortKey: "settings" },

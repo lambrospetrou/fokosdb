@@ -50,8 +50,12 @@ describe("transactions - an update plan at the binding limit", () => {
  * two-phase path is the one with the materialized pending row, the lock, and the commit apply.
  */
 describe.each([true, false])("transactions - update expressions (singlePartitionFastPath=%s)", (singlePartitionFastPath) => {
+	// One table serves every test of this describe: each test writes keys of its own, so the
+	// partition DOs stay warm instead of cold-starting a fresh set per test. The root count stays
+	// small so the keys keep landing on those warm roots.
+	const db = makeDB({ singlePartitionFastPath, rootTreesN: 8 });
+
 	it("evaluates pre-image: REMOVE a SET b = a, c = b gives {b: 1, c: 2}", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `user-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { a: 1, b: 2, c: 3 } });
 
@@ -78,7 +82,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("removes plain array indexes under one parent in descending index order", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `list-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { r: ["c", "h", "n", "s", "x"] } });
 
@@ -104,7 +107,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects update with update_not_applicable when the item is text or bytes", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const textKey = { hashKey: `text-${crypto.randomUUID()}` };
 		const bytesKey = { hashKey: `bytes-${crypto.randomUUID()}` };
 
@@ -135,7 +137,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("creates the item when it is absent, with the empty document as the pre-image", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `create-${crypto.randomUUID()}` };
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 
@@ -161,7 +162,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("creates an absent item and updates an existing one in the same transaction", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const [existing, absent] = keysAcrossPartitions(db, 2, `mixed-${crypto.randomUUID()}`);
 		await db.putItem({ ...existing, data: { n: 1 } });
 
@@ -208,7 +208,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	];
 
 	it.each(guardsThatNeedTheItem)("cancels an update of an absent item under %s, and creates nothing", async (_name, condition) => {
-		const db = makeDB({ singlePartitionFastPath });
 		// The request names a sort key, so the sort-key guard fails on the stored pre-image and not on a
 		// key the caller left out.
 		const key = { hashKey: `guarded-${crypto.randomUUID()}`, sortKey: "sk" };
@@ -227,7 +226,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	// The contrast that makes the cases above meaningful: the condition is what stops the creation, so
 	// a condition that an absent item passes lets the same update create it.
 	it("creates the absent item when its condition passes on the absent pre-image", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `unguarded-${crypto.randomUUID()}`, sortKey: "sk" };
 		const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
 
@@ -242,7 +240,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects a create whose set target has no parent in the empty document", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `no-parent-${crypto.randomUUID()}` };
 
 		const res = await writeOutcome(
@@ -264,7 +261,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects update with update_not_applicable on missing parent or index past end", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `guard-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { a: 1, list: [1, 2] } });
 
@@ -321,7 +317,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects update with update_not_applicable when an operand is missing or the arithmetic is not finite", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `operand-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { big: 1e308 } });
 
@@ -377,7 +372,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("remove on missing path is a no-op that still increments version", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `noop-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { existing: "value" } });
 
@@ -400,7 +394,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("preserves pre-image TTL when ttlAt is omitted, and replaces TTL when ttlAt is provided", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key1 = { hashKey: `ttl-preserve-${crypto.randomUUID()}` };
 		const key2 = { hashKey: `ttl-replace-${crypto.randomUUID()}` };
 
@@ -450,7 +443,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("rejects transaction with item_too_large when update result exceeds MAX_ITEM_BYTES", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `large-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { str: "small" } });
 
@@ -470,7 +462,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("supports idempotent retries and rejects reusing token with a different update", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const key = { hashKey: `idemp-${crypto.randomUUID()}` };
 		await db.putItem({ ...key, data: { counter: 0 } });
 
@@ -508,7 +499,6 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 	});
 
 	it("executes mixed atomic transaction with put, update, delete, and check across partitions", async () => {
-		const db = makeDB({ singlePartitionFastPath });
 		const kPut = { hashKey: `mixed-put-${crypto.randomUUID()}` };
 		const kUpdate = { hashKey: `mixed-upd-${crypto.randomUUID()}` };
 		const kDel = { hashKey: `mixed-del-${crypto.randomUUID()}` };

@@ -5,7 +5,7 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { hashChildIndex, PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
 import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
@@ -345,15 +345,29 @@ describe.concurrent("PartitionDO - splitting", () => {
 	}, 30_000);
 
 	describe("hash topology cache", async () => {
-		// A fixed probe key used to trace a deterministic path through the tree.
-		const hashKey = "probe-key";
+		// One split root serves the four tests: each test works the subtree of one depth-1 child,
+		// because its probe key lands in that child by construction. The splits, the learned cache
+		// paths and the stale-cache fix-ups stay disjoint, and the root splits once instead of four
+		// times.
+		const HASH_SPLIT_N = 4;
+		let partition: TestPartition;
+		beforeAll(async () => {
+			partition = makePartition({ hashSplitN: HASH_SPLIT_N, hashSplitConditions: { maxSizeMb: 1 } });
+			await partition.splitHash();
+		});
+
+		// A fixed probe key that the root routes to depth-1 child `slot`, used to trace a
+		// deterministic path through the tree.
+		const probeKey = (slot: number) => {
+			for (let i = 0; ; i++) {
+				const key = `probe-${slot}-${i}`;
+				if (hashChildIndex(kb(key), 0, HASH_SPLIT_N) === slot) return key;
+			}
+		};
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
-
-			// Root splits into two children.
-			await partition.splitHash();
+			const hashKey = probeKey(0);
 
 			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
 			const r1 = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk") });
@@ -370,10 +384,9 @@ describe.concurrent("PartitionDO - splitting", () => {
 		});
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
+			const hashKey = probeKey(1);
 
-			await partition.splitHash();
 			await (await partition.childOwning(hashKey)).splitHash();
 
 			// First request: cold cache — root→child→grandchild (two hops). Root learns depth=2.
@@ -388,8 +401,7 @@ describe.concurrent("PartitionDO - splitting", () => {
 		});
 
 		it("forwards a getItem sent directly to a split child partition to its grandchild in one hop", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			await partition.splitHash();
+			const hashKey = probeKey(2);
 			const child = await partition.childOwning(hashKey);
 			await child.splitHash();
 
@@ -404,11 +416,10 @@ describe.concurrent("PartitionDO - splitting", () => {
 		});
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
+			const hashKey = probeKey(3);
 
 			// Build a two-level tree: root → child → grandchild.
-			await partition.splitHash();
 			await (await partition.childOwning(hashKey)).splitHash();
 
 			// Warm root's cache to depth=2 with one request (root→child→grandchild).
