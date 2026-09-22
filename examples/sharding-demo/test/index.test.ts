@@ -1,5 +1,34 @@
-import { SELF } from "cloudflare:test";
+import { env, runInDurableObject, SELF } from "cloudflare:test";
+import type { CounterPartitionDO } from "../counter-host.js";
 import { describe, expect, it } from "vitest";
+
+async function post(tile: string, action: string, body: object = {}): Promise<any> {
+	const res = await SELF.fetch(`https://example.com/api/action/${tile}/${action}`, {
+		method: "POST",
+		headers: { "content-type": "application/json" },
+		body: JSON.stringify(body),
+	});
+	expect(res.status).toBe(200);
+	return res.json();
+}
+
+async function topology(): Promise<any> {
+	const res = await SELF.fetch("https://example.com/api/topology/demo1");
+	expect(res.status).toBe(200);
+	return res.json();
+}
+
+/** The runtime moves splits and imports on by itself, so a test waits for the state it expects. */
+async function waitForTopology(done: (t: any) => boolean): Promise<any> {
+	let top: any;
+	const deadline = Date.now() + 10_000;
+	while (Date.now() < deadline) {
+		top = await topology();
+		if (done(top)) return top;
+		await scheduler.wait(50);
+	}
+	throw new Error(`the topology did not settle: ${JSON.stringify(top.summary)} ${JSON.stringify(top.reconciliation)}`);
+}
 
 describe("sharding-demo worker and topology endpoints", () => {
 	it("responds to /api/health", async () => {
@@ -8,88 +37,79 @@ describe("sharding-demo worker and topology endpoints", () => {
 		expect(await res.json()).toEqual({ status: "ok" });
 	});
 
-	it("returns topology for Demo 1 and executes routed writes", async () => {
-		// Reset first
-		await SELF.fetch("https://example.com/api/action/demo1/reset", { method: "POST" });
+	it("routes writes through the root after it splits on request volume", async () => {
+		await post("demo1", "reset");
 
-		// Initial topology should be single root leaf
-		const topRes1 = await SELF.fetch("https://example.com/api/topology/demo1");
-		expect(topRes1.status).toBe(200);
-		const top1 = (await topRes1.json()) as any;
-		expect(top1.tile).toBe("demo1");
-		expect(top1.roots.length).toBe(1);
+		const top1 = await topology();
 		expect(top1.roots[0].role).toBe("leaf");
 		expect(top1.roots[0].children.length).toBe(0);
 
-		// Increment on single leaf
-		const incRes = await SELF.fetch("https://example.com/api/action/demo1/increment", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ key: "k-1", amount: 2 }),
-		});
-		expect(incRes.status).toBe(200);
-		const incJson = (await incRes.json()) as any;
-		expect(incJson.success).toBe(true);
-		expect(incJson.result.val).toBe(2);
-		expect(incJson.trace.forwardCount).toBe(0);
-		expect(incJson.trace.servedBy.length).toBe(1);
+		const inc = await post("demo1", "increment", { key: "k-1", amount: 2 });
+		expect(inc.result.val).toBe(2);
+		expect(inc.trace.forwardCount).toBe(0);
 
-		// Trigger split
-		const splitRes = await SELF.fetch("https://example.com/api/action/demo1/split", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ childCount: 4 }),
-		});
-		expect(splitRes.status).toBe(200);
-		const splitJson = (await splitRes.json()) as any;
-		expect(splitJson.success).toBe(true);
-		expect(splitJson.children.length).toBe(4);
-
-		// Topology after split
-		const topRes2 = await SELF.fetch("https://example.com/api/topology/demo1");
-		const top2 = (await topRes2.json()) as any;
-		expect(top2.roots[0].role).toBe("router");
+		// Five writes over more than one key cross the threshold of the root.
+		await post("demo1", "batch-increment", { count: 5 });
+		const top2 = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
 		expect(top2.roots[0].children.length).toBe(4);
-		expect(top2.summary.routerCount).toBe(1);
-		expect(top2.summary.leafCount).toBe(4);
 
-		// Increment on routed topology
-		const routedIncRes = await SELF.fetch("https://example.com/api/action/demo1/increment", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ key: "k-1", amount: 1 }),
-		});
-		expect(routedIncRes.status).toBe(200);
-		const routedIncJson = (await routedIncRes.json()) as any;
-		expect(routedIncJson.success).toBe(true);
-		expect(routedIncJson.trace.forwardCount).toBe(1);
-		expect(routedIncJson.trace.servedBy[0].role).toBe("router");
-		expect(routedIncJson.trace.servedBy[1].role).toBe("leaf");
+		const routed = await post("demo1", "increment", { key: "k-1", amount: 1 });
+		expect(routed.result.val).toBe(3);
+		expect(routed.trace.forwardCount).toBe(1);
+		expect(routed.trace.servedBy[0].role).toBe("router");
 
-		// Batch increment
-		const batchRes = await SELF.fetch("https://example.com/api/action/demo1/batch-increment", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ count: 5 }),
-		});
-		expect(batchRes.status).toBe(200);
-		const batchJson = (await batchRes.json()) as any;
-		expect(batchJson.success).toBe(true);
-		expect(batchJson.count).toBe(5);
+		const top3 = await waitForTopology((t) => t.reconciliation.reconciled);
+		expect(top3.reconciliation.acknowledgedWrites).toBe(8);
+	});
 
-		// Kill parent action (evicts DO)
-		const killRes = await SELF.fetch("https://example.com/api/action/demo1/kill", {
-			method: "POST",
-		});
-		expect(killRes.status).toBe(200);
-		const killJson = (await killRes.json()) as any;
-		expect(killJson.killed).toBe(true);
+	it("reconciles across multi-level splits when children split again", async () => {
+		await post("demo1", "reset");
+		for (let i = 0; i < 30; i++) await post("demo1", "increment", { key: `user-${i % 8}`, amount: 1 });
 
-		// Reset Demo 1
-		const resetRes = await SELF.fetch("https://example.com/api/action/demo1/reset", {
-			method: "POST",
-		});
-		expect(resetRes.status).toBe(200);
+		const top = await waitForTopology((t) => t.reconciliation.reconciled && t.summary.totalPartitions > 5);
+		expect(top.reconciliation.acknowledgedWrites).toBe(30);
+		expect(top.reconciliation.presentWrites).toBe(30);
+	});
+
+	it("loses no write when the splitting partition is killed", async () => {
+		await post("demo1", "reset");
+		await post("demo1", "batch-increment", { count: 5 });
+
+		// The fifth write queued the split, so the root is the source of a split in progress.
+		const kill = await post("demo1", "kill");
+		expect(kill.success).toBe(true);
+
+		for (let i = 0; i < 10; i++) await post("demo1", "increment", { key: `after-${i}`, amount: 1 });
+		const top = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
+		expect(top.reconciliation.acknowledgedWrites).toBe(15);
+
+		const idle = await post("demo1", "reset").then(() => post("demo1", "kill"));
+		expect(idle.success).toBe(false);
+	}, 20_000);
+
+	it("reset deletes the storage and the alarm of every partition", async () => {
+		await post("demo1", "reset");
+		await post("demo1", "batch-increment", { count: 5 });
+		const top = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
+		const names: string[] = [];
+		const collect = (item: any) => {
+			names.push(item.doName);
+			item.children.forEach(collect);
+		};
+		top.roots.forEach(collect);
+		expect(names.length).toBe(5);
+
+		await post("demo1", "reset");
+
+		for (const name of names) {
+			const stub = env.COUNTER_PARTITION_DO.get(env.COUNTER_PARTITION_DO.idFromName(name));
+			await runInDurableObject(stub, async (instance: CounterPartitionDO, state) => {
+				expect(instance.fokos.initialized()).toBe(false);
+				expect(await state.storage.getAlarm()).toBeNull();
+				expect(state.storage.sql.exec("SELECT * FROM counters").toArray()).toEqual([]);
+				expect(state.storage.sql.exec("SELECT * FROM counter_meta").toArray()).toEqual([]);
+			});
+		}
 	});
 
 	it("returns topology for Demo 2 and supports promotion", async () => {

@@ -13,6 +13,17 @@
 				padding: 1.5rem;
 				max-width: 1400px;
 				margin: 0 auto;
+				min-height: 100vh;
+				min-height: 100dvh;
+				display: flex;
+				flex-direction: column;
+			}
+			#app,
+			.app-shell {
+				flex: 1;
+				display: flex;
+				flex-direction: column;
+				min-height: 0;
 			}
 			header.demo-header {
 				display: flex;
@@ -39,11 +50,17 @@
 				display: grid;
 				grid-template-columns: 1fr 380px;
 				gap: 1.5rem;
-				align-items: start;
+				align-items: stretch;
+				flex: 1;
+				min-height: 0;
 			}
 			@media (max-width: 1024px) {
 				.layout-grid {
 					grid-template-columns: 1fr;
+					flex: none;
+				}
+				.topology-scroll {
+					max-height: 70vh;
 				}
 			}
 			.topology-container {
@@ -52,8 +69,14 @@
 				border-radius: var(--pico-border-radius);
 				padding: 1rem;
 				position: relative;
-				min-height: 480px;
-				overflow: hidden;
+				min-height: 320px;
+				display: flex;
+				flex-direction: column;
+			}
+			.topology-scroll {
+				flex: 1;
+				min-height: 0;
+				overflow: auto;
 			}
 			.topology-toolbar {
 				display: flex;
@@ -64,8 +87,6 @@
 				color: var(--pico-muted-color);
 			}
 			.topology-svg {
-				width: 100%;
-				height: 440px;
 				display: block;
 			}
 			/* Box styles */
@@ -89,10 +110,6 @@
 				fill: #111827;
 				stroke: #ea580c;
 				stroke-dasharray: 4 2;
-			}
-			.node-group.is-killed .node-rect {
-				stroke: #ef4444;
-				fill: #271414;
 			}
 			.node-group.is-active-target .node-rect {
 				stroke: #22c55e;
@@ -228,7 +245,7 @@
 				{
 					id: "demo1",
 					name: "Demo 1: Request Volume Split",
-					desc: "Hash-only partition host. Splits on request volume threshold. Can kill parent mid-split to resume.",
+					desc: "Hash-only partition host. Splits on request volume threshold. Can kill the splitting partition, and the migration resumes by itself.",
 				},
 				{
 					id: "demo2",
@@ -296,7 +313,7 @@
 						handleTrace(json.trace);
 					}
 					addLog(
-						`[${action}] ${json.success ? "Success" : "Failed"}: ${JSON.stringify(json.result || json.stats || json.item || {})}`,
+						`[${action}] ${json.success ? "Success" : "Failed"}: ${JSON.stringify(json.result || json.error || json.stats || json.item || {})}`,
 						json.trace,
 					);
 					await fetchTopology();
@@ -324,76 +341,58 @@
 			}
 
 			// ── Tree Layout Calculation ───────────────────────────────────────────────────
-			function computeTreeLayout(roots, svgWidth = 720, svgHeight = 420) {
-				if (!roots || roots.length === 0) return { nodes: [], links: [] };
+			// File-tree layout: one row per partition, children indented under their parent.
+			// Depth costs only a small indent, so wide trees grow down instead of sideways.
+			const INDENT = 30;
+			const ROW_H = 54;
+			const BOX_W = 340;
+			const BOX_H = 44;
+			const PAD_X = 24;
+			const PAD_Y = 24;
+
+			function computeTreeLayout(roots) {
+				if (!roots || roots.length === 0) return { nodes: [], links: [], width: 720, height: 200 };
 
 				const nodes = [];
 				const links = [];
+				let row = 0;
+				let maxDepth = 0;
 
-				function getLeafCount(node) {
-					if (!node.children || node.children.length === 0) return 1;
-					return node.children.reduce((acc, c) => acc + getLeafCount(c), 0);
-				}
-
-				const totalLeaves = roots.reduce((acc, r) => acc + getLeafCount(r), 0);
-				let currentLeafIndex = 0;
-
-				function layoutSubtree(node, depth, parentPos) {
-					const nodeLeaves = getLeafCount(node);
-					const leafSpanStart = currentLeafIndex;
-					const leafSpanEnd = currentLeafIndex + nodeLeaves;
-
-					const childPositions = [];
-					if (node.children && node.children.length > 0) {
-						for (const child of node.children) {
-							childPositions.push(layoutSubtree(child, depth + 1, null));
-						}
-					} else {
-						currentLeafIndex += 1;
-					}
-
-					let x;
-					if (childPositions.length > 0) {
-						const minX = childPositions[0].x;
-						const maxX = childPositions[childPositions.length - 1].x;
-						x = (minX + maxX) / 2;
-					} else {
-						const leafCenter = (leafSpanStart + 0.5) / Math.max(1, totalLeaves);
-						x = 80 + leafCenter * (svgWidth - 160);
-					}
-
-					const y = 50 + depth * 140;
-					const pos = { node, x, y, depth };
+				function layoutSubtree(node, depth) {
+					maxDepth = Math.max(maxDepth, depth);
+					const pos = { node, x: PAD_X + depth * INDENT, y: PAD_Y + row * ROW_H + ROW_H / 2, depth };
+					row += 1;
 					nodes.push(pos);
 
-					if (childPositions.length > 0) {
-						for (const cp of childPositions) {
-							links.push({
-								from: node,
-								to: cp.node,
-								fromPos: pos,
-								toPos: cp,
-								id: `${node.doName}->${cp.node.doName}`,
-							});
-						}
+					for (const child of node.children ?? []) {
+						const cp = layoutSubtree(child, depth + 1);
+						links.push({
+							from: node,
+							to: child,
+							fromPos: pos,
+							toPos: cp,
+							id: `${node.doName}->${child.doName}`,
+						});
 					}
 
 					return pos;
 				}
 
 				for (const r of roots) {
-					layoutSubtree(r, 0, null);
+					layoutSubtree(r, 0);
 				}
 
-				return { nodes, links };
+				const width = Math.max(720, PAD_X * 2 + maxDepth * INDENT + BOX_W + 40);
+				const height = PAD_Y * 2 + row * ROW_H;
+				return { nodes, links, width, height };
 			}
 
 			// ── Component: Box-Tree Topology View ──────────────────────────────────────────
 			function TopologyView({ topology }) {
 				const roots = topology?.roots ?? [];
-				const svgWidth = 840;
-				const svgHeight = 440;
-				const { nodes, links } = computeTreeLayout(roots, svgWidth, svgHeight);
+				const { nodes, links, width: svgWidth, height: svgHeight } = computeTreeLayout(roots);
+				const boxWidth = BOX_W;
+				const boxHeight = BOX_H;
 
 				function onNodeClick(node) {
 					if (node.role === "router" && node.children?.length > 0) {
@@ -423,77 +422,81 @@
 							</div>
 						</div>
 
-						<svg class="topology-svg" viewBox="0 0 ${svgWidth} ${svgHeight}">
-							<defs>
-								<linearGradient id="linkGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-									<stop offset="0%" stop-color="#ea580c" />
-									<stop offset="100%" stop-color="#f97316" />
-								</linearGradient>
-							</defs>
+						<div class="topology-scroll">
+							<svg class="topology-svg" viewBox="0 0 ${svgWidth} ${svgHeight}" width=${svgWidth} height=${svgHeight}>
+								<defs>
+									<linearGradient id="linkGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+										<stop offset="0%" stop-color="#ea580c" />
+										<stop offset="100%" stop-color="#f97316" />
+									</linearGradient>
+								</defs>
 
-							<!-- Connecting Lines -->
-							${links.map((link) => {
-								const fx = link.fromPos.x;
-								const fy = link.fromPos.y + 36;
-								const tx = link.toPos.x;
-								const ty = link.toPos.y - 36;
-								const midY = (fy + ty) / 2;
-								const d = `M ${fx} ${fy} C ${fx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`;
+								<!-- Connecting Lines: a shared vertical trunk out of the parent's
+							     bottom edge, then a stub into the child's left edge. -->
+								${links.map((link) => {
+									const vx = link.fromPos.x + 14;
+									const sy = link.fromPos.y + boxHeight / 2;
+									const ty = link.toPos.y;
+									const tx = link.toPos.x;
+									const d = `M ${vx} ${sy} V ${ty} H ${tx}`;
 
-								const isHopActive = activeHops.value.some((h) => h.from === link.from.doName && h.to === link.to.doName);
+									const isHopActive = activeHops.value.some((h) => h.from === link.from.doName && h.to === link.to.doName);
 
-								return html`
-									<g key=${link.id}>
-										<path d=${d} class="tree-link ${isHopActive ? "link-active" : ""}" />
-										${isHopActive &&
-										html`
-											<circle r="5" class="link-pulse-dot">
-												<animateMotion path=${d} dur="0.8s" repeatCount="1" />
-											</circle>
-										`}
-									</g>
-								`;
-							})}
+									return html`
+										<g key=${link.id}>
+											<path d=${d} class="tree-link ${isHopActive ? "link-active" : ""}" />
+											${isHopActive &&
+											html`
+												<circle r="5" class="link-pulse-dot">
+													<animateMotion path=${d} dur="0.8s" repeatCount="1" />
+												</circle>
+											`}
+										</g>
+									`;
+								})}
 
-							<!-- Partition Boxes -->
-							${nodes.map((pos) => {
-								const node = pos.node;
-								const isRouter = node.role === "router";
-								const isKilled = node.status === "killed";
-								const isTarget = activeHops.value.some((h) => h.to === node.doName);
+								<!-- Partition Boxes -->
+								${nodes.map((pos) => {
+									const node = pos.node;
+									const isRouter = node.role === "router";
+									const isTarget = activeHops.value.some((h) => h.to === node.doName);
 
-								const boxWidth = isRouter ? 140 : 154;
-								const boxHeight = isRouter ? 64 : 72;
-								const rx = pos.x - boxWidth / 2;
-								const ry = pos.y - boxHeight / 2;
+									const isSplitting = node.status === "queued" || node.status === "planned" || node.status === "cutover";
+									const isImporting = node.importState === "awaiting_data" || node.importState === "importing";
+									const badgeText = isRouter
+										? "Router"
+										: isSplitting
+											? "Splitting"
+											: isImporting
+												? "Importing"
+												: node.kind === "range"
+													? "Range Leaf"
+													: "Leaf";
+									const statsLine = isRouter
+										? `Routing to ${node.children?.length ?? 0} targets · Requests: ${node.requestCount ?? 0}`
+										: `${node.hashKey ? `Key: ${node.hashKey} · ` : ""}Items: ${node.itemCount ?? 0} · Requests: ${node.requestCount ?? 0}`;
 
-								const badgeText = isRouter ? "Router" : node.kind === "range" ? "Range Leaf" : "Leaf";
-
-								return html`
-									<g
-										key=${node.id}
-										class="node-group ${isRouter ? "is-router" : ""} ${isKilled ? "is-killed" : ""} ${isTarget ? "is-active-target" : ""}"
-										transform="translate(${rx}, ${ry})"
-										onClick=${() => onNodeClick(node)}
-									>
-										<rect width=${boxWidth} height=${boxHeight} class="node-rect" />
-										<!-- Header / Title -->
-										<text x="12" y="22" class="node-title">
-											${node.doName.length > 14 ? node.doName.slice(0, 14) + "…" : node.doName}
-										</text>
-										<!-- Badge -->
-										<text x=${boxWidth - 12} y="22" text-anchor="end" class="node-badge"> ${badgeText} </text>
-										<!-- Subtitle / Stats -->
-										<text x="12" y="42" class="node-subtitle">
-											${isRouter ? `Routing to ${node.children?.length ?? 0} targets` : `Items: ${node.itemCount ?? 0}`}
-										</text>
-										<text x="12" y="56" class="node-subtitle">
-											${node.hashKey ? `Key: ${node.hashKey}` : `Requests: ${node.requestCount ?? 0}`}
-										</text>
-									</g>
-								`;
-							})}
-						</svg>
+									return html`
+										<g
+											key=${node.id}
+											class="node-group ${isRouter ? "is-router" : ""} ${isTarget ? "is-active-target" : ""}"
+											transform="translate(${pos.x}, ${pos.y - boxHeight / 2})"
+											onClick=${() => onNodeClick(node)}
+										>
+											<rect width=${boxWidth} height=${boxHeight} class="node-rect" />
+											<!-- Header / Title -->
+											<text x="10" y="18" class="node-title">
+												${node.doName.length > 28 ? node.doName.slice(0, 28) + "…" : node.doName}
+											</text>
+											<!-- Badge, far right of the title line -->
+											<text x=${boxWidth - 10} y="18" text-anchor="end" class="node-badge">${badgeText}</text>
+											<!-- Subtitle / Stats -->
+											<text x="10" y="35" class="node-subtitle">${statsLine}</text>
+										</g>
+									`;
+								})}
+							</svg>
+						</div>
 					</div>
 				`;
 			}
@@ -529,29 +532,50 @@
 
 						${id === "demo1" &&
 						html`
+							<div class="stats-grid" style="grid-template-columns: 1fr 1fr; margin-bottom: 0.75rem;">
+								<div class="stat-item" style="border-left: 3px solid #f97316;">
+									<small>Writes Acknowledged</small>
+									<strong>${data?.reconciliation?.acknowledgedWrites ?? 0}</strong>
+								</div>
+								<div class="stat-item" style="border-left: 3px solid #22c55e;">
+									<small>Writes in Partitions</small>
+									<strong>${data?.reconciliation?.presentWrites ?? 0}</strong>
+								</div>
+							</div>
+							<div style="background: #0f172a; padding: 0.4rem 0.6rem; border-radius: 4px; margin-bottom: 1rem; font-size: 0.8rem;">
+								<span style="display: block; color: var(--pico-muted-color);">Reconciliation</span>
+								<strong style="display: block; color: ${data?.reconciliation?.reconciled ? "#22c55e" : "#f59e0b"}">
+									${data?.reconciliation?.reconciled
+										? "✓ Reconciled (Zero Lost / Dupes)"
+										: `Reconciling (${data?.reconciliation?.presentWrites ?? 0} / ${data?.reconciliation?.acknowledgedWrites ?? 0})...`}
+								</strong>
+							</div>
+
 							<div class="btn-row">
 								<button
 									class="primary"
 									disabled=${isLoading.value}
 									onClick=${() => executeAction("increment", { key: `k-${Math.floor(Math.random() * 8)}` })}
 								>
-									⚡ Increment (+1 synthetic write)
+									⚡ Increment (+1 write)
 								</button>
-								<button disabled=${isLoading.value} onClick=${() => executeAction("batch-increment", { count: 10 })}>
-									🚀 Batch Load (+10 writes)
+								<button disabled=${isLoading.value} onClick=${() => executeAction("batch-increment", { count: 5 })}>
+									🚀 Volume Burst (+5 writes to trigger split)
 								</button>
 								<button
-									class="secondary"
-									disabled=${isLoading.value || summary?.routerCount > 0}
-									onClick=${() => executeAction("split", { childCount: 4 })}
+									class="outline"
+									style="border-color:#ef4444; color:#ef4444;"
+									disabled=${isLoading.value}
+									onClick=${() => executeAction("kill")}
 								>
-									✂️ Trigger Split (to 4 children)
-								</button>
-								<button style="border-color:#ef4444; color:#ef4444;" disabled=${isLoading.value} onClick=${() => executeAction("kill")}>
-									⚠️ Kill Parent Mid-Split (ctx.abort)
+									⚠️ Kill Splitting Partition (ctx.abort)
 								</button>
 								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset Demo 1</button>
 							</div>
+							<small style="color:var(--pico-muted-color); font-size:0.75rem; display:block;">
+								Kill crashes the partition that is splitting now. Its children pull the next page, which starts it again from storage.
+								Reconciliation above shows that no write was lost.
+							</small>
 						`}
 						${id === "demo2" &&
 						html`
@@ -632,7 +656,7 @@
 				const currentTile = TILES.find((t) => t.id === activeTile.value) ?? TILES[0];
 
 				return html`
-					<div>
+					<div class="app-shell">
 						<header class="demo-header">
 							<div>
 								<h2 style="margin: 0; font-size: 1.4rem;">FokosShardingRuntime</h2>
