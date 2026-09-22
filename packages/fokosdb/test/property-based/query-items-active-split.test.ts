@@ -72,8 +72,10 @@ const MAX_PUTS_PER_PUSH = 20;
 // suite on a walk of the tree instead of a check of it — and a deep search even more.
 const CHURN_PUT_BUDGET = 200;
 const RANGE_CAP_BYTES = RANGE_SPLIT_MAX_SIZE_MB * 1024 * 1024;
-// One second. A write meets `partition_migrating` while a child imports, and that clears in a moment.
-const CHURN_RETRY_LIMIT = 40;
+// The time the churn tries a write again after another unavailable error. This limit finds a table
+// that stopped. It must not decide a table that is only slow, thus it is much more than the time a
+// retry needs under the load of the full suite.
+const CHURN_RETRY_BUDGET_MS = 10_000;
 
 /** A churn sort key sits between two stable ones, so the writes land inside the tree and not above it. */
 const churnSortKey = (region: number, seq: number) => `${hotSortKey(region)}.w${String(seq).padStart(4, "0")}`;
@@ -149,18 +151,25 @@ class Churn {
 	}
 
 	/**
-	 * Runs one write and reports a refusal instead of a wait for it to clear. A partition above 1.1
-	 * times its cap refuses every write, a delete included, until its split makes room, and a wait
-	 * for that would close the very window this suite reads in. The churn never writes a refused key
-	 * again and never puts it in the model, so the model still knows every version it holds.
+	 * Runs one write and reports a refusal instead of a wait for it to clear. Two refusals apply:
+	 *
+	 * - A partition above 1.1 times its cap refuses every write, a delete included, until its split
+	 *   makes room. A wait for that would close the window that this suite reads in.
+	 * - A child that still imports refuses every write with `partition_migrating`. The length of the
+	 *   import depends on the load of the machine, thus a wait for it measures the clock.
+	 *
+	 * Both refusals occur before the write applies. The churn never writes a refused key again and
+	 * never puts it in the model, so the model still knows every version it holds.
 	 */
 	async #write<T>(op: () => Promise<T>): Promise<T | "refused"> {
-		for (let attempt = 0; ; attempt++) {
+		const deadline = Date.now() + CHURN_RETRY_BUDGET_MS;
+		for (;;) {
 			try {
 				return await op();
 			} catch (e) {
 				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) return "refused";
-				if (!FokosUnavailableError.is(e) || attempt >= CHURN_RETRY_LIMIT) throw e;
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) return "refused";
+				if (!FokosUnavailableError.is(e) || Date.now() >= deadline) throw e;
 				await sleep(25);
 			}
 		}

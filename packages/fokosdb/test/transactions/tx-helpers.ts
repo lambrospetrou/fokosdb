@@ -17,7 +17,11 @@ import { openedRpc } from "../partition-do/helpers.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
-import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
+import type {
+	TransactWriteItemsOptions,
+	TransactWriteItemsResult,
+	TransactWriteOperationResult,
+} from "../../src/shared/transaction-api-types.js";
 
 export type Key = { hashKey: string; sortKey: string };
 
@@ -51,6 +55,34 @@ export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Pr
 			results: e.results,
 		};
 	}
+}
+
+/**
+ * Sends a transaction write, and sends it again after a cancel with `timestamp_conflict`.
+ *
+ * On the two-phase path, the coordinator stamps the transaction with its own clock. A partition
+ * refuses a stamp that is not above the stamp of the item, or above the last delete of the partition.
+ * A write of the same test, or of another test on a shared table, can have a stamp in the same
+ * millisecond, and the clock can go back in local workerd/miniflare.
+ * A cancelled transaction applies nothing, thus a new attempt is safe.
+ * A cancel for any other reason returns at once.
+ *
+ * A request with a `clientRequestToken` is refused: a replay of that token returns the same cancel.
+ */
+export async function writeOutcomeWithClockRetry(db: FokosDB, request: TransactWriteItemsOptions): Promise<WriteOutcome> {
+	expect(request.clientRequestToken, "a replay of a token returns the same cancel").toBeUndefined();
+	let outcome = await writeOutcome(db.transactWriteItems(request));
+	for (let attempt = 1; attempt < 5 && isTimestampConflict(outcome); attempt++) {
+		await new Promise((resolve) => setTimeout(resolve, 2));
+		outcome = await writeOutcome(db.transactWriteItems(request));
+	}
+	return outcome;
+}
+
+function isTimestampConflict(outcome: WriteOutcome): boolean {
+	return (
+		outcome.outcome === "cancelled" && outcome.results.some((op) => op.outcome === "rejected" && op.reason.code === "timestamp_conflict")
+	);
 }
 
 export type MakeDBOptions = {

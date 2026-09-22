@@ -113,7 +113,8 @@ Progress: milestones 1, 2 and 3 are done.
 - Milestone 4 started. The resume of a truncated migration page is a test of the flow tier, in
   `test/repartition/repartition-flow.test.ts`. It replaces the Durable Object test that capped each
   page at one row, and `withMigrationBatchCap` is removed.
-- Milestone 5 is not started.
+- Milestone 5 is done. The churn of `query-items-active-split.test.ts` refuses a write that meets
+  `partition_migrating`, and its retry for other unavailable errors has a deadline of 10 s.
 
 ## 5. Proposed solution
 
@@ -258,6 +259,10 @@ window under full-suite load is longer. Two answers, and the suite can take both
 - Treat `fokos/partition_migrating` the way the churn already treats `fokos/partition_over_size`: a
   refusal that the model understands, and not an error that ends the run.
 
+Done, with both answers. A child that imports refuses the write before the write applies, thus the
+churn does not record the key in the model. `CHURN_RETRY_BUDGET_MS` is 10 s. It stops a table that
+stopped, and it is much more than a retry needs under the load of the full suite.
+
 ### 5.6 The guard script
 
 `tools/check-key-invariants.sh` is the precedent: a backstop for a rule that a comment cannot hold.
@@ -294,11 +299,19 @@ split of a long file into two files, and from a fixture that `beforeAll` builds 
 Sections 5.2 and 5.3 make a concurrent file safe again. That is insurance, and not a reason to make
 one concurrent.
 
-A shared table has a limit. A test that writes through the coordinator uses a table of its own. The
-coordinator stamps a transaction with its own clock, and a partition refuses a stamp that is not
-above its last delete or read. On a shared table, those come from other tests, and the clock of
-miniflare can go back. A wait of 1 ms does not prevent this, because the clock can go back more
-than 1 ms.
+A shared table has a limit: the timestamp conflict. The coordinator stamps a transaction with its
+own clock, and a partition refuses a stamp that is not above the stamp of the item, or above the last
+delete of the partition. That stamp can come from another test on a shared table, or from a write of
+the same test in the same millisecond. The clock of miniflare can also go back. A wait of 1 ms before
+the write does not prevent this, because the clock can go back more than 1 ms.
+
+A test that writes through the coordinator and expects a result that is not a timestamp conflict
+uses `writeOutcomeWithClockRetry` in `test/transactions/tx-helpers.ts`. The helper sends the
+transaction again, after a wait of 2 ms, only after a cancel with `timestamp_conflict`, and at most
+five times. A cancelled transaction applies nothing, thus a new attempt is safe. The helper refuses a
+request with a `clientRequestToken`, because a replay of the token returns the same cancel. A test
+that asserts the conflict itself keeps `writeOutcome`. The property suites accept the conflict as a
+cancel of the model (`ORDERING_CANCEL_CODES` in `test/property-based/harness.ts`).
 
 ## 6. Alternative options
 

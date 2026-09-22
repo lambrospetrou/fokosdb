@@ -16,6 +16,7 @@ import {
 	partitionNameOf,
 	txCalls,
 	writeOutcome,
+	writeOutcomeWithClockRetry,
 } from "./tx-helpers.js";
 
 const passingConditions: readonly ConditionExpression[] = [
@@ -138,7 +139,7 @@ describe("transactions - end-to-end", () => {
 			};
 		});
 
-		const txResult = await writeOutcome(db.transactWriteItems({ items: operations }));
+		const txResult = await writeOutcomeWithClockRetry(db, { items: operations });
 
 		expect(txResult.outcome).toBe("committed");
 		expect(txResult).toMatchObject({
@@ -179,22 +180,20 @@ describe("transactions - end-to-end", () => {
 
 		// Transaction: update all 5 items + a 6th "check" on a non-existent item
 		// with item_exists condition — this MUST fail and roll back everything.
-		const txResult = await writeOutcome(
-			db.transactWriteItems({
-				items: [
-					...Array.from({ length: 5 }, (_, i) => ({
-						hashKey: `atom-${i}`,
-						operation: "put" as const,
-						data: `should-not-appear-${i}`,
-					})),
-					{
-						hashKey: "atom-nonexistent",
-						operation: "check" as const,
-						condition: { op: "exists" as const, args: [{ ref: "hashKey" as const }] },
-					},
-				],
-			}),
-		);
+		const txResult = await writeOutcomeWithClockRetry(db, {
+			items: [
+				...Array.from({ length: 5 }, (_, i) => ({
+					hashKey: `atom-${i}`,
+					operation: "put" as const,
+					data: `should-not-appear-${i}`,
+				})),
+				{
+					hashKey: "atom-nonexistent",
+					operation: "check" as const,
+					condition: { op: "exists" as const, args: [{ ref: "hashKey" as const }] },
+				},
+			],
+		});
 
 		expect(txResult.outcome).toBe("cancelled");
 		invariant(txResult.outcome === "cancelled");
@@ -229,16 +228,14 @@ describe("transactions - end-to-end", () => {
 		// Transaction: put all 10 items, but with item_not_exists condition on the
 		// first one (which already exists). The condition check will fail, so none
 		// of the 10 puts should be applied.
-		const txResult = await writeOutcome(
-			db.transactWriteItems({
-				items: keys.map((k, i) => ({
-					...k,
-					operation: "put" as const,
-					data: `should-not-appear`,
-					condition: i === 0 ? ({ op: "not_exists", args: [{ ref: "hashKey" }] } as const) : undefined,
-				})),
-			}),
-		);
+		const txResult = await writeOutcomeWithClockRetry(db, {
+			items: keys.map((k, i) => ({
+				...k,
+				operation: "put" as const,
+				data: `should-not-appear`,
+				condition: i === 0 ? ({ op: "not_exists", args: [{ ref: "hashKey" }] } as const) : undefined,
+			})),
+		});
 
 		expect(txResult.outcome).toBe("cancelled");
 
@@ -631,7 +628,7 @@ describe("transactions - end-to-end", () => {
 		const key = { hashKey: `ttl-${crypto.randomUUID()}` };
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 
-		expect(await writeOutcome(db.transactWriteItems({ items: [{ ...key, operation: "put", data: "value", ttlAt }] }))).toMatchObject({
+		expect(await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "put", data: "value", ttlAt }] })).toMatchObject({
 			outcome: "committed",
 		});
 		expect(await db.getItem(key)).toMatchObject({ found: true, item: { data: "value", ttlAt } });
@@ -750,17 +747,15 @@ describe("transactions - end-to-end", () => {
 
 		vi.advanceTimersByTime(1);
 
-		const txResult = await writeOutcome(
-			db.transactWriteItems({
-				items: [
-					{ hashKey: "del-0", operation: "delete" },
-					{ hashKey: "del-1", operation: "delete" },
-					{ hashKey: "del-2", operation: "put", data: "updated" },
-					{ hashKey: "del-3", operation: "put", data: "updated" },
-					{ hashKey: "del-4", operation: "delete" },
-				],
-			}),
-		);
+		const txResult = await writeOutcomeWithClockRetry(db, {
+			items: [
+				{ hashKey: "del-0", operation: "delete" },
+				{ hashKey: "del-1", operation: "delete" },
+				{ hashKey: "del-2", operation: "put", data: "updated" },
+				{ hashKey: "del-3", operation: "put", data: "updated" },
+				{ hashKey: "del-4", operation: "delete" },
+			],
+		});
 
 		expect(txResult.outcome).toBe("committed");
 
@@ -789,18 +784,16 @@ describe("transactions - end-to-end", () => {
 		vi.advanceTimersByTime(1);
 
 		// Transaction: put on one item + delete on a non-existent item with item_exists condition.
-		const txResult = await writeOutcome(
-			db.transactWriteItems({
-				items: [
-					{ hashKey: "rollback-put", operation: "put", data: "should-not-appear" },
-					{
-						hashKey: "rollback-missing",
-						operation: "delete",
-						condition: { op: "exists", args: [{ ref: "hashKey" }] },
-					},
-				],
-			}),
-		);
+		const txResult = await writeOutcomeWithClockRetry(db, {
+			items: [
+				{ hashKey: "rollback-put", operation: "put", data: "should-not-appear" },
+				{
+					hashKey: "rollback-missing",
+					operation: "delete",
+					condition: { op: "exists", args: [{ ref: "hashKey" }] },
+				},
+			],
+		});
 
 		expect(txResult.outcome).toBe("cancelled");
 
