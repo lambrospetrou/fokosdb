@@ -19,7 +19,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	});
 
 	// The shipped budget and stale threshold are both 5s, and a test that must watch one expire
-	// would spend that long doing nothing. The seams shorten the wait to the phase under test. Restore
+	// would spend that long doing nothing. The test controls shorten the wait to the phase under test. Restore
 	// the budget before any step that has to FINISH inside it, so that step runs on the shipped
 	// value — see the test below that runs the whole path on it.
 	const SHORT_BUDGET_MS = 250;

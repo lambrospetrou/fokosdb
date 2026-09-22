@@ -63,7 +63,7 @@ export type MakeDBOptions = {
 	tableName?: string;
 	/**
 	 * Puts the table on `ControlledPartitionDO` and `ControlledTransactionCoordinatorDO`, so that a
-	 * test can use their seams. The coordinator pool defaults to one coordinator, which
+	 * test can use their test controls. The coordinator pool defaults to one coordinator, which
 	 * `controlledCoordinator` reaches.
 	 */
 	controlled?: boolean;
@@ -131,10 +131,10 @@ export function owningPartition(db: FokosDB, key: Key) {
 	return { stub, rpc: openedRpc(stub), pCtx };
 }
 
-/** The seams of the partition that owns `key`. The table must be `controlled`. */
+/** The test controls of the partition that owns `key`. The table must be `controlled`. */
 export function controlledPartition(db: FokosDB, key: Key): DurableObjectStub<ControlledPartitionDO> {
 	const { topology } = db.options();
-	expect(topology.policy.ns, "a seam needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
+	expect(topology.policy.ns, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
 	return env.CONTROLLED_PARTITION_DO.getByName(partitionNameOf(db, key));
 }
 
@@ -148,11 +148,11 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 	return (await Promise.all([...partitions.values()].map((p) => p.testTxCalls(op)))).flat() as TxRequest<Op>[];
 }
 
-/** The seams of the one coordinator of a `controlled` table. */
+/** The test controls of the one coordinator of a `controlled` table. */
 export function controlledCoordinator(db: FokosDB): DurableObjectStub<ControlledTransactionCoordinatorDO> {
 	const { topology, numTxCoordinators } = db.options();
-	expect(topology.policy.nsTx, "a seam needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
-	expect(numTxCoordinators, "the coordinator seams need a pool of one coordinator").toBe(1);
+	expect(topology.policy.nsTx, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
+	expect(numTxCoordinators, "the coordinator test controls need a pool of one coordinator").toBe(1);
 	// The pool names each coordinator `<shardGroupName>-<shard>`, and FokosDB sets the group name.
 	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(`fokos_tc.${topology.topology.shardGroup}-0`);
 }

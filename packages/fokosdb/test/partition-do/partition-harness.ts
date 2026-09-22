@@ -61,7 +61,7 @@ const RANGE_SPLIT_MAX_SIZE_MB = 1;
 const RANGE_ITEM_DATA = "x".repeat(50 * 1024);
 
 /**
- * The namespace of `ControlledPartitionDO`. A test that holds, caps, or fails a call creates its
+ * The namespace of `ControlledPartitionDO`. A test that holds, counts, answers, or fails a call creates its
  * partitions here. Each child of a split inherits the namespace from its parent.
  */
 export const CONTROLLED_NS = "CONTROLLED_PARTITION_DO";
@@ -94,10 +94,12 @@ export class TestPartition {
 		return this.ctx.doName;
 	}
 
-	/** The seams of this partition. The partition must be in the `CONTROLLED_NS` namespace. */
+	/** The test controls of this partition. The partition must be in the `CONTROLLED_NS` namespace. */
 	get controlled(): DurableObjectStub<ControlledPartitionDO> {
 		if (this.ctx.policy.ns !== CONTROLLED_NS) {
-			throw new Error(`${this.doName}: a seam needs a partition in ${CONTROLLED_NS}; create the partition with { ns: CONTROLLED_NS }`);
+			throw new Error(
+				`${this.doName}: a test control needs a partition in ${CONTROLLED_NS}; create the partition with { ns: CONTROLLED_NS }`,
+			);
 		}
 		return testControlledPartitionStub(this.doName);
 	}
@@ -550,33 +552,6 @@ export async function withMigrationHeld<T>(
 				},
 				{ timeout: 30_000, interval: 10 },
 			);
-		});
-	} finally {
-		await source.testReleasePulls();
-		if ((await parent.status()).splitStatus) await parent.awaitSplitCompleted();
-	}
-}
-
-/**
- * Caps every migration page the source serves at `maxRows` rows. Each phase and each stream of the
- * host then needs more than one round trip of the cursor.
- *
- * A truncated page points its cursor at the last row it returned, and the resume continues after that
- * row. No row is lost and none is duplicated, which is the path the real byte budget takes when it
- * stops a scan. `run` receives counters, so a test can assert that the pagination happened.
- */
-export async function withMigrationBatchCap<T>(
-	parent: TestPartition,
-	maxRows: number,
-	run: (stats: { calls: () => Promise<number>; truncated: () => Promise<number> }) => Promise<T>,
-): Promise<T> {
-	invariant(maxRows >= 1, "withMigrationBatchCap: maxRows must be >= 1");
-	const source = parent.controlled;
-	await source.testCapPulls(maxRows);
-	try {
-		return await run({
-			calls: async () => (await source.testPullStats()).calls,
-			truncated: async () => (await source.testPullStats()).truncated,
 		});
 	} finally {
 		await source.testReleasePulls();

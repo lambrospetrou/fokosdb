@@ -10,7 +10,7 @@ import { describe, expect, it } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
-import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node } from "./repartition-harness.js";
+import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node, type NodeEnv } from "./repartition-harness.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
@@ -298,6 +298,59 @@ describe("Repartition — initialization and cutover", () => {
 });
 
 describe("Repartition — the migration protocol", () => {
+	it("resumes each stream after its last row when the slice needs more than one page", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		const { hashSplitN } = c.base.topology;
+		// More than one page of rows and of locks (a page holds 1000 rows) for each child. Three sort
+		// keys per hash key, the first of them empty, so that a page can end inside one hash key.
+		await root.enter(({ source, store }) => {
+			for (let i = 0; i < 1_500; i++) {
+				store.upsertItem({
+					hk: kb(`k${i}`),
+					sk: KeyCodec.encodeOptional(undefined),
+					data: `d-${i}`,
+					kind: "text",
+					ttlAt: null,
+					txOrderTs: 1,
+				});
+				putItem(store, `k${i}`, "a");
+				putItem(store, `k${i}`, "b");
+				putLock(store, `l${i}`, "s", `tx-${i}`);
+				putLock(store, `m${i}`, "s", `tx-m${i}`);
+			}
+			source.queue({ kind: "hash_split" });
+		});
+		await cutOver(root);
+
+		const rows = ({ store }: NodeEnv) => ({
+			items: store.queryItemsPage(null, 1_000_000).map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: store.queryPendingTxPage(null, 1_000_000).map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+		});
+		const source = await root.enter(rows);
+
+		for (let childIndex = 0; childIndex < hashSplitN; childIndex++) {
+			const child = await targetNode(c, root, childIndex);
+			// The target's own record names the stream of its next pull.
+			const pulls = { overrides: 0, items: 0, pending_tx: 0 };
+			for (let i = 0; (await child.enter(({ target }) => target.importState())) !== "imported"; i++) {
+				expect(i, `${child.doName}: the import did not finish`).toBeLessThan(50);
+				const cursor = await child.enter(({ target }) => target.importRecord()!.cursor);
+				const stream = cursor?.phase !== "host" ? "overrides" : ((cursor.inner as { stream?: "pending_tx" } | null)?.stream ?? "items");
+				pulls[stream]++;
+				expect(await child.enter(async ({ target }) => await target.importOnePage())).toBe("progressed");
+			}
+			expect(pulls.items, `${child.doName}: the items stream took one page`).toBeGreaterThan(1);
+			expect(pulls.pending_tx, `${child.doName}: the lock stream took one page`).toBeGreaterThan(1);
+
+			// Each row and each lock that the child owns arrived exactly once, and nothing else arrived.
+			const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === childIndex;
+			const imported = await child.enter(rows);
+			expect(imported.items).toEqual(source.items.filter(owned));
+			expect(imported.locks).toEqual(source.locks.filter(owned));
+		}
+	});
+
 	it("runs a hash split end to end: pages, imported, ack, completed, cleaned", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);

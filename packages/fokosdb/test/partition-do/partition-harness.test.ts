@@ -1,6 +1,6 @@
 /**
  * The partition harness. A wait for a split or a migration fails when the tree makes no progress, and
- * not when a period of time ends. A seam needs a partition of `ControlledPartitionDO`.
+ * not when a period of time ends. A test control needs a partition of `ControlledPartitionDO`.
  */
 import { describe, expect, it } from "vitest";
 import { drainUntil, makePartition } from "./partition-harness.js";
@@ -20,6 +20,6 @@ describe("TestPartition.controlled", () => {
 	it("refuses a partition outside the controlled namespace", () => {
 		const partition = makePartition();
 
-		expect(() => partition.controlled).toThrow(/a seam needs a partition in CONTROLLED_PARTITION_DO/);
+		expect(() => partition.controlled).toThrow(/a test control needs a partition in CONTROLLED_PARTITION_DO/);
 	});
 });

@@ -21,7 +21,7 @@ export { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinat
 // subclassed PartitionDO stays covered.
 export class CustomPartitionDO extends PartitionDO {}
 
-// Partition tests that must hold, cap, or fail one call use this class. See the module for the seams.
+// Partition tests that must hold, count, answer, or fail one call use this class. The module lists its test controls.
 export { ControlledPartitionDO } from "./controlled-partition-do.js";
 export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
 

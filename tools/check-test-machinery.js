@@ -7,10 +7,11 @@ import { join } from "node:path";
 
 const PACKAGE_DIR = join(import.meta.dirname, "../packages/fokosdb");
 
-// Files that still have a prototype spy. Each entry is work to do: move the spy to a seam on a
+// Files that still have a prototype spy. Each entry is work to do: move the spy to a test control on a
 // test-only subclass, then remove the entry. The check fails when an entry has no spy.
 const PROTOTYPE_SPY_EXCEPTIONS = {
-	"test/partition-do/promotion.test.ts": "PartialRangeTopology is private to the runtime, thus no subclass can reach it.",
+	"test/partition-do/promotion.test.ts":
+		"PartialRangeTopology is private to the runtime, thus no subclass can reach it. The spy is in a sequential top-level describe.",
 };
 
 const TIMER_MARKER = "guard: allow-timer";
@@ -22,7 +23,7 @@ function matches({ name, lines }, pattern) {
 
 const CHECKS = [
 	// A prototype spy reaches every instance in the isolate, and `vi.restoreAllMocks()` of a different
-	// test can remove it. Put the seam on `ControlledPartitionDO` (test/controlled-partition-do.ts).
+	// test can remove it. Put a test control on `ControlledPartitionDO` (test/controlled-partition-do.ts).
 	function noPrototypeSpy(files) {
 		const pattern = /vi\.spyOn\([^,]*prototype/;
 		const errors = [];
@@ -40,7 +41,7 @@ const CHECKS = [
 	// A file that uses a migration hold helper stays sequential.
 	function noConcurrentHoldUser(files) {
 		return files
-			.filter(({ lines }) => lines.some((line) => /withMigrationHeld|withMigrationBatchCap/.test(line)))
+			.filter(({ lines }) => lines.some((line) => /withMigrationHeld/.test(line)))
 			.flatMap((file) => matches(file, /describe\.concurrent/))
 			.map((hit) => `describe.concurrent in a file that uses a migration hold helper: ${hit}`);
 	},

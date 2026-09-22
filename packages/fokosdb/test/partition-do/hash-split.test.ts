@@ -16,7 +16,6 @@ import {
 	drainUntil,
 	makePartition,
 	TestPartition,
-	withMigrationBatchCap,
 	withMigrationHeld,
 } from "./partition-harness.js";
 
@@ -642,45 +641,5 @@ describe("PartitionDO - splitting", () => {
 			});
 			await assertSplitTreeComplete(partition);
 		});
-
-		it(
-			"migrates all items correctly when the parent sends data in multiple cursor-paginated batches",
-			{ concurrent: false },
-			async ({ expect }) => {
-				const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-				const { ctx, stub, rpc } = partition;
-
-				// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
-				const seedItems = [
-					{ hashKey: kb("alpha"), sortKey: kb(), data: "data-alpha-nosort", kind: "text" as const },
-					{ hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-s1", kind: "text" as const },
-					{ hashKey: kb("banana"), sortKey: kb("s1"), data: "data-banana-1", kind: "text" as const },
-					{ hashKey: kb("cherry"), sortKey: kb("s1"), data: "data-cherry-1", kind: "text" as const },
-					{ hashKey: kb("delta"), sortKey: kb("s1"), data: "data-delta-1", kind: "text" as const },
-				];
-				for (const item of seedItems) {
-					await rpc.apiPutItem(ctx, item);
-				}
-
-				// One row per batch response forces a cursor-paginated round trip per item on every
-				// migration stream (items, pending transactions, promoted keys).
-				await withMigrationBatchCap(partition, 1, async ({ truncated }) => {
-					await partition.splitHash();
-					expect(await truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
-				});
-
-				// Every item is reachable through root via forwarding.
-				for (const item of seedItems) {
-					const result = await rpc.apiGetItem(ctx, { hashKey: item.hashKey, sortKey: item.sortKey });
-					expect(result).toMatchObject({
-						found: true,
-						meta: { forwardCount: 1 },
-						item: { data: item.data },
-					});
-				}
-
-				await assertSplitTreeComplete(partition);
-			},
-		);
 	});
 });

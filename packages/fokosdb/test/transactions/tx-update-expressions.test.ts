@@ -172,16 +172,30 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 				value: { fn: "+", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.n" }, { val: 0 }] }, { val: 10 }] },
 			},
 		];
-		const res = await writeOutcome(
-			db.transactWriteItems({
-				items: [
-					{ ...existing, operation: "update", update },
-					{ ...absent, operation: "update", update },
-				],
-			}),
-		);
+		const write = () =>
+			writeOutcome(
+				db.transactWriteItems({
+					items: [
+						{ ...existing, operation: "update", update },
+						{ ...absent, operation: "update", update },
+					],
+				}),
+			);
+		// On the two-phase path, the coordinator stamps the transaction with its own clock. A partition
+		// refuses a stamp that is not above the stamp of the item, or above the last delete of the
+		// partition. The put above and the other tests of this shared table write with the clock of the
+		// partition, and the clock can go back. A cancelled transaction applies nothing, thus the test
+		// sends it again after a `timestamp_conflict`, and after no other refusal.
+		const timestampConflict = (r: Awaited<ReturnType<typeof write>>) =>
+			r.outcome === "cancelled" && r.results.some((op) => op.outcome === "rejected" && op.reason.code === "timestamp_conflict");
+		let res = await write();
+		for (let attempt = 1; attempt < 5 && timestampConflict(res); attempt++) {
+			await new Promise((resolve) => setTimeout(resolve, 2));
+			res = await write();
+		}
 
-		expect(res).toMatchObject({ outcome: "committed" });
+		// The whole result is the message, so that a cancel shows the reason of each operation.
+		expect(res.outcome, JSON.stringify(res)).toBe("committed");
 		expect(await db.getItem(existing)).toMatchObject({ found: true, item: { version: 2, data: { n: 11 } } });
 		expect(await db.getItem(absent)).toMatchObject({ found: true, item: { version: 1, data: { n: 10 } } });
 	});

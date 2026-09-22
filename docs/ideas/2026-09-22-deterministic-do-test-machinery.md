@@ -2,14 +2,14 @@
 
 Status: **draft**. Written on 2026-09-22 after two flakes of the same week: a migration hold that a
 sibling test removed, and a property suite that ran out of its retry budget under load. Both tests
-were correct. The machinery under them measures the speed of the machine, and it keeps its seams on
-state that the whole isolate shares.
+were correct. The machinery under them measures the speed of the machine, and it keeps its test
+controls on state that the whole isolate shares.
 
 ## 1. The problem
 
 Two failures of the test machinery, and not of the code under test, occurred in one week.
 
-**A seam that the whole isolate shares.** `withMigrationHeld` in
+**A test control that the whole isolate shares.** `withMigrationHeld` in
 `test/partition-do/partition-harness.ts` held a migration open with `vi.spyOn` on
 `PartitionDO.prototype.fokosMigrationPull`. The RPC dispatcher looks for an operation on the class,
 thus the hold could not go on the DO instance. Three facts then removed it:
@@ -75,8 +75,8 @@ The runtime also wakes itself with a 50 ms fast path, and it arms a fallback ala
 ### 3.1 In scope
 
 - A test fails when the system stops, and not when the machine is slow.
-- No test seam is on state that a different test can reach. A seam belongs to one Durable Object
-  instance.
+- No test control is on state that a different test can reach. A test control belongs to one
+  Durable Object instance.
 - The suites stay safe when a person makes a file concurrent again.
 - A rule that the machinery holds is enforced by a check, and not only by a comment.
 - The machinery stays small enough that one person can read all of it.
@@ -96,20 +96,31 @@ Each milestone delivers a result on its own, and the next one does not wait for 
 
 1. **Progress-based waiting** (section 5.2). The harness drives the scheduler and fails on a stall.
    It reaches every Durable Object test and touches no test file.
-2. **The instance seam** (section 5.3). A test-only subclass replaces the prototype mocks. It removes
-   the class of failure of section 1.
+2. **Test controls on one instance** (section 5.3). A test-only subclass replaces the prototype
+   mocks. It removes the class of failure of section 1.
 3. **The guard script** (section 5.6). It holds milestones 1 and 2.
 4. **Tier migration** (section 5.4), as each area is touched. No fixed date.
 5. **Budgets as deadlines** (section 5.5), at the next failure of the property suite.
 
-Progress: milestones 1, 2 and 3 are done. The harness drives the scheduler and fails after 20 idle rounds, and the seams are on `ControlledPartitionDO` in `test/controlled-partition-do.ts`. `tools/check-test-machinery.js` holds the rules. Its `PROTOTYPE_SPY_EXCEPTIONS` list is the prototype spies that remain, and each entry goes when its file moves to a seam.
+Progress: milestones 1, 2 and 3 are done.
+
+- The harness drives the scheduler and fails after 20 idle rounds.
+- The partition test controls are on `ControlledPartitionDO` in `test/controlled-partition-do.ts`.
+  The coordinator test controls are on `ControlledTransactionCoordinatorDO` in
+  `test/controlled-transaction-coordinator-do.ts`.
+- `tools/check-test-machinery.js` holds the rules. Its `PROTOTYPE_SPY_EXCEPTIONS` list has one
+  entry, `test/partition-do/promotion.test.ts`. Section 8.2 gives the reason.
+- Milestone 4 started. The resume of a truncated migration page is a test of the flow tier, in
+  `test/repartition/repartition-flow.test.ts`. It replaces the Durable Object test that capped each
+  page at one row, and `withMigrationBatchCap` is removed.
+- Milestone 5 is not started.
 
 ## 5. Proposed solution
 
 ### 5.1 High-level overview
 
 The machinery changes on two axes. On the time axis, a test drives the background work instead of a
-wait for it. On the seam axis, a test changes one object instead of one class.
+wait for it. On the control axis, a test changes one object instead of one class.
 
 ```
 today                                   proposed
@@ -161,14 +172,14 @@ The test keeps no assumption that it is the only driver.
 
 Cost: about 40 lines in `test/partition-do/partition-harness.ts`. No test file changes.
 
-### 5.3 Put the seam on a test-only subclass
+### 5.3 Put the test controls on a test-only subclass
 
 `test/worker-entry.ts` already exports `CustomPartitionDO extends PartitionDO` with its own binding,
-and `src/client/db.test.ts` runs its whole suite over it. The seams use the same pattern:
+and `src/client/db.test.ts` runs its whole suite over it. The test controls use the same pattern:
 
 ```ts
 // test/worker-entry.ts
-// A test drives the seams of this class through its own RPCs. The class adds no behavior of its own:
+// A test drives the test controls of this class through its own RPCs. The class adds no behavior of its own:
 // `PartitionDO` does all the work, and each override only gates or counts.
 export class ControlledPartitionDO extends PartitionDO {
 	#pullGate: PullGate | null = null;
@@ -193,7 +204,7 @@ The `PartitionContext` carries the namespace in `ctx.ns`, and each child of a sp
 a tree that starts in `CONTROLLED_PARTITION_DO` stays in that namespace, and the source that a child
 pulls from is the same class.
 
-`withMigrationHeld` and `withMigrationBatchCap` keep their signatures. They lose
+`withMigrationHeld` keeps its signature. It loses
 `replaceMigrationPull`, `vi.spyOn`, and the `installed()` invariant that reports a lost hold.
 
 Tradeoff: those tests then measure a subclass, and not `PartitionDO` itself. The repository accepts
@@ -203,12 +214,37 @@ each override calls `super`.
 Cost: one class in `test/worker-entry.ts`, one binding and one `new_sqlite_classes` entry in
 `packages/fokosdb/wrangler.jsonc`, and a namespace switch in the harness. About 100 lines.
 
+The transaction suites use the same pattern. `makeDB({ controlled: true })` in
+`test/transactions/tx-helpers.ts` puts a table on the two controlled classes, with a pool of one
+coordinator, thus a test can reach that coordinator by its name. The test controls are these:
+
+| Class | Test control | Use |
+| --- | --- | --- |
+| `ControlledPartitionDO` | a log of the requests of each `tx*` operation | counts the RPCs of a path |
+| `ControlledPartitionDO` | an answer or an error for an operation, for N calls or until cleared | a partition that cannot execute a set, or that is unreachable |
+| `ControlledPartitionDO` | a hold after the phase-one read of `txReadForTransaction` | a real mutation between the two phases |
+| `ControlledPartitionDO` | the stale-transaction time | a short stale threshold |
+| `ControlledTransactionCoordinatorDO` | a count of `initiateWrite` calls, and the fan-out budget | the coordinator path and a short budget |
+
+A call with no rule returns the promise of `PartitionDO` itself, thus its timing does not change.
+
 ### 5.4 Move the observation down a tier
 
-Some tests of the Durable Object tier ask a question that holds no Durable Object.
-`withMigrationBatchCap` asks if a truncated page resumes after its last row. That question belongs to
-`RepartitionSource` and `FokosMigrationHost` over a real `PartitionStore`: no alarm, no RPC, no wait,
-milliseconds. The 762 units beside the code show the pattern.
+Some tests of the Durable Object tier ask a question that holds no Durable Object. The first one
+asked if a truncated migration page resumes after its last row. It capped each page at one row with
+`withMigrationBatchCap`, and it ran a full split.
+
+That question is now a test of the flow tier: "resumes each stream after its last row when the slice
+needs more than one page", in `test/repartition/repartition-flow.test.ts`. The harness of that file
+drives the real `RepartitionSource`, `RepartitionTarget` and `FokosMigrationHost` over real stores. It
+sends each call directly to the other side, with no alarm, no RPC and no wait.
+
+- The source holds more rows and more locks than one page, and some sort keys are empty.
+- A hash split runs. Each child reads the stream of its next pull from its own import record.
+- The test asserts that the items stream and the lock stream each took more than one pull, and that
+  each child holds exactly the rows and locks that it owns.
+- The test operates in less than one second. It fails when the host drops the rest of a stream
+  after its first page.
 
 Rule: a test belongs to the Durable Object tier only when it needs two partitions and a real RPC hop.
 Each test that moves down is a test that can never flake.
@@ -224,14 +260,21 @@ window under full-suite load is longer. Two answers, and the suite can take both
 
 ### 5.6 The guard script
 
-`tools/check-key-invariants.sh` is the precedent: a grep backstop for a rule that a comment cannot
-hold. A second script keeps the rules of this document:
+`tools/check-key-invariants.sh` is the precedent: a backstop for a rule that a comment cannot hold.
+`tools/check-test-machinery.js` keeps the rules of this document. It is a Node script with no
+dependencies. Each rule is one function in its `CHECKS` list. The function gets each test file and
+returns its errors. To add a rule, add a function to the list.
 
-- no `vi.spyOn(` on a `prototype` under `test/`;
-- no `describe.concurrent` in a file that imports a hold helper;
-- no bare `setTimeout` or `sleep` in `test/partition-do/`.
+- `noPrototypeSpy`: no `vi.spyOn(` on a `prototype` under `test/`. A file in
+  `PROTOTYPE_SPY_EXCEPTIONS` is permitted, with its reason. The check fails when an entry has no
+  spy or its file does not exist, thus the list can only become shorter.
+- `noConcurrentHoldUser`: no `describe.concurrent` in a file that uses `withMigrationHeld`.
+- `noBareTimerInPartitionTests`: no bare `setTimeout` or `sleep` in `test/partition-do/`. A timer
+  that is not a wait is permitted when its line, or the line above it, has `guard: allow-timer` and
+  a reason.
 
-It runs in the `test` script of `packages/fokosdb/package.json`, beside the key check.
+It runs as `check:test-machinery` in the `test` script of `packages/fokosdb/package.json`, after the
+key check.
 
 ### 5.7 The concurrency policy
 
@@ -251,6 +294,12 @@ split of a long file into two files, and from a fixture that `beforeAll` builds 
 Sections 5.2 and 5.3 make a concurrent file safe again. That is insurance, and not a reason to make
 one concurrent.
 
+A shared table has a limit. A test that writes through the coordinator uses a table of its own. The
+coordinator stamps a transaction with its own clock, and a partition refuses a stamp that is not
+above its last delete or read. On a shared table, those come from other tests, and the clock of
+miniflare can go back. A wait of 1 ms does not prevent this, because the clock can go back more
+than 1 ms.
+
 ## 6. Alternative options
 
 **A scheduler option from `PartitionDO`.** `src/sharding/runtime-types.ts` already declares
@@ -266,13 +315,13 @@ in the wrong I/O context. `AGENTS.md` records the cross-object TTL errors that f
 4 of 8 runs to 2 of 8. A longer deadline hides the fault and pays for it in the time of a real stall.
 
 **A mock library with per-instance scope.** The dispatcher looks for an operation on the class, thus
-no mock of the DO instance is reachable. A subclass is the only instance-scoped seam that the RPC
+no mock of the DO instance is reachable. A subclass is the only test control on one instance that the RPC
 model allows.
 
 ## 7. Frequently asked questions
 
 **Does a subclass weaken the coverage of `PartitionDO`?** The subclass inherits every operation and
-each override calls `super`. The tests that need no seam keep the `PARTITION_DO` binding, thus the
+each override calls `super`. The tests that need no test control keep the `PARTITION_DO` binding, thus the
 production class stays covered by most of the tier.
 
 **What happens when a test forgets to release a gate?** The gate is a field of one instance, and the
@@ -292,10 +341,20 @@ what `alarm()` calls. A defect in the alarm plumbing itself stays covered by the
 must be more than the longest chain of steps that produce no observable state change. TODO: measure
 the longest such chain in a hash split and in a range split.
 
-**8.2 The reach of the subclass.** `test/partition-do/import-page-guards.test.ts`,
-`test/partition-do/destroy-fence.test.ts` and `test/partition-do/promotion.test.ts` also mock a
-prototype. Their files are sequential today, except `promotion.test.ts`, which is
-`describe.concurrent`. TODO: decide if all of them move to the subclass, or only the concurrent one.
+**8.2 The reach of the subclass.** Decided: every file moves to a test control. `destroy-fence.test.ts`
+and the four transaction suites use the test controls now. One spy remains:
+`PartialRangeTopology.prototype.maybePromoted` in `test/partition-do/promotion.test.ts`. That class
+is the private bloom filter of the runtime, thus no subclass can reach it without a production
+hook. The spy is in a sequential `describe` at the top level of the file. Vitest runs the sibling
+tasks of a suite in groups by their `concurrent` flag, and one group ends before the next starts.
+Thus no other test of the file operates while the spy is installed, and the spy is safe. A comment
+at the spy says that the `describe` must stay sequential. The file stays in
+`PROTOTYPE_SPY_EXCEPTIONS`.
+
+**8.3 Other shared spies.** The guard finds only a spy on a prototype. `test/partition-do/tx-stale-recovery.test.ts`
+spies on `Date.now` and on the `doStubs` module. That state is also shared by the whole isolate,
+and `vi.restoreAllMocks()` of another test can remove it. The file is sequential today. TODO: decide
+if the guard also refuses a spy on a global or on a module.
 
 References:
 

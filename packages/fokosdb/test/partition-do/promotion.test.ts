@@ -271,6 +271,10 @@ describe("PartitionDO — promotion read fallback", () => {
 
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
 
+		// This spy is on a prototype, thus each test in the isolate sees it, and `vi.restoreAllMocks()` of
+		// another test can remove it. The class is private to the runtime, thus no test control can replace the
+		// spy. The spy is safe only because this `describe` is sequential and at the top level: vitest
+		// runs no other test of this file at the same time. Do not make it concurrent.
 		const maybePromotedSpy = vi.spyOn(PartialRangeTopology.prototype, "maybePromoted").mockReturnValue(true);
 
 		const aliceRangeRoot = partition.rangeRoot("alice").controlled;

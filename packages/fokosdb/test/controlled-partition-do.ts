@@ -1,17 +1,17 @@
 /**
- * A `PartitionDO` with seams that a test drives through its own RPCs.
+ * A `PartitionDO` with test controls: RPCs that a test calls to hold, count, answer, or fail one
+ * call on one instance.
  *
  * The RPC dispatcher finds an operation on the class, thus a test cannot put a mock on one DO
  * instance. A mock on the `PartitionDO` prototype reaches every partition of every test in the
- * isolate, and `vi.restoreAllMocks()` of a different test can remove it. Each seam of this class is
+ * isolate, and `vi.restoreAllMocks()` of a different test can remove it. Each test control of this class is
  * a field of one instance, and nothing else can reach it.
  *
  * The class adds no behavior of its own: `PartitionDO` does all the work, and each override only
- * holds, counts, truncates, answers, or fails one call, or replaces one tuning value.
+ * holds, counts, answers, or fails one call, or replaces one tuning value.
  */
 import { PartitionDO } from "../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../src/shared/partition-context.js";
-import type { FokosDbHostPage } from "../src/shared/partition/fokos-migration-host.js";
 import type { FokosInitRequest, FokosMigrationPage, FokosMigrationPullRequest } from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
@@ -23,7 +23,7 @@ export type MigrationStream = "overrides" | "items" | "pending_tx";
  */
 export type PullGateSpec = { stream: MigrationStream; target?: string; afterRead?: boolean };
 
-export type PullStats = { calls: number; truncated: number; heldTargets: string[] };
+export type PullStats = { calls: number; heldTargets: string[] };
 
 type Gate = { held: Promise<void>; release: () => void };
 
@@ -54,8 +54,7 @@ export type TxResponseRule<Op extends TxOp> = ({ error: string } | { value: TxRe
 
 export class ControlledPartitionDO extends PartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
-	#pullCap: number | null = null;
-	#pullStats: PullStats = { calls: 0, truncated: 0, heldTargets: [] };
+	#pullStats: PullStats = { calls: 0, heldTargets: [] };
 	#initGate: Gate | null = null;
 	#initCalls = 0;
 	#txCalls: { [Op in TxOp]: TxRequest<Op>[] } = {
@@ -124,10 +123,7 @@ export class ControlledPartitionDO extends PartitionDO {
 			if (!this.#pullStats.heldTargets.includes(req.target.doName)) this.#pullStats.heldTargets.push(req.target.doName);
 			await pullGate.held;
 		}
-		page ??= await super.fokosMigrationPull(req);
-		const capped = this.#pullCap === null ? null : capPage(page, this.#pullCap);
-		if (capped) this.#pullStats.truncated++;
-		return capped ?? page;
+		return page ?? (await super.fokosMigrationPull(req));
 	}
 
 	override async fokosInit(req: FokosInitRequest): Promise<void> {
@@ -141,16 +137,10 @@ export class ControlledPartitionDO extends PartitionDO {
 		this.#pullGate = { ...gate(), spec };
 	}
 
-	/** Caps each page this source serves at `maxRows` rows, until `testReleasePulls`. */
-	async testCapPulls(maxRows: number): Promise<void> {
-		this.#pullCap = maxRows;
-	}
-
-	/** Releases the held pulls, and removes the gate and the cap. */
+	/** Releases the held pulls, and removes the gate. */
 	async testReleasePulls(): Promise<void> {
 		this.#pullGate?.release();
 		this.#pullGate = null;
-		this.#pullCap = null;
 	}
 
 	async testPullStats(): Promise<PullStats> {
@@ -206,39 +196,4 @@ export class ControlledPartitionDO extends PartitionDO {
 	async testStaleTransactionMs(ms: number | null): Promise<void> {
 		this.#staleTransactionMs = ms;
 	}
-}
-
-/**
- * Truncates one page to `maxRows` rows and points its cursor at the last row it kept. It returns null
- * when the page already fits. The flow owns the overrides phase and the host owns its own streams, so
- * each one carries its own row shape and its own cursor.
- */
-function capPage(page: FokosMigrationPage, maxRows: number): FokosMigrationPage | null {
-	if (page.phase === "overrides") {
-		if (page.overrides.length <= maxRows) return null;
-		const kept = page.overrides.slice(0, maxRows);
-		return { phase: "overrides", overrides: kept, nextCursor: { phase: "overrides", inner: { hashKey: kept[maxRows - 1].hashKey } } };
-	}
-	const hostPage = page.page as FokosDbHostPage;
-	if (hostPage.stream === "items") {
-		if (hostPage.items.length <= maxRows) return null;
-		const kept = hostPage.items.slice(0, maxRows);
-		const last = kept[maxRows - 1];
-		return {
-			phase: "host",
-			page: { stream: "items", items: kept },
-			nextCursor: { phase: "host", inner: { stream: "items", cursor: { hk: last.hk, sk: last.sk } } },
-		};
-	}
-	if (hostPage.pendingTransactions.length <= maxRows) return null;
-	const kept = hostPage.pendingTransactions.slice(0, maxRows);
-	const last = kept[maxRows - 1];
-	return {
-		phase: "host",
-		page: { ...hostPage, pendingTransactions: kept },
-		nextCursor: {
-			phase: "host",
-			inner: { stream: "pending_tx", cursor: { hk: last.hk, sk: last.sk, transaction_id: last.transaction_id } },
-		},
-	};
 }

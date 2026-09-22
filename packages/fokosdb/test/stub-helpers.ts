@@ -17,7 +17,7 @@ export function testPartitionStub(
 	return typeof nameOrId === "string" ? namespace.getByName(nameOrId) : namespace.get(nameOrId);
 }
 
-/** A partition of `ControlledPartitionDO`, with the RPCs of its seams. */
+/** A partition of `ControlledPartitionDO`, with the RPCs of its test controls. */
 export function testControlledPartitionStub(name: string): DurableObjectStub<ControlledPartitionDO> {
 	return env.CONTROLLED_PARTITION_DO.getByName(name);
 }
