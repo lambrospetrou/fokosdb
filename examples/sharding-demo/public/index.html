@@ -1,0 +1,670 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>FokosShardingRuntime — Demo Suite</title>
+		<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.orange.min.css" />
+		<style>
+			:root {
+				--font-family: system-ui, -apple-system, sans-serif;
+			}
+			body {
+				padding: 1.5rem;
+				max-width: 1400px;
+				margin: 0 auto;
+			}
+			header.demo-header {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				border-bottom: 1px solid var(--pico-muted-border-color);
+				padding-bottom: 1rem;
+				margin-bottom: 1.5rem;
+			}
+			.tile-nav {
+				display: flex;
+				gap: 0.5rem;
+			}
+			.tile-nav button {
+				padding: 0.4rem 0.9rem;
+				font-size: 0.85rem;
+				margin: 0;
+			}
+			.tile-nav button.active {
+				background: var(--pico-primary);
+				color: var(--pico-primary-inverse);
+			}
+			.layout-grid {
+				display: grid;
+				grid-template-columns: 1fr 380px;
+				gap: 1.5rem;
+				align-items: start;
+			}
+			@media (max-width: 1024px) {
+				.layout-grid {
+					grid-template-columns: 1fr;
+				}
+			}
+			.topology-container {
+				background: var(--pico-card-background-color);
+				border: 1px solid var(--pico-muted-border-color);
+				border-radius: var(--pico-border-radius);
+				padding: 1rem;
+				position: relative;
+				min-height: 480px;
+				overflow: hidden;
+			}
+			.topology-toolbar {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+				margin-bottom: 0.75rem;
+				font-size: 0.8rem;
+				color: var(--pico-muted-color);
+			}
+			.topology-svg {
+				width: 100%;
+				height: 440px;
+				display: block;
+			}
+			/* Box styles */
+			.node-group {
+				cursor: pointer;
+				transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+			}
+			.node-rect {
+				fill: #1e293b;
+				stroke: #475569;
+				stroke-width: 2;
+				rx: 8;
+				ry: 8;
+				transition: all 0.3s ease;
+			}
+			.node-group:hover .node-rect {
+				stroke: var(--pico-primary);
+				filter: drop-shadow(0 0 8px rgba(249, 115, 22, 0.3));
+			}
+			.node-group.is-router .node-rect {
+				fill: #111827;
+				stroke: #ea580c;
+				stroke-dasharray: 4 2;
+			}
+			.node-group.is-killed .node-rect {
+				stroke: #ef4444;
+				fill: #271414;
+			}
+			.node-group.is-active-target .node-rect {
+				stroke: #22c55e;
+				filter: drop-shadow(0 0 10px rgba(34, 197, 94, 0.5));
+			}
+			.node-title {
+				font-size: 13px;
+				font-weight: 700;
+				fill: #f8fafc;
+			}
+			.node-badge {
+				font-size: 10px;
+				font-weight: 600;
+				fill: #ea580c;
+				text-transform: uppercase;
+			}
+			.node-subtitle {
+				font-size: 11px;
+				fill: #94a3b8;
+			}
+			/* Connection links */
+			.tree-link {
+				fill: none;
+				stroke: #334155;
+				stroke-width: 2;
+				transition: stroke 0.3s ease;
+			}
+			.tree-link.link-active {
+				stroke: var(--pico-primary);
+				stroke-width: 3.5;
+				filter: drop-shadow(0 0 6px var(--pico-primary));
+			}
+			.link-pulse-dot {
+				fill: #f97316;
+				filter: drop-shadow(0 0 6px #f97316);
+			}
+			/* Controls and sidebar */
+			.control-card {
+				background: var(--pico-card-background-color);
+				border: 1px solid var(--pico-muted-border-color);
+				border-radius: var(--pico-border-radius);
+				padding: 1.25rem;
+			}
+			.control-card h3 {
+				font-size: 1.1rem;
+				margin-bottom: 0.5rem;
+			}
+			.control-card p {
+				font-size: 0.85rem;
+				color: var(--pico-muted-color);
+				margin-bottom: 1rem;
+			}
+			.btn-row {
+				display: flex;
+				flex-direction: column;
+				gap: 0.5rem;
+				margin-bottom: 1rem;
+			}
+			.btn-row button {
+				width: 100%;
+				margin: 0;
+				padding: 0.5rem 0.8rem;
+				font-size: 0.85rem;
+			}
+			.stats-grid {
+				display: grid;
+				grid-template-columns: 1fr 1fr;
+				gap: 0.5rem;
+				margin-bottom: 1rem;
+			}
+			.stat-item {
+				background: #0f172a;
+				border: 1px solid #1e293b;
+				border-radius: 6px;
+				padding: 0.5rem 0.75rem;
+			}
+			.stat-item small {
+				color: #94a3b8;
+				font-size: 0.7rem;
+				display: block;
+			}
+			.stat-item strong {
+				font-size: 1.1rem;
+				color: #f8fafc;
+			}
+			.log-console {
+				background: #020617;
+				border: 1px solid #1e293b;
+				border-radius: 6px;
+				padding: 0.6rem;
+				font-family: monospace;
+				font-size: 0.75rem;
+				max-height: 180px;
+				overflow-y: auto;
+				color: #cbd5e1;
+			}
+			.log-entry {
+				padding: 0.2rem 0;
+				border-bottom: 1px solid #0f172a;
+			}
+			.log-entry:last-child {
+				border-bottom: none;
+			}
+			.log-time {
+				color: #64748b;
+				margin-right: 0.4rem;
+			}
+			.log-trace {
+				color: #f97316;
+			}
+		</style>
+		<script type="importmap">
+			{
+				"imports": {
+					"preact": "https://esm.sh/preact@10.23.1",
+					"preact/": "https://esm.sh/preact@10.23.1/",
+					"@preact/signals": "https://esm.sh/@preact/signals@1.3.0?external=preact",
+					"htm/preact": "https://esm.sh/htm@3.1.1/preact?external=preact"
+				}
+			}
+		</script>
+	</head>
+	<body>
+		<div id="app"></div>
+
+		<script type="module">
+			import { h, render } from "preact";
+			import { signal, computed, effect } from "@preact/signals";
+			import { html } from "htm/preact";
+
+			// ── Demos definition ──────────────────────────────────────────────────────────
+			const TILES = [
+				{
+					id: "demo1",
+					name: "Demo 1: Request Volume Split",
+					desc: "Hash-only partition host. Splits on request volume threshold. Can kill parent mid-split to resume.",
+				},
+				{
+					id: "demo2",
+					name: "Demo 2: Multi-Tenant FTS5",
+					desc: "Tenants start co-located on shared hash partitions. Hot tenants promote into dedicated range partitions.",
+				},
+				{
+					id: "demo3",
+					name: "Demo 3: FokosDB Topology",
+					desc: "Production PartitionDO topology with real 2PC range and hash trees.",
+				},
+			];
+
+			// ── Global Signals ────────────────────────────────────────────────────────────
+			const activeTile = signal("demo1");
+			const topologyData = signal(null);
+			const isLoading = signal(false);
+			const isAutoPolling = signal(true);
+			const logs = signal([]);
+			const activeHops = signal([]); // [{ from, to }]
+			const animatedPackets = signal([]); // [{ id, fromX, fromY, toX, toY, progress }]
+
+			function addLog(msg, trace = null) {
+				const time = new Date().toLocaleTimeString();
+				logs.value = [{ time, msg, trace }, ...logs.value.slice(0, 40)];
+			}
+
+			// ── Topology Polling ──────────────────────────────────────────────────────────
+			async function fetchTopology() {
+				try {
+					const res = await fetch(`/api/topology/${activeTile.value}`);
+					if (!res.ok) throw new Error(`HTTP ${res.status}`);
+					const data = await res.json();
+					topologyData.value = data;
+				} catch (err) {
+					console.error("fetchTopology failed:", err);
+				}
+			}
+
+			// Poll periodically
+			setInterval(() => {
+				if (isAutoPolling.value) {
+					fetchTopology();
+				}
+			}, 1500);
+
+			effect(() => {
+				// Re-fetch when tile changes
+				const current = activeTile.value;
+				activeHops.value = [];
+				fetchTopology();
+			});
+
+			// ── Execute Action Helper ─────────────────────────────────────────────────────
+			async function executeAction(action, payload = {}) {
+				isLoading.value = true;
+				try {
+					const res = await fetch(`/api/action/${activeTile.value}/${action}`, {
+						method: "POST",
+						headers: { "content-type": "application/json" },
+						body: JSON.stringify(payload),
+					});
+					const json = await res.json();
+					if (json.trace) {
+						handleTrace(json.trace);
+					}
+					addLog(
+						`[${action}] ${json.success ? "Success" : "Failed"}: ${JSON.stringify(json.result || json.stats || json.item || {})}`,
+						json.trace,
+					);
+					await fetchTopology();
+					return json;
+				} catch (err) {
+					addLog(`[${action}] Error: ${err.message}`);
+				} finally {
+					isLoading.value = false;
+				}
+			}
+
+			function handleTrace(trace) {
+				if (!trace || !trace.servedBy || trace.servedBy.length <= 1) return;
+				const hops = [];
+				for (let i = 0; i < trace.servedBy.length - 1; i++) {
+					hops.push({
+						from: trace.servedBy[i].doName,
+						to: trace.servedBy[i + 1].doName,
+					});
+				}
+				activeHops.value = hops;
+				setTimeout(() => {
+					activeHops.value = [];
+				}, 1200);
+			}
+
+			// ── Tree Layout Calculation ───────────────────────────────────────────────────
+			function computeTreeLayout(roots, svgWidth = 720, svgHeight = 420) {
+				if (!roots || roots.length === 0) return { nodes: [], links: [] };
+
+				const nodes = [];
+				const links = [];
+
+				function getLeafCount(node) {
+					if (!node.children || node.children.length === 0) return 1;
+					return node.children.reduce((acc, c) => acc + getLeafCount(c), 0);
+				}
+
+				const totalLeaves = roots.reduce((acc, r) => acc + getLeafCount(r), 0);
+				let currentLeafIndex = 0;
+
+				function layoutSubtree(node, depth, parentPos) {
+					const nodeLeaves = getLeafCount(node);
+					const leafSpanStart = currentLeafIndex;
+					const leafSpanEnd = currentLeafIndex + nodeLeaves;
+
+					const childPositions = [];
+					if (node.children && node.children.length > 0) {
+						for (const child of node.children) {
+							childPositions.push(layoutSubtree(child, depth + 1, null));
+						}
+					} else {
+						currentLeafIndex += 1;
+					}
+
+					let x;
+					if (childPositions.length > 0) {
+						const minX = childPositions[0].x;
+						const maxX = childPositions[childPositions.length - 1].x;
+						x = (minX + maxX) / 2;
+					} else {
+						const leafCenter = (leafSpanStart + 0.5) / Math.max(1, totalLeaves);
+						x = 80 + leafCenter * (svgWidth - 160);
+					}
+
+					const y = 50 + depth * 140;
+					const pos = { node, x, y, depth };
+					nodes.push(pos);
+
+					if (childPositions.length > 0) {
+						for (const cp of childPositions) {
+							links.push({
+								from: node,
+								to: cp.node,
+								fromPos: pos,
+								toPos: cp,
+								id: `${node.doName}->${cp.node.doName}`,
+							});
+						}
+					}
+
+					return pos;
+				}
+
+				for (const r of roots) {
+					layoutSubtree(r, 0, null);
+				}
+
+				return { nodes, links };
+			}
+
+			// ── Component: Box-Tree Topology View ──────────────────────────────────────────
+			function TopologyView({ topology }) {
+				const roots = topology?.roots ?? [];
+				const svgWidth = 840;
+				const svgHeight = 440;
+				const { nodes, links } = computeTreeLayout(roots, svgWidth, svgHeight);
+
+				function onNodeClick(node) {
+					if (node.role === "router" && node.children?.length > 0) {
+						// Animate forward from router to a child
+						const randomChild = node.children[Math.floor(Math.random() * node.children.length)];
+						activeHops.value = [{ from: node.doName, to: randomChild.doName }];
+						setTimeout(() => {
+							activeHops.value = [];
+						}, 1200);
+					}
+				}
+
+				return html`
+					<div class="topology-container">
+						<div class="topology-toolbar">
+							<span>
+								<strong>${topology?.tile?.toUpperCase() ?? "SHARD GROUP"}</strong>
+								${topology?.summary
+									? ` — ${topology.summary.totalPartitions} partitions (${topology.summary.routerCount} routers, ${topology.summary.leafCount} leaves)`
+									: ""}
+							</span>
+							<div>
+								<label style="display:inline-flex; align-items:center; gap:0.4rem; margin:0; cursor:pointer;">
+									<input type="checkbox" checked=${isAutoPolling.value} onChange=${(e) => (isAutoPolling.value = e.target.checked)} />
+									Auto-refresh (1.5s)
+								</label>
+							</div>
+						</div>
+
+						<svg class="topology-svg" viewBox="0 0 ${svgWidth} ${svgHeight}">
+							<defs>
+								<linearGradient id="linkGradient" x1="0%" y1="0%" x2="0%" y2="100%">
+									<stop offset="0%" stop-color="#ea580c" />
+									<stop offset="100%" stop-color="#f97316" />
+								</linearGradient>
+							</defs>
+
+							<!-- Connecting Lines -->
+							${links.map((link) => {
+								const fx = link.fromPos.x;
+								const fy = link.fromPos.y + 36;
+								const tx = link.toPos.x;
+								const ty = link.toPos.y - 36;
+								const midY = (fy + ty) / 2;
+								const d = `M ${fx} ${fy} C ${fx} ${midY}, ${tx} ${midY}, ${tx} ${ty}`;
+
+								const isHopActive = activeHops.value.some((h) => h.from === link.from.doName && h.to === link.to.doName);
+
+								return html`
+									<g key=${link.id}>
+										<path d=${d} class="tree-link ${isHopActive ? "link-active" : ""}" />
+										${isHopActive &&
+										html`
+											<circle r="5" class="link-pulse-dot">
+												<animateMotion path=${d} dur="0.8s" repeatCount="1" />
+											</circle>
+										`}
+									</g>
+								`;
+							})}
+
+							<!-- Partition Boxes -->
+							${nodes.map((pos) => {
+								const node = pos.node;
+								const isRouter = node.role === "router";
+								const isKilled = node.status === "killed";
+								const isTarget = activeHops.value.some((h) => h.to === node.doName);
+
+								const boxWidth = isRouter ? 140 : 154;
+								const boxHeight = isRouter ? 64 : 72;
+								const rx = pos.x - boxWidth / 2;
+								const ry = pos.y - boxHeight / 2;
+
+								const badgeText = isRouter ? "Router" : node.kind === "range" ? "Range Leaf" : "Leaf";
+
+								return html`
+									<g
+										key=${node.id}
+										class="node-group ${isRouter ? "is-router" : ""} ${isKilled ? "is-killed" : ""} ${isTarget ? "is-active-target" : ""}"
+										transform="translate(${rx}, ${ry})"
+										onClick=${() => onNodeClick(node)}
+									>
+										<rect width=${boxWidth} height=${boxHeight} class="node-rect" />
+										<!-- Header / Title -->
+										<text x="12" y="22" class="node-title">
+											${node.doName.length > 14 ? node.doName.slice(0, 14) + "…" : node.doName}
+										</text>
+										<!-- Badge -->
+										<text x=${boxWidth - 12} y="22" text-anchor="end" class="node-badge"> ${badgeText} </text>
+										<!-- Subtitle / Stats -->
+										<text x="12" y="42" class="node-subtitle">
+											${isRouter ? `Routing to ${node.children?.length ?? 0} targets` : `Items: ${node.itemCount ?? 0}`}
+										</text>
+										<text x="12" y="56" class="node-subtitle">
+											${node.hashKey ? `Key: ${node.hashKey}` : `Requests: ${node.requestCount ?? 0}`}
+										</text>
+									</g>
+								`;
+							})}
+						</svg>
+					</div>
+				`;
+			}
+
+			// ── Component: Control Panel Shell ────────────────────────────────────────────
+			function ControlPanel({ tile, data }) {
+				const id = tile.id;
+				const summary = data?.summary;
+
+				return html`
+					<div class="control-card">
+						<h3>${tile.name}</h3>
+						<p>${tile.desc}</p>
+
+						<div class="stats-grid">
+							<div class="stat-item">
+								<small>Partitions</small>
+								<strong>${summary?.totalPartitions ?? 1}</strong>
+							</div>
+							<div class="stat-item">
+								<small>Routers / Splits</small>
+								<strong>${summary?.routerCount ?? 0}</strong>
+							</div>
+							<div class="stat-item">
+								<small>Leaves</small>
+								<strong>${summary?.leafCount ?? 1}</strong>
+							</div>
+							<div class="stat-item">
+								<small>State</small>
+								<strong>${summary?.routerCount ? "Split / Routed" : "Single Root"}</strong>
+							</div>
+						</div>
+
+						${id === "demo1" &&
+						html`
+							<div class="btn-row">
+								<button
+									class="primary"
+									disabled=${isLoading.value}
+									onClick=${() => executeAction("increment", { key: `k-${Math.floor(Math.random() * 8)}` })}
+								>
+									⚡ Increment (+1 synthetic write)
+								</button>
+								<button disabled=${isLoading.value} onClick=${() => executeAction("batch-increment", { count: 10 })}>
+									🚀 Batch Load (+10 writes)
+								</button>
+								<button
+									class="secondary"
+									disabled=${isLoading.value || summary?.routerCount > 0}
+									onClick=${() => executeAction("split", { childCount: 4 })}
+								>
+									✂️ Trigger Split (to 4 children)
+								</button>
+								<button style="border-color:#ef4444; color:#ef4444;" disabled=${isLoading.value} onClick=${() => executeAction("kill")}>
+									⚠️ Kill Parent Mid-Split (ctx.abort)
+								</button>
+								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset Demo 1</button>
+							</div>
+						`}
+						${id === "demo2" &&
+						html`
+							<div class="btn-row">
+								<button
+									class="primary"
+									disabled=${isLoading.value}
+									onClick=${() =>
+										executeAction("add-doc", { tenantId: "acme", title: "Quarterly Report", body: "financial metrics database sharding" })}
+								>
+									📄 Ingest Acme Doc (Hot Tenant)
+								</button>
+								<button
+									disabled=${isLoading.value}
+									onClick=${() =>
+										executeAction("add-doc", { tenantId: "beta", title: "Team Notes", body: "weekly sync engineering topics" })}
+								>
+									📄 Ingest Beta Doc (Shared Tenant)
+								</button>
+								<button class="secondary" disabled=${isLoading.value} onClick=${() => executeAction("promote", { tenantId: "acme" })}>
+									⭐ Promote Tenant Acme (Range Root)
+								</button>
+								<button disabled=${isLoading.value} onClick=${() => executeAction("search", { tenantId: "acme", query: "database" })}>
+									🔍 Scoped Search (Acme: "database")
+								</button>
+								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset Demo 2</button>
+							</div>
+						`}
+						${id === "demo3" &&
+						html`
+							<div class="btn-row">
+								<button
+									class="primary"
+									disabled=${isLoading.value}
+									onClick=${() =>
+										executeAction("put-item", { hashKey: `user#${Math.floor(Math.random() * 30)}`, sortKey: "profile", data: "live demo" })}
+								>
+									💾 FokosDB putItem (2PC Write)
+								</button>
+								<button disabled=${isLoading.value} onClick=${() => executeAction("get-item", { hashKey: "user#1", sortKey: "profile" })}>
+									🔎 FokosDB getItem
+								</button>
+								<button class="secondary" disabled=${isLoading.value} onClick=${() => executeAction("seed", { count: 8 })}>
+									🌱 Pre-seed Shard Group
+								</button>
+								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset FokosDB Table</button>
+							</div>
+						`}
+
+						<!-- Log stream -->
+						<div style="margin-top: 1rem;">
+							<small style="color:var(--pico-muted-color); font-weight:600;">ACTIVITY LOG & ROUTING EVIDENCE</small>
+							<div class="log-console">
+								${logs.value.length === 0
+									? html`<div style="color:#64748b">No activity yet. Click an action above.</div>`
+									: logs.value.map(
+											(l, i) => html`
+												<div key=${i} class="log-entry">
+													<span class="log-time">[${l.time}]</span>
+													<span>${l.msg}</span>
+													${l.trace &&
+													html`
+														<div class="log-trace">
+															↳ Hops: ${l.trace.forwardCount} (${l.trace.servedBy.map((s) => s.doName).join(" → ")})
+														</div>
+													`}
+												</div>
+											`,
+										)}
+							</div>
+						</div>
+					</div>
+				`;
+			}
+
+			// ── Main App Component ────────────────────────────────────────────────────────
+			function App() {
+				const currentTile = TILES.find((t) => t.id === activeTile.value) ?? TILES[0];
+
+				return html`
+					<div>
+						<header class="demo-header">
+							<div>
+								<h2 style="margin: 0; font-size: 1.4rem;">FokosShardingRuntime</h2>
+								<small style="color: var(--pico-muted-color);"> Multi-Tenant Sharding, Request-Volume Splits, and Promotion </small>
+							</div>
+							<div class="tile-nav">
+								${TILES.map(
+									(t) => html`
+										<button
+											key=${t.id}
+											class=${activeTile.value === t.id ? "active" : "outline"}
+											onClick=${() => (activeTile.value = t.id)}
+										>
+											${t.name.split(":")[0]}
+										</button>
+									`,
+								)}
+							</div>
+						</header>
+
+						<main class="layout-grid">
+							<!-- Left Column: Shared Topology View -->
+							<${TopologyView} topology=${topologyData.value} />
+
+							<!-- Right Column: Control Panel Shell -->
+							<${ControlPanel} tile=${currentTile} data=${topologyData.value} />
+						</main>
+					</div>
+				`;
+			}
+
+			render(html`<${App} />`, document.getElementById("app"));
+		</script>
+	</body>
+</html>

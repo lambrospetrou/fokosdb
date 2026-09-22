@@ -1,0 +1,23 @@
+{
+	"name": "@fokosdb-example/sharding-demo",
+	"version": "0.0.0",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"check": "tsc --noEmit",
+		"dev": "wrangler dev",
+		"test": "vitest run",
+		"cf-typegen": "wrangler types"
+	},
+	"dependencies": {
+		"fokosdb": "workspace:*",
+		"hono": "^4.12.22"
+	},
+	"devDependencies": {
+		"@cloudflare/vitest-pool-workers": "^0.16.9",
+		"@types/node": "^25.6.0",
+		"typescript": "^5.9.3",
+		"vitest": "^4.1.7",
+		"wrangler": "^4.131.0"
+	}
+}
