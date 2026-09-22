@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -11,6 +11,7 @@ import {
 	PROMOTION_TEST_MAX_SIZE_MB,
 	type TestPartition,
 	assertSplitTreeComplete,
+	CONTROLLED_NS,
 	drainUntil,
 	makePartition,
 } from "./partition-harness.js";
@@ -257,7 +258,7 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 
 describe("PartitionDO — promotion read fallback", () => {
 	it("a read falls back to the local rows while the promotion waits for cutover; a write does not", async () => {
-		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.splitHash();
 		const owner = await partition.childOwning("alice");
 
@@ -271,25 +272,12 @@ describe("PartitionDO — promotion read fallback", () => {
 
 		const maybePromotedSpy = vi.spyOn(PartialRangeTopology.prototype, "maybePromoted").mockReturnValue(true);
 
-		const aliceRangeRoot = partition.rangeRoot("alice");
-		let initCalls = 0;
-		let release!: () => void;
-		const held = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		const originalInit = PartitionDO.prototype.fokosInit;
-		const initSpy = vi.spyOn(PartitionDO.prototype, "fokosInit").mockImplementation(async function (this: PartitionDO, req) {
-			const result = await originalInit.call(this, req);
-			if (req.target.doName === aliceRangeRoot.doName) {
-				initCalls++;
-				await held;
-			}
-			return result;
-		});
+		const aliceRangeRoot = partition.rangeRoot("alice").controlled;
+		await aliceRangeRoot.testHoldInit();
 
 		try {
 			await owner.rpc.debugForcePromoteKey(owner.ctx, { hashKey: kb("alice") });
-			await vi.waitFor(() => expect(initCalls).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+			await vi.waitFor(async () => expect(await aliceRangeRoot.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 
 			const g = await partition.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 			expect(g).toMatchObject({ found: true, item: { data: "v" } });
@@ -300,8 +288,7 @@ describe("PartitionDO — promotion read fallback", () => {
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 			});
 		} finally {
-			release();
-			initSpy.mockRestore();
+			await aliceRangeRoot.testReleaseInit();
 			maybePromotedSpy.mockRestore();
 		}
 
@@ -311,7 +298,7 @@ describe("PartitionDO — promotion read fallback", () => {
 
 describe("PartitionDO — transaction commit and promotion candidates", () => {
 	it("keeps the local promotion candidates when a forwarded child commit fails", async () => {
-		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
@@ -328,15 +315,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 		});
 		expect(prepare.outcome).toBe("accepted");
 
-		let failed = false;
-		const original = PartitionDO.prototype.txCommit;
-		const spy = vi.spyOn(PartitionDO.prototype, "txCommit").mockImplementation(function (this: PartitionDO, pCtx, request) {
-			if (this.ctx.id.name === rangeRoot.doName && !failed) {
-				failed = true;
-				return Promise.reject(new Error("simulated child commit failure"));
-			}
-			return original.call(this, pCtx, request);
-		});
+		await rangeRoot.controlled.testFailCommits(1);
 
 		const commit = {
 			transactionId: txId,
@@ -354,7 +333,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 
 			expect(await partition.promotedKeyStatus("hot"), "the local hot key must be queued for promotion").toBeDefined();
 		} finally {
-			spy.mockRestore();
+			await rangeRoot.controlled.testFailCommits(0);
 		}
 
 		// The promotion of the local hot key is queued off the request path, so the new range root can

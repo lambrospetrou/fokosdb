@@ -13,21 +13,16 @@
  */
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
-import type { FokosImportRecord, FokosMigrationPullRequest } from "../../src/sharding/repartition-types.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { PartitionIdHelper, hashChildIndex } from "../../src/sharding/partition-id.js";
+import type { MigrationStream } from "../controlled-partition-do.js";
 import { kb } from "./helpers.js";
-import { makePartition, TestPartition } from "./partition-harness.js";
+import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
 const IMPORT_KEY = FOKOS_KV_KEYS.IMPORT;
 const HELD_KEY = "alice";
-
-/** The stream a pull is asking for, read back out of the flow's opaque cursor. */
-function streamOf(req: FokosMigrationPullRequest): "overrides" | "items" | "pending_tx" {
-	if (req.cursor === null || req.cursor.phase === "overrides") return "overrides";
-	return (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx" ? "pending_tx" : "items";
-}
 
 /**
  * Holds one target's pull of one stream on the source, after the page is built.
@@ -37,41 +32,23 @@ function streamOf(req: FokosMigrationPullRequest): "overrides" | "items" | "pend
  */
 async function withPullHeld(
 	source: TestPartition,
-	hold: { target: TestPartition; stream: "overrides" | "items" | "pending_tx" },
-	run: (gate: { waitForHold: () => Promise<void>; release: () => void }) => Promise<void>,
+	hold: { target: TestPartition; stream: MigrationStream },
+	run: (gate: { waitForHold: () => Promise<void>; release: () => Promise<void> }) => Promise<void>,
 ): Promise<void> {
-	let release!: () => void;
-	const gate = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	let held = 0;
-	const restore = await runInDurableObject(source.stub, (instance: PartitionDO) => {
-		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
-		// property on the DO instance. The guard keeps the mock on the shared prototype scoped to this
-		// one instance, so a background pull from another partition passes through.
-		const prototype: PartitionDO = Object.getPrototypeOf(instance);
-		const original = prototype.fokosMigrationPull;
-		const spy = vi.spyOn(prototype, "fokosMigrationPull").mockImplementation(async function (this: PartitionDO, req) {
-			if (this !== instance || req.target.doName !== hold.target.doName || streamOf(req) !== hold.stream) {
-				return await original.call(this, req);
-			}
-			const page = await original.call(this, req);
-			held++;
-			await gate;
-			return page;
-		});
-		return () => spy.mockRestore();
-	});
+	const controlled = source.controlled;
+	await controlled.testHoldPulls({ stream: hold.stream, target: hold.target.doName, afterRead: true });
 	try {
 		await run({
 			waitForHold: async () => {
-				await vi.waitFor(() => expect(held).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+				await vi.waitFor(async () => expect((await controlled.testPullStats()).heldTargets).toContain(hold.target.doName), {
+					timeout: 5000,
+					interval: 10,
+				});
 			},
-			release,
+			release: async () => await controlled.testReleasePulls(),
 		});
 	} finally {
-		release();
-		restore();
+		await controlled.testReleasePulls();
 	}
 }
 
@@ -97,7 +74,7 @@ function ownerOf(parent: TestPartition, hashKey: string): TestPartition {
 
 /** A parent holding one item under `HELD_KEY`, ready to split, plus the child that will own the key. */
 async function partitionWithHeldKey(): Promise<{ parent: TestPartition; child: TestPartition }> {
-	const parent = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+	const parent = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 	await parent.put({ hashKey: kb(HELD_KEY), sortKey: kb("sk"), data: "owned-by-a-child", kind: "text" });
 	return { parent, child: ownerOf(parent, HELD_KEY) };
 }
@@ -112,7 +89,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 			// Another loop finished the whole import. This page would now re-insert rows for which the
 			// active child can already have served a delete.
 			await moveImportOn(child, { state: "imported", cursor: null });
-			release();
+			await release();
 		});
 
 		await parent.awaitSplitCompleted();
@@ -128,7 +105,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 			await waitForHold();
 			// The other loop committed past the whole items stream while this page was on the wire.
 			await moveImportOn(child, { cursor: { phase: "host", inner: { stream: "pending_tx", cursor: null } } });
-			release();
+			await release();
 		});
 
 		// The import finishes from the cursor the other loop left, so the dropped page adds nothing.
@@ -152,7 +129,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 			await parent.triggerHashSplit();
 			await waitForHold();
 			await moveImportOn(child, { state: "imported", cursor: null });
-			release();
+			await release();
 		});
 
 		await parent.awaitSplitCompleted();

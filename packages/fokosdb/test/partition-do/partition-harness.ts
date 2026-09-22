@@ -2,7 +2,8 @@
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { expect, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
-import { testPartitionStub } from "../stub-helpers.js";
+import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.js";
+import type { ControlledPartitionDO } from "../controlled-partition-do.js";
 import { RANGE_PROMOTION_FRACTION, type GetItemRpcRequest, type PutItemRpcRequest } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
@@ -20,8 +21,6 @@ import {
 import { FokosRouter } from "../../src/sharding/router.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
-import type { FokosMigrationPage } from "../../src/sharding/repartition-types.js";
-import type { FokosDbHostPage } from "../../src/shared/partition/fokos-migration-host.js";
 import { MAX_ITEM_BYTES, validateItemKeys } from "../../src/shared/transaction-limits.js";
 import {
 	type OpenedPartitionRpc,
@@ -61,6 +60,12 @@ export const PROMOTION_BIG_DATA = "x".repeat(300 * 1024);
 const RANGE_SPLIT_MAX_SIZE_MB = 1;
 const RANGE_ITEM_DATA = "x".repeat(50 * 1024);
 
+/**
+ * The namespace of `ControlledPartitionDO`. A test that holds, caps, or fails a call creates its
+ * partitions here. Each child of a split inherits the namespace from its parent.
+ */
+export const CONTROLLED_NS = "CONTROLLED_PARTITION_DO";
+
 /** Creates a root hash partition over a table name no other suite uses. */
 export function makePartition(opts?: PartitionOptions): TestPartition {
 	const { ctx, stub } = makeStub(opts);
@@ -69,14 +74,14 @@ export function makePartition(opts?: PartitionOptions): TestPartition {
 
 export class TestPartition {
 	readonly ctx: FokosDbRouteContext;
-	/** The raw stub: every call answers an envelope. `runInDurableObject` and prototype spies need it. */
+	/** The raw stub: every call answers an envelope. `runInDurableObject` needs it. */
 	readonly stub: DurableObjectStub<PartitionDO>;
 	/** The same stub with every envelope opened, as a test reads a response. */
 	readonly rpc: OpenedPartitionRpc;
 
 	private constructor(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>) {
 		this.ctx = ctx;
-		this.stub = stub ?? testPartitionStub(ctx.doName);
+		this.stub = stub ?? testPartitionStub(ctx.doName, ctx.policy.ns);
 		this.rpc = openedRpc(this.stub);
 	}
 
@@ -87,6 +92,14 @@ export class TestPartition {
 
 	get doName(): string {
 		return this.ctx.doName;
+	}
+
+	/** The seams of this partition. The partition must be in the `CONTROLLED_NS` namespace. */
+	get controlled(): DurableObjectStub<ControlledPartitionDO> {
+		if (this.ctx.policy.ns !== CONTROLLED_NS) {
+			throw new Error(`${this.doName}: a seam needs a partition in ${CONTROLLED_NS}; create the partition with { ns: CONTROLLED_NS }`);
+		}
+		return testControlledPartitionStub(this.doName);
 	}
 
 	put(req: PutItemRpcRequest) {
@@ -508,71 +521,15 @@ async function migrationProbe(child: TestPartition): Promise<string> {
 	return await Promise.race([probe(), blocked]);
 }
 
-type MigrationPull = PartitionDO["fokosMigrationPull"];
-
-/**
- * Puts a different `fokosMigrationPull` on the class of `instance` for the time of one test.
- *
- * `make` receives the initial method and gives back the method to install. `restore()` puts the
- * initial method back. `installed()` tells you if the replacement is still in place.
- *
- * The replacement MUST go on the prototype, which is the class. The RPC dispatcher looks for the
- * method there. If you put the method on the DO object, the dispatcher refuses it ("receiver does
- * not implement the method"). All partitions of the test use the same class. Thus the new method
- * must compare `this` with `instance`, and it must send each other call to the initial method.
- *
- * The replacement is a plain property write, and not `vi.spyOn`. `restoreMocks` is on in
- * vitest.config.ts, thus vitest calls `vi.restoreAllMocks()` around each test. That call removes
- * all spies, also a spy that a different test installed and still uses. A test that holds a
- * migration keeps its replacement for many seconds, and a spy is not safe for that time. Vitest
- * does not know a plain property write, thus this replacement stays until `restore()`.
- *
- * Only one test can hold a replacement at one time. Two installs on the same class make a chain,
- * and each install keeps the other install as its initial method. Thus the suites that use this
- * helper are sequential, and `installed()` finds a condition that must not occur.
- */
-function replaceMigrationPull(
-	instance: PartitionDO,
-	make: (original: MigrationPull) => MigrationPull,
-): { restore: () => void; installed: () => boolean } {
-	const prototype: PartitionDO = Object.getPrototypeOf(instance);
-	const descriptor = Object.getOwnPropertyDescriptor(prototype, "fokosMigrationPull");
-	invariant(descriptor?.value, "fokosMigrationPull is not a data property of the PartitionDO prototype");
-	const patched = make(descriptor.value as MigrationPull);
-	// A class method is not enumerable. The descriptor keeps that property, and an assignment does not.
-	Object.defineProperty(prototype, "fokosMigrationPull", { ...descriptor, value: patched });
-	return {
-		restore: () => Object.defineProperty(prototype, "fokosMigrationPull", descriptor),
-		installed: () => prototype.fokosMigrationPull === patched,
-	};
-}
-
 /** Holds every child transaction-metadata request, then releases and completes the split. */
 export async function withMigrationHeld<T>(
 	parent: TestPartition,
 	run: (waitForAllRequests: () => Promise<void>) => Promise<T>,
 ): Promise<T> {
-	let release!: () => void;
-	const requestedBy = new Set<string>();
-	const held = new Promise<void>((resolve) => {
-		release = resolve;
-	});
-	const { restore, installed } = await runInDurableObject(parent.stub, (instance: PartitionDO) =>
-		replaceMigrationPull(
-			instance,
-			(original) =>
-				async function (this: PartitionDO, req) {
-					// Held in the pending-transaction stream, which is the last stream an import runs. Every
-					// target has pulled its items by then, so the whole tree migrates when the wait returns.
-					const inPendingTx = req.cursor?.phase === "host" && (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx";
-					if (this === instance && inPendingTx) {
-						requestedBy.add(req.target.doName);
-						await held;
-					}
-					return await original.call(this, req);
-				},
-		),
-	);
+	const source = parent.controlled;
+	// Held in the pending-transaction stream, which is the last stream an import runs. Every target
+	// has pulled its items by then, so the whole tree migrates when the wait returns.
+	await source.testHoldPulls({ stream: "pending_tx" });
 	try {
 		return await run(async () => {
 			// The probe reads the children. A read can also start a child that waits for its alarm. This
@@ -581,12 +538,9 @@ export async function withMigrationHeld<T>(
 			const probeAfter = Date.now() + 25_000;
 			await vi.waitFor(
 				async () => {
-					const missing = (await parent.children()).filter((child) => !requestedBy.has(child.doName));
+					const { heldTargets } = await source.testPullStats();
+					const missing = (await parent.children()).filter((child) => !heldTargets.includes(child.doName));
 					if (missing.length === 0) return;
-					// All partitions use the same class. If a different test replaces `fokosMigrationPull`
-					// while this hold is active, the pulls go to the other method, and this function records
-					// no child. The report below then names the children, but the cause is the lost hold.
-					invariant(installed(), `${parent.doName}: a different test removed the migration hold while it was active`);
 					const names = missing.map((child) => child.doName).join(", ");
 					if (Date.now() < probeAfter) {
 						throw new Error(`migration RPC not received from ${names}`);
@@ -597,8 +551,7 @@ export async function withMigrationHeld<T>(
 			);
 		});
 	} finally {
-		release();
-		restore();
+		await source.testReleasePulls();
 		if ((await parent.status()).splitStatus) await parent.awaitSplitCompleted();
 	}
 }
@@ -614,29 +567,18 @@ export async function withMigrationHeld<T>(
 export async function withMigrationBatchCap<T>(
 	parent: TestPartition,
 	maxRows: number,
-	run: (stats: { calls: () => number; truncated: () => number }) => Promise<T>,
+	run: (stats: { calls: () => Promise<number>; truncated: () => Promise<number> }) => Promise<T>,
 ): Promise<T> {
 	invariant(maxRows >= 1, "withMigrationBatchCap: maxRows must be >= 1");
-	let calls = 0;
-	let truncated = 0;
-	const { restore } = await runInDurableObject(parent.stub, (instance: PartitionDO) =>
-		replaceMigrationPull(
-			instance,
-			(original) =>
-				async function (this: PartitionDO, req) {
-					const page = await original.call(this, req);
-					if (this !== instance) return page;
-					calls++;
-					const capped = capPage(page, maxRows);
-					if (capped) truncated++;
-					return capped ?? page;
-				},
-		),
-	);
+	const source = parent.controlled;
+	await source.testCapPulls(maxRows);
 	try {
-		return await run({ calls: () => calls, truncated: () => truncated });
+		return await run({
+			calls: async () => (await source.testPullStats()).calls,
+			truncated: async () => (await source.testPullStats()).truncated,
+		});
 	} finally {
-		restore();
+		await source.testReleasePulls();
 		if ((await parent.status()).splitStatus) await parent.awaitSplitCompleted();
 	}
 }
@@ -669,39 +611,4 @@ export async function makeTriggeredRangeRoot(
 	const start = sks.length;
 	sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
 	return { root, sks, hashPartition };
-}
-
-/**
- * Truncates one page to `maxRows` rows and points its cursor at the last row it kept. It returns null
- * when the page already fits. The flow owns the overrides phase and the host owns its own streams, so
- * each one carries its own row shape and its own cursor.
- */
-function capPage(page: FokosMigrationPage, maxRows: number): FokosMigrationPage | null {
-	if (page.phase === "overrides") {
-		if (page.overrides.length <= maxRows) return null;
-		const kept = page.overrides.slice(0, maxRows);
-		return { phase: "overrides", overrides: kept, nextCursor: { phase: "overrides", inner: { hashKey: kept[maxRows - 1].hashKey } } };
-	}
-	const hostPage = page.page as FokosDbHostPage;
-	if (hostPage.stream === "items") {
-		if (hostPage.items.length <= maxRows) return null;
-		const kept = hostPage.items.slice(0, maxRows);
-		const last = kept[maxRows - 1];
-		return {
-			phase: "host",
-			page: { stream: "items", items: kept },
-			nextCursor: { phase: "host", inner: { stream: "items", cursor: { hk: last.hk, sk: last.sk } } },
-		};
-	}
-	if (hostPage.pendingTransactions.length <= maxRows) return null;
-	const kept = hostPage.pendingTransactions.slice(0, maxRows);
-	const last = kept[maxRows - 1];
-	return {
-		phase: "host",
-		page: { ...hostPage, pendingTransactions: kept },
-		nextCursor: {
-			phase: "host",
-			inner: { stream: "pending_tx", cursor: { hk: last.hk, sk: last.sk, transaction_id: last.transaction_id } },
-		},
-	};
 }

@@ -5,10 +5,21 @@
 import { env } from "cloudflare:workers";
 import type { PartitionDO } from "../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+import type { PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import type { ControlledPartitionDO } from "./controlled-partition-do.js";
 
 /** A name is a string and an id is an object, so one function serves both. */
-export function testPartitionStub(nameOrId: string | DurableObjectId): DurableObjectStub<PartitionDO> {
-	return typeof nameOrId === "string" ? env.PARTITION_DO.getByName(nameOrId) : env.PARTITION_DO.get(nameOrId);
+export function testPartitionStub(
+	nameOrId: string | DurableObjectId,
+	ns: PartitionNamespaceKey = "PARTITION_DO",
+): DurableObjectStub<PartitionDO> {
+	const namespace: DurableObjectNamespace<PartitionDO> = env[ns];
+	return typeof nameOrId === "string" ? namespace.getByName(nameOrId) : namespace.get(nameOrId);
+}
+
+/** A partition of `ControlledPartitionDO`, with the RPCs of its seams. */
+export function testControlledPartitionStub(name: string): DurableObjectStub<ControlledPartitionDO> {
+	return env.CONTROLLED_PARTITION_DO.getByName(name);
 }
 
 export function testCoordinatorStubByName(doName: string): DurableObjectStub<TransactionCoordinatorDO> {

@@ -14,7 +14,15 @@ import type { StoredItem } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, opened } from "./helpers.js";
-import { drainUntil, makePartition, makeTriggeredRangeRoot, withMigrationHeld, rangeOf, type TestPartition } from "./partition-harness.js";
+import {
+	CONTROLLED_NS,
+	drainUntil,
+	makePartition,
+	makeTriggeredRangeRoot,
+	withMigrationHeld,
+	rangeOf,
+	type TestPartition,
+} from "./partition-harness.js";
 
 const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
 	hashKey: kb(hashKey),
@@ -31,10 +39,9 @@ const queryRequest = (hashKey: string, overrides: Partial<QueryItemsRpcRequest> 
 	...overrides,
 });
 
-// The tests in this file operate one after the other. Some tests hold a migration open, and to do
-// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
-// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
-// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+// The tests in this file operate one after the other. Some tests hold a migration open on a
+// partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
+// operates at the same time cannot remove it.
 describe("PartitionDO — fokosExecuteLocal", () => {
 	// The two hash-split tests exercise the same two-child topology, so the split runs once.
 	let shared: { partition: TestPartition; children: TestPartition[]; repartitionId: string };
@@ -108,7 +115,7 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		// The defect: a hash child importing from its parent read a promoted key out of the parent's
 		// local rows. Promotion GC makes those rows stale and then deletes them, so the child served a
 		// stale value and later an empty answer, for a key whose data lives in the range tree.
-		const partition = makePartition({ hashSplitConditions: { maxSizeMb: 1 } });
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: 1 } });
 		await partition.triggerPromotion("alice", (i) => `sk${i + 1}`);
 		const rangeRoot = await partition.awaitPromoted("alice");
 		await drainUntil(

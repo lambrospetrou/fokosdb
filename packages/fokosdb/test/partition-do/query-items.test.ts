@@ -21,6 +21,7 @@ import type { FokosEnvelope } from "../../src/sharding/runtime-types.js";
 import { kb, makeStub, opened, type Opened } from "./helpers.js";
 import {
 	type TestPartition,
+	CONTROLLED_NS,
 	makePartition,
 	makeRangeRoot,
 	makeTriggeredRangeRoot,
@@ -29,10 +30,9 @@ import {
 	rangeOf,
 } from "./partition-harness.js";
 
-// The tests in this file operate one after the other. Some tests hold a migration open, and to do
-// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
-// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
-// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+// The tests in this file operate one after the other. Some tests hold a migration open on a
+// partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
+// operates at the same time cannot remove it.
 describe("PartitionDO — range split", () => {
 	// One request with every budget wide open; tests override the budget they exercise.
 	const fullRequest = (overrides: Partial<QueryItemsRpcRequest> = {}): QueryItemsRpcRequest => ({
@@ -126,9 +126,7 @@ describe("PartitionDO — range split", () => {
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
 
-				const result = opened(
-					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 10 })),
-				);
+				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 10 })));
 
 				expect(result.items).toEqual([]);
 				expect(result.responseBytes).toBe(0);
@@ -250,16 +248,12 @@ describe("PartitionDO — range split", () => {
 				expect(cnt.nextCursor).toBeNull();
 
 				// The projection cursor resumes under count at the rejected candidate.
-				const cntResume = opened(
-					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", cursor: proj.nextCursor })),
-				);
+				const cntResume = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", cursor: proj.nextCursor })));
 				expect(cntResume.count).toBe(4);
 				expect(cntResume.nextCursor).toBeNull();
 
 				// The count cursor resumes under projection and materializes the rest.
-				const cnt3 = opened(
-					await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 3 })),
-				);
+				const cnt3 = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", remainingEvaluatedItems: 3 })));
 				expect(cnt3.count).toBe(3);
 				expect(cnt3.nextCursor).not.toBeNull();
 				const projResume = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, cursor: cnt3.nextCursor })));
@@ -582,7 +576,7 @@ describe("PartitionDO — range split", () => {
 				// fokosExecuteLocal always calls queryItemsLocal and bypasses the child routing. forwardCount=0
 				// asserts that: a walk of the children would report one forward per child, migrated or not.
 				const N = 2;
-				const { root, sks } = await makeRangeRoot(N);
+				const { root, sks } = await makeRangeRoot(N, { ns: CONTROLLED_NS });
 
 				// Start the real split with child transaction-metadata responses held at the parent.
 				// Check the migration state instead of assuming that child alarms have not run.
@@ -817,7 +811,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a migrating range child answers a count query from its parent", { concurrent: false }, async () => {
 			const N = 2;
-			const { root, sks } = await makeRangeRoot(N);
+			const { root, sks } = await makeRangeRoot(N, { ns: CONTROLLED_NS });
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
 				const start = sks.length;
 				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
@@ -889,7 +883,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a migrating range child answers a projected query from its parent", { concurrent: false }, async () => {
 			const N = 2;
-			const { root, sks } = await makeRangeRoot(N);
+			const { root, sks } = await makeRangeRoot(N, { ns: CONTROLLED_NS });
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
 				const start = sks.length;
 				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));
@@ -916,7 +910,7 @@ describe("PartitionDO — range split", () => {
 
 		it("a migrating range child answers a filtered query from its parent", { concurrent: false }, async () => {
 			const N = 2;
-			const { root, sks } = await makeRangeRoot(N);
+			const { root, sks } = await makeRangeRoot(N, { ns: CONTROLLED_NS });
 			await withMigrationHeld(root, async (waitForAllChildRequests) => {
 				const start = sks.length;
 				sks.push(...(await root.triggerRangeSplit((i) => `sk${String(i + start).padStart(3, "0")}-${crypto.randomUUID()}`)));

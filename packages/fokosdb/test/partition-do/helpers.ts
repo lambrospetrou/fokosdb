@@ -106,7 +106,7 @@ export function makeStub(opts?: PartitionOptions) {
 		...opts,
 	});
 	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy).rootContext(kb("dummyHashKey"));
-	const stub = testPartitionStub(ctx.doName);
+	const stub = testPartitionStub(ctx.doName, ctx.policy.ns);
 	return { ctx, stub, rpc: openedRpc(stub) };
 }
 

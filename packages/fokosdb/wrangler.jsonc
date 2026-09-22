@@ -14,7 +14,7 @@
 	"compatibility_flags": ["nodejs_compat"],
 	"migrations": [
 		{
-			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "CustomPartitionDO", "ErrorProbeDO"],
+			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "CustomPartitionDO", "ControlledPartitionDO", "ErrorProbeDO"],
 			"tag": "v1",
 		},
 	],
@@ -31,6 +31,10 @@
 			{
 				"class_name": "CustomPartitionDO",
 				"name": "CUSTOM_PARTITION_DO",
+			},
+			{
+				"class_name": "ControlledPartitionDO",
+				"name": "CONTROLLED_PARTITION_DO",
 			},
 			{
 				"class_name": "ErrorProbeDO",

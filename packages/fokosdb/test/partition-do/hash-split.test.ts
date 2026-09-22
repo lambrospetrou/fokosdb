@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
-import { beforeAll, describe, it } from "vitest";
+import { beforeAll, describe, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
@@ -12,6 +12,7 @@ import { compileProjectionExpression } from "../../src/shared/expression/compile
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
 	assertSplitTreeComplete,
+	CONTROLLED_NS,
 	drainUntil,
 	makePartition,
 	TestPartition,
@@ -19,10 +20,9 @@ import {
 	withMigrationHeld,
 } from "./partition-harness.js";
 
-// The tests in this file operate one after the other. Some tests hold a migration open, and to do
-// this they replace a method on the prototype that every PartitionDO shares. If two tests operate
-// at the same time, one test removes the replacement of the other test. The `{ concurrent: false }`
-// mark on those tests stays, and it protects them if a person makes this suite concurrent again.
+// The tests in this file operate one after the other. Some tests hold a migration open on a
+// partition of `ControlledPartitionDO`. The hold is a field of that one instance, thus a test that
+// operates at the same time cannot remove it.
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
 		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
@@ -522,7 +522,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("arms TTL deletion after child migration completes", { concurrent: false }, async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			await partition.put({ hashKey: kb("ttl-migration"), sortKey: kb("sk"), data: "value", kind: "text" });
 
 			let children: TestPartition[] = [];
@@ -557,7 +557,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("putItem is rejected while migration is in progress", { concurrent: false }, async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			await partition.put({ hashKey: kb("key1"), sortKey: kb("sk"), data: "value1", kind: "text" });
 
 			// Install the RPC delay before the write that triggers the split.
@@ -567,6 +567,9 @@ describe("PartitionDO - splitting", () => {
 			await withMigrationHeld(partition, async (waitForAllChildRequests) => {
 				await partition.triggerHashSplit();
 				await partition.awaitSplitStarted();
+				// `restoreMocks` in vitest.config.ts makes this call around each test of the isolate. The
+				// hold is a field of the source instance, thus the call must not release it.
+				vi.restoreAllMocks();
 				await waitForAllChildRequests();
 				const child = await partition.childOwning("key1");
 				expect((await child.status()).migrationStatus).toBe("migration_migrating");
@@ -589,7 +592,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("getItem on a child reads through to the parent while migration is in progress", { concurrent: false }, async ({ expect }) => {
-			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+			const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 			const { ctx, stub, rpc } = partition;
 
 			const seedItems = [
@@ -644,7 +647,7 @@ describe("PartitionDO - splitting", () => {
 			"migrates all items correctly when the parent sends data in multiple cursor-paginated batches",
 			{ concurrent: false },
 			async ({ expect }) => {
-				const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+				const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 				const { ctx, stub, rpc } = partition;
 
 				// Items with a mix of null and non-null sort keys to exercise the null-sk cursor boundary.
@@ -663,7 +666,7 @@ describe("PartitionDO - splitting", () => {
 				// migration stream (items, pending transactions, promoted keys).
 				await withMigrationBatchCap(partition, 1, async ({ truncated }) => {
 					await partition.splitHash();
-					expect(truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
+					expect(await truncated(), "the batch cap should have forced extra round trips").toBeGreaterThan(0);
 				});
 
 				// Every item is reachable through root via forwarding.
