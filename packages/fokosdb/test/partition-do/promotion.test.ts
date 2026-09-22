@@ -149,7 +149,6 @@ describe.concurrent("PartitionDO — hash-child migration excludes promoted keys
 			[partition, rangeRoot],
 			async () => (await partition.localItemCount("alice")) === 0,
 			"alice to be garbage-collected from the hash DO",
-			8000,
 		);
 
 		// Trigger the hash split with spread data; none of it exceeds the per-key promotion threshold.

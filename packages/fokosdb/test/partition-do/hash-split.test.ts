@@ -553,7 +553,7 @@ describe("PartitionDO - splitting", () => {
 				}
 				expect(await countExpired()).toBe(1);
 			});
-			await drainUntil(children, async () => (await countExpired()) === 0, "TTL sweep after migration", 10_000);
+			await drainUntil(children, async () => (await countExpired()) === 0, "TTL sweep after migration");
 		});
 
 		it("putItem is rejected while migration is in progress", { concurrent: false }, async ({ expect }) => {

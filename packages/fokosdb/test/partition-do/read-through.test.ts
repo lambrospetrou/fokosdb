@@ -115,7 +115,6 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			[partition, rangeRoot],
 			async () => (await partition.localItemCount("alice")) === 0,
 			"alice to be garbage-collected from the hash DO",
-			8000,
 		);
 
 		// Split with the child transaction-metadata responses held: the children have pulled their items

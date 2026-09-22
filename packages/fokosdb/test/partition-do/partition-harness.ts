@@ -18,6 +18,7 @@ import {
 	resolveRangePartitionContext,
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
+import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
 import type { FokosMigrationPage } from "../../src/sharding/repartition-types.js";
 import type { FokosDbHostPage } from "../../src/shared/partition/fokos-migration-host.js";
@@ -178,13 +179,28 @@ export class TestPartition {
 		await runDurableObjectAlarm(this.stub);
 	}
 
-	/** Runs one alarm pass through the current split tree. */
-	private async runTreeAlarms(): Promise<void> {
-		await this.runAlarm();
-		const state = await this.status();
-		if (!state.splitStatus || state.splitStatus.status === "split_queued") return;
+	/**
+	 * Runs one scheduler pass on this partition. The pass is the same work that the alarm runs. The
+	 * result tells if the pass changed the lifecycle or the job record, and when the next work is due.
+	 */
+	async runDueWork(): Promise<DrivePass> {
+		return await runInDurableObject(this.stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const snapshot = () =>
+				JSON.stringify({ lifecycle: instance.fokos.lifecycle(), jobs: state.storage.kv.get(FOKOS_KV_KEYS.JOBS) ?? null });
+			const before = snapshot();
+			await instance.fokos.runDueWork();
+			const after = snapshot();
+			return { doName: this.doName, changed: after !== before, alarmAt: await state.storage.getAlarm(), snapshot: after };
+		});
+	}
 
-		for (const child of await this.children()) await child.runTreeAlarms();
+	/** This partition and each node below it that the split created. */
+	private async splitTree(): Promise<TestPartition[]> {
+		const state = await this.status();
+		if (!state.splitStatus || state.splitStatus.status === "split_queued") return [this];
+		const nodes: TestPartition[] = [this];
+		for (const child of await this.children()) nodes.push(...(await child.splitTree()));
+		return nodes;
 	}
 
 	/** Writes distributed filler items until this partition starts a hash split. */
@@ -298,15 +314,10 @@ export class TestPartition {
 
 	/** Drives this partition's own split to completion, driving the whole subtree on each attempt. */
 	async awaitSplitCompleted(): Promise<void> {
-		await vi.waitFor(
-			async () => {
-				await this.runTreeAlarms();
-				const state = await this.status();
-				if (state.splitStatus?.status !== "split_completed")
-					throw new Error(`${this.doName}: split not completed; ${JSON.stringify(state)}`);
-				await assertSplitTreeComplete(this);
-			},
-			{ timeout: 15_000, interval: 100 },
+		await driveUntil(
+			() => this.splitTree(),
+			async () => (await this.status()).splitStatus?.status === "split_completed" && (await isSplitTreeComplete(this)),
+			`${this.doName} split completion`,
 		);
 	}
 
@@ -324,11 +335,7 @@ export class TestPartition {
 	}
 
 	/** Waits for a promotion status and drives the partitions that own the next step. */
-	async awaitPromotedKeyStatus(
-		hashKey: string,
-		statuses: readonly PromotedKeyStatus[],
-		opts?: { drive?: TestPartition[]; timeoutMs?: number },
-	): Promise<void> {
+	async awaitPromotedKeyStatus(hashKey: string, statuses: readonly PromotedKeyStatus[], opts?: { drive?: TestPartition[] }): Promise<void> {
 		await drainUntil(
 			opts?.drive ?? [this],
 			async () => {
@@ -336,7 +343,6 @@ export class TestPartition {
 				return status !== undefined && statuses.includes(status);
 			},
 			`"${hashKey}" to reach ${statuses.join(" or ")}`,
-			opts?.timeoutMs,
 		);
 	}
 
@@ -374,19 +380,10 @@ export class TestPartition {
 
 	/** Waits until no split or migration is in flight anywhere in the tree rooted here. */
 	async awaitTreeSettled(): Promise<void> {
-		await vi.waitFor(
-			async () => {
-				// A settled tree needs no alarm pass at all; nudge the tree only when the
-				// completeness check still fails.
-				try {
-					await assertSplitTreeComplete(this);
-					return;
-				} catch {
-					await this.runTreeAlarms();
-				}
-				await assertSplitTreeComplete(this);
-			},
-			{ timeout: 15_000, interval: 100 },
+		await driveUntil(
+			() => this.splitTree(),
+			async () => await isSplitTreeComplete(this),
+			`${this.doName} tree to settle`,
 		);
 	}
 
@@ -415,25 +412,64 @@ export function rangeOf(ctx: FokosDbRouteContext) {
 	return decoded;
 }
 
+/** What one scheduler pass on one partition left behind. */
+type DrivePass = { doName: string; changed: boolean; alarmAt: number | null; snapshot: string };
+
+// A round is idle when no pass changed a node and no node has an alarm. The runtime keeps an alarm
+// at the earliest deadline of its jobs, thus a node with no alarm has no work that the loop can wait
+// for. The idle rounds give an in-memory timer, such as the TTL sweep, the time to operate.
+const IDLE_ROUNDS_BEFORE_FAILURE = 20;
+const IDLE_PAUSE_MS = 100;
+// A retry or a cleanup can be due some seconds later. The loop waits for it in steps, and it
+// examines the condition after each step.
+const MAX_PENDING_PAUSE_MS = 1000;
+
 /**
- * Polls durable state until `check` passes. When progress stalls, it runs the scheduled alarm of
- * each partition in `drive` — the runtime normally fires them on its own, so the alarm pass is a
- * fallback nudge, not the primary driver.
+ * Drives the scheduler of each node until `check` passes. The loop fails when the nodes make no
+ * progress, and not when a period of time ends: a slow machine needs more time for a split, but it
+ * does not need more passes. The test timeout stops a run that hangs.
+ *
+ * The runtime also drives the same nodes with its alarm and its fast path. The scheduler runs one
+ * pass at a time, thus the two drivers cannot interleave.
  */
-export async function drainUntil(drive: TestPartition[], check: () => Promise<boolean>, label: string, timeoutMs = 15_000): Promise<void> {
-	let nextDrive = Date.now() + 1000;
-	await vi.waitFor(
-		async () => {
-			if (await check()) return;
-			if (Date.now() >= nextDrive) {
-				for (const p of drive) await p.runAlarm();
-				nextDrive = Date.now() + 1000;
-			}
-			if (!(await check()))
-				throw new Error(`timed out waiting for ${label}: ${JSON.stringify(await Promise.all(drive.map((p) => p.status())))}`);
-		},
-		{ timeout: timeoutMs, interval: 100 },
-	);
+async function driveUntil(nodes: () => Promise<TestPartition[]>, check: () => Promise<boolean>, label: string): Promise<void> {
+	let last: DrivePass[] = [];
+	for (let idle = 0; idle < IDLE_ROUNDS_BEFORE_FAILURE; ) {
+		if (await check()) return;
+		last = [];
+		for (const node of await nodes()) {
+			last.push(await node.runDueWork());
+		}
+		const now = Date.now();
+		const alarms = last.flatMap((pass) => (pass.alarmAt === null ? [] : [pass.alarmAt]));
+		if (last.some((pass) => pass.changed) || alarms.some((at) => at <= now)) {
+			idle = 0;
+		} else if (alarms.length > 0) {
+			idle = 0;
+			await scheduler.wait(Math.min(Math.min(...alarms) - now, MAX_PENDING_PAUSE_MS));
+		} else {
+			idle++;
+			await scheduler.wait(IDLE_PAUSE_MS);
+		}
+	}
+	if (await check()) return;
+	const report = last.map((pass) => `${pass.doName}: ${pass.snapshot}`).join("; ");
+	throw new Error(`${label}: no progress in ${IDLE_ROUNDS_BEFORE_FAILURE} rounds; ${report}`);
+}
+
+/** Drives each partition in `drive` until `check` passes. */
+export async function drainUntil(drive: TestPartition[], check: () => Promise<boolean>, label: string): Promise<void> {
+	await driveUntil(async () => drive, check, label);
+}
+
+/** True when each node of the split tree completed its split and its migration. */
+async function isSplitTreeComplete(node: TestPartition): Promise<boolean> {
+	const state = await node.status();
+	if (state.parentPartitionContext && state.migrationStatus !== "migration_completed") return false;
+	if (!state.splitStatus) return true;
+	if (state.splitStatus.status !== "split_completed") return false;
+	for (const child of await node.children()) if (!(await isSplitTreeComplete(child))) return false;
+	return true;
 }
 
 /** Asserts that a split tree is complete and returns its number of split nodes. */

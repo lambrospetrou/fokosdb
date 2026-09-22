@@ -24,8 +24,8 @@ export default defineConfig({
 		testTimeout: 45_000,
 		// The hooks get the same limit. The suites build their shared split trees in `beforeAll`. Thus a
 		// hook does the same waits as a test, and it needs the same time. The default limit is 10 s,
-		// which is less than the 15 s deadlines of the harness. That limit stops the setup of a full
-		// file before the file can report a state.
+		// and a split under load can need more. That limit stops the setup of a full file before the
+		// file can report a state.
 		hookTimeout: 45_000,
 	},
 	plugins: [
