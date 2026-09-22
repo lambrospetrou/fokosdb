@@ -49,6 +49,31 @@ importers:
         specifier: ^4.131.0
         version: 4.131.0(@types/node@25.9.5)
 
+  examples/sharding-demo:
+    dependencies:
+      fokosdb:
+        specifier: workspace:*
+        version: link:../../packages/fokosdb
+      hono:
+        specifier: ^4.12.22
+        version: 4.13.5
+    devDependencies:
+      '@cloudflare/vitest-pool-workers':
+        specifier: ^0.16.9
+        version: 0.16.20(@vitest/runner@4.1.11)(@vitest/snapshot@4.1.11)(vitest@4.1.11(@types/node@25.9.5)(vite@8.2.2(@types/node@25.9.5)(esbuild@0.28.1)(jiti@2.7.0)))
+      '@types/node':
+        specifier: ^25.6.0
+        version: 25.9.5
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^4.1.7
+        version: 4.1.11(@types/node@25.9.5)(vite@8.2.2(@types/node@25.9.5)(esbuild@0.28.1)(jiti@2.7.0))
+      wrangler:
+        specifier: ^4.131.0
+        version: 4.131.0(@types/node@25.9.5)
+
   examples/typed-keys:
     dependencies:
       fokosdb:
