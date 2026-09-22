@@ -343,13 +343,29 @@ export async function buildFixture(): Promise<Fixture> {
 	const db = makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
 	const model: QueryModel = new Map();
 
-	for (let i = 0; i < PROMOTE_ITEMS; i++) await putAndRecord(db, model, HOT_HASH_KEY, hotSortKey(i), hotData(hotSortKey(i)));
+	// Writes land a batch at a time: one put per round trip would spend the build on waiting, and
+	// two puts of one batch never name the same key.
+	const BUILD_BATCH = 16;
+	const putRange = async (start: number, end: number) => {
+		for (let i = start; i < end; i += BUILD_BATCH) {
+			await Promise.all(
+				Array.from({ length: Math.min(BUILD_BATCH, end - i) }, (_, j) => {
+					const sortKey = hotSortKey(i + j);
+					return putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey));
+				}),
+			);
+		}
+	};
+
+	await putRange(0, PROMOTE_ITEMS);
 	// The range root must exist before the rest of the payload arrives. Its name carries ".r.".
 	await awaitLeaves(db, (leaves) => leaves.some((name) => name.includes(".r.")), "the hot key is promoted");
 
-	for (let i = PROMOTE_ITEMS; i < HOT_ITEMS; i++) await putAndRecord(db, model, HOT_HASH_KEY, hotSortKey(i), hotData(hotSortKey(i)));
-	for (const sortKey of BINARY_SORT_KEYS) await putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey));
-	for (const [index, sortKey] of COLD_SORT_KEYS.entries()) await putAndRecord(db, model, COLD_HASH_KEY, sortKey, coldData(sortKey, index));
+	await putRange(PROMOTE_ITEMS, HOT_ITEMS);
+	await Promise.all([
+		...BINARY_SORT_KEYS.map((sortKey) => putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey))),
+		...COLD_SORT_KEYS.map((sortKey, index) => putAndRecord(db, model, COLD_HASH_KEY, sortKey, coldData(sortKey, index))),
+	]);
 
 	// The tree must grow past its root, and it must stop growing before the properties read it: a
 	// split that runs under a property makes a page race the topology it walks.
@@ -371,9 +387,13 @@ export async function buildFixture(): Promise<Fixture> {
 	// of its own and carries none of the page, and it must still not break the position the next
 	// child resumes from.
 	const empty = middleLeafKeys(sorted, boundaries);
-	for (const sortKey of empty) {
-		await untilAvailable(() => db.deleteItem({ hashKey: HOT_HASH_KEY, sortKey }));
-		model.delete(itemId(HOT_HASH_KEY, sortKey));
+	for (let i = 0; i < empty.length; i += BUILD_BATCH) {
+		await Promise.all(
+			empty.slice(i, i + BUILD_BATCH).map(async (sortKey) => {
+				await untilAvailable(() => db.deleteItem({ hashKey: HOT_HASH_KEY, sortKey }));
+				model.delete(itemId(HOT_HASH_KEY, sortKey));
+			}),
+		);
 	}
 	const emptiedLeaf = await leavesOf(db, {
 		queries: [
