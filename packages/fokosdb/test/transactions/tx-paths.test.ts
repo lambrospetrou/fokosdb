@@ -232,7 +232,10 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("keeps a transaction that carries a clientRequestToken on the coordinator path", async () => {
-		const db = sharedDb;
+		// The coordinator stamps the transaction with its own clock, and a partition refuses a stamp that
+		// is not above its last delete or read. A shared table has the deletes and reads of other tests,
+		// and the clock can go back. Thus this test uses a table of its own.
+		const db = makeDB({ rootTreesN: 8, controlled: true });
 		const keys = keysInOnePartition(db, 2, "fast-token");
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "tokened" }));
 		const clientRequestToken = `fast-token-${crypto.randomUUID()}`;
@@ -273,7 +276,10 @@ describe("transactions - single-partition fast path", () => {
 	});
 
 	it("runs the coordinator path for a write when the partition cannot execute the whole set", async () => {
-		const db = sharedDb;
+		// The coordinator stamps the transaction with its own clock, and a partition refuses a stamp that
+		// is not above its last delete or read. A shared table has the deletes and reads of other tests,
+		// and the clock can go back. Thus this test uses a table of its own.
+		const db = makeDB({ rootTreesN: 8, controlled: true });
 		const keys = keysInOnePartition(db, 2, "fast-write-fallback");
 
 		// A partition answers this when the items straddle a split or a promotion below it. The answer
@@ -289,7 +295,8 @@ describe("transactions - single-partition fast path", () => {
 		);
 
 		expect(await calls()).toMatchObject({ txExecuteSingleShot: 1, initiateWrite: 1 });
-		expect(result.outcome).toBe("committed");
+		// The whole result, so that a cancel shows the reason of each operation.
+		expect(result).toMatchObject({ outcome: "committed" });
 		for (const key of keys) {
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: "via-coordinator" } });
 		}
