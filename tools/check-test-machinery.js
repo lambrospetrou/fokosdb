@@ -10,12 +10,7 @@ const PACKAGE_DIR = join(import.meta.dirname, "../packages/fokosdb");
 // Files that still have a prototype spy. Each entry is work to do: move the spy to a seam on a
 // test-only subclass, then remove the entry. The check fails when an entry has no spy.
 const PROTOTYPE_SPY_EXCEPTIONS = {
-	"test/partition-do/destroy-fence.test.ts": "Holds fokosInit on the children of a split. testHoldInit can replace it.",
 	"test/partition-do/promotion.test.ts": "PartialRangeTopology is private to the runtime, thus no subclass can reach it.",
-	"test/transactions/tx-paths.test.ts": "Counts the read and write RPCs. Needs call counters and a coordinator subclass.",
-	"test/transactions/tx-commit-fanout.test.ts": "Shortens the fan-out and stale budgets, and fails txCommit and txCancel on one partition.",
-	"test/transactions/tx-end-to-end.test.ts": "Changes the txReadForTransaction response. Needs real state and a hold after phase one.",
-	"test/transactions/tx-read-revisions.test.ts": "Mutates state between the two read phases. Needs a hold after phase one.",
 };
 
 const TIMER_MARKER = "guard: allow-timer";

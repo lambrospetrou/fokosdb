@@ -23,6 +23,7 @@ export class CustomPartitionDO extends PartitionDO {}
 
 // Partition tests that must hold, cap, or fail one call use this class. See the module for the seams.
 export { ControlledPartitionDO } from "./controlled-partition-do.js";
+export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
 
 export default {
 	async fetch(): Promise<Response> {

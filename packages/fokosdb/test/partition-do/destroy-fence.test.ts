@@ -13,7 +13,7 @@ import type { FokosDbRouteContext } from "../../src/shared/partition-context.js"
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
-import { makePartition, TestPartition } from "./partition-harness.js";
+import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
 /** Every entry of every page, so a test reads the whole view the traversal would walk. */
 async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbRouteContext) {
@@ -174,30 +174,18 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 	});
 
 	it("waits for the target RPC a source step is parked in, and lets no transition follow it", async ({ expect }) => {
-		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		let release!: () => void;
-		const held = new Promise<void>((resolve) => {
-			release = resolve;
-		});
-		let calls = 0;
-
-		// The spy MUST go on the prototype. The RPC dispatcher rejects a method installed as an own
-		// property on the DO instance. It is scoped to the children of this one split, so a stray call
-		// from another partition passes through.
-		const childNames = new Set(partition.hashChildren().map((c) => c.doName));
-		const prototype = PartitionDO.prototype;
-		const original = prototype.fokosInit;
-		const spy = vi.spyOn(prototype, "fokosInit").mockImplementation(async function (this: PartitionDO, req) {
-			if (!childNames.has(req.target.doName)) return await original.call(this, req);
-			calls++;
-			await held;
-			return await original.call(this, req);
-		});
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+		const children = partition.hashChildren().map((c) => c.controlled);
+		for (const child of children) await child.testHoldInit();
+		const release = async () => {
+			for (const child of children) await child.testReleaseInit();
+		};
+		const initCalls = async () => (await Promise.all(children.map((c) => c.testInitCalls()))).reduce((a, b) => a + b, 0);
 
 		try {
 			await partition.triggerHashSplit();
 			// The background pass of the parent is now inside the child call and cannot take its next step.
-			await vi.waitFor(() => expect(calls).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+			await vi.waitFor(async () => expect(await initCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
 
 			let settled = false;
 			const prepare = partition.stub.fokosPrepareDestroy({}).then(() => void (settled = true));
@@ -206,11 +194,10 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 			await new Promise((resolve) => setTimeout(resolve, 100));
 			expect(settled, "fokosPrepareDestroy returned while a source step was still in flight").toBe(false);
 
-			release();
+			await release();
 			await prepare;
 		} finally {
-			release();
-			spy.mockRestore();
+			await release();
 		}
 
 		// The parked step recorded its own result, and nothing ran after it. The split never cut over.

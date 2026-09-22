@@ -7,7 +7,7 @@
  * a field of one instance, and nothing else can reach it.
  *
  * The class adds no behavior of its own: `PartitionDO` does all the work, and each override only
- * holds, counts, truncates, or fails one call.
+ * holds, counts, truncates, answers, or fails one call, or replaces one tuning value.
  */
 import { PartitionDO } from "../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../src/shared/partition-context.js";
@@ -41,13 +41,77 @@ export function streamOf(req: FokosMigrationPullRequest): MigrationStream {
 	return (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx" ? "pending_tx" : "items";
 }
 
+/** The transaction operations that this class logs, and that a test can make answer or fail. */
+export type TxOp = "txReadSnapshot" | "txReadForTransaction" | "txExecuteSingleShot" | "txCommit" | "txCancel";
+export type TxRequest<Op extends TxOp> = Parameters<PartitionDO[Op]>[1];
+type TxResponse<Op extends TxOp> = Awaited<ReturnType<PartitionDO[Op]>>;
+
+/**
+ * What an operation does in place of its work, for `times` calls. `error` fails the call with that
+ * message, and `value` answers the call with that value.
+ */
+export type TxResponseRule<Op extends TxOp> = ({ error: string } | { value: TxResponse<Op> }) & { times?: number };
+
 export class ControlledPartitionDO extends PartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
 	#pullCap: number | null = null;
 	#pullStats: PullStats = { calls: 0, truncated: 0, heldTargets: [] };
 	#initGate: Gate | null = null;
 	#initCalls = 0;
-	#failCommits = 0;
+	#txCalls: { [Op in TxOp]: TxRequest<Op>[] } = {
+		txReadSnapshot: [],
+		txReadForTransaction: [],
+		txExecuteSingleShot: [],
+		txCommit: [],
+		txCancel: [],
+	};
+	#txRules: { [Op in TxOp]?: TxResponseRule<Op> } = {};
+	#readGate: (Gate & { parked: boolean }) | null = null;
+	#staleTransactionMs: number | null = null;
+
+	/**
+	 * Logs the call, and applies the rule of `op` when one exists. Else it returns the promise of
+	 * `PartitionDO` itself, so a call with no rule has the same timing as on `PartitionDO`.
+	 */
+	#tx<Op extends TxOp>(op: Op, req: TxRequest<Op>, work: () => Promise<TxResponse<Op>>): Promise<TxResponse<Op>> {
+		(this.#txCalls[op] as TxRequest<Op>[]).push(req);
+		const rule = this.#txRules[op] as TxResponseRule<Op> | undefined;
+		if (!rule) return work();
+		if (rule.times !== undefined && --rule.times <= 0) delete this.#txRules[op];
+		return "error" in rule ? Promise.reject(new Error(rule.error)) : Promise.resolve(rule.value);
+	}
+
+	override txReadSnapshot(ctx: FokosDbRouteContext, req: TxRequest<"txReadSnapshot">) {
+		return this.#tx("txReadSnapshot", req, () => super.txReadSnapshot(ctx, req));
+	}
+
+	override txReadForTransaction(ctx: FokosDbRouteContext, req: TxRequest<"txReadForTransaction">) {
+		return this.#tx("txReadForTransaction", req, async () => {
+			const response = await super.txReadForTransaction(ctx, req);
+			const readGate = this.#readGate;
+			if (readGate && !readGate.parked) {
+				readGate.parked = true;
+				await readGate.held;
+			}
+			return response;
+		});
+	}
+
+	override txExecuteSingleShot(ctx: FokosDbRouteContext, req: TxRequest<"txExecuteSingleShot">) {
+		return this.#tx("txExecuteSingleShot", req, () => super.txExecuteSingleShot(ctx, req));
+	}
+
+	override txCommit(ctx: FokosDbRouteContext, req: TxRequest<"txCommit">) {
+		return this.#tx("txCommit", req, () => super.txCommit(ctx, req));
+	}
+
+	override txCancel(ctx: FokosDbRouteContext, req: TxRequest<"txCancel">) {
+		return this.#tx("txCancel", req, () => super.txCancel(ctx, req));
+	}
+
+	override fokosStaleTransactionMs(): number {
+		return this.#staleTransactionMs ?? super.fokosStaleTransactionMs();
+	}
 
 	override async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
 		this.#pullStats.calls++;
@@ -70,14 +134,6 @@ export class ControlledPartitionDO extends PartitionDO {
 		await super.fokosInit(req);
 		this.#initCalls++;
 		if (this.#initGate) await this.#initGate.held;
-	}
-
-	override txCommit(ctx: FokosDbRouteContext, req: Parameters<PartitionDO["txCommit"]>[1]): ReturnType<PartitionDO["txCommit"]> {
-		if (this.#failCommits > 0) {
-			this.#failCommits--;
-			return Promise.reject(new Error("simulated child commit failure"));
-		}
-		return super.txCommit(ctx, req);
 	}
 
 	/** Holds each pull that matches `spec` until `testReleasePulls`. */
@@ -115,9 +171,40 @@ export class ControlledPartitionDO extends PartitionDO {
 		return this.#initCalls;
 	}
 
-	/** Makes the next `count` calls of `txCommit` on this partition fail before they apply. */
-	async testFailCommits(count: number): Promise<void> {
-		this.#failCommits = count;
+	/** The requests of `op` that this partition received, in order of arrival. */
+	async testTxCalls<Op extends TxOp>(op: Op): Promise<TxRequest<Op>[]> {
+		return this.#txCalls[op];
+	}
+
+	/** Makes `op` answer or fail as `rule` says, until `testClearTxResponse` or until `rule.times` calls. */
+	async testTxResponse<Op extends TxOp>(op: Op, rule: TxResponseRule<Op>): Promise<void> {
+		(this.#txRules as Record<Op, TxResponseRule<Op>>)[op] = { ...rule };
+	}
+
+	async testClearTxResponse(op: TxOp): Promise<void> {
+		delete this.#txRules[op];
+	}
+
+	/**
+	 * Holds the next `txReadForTransaction` after it reads, until `testReleaseReadPhase`. The read of a
+	 * two-phase transaction is then complete, and its answer has not returned.
+	 */
+	async testHoldReadPhase(): Promise<void> {
+		this.#readGate = { ...gate(), parked: false };
+	}
+
+	async testReadPhaseParked(): Promise<boolean> {
+		return this.#readGate?.parked ?? false;
+	}
+
+	async testReleaseReadPhase(): Promise<void> {
+		this.#readGate?.release();
+		this.#readGate = null;
+	}
+
+	/** Replaces the stale-transaction time of this partition. `null` restores the shipped value. */
+	async testStaleTransactionMs(ms: number | null): Promise<void> {
+		this.#staleTransactionMs = ms;
 	}
 }
 

@@ -1,9 +1,8 @@
 import { runDurableObjectAlarm } from "cloudflare:test";
-import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { PartitionDO } from "../../src/server/do-partition.js";
-import { testPartitionStub } from "../stub-helpers.js";
-import { TX_FANOUT_REQUEST_BUDGET_MS, TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
-import { keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
+import { beforeEach, describe, it, expect, vi } from "vitest";
+import type { FokosDB } from "../../src/client/db.js";
+import { TX_FANOUT_REQUEST_BUDGET_MS } from "../../src/server/do-transaction-coordinator.js";
+import { controlledCoordinator, controlledPartition, keysAcrossPartitions, makeDB, txCalls, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 
@@ -19,39 +18,34 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		vi.useRealTimers();
 	});
 
-	afterEach(() => {
-		vi.restoreAllMocks();
-	});
-
 	// The shipped budget and stale threshold are both 5s, and a test that must watch one expire
-	// would spend that long doing nothing. These shorten the wait to the phase under test. Restore
-	// the spy before any step that has to FINISH inside the budget, so that step runs on the shipped
+	// would spend that long doing nothing. The seams shorten the wait to the phase under test. Restore
+	// the budget before any step that has to FINISH inside it, so that step runs on the shipped
 	// value — see the test below that runs the whole path on it.
 	const SHORT_BUDGET_MS = 250;
 
-	function shortenFanoutBudget() {
-		return vi.spyOn(TransactionCoordinatorDO.prototype, "fokosFanoutRequestBudgetMs").mockReturnValue(SHORT_BUDGET_MS);
-	}
-
-	function shortenStaleTransactions() {
-		return vi.spyOn(PartitionDO.prototype, "fokosStaleTransactionMs").mockReturnValue(SHORT_BUDGET_MS);
+	/** Makes the commit or cancel RPCs to the partition of `key` fail, until the test clears it. */
+	async function makeUnreachable(db: FokosDB, key: { hashKey: string; sortKey: string }, op: "txCommit" | "txCancel", error: string) {
+		const partition = controlledPartition(db, key);
+		await partition.testTxResponse(op, { error });
+		return () => partition.testClearTxResponse(op);
 	}
 
 	it("commits a multi-megabyte transaction with commit RPCs that carry keys only", async () => {
-		const db = makeDB();
+		const db = makeDB({ controlled: true });
 		// 10 items x 350 KB ≈ 3.4 MB: well over a megabyte on the wire if the payload were re-sent.
 		const keys = keysAcrossPartitions(db, 10, "keys-only");
 		const data = "x".repeat(350 * 1024);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data }));
 
-		const commitSpy = vi.spyOn(PartitionDO.prototype, "txCommit");
 		const result = await writeOutcome(db.transactWriteItems({ items }));
 
 		expect(result.outcome).toBe("committed");
 		// One commit RPC per participant, and every wire item is a bare key: the payload each
 		// participant applies comes from its own pending_transactions rows, not from the wire.
-		expect(commitSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
-		for (const [, request] of commitSpy.mock.calls) {
+		const commits = await txCalls(db, keys, "txCommit");
+		expect(commits.length).toBeGreaterThanOrEqual(2);
+		for (const request of commits) {
 			for (const item of request.items) {
 				expect(Object.keys(item).sort()).toEqual(["hashKey", "sortKey"]);
 			}
@@ -62,18 +56,13 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	});
 
 	it("answers the retryable commit-pending error when one participant is unreachable, and a token replay commits after it returns", async () => {
-		const db = makeDB();
+		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "commit-pending");
-		const unreachable = partitionNameOf(db, keys[1]);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: `data-${key.hashKey}` }));
 		const token = `commit-pending-${crypto.randomUUID()}`;
-		const budget = shortenFanoutBudget();
-
-		const orig = PartitionDO.prototype.txCommit;
-		const spy = vi.spyOn(PartitionDO.prototype, "txCommit").mockImplementation(function (this: PartitionDO, pCtx, request) {
-			if (pCtx.doName === unreachable) throw new Error("simulated participant outage");
-			return orig.call(this, pCtx, request);
-		});
+		const coordinator = controlledCoordinator(db);
+		await coordinator.testFanoutBudgetMs(SHORT_BUDGET_MS);
+		const reachable = await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
 
 		const start = Date.now();
 		const err = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token })).then(
@@ -90,8 +79,8 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(Date.now() - start).toBeLessThan(SHORT_BUDGET_MS + 3_000);
 
 		// The replay has to finish its fan-out inside the budget, so give it the shipped one.
-		budget.mockRestore();
-		spy.mockRestore();
+		await coordinator.testFanoutBudgetMs(null);
+		await reachable();
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 		// Read-your-writes: every written key, on every participant, returns the new value.
@@ -101,22 +90,17 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	});
 
 	it("answers commit-pending while a split participant's children migrate, and a token replay commits once they finish", async () => {
-		const db = makeDB();
+		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "split-window");
-		const splitting = partitionNameOf(db, keys[0]);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: `data-${key.hashKey}` }));
 		const token = `split-window-${crypto.randomUUID()}`;
-		const budget = shortenFanoutBudget();
+		const coordinator = controlledCoordinator(db);
+		await coordinator.testFanoutBudgetMs(SHORT_BUDGET_MS);
 
 		// A partition that started a split forwards the commit to its children, and a child rejects
 		// commit while it still migrates. Hold that window open deterministically instead of racing
 		// a real migration against the request budget.
-		let childrenMigrating = true;
-		const orig = PartitionDO.prototype.txCommit;
-		const spy = vi.spyOn(PartitionDO.prototype, "txCommit").mockImplementation(function (this: PartitionDO, pCtx, request) {
-			if (pCtx.doName === splitting && childrenMigrating) throw new Error("simulated split window: children migrating");
-			return orig.call(this, pCtx, request);
-		});
+		const childrenMigrated = await makeUnreachable(db, keys[0], "txCommit", "simulated split window: children migrating");
 
 		const err = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token })).then(
 			() => null,
@@ -124,9 +108,8 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		);
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 
-		childrenMigrating = false;
-		budget.mockRestore();
-		spy.mockRestore();
+		await childrenMigrated();
+		await coordinator.testFanoutBudgetMs(null);
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 		for (const key of keys) {
@@ -135,9 +118,8 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	});
 
 	it("answers cancelled while an unreachable participant still holds its locks, and the stale-transaction alarm releases them", async () => {
-		const db = makeDB();
+		const db = makeDB({ controlled: true });
 		const [checkKey, lockedKey] = keysAcrossPartitions(db, 2, "cancel-locked");
-		const unreachable = partitionNameOf(db, lockedKey);
 		// A failing check on the reachable participant cancels the transaction during prepare, after
 		// the unreachable participant already locked its key.
 		await db.putItem({ ...checkKey, data: { x: 1 } });
@@ -150,14 +132,10 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			},
 		];
 		const token = `cancel-locked-${crypto.randomUUID()}`;
-		shortenFanoutBudget();
-		shortenStaleTransactions();
-
-		const orig = PartitionDO.prototype.txCancel;
-		const spy = vi.spyOn(PartitionDO.prototype, "txCancel").mockImplementation(function (this: PartitionDO, pCtx, request) {
-			if (pCtx.doName === unreachable) throw new Error("simulated participant outage");
-			return orig.call(this, pCtx, request);
-		});
+		await controlledCoordinator(db).testFanoutBudgetMs(SHORT_BUDGET_MS);
+		const unreachableStub = controlledPartition(db, lockedKey);
+		await unreachableStub.testStaleTransactionMs(SHORT_BUDGET_MS);
+		const reachable = await makeUnreachable(db, lockedKey, "txCancel", "simulated participant outage");
 
 		const start = Date.now();
 		const result = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
@@ -173,12 +151,11 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		await expect(db.putItem({ ...lockedKey, data: "blocked" })).rejects.toThrow(fokosErrorWith("item_locked_by_transaction"));
 		await expect(db.getItem(lockedKey)).resolves.toMatchObject({ found: false });
 
-		spy.mockRestore();
+		await reachable();
 		// The stale-transaction alarm releases the lock once it ages past the stale threshold,
 		// whose clock does not depend on how long the cancel retries happened to take. Force the
 		// partition's alarm on every attempt so the release does not depend on the scheduler,
 		// and retry the write that the lock was blocking until it goes through.
-		const unreachableStub = testPartitionStub(unreachable);
 		await vi.waitFor(
 			async () => {
 				await runDurableObjectAlarm(unreachableStub);
@@ -199,16 +176,10 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	// the shipped constant and its own assertion caps it at the constant plus 3 s. Deriving the timeout
 	// keeps it above that ceiling if the constant ever changes.
 	it("waits out the shipped fan-out budget, and stops there", { timeout: TX_FANOUT_REQUEST_BUDGET_MS * 4 + 10_000 }, async () => {
-		const db = makeDB();
+		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "shipped-budget");
-		const unreachable = partitionNameOf(db, keys[1]);
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "value" }));
-
-		const orig = PartitionDO.prototype.txCommit;
-		vi.spyOn(PartitionDO.prototype, "txCommit").mockImplementation(function (this: PartitionDO, pCtx, request) {
-			if (pCtx.doName === unreachable) throw new Error("simulated participant outage");
-			return orig.call(this, pCtx, request);
-		});
+		await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
 
 		const start = Date.now();
 		const err = await writeOutcome(db.transactWriteItems({ items })).then(

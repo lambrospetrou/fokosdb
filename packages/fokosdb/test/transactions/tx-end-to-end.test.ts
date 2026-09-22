@@ -3,11 +3,20 @@ import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../../src/client/db.js";
-import { PartitionDO } from "../../src/server/do-partition.js";
 import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
-import { countDistinctPartitions, keysAcrossPartitions, makeDB, partitionNameOf, writeOutcome } from "./tx-helpers.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
+import {
+	betweenPhases,
+	countDistinctPartitions,
+	holdPendingLock,
+	keysAcrossPartitions,
+	makeDB,
+	partitionNameOf,
+	txCalls,
+	writeOutcome,
+} from "./tx-helpers.js";
 
 const passingConditions: readonly ConditionExpression[] = [
 	{ op: "eq", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
@@ -573,56 +582,44 @@ describe("transactions - end-to-end", () => {
 	});
 
 	describe("Worker read transaction driver", () => {
-		afterEach(() => {
-			vi.restoreAllMocks();
-		});
-
 		it("raises pending_write after phase one when a participant reports a pending write", async () => {
-			const db = sharedDb;
+			const db = makeDB({ controlled: true });
 			const keys = keysAcrossPartitions(db, 2, "read-pending");
-			const pendingPartition = partitionNameOf(db, keys[0]);
-			const original = PartitionDO.prototype.txReadForTransaction;
-			const spy = vi.spyOn(PartitionDO.prototype, "txReadForTransaction").mockImplementation(async function (
-				this: PartitionDO,
-				pCtx,
-				request,
-			) {
-				const response = await original.call(this, pCtx, request);
-				if (pCtx.doName !== pendingPartition) return response;
-				return { ...response, value: { items: response.value.items.map((item) => ({ ...item, hasPendingWrite: true })) } };
-			});
+			const release = await holdPendingLock(db, keys[0], { operation: "put", data: "pending", kind: "text" });
 
-			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("pending_write"));
-			expect(spy).toHaveBeenCalledTimes(2);
+			try {
+				await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("pending_write"));
+			} finally {
+				await release();
+			}
+			// Phase one ran on both participants, and phase two never started.
+			expect(await txCalls(db, keys, "txReadForTransaction")).toHaveLength(2);
 		});
 
 		it("raises read_conflict when committed item state changes between the two phases", async () => {
-			const db = sharedDb;
+			const db = makeDB({ controlled: true });
 			const keys = keysAcrossPartitions(db, 2, "read-conflict");
 			for (const key of keys) await db.putItem({ ...key, data: "value" });
-			const changingPartition = partitionNameOf(db, keys[0]);
-			const callsByPartition = new Map<string, number>();
-			const transactionIds = new Set<string>();
-			const original = PartitionDO.prototype.txReadForTransaction;
-			const spy = vi.spyOn(PartitionDO.prototype, "txReadForTransaction").mockImplementation(async function (
-				this: PartitionDO,
-				pCtx,
-				request,
-			) {
-				transactionIds.add(request.transactionId);
-				const call = (callsByPartition.get(pCtx.doName) ?? 0) + 1;
-				callsByPartition.set(pCtx.doName, call);
-				const response = await original.call(this, pCtx, request);
-				if (pCtx.doName !== changingPartition || call !== 2) return response;
-				return {
-					...response,
-					value: { items: response.value.items.map((item) => ({ ...item, deleteRevision: item.deleteRevision + 1 })) },
-				};
-			});
 
-			await expect(db.transactGetItems({ items: keys })).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));
-			expect(spy).toHaveBeenCalledTimes(4);
-			expect(transactionIds.size).toBe(1);
+			const read = betweenPhases(
+				db,
+				keys[0],
+				async (instance, _state, pCtx) => {
+					await instance.apiPutItem(pCtx, {
+						hashKey: KeyCodec.encode(keys[0].hashKey),
+						sortKey: KeyCodec.encode(keys[0].sortKey),
+						data: "changed",
+						kind: "text",
+					});
+				},
+				() => db.transactGetItems({ items: keys }),
+			);
+			await expect(read).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: keys[0].hashKey }));
+
+			// Both phases ran on both participants, under one transaction id.
+			const calls = await txCalls(db, keys, "txReadForTransaction");
+			expect(calls).toHaveLength(4);
+			expect(new Set(calls.map((call) => call.transactionId)).size).toBe(1);
 		});
 	});
 

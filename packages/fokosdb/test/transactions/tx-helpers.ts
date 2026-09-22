@@ -2,11 +2,19 @@
  * Shared setup for the transaction suites: a client over an isolated table, and the two key
  * selections the tests need — keys that fan out across partitions, and keys that all land in one.
  */
+import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
-import { expect } from "vitest";
+import { expect, vi } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
+import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { type FokosDbRouteContext, PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
+import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
+import type { ControlledPartitionDO, TxOp, TxRequest } from "../controlled-partition-do.js";
+import type { ControlledTransactionCoordinatorDO } from "../controlled-transaction-coordinator-do.js";
+import { openedRpc } from "../partition-do/helpers.js";
+import { testPartitionStub } from "../stub-helpers.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type { TransactWriteItemsResult, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
@@ -53,14 +61,20 @@ export type MakeDBOptions = {
 	/** Fixes the table name. Routing is a pure function of it, so two clients built with the same
 	 *  name share one topology. Omit it for a table no other test touches. */
 	tableName?: string;
+	/**
+	 * Puts the table on `ControlledPartitionDO` and `ControlledTransactionCoordinatorDO`, so that a
+	 * test can use their seams. The coordinator pool defaults to one coordinator, which
+	 * `controlledCoordinator` reaches.
+	 */
+	controlled?: boolean;
 };
 
 /** A client over its own table, so no two tests share partitions. */
 export function makeDB(opts?: MakeDBOptions) {
-	const { maxSizeMb, rootTreesN, tableName, ...dbOptions } = opts ?? {};
+	const { maxSizeMb, rootTreesN, tableName, controlled, ...dbOptions } = opts ?? {};
 	const base = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
+		ns: controlled ? "CONTROLLED_PARTITION_DO" : "PARTITION_DO",
+		nsTx: controlled ? "CONTROLLED_TRANSACTION_COORDINATOR_DO" : "TRANSACTION_COORDINATOR_DO",
 		tableName: tableName ?? `txtest.${crypto.randomUUID()}`,
 		rootTreesN: rootTreesN ?? 100,
 		hashSplitN: 2,
@@ -69,7 +83,7 @@ export function makeDB(opts?: MakeDBOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const topology = new FokosRouter(base.topology, base.rangeConfig, base.policy);
-	return new FokosDB({ topology, ...dbOptions });
+	return new FokosDB({ topology, ...(controlled ? { numTxCoordinators: 1 } : {}), ...dbOptions });
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
@@ -106,5 +120,88 @@ export function keysInOnePartition(db: FokosDB, count: number, prefix: string): 
 		bucket.push(key);
 		buckets.set(partitionNameOf(db, key), bucket);
 		if (bucket.length === count) return bucket;
+	}
+}
+
+/** The stub and route context of the partition that owns `key`, in the namespace of the table. */
+export function owningPartition(db: FokosDB, key: Key) {
+	const { topology } = db.options();
+	const pCtx = topology.rootContext(KeyCodec.encode(key.hashKey));
+	const stub = testPartitionStub(pCtx.doName, topology.policy.ns);
+	return { stub, rpc: openedRpc(stub), pCtx };
+}
+
+/** The seams of the partition that owns `key`. The table must be `controlled`. */
+export function controlledPartition(db: FokosDB, key: Key): DurableObjectStub<ControlledPartitionDO> {
+	const { topology } = db.options();
+	expect(topology.policy.ns, "a seam needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
+	return env.CONTROLLED_PARTITION_DO.getByName(partitionNameOf(db, key));
+}
+
+/**
+ * The requests of `op` that the partition of each key received, in one list. A partition that owns
+ * two of the keys counts once.
+ */
+export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op): Promise<TxRequest<Op>[]> {
+	const partitions = new Map(keys.map((key) => [partitionNameOf(db, key), controlledPartition(db, key)]));
+	// The RPC stub type drops the type parameter of `testTxCalls`, so the cast restores it.
+	return (await Promise.all([...partitions.values()].map((p) => p.testTxCalls(op)))).flat() as TxRequest<Op>[];
+}
+
+/** The seams of the one coordinator of a `controlled` table. */
+export function controlledCoordinator(db: FokosDB): DurableObjectStub<ControlledTransactionCoordinatorDO> {
+	const { topology, numTxCoordinators } = db.options();
+	expect(topology.policy.nsTx, "a seam needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
+	expect(numTxCoordinators, "the coordinator seams need a pool of one coordinator").toBe(1);
+	// The pool names each coordinator `<shardGroupName>-<shard>`, and FokosDB sets the group name.
+	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(`fokos_tc.${topology.topology.shardGroup}-0`);
+}
+
+/**
+ * Holds a two-phase transaction lock on `key` and returns the release. The prepare stamps the
+ * partition's own clock, so it always orders above the writes that seeded the item.
+ */
+export async function holdPendingLock(
+	db: FokosDB,
+	key: Key,
+	item: Omit<TransactionItem, "opIndex" | "hashKey" | "sortKey">,
+): Promise<() => Promise<unknown>> {
+	const { rpc, pCtx } = owningPartition(db, key);
+	const transactionId = crypto.randomUUID();
+	const keys = { hashKey: KeyCodec.encode(key.hashKey), sortKey: KeyCodec.encode(key.sortKey) };
+	const res = await rpc.txPrepare(pCtx, {
+		transactionId,
+		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+		transactionTimestamp: txOrderTimestampNow(),
+		items: [{ opIndex: 0, ...keys, ...item }],
+	});
+	expect(res.outcome).toBe("accepted");
+	return () => rpc.txCancel(pCtx, { transactionId, items: [keys] });
+}
+
+/**
+ * Runs `read`, a two-phase `transactGetItems`, and runs `between` inside the partition that owns
+ * `key` after its phase-one read and before that answer returns. `between` calls the DO instance
+ * directly, so the second phase sees a real committed mutation. The table must be `controlled`.
+ */
+export async function betweenPhases<T>(
+	db: FokosDB,
+	key: Key,
+	between: (instance: PartitionDO, state: DurableObjectState, pCtx: FokosDbRouteContext) => Promise<void>,
+	read: () => Promise<T>,
+): Promise<T> {
+	const partition = controlledPartition(db, key);
+	const { pCtx } = owningPartition(db, key);
+	await partition.testHoldReadPhase();
+	try {
+		const result = read();
+		// The caller gets a failure of the read from the `await` below.
+		result.catch(() => {});
+		await vi.waitFor(async () => expect(await partition.testReadPhaseParked()).toBe(true), { timeout: 5000, interval: 10 });
+		await runInDurableObject(partition, (instance: PartitionDO, state: DurableObjectState) => between(instance, state, pCtx));
+		await partition.testReleaseReadPhase();
+		return await result;
+	} finally {
+		await partition.testReleaseReadPhase();
 	}
 }

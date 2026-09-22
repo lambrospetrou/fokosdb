@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
+import { SHARDING_INTERNAL_CODES } from "../../src/sharding/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
@@ -315,7 +316,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 		});
 		expect(prepare.outcome).toBe("accepted");
 
-		await rangeRoot.controlled.testFailCommits(1);
+		await rangeRoot.controlled.testTxResponse("txCommit", { error: "simulated child commit failure", times: 1 });
 
 		const commit = {
 			transactionId: txId,
@@ -333,7 +334,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 
 			expect(await partition.promotedKeyStatus("hot"), "the local hot key must be queued for promotion").toBeDefined();
 		} finally {
-			await rangeRoot.controlled.testFailCommits(0);
+			await rangeRoot.controlled.testClearTxResponse("txCommit");
 		}
 
 		// The promotion of the local hot key is queued off the request path, so the new range root can
@@ -346,7 +347,12 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 				try {
 					return (await partition.rpc.txCommit(partition.ctx, commit)).outcome === "committed";
 				} catch (error) {
-					if (!FokosError.isCode(error, UNAVAILABLE_CODES.partition_migrating)) throw error;
+					// The commit goes through the parent to the new range root, and that group can fail while
+					// the range root imports. The parent then attempts every group and wraps the failure as
+					// `partition_fanout_failed`, with `partition_migrating` as its cause. The coordinator
+					// retries both errors, thus the test accepts both.
+					const migrating = FokosError.isCode(error, SHARDING_INTERNAL_CODES.partition_fanout_failed) ? error.cause : error;
+					if (!FokosError.isCode(migrating, UNAVAILABLE_CODES.partition_migrating)) throw error;
 					return false;
 				}
 			},
