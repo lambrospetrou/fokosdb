@@ -102,6 +102,8 @@ Each milestone delivers a result on its own, and the next one does not wait for 
 4. **Tier migration** (section 5.4), as each area is touched. No fixed date.
 5. **Budgets as deadlines** (section 5.5), at the next failure of the property suite.
 
+Progress: milestones 1, 2 and 3 are done. The harness drives the scheduler and fails after 20 idle rounds, and the seams are on `ControlledPartitionDO` in `test/controlled-partition-do.ts`. `tools/check-test-machinery.js` holds the rules. Its `PROTOTYPE_SPY_EXCEPTIONS` list is the prototype spies that remain, and each entry goes when its file moves to a seam.
+
 ## 5. Proposed solution
 
 ### 5.1 High-level overview

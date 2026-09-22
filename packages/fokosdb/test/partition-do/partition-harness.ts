@@ -517,6 +517,7 @@ async function migrationProbe(child: TestPartition): Promise<string> {
 		});
 		return `${child.doName}: migration=${migration} import=${JSON.stringify(inner.import)} alarmInMs=${inner.alarmInMs}`;
 	};
+	// guard: allow-timer. A limit on a diagnostic probe, and not a wait for the system.
 	const blocked = new Promise<string>((resolve) => setTimeout(() => resolve(`${child.doName}: probe blocked, the child is busy`), 2000));
 	return await Promise.race([probe(), blocked]);
 }

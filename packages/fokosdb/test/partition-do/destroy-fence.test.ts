@@ -202,6 +202,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 			let settled = false;
 			const prepare = partition.stub.fokosPrepareDestroy({}).then(() => void (settled = true));
 			// Every chance to settle, which it must not take, because the fence waits for the parked pass.
+			// guard: allow-timer. A negative check: no state change can show that the call is still blocked.
 			await new Promise((resolve) => setTimeout(resolve, 100));
 			expect(settled, "fokosPrepareDestroy returned while a source step was still in flight").toBe(false);
 
