@@ -48,7 +48,7 @@
 			}
 			.layout-grid {
 				display: grid;
-				grid-template-columns: 1fr 380px;
+				grid-template-columns: minmax(0, 1fr) 380px;
 				gap: 1.5rem;
 				align-items: stretch;
 				flex: 1;
@@ -220,6 +220,121 @@
 			.log-trace {
 				color: #f97316;
 			}
+			/* Demo 2 search: the partitions that the search visited, and the tenant partitions that it skipped */
+			.node-group.is-visited .node-rect {
+				stroke: #22c55e;
+				stroke-width: 3;
+			}
+			.node-group.is-skipped {
+				opacity: 0.35;
+			}
+			/* The search bar and its results span both columns, above the topology and the control panel. */
+			.search-card {
+				margin-bottom: 1rem;
+				background: var(--pico-card-background-color);
+				border: 1px solid var(--pico-muted-border-color);
+				border-radius: var(--pico-border-radius);
+				padding: 0.75rem 1rem;
+			}
+			.search-form {
+				display: flex;
+				flex-direction: column;
+				gap: 0.5rem;
+				margin: 0;
+			}
+			.search-form select,
+			.search-form input[type="search"],
+			.search-form button {
+				margin: 0;
+				padding: 0.4rem 0.6rem;
+				font-size: 0.85rem;
+				height: auto;
+			}
+			.search-row {
+				display: flex;
+				flex-wrap: wrap;
+				align-items: center;
+				gap: 0.5rem 0.75rem;
+			}
+			.search-row select {
+				width: 6.5rem;
+				flex: none;
+			}
+			/* Pico draws a search icon at the left edge, so the text starts after it. */
+			.search-row input[type="search"] {
+				flex: 1 1 16rem;
+				min-width: 12rem;
+				padding-inline-start: 2.25rem;
+				background-position: center left 0.7rem;
+			}
+			.search-row .chip-row {
+				flex-wrap: nowrap;
+			}
+			/* Pico gives a submit button the full width. This rule keeps the button at the right end of the row. */
+			.search-row button[type="submit"] {
+				width: auto;
+				flex: none;
+				margin-left: auto;
+			}
+			.search-row-label {
+				font-size: 0.75rem;
+				color: var(--pico-muted-color);
+			}
+			.chip-row {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 0.3rem;
+			}
+			.search-form .chip-row button {
+				padding: 0.15rem 0.5rem;
+				font-size: 0.72rem;
+				font-family: monospace;
+				width: auto;
+			}
+			.search-form label {
+				font-size: 0.8rem;
+				margin: 0;
+				white-space: nowrap;
+			}
+			.search-summary {
+				margin-top: 0.75rem;
+				font-size: 0.8rem;
+				color: #22c55e;
+				margin-bottom: 0.4rem;
+			}
+			.hit-list {
+				max-height: 220px;
+				overflow-y: auto;
+				display: grid;
+				grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+				gap: 0.4rem;
+			}
+			.hit {
+				background: #0f172a;
+				border: 1px solid #1e293b;
+				border-radius: 6px;
+				padding: 0.4rem 0.6rem;
+				font-size: 0.8rem;
+			}
+			.hit-date {
+				color: #94a3b8;
+				font-family: monospace;
+				margin-right: 0.4rem;
+			}
+			.hit-snippet {
+				color: #cbd5e1;
+				margin: 0.15rem 0;
+			}
+			.hit-snippet mark {
+				background: rgba(249, 115, 22, 0.3);
+				color: #fdba74;
+				padding: 0 0.1rem;
+			}
+			.hit-partition {
+				color: #64748b;
+				font-family: monospace;
+				font-size: 0.7rem;
+			}
 		</style>
 		<script type="importmap">
 			{
@@ -236,47 +351,53 @@
 		<div id="app"></div>
 
 		<script type="module">
-			import { h, render } from "preact";
-			import { signal, computed, effect } from "@preact/signals";
+			import { render } from "preact";
+			import { signal, effect } from "@preact/signals";
 			import { html } from "htm/preact";
 
-			// ── Demos definition ──────────────────────────────────────────────────────────
+			// ── The demos ─────────────────────────────────────────────────────────────────
 			const TILES = [
 				{
 					id: "demo1",
 					name: "Demo 1: Request Volume Split",
-					desc: "Hash-only partition host. Splits on request volume threshold. Can kill the splitting partition, and the migration resumes by itself.",
+					desc: "A hash-only host. A partition splits after 5 writes. A kill crashes the partition that splits, and the migration continues by itself.",
 				},
 				{
 					id: "demo2",
 					name: "Demo 2: Multi-Tenant FTS5",
-					desc: "Tenants start co-located on shared hash partitions. Hot tenants promote into dedicated range partitions.",
+					desc: "Tenants share one hash partition. A large tenant is promoted to its own range tree, which splits by date.",
 				},
 				{
 					id: "demo3",
 					name: "Demo 3: FokosDB Topology",
-					desc: "Production PartitionDO topology with real 2PC range and hash trees.",
+					desc: "The PartitionDO topology of a real FokosDB table.",
 				},
 			];
 
-			// ── Global Signals ────────────────────────────────────────────────────────────
-			const activeTile = signal("demo1");
+			// ── State ─────────────────────────────────────────────────────────────────────
+			// The URL hash (#demo1, #demo2, #demo3) names the active tile, so a shared link or a refresh opens the same tile.
+			const tileFromHash = () => TILES.find((t) => `#${t.id}` === location.hash)?.id ?? TILES[0].id;
+			const activeTile = signal(tileFromHash());
+			window.addEventListener("hashchange", () => (activeTile.value = tileFromHash()));
 			const topologyData = signal(null);
 			const isLoading = signal(false);
 			const isAutoPolling = signal(true);
 			const logs = signal([]);
-			const activeHops = signal([]); // [{ from, to }]
-			const animatedPackets = signal([]); // [{ id, fromX, fromY, toX, toY, progress }]
+			// The tree edges that the last request used: [{ from, to }]. They light up for 1.2 seconds.
+			const activeHops = signal([]);
+			// Demo 2: the last search, and the partitions it visited and skipped. They stay until the next action.
+			const searchForm = signal({ tenant: "acme", query: "failover", window: "all", newest: false });
+			const searchResult = signal(null);
 
 			function addLog(msg, trace = null) {
 				const time = new Date().toLocaleTimeString();
 				logs.value = [{ time, msg, trace }, ...logs.value.slice(0, 40)];
 			}
 
-			// ── Topology Polling ──────────────────────────────────────────────────────────
+			// ── Topology polling ──────────────────────────────────────────────────────────
 			async function fetchTopology() {
 				try {
-					const res = await fetch(`/api/topology/${activeTile.value}`);
+					const res = await fetch(`/api/${activeTile.value}/topology`);
 					if (!res.ok) throw new Error(`HTTP ${res.status}`);
 					const data = await res.json();
 					topologyData.value = data;
@@ -285,25 +406,26 @@
 				}
 			}
 
-			// Poll periodically
 			setInterval(() => {
 				if (isAutoPolling.value) {
 					fetchTopology();
 				}
 			}, 1500);
 
+			// A tile change clears the highlights and reads the new topology.
 			effect(() => {
-				// Re-fetch when tile changes
-				const current = activeTile.value;
+				activeTile.value; // The read of the signal makes this effect run again when the tile changes.
 				activeHops.value = [];
+				searchResult.value = null;
 				fetchTopology();
 			});
 
-			// ── Execute Action Helper ─────────────────────────────────────────────────────
+			// ── Actions ───────────────────────────────────────────────────────────────────
 			async function executeAction(action, payload = {}) {
 				isLoading.value = true;
+				searchResult.value = null;
 				try {
-					const res = await fetch(`/api/action/${activeTile.value}/${action}`, {
+					const res = await fetch(`/api/${activeTile.value}/${action}`, {
 						method: "POST",
 						headers: { "content-type": "application/json" },
 						body: JSON.stringify(payload),
@@ -312,10 +434,12 @@
 					if (json.trace) {
 						handleTrace(json.trace);
 					}
-					addLog(
-						`[${action}] ${json.success ? "Success" : "Failed"}: ${JSON.stringify(json.result || json.error || json.stats || json.item || {})}`,
-						json.trace,
-					);
+					// A search result holds all its hits, so the log shows its counts only.
+					const r = json.result;
+					const logged = r?.hits
+						? { hits: r.hits.length, visited: r.visited.length, skipped: r.skipped.length, stoppedEarly: r.stoppedEarly }
+						: (r ?? json.error ?? {});
+					addLog(`[${action}] ${json.success ? "Success" : "Failed"}: ${JSON.stringify(logged)}`, json.trace);
 					await fetchTopology();
 					return json;
 				} catch (err) {
@@ -325,30 +449,78 @@
 				}
 			}
 
-			function handleTrace(trace) {
-				if (!trace || !trace.servedBy || trace.servedBy.length <= 1) return;
-				const hops = [];
-				for (let i = 0; i < trace.servedBy.length - 1; i++) {
-					hops.push({
-						from: trace.servedBy[i].doName,
-						to: trace.servedBy[i + 1].doName,
-					});
+			// The DO names on the path from `node` down to `doName`, or null when `doName` is not under `node`.
+			function pathTo(node, doName) {
+				if (node.doName === doName) return [node.doName];
+				for (const child of node.children ?? []) {
+					const path = pathTo(child, doName);
+					if (path) return [node.doName, ...path];
 				}
-				activeHops.value = hops;
+				return null;
+			}
+
+			// Lights the tree edges from the root to each partition that served the request. When a search
+			// goes to more than one partition, each branch lights up.
+			function handleTrace(trace) {
+				const roots = topologyData.value?.roots ?? [];
+				const edges = new Map();
+				for (const hop of trace?.servedBy ?? []) {
+					const path = roots.map((r) => pathTo(r, hop.doName)).find(Boolean) ?? [];
+					for (let i = 0; i + 1 < path.length; i++) edges.set(`${path[i]}->${path[i + 1]}`, { from: path[i], to: path[i + 1] });
+				}
+				if (edges.size === 0) return;
+				activeHops.value = [...edges.values()];
 				setTimeout(() => {
 					activeHops.value = [];
 				}, 1200);
 			}
 
-			// ── Tree Layout Calculation ───────────────────────────────────────────────────
-			// File-tree layout: one row per partition, children indented under their parent.
-			// Depth costs only a small indent, so wide trees grow down instead of sideways.
+			// ── Tree layout ───────────────────────────────────────────────────────────────
+			// The layout is a file tree: one row for each partition, and each child indented under its parent.
+			// A deep tree grows down, not sideways.
 			const INDENT = 30;
 			const ROW_H = 54;
-			const BOX_W = 340;
+			const BOX_MIN_W = 340;
 			const BOX_H = 44;
+			const BOX_PAD = 10;
+			const BADGE_GAP = 16;
 			const PAD_X = 24;
 			const PAD_Y = 24;
+
+			// These fonts are the fonts of .node-title, .node-badge and .node-subtitle, so a box gets the width of its text.
+			const measureCtx = document.createElement("canvas").getContext("2d");
+			const pageFont = getComputedStyle(document.body).fontFamily;
+			function textWidth(text, font) {
+				measureCtx.font = `${font} ${pageFont}`;
+				return Math.ceil(measureCtx.measureText(text).width);
+			}
+
+			function nodeLabels(node) {
+				const isRouter = node.role === "router";
+				const isSplitting = node.status === "queued" || node.status === "planned" || node.status === "cutover";
+				const isImporting = node.importState === "awaiting_data" || node.importState === "importing";
+				const badge = isRouter
+					? "Router"
+					: isSplitting
+						? "Splitting"
+						: isImporting
+							? "Importing"
+							: node.kind === "range"
+								? "Range Leaf"
+								: "Leaf";
+				const requests = node.requestCount == null ? "" : ` · Requests: ${node.requestCount}`;
+				const stats = isRouter
+					? `Routing to ${node.children?.length ?? 0} targets${requests}`
+					: `${node.label ? `${node.label} · ` : ""}Items: ${node.itemCount ?? 0}${requests}`;
+				return { badge, stats };
+			}
+
+			// The box is wide enough for the full DO name and the badge on the first line, and for the stats line.
+			function boxWidth(node) {
+				const { badge, stats } = nodeLabels(node);
+				const titleLine = textWidth(node.doName, "700 13px") + BADGE_GAP + textWidth(badge.toUpperCase(), "600 10px");
+				return Math.max(BOX_MIN_W, BOX_PAD * 2 + Math.max(titleLine, textWidth(stats, "11px")));
+			}
 
 			function computeTreeLayout(roots) {
 				if (!roots || roots.length === 0) return { nodes: [], links: [], width: 720, height: 200 };
@@ -356,11 +528,11 @@
 				const nodes = [];
 				const links = [];
 				let row = 0;
-				let maxDepth = 0;
+				let right = 0;
 
 				function layoutSubtree(node, depth) {
-					maxDepth = Math.max(maxDepth, depth);
-					const pos = { node, x: PAD_X + depth * INDENT, y: PAD_Y + row * ROW_H + ROW_H / 2, depth };
+					const pos = { node, x: PAD_X + depth * INDENT, y: PAD_Y + row * ROW_H + ROW_H / 2, w: boxWidth(node) };
+					right = Math.max(right, pos.x + pos.w);
 					row += 1;
 					nodes.push(pos);
 
@@ -382,21 +554,20 @@
 					layoutSubtree(r, 0);
 				}
 
-				const width = Math.max(720, PAD_X * 2 + maxDepth * INDENT + BOX_W + 40);
+				const width = Math.max(720, right + PAD_X);
 				const height = PAD_Y * 2 + row * ROW_H;
 				return { nodes, links, width, height };
 			}
 
-			// ── Component: Box-Tree Topology View ──────────────────────────────────────────
+			// ── Component: topology view ──────────────────────────────────────────────────
 			function TopologyView({ topology }) {
 				const roots = topology?.roots ?? [];
 				const { nodes, links, width: svgWidth, height: svgHeight } = computeTreeLayout(roots);
-				const boxWidth = BOX_W;
 				const boxHeight = BOX_H;
 
 				function onNodeClick(node) {
 					if (node.role === "router" && node.children?.length > 0) {
-						// Animate forward from router to a child
+						// A click on a router lights the edge to one of its children.
 						const randomChild = node.children[Math.floor(Math.random() * node.children.length)];
 						activeHops.value = [{ from: node.doName, to: randomChild.doName }];
 						setTimeout(() => {
@@ -424,15 +595,7 @@
 
 						<div class="topology-scroll">
 							<svg class="topology-svg" viewBox="0 0 ${svgWidth} ${svgHeight}" width=${svgWidth} height=${svgHeight}>
-								<defs>
-									<linearGradient id="linkGradient" x1="0%" y1="0%" x2="0%" y2="100%">
-										<stop offset="0%" stop-color="#ea580c" />
-										<stop offset="100%" stop-color="#f97316" />
-									</linearGradient>
-								</defs>
-
-								<!-- Connecting Lines: a shared vertical trunk out of the parent's
-							     bottom edge, then a stub into the child's left edge. -->
+								<!-- Each edge goes down from the bottom edge of the parent, then right into the child. -->
 								${links.map((link) => {
 									const vx = link.fromPos.x + 14;
 									const sy = link.fromPos.y + boxHeight / 2;
@@ -455,43 +618,28 @@
 									`;
 								})}
 
-								<!-- Partition Boxes -->
+								<!-- Partition boxes -->
 								${nodes.map((pos) => {
 									const node = pos.node;
 									const isRouter = node.role === "router";
 									const isTarget = activeHops.value.some((h) => h.to === node.doName);
-
-									const isSplitting = node.status === "queued" || node.status === "planned" || node.status === "cutover";
-									const isImporting = node.importState === "awaiting_data" || node.importState === "importing";
-									const badgeText = isRouter
-										? "Router"
-										: isSplitting
-											? "Splitting"
-											: isImporting
-												? "Importing"
-												: node.kind === "range"
-													? "Range Leaf"
-													: "Leaf";
-									const statsLine = isRouter
-										? `Routing to ${node.children?.length ?? 0} targets · Requests: ${node.requestCount ?? 0}`
-										: `${node.hashKey ? `Key: ${node.hashKey} · ` : ""}Items: ${node.itemCount ?? 0} · Requests: ${node.requestCount ?? 0}`;
+									const isVisited = searchResult.value?.visited.includes(node.doName);
+									const isSkipped = searchResult.value?.skipped.includes(node.doName);
+									const { badge, stats } = nodeLabels(node);
 
 									return html`
 										<g
 											key=${node.id}
-											class="node-group ${isRouter ? "is-router" : ""} ${isTarget ? "is-active-target" : ""}"
+											class="node-group ${isRouter ? "is-router" : ""} ${isTarget ? "is-active-target" : ""} ${isVisited
+												? "is-visited"
+												: ""} ${isSkipped ? "is-skipped" : ""}"
 											transform="translate(${pos.x}, ${pos.y - boxHeight / 2})"
 											onClick=${() => onNodeClick(node)}
 										>
-											<rect width=${boxWidth} height=${boxHeight} class="node-rect" />
-											<!-- Header / Title -->
-											<text x="10" y="18" class="node-title">
-												${node.doName.length > 28 ? node.doName.slice(0, 28) + "…" : node.doName}
-											</text>
-											<!-- Badge, far right of the title line -->
-											<text x=${boxWidth - 10} y="18" text-anchor="end" class="node-badge">${badgeText}</text>
-											<!-- Subtitle / Stats -->
-											<text x="10" y="35" class="node-subtitle">${statsLine}</text>
+											<rect width=${pos.w} height=${boxHeight} class="node-rect" />
+											<text x=${BOX_PAD} y="18" class="node-title">${node.doName}</text>
+											<text x=${pos.w - BOX_PAD} y="18" text-anchor="end" class="node-badge">${badge}</text>
+											<text x=${BOX_PAD} y="35" class="node-subtitle">${stats}</text>
 										</g>
 									`;
 								})}
@@ -501,7 +649,105 @@
 				`;
 			}
 
-			// ── Component: Control Panel Shell ────────────────────────────────────────────
+			// ── Component: Demo 2 full-text search ────────────────────────────────────────
+			const EXAMPLE_QUERIES = ["failover", "data*", "failover OR outage", "database NOT cache", '"replication lag"', "invoice"];
+			const daysAgo = (n) => new Date(Date.now() - n * 86_400_000).toISOString().slice(0, 10);
+			// A date window is the sort-key interval [from, to): every sort key starts with the document date.
+			const DATE_WINDOWS = [
+				{ id: "all", label: "All time", from: null, to: null },
+				{ id: "2025", label: "2025", from: "2025-01-01", to: "2026-01-01" },
+				{ id: "2026h1", label: "2026 H1", from: "2026-01-01", to: "2026-07-01" },
+				{ id: "90d", label: "Last 90 days", from: daysAgo(90), to: null },
+			];
+
+			async function runSearch() {
+				const f = searchForm.value;
+				const w = DATE_WINDOWS.find((d) => d.id === f.window);
+				const json = await executeAction("search", {
+					tenant: f.tenant,
+					query: f.query,
+					from: w.from,
+					to: w.to,
+					limit: f.newest ? 5 : undefined,
+				});
+				searchResult.value = json?.success ? json.result : null;
+			}
+
+			// An FTS5 snippet has U+E000 before each match and U+E001 after it. Each match becomes a <mark>.
+			function renderSnippet(snippet) {
+				return snippet
+					.split(/(\uE000[^\uE001]*\uE001)/)
+					.map((part) => (part.startsWith("\uE000") ? html`<mark>${part.slice(1, -1)}</mark>` : part));
+			}
+
+			function SearchBar() {
+				const f = searchForm.value;
+				const set = (patch) => (searchForm.value = { ...f, ...patch });
+				return html`
+					<form
+						class="search-form"
+						onSubmit=${(e) => {
+							e.preventDefault();
+							runSearch();
+						}}
+					>
+						<div class="search-row">
+							<select value=${f.tenant} onChange=${(e) => set({ tenant: e.target.value })}>
+								<option value="acme">acme</option>
+								<option value="beta">beta</option>
+							</select>
+							<input type="search" value=${f.query} placeholder="FTS5 query" onInput=${(e) => set({ query: e.target.value })} />
+							<div class="chip-row">
+								${DATE_WINDOWS.map(
+									(w) =>
+										html`<button type="button" class=${f.window === w.id ? "" : "secondary outline"} onClick=${() => set({ window: w.id })}>
+											${w.label}
+										</button>`,
+								)}
+							</div>
+							<label
+								><input type="checkbox" role="switch" checked=${f.newest} onChange=${(e) => set({ newest: e.target.checked })} /> Newest 5
+								only</label
+							>
+							<button type="submit" disabled=${isLoading.value}>🔍 Search ${f.tenant}</button>
+						</div>
+						<div class="search-row">
+							<span class="search-row-label">Try:</span>
+							<div class="chip-row">
+								${EXAMPLE_QUERIES.map(
+									(q) =>
+										html`<button type="button" class=${f.query === q ? "" : "outline"} onClick=${() => set({ query: q })}>${q}</button>`,
+								)}
+							</div>
+						</div>
+					</form>
+				`;
+			}
+
+			function SearchResults() {
+				const r = searchResult.value;
+				if (!r) return null;
+				const total = r.visited.length + r.skipped.length;
+				return html`
+					<div class="search-summary">
+						${r.hits.length} hits · visited ${r.visited.length} of ${total} ${r.tenant}
+						partitions${r.stoppedEarly ? " · stopped early" : ""}
+					</div>
+					<div class="hit-list">
+						${r.hits.map(
+							(hit) => html`
+								<div class="hit">
+									<div><span class="hit-date">${hit.sortKey.slice(0, 10)}</span><strong>${hit.title}</strong></div>
+									<div class="hit-snippet">${renderSnippet(hit.snippet)}</div>
+									<div class="hit-partition">${hit.partition} · bm25 ${hit.score.toFixed(2)}</div>
+								</div>
+							`,
+						)}
+					</div>
+				`;
+			}
+
+			// ── Component: control panel ──────────────────────────────────────────────────
 			function ControlPanel({ tile, data }) {
 				const id = tile.id;
 				const summary = data?.summary;
@@ -552,11 +798,7 @@
 							</div>
 
 							<div class="btn-row">
-								<button
-									class="primary"
-									disabled=${isLoading.value}
-									onClick=${() => executeAction("increment", { key: `k-${Math.floor(Math.random() * 8)}` })}
-								>
+								<button class="primary" disabled=${isLoading.value} onClick=${() => executeAction("increment")}>
 									⚡ Increment (+1 write)
 								</button>
 								<button disabled=${isLoading.value} onClick=${() => executeAction("batch-increment", { count: 5 })}>
@@ -573,8 +815,8 @@
 								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset Demo 1</button>
 							</div>
 							<small style="color:var(--pico-muted-color); font-size:0.75rem; display:block;">
-								Kill crashes the partition that is splitting now. Its children pull the next page, which starts it again from storage.
-								Reconciliation above shows that no write was lost.
+								Kill crashes the partition that splits now. Its children pull the next page, and the pull starts it again from storage. The
+								reconciliation above shows that no write is lost.
 							</small>
 						`}
 						${id === "demo2" &&
@@ -583,26 +825,19 @@
 								<button
 									class="primary"
 									disabled=${isLoading.value}
-									onClick=${() =>
-										executeAction("add-doc", { tenantId: "acme", title: "Quarterly Report", body: "financial metrics database sharding" })}
+									onClick=${() => executeAction("add-docs", { tenant: "acme", count: 5 })}
 								>
-									📄 Ingest Acme Doc (Hot Tenant)
+									📄 Ingest 5 Acme Docs (Hot Tenant)
 								</button>
-								<button
-									disabled=${isLoading.value}
-									onClick=${() =>
-										executeAction("add-doc", { tenantId: "beta", title: "Team Notes", body: "weekly sync engineering topics" })}
-								>
-									📄 Ingest Beta Doc (Shared Tenant)
-								</button>
-								<button class="secondary" disabled=${isLoading.value} onClick=${() => executeAction("promote", { tenantId: "acme" })}>
-									⭐ Promote Tenant Acme (Range Root)
-								</button>
-								<button disabled=${isLoading.value} onClick=${() => executeAction("search", { tenantId: "acme", query: "database" })}>
-									🔍 Scoped Search (Acme: "database")
+								<button disabled=${isLoading.value} onClick=${() => executeAction("add-docs", { tenant: "beta", count: 1 })}>
+									📄 Ingest 1 Beta Doc (Small Tenant)
 								</button>
 								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset Demo 2</button>
 							</div>
+							<small style="color:var(--pico-muted-color); font-size:0.75rem; display:block;">
+								A tenant with 5 documents moves from the shared partition to a range tree of its own. A range partition with 8 documents
+								splits by document date. A date window is a sort-key range, so a search visits only the partitions of that window.
+							</small>
 						`}
 						${id === "demo3" &&
 						html`
@@ -613,7 +848,7 @@
 									onClick=${() =>
 										executeAction("put-item", { hashKey: `user#${Math.floor(Math.random() * 30)}`, sortKey: "profile", data: "live demo" })}
 								>
-									💾 FokosDB putItem (2PC Write)
+									💾 FokosDB putItem
 								</button>
 								<button disabled=${isLoading.value} onClick=${() => executeAction("get-item", { hashKey: "user#1", sortKey: "profile" })}>
 									🔎 FokosDB getItem
@@ -625,7 +860,7 @@
 							</div>
 						`}
 
-						<!-- Log stream -->
+						<!-- Activity log -->
 						<div style="margin-top: 1rem;">
 							<small style="color:var(--pico-muted-color); font-weight:600;">ACTIVITY LOG & ROUTING EVIDENCE</small>
 							<div class="log-console">
@@ -651,7 +886,7 @@
 				`;
 			}
 
-			// ── Main App Component ────────────────────────────────────────────────────────
+			// ── Component: app ────────────────────────────────────────────────────────────
 			function App() {
 				const currentTile = TILES.find((t) => t.id === activeTile.value) ?? TILES[0];
 
@@ -665,11 +900,7 @@
 							<div class="tile-nav">
 								${TILES.map(
 									(t) => html`
-										<button
-											key=${t.id}
-											class=${activeTile.value === t.id ? "active" : "outline"}
-											onClick=${() => (activeTile.value = t.id)}
-										>
+										<button key=${t.id} class=${activeTile.value === t.id ? "active" : "outline"} onClick=${() => (location.hash = t.id)}>
 											${t.name.split(":")[0]}
 										</button>
 									`,
@@ -677,11 +908,17 @@
 							</div>
 						</header>
 
+						${activeTile.value === "demo2" &&
+						html`
+							<section class="search-card">
+								<${SearchBar} />
+								<${SearchResults} />
+							</section>
+						`}
+
 						<main class="layout-grid">
-							<!-- Left Column: Shared Topology View -->
 							<${TopologyView} topology=${topologyData.value} />
 
-							<!-- Right Column: Control Panel Shell -->
 							<${ControlPanel} tile=${currentTile} data=${topologyData.value} />
 						</main>
 					</div>

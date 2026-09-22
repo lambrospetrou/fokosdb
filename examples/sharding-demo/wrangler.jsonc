@@ -12,6 +12,10 @@
 			"new_sqlite_classes": ["CounterPartitionDO", "SearchPartitionDO", "PartitionDO"],
 			"tag": "v1",
 		},
+		{
+			"new_sqlite_classes": ["TransactionCoordinatorDO"],
+			"tag": "v2",
+		},
 	],
 	"durable_objects": {
 		"bindings": [
@@ -26,6 +30,10 @@
 			{
 				"class_name": "PartitionDO",
 				"name": "PARTITION_DO",
+			},
+			{
+				"class_name": "TransactionCoordinatorDO",
+				"name": "TRANSACTION_COORDINATOR_DO",
 			},
 		],
 	},

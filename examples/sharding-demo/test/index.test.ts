@@ -2,8 +2,9 @@ import { env, runInDurableObject, SELF } from "cloudflare:test";
 import type { CounterPartitionDO } from "../counter-host.js";
 import { describe, expect, it } from "vitest";
 
+/** Runs one control-panel action, as a button of the UI does. */
 async function post(tile: string, action: string, body: object = {}): Promise<any> {
-	const res = await SELF.fetch(`https://example.com/api/action/${tile}/${action}`, {
+	const res = await SELF.fetch(`https://example.com/api/${tile}/${action}`, {
 		method: "POST",
 		headers: { "content-type": "application/json" },
 		body: JSON.stringify(body),
@@ -12,31 +13,34 @@ async function post(tile: string, action: string, body: object = {}): Promise<an
 	return res.json();
 }
 
-async function topology(): Promise<any> {
-	const res = await SELF.fetch("https://example.com/api/topology/demo1");
+async function topology(tile = "demo1"): Promise<any> {
+	const res = await SELF.fetch(`https://example.com/api/${tile}/topology`);
 	expect(res.status).toBe(200);
 	return res.json();
 }
 
-/** The runtime moves splits and imports on by itself, so a test waits for the state it expects. */
-async function waitForTopology(done: (t: any) => boolean): Promise<any> {
+/** Every sample document has one of these topic words, so this query matches every document. */
+const EVERY_TOPIC = "failover OR invoice OR roadmap OR hiring OR outage OR stampede";
+
+/** The runtime moves splits and imports on by itself, so a test waits until the topology gets to the state it expects. */
+async function waitForTopology(tile: string, done: (t: any) => boolean): Promise<any> {
 	let top: any;
 	const deadline = Date.now() + 10_000;
 	while (Date.now() < deadline) {
-		top = await topology();
+		top = await topology(tile);
 		if (done(top)) return top;
 		await scheduler.wait(50);
 	}
 	throw new Error(`the topology did not settle: ${JSON.stringify(top.summary)} ${JSON.stringify(top.reconciliation)}`);
 }
 
-describe("sharding-demo worker and topology endpoints", () => {
-	it("responds to /api/health", async () => {
-		const res = await SELF.fetch("https://example.com/api/health");
-		expect(res.status).toBe(200);
-		expect(await res.json()).toEqual({ status: "ok" });
-	});
+it("responds to /api/health", async () => {
+	const res = await SELF.fetch("https://example.com/api/health");
+	expect(res.status).toBe(200);
+	expect(await res.json()).toEqual({ status: "ok" });
+});
 
+describe("Demo 1: counter host", () => {
 	it("routes writes through the root after it splits on request volume", async () => {
 		await post("demo1", "reset");
 
@@ -48,9 +52,9 @@ describe("sharding-demo worker and topology endpoints", () => {
 		expect(inc.result.val).toBe(2);
 		expect(inc.trace.forwardCount).toBe(0);
 
-		// Five writes over more than one key cross the threshold of the root.
+		// Five writes to more than one key get to the split threshold of the root.
 		await post("demo1", "batch-increment", { count: 5 });
-		const top2 = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
+		const top2 = await waitForTopology("demo1", (t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
 		expect(top2.roots[0].children.length).toBe(4);
 
 		const routed = await post("demo1", "increment", { key: "k-1", amount: 1 });
@@ -58,7 +62,7 @@ describe("sharding-demo worker and topology endpoints", () => {
 		expect(routed.trace.forwardCount).toBe(1);
 		expect(routed.trace.servedBy[0].role).toBe("router");
 
-		const top3 = await waitForTopology((t) => t.reconciliation.reconciled);
+		const top3 = await waitForTopology("demo1", (t) => t.reconciliation.reconciled);
 		expect(top3.reconciliation.acknowledgedWrites).toBe(8);
 	});
 
@@ -66,7 +70,7 @@ describe("sharding-demo worker and topology endpoints", () => {
 		await post("demo1", "reset");
 		for (let i = 0; i < 30; i++) await post("demo1", "increment", { key: `user-${i % 8}`, amount: 1 });
 
-		const top = await waitForTopology((t) => t.reconciliation.reconciled && t.summary.totalPartitions > 5);
+		const top = await waitForTopology("demo1", (t) => t.reconciliation.reconciled && t.summary.totalPartitions > 5);
 		expect(top.reconciliation.acknowledgedWrites).toBe(30);
 		expect(top.reconciliation.presentWrites).toBe(30);
 	});
@@ -75,12 +79,12 @@ describe("sharding-demo worker and topology endpoints", () => {
 		await post("demo1", "reset");
 		await post("demo1", "batch-increment", { count: 5 });
 
-		// The fifth write queued the split, so the root is the source of a split in progress.
+		// The fifth write queued the split, so the root is now the source of a split.
 		const kill = await post("demo1", "kill");
 		expect(kill.success).toBe(true);
 
 		for (let i = 0; i < 10; i++) await post("demo1", "increment", { key: `after-${i}`, amount: 1 });
-		const top = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
+		const top = await waitForTopology("demo1", (t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
 		expect(top.reconciliation.acknowledgedWrites).toBe(15);
 
 		const idle = await post("demo1", "reset").then(() => post("demo1", "kill"));
@@ -90,7 +94,7 @@ describe("sharding-demo worker and topology endpoints", () => {
 	it("reset deletes the storage and the alarm of every partition", async () => {
 		await post("demo1", "reset");
 		await post("demo1", "batch-increment", { count: 5 });
-		const top = await waitForTopology((t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
+		const top = await waitForTopology("demo1", (t) => t.roots[0].role === "router" && t.reconciliation.reconciled);
 		const names: string[] = [];
 		const collect = (item: any) => {
 			names.push(item.doName);
@@ -111,85 +115,105 @@ describe("sharding-demo worker and topology endpoints", () => {
 			});
 		}
 	});
+});
 
-	it("returns topology for Demo 2 and supports promotion", async () => {
-		await SELF.fetch("https://example.com/api/action/demo2/reset", { method: "POST" });
+describe("Demo 2: search host", () => {
+	it("promotes a large tenant out of the shared partition, and its search follows", async () => {
+		await post("demo2", "reset");
+		const empty = await topology("demo2");
+		expect(empty.roots[0].children).toEqual([]);
+		expect(empty.roots[0].itemCount).toBe(0);
 
-		// Add docs
-		const addRes = await SELF.fetch("https://example.com/api/action/demo2/add-doc", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tenantId: "acme", title: "Doc 1", body: "database sharding" }),
+		await post("demo2", "add-docs", { tenant: "beta", count: 1 });
+		await post("demo2", "add-docs", { tenant: "acme", count: 5 });
+
+		// The shared partition keeps beta, and acme's five documents move to a range root of its own.
+		const top = await waitForTopology("demo2", (t) => {
+			const [rangeRoot] = t.roots[0].children;
+			return t.roots[0].itemCount === 1 && rangeRoot?.kind === "range" && rangeRoot.itemCount === 5 && rangeRoot.importState === "active";
 		});
-		expect(addRes.status).toBe(200);
-		const addJson = (await addRes.json()) as any;
-		expect(addJson.success).toBe(true);
+		expect(top.roots[0].label).toBe("beta:1");
+		const rangeRoot = top.roots[0].children[0].doName;
 
-		// Promote tenant
-		const promoRes = await SELF.fetch("https://example.com/api/action/demo2/promote", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tenantId: "acme" }),
-		});
-		expect(promoRes.status).toBe(200);
-		const promoJson = (await promoRes.json()) as any;
-		expect(promoJson.promoted).toBe(true);
+		const acme = await post("demo2", "search", { tenant: "acme", query: EVERY_TOPIC });
+		expect(acme.result.hits.length).toBe(5);
+		expect(acme.result.visited).toEqual([rangeRoot]);
+		expect(acme.result.skipped).toEqual([]);
+		expect(acme.trace.forwardCount).toBe(1);
 
-		// Check topology has promoted tenant range root
-		const topRes = await SELF.fetch("https://example.com/api/topology/demo2");
-		const top = (await topRes.json()) as any;
-		expect(top.roots[0].children.length).toBeGreaterThanOrEqual(1);
-
-		// Search routed to promoted tenant
-		const searchRes = await SELF.fetch("https://example.com/api/action/demo2/search", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ tenantId: "acme", query: "database" }),
-		});
-		expect(searchRes.status).toBe(200);
-		const searchJson = (await searchRes.json()) as any;
-		expect(searchJson.hits.length).toBeGreaterThanOrEqual(1);
-		expect(searchJson.trace.forwardCount).toBe(1);
+		const beta = await post("demo2", "search", { tenant: "beta", query: EVERY_TOPIC });
+		expect(beta.result.hits.length).toBe(1);
+		expect(beta.trace.forwardCount).toBe(0);
 	});
 
-	it("returns topology for Demo 3 and performs FokosDB actions", async () => {
-		const topRes = await SELF.fetch("https://example.com/api/topology/demo3");
-		expect(topRes.status).toBe(200);
-		const top = (await topRes.json()) as any;
-		expect(top.tile).toBe("demo3");
-		expect(top.roots.length).toBe(2); // 2 root trees
+	it("searches only the date partitions that a window or a limit needs", async () => {
+		await post("demo2", "reset");
+		await post("demo2", "add-docs", { tenant: "acme", count: 5 });
+		await waitForTopology("demo2", (t) => t.roots[0].children[0]?.importState === "active");
 
-		// Put item into FokosDB
-		const putRes = await SELF.fetch("https://example.com/api/action/demo3/put-item", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ hashKey: "user#1", sortKey: "profile", data: "test data" }),
+		// Ten documents are more than the range split threshold of 8, so the range root of acme splits by date.
+		await post("demo2", "add-docs", { tenant: "acme", count: 5 });
+		const top = await waitForTopology("demo2", (t) => {
+			const rangeRoot = t.roots[0].children[0];
+			const leaves = rangeRoot?.children ?? [];
+			return (
+				rangeRoot?.role === "router" &&
+				leaves.length === 2 &&
+				leaves.every((l: any) => l.importState === "active") &&
+				rangeRoot.itemCount === 0
+			);
 		});
-		expect(putRes.status).toBe(200);
-		const putJson = (await putRes.json()) as any;
-		expect(putJson.success).toBe(true);
-		expect(putJson.trace.forwardCount).toBe(0);
+		const leaves = top.roots[0].children[0].children.map((l: any) => l.doName);
 
-		// Get item back
-		const getRes = await SELF.fetch("https://example.com/api/action/demo3/get-item", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ hashKey: "user#1", sortKey: "profile" }),
-		});
-		expect(getRes.status).toBe(200);
-		const getJson = (await getRes.json()) as any;
-		expect(getJson.success).toBe(true);
-		expect(getJson.found).toBe(true);
-		expect(getJson.item.data).toBe("test data");
+		// A search without a window or a limit visits every partition. The hits come newest first.
+		const all = await post("demo2", "search", { tenant: "acme", query: EVERY_TOPIC });
+		const keys = all.result.hits.map((h: any) => h.sortKey);
+		expect(keys).toEqual([...keys].sort().reverse());
+		expect(keys.length).toBe(10);
+		expect(all.result.visited.sort()).toEqual([...leaves].sort());
+		expect(all.result.stoppedEarly).toBe(false);
 
-		// Seed items
-		const seedRes = await SELF.fetch("https://example.com/api/action/demo3/seed", {
-			method: "POST",
-			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ count: 4 }),
-		});
-		expect(seedRes.status).toBe(200);
-		const seedJson = (await seedRes.json()) as any;
-		expect(seedJson.seeded).toBe(4);
+		// The split boundary is the lowest sort key of the newer partition, so a window that starts there
+		// overlaps only that partition.
+		const newer = all.result.hits[0].partition;
+		const older = leaves.find((l: string) => l !== newer);
+		const newerHits = all.result.hits.filter((h: any) => h.partition === newer);
+		const boundary = newerHits.at(-1).sortKey;
+		const windowed = await post("demo2", "search", { tenant: "acme", query: EVERY_TOPIC, from: boundary });
+		expect(windowed.result.hits).toEqual(newerHits);
+		expect(windowed.result.visited).toEqual([newer]);
+		expect(windowed.result.skipped).toEqual([older]);
+
+		// Each partition holds 4 or more documents, so the newest 3 come from the newer partition, and the search stops there.
+		const newest = await post("demo2", "search", { tenant: "acme", query: EVERY_TOPIC, limit: 3 });
+		expect(newest.result.hits).toEqual(all.result.hits.slice(0, 3));
+		expect(newest.result.stoppedEarly).toBe(true);
+		expect(newest.result.visited).toEqual([newer]);
+		expect(newest.result.skipped).toEqual([older]);
+	}, 30_000);
+
+	it("answers an invalid FTS5 query with a clean error", async () => {
+		await post("demo2", "reset");
+		await post("demo2", "add-docs", { tenant: "beta", count: 1 });
+		const res = await post("demo2", "search", { tenant: "beta", query: "failover AND" });
+		expect(res.success).toBe(false);
+		expect(res.error).toMatch(/syntax error/);
+	});
+});
+
+describe("Demo 3: FokosDB table", () => {
+	it("draws the root partitions and writes and reads an item", async () => {
+		const top = await topology("demo3");
+		expect(top.roots.length).toBe(2);
+
+		const put = await post("demo3", "put-item", { hashKey: "user#1", sortKey: "profile", data: "test data" });
+		expect(put.trace.forwardCount).toBe(0);
+
+		const get = await post("demo3", "get-item", { hashKey: "user#1", sortKey: "profile" });
+		expect(get.result.found).toBe(true);
+		expect(get.result.item.data).toBe("test data");
+
+		const seed = await post("demo3", "seed", { count: 4 });
+		expect(seed.result.seeded).toBe(4);
 	});
 });
