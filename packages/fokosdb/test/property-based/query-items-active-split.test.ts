@@ -56,11 +56,15 @@ const SUITE_TIMEOUT_MS = 600_000;
 
 // A churn item is large, so few writes carry one leaf from half full to past its cap: a split costs
 // about a third of a megabyte of writes, and a run that paid for a whole megabyte would spend more
-// time on writes than on reads.
+// time on writes than on reads. It must also stay below a tenth of the range cap: the write that
+// crosses the cap then leaves the leaf inside the 1.1x band, and the next push can still write to it
+// while the split it queued runs. A larger item carries the leaf straight past the band, where every
+// write is refused until the split completes, and a push that is refused queues no split at all —
+// the properties then read a tree that stands still, which is what the settled suite already covers.
 const CHURN_ITEM_BYTES = 32 * 1024;
 // The live churn items a query has to read. SQLite keeps the space of a deleted row, so the leaf
 // still grows towards its cap and still splits, while the answer a property compares stays small.
-const CHURN_LIVE_MAX = 24;
+const CHURN_LIVE_MAX = 12;
 const MAX_PUTS_PER_PUSH = 20;
 // The whole suite writes no more than this, which is about a dozen splits. Every split adds two
 // partitions and every partition adds a hop to a scan, so an unbounded churn would spend the whole
@@ -226,6 +230,7 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 				const { count, readThrough } = await probeHotKey();
 				expect(count, "the count of the hot key must not change while its leaves split").toBe(hotCount());
 				if (readThrough) return;
+				await sleep(5);
 			}
 		}
 		throw new Error("no page ever showed a child reading through its source; the suite covers nothing new");

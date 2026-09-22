@@ -1062,9 +1062,12 @@ export function arbContendingBatch(
 // before and after a property, so a split that drops or duplicates a row fails the suite.
 
 export const HASH_SPLIT_MAX_SIZE_MB = 0.5;
-const SEED_ITEMS = 1_000;
+// Fewer, larger items: the split thresholds care about bytes, not rows, so the same four
+// megabytes split the tree the same way as more smaller writes,
+// while the puts and the read-backs cost half the calls.
+const SEED_ITEMS = 500;
 const SEED_CONCURRENCY = 20;
-const SEED_ITEM_BYTES = 4 * 1024;
+const SEED_ITEM_BYTES = 8 * 1024;
 
 const seedKey = (i: number) => ({ hashKey: `seed:${String(i).padStart(4, "0")}` });
 const seedItemData = (i: number) => `${i}:`.padEnd(SEED_ITEM_BYTES, "x");

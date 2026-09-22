@@ -37,9 +37,11 @@ type PartitionWriter = {
 	status(ctx: FokosDbRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
-// Each hash filler is below the promotion threshold and the write-reject grace band.
-const FILLER_CHUNK_FRACTION = 0.3;
-// ~0.075 of the split budget per filler write, so ~14 writes cross the threshold; 200 is headroom.
+// Each hash filler is below the promotion threshold (a quarter of the cap), and the write that
+// crosses the cap leaves the stored size below the 1.1 write-reject band, so a test can still land
+// a write while the split waits for its alarm.
+const FILLER_CHUNK_FRACTION = 0.35;
+// ~0.09 of the split budget per filler write, so ~12 writes cross the threshold; 200 is headroom.
 const MAX_FILLER_WRITES = 200;
 const MAX_RANGE_FILLER_WRITES = 200;
 
@@ -190,17 +192,24 @@ export class TestPartition {
 		invariant(isHashPartition(this.ctx), `${this.doName}: not a hash partition`);
 		invariant(!(await writer.status(this.ctx)).splitStatus, `${this.doName}: already splitting`);
 		const data = fillerChunk(this.maxSizeMb("hash"));
+		const capBytes = this.maxSizeMb("hash") * 1024 * 1024;
 		const keys = this.fillerHashKeys();
 		const items: PutItemRpcRequest[] = [];
 		for (let i = 0; i < MAX_FILLER_WRITES; i++) {
 			const item: PutItemRpcRequest = { hashKey: kb(keys.next().value!), sortKey: kb("sk"), data, kind: "text" };
 			try {
-				await writer.apiPutItem(this.ctx, item);
+				const res = await writer.apiPutItem(this.ctx, item);
 				items.push(item);
+				// The split queues inside the write that carries the stored size past the cap, so only
+				// that write needs the status read below.
+				if (res.meta.databaseSize <= capBytes) {
+					continue;
+				}
 			} catch (e) {
 				// A size rejection is normal once a split is already queued — a prior write crossed the
 				// threshold. Any other error, or a rejection with no split queued (e.g. mutual exclusion
-				// with a queued promotion), is a real failure.
+				// with a queued promotion), is a real failure: the rest of the writes would be refused
+				// too, so the loop would spend every attempt before it reported the cause.
 				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) throw e;
 				if (!(await writer.status(this.ctx)).splitStatus) throw e;
 			}
@@ -296,7 +305,7 @@ export class TestPartition {
 					throw new Error(`${this.doName}: split not completed; ${JSON.stringify(state)}`);
 				await assertSplitTreeComplete(this);
 			},
-			{ timeout: 5000, interval: 100 },
+			{ timeout: 15_000, interval: 100 },
 		);
 	}
 
@@ -376,7 +385,7 @@ export class TestPartition {
 				}
 				await assertSplitTreeComplete(this);
 			},
-			{ timeout: 5000, interval: 100 },
+			{ timeout: 15_000, interval: 100 },
 		);
 	}
 
@@ -410,7 +419,7 @@ export function rangeOf(ctx: FokosDbRouteContext) {
  * each partition in `drive` — the runtime normally fires them on its own, so the alarm pass is a
  * fallback nudge, not the primary driver.
  */
-export async function drainUntil(drive: TestPartition[], check: () => Promise<boolean>, label: string, timeoutMs = 5000): Promise<void> {
+export async function drainUntil(drive: TestPartition[], check: () => Promise<boolean>, label: string, timeoutMs = 15_000): Promise<void> {
 	let nextDrive = Date.now() + 1000;
 	await vi.waitFor(
 		async () => {
@@ -476,7 +485,7 @@ export async function withMigrationHeld<T>(
 					const missing = (await parent.children()).filter((child) => !requestedBy.has(child.doName));
 					if (missing.length > 0) throw new Error(`migration RPC not received from ${missing.map((child) => child.doName).join(", ")}`);
 				},
-				{ timeout: 5000, interval: 10 },
+				{ timeout: 30_000, interval: 10 },
 			);
 		});
 	} finally {

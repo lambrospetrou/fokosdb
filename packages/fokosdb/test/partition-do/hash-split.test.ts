@@ -303,7 +303,6 @@ describe.concurrent("PartitionDO - splitting", () => {
 					}
 				}
 				expect(written, `write did not land for ${hashKey}`).toBe(true);
-				await partition.awaitTreeSettled();
 				// console.log("BOOM 1 - end", { item: hashKey });
 			}
 
