@@ -81,7 +81,7 @@ export class FokosMigrationHost implements MigrationHost {
 		this.#applyPendingTx(p);
 	}
 
-	validatePage(cursor: unknown, page: unknown, nextCursor: unknown | null): void {
+	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void {
 		assertHostPageFollowsCursor(cursor, page, nextCursor);
 	}
 
@@ -189,7 +189,7 @@ function asHostCursor(cursor: unknown): FokosDbHostCursor {
 const STREAM_ORDER: Record<FokosDbHostCursor["stream"], number> = { items: 0, pending_tx: 1 };
 
 /** Throws when a page would move the host's own streams backwards. */
-export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, nextCursor: unknown | null): void {
+export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, nextCursor: unknown): void {
 	const requested = asHostCursor(cursor);
 	const answered = (page as FokosDbHostPage).stream;
 	invariant(

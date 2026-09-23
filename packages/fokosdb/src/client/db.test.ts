@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { FokosStd } from "./fokos-std.js";
@@ -496,7 +495,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			async function populateAndQuery(sortKeyCondition: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sortKeyCondition"]) {
 				const db = makeDB();
 				for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
-				return db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
+				return await db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
 			}
 
 			it("eq: returns only the exact match", async () => {

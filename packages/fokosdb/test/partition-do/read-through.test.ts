@@ -89,12 +89,14 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		const sibling = (await partition.children()).find((c) => c.doName !== owner.doName);
 		expect(sibling, "a two-way split should have a sibling").toBeDefined();
 
-		const mine = (await partition.stub.fokosExecuteLocal({
-			op: "apiGetItem",
-			repartitionId,
-			caller: { partitionId: owner.ctx.partitionId, doName: owner.doName },
-			request: { hashKey: kb("alpha"), sortKey: kb("s1") },
-		})) as FokosEnvelope<GetItemRpcResponse>;
+		const mine = await Promise.resolve(
+			partition.stub.fokosExecuteLocal({
+				op: "apiGetItem",
+				repartitionId,
+				caller: { partitionId: owner.ctx.partitionId, doName: owner.doName },
+				request: { hashKey: kb("alpha"), sortKey: kb("s1") },
+			}) as FokosEnvelope<GetItemRpcResponse>,
+		);
 		expect(mine.value).toMatchObject({ found: true, item: { data: "alpha-value" } });
 
 		// The sibling asking for the same key is a routing defect, not an empty answer: an empty answer
@@ -142,12 +144,14 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 			expect(point.meta.servedByActorName, "the range tree owns the key, not the hash parent").toBe(rangeRoot.doName);
 
 			const page = opened(
-				(await partition.stub.fokosExecuteLocal({
-					op: "apiQueryItems",
-					repartitionId: await partition.splitRepartitionId(),
-					caller: { partitionId: child.ctx.partitionId, doName: child.doName },
-					request: queryRequest("alice"),
-				})) as FokosEnvelope<QueryItemsRpcResponse>,
+				await Promise.resolve(
+					partition.stub.fokosExecuteLocal({
+						op: "apiQueryItems",
+						repartitionId: await partition.splitRepartitionId(),
+						caller: { partitionId: child.ctx.partitionId, doName: child.doName },
+						request: queryRequest("alice"),
+					}) as FokosEnvelope<QueryItemsRpcResponse>,
+				),
 			);
 			expect(page.items.length, "a query of a promoted key must reach the range tree too").toBeGreaterThan(0);
 			expect(page.meta.servedByActorName).toBe(rangeRoot.doName);
@@ -181,13 +185,15 @@ describe("PartitionDO — fokosExecuteLocal", () => {
 		expect(end, "the leftmost child must have a bounded upper edge").not.toBeNull();
 
 		const page = opened(
-			(await root.stub.fokosExecuteLocal({
-				op: "apiQueryItems",
-				repartitionId,
-				caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
-				// The caller asks for the whole key; the source narrows it to what this child owns.
-				request: queryRequest("alice"),
-			})) as FokosEnvelope<QueryItemsRpcResponse>,
+			await Promise.resolve(
+				root.stub.fokosExecuteLocal({
+					op: "apiQueryItems",
+					repartitionId,
+					caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+					// The caller asks for the whole key; the source narrows it to what this child owns.
+					request: queryRequest("alice"),
+				}) as FokosEnvelope<QueryItemsRpcResponse>,
+			),
 		);
 
 		const owned = [...sks].sort().filter((sk) => KeyCodec.compare(kb(sk), end!) < 0);

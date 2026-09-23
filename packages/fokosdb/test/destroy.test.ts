@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
@@ -35,7 +34,6 @@ describe.skip("FokosDB.destroy()", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
 		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(tableName);
-		const topology = db.options().topology;
 
 		// Write 50 × 50 KB items to each root partition.
 		const doNamesSet = new Set<string>();

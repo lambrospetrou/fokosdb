@@ -77,7 +77,7 @@ describe("FokosRouter.walk", () => {
 			"child-a": [ref("grandchild")],
 		});
 
-		await router.walk(c.stub, async (_ctx, stub) => stub.destroy());
+		await router.walk(c.stub, async (_ctx, stub) => await stub.destroy());
 
 		expect(c.destroyed()).toEqual(["grandchild", "child-a", "range-root", root.doName]);
 		expect(c.fenced()).toEqual([root.doName, "child-a", "grandchild", "range-root"]);
@@ -97,7 +97,7 @@ describe("FokosRouter.walk", () => {
 			"child-b": [ref("range-root")],
 		});
 
-		await router.walk(c.stub, async (_ctx, stub) => stub.destroy());
+		await router.walk(c.stub, async (_ctx, stub) => await stub.destroy());
 
 		expect(c.destroyed()).toEqual(["range-root", "child-a", "child-b", root.doName]);
 		// The traversal skips the second link whole, so it reads the fence and the status pages once.
@@ -109,7 +109,7 @@ describe("FokosRouter.walk", () => {
 		const roots = router.allRoots().map((ctx) => ctx.doName);
 		const c = makeCluster({});
 
-		await router.walk(c.stub, async (_ctx, stub) => stub.destroy());
+		await router.walk(c.stub, async (_ctx, stub) => await stub.destroy());
 
 		expect(c.destroyed()).toEqual(roots);
 	});

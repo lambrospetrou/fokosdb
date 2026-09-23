@@ -198,6 +198,7 @@ export abstract class FokosError<T extends string = string, C extends string = s
 		const cause: unknown = err.cause;
 		if (cause !== undefined) {
 			// An Error object stores as `{}` in JSON, so the cause keeps its text and its own enumerable fields.
+			// oxlint-disable-next-line typescript/no-base-to-string
 			wire.cause = { error: String(cause), errorProps: typeof cause === "object" && cause !== null ? { ...cause } : {} };
 		}
 		return wire;

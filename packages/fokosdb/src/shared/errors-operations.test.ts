@@ -35,9 +35,9 @@ describe("the code tables of the library", () => {
 
 	it("hold at least one table for each category of the library, and one category per table", () => {
 		for (const table of FOKOS_LIBRARY_CODE_TABLES) expect(new Set(Object.values(table).map((def) => def.tag)).size).toBe(1);
-		const tags = [...new Set(FOKOS_LIBRARY_CODE_TABLES.map((table) => Object.values(table)[0].tag))].sort();
+		const tags = [...new Set(FOKOS_LIBRARY_CODE_TABLES.map((table) => Object.values(table)[0].tag))].sort((a, b) => a.localeCompare(b));
 		const categories = [...FOKOS_ERROR_CATEGORIES.keys(), FokosConditionCheckError.tag, FokosTransactionCancelledError.tag];
-		expect(tags).toEqual(categories.sort());
+		expect(tags).toEqual(categories.sort((a, b) => a.localeCompare(b)));
 	});
 });
 
@@ -99,7 +99,7 @@ describe("FokosTransactionCancelledError", () => {
 
 	it("keeps its results in fromWire from an error that crossed a hop, as the generic class of its category", () => {
 		const e = cancelled([conditionFailed, migrating]);
-		const copy = Object.assign(new Error(e.message), { ...e });
+		const copy = Object.assign(new Error(e.message), e);
 		const back = FokosError.fromWire(copy);
 		expect(FokosTransactionCancelledError.is(back)).toBe(true);
 		if (!FokosTransactionCancelledError.is(back)) throw new Error("unreachable");

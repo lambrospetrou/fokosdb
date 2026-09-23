@@ -791,7 +791,7 @@ async function cutOver(node: Node, request?: QueueRequest, now = T0): Promise<vo
 	if (request) await node.enter(({ source }) => void source.queue(request, now));
 	for (let i = 0; i < 20; i++) {
 		const at = now + i * 30_000;
-		const state = await node.enter(({ store, sharding }) => {
+		const state = await node.enter(({ sharding }) => {
 			const id = activeRepartitionId(sharding);
 			if (!id) return "none";
 			const row = sharding.getRepartition(id)!;

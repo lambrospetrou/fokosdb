@@ -24,8 +24,9 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * A stub for one partition of the host's own class. Host code: it applies the host binding, the
 	 * topology jurisdiction, and the policy location hint. The runtime never creates a stub itself. When
 	 * the runtime needs a stub outside a request, it calls this with its own stored route context.
+	 * The `this: void` annotation states that this callback does not use a receiver. TypeScript removes it from JavaScript output.
 	 */
-	stub(ctx: FokosRouteContext<TPolicy>, doName: string): DurableObjectStub;
+	stub(this: void, ctx: FokosRouteContext<TPolicy>, doName: string): DurableObjectStub;
 	caches?: {
 		/** The byte budget of the hash arena cache. Default: 1 MiB. */
 		hashArenaBytes?: number;
@@ -222,13 +223,15 @@ export type FokosOperation<Req, Res> =
 			walk(input: {
 				request: Req;
 				visits: readonly FokosRangeVisit[];
-				local(req: Req): Res | Promise<Res>;
+				/** This callback does not use a receiver. TypeScript removes `this: void` from JavaScript output. */
+				local(this: void, req: Req): Res | Promise<Res>;
 				/**
 				 * The part this visit answered. The runtime collects the route evidence of the visit into
 				 * the routing of the whole walk, which `dispatch` returns, so the host folds a forwarded
-				 * part exactly as it folds a local one.
+				 * part exactly as it folds a local one. This callback does not use a receiver. TypeScript
+				 * removes `this: void` from JavaScript output.
 				 */
-				forward(visit: FokosRangeVisit, req: Req): Promise<Res>;
+				forward(this: void, visit: FokosRangeVisit, req: Req): Promise<Res>;
 			}): Promise<Res>;
 	  })
 	| {

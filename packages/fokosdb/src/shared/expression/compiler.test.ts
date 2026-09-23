@@ -28,7 +28,7 @@ function runUpdatePlan(state: DurableObjectState, plan: CompiledUpdatePlan, docu
 		.exec<{ doc: string; applicable: number }>(
 			`WITH i AS (SELECT 1 AS hk, 2 AS data_kind, jsonb(${dataParam}) AS data)
 			 SELECT json(${plan.documentSql}) AS doc, (${plan.applicableSql}) AS applicable FROM i`,
-			...new Array(UPDATE_FIXED_BINDING_COUNT).fill(null),
+			...Array.from({ length: UPDATE_FIXED_BINDING_COUNT }).fill(null),
 			...materializeExpressionBindings(plan.bindings),
 			documentJson,
 		)

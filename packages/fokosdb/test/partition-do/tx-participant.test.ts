@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
@@ -19,7 +18,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 	it("prepare+commit spanning a local key and a promoted key both commit", async () => {
 		// Promote alice, leave bob local.
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx, rpc } = partition;
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
@@ -57,9 +56,9 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 	it("cancel via hash DO releases both local and promoted-key locks", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx, rpc } = partition;
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: PROMOTION_BIG_DATA, kind: "text" as const });
-		const rangeRoot = await partition.awaitPromoted("alice");
+		await partition.awaitPromoted("alice");
 
 		const txId = crypto.randomUUID();
 		const coordinator = testCoordinatorRef();
@@ -118,7 +117,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	// retries, and it sees this error only AFTER a Durable Object RPC hop, which keeps the message but
 	// drops the class. Asserting it here, on a genuinely remote error, is what proves the skip fires.
 	it("prepare on an over-size partition reports backpressure", async () => {
-		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
+		const { ctx, stub } = makeStub(OVER_SIZE);
 		const error = await stub
 			.txPrepare(ctx, {
 				transactionId: crypto.randomUUID(),
@@ -136,7 +135,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 	// Commit is non-growing (prepare already persisted the payload) and its outcome is already
 	// decided, so an over-size partition must not refuse it — that would wedge the transaction.
 	it("commit is not refused by an over-size partition", async () => {
-		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
+		const { ctx, rpc } = makeStub(OVER_SIZE);
 		// No prepare ran, so commit finds no pending rows and is a no-op — enough to prove it routed.
 		await expect(
 			rpc.txCommit(ctx, {
@@ -149,7 +148,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 
 	// Reads cannot grow a partition either, so they stay available.
 	it("readForTransaction is not refused by an over-size partition", async () => {
-		const { ctx, stub, rpc } = makeStub(OVER_SIZE);
+		const { ctx, rpc } = makeStub(OVER_SIZE);
 		const res = await rpc.txReadForTransaction(ctx, {
 			transactionId: crypto.randomUUID(),
 			items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
@@ -261,7 +260,7 @@ describe("PartitionDO — single-shot transaction", () => {
 	it("reports backpressure from an over-size partition", async () => {
 		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 		// written and every write is refused for size.
-		const { ctx, stub, rpc } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
+		const { ctx, stub } = makeStub({ hashSplitConditions: { maxSizeMb: 0.000_001 } });
 		const error = await stub
 			.txExecuteSingleShot(ctx, {
 				items: withOpIndex([{ hashKey: kb("over-size"), sortKey: kb("sk"), operation: "put", data: "d", kind: "text" }]),
@@ -275,7 +274,7 @@ describe("PartitionDO — single-shot transaction", () => {
 
 	it("queues a split once its writes push the partition over the threshold", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx, rpc } = partition;
 		const data = "x".repeat(64 * 1024);
 
 		for (let i = 0; i < 40; i++) {
@@ -298,7 +297,7 @@ describe("PartitionDO — single-shot transaction", () => {
 describe("PartitionDO — two-phase commit queues splits", () => {
 	it("commits a prepared TTL put after its pending lock migrates through a hash split", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx, rpc } = partition;
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now();
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
@@ -332,7 +331,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 	it("queues a split once committed transactions push the partition over the threshold", async () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx, rpc } = partition;
 		const data = "x".repeat(64 * 1024);
 		const coordinator = testCoordinatorRef();
 
@@ -357,7 +356,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 
 describe("PartitionDO — single-partition read snapshot", () => {
 	it("answers every key from local storage, positionally matched to the request", async () => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { hashKey: kb("snap-a"), sortKey: kb("sk"), data: "a", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("snap-b"), sortKey: kb("sk"), data: "b", kind: "text" as const });
 
@@ -378,7 +377,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 	});
 
 	it("aborts with pending_write when a two-phase transaction holds a lock on one of the keys", async () => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 		await rpc.apiPutItem(ctx, { hashKey: kb("snap-free"), sortKey: kb("sk"), data: "free", kind: "text" as const });
 
 		const prepared = await rpc.txPrepare(ctx, {

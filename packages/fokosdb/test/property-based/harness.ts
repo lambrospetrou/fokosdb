@@ -984,11 +984,11 @@ class ContendingTransactWrites implements fc.AsyncCommand<Model, FokosDB> {
 
 		const replayed = this.transactions[this.replayIndex];
 		const answer = await replayed.replay(db);
-		expect(describeOutcome(answer), `a replay under the same token answered differently — ${replayed}`).toBe(
+		expect(describeOutcome(answer), `a replay under the same token answered differently — ${replayed.toString()}`).toBe(
 			describeOutcome(outcomes[this.replayIndex]),
 		);
 		const afterReplay = poolModel(await readPool(db, this.keys), this.keys);
-		expect(stateSignature(afterReplay, this.keys), `a replay under the same token wrote again — ${replayed}`).toBe(
+		expect(stateSignature(afterReplay, this.keys), `a replay under the same token wrote again — ${replayed.toString()}`).toBe(
 			stateSignature(observed, this.keys),
 		);
 
@@ -1000,7 +1000,7 @@ class ContendingTransactWrites implements fc.AsyncCommand<Model, FokosDB> {
 	private describe(before: Model, observed: Model, outcomes: readonly (TransactWriteOperationResult[] | undefined)[]): string {
 		return [
 			`before:\n${stateSignature(before, this.keys)}`,
-			...this.transactions.map((tx, i) => `${describeOutcome(outcomes[i])} ${tx}`),
+			...this.transactions.map((tx, i) => `${describeOutcome(outcomes[i])} ${tx.toString()}`),
 			`observed:\n${stateSignature(observed, this.keys)}`,
 		].join("\n");
 	}

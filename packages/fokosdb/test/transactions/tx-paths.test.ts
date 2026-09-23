@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import {
 	controlledCoordinator,

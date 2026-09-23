@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";

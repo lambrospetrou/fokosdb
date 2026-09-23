@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import { routedError } from "../../src/sharding/envelope.js";

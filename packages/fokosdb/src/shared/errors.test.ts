@@ -158,7 +158,7 @@ describe("FokosError.is", () => {
 	});
 
 	it("reads own properties, so a plain copy of an error holds as well", () => {
-		const copy = Object.assign(new Error("fokos/read_conflict: x"), { ...errorOf(CONFLICT_CODES.read_conflict) });
+		const copy = Object.assign(new Error("fokos/read_conflict: x"), errorOf(CONFLICT_CODES.read_conflict));
 		expect(FokosError.is(copy)).toBe(true);
 		expect(FokosConflictError.is(copy)).toBe(true);
 	});
@@ -210,7 +210,7 @@ describe("isFokosAnyError", () => {
 	it("does not hold for a code that the library does not define, or for a code in the wrong category", () => {
 		const [otherCode] = Object.values(defineCodes("FokosConflictError", "caller", 409, { other_conflict: "zzzzzz" }));
 		expect(isFokosAnyError(errorOf(otherCode))).toBe(false);
-		const wrongCategory = { ...errorOf(CONFLICT_CODES.read_conflict), _tag: "FokosValidationError" };
+		const wrongCategory = Object.assign({}, errorOf(CONFLICT_CODES.read_conflict), { _tag: "FokosValidationError" });
 		expect(isFokosAnyError(wrongCategory)).toBe(false);
 	});
 
@@ -283,7 +283,7 @@ describe("an extension in another package", () => {
 	});
 
 	it("keeps the tag and the fields of a category that fromWire does not know", () => {
-		for (const input of [FokosError.toWire(moved), Object.assign(new Error(moved.message), { ...moved })]) {
+		for (const input of [FokosError.toWire(moved), Object.assign(new Error(moved.message), moved)]) {
 			const back = FokosError.fromWire(input);
 			expect(contractOf(back)).toEqual(contractOf(moved));
 			expect(FokosShardError.is(back)).toBe(true);
@@ -362,7 +362,7 @@ describe("FokosError.toWire and FokosError.fromWire", () => {
 
 	it("rebuild the class from an error that has no prototype", () => {
 		const e = errorOf(DEFS.find((def) => def.code === "transaction_undecided")!, { cause: new Error("inner") });
-		const copy = Object.assign(new Error(e.message), { ...e, cause: e.cause });
+		const copy = Object.assign(new Error(e.message), e, { cause: e.cause });
 		const back = FokosError.fromWire(copy);
 		expect(back).toBeInstanceOf(FOKOS_ERROR_CATEGORIES.get("FokosTransactionPendingError")!);
 		expect(contractOf(back)).toEqual(contractOf(e));

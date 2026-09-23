@@ -1404,7 +1404,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	#admit(op: string, descriptor: Exclude<AnyOperation, { shape: "local" }>, keys: RouteKey[]): void {
 		if (!this.#hooks.admit) return;
-		const runtime = this;
+		const rl = () => this.lifecycle();
 		const decision = this.#hooks.admit({
 			op,
 			admissionTag: descriptor.admissionTag,
@@ -1412,7 +1412,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// Read on demand: every dispatch admits, and `lifecycle()` reads the import record and queries
 			// the repartition rows to answer. A host that admits on its own size or tag alone never asks.
 			get lifecycle() {
-				return runtime.lifecycle();
+				return rl();
 			},
 			policy: this.policy(),
 		});

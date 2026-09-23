@@ -8,7 +8,6 @@ import {
 	rangeIntersects,
 	type SkInterval,
 } from "./sk-interval.js";
-import type { ScanCursor } from "../shared/partition/partition-store.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const sentinel = () => KeyCodec.encodeOptional(undefined);

@@ -300,45 +300,45 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
 
-	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest) {
-		return this.#api("apiPutItem", ctx, req);
+	async apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest) {
+		return await this.#api("apiPutItem", ctx, req);
 	}
-	apiGetItem(ctx: FokosDbRouteContext, req: GetItemRpcRequest) {
-		return this.#api("apiGetItem", ctx, req);
+	async apiGetItem(ctx: FokosDbRouteContext, req: GetItemRpcRequest) {
+		return await this.#api("apiGetItem", ctx, req);
 	}
-	apiDeleteItem(ctx: FokosDbRouteContext, req: DeleteItemRpcRequest) {
-		return this.#api("apiDeleteItem", ctx, req);
+	async apiDeleteItem(ctx: FokosDbRouteContext, req: DeleteItemRpcRequest) {
+		return await this.#api("apiDeleteItem", ctx, req);
 	}
-	apiQueryItems(ctx: FokosDbRouteContext, req: QueryItemsRpcRequest) {
-		return this.#api("apiQueryItems", ctx, req);
+	async apiQueryItems(ctx: FokosDbRouteContext, req: QueryItemsRpcRequest) {
+		return await this.#api("apiQueryItems", ctx, req);
 	}
-	txPrepare(ctx: FokosDbRouteContext, req: PrepareRequest) {
-		return this.#api("txPrepare", ctx, req);
+	async txPrepare(ctx: FokosDbRouteContext, req: PrepareRequest) {
+		return await this.#api("txPrepare", ctx, req);
 	}
-	txCommit(ctx: FokosDbRouteContext, req: CommitRequest) {
-		return this.#api("txCommit", ctx, req);
+	async txCommit(ctx: FokosDbRouteContext, req: CommitRequest) {
+		return await this.#api("txCommit", ctx, req);
 	}
 	/**
 	 * Releases this transaction's locks in this partition and in the descendants that own `req.items`.
 	 * The release is by transaction id, so every hop clears itself before it forwards; the keys only
 	 * decide where else the cancel goes.
 	 */
-	txCancel(ctx: FokosDbRouteContext, req: CancelRequest) {
-		return this.#api("txCancel", ctx, req);
+	async txCancel(ctx: FokosDbRouteContext, req: CancelRequest) {
+		return await this.#api("txCancel", ctx, req);
 	}
-	txReadForTransaction(ctx: FokosDbRouteContext, req: ReadForTransactionRequest) {
-		return this.#api("txReadForTransaction", ctx, req);
+	async txReadForTransaction(ctx: FokosDbRouteContext, req: ReadForTransactionRequest) {
+		return await this.#api("txReadForTransaction", ctx, req);
 	}
 	/** The single-partition fast path for `transactGetItems`: one round trip, no coordinator, nothing persisted. */
-	txReadSnapshot(ctx: FokosDbRouteContext, req: ReadSnapshotRequest) {
-		return this.#api("txReadSnapshot", ctx, req);
+	async txReadSnapshot(ctx: FokosDbRouteContext, req: ReadSnapshotRequest) {
+		return await this.#api("txReadSnapshot", ctx, req);
 	}
 	/** The single-partition fast path for `transactWriteItems`: one storage transaction applies the whole set. */
-	txExecuteSingleShot(ctx: FokosDbRouteContext, req: SingleShotRequest) {
-		return this.#api("txExecuteSingleShot", ctx, req);
+	async txExecuteSingleShot(ctx: FokosDbRouteContext, req: SingleShotRequest) {
+		return await this.#api("txExecuteSingleShot", ctx, req);
 	}
-	debugForceResolveTransaction(ctx: FokosDbRouteContext, req: DebugForceResolveTransactionRequest) {
-		return this.#api("debugForceResolveTransaction", ctx, req);
+	async debugForceResolveTransaction(ctx: FokosDbRouteContext, req: DebugForceResolveTransactionRequest) {
+		return await this.#api("debugForceResolveTransaction", ctx, req);
 	}
 	/**
 	 * Promotes `hashKey` to its own range structure now, instead of waiting for the key to grow past
@@ -346,43 +346,43 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * background pass performs the cutover, the migration and the acknowledgement. Idempotent: a key
 	 * that already has a promotion entry comes back with `queued: false`.
 	 */
-	debugForcePromoteKey(ctx: FokosDbRouteContext, req: DebugForcePromoteKeyRequest) {
-		return this.#api("debugForcePromoteKey", ctx, req);
+	async debugForcePromoteKey(ctx: FokosDbRouteContext, req: DebugForcePromoteKeyRequest) {
+		return await this.#api("debugForcePromoteKey", ctx, req);
 	}
 	/** INTERNAL ONLY FOR TESTING. */
-	status(ctx: FokosDbRouteContext) {
-		return this.#api("status", ctx, null);
+	async status(ctx: FokosDbRouteContext) {
+		return await this.#api("status", ctx, null);
 	}
 
-	fokosInit(req: FokosInitRequest): Promise<void> {
-		return this.fokos.fokosInit(req);
+	async fokosInit(req: FokosInitRequest): Promise<void> {
+		return await this.fokos.fokosInit(req);
 	}
-	fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return this.fokos.fokosStartImport(req);
+	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
+		return await this.fokos.fokosStartImport(req);
 	}
-	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return this.fokos.fokosMigrationPull(req);
+	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
+		return await this.fokos.fokosMigrationPull(req);
 	}
-	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return this.fokos.fokosMigrationAck(req);
+	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
+		return await this.fokos.fokosMigrationAck(req);
 	}
-	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return this.fokos.fokosExecuteLocal(req);
+	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
+		return await this.fokos.fokosExecuteLocal(req);
 	}
-	fokosRequestPromotion(req: FokosRequestPromotionRequest) {
-		return this.fokos.fokosRequestPromotion(req);
+	async fokosRequestPromotion(req: FokosRequestPromotionRequest) {
+		return await this.fokos.fokosRequestPromotion(req);
 	}
-	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
-		return this.fokos.fokosStatus(req);
+	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
+		return await this.fokos.fokosStatus(req);
 	}
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		await this.fokos.fokosPrepareDestroy(req);
 		// After the pass the fence waited for, never before it: the pass can arm the sweep.
 		this.#ttl.disarm();
 	}
-	fokosDestroy(): Promise<void> {
+	async fokosDestroy(): Promise<void> {
 		this.#ttl.disarm();
-		return this.fokos.fokosDestroy();
+		return await this.fokos.fokosDestroy();
 	}
 
 	/**

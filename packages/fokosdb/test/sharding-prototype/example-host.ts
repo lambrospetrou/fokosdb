@@ -100,7 +100,12 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 				whileMigrating: "read_source",
 				readOnly: true,
 				range: (req) => ({ hashKey: req.hashKey, interval: req.interval, descending: req.descending }),
-				clip: (req, visit) => ({ ...req, interval: todo(`clipToChildRange(${req.interval}, ${visit.start}, ${visit.end})`) }),
+				clip: (req, visit) => ({
+					...req,
+					interval: todo(
+						`clipToChildRange(${JSON.stringify(req.interval) ?? "null"}, ${JSON.stringify(visit.start) ?? "null"}, ${JSON.stringify(visit.end) ?? "null"})`,
+					),
+				}),
 				local: (req) => ({ rows: todo(`SELECT sk, body ... LIMIT ${req.limit + 1}`), more: false }),
 				walk: async ({ request, visits, local, forward }) => {
 					const rows: Array<{ sk: KeyBytes; body: string }> = [];
@@ -132,13 +137,15 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 		return {
 			evaluateSplit: ({ policy }) => (this.rowCount() > policy.maxRows ? {} : false),
 			computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
-				todo(`NTILE(${childCount}) over sk of ${hashKey} in [${start}, ${end})`),
+				todo(
+					`NTILE(${childCount}) over sk of ${JSON.stringify(hashKey) ?? "null"} in [${JSON.stringify(start) ?? "null"}, ${JSON.stringify(end) ?? "null"})`,
+				),
 			migration: {
 				buildPage: (cursor, _slice, belongsToTarget) => {
 					const rows = sql
 						.exec<{ hk: ArrayBuffer; sk: ArrayBuffer; body: string }>(
 							"SELECT hk, sk, body FROM docs WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT 1000",
-							...todo<[KeyBytes, KeyBytes]>(`${cursor}`),
+							...todo<[KeyBytes, KeyBytes]>(JSON.stringify(cursor) ?? "null"),
 						)
 						.toArray()
 						.map((r) => ({ hk: new Uint8Array(r.hk) as KeyBytes, sk: new Uint8Array(r.sk) as KeyBytes, body: r.body }));

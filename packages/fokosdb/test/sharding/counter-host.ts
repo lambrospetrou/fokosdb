@@ -81,50 +81,50 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 		ctx: FokosRouteContext<CounterPolicy>,
 		req: CounterOps["increment"]["req"],
 	): Promise<FokosEnvelope<CounterOps["increment"]["res"]>> {
-		return this.fokos.dispatch("increment", ctx, req);
+		return await this.fokos.dispatch("increment", ctx, req);
 	}
 
 	// ── The runtime RPCs ──────────────────────────────────────────────────────
 	// The runtime calls these methods on the other partitions of this class.
 
 	async fokosInit(req: FokosInitRequest): Promise<void> {
-		return this.fokos.fokosInit(req);
+		return await this.fokos.fokosInit(req);
 	}
 
 	async fokosStartImport(req: FokosStartImportRequest): Promise<void> {
-		return this.fokos.fokosStartImport(req);
+		return await this.fokos.fokosStartImport(req);
 	}
 
 	async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
-		return this.fokos.fokosMigrationPull(req);
+		return await this.fokos.fokosMigrationPull(req);
 	}
 
 	async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
-		return this.fokos.fokosMigrationAck(req);
+		return await this.fokos.fokosMigrationAck(req);
 	}
 
 	async fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
-		return this.fokos.fokosExecuteLocal(req);
+		return await this.fokos.fokosExecuteLocal(req);
 	}
 
 	async fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult> {
-		return this.fokos.fokosRequestPromotion(req);
+		return await this.fokos.fokosRequestPromotion(req);
 	}
 
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
-		return this.fokos.fokosStatus(req);
+		return await this.fokos.fokosStatus(req);
 	}
 
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
-		return this.fokos.fokosPrepareDestroy(req);
+		return await this.fokos.fokosPrepareDestroy(req);
 	}
 
 	async fokosDestroy(): Promise<void> {
-		return this.fokos.fokosDestroy();
+		return await this.fokos.fokosDestroy();
 	}
 
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
-		return this.fokos.alarm(info);
+		return await this.fokos.alarm(info);
 	}
 
 	// ── Test controls ─────────────────────────────────────────────────────────

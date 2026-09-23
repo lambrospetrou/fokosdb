@@ -104,16 +104,16 @@ export class TestPartition {
 		return testControlledPartitionStub(this.doName);
 	}
 
-	put(req: PutItemRpcRequest) {
-		return this.rpc.apiPutItem(this.ctx, req);
+	async put(req: PutItemRpcRequest) {
+		return await this.rpc.apiPutItem(this.ctx, req);
 	}
 
-	get(req: GetItemRpcRequest) {
-		return this.rpc.apiGetItem(this.ctx, req);
+	async get(req: GetItemRpcRequest) {
+		return await this.rpc.apiGetItem(this.ctx, req);
 	}
 
-	status() {
-		return this.rpc.status(this.ctx);
+	async status() {
+		return await this.rpc.status(this.ctx);
 	}
 
 	/** This partition's split status, narrowed to a started or completed split. */
@@ -163,11 +163,13 @@ export class TestPartition {
 
 	/** Walks down the hash tree to the leaf that owns `hashKey` — this partition when it has not split. */
 	async leafOwning(hashKey: string): Promise<TestPartition> {
-		let node: TestPartition = this;
-		while ((await node.status()).splitStatus !== undefined) {
-			node = await node.childOwning(hashKey);
-		}
-		return node;
+		const findLeaf = async (node: TestPartition): Promise<TestPartition> => {
+			while ((await node.status()).splitStatus !== undefined) {
+				node = await node.childOwning(hashKey);
+			}
+			return node;
+		};
+		return await findLeaf(this);
 	}
 
 	/**

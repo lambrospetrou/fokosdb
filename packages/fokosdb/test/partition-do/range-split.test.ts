@@ -75,7 +75,6 @@ describe.concurrent("PartitionDO — range split", () => {
 	});
 
 	it("partitions every sort key into exactly one child and the router serves each via that child", async () => {
-		const N = 4;
 		const { root, sks } = shared;
 		const status = await root.splitStatus();
 

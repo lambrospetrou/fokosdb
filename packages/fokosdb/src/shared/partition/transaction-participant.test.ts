@@ -5,7 +5,7 @@ import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helper
 import { PartitionStore } from "./partition-store.js";
 import { parseCoordinatorRef, TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.js";
-import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
+import { KeyCodec } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";
 import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
@@ -341,7 +341,8 @@ describe("TransactionParticipant - prepare", () => {
 			expect(pending?.kind).toBe("json");
 			expect(pending?.ttl_epoch_utc_seconds).toBe(555);
 			expect(pending?.data).toBeInstanceOf(Uint8Array);
-			const materializedBytes = (pending?.data as Uint8Array).byteLength;
+			invariant(pending?.data);
+			const materializedBytes = (pending.data as Uint8Array).byteLength;
 
 			// Commit applies the materialized document
 			const commit = participant.commitLocal({

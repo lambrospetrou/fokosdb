@@ -8,8 +8,6 @@
 import { hash64 } from "../sharding/hash-primitives.js";
 import type { TCWriteOperation } from "./transaction-wire-types.js";
 
-const U64_MASK = (1n << 64n) - 1n;
-
 // Domain separation: nothing else in the codebase hashes with this seed, so an operation fingerprint
 // can never be confused with a routing hash.
 const OPERATIONS_SEED = 0x666f6b6f735f7478n; // "fokos_tx"

@@ -14,6 +14,7 @@ export const DESTROY_ABORT_SENTINEL = "__special_destroy_sentinel";
  */
 export function isDestroyAbortError(e: unknown): boolean {
 	for (let current = e, depth = 0; current != null && depth < 8; current = (current as { cause?: unknown }).cause, depth++) {
+		// oxlint-disable-next-line typescript/no-base-to-string
 		if (String(current).includes(DESTROY_ABORT_SENTINEL)) return true;
 	}
 	return false;

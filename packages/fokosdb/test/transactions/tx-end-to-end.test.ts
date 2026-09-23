@@ -499,7 +499,9 @@ describe("transactions - end-to-end", () => {
 		for (const item of readResult.items) {
 			expect(item.found).toBe(true);
 			invariant(item.found);
-			expect(item.data).toBe(`data-${item.hashKey}`);
+			const hashKey = item.hashKey;
+			if (typeof hashKey !== "string") throw new Error("expected a string hash key");
+			expect(item.data).toBe(`data-${hashKey}`);
 			// Each key was written exactly once above, so v=1 — the same version getItem reports, and
 			// the value a caller feeds back into an attribute_equals condition.
 			expect(item.version).toBe(1);

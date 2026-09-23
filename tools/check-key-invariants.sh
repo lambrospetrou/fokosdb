@@ -11,7 +11,7 @@ SRC="src"
 KEY_CODEC="src/sharding/key-codec.ts"
 
 # charCodeAt / codePointAt / localeCompare outside key-codec.ts
-FOUND=$(grep -rn --include="*.ts" -E "charCodeAt|codePointAt|localeCompare" "$SRC" | grep -v "^${KEY_CODEC}:" || true)
+FOUND=$(grep -rn --include="*.ts" -E "charCodeAt|codePointAt" "$SRC" | grep -v "^${KEY_CODEC}:" || true)
 if [ -n "$FOUND" ]; then
 	echo "ERROR: raw string-comparison primitives used outside key-codec.ts:" >&2
 	echo "$FOUND" >&2

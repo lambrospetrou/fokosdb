@@ -174,9 +174,9 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * slice it tests the hash key and `[start, end)`. For a `promoted_key` slice it tests the hash key only.
  */
 export interface MigrationHost {
-	buildPage(cursor: unknown, slice: FokosSlice, belongsToTarget: (key: RouteKey) => boolean): { page: unknown; nextCursor: unknown | null };
+	buildPage(cursor: unknown, slice: FokosSlice, belongsToTarget: (key: RouteKey) => boolean): { page: unknown; nextCursor: unknown };
 	applyPage(page: unknown, slice: FokosSlice): void;
-	validatePage(cursor: unknown, page: unknown, nextCursor: unknown | null): void;
+	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void;
 }
 
 // ─── the paginated administration view ───────────────────────────────────────

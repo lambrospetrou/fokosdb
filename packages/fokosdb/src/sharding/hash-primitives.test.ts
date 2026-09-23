@@ -60,7 +60,7 @@ describe("depth seeding decorrelates levels", () => {
 describe("distribution is roughly uniform", () => {
 	it("spreads a fixture key set across K root slots within tolerance", () => {
 		const K = 8;
-		const counts = new Array(K).fill(0);
+		const counts = Array.from({ length: K }, () => 0);
 		for (const k of KEYS) counts[hashRootIndex(k, K)]++;
 		const expected = KEYS.length / K;
 		// Loose chi-square-free bound: no bucket should be wildly off (within 2.5x of expected).

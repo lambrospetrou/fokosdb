@@ -19,7 +19,7 @@ async function dispatchIsTypedByName(): Promise<void> {
 	await partition.fokos.dispatch("apiScanItems", ctx, getReq);
 	const res = await partition.fokos.dispatch("txReadSnapshot", ctx, { items: [] });
 	// @ts-expect-error the result is typed from the spec
-	res.value.outcome === "rejected";
+	if (res.value.outcome === "rejected") return;
 	await partition.fokos.forward({ partitionId: "", doName: "" }, "txCancel", { transactionId: "t", items: [] });
 	// @ts-expect-error a forward carries the request of the named operation
 	await partition.fokos.forward({ partitionId: "", doName: "" }, "txCancel", getReq);

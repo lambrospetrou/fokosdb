@@ -483,7 +483,7 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
 			return store.databaseSize > cap ? {} : false;
 		},
 		computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
-			todo(`store.rangeBoundaries(${hashKey.length}, ${childCount}, ${start}, ${end})`),
+			todo(`store.rangeBoundaries(${hashKey.length}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
 		migration: todo("FokosDbMigrationHost, unchanged"),
 		// A promotion cannot move a locked key. A split never holds: every lock follows its key to the child.
 		beforeCutover: (plan) => plan.kind !== "key_promotion" || todo<number>("store.pendingLockCountForHashKey") === 0,

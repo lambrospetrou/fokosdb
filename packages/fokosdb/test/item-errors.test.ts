@@ -188,7 +188,7 @@ describe("a failed condition of putItem and deleteItem", () => {
 		const err = (await errorOf(() =>
 			db.deleteItem({ ...key, condition: { op: "exists", args: [{ ref: "hashKey" }] } }),
 		)) as FokosConditionCheckError;
-		const copy = Object.assign(new Error(err.message), { ...err });
+		const copy = Object.assign(new Error(err.message), err);
 
 		// The category lives outside errors.ts, so fromWire builds the generic class, and the own fields
 		// and the category guard still hold on it.

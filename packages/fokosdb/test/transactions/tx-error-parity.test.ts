@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { openedRpc } from "../partition-do/helpers.js";

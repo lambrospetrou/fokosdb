@@ -97,11 +97,11 @@ export class FokosDB {
 	async destroy(): Promise<void> {
 		await this.partitions.walk(
 			(ctx, doName) => todo(`partitionStubByName(${ctx.policy.ns}, ${doName})`),
-			async (_ctx, stub) => (stub as unknown as PartitionRpc).fokosDestroy(),
+			async (_ctx, stub) => await (stub as unknown as PartitionRpc).fokosDestroy(),
 		);
 		await this.coordinators.walk(
 			(ctx, doName) => todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${doName})`),
-			async (_ctx, stub) => (stub as unknown as CoordinatorRpc).fokosDestroy(),
+			async (_ctx, stub) => await (stub as unknown as CoordinatorRpc).fokosDestroy(),
 		);
 	}
 }

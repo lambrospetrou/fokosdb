@@ -208,7 +208,7 @@ function coordinatorHooks(host: TransactionCoordinatorDO): FokosShardingHooks<Fo
 		migration: {
 			// A page is a batch of transactions with their items, participants, and results, keyed by token.
 			buildPage: (cursor, _slice, belongsToTarget) => {
-				const rows = todo<TcStateRow[]>(`tc_state after ${cursor}, bounded`);
+				const rows = todo<TcStateRow[]>(`tc_state after ${JSON.stringify(cursor) ?? "null"}, bounded`);
 				const mine = rows.filter((r) => belongsToTarget(tokenKey(r.idempotency_token)));
 				return { page: todo(`rows of ${mine.length} transactions`), nextCursor: rows.length === 0 ? null : rows.at(-1)!.transaction_id };
 			},

@@ -1,4 +1,3 @@
-import { env, exports } from "cloudflare:workers";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { PartitionContextCreator } from "../src/shared/partition-context.js";

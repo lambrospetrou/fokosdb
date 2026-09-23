@@ -24,7 +24,7 @@ import {
 // operates at the same time cannot remove it.
 describe("PartitionDO - splitting", () => {
 	it("reports no split status before any threshold is crossed", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
+		const { ctx, rpc } = makeStub({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 100 } });
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "small", kind: "text" as const });
 
@@ -63,7 +63,7 @@ describe("PartitionDO - splitting", () => {
 
 	it("alarm triggers startSplit and initializes child partitions", async ({ expect }) => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-		const { ctx, stub, rpc } = partition;
+		const { ctx } = partition;
 
 		await partition.triggerHashSplit();
 		await partition.runAlarm();
@@ -220,7 +220,7 @@ describe("PartitionDO - splitting", () => {
 		it("forwards putItem and getItem to a child after split, reporting forwardCount=1 and consistent servedByActorName", async ({
 			expect,
 		}) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			const childNames = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((c) => c.doName);
 
@@ -244,7 +244,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("returns found:false with forwardCount=1 for a missing key looked up through root after split", async ({ expect }) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("definitely-missing"), sortKey: kb("sk") });
 			expect(result.found).toBe(false);
@@ -253,7 +253,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("forwards a projected getItem to the owning child after split", async ({ expect }) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			const hashKey = "projected-key";
 			await rpc.apiPutItem(ctx, {
@@ -281,7 +281,7 @@ describe("PartitionDO - splitting", () => {
 			const dummyData = "x".repeat(ITEM_SIZE_BYTES);
 			const TOTAL_ITEMS = 50;
 			const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 0.25 } });
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			const allItems: Array<{ hashKey: string; sortKey: string; data: string }> = [];
 
@@ -366,7 +366,7 @@ describe("PartitionDO - splitting", () => {
 		};
 
 		it("propagates hashDepth=1 after one hash split and hashDepth=2 after two", async ({ expect }) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 			const hashKey = probeKey(0);
 
 			// root → child (leaf): hashDepth=1, forwardCount=1. Cache stays cold (child returns hashDepth=0).
@@ -384,7 +384,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("reduces forwardCount to 1 after learning a depth-2 path from the first response", async ({ expect }) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 			const hashKey = probeKey(1);
 
 			await (await partition.childOwning(hashKey)).splitHash();
@@ -416,7 +416,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		it("recovers from stale cache when grandchild splits: updates to depth=3 then skips directly", async ({ expect }) => {
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 			const hashKey = probeKey(3);
 
 			// Build a two-level tree: root → child → grandchild.
@@ -446,7 +446,7 @@ describe("PartitionDO - splitting", () => {
 	describe("migration", () => {
 		it("migrates each item to exactly one child and preserves reads through the parent", async ({ expect }) => {
 			const partition = makePartition({ hashSplitN: 10, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			// Seed items with varied hash keys so they spread across children.
 			const seedItems = [
@@ -503,18 +503,19 @@ describe("PartitionDO - splitting", () => {
 			const foundIds = new Set<string>();
 			for (const item of seedItems) {
 				let foundInDoName: string | undefined;
+				const keyLabel = `${KeyCodec.keyForLog(item.hashKey)}/${KeyCodec.keyForLog(item.sortKey)}`;
 				for (const childCtx of childContexts) {
 					const child = TestPartition.at(childCtx);
 					if ((await partition.childOwning(KeyCodec.decode(item.hashKey) as string)).doName !== child.doName) continue;
 					const result = await child.get({ hashKey: item.hashKey, sortKey: item.sortKey });
 					if (result.found) {
-						expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" found in multiple children`).toBeUndefined();
+						expect(foundInDoName, `${keyLabel} found in multiple children`).toBeUndefined();
 						expect(result).toMatchObject({ item: { data: item.data } });
 						foundInDoName = childCtx.doName;
 						foundIds.add(foundInDoName);
 					}
 				}
-				expect(foundInDoName, `"${item.hashKey}/${item.sortKey}" not found in any child`).toBeDefined();
+				expect(foundInDoName, `${keyLabel} not found in any child`).toBeDefined();
 			}
 			// The split spreads the items over more than one child. A very skewed hash can make this flaky.
 			expect(foundIds.size).toBeGreaterThan(1);
@@ -592,7 +593,7 @@ describe("PartitionDO - splitting", () => {
 
 		it("getItem on a child reads through to the parent while migration is in progress", { concurrent: false }, async ({ expect }) => {
 			const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
-			const { ctx, stub, rpc } = partition;
+			const { ctx, rpc } = partition;
 
 			const seedItems = [
 				{ name: "alpha", item: { hashKey: kb("alpha"), sortKey: kb("s1"), data: "data-alpha-1", kind: "text" as const } },

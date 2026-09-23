@@ -7,10 +7,14 @@ import type { SkInterval } from "./sk-interval.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const k = (s: string | null): KeyBytes | null => (s === null ? null : kb(s));
+const keyLabel = (key: KeyBytes): string => {
+	const decoded = KeyCodec.decode(key);
+	return typeof decoded === "string" ? decoded : `b64:${decoded.toBase64({ alphabet: "base64url" })}`;
+};
 
 /** A readable reference for one interval, so a test compares names and not bytes. */
 function refOf(start: KeyBytes | null, end: KeyBytes | null): FokosPartitionRef {
-	const name = `r.${start === null ? "min" : KeyCodec.decode(start)}.${end === null ? "max" : KeyCodec.decode(end)}`;
+	const name = `r.${start === null ? "min" : keyLabel(start)}.${end === null ? "max" : keyLabel(end)}`;
 	return { partitionId: name, doName: name };
 }
 

@@ -6,7 +6,7 @@ import { compiledCondition, kb, makeStub, opened } from "./helpers.js";
 describe("PartitionDO - conditional putItem", () => {
 	describe("item_not_exists", () => {
 		it("succeeds and creates the item when it does not exist", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			const result = await rpc.apiPutItem(ctx, {
 				hashKey: kb("hk"),
@@ -68,7 +68,7 @@ describe("PartitionDO - conditional putItem", () => {
 
 	describe("attribute_equals", () => {
 		it("succeeds when v matches the expected value", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "first", kind: "text" as const });
 			const result = await rpc.apiPutItem(ctx, {
@@ -106,7 +106,7 @@ describe("PartitionDO - conditional putItem", () => {
 		});
 
 		it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, stub } = makeStub();
 
 			await runInDurableObject(stub, async (instance: PartitionDO) => {
 				const res = opened(
@@ -123,7 +123,7 @@ describe("PartitionDO - conditional putItem", () => {
 		});
 
 		it("allows sequential optimistic-concurrency updates at the correct version", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			const r1 = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 			expect(r1).toMatchObject({ outcome: "ok", version: 1 });
@@ -150,7 +150,7 @@ describe("PartitionDO - conditional putItem", () => {
 
 	describe("multiple conditions", () => {
 		it("succeeds when all conditions pass", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "first", kind: "text" as const });
 			const result = await rpc.apiPutItem(ctx, {
@@ -231,7 +231,7 @@ describe("PartitionDO - conditional putItem", () => {
 		});
 
 		it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			const result = await rpc.apiPutItem(ctx, {
 				hashKey: kb("hk"),
@@ -249,7 +249,7 @@ describe("PartitionDO - deleteItem", () => {
 	describe("conditional deleteItem", () => {
 		describe("item_exists", () => {
 			it("succeeds and deletes the item when it exists", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, rpc } = makeStub();
 
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
 				const result = await rpc.apiDeleteItem(ctx, {
@@ -281,7 +281,7 @@ describe("PartitionDO - deleteItem", () => {
 			});
 
 			it("works when sortKey is absent", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
 					const res = opened(
@@ -298,7 +298,7 @@ describe("PartitionDO - deleteItem", () => {
 
 		describe("attribute_equals", () => {
 			it("succeeds when v matches the expected value", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, rpc } = makeStub();
 
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
 				const result = await rpc.apiDeleteItem(ctx, {
@@ -334,7 +334,7 @@ describe("PartitionDO - deleteItem", () => {
 			});
 
 			it("rejects when the item does not exist (actual v is null)", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, stub } = makeStub();
 
 				await runInDurableObject(stub, async (instance: PartitionDO) => {
 					const res = opened(
@@ -351,7 +351,7 @@ describe("PartitionDO - deleteItem", () => {
 
 		describe("multiple conditions", () => {
 			it("succeeds when all conditions pass", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, rpc } = makeStub();
 
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
 				const result = await rpc.apiDeleteItem(ctx, {
@@ -370,7 +370,7 @@ describe("PartitionDO - deleteItem", () => {
 			});
 
 			it("fails on the first failing condition and does not evaluate the rest", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, stub } = makeStub();
 
 				// item_exists is listed first and will fail since no item exists.
 				// attribute_equals would never be reached.
@@ -423,7 +423,7 @@ describe("PartitionDO - deleteItem", () => {
 			});
 
 			it("succeeds with empty conditions array (no conditions)", async ({ expect }) => {
-				const { ctx, stub, rpc } = makeStub();
+				const { ctx, rpc } = makeStub();
 
 				await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "value", kind: "text" as const });
 				const result = await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });

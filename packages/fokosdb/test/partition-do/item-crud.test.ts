@@ -6,7 +6,7 @@ import { kb, makeStub } from "./helpers.js";
 
 describe.concurrent("PartitionDO - putItem / getItem", () => {
 	it("returns found:false for a missing key", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk") });
 		expect(result).toEqual({
@@ -26,7 +26,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("stores and retrieves a string value", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -38,7 +38,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("stores and retrieves binary data", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 		const data = new Uint8Array([1, 2, 3, 4, 5]);
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk-bin"), sortKey: kb("sk-bin"), data, kind: "bytes" });
@@ -48,7 +48,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("overwrites an existing item on repeated put", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "first", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "second", kind: "text" as const });
@@ -58,7 +58,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("isolates items by (hashKey, sortKey) composite key", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk1"), sortKey: kb("sk1"), data: "a", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk1"), sortKey: kb("sk2"), data: "b", kind: "text" as const });
@@ -74,7 +74,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("returns version 1 on first write", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		const result = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 
@@ -82,7 +82,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("increments version on each subsequent write to the same key", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		const r1 = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 		const r2 = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const });
@@ -94,7 +94,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("getItem returns the current version", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const });
@@ -104,7 +104,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("versions are independent per (hashKey, sortKey) key", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk1"), data: "a", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk1"), data: "a2", kind: "text" as const });
@@ -119,7 +119,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("includes operation metrics in putItem result", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		const result = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 
@@ -133,7 +133,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("getItem with a projection returns the wire cells and no item envelope", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, {
 			hashKey: kb("hk"),
@@ -160,7 +160,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("includes operation metrics in getItem result", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -179,7 +179,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 
 	describe("TTL", () => {
 		it("stores and returns ttlAt when set on put", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
 			await rpc.apiPutItem(ctx, {
@@ -195,7 +195,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 		});
 
 		it("ttlAt is absent when not set on put", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 
 			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "val", kind: "text" as const });
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -205,7 +205,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 		});
 
 		it("clears ttlAt when an item is overwritten without TTL", async ({ expect }) => {
-			const { ctx, stub, rpc } = makeStub();
+			const { ctx, rpc } = makeStub();
 			const ttl = Math.floor(Date.now() / 1000) + 3600;
 
 			await rpc.apiPutItem(ctx, {
@@ -250,7 +250,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("stores and retrieves an item with no sortKey", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb(), data: "no-sort", kind: "text" as const });
 		const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb() });
@@ -261,7 +261,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 	});
 
 	it("isolates null-sortKey items from same-hashKey items that have a sortKey", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb(), data: "no-sort", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "with-sort", kind: "text" as const });
@@ -278,7 +278,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 
 describe.concurrent("PartitionDO - deleteItem", () => {
 	it("returns deleted:false for a missing key", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		const result = await rpc.apiDeleteItem(ctx, { hashKey: kb("missing"), sortKey: kb("sk") });
 		expect(result).toEqual({
@@ -299,7 +299,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("returns deleted:true and removes the item when it exists", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 		const result = await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -310,7 +310,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("is idempotent — second delete returns deleted:false", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "hello", kind: "text" as const });
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
@@ -320,7 +320,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("only deletes the exact (hashKey, sortKey) pair, leaving siblings untouched", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk1"), data: "a", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk2"), data: "b", kind: "text" as const });
@@ -340,7 +340,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("works when sortKey is absent — deletes only the no-sortKey row", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb(), data: "no-sort", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "with-sort", kind: "text" as const });
@@ -356,7 +356,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v2", kind: "text" as const });
@@ -371,7 +371,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 	});
 
 	it("includes operation metrics in deleteItem result", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "data", kind: "text" as const });
 		const result = await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });

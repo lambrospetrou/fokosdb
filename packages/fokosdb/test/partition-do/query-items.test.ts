@@ -590,12 +590,14 @@ describe("PartitionDO — range split", () => {
 
 					const caller = children[0];
 					const result = opened(
-						(await root.stub.fokosExecuteLocal({
-							op: "apiQueryItems",
-							repartitionId: await root.splitRepartitionId(),
-							caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
-							request: fullRequest(),
-						})) as FokosEnvelope<QueryItemsRpcResponse>,
+						await Promise.resolve(
+							root.stub.fokosExecuteLocal({
+								op: "apiQueryItems",
+								repartitionId: await root.splitRepartitionId(),
+								caller: { partitionId: caller.ctx.partitionId, doName: caller.doName },
+								request: fullRequest(),
+							}) as FokosEnvelope<QueryItemsRpcResponse>,
+						),
 					);
 
 					// The router's own DB still holds every item (parent rows are never deleted during a split),
@@ -617,7 +619,6 @@ describe("PartitionDO — range split", () => {
 		// that can contribute. A cursor there costs the client a round trip that returns nothing.
 		// `db.ts:queryItems` follows the same rule: it emits a cursor only when a later sub-query remains.
 		it("emits no cursor when the byte budget lands on zero at the last leaf", async () => {
-			const N = 4;
 			const { root, sks } = sharedTree;
 
 			// The exact bytes the whole scan consumes. Replayed as the budget, every leaf still drains
@@ -633,7 +634,6 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("emits no cursor when the partition-visit cap is reached but every remaining child is outside the interval", async () => {
-			const N = 4;
 			const { root, sks } = sharedTree;
 			const children = (await root.splitStatus()).childPartitionContexts;
 			// Children are in ascending boundary order, so an exclusive upper bound at the third child's
@@ -668,7 +668,6 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("the evaluated-byte budget paginates across leaves without gaps or duplicates", async () => {
-			const N = 4;
 			const { root, sks } = sharedTree;
 
 			const full = await queryPage(root);
@@ -681,7 +680,6 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("the evaluated-item budget that lands on zero at the last leaf emits no cursor", async () => {
-			const N = 4;
 			const { root, sks } = sharedTree;
 
 			const res = await queryPage(root, { remainingEvaluatedItems: sks.length });
@@ -694,7 +692,6 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("the first-item exception applies once per page, not once per leaf", async () => {
-			const N = 4;
 			const { root } = sharedTree;
 			const children = byBoundary(await root.children());
 			const c0 = children[0];
@@ -942,7 +939,6 @@ describe("PartitionDO — range split", () => {
 		});
 
 		it("sums SQL result rows across range leaves", async () => {
-			const N = 4;
 			const { root, sks } = sharedTree;
 
 			const res = await queryPage(root);

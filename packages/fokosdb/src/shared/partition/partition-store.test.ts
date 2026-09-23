@@ -20,9 +20,13 @@ import type { ProjectedWireRow } from "../expression/projection.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import { MAX_ITEM_BYTES } from "../transaction-limits.js";
-import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
+import { fokosErrorWith } from "../../../test/errors-matchers.js";
 
 const kb = (s: string | Uint8Array) => KeyCodec.encode(s);
+const keyLabel = (key: KeyBytes): string => {
+	const decoded = KeyCodec.decode(key);
+	return typeof decoded === "string" ? decoded : `b64:${decoded.toBase64({ alphabet: "base64url" })}`;
+};
 
 // Only the store creates link ids; a test stands in for the parent partition that read one.
 const linkId = (n: number) => n as ItemLinkId;
@@ -293,7 +297,7 @@ describe("PartitionStore - items", () => {
 				const page = store.queryItemsPage(cursor, 1);
 				if (page.length === 0) break;
 				const row = page[0];
-				seen.push(`${KeyCodec.decode(row.hk)}/${row.sk.byteLength === 0 ? "" : KeyCodec.decode(row.sk)}`);
+				seen.push(`${keyLabel(row.hk)}/${keyLabel(row.sk)}`);
 				cursor = { hk: row.hk, sk: row.sk };
 			}
 			expect(seen).toEqual(["a/", "a/m", "b/", "c/q"]);
@@ -1166,7 +1170,7 @@ describe("PartitionStore - pending transactions", () => {
 	});
 
 	it("hasAnyPendingTx answers from a single row", async () => {
-		await withStore((store, state) => {
+		await withStore((store, _state) => {
 			expect(store.hasAnyPendingTx()).toBe(false);
 			for (const sk of ["1", "2", "3"]) store.insertPendingLock(lockRow("hk", sk, "tx1"));
 			expect(store.hasAnyPendingTx()).toBe(true);
@@ -1405,7 +1409,7 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 	// Buckets known sorted keys into the N children defined by `boundaries` and returns the count per child.
 	// Child i owns [b_{i-1}, b_i); mirrors the byte-space [start, end) routing the migration scans use.
 	function bucketCounts(sortedKeys: string[], boundaries: KeyBytes[]): number[] {
-		const counts = new Array(boundaries.length + 1).fill(0);
+		const counts = Array.from({ length: boundaries.length + 1 }, () => 0);
 		for (const key of sortedKeys) {
 			let child = boundaries.length; // last child unless an earlier boundary claims it
 			for (let i = 0; i < boundaries.length; i++) {

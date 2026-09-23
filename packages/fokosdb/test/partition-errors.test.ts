@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
 import { testCoordinatorRef, testPartitionStub } from "./stub-helpers.js";

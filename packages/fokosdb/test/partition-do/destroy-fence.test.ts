@@ -29,7 +29,7 @@ async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbR
 
 describe.concurrent("PartitionDO — fokosStatus", () => {
 	it("bootstraps an empty root from its context and reports no repartition", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub } = makeStub();
 
 		const page = await stub.fokosStatus({ cursor: null, rootContext: ctx });
 
@@ -165,7 +165,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 	});
 
 	it("bootstraps a root from its context, so an empty database can still be destroyed", async ({ expect }) => {
-		const { ctx, stub, rpc } = makeStub();
+		const { ctx, stub } = makeStub();
 
 		await stub.fokosPrepareDestroy({ rootContext: ctx });
 
