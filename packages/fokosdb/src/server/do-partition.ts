@@ -78,7 +78,7 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -980,14 +980,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		for (const row of staleTxRows) {
 			try {
 				const ctx = this.fokos.routeContext();
-				// The coordinator that drove the transaction, either the original DO or a child that now owns the token.
-				const { route, idempotencyToken } = parseCoordinatorRef(row.coordinator_json, row.transaction_id);
-				const result = (
-					await txCoordinatorStubByName(this.env, route, route.doName).recoverTransaction(route, {
-						transactionId: row.transaction_id,
-						idempotencyToken,
-					})
-				).value;
+				// The coordinator that drove the prepare. It forwards the call to the child that now owns the token.
+				const { doName: coordinatorDoName, idempotencyToken } = parseCoordinatorRef(row.coordinator_json, row.transaction_id);
+				const address = { nsTx: ctx.policy.nsTx, jurisdiction: ctx.topology.jurisdiction };
+				const result = await txCoordinatorStubForParticipant(this.env, address, coordinatorDoName).recoverTransactionForParticipant({
+					transactionId: row.transaction_id,
+					idempotencyToken,
+				});
 
 				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 				if (pendingRows.length === 0) continue;
@@ -1016,7 +1015,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 								...this.logParams(),
 								message: "fokos/partition: lock-age guard: over-age lock with not_found",
 								transactionId: row.transaction_id,
-								coordinatorDoName: route.doName,
+								coordinatorDoName,
 								idempotencyToken,
 								keys: pendingRows.map((pending) => ({
 									hashKey: pending.hk.toBase64({ alphabet: "base64url" }),

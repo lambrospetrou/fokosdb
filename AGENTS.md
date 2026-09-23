@@ -75,7 +75,7 @@ The model follows the DynamoDB papers: [ATC 2023, Idziorek et al.](https://www.u
 - A read transaction reads twice and compares `found`, `version` and the partition's `deleteRevision`. Any change aborts it with `read_conflict`.
 - `clientRequestToken` routes to the coordinator and gives idempotency. `db.ts` always sends a token, and generates one when the caller gave none. A retry must use the same `coordinatorRootsN`.
 - Every durable transition of the coordinator runs `fokos.owns(token)` inside its `transactionSync`. After a split cutover the transition writes nothing and throws `partition_migrating`, and `db.ts` retries with the same token until the child resumes the transaction.
-- A lock row stores a `CoordinatorRef` (the route context of its coordinator and the token) as one JSON column. The stale-recovery job calls `recoverTransaction` on that coordinator, and a coordinator that has split forwards the call.
+- A lock row stores a `CoordinatorRef` (the `doName` of its coordinator and the token) as one JSON column. The stale-recovery job gets the stub with `txCoordinatorStubForParticipant`, from the `nsTx` and the jurisdiction of the partition, and calls `recoverTransactionForParticipant`. The coordinator routes the call with its own stored route context, and a coordinator that has split forwards the call.
 
 ## Rules for PartitionDO operations
 

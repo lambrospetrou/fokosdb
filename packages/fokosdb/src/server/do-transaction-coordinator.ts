@@ -348,12 +348,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return this.fokos.dispatch("initiateWrite", ctx, req);
 	}
 
-	/**
-	 * Called by a partition whose lock is stale, with the route context and the token it stored at
-	 * prepare. A coordinator that has split forwards the call to the child that owns the token.
-	 */
+	/** The routed operation. A coordinator that has split forwards the call to the child that owns the token. */
 	recoverTransaction(ctx: FokosDbRouteContext, req: RecoverTransactionRequest): Promise<FokosEnvelope<RecoverTransactionResult>> {
 		return this.fokos.dispatch("recoverTransaction", ctx, req);
+	}
+
+	/**
+	 * Called by a partition whose lock is stale. The lock stores only the name of this coordinator and
+	 * the token, so this coordinator routes the call with its own stored route context. A coordinator
+	 * with no identity has no ledger, so it has no record of the transaction.
+	 */
+	async recoverTransactionForParticipant(req: RecoverTransactionRequest): Promise<RecoverTransactionResult> {
+		if (!this.fokos.initialized()) return { state: "not_found" };
+		return (await this.recoverTransaction(this.fokos.routeContext(), req)).value;
 	}
 
 	fokosInit(req: FokosInitRequest): Promise<void> {
@@ -914,7 +921,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/** The reference that each participant stores in its lock, and calls back on recovery. */
 	private coordinatorRef(idempotencyToken: string): CoordinatorRef {
-		return { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
+		return { v: COORDINATOR_REF_VERSION, doName: this.fokos.routeContext().doName, idempotencyToken };
 	}
 
 	/** Moves PREPARING to PREPARED, the point of no return, and removes the payload that the prepare no longer needs. */

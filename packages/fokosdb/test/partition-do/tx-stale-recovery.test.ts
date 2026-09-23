@@ -39,7 +39,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			kind: "text",
 			conditions_json: null,
 			ttl_epoch_utc_seconds: null,
-			coordinator_json: JSON.stringify({ v: 1, route: coordinator, idempotencyToken: `token-${transactionId}` }),
+			coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` }),
 			created_at: createdAt,
 			guarded_at: options?.guardedAt ?? null,
 		});
@@ -49,14 +49,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 	/**
 	 * Substitutes the coordinator stub with a fake that answers `not_found`.
 	 *
-	 * The substitution is at the `txCoordinatorStubByName` helper, not at the class prototype: the
+	 * The substitution is at the `txCoordinatorStubForParticipant` helper, not at the class prototype: the
 	 * helper returns an RPC stub whose target runs outside this isolate, so a prototype spy records
 	 * nothing. The partial fake is why the cast is here.
 	 */
 	function mockCoordinatorRecovery() {
-		const recoverTransaction = vi.fn(async () => ({ value: { state: "not_found" as const } }));
-		vi.spyOn(doStubs, "txCoordinatorStubByName").mockReturnValue({
-			recoverTransaction,
+		const recoverTransaction = vi.fn(async () => ({ state: "not_found" as const }));
+		vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+			recoverTransactionForParticipant: recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		return recoverTransaction;
 	}
@@ -208,8 +208,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = vi.fn(async () => {
 			throw new Error("coordinator unavailable");
 		});
-		vi.spyOn(doStubs, "txCoordinatorStubByName").mockReturnValue({
-			recoverTransaction,
+		vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+			recoverTransactionForParticipant: recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
@@ -344,7 +344,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 	});
 
-	it("recovers through the stored coordinator route context and commits the TTL in a stale pending row", async () => {
+	it("recovers through the stored coordinator name and commits the TTL in a stale pending row", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.status(ctx);
 		const transactionId = crypto.randomUUID();
@@ -352,6 +352,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 		const coordinator = testCoordinatorContext();
 		const tcStub = testCoordinatorStubByName(coordinator.doName);
+		// A coordinator gets its identity from its first routed request, as `initiateWrite` gives it in
+		// production. A coordinator with no identity answers `not_found`.
+		await tcStub.recoverTransaction(coordinator, { transactionId: "no-such-transaction", idempotencyToken: `stale-${transactionId}` });
 
 		await runInDurableObject(tcStub, async (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
@@ -364,7 +367,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				"0000000000000000",
 			);
 		});
-		const getCoordinatorByName = vi.spyOn(doStubs, "txCoordinatorStubByName");
+		const getCoordinatorStub = vi.spyOn(doStubs, "txCoordinatorStubForParticipant");
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
 			store.insertPendingLock({
@@ -377,7 +380,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				kind: "text",
 				conditions_json: null,
 				ttl_epoch_utc_seconds: ttlAt,
-				coordinator_json: JSON.stringify({ v: 1, route: coordinator, idempotencyToken: `stale-${transactionId}` }),
+				coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `stale-${transactionId}` }),
 				created_at: transactionTimestamp,
 				guarded_at: null,
 			});
@@ -386,7 +389,12 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		await runDurableObjectAlarm(stub);
 		await vi.waitFor(async () => {
-			expect(getCoordinatorByName).toHaveBeenCalledWith(env, coordinator, coordinator.doName);
+			// The namespace and the jurisdiction come from the partition, and only the name from the lock.
+			expect(getCoordinatorStub).toHaveBeenCalledWith(
+				env,
+				{ nsTx: ctx.policy.nsTx, jurisdiction: ctx.topology.jurisdiction },
+				coordinator.doName,
+			);
 			expect(await rpc.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
 				found: true,
 				item: { data: "value", ttlAt },

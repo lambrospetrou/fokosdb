@@ -1130,6 +1130,32 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 	});
 });
 
+describe("TransactionCoordinatorDO - recoverTransactionForParticipant", () => {
+	// A lock stores only the name of the coordinator and the token. The coordinator routes the call
+	// with the route context it stored.
+	it("answers from the ledger through the stored route context", async () => {
+		await withCoordinator(async (tc, state) => {
+			insertState(state, { token: TOKEN, transactionId: TX_ID, state: "COMMITTED", createdAt: BASE_TIME, completedAt: BASE_TIME });
+
+			const coordinator = tc as unknown as TransactionCoordinatorDO;
+			await expect(coordinator.recoverTransactionForParticipant({ transactionId: TX_ID, idempotencyToken: TOKEN })).resolves.toEqual({
+				state: "COMMITTED",
+			});
+		});
+	});
+
+	it("answers not_found on a coordinator with no identity, and does not create one", async () => {
+		const stub = testCoordinatorStubByName(testCoordinatorContext().doName);
+
+		await expect(stub.recoverTransactionForParticipant({ transactionId: TX_ID, idempotencyToken: TOKEN })).resolves.toEqual({
+			state: "not_found",
+		});
+		await runInDurableObject(stub, (instance: TransactionCoordinatorDO) => {
+			expect(instance.fokos.initialized()).toBe(false);
+		});
+	});
+});
+
 describe("TransactionCoordinatorDO - fokosDestroy", () => {
 	// The idempotency window lives in tc_state. A coordinator that survives FokosDB.destroy() answers a
 	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was

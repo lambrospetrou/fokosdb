@@ -46,5 +46,5 @@ export function testCoordinatorContext(): FokosDbRouteContext {
  * test that never recovers the transaction needs only a valid reference.
  */
 export function testCoordinatorRef(idempotencyToken = "test-token"): CoordinatorRef {
-	return { v: COORDINATOR_REF_VERSION, route: testCoordinatorContext(), idempotencyToken };
+	return { v: COORDINATOR_REF_VERSION, doName: testCoordinatorContext().doName, idempotencyToken };
 }

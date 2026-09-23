@@ -389,7 +389,7 @@ Deliverables:
   operations keyed by the idempotency token, and runs its recovery and idempotency sweep as host jobs
   (section 4.2.21).
 - Every durable transition of the 2PC driver runs `owns()` inside its `transactionSync`.
-- `PrepareRequest` carries the coordinator route context and the token. The lock row stores both.
+- `PrepareRequest` carries the coordinator `doName` and the token. The lock row stores both.
 - `db.ts` builds a second `FokosRouter` for `fokos.tc.<shardGroup>`, `StaticShardedDO` and `numTxCoordinators`
   are removed, and `destroy` walks both shard groups.
 - The coordinator tests of section 4.2.20.
@@ -425,7 +425,7 @@ made during the implementation and differ from, or add to, the text of sections 
 - `cleanupSourceStep` deletes the ledger of a split source in batches of `SWEEP_BATCH_ROWS` transactions.
 - A migration page reads at most `FOKOS_PAGE_ROWS` ledger rows and stops before the transaction that would
   cross `FOKOS_PAGE_BYTES`. It always holds at least one transaction.
-- `PrepareRequest.coordinator` is a `CoordinatorRef`: `{ v: 1, route, idempotencyToken }`. The lock row stores it
+- `PrepareRequest.coordinator` is a `CoordinatorRef`: `{ v: 1, doName, idempotencyToken }`. The lock row stores it
   as one JSON value in `coordinator_json`, in place of `coordinator_do_id`. The partition does not read its fields
   except to call the coordinator back, so a new field needs no schema change, and the update-lock statement
   keeps its 6 trailing parameters. `parseCoordinatorRef` checks the version and each field that the call uses,
@@ -1699,9 +1699,10 @@ The FokosDB host maps current mechanisms as follows:
   walks the partition group and then the coordinator group.
 - `debugForceResolveTransaction` is a `local` shape whose handler re-enters `dispatch` for `txCommit` or
   `txCancel`, so each key is applied on its current owner.
-- The stale-recovery job reads the coordinator route context and the token from the lock row, calls
-  `recoverTransaction` on that coordinator through a host-created stub, and applies the answer through
-  `dispatch` (section 4.2.21).
+- The stale-recovery job reads the coordinator `doName` and the token from the lock row, and calls
+  `recoverTransactionForParticipant` on that coordinator. The stub uses the `nsTx` and the jurisdiction of the
+  partition. The coordinator routes the call with its own stored route context. The partition applies the answer
+  through `dispatch` (section 4.2.21).
 
 Both FokosDB hosts share one policy type, `FokosDbPolicy`: `ns`, `nsTx`, `locationHint`, and the two split
 condition sets. The coordinator reads `ns` when it calls partitions; the partition reads `nsTx` when it calls

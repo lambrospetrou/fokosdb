@@ -12,7 +12,7 @@
  */
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { FokosDbStubContext } from "./partition-context.js";
+import type { FokosDbStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
@@ -44,4 +44,27 @@ export function partitionStubByName(env: Env, ctx: FokosDbStubContext, doName: s
 
 export function txCoordinatorStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
 	return txCoordinatorNamespace(env, ctx).getByName(doName, stubOptions(ctx));
+}
+
+/**
+ * The fields that a partition uses to reach a coordinator of its table. They come from the route
+ * context of the partition, never from a coordinator context: the coordinators of a table use the
+ * `nsTx` namespace and the jurisdiction of the table.
+ */
+export type ParticipantCoordinatorAddress = {
+	nsTx: TransactionCoordinatorNamespaceKey;
+	jurisdiction?: DurableObjectJurisdiction;
+};
+
+/**
+ * The stub of a coordinator that a partition calls back from a lock. The coordinator exists already,
+ * so no location hint applies.
+ */
+export function txCoordinatorStubForParticipant(
+	env: Env,
+	address: ParticipantCoordinatorAddress,
+	doName: string,
+): DurableObjectStub<TransactionCoordinatorDO> {
+	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[address.nsTx];
+	return (address.jurisdiction === undefined ? ns : ns.jurisdiction(address.jurisdiction)).getByName(doName);
 }

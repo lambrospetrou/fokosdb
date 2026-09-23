@@ -56,13 +56,18 @@ export const COORDINATOR_REF_VERSION = 1;
 
 /**
  * What a participant needs to call the coordinator of a transaction back. The partition stores it as
- * one JSON value in `pending_transactions`, and the stale-recovery job calls `recoverTransaction` with
- * it. A new field needs no schema change. A change that an older reader cannot read increments `v`.
+ * one JSON value in `pending_transactions`, and the stale-recovery job calls
+ * `recoverTransactionForParticipant` with it. A new field needs no schema change. A change that an
+ * older reader cannot read increments `v`.
+ *
+ * The reference has no namespace and no jurisdiction. The coordinators of a table use the `nsTx`
+ * namespace and the jurisdiction of the table, so the partition uses its own values. The coordinator
+ * loads its route context from its own storage.
  */
 export type CoordinatorRef = {
 	v: typeof COORDINATOR_REF_VERSION;
-	/** The route context of the coordinator that drove the prepare. */
-	route: FokosDbRouteContext;
+	/** The Durable Object name of the coordinator that drove the prepare. */
+	doName: string;
 	/** The route key of the transaction. A coordinator that has split forwards the call to the child that owns it. */
 	idempotencyToken: IdempotencyToken;
 };

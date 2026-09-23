@@ -69,7 +69,7 @@ describe("TransactionParticipant - prepare", () => {
 		["transactionId", { transactionId: "" }],
 		["coordinator.v", { coordinator: { ...COORDINATOR, v: 2 as never } }],
 		["coordinator.idempotencyToken", { coordinator: { ...COORDINATOR, idempotencyToken: "" } }],
-		["coordinator.route", { coordinator: { ...COORDINATOR, route: { ...COORDINATOR.route, doName: "" } } }],
+		["coordinator.doName", { coordinator: { ...COORDINATOR, doName: "" } }],
 	])("refuses to lock an item when %s is empty, so no unreleasable lock is created", async (_name, override) => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({
@@ -1017,10 +1017,10 @@ describe("parseCoordinatorRef", () => {
 		["is not JSON", "{not json"],
 		["has an unknown version", "null"],
 		["has an unknown version", JSON.stringify({ ...COORDINATOR, v: 2 })],
-		["has an unknown version", JSON.stringify({ route: COORDINATOR.route, idempotencyToken: "tok" })],
+		["has an unknown version", JSON.stringify({ doName: COORDINATOR.doName, idempotencyToken: "tok" })],
 		["has no idempotency token", JSON.stringify({ ...COORDINATOR, idempotencyToken: "" })],
-		["has no valid route context", JSON.stringify({ ...COORDINATOR, route: { ...COORDINATOR.route, doName: "" } })],
-		["has no valid route context", JSON.stringify({ ...COORDINATOR, route: { ...COORDINATOR.route, policy: {} } })],
+		["has no coordinator name", JSON.stringify({ ...COORDINATOR, doName: "" })],
+		["has no coordinator name", JSON.stringify({ v: COORDINATOR.v, idempotencyToken: "tok" })],
 	])("refuses a reference that %s", (detail, json) => {
 		expect(() => parseCoordinatorRef(json, "tx-bad")).toThrow(
 			fokosErrorWith("unexpected_transaction_state", { detail: `the coordinator reference of a lock ${detail}`, transactionId: "tx-bad" }),

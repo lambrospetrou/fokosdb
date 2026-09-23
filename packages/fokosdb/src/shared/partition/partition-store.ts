@@ -1524,7 +1524,7 @@ export class PartitionStore {
 	 *
 	 * Two alternatives were measured and are worse. Widening `pending_transactions_created_at` to
 	 * `(created_at, transaction_id, coordinator_json)` makes the plan covering but reads the same
-	 * 9,000 rows, and costs several MB per 20k rows because `coordinator_json` is a long string. A
+	 * 9,000 rows, and makes the index larger, because each entry copies `coordinator_json`. A
 	 * `GROUP BY transaction_id ... HAVING MIN(created_at) < ?` walks the `transaction_id` index, which
 	 * cannot use `created_at` at all: 10,000 rows read in the same case, and the whole table in the
 	 * common case where few rows are stale.

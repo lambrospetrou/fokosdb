@@ -213,7 +213,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				kind: "text",
 				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
-				coordinator_json: JSON.stringify({ v: 1, route: root, idempotencyToken: token }),
+				coordinator_json: JSON.stringify({ v: 1, doName: root.doName, idempotencyToken: token }),
 				created_at: Date.now() - 60_000,
 				guarded_at: null,
 			});

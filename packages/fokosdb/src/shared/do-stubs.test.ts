@@ -4,7 +4,14 @@
  */
 import { describe, expect, it, vi } from "vitest";
 import { PartitionContextCreator } from "./partition-context.js";
-import { partitionNamespace, partitionStub, partitionStubByName, txCoordinatorNamespace, txCoordinatorStubByName } from "./do-stubs.js";
+import {
+	partitionNamespace,
+	partitionStub,
+	partitionStubByName,
+	txCoordinatorNamespace,
+	txCoordinatorStubByName,
+	txCoordinatorStubForParticipant,
+} from "./do-stubs.js";
 
 function fakeNamespace() {
 	return {
@@ -111,6 +118,22 @@ describe("stub helpers", () => {
 			expect(txCoordinatorStubByName(env, ctx, "tc0")).toBe("stub-by-name:tc0");
 			expect(target.getByName).toHaveBeenCalledTimes(1);
 			expect(target.getByName).toHaveBeenCalledWith("tc0", undefined);
+			for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
+				if (other !== target) expect(other.getByName).not.toHaveBeenCalled();
+			}
+		},
+	);
+
+	it.each([undefined, "eu" as const])(
+		"txCoordinatorStubForParticipant gets the stub on the nsTx namespace of the address only, with no options (jurisdiction: %s)",
+		(jurisdiction) => {
+			const { env, partitionNs, coordinatorNs, partitionSub, coordinatorSub } = makeEnv();
+			const target = jurisdiction === undefined ? coordinatorNs : coordinatorSub;
+
+			expect(txCoordinatorStubForParticipant(env, { nsTx: "TRANSACTION_COORDINATOR_DO", jurisdiction }, "tc0")).toBe("stub-by-name:tc0");
+			expect(target.getByName).toHaveBeenCalledTimes(1);
+			expect(target.getByName).toHaveBeenCalledWith("tc0");
+			if (jurisdiction !== undefined) expect(coordinatorNs.jurisdiction).toHaveBeenCalledWith(jurisdiction);
 			for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
 				if (other !== target) expect(other.getByName).not.toHaveBeenCalled();
 			}

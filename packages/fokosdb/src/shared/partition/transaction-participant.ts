@@ -50,7 +50,7 @@ export function parseCoordinatorRef(json: string, transactionId: string): Coordi
 	}
 	if (ref?.v !== COORDINATOR_REF_VERSION) throw invalid("has an unknown version", { v: ref?.v });
 	if (!ref.idempotencyToken) throw invalid("has no idempotency token");
-	if (!ref.route?.doName || !ref.route.topology || !ref.route.policy?.nsTx) throw invalid("has no valid route context");
+	if (!ref.doName) throw invalid("has no coordinator name");
 	return ref as CoordinatorRef;
 }
 
@@ -179,13 +179,13 @@ export class TransactionParticipant {
 	prepareLocal(request: PrepareRequest): PrepareResponse {
 		// A lock is only ever released by the outcome of its transaction, and the values below are the
 		// whole thread back to that outcome: the recovery job selects locks by transaction_id and calls
-		// the coordinator that the stored route context and token name (nothing else in the system can
+		// the coordinator that the stored name and token address (nothing else in the system can
 		// supply them). A lock missing one is therefore unreleasable — it would block every
 		// non-transactional write to its key for the life of the partition. Refuse to create it.
 		invariant(request.transactionId.length > 0, "fokos/partition.prepare: transactionId is required");
 		invariant(request.coordinator?.v === COORDINATOR_REF_VERSION, "fokos/partition.prepare: the coordinator reference version is required");
 		invariant(request.coordinator.idempotencyToken, "fokos/partition.prepare: the coordinator idempotencyToken is required");
-		invariant(request.coordinator.route?.doName, "fokos/partition.prepare: the coordinator route context is required");
+		invariant(request.coordinator.doName, "fokos/partition.prepare: the coordinator doName is required");
 		const coordinatorJson = JSON.stringify(request.coordinator);
 
 		const now = this.#now();
