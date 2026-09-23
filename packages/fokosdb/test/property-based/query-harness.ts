@@ -208,7 +208,8 @@ export async function drainFromCursor(
 //
 // The fixture promotes one hash key into a range tree of several leaves, empties one middle leaf,
 // and adds a second hash key on an ordinary partition. The build costs several hundred writes, so a
-// suite builds it once in `beforeAll`.
+// suite builds it once in `beforeAll`. `buildSplittingFixture` stops at the promotion, for a suite
+// that makes its own splits and builds a new tree for each batch of runs.
 //
 // `query-items-split.test.ts` queries the tree after it settles. `query-items-active-split.test.ts`
 // keeps writing to it, so a query runs while a leaf splits and its children still import.
@@ -382,29 +383,35 @@ async function scanBoundaries(db: FokosDB, sorted: readonly OptionalQueryKey[]):
 	}
 }
 
-export async function buildFixture(): Promise<Fixture> {
+// Writes land a batch at a time: one put per round trip would spend the build on waiting, and
+// two puts of one batch never name the same key.
+const BUILD_BATCH = 16;
+
+/** Writes the hot items `start` to `end` and records them in the model. */
+async function putHotRange(db: FokosDB, model: QueryModel, start: number, end: number): Promise<void> {
+	for (let i = start; i < end; i += BUILD_BATCH) {
+		await Promise.all(
+			Array.from({ length: Math.min(BUILD_BATCH, end - i) }, (_, j) => {
+				const sortKey = hotSortKey(i + j);
+				return putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey));
+			}),
+		);
+	}
+}
+
+/** A new table whose hot key is just past the promotion threshold, so its range root exists. */
+async function promotedTable(): Promise<{ db: FokosDB; model: QueryModel }> {
 	const db = makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
 	const model: QueryModel = new Map();
-
-	// Writes land a batch at a time: one put per round trip would spend the build on waiting, and
-	// two puts of one batch never name the same key.
-	const BUILD_BATCH = 16;
-	const putRange = async (start: number, end: number) => {
-		for (let i = start; i < end; i += BUILD_BATCH) {
-			await Promise.all(
-				Array.from({ length: Math.min(BUILD_BATCH, end - i) }, (_, j) => {
-					const sortKey = hotSortKey(i + j);
-					return putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey));
-				}),
-			);
-		}
-	};
-
-	await putRange(0, PROMOTE_ITEMS);
+	await putHotRange(db, model, 0, PROMOTE_ITEMS);
 	// The range root must exist before the rest of the payload arrives. Its name carries ".r.".
 	await awaitLeaves(db, (leaves) => leaves.some((name) => name.includes(".r.")), "the hot key is promoted");
+	return { db, model };
+}
 
-	await putRange(PROMOTE_ITEMS, HOT_ITEMS);
+export async function buildFixture(): Promise<Fixture> {
+	const { db, model } = await promotedTable();
+	await putHotRange(db, model, PROMOTE_ITEMS, HOT_ITEMS);
 	await Promise.all([
 		...BINARY_SORT_KEYS.map((sortKey) => putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey))),
 		...COLD_SORT_KEYS.map((sortKey, index) => putAndRecord(db, model, COLD_HASH_KEY, sortKey, coldData(sortKey, index))),
@@ -444,6 +451,20 @@ export async function buildFixture(): Promise<Fixture> {
 	return { db, model, hotSortKeys: sorted, leaves, boundaries, emptiedKeys: empty };
 }
 
+/**
+ * The fixture of a suite that splits the tree itself. It stops at the promotion: the range root
+ * holds all the hot items, and the first leaf that the suite fills past its cap splits it. It has no
+ * binary sort keys, no emptied leaf and no boundaries, because every split after the build moves
+ * the boundaries. `buildFixture` gives a settled tree these cases.
+ */
+export async function buildSplittingFixture(): Promise<Fixture> {
+	const { db, model } = await promotedTable();
+	await Promise.all(COLD_SORT_KEYS.map((sortKey, index) => putAndRecord(db, model, COLD_HASH_KEY, sortKey, coldData(sortKey, index))));
+	const leaves = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
+	const hotSortKeys = Array.from({ length: PROMOTE_ITEMS }, (_, i) => hotSortKey(i));
+	return { db, model, hotSortKeys, leaves, boundaries: [], emptiedKeys: [] };
+}
+
 // ─── The request arbitrary of the split suites ────────────────────────────────
 
 /**
@@ -467,7 +488,9 @@ function boundPool(fixture: Fixture): QueryKey[] {
 	// from the emptied leaf, so a bound lands inside the stretch that holds nothing.
 	for (let i = 0; i < hotSortKeys.length; i += Math.ceil(hotSortKeys.length / 6)) pool.push(hotSortKeys[i] as QueryKey);
 	const emptied = fixture.emptiedKeys;
-	pool.push(emptied[0] as QueryKey, emptied[Math.floor(emptied.length / 2)] as QueryKey, emptied[emptied.length - 1] as QueryKey);
+	if (emptied.length > 0) {
+		pool.push(emptied[0] as QueryKey, emptied[Math.floor(emptied.length / 2)] as QueryKey, emptied[emptied.length - 1] as QueryKey);
+	}
 	pool.push("sk", "sz", new Uint8Array([0x01]), new Uint8Array([0xff]));
 	return pool;
 }
@@ -565,6 +588,8 @@ export function budgetFor(
  */
 function countBeforeEmptyLeaf(expected: readonly QueryModelItem[], fixture: Fixture): number {
 	const emptied = fixture.emptiedKeys;
+	// A fixture without an emptied leaf has no such stop.
+	if (emptied.length === 0) return 0;
 	const start = encodeKey(emptied[0]);
 	const end = encodeKey(emptied[emptied.length - 1]);
 	const index = expected.findIndex((item) => compareBytes(item.sortKeyBytes, start) >= 0 && compareBytes(item.sortKeyBytes, end) <= 0);

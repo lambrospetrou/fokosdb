@@ -1,7 +1,7 @@
 // Property-based tests for queryItems while the range tree under it is still splitting.
 //
 // query-items-split.test.ts settles the tree first, so its walk always reads a topology that stands
-// still. This suite keeps writing to the same fixture: before each run it fills one leaf past its
+// still. This suite keeps writing to its fixture: before each run it fills one leaf past its
 // cap, which queues a split, and the run then reads the tree while that leaf turns into a router and
 // its two children import their share. Two paths exist only inside that window.
 //
@@ -16,7 +16,8 @@
 // about what the table holds, and the churn stops before each drain, so the model stays exact while
 // a migration runs in the background and the pages arrive.
 //
-// query-harness.ts holds the fixture, the request arbitrary, the model and the key oracle.
+// query-harness.ts holds the fixture, the request arbitrary, the model and the key oracle. The
+// fixture stops at the promotion of the hot key, and the churn makes every split after it.
 //
 // A query of a promoted hash key must enter its range tree at the root. An operation that spans the
 // sort-key axis carries no single sort key, so it can never select a node from a point-keyed cache:
@@ -25,32 +26,33 @@
 // interval planner picks nodes that fully contain each segment.
 // docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md records the defect this prevents.
 import fc from "fast-check";
-import { beforeAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PutItemResult, QueryItemsOptions } from "../../src/shared/types.js";
 import { propertyRuns, sleep, untilAvailable } from "./harness.js";
 import {
 	budgetFor,
-	buildFixture,
+	buildSplittingFixture,
 	drainFromCursor,
 	expectDrainedAnswer,
 	expectedAnswer,
 	expectedItems,
 	hotSortKey,
 	HOT_HASH_KEY,
-	HOT_ITEMS,
 	itemId,
-	leavesOf,
 	makeArbRequest,
-	pollLeaves,
 	publicItem,
 	RANGE_SPLIT_MAX_SIZE_MB,
 	recordItem,
 	type Fixture,
+	type Query,
 	type QueryKey,
 } from "./query-harness.js";
 
 const SUITE_TIMEOUT_MS = 600_000;
+// A run with a split costs about 0.6 s alone, a tree build included. This allows for the load of the
+// full suite, so a high run count gets more time than the fixed suite limit.
+const timeoutFor = (runs: number) => Math.max(SUITE_TIMEOUT_MS, runs * 5_000);
 
 // ─── The churn ────────────────────────────────────────────────────────────────
 
@@ -67,11 +69,16 @@ const CHURN_ITEM_BYTES = 32 * 1024;
 // still grows towards its cap and still splits, while the answer a property compares stays small.
 const CHURN_LIVE_MAX = 12;
 const MAX_PUTS_PER_PUSH = 20;
-// The whole suite writes no more than this, which is about a dozen splits. Every split adds two
-// partitions and every partition adds a hop to a scan, so an unbounded churn would spend the whole
-// suite on a walk of the tree instead of a check of it — and a deep search even more.
+// One tree gets no more than this. A split needs about 11 puts, so a tree ends at about 20 leaves.
+// Every split adds two partitions and every partition adds a hop to a scan, so an unbounded churn
+// would spend the suite on a walk of the tree instead of a check of it — and a deep search even more.
 const CHURN_PUT_BUDGET = 200;
 const RANGE_CAP_BYTES = RANGE_SPLIT_MAX_SIZE_MB * 1024 * 1024;
+// The runs of one property that share a tree. A push that queues a split uses about 10 puts. A run
+// after the budget reads a tree that does not change, and query-items-split.test.ts already does
+// that test. Thus a property builds a new tree and a new churn for each batch of runs, and does not
+// run on after the budget.
+const RUNS_PER_TREE = CHURN_PUT_BUDGET / 10;
 // The time the churn tries a write again after another unavailable error. This limit finds a table
 // that stopped. It must not decide a table that is only slow, thus it is much more than the time a
 // retry needs under the load of the full suite.
@@ -176,18 +183,9 @@ class Churn {
 	}
 }
 
-/**
- * The stable sort keys the churn writes around: spread over the tree, and never inside the stretch
- * the fixture emptied, which has to stay empty to keep covering the child that carries no rows.
- */
-function churnRegions(fixture: Fixture): number[] {
-	const emptied = new Set(fixture.emptiedKeys.filter((key): key is string => typeof key === "string"));
-	return [0.1, 0.35, 0.6, 0.85].map((fraction) => {
-		let index = Math.floor(fraction * HOT_ITEMS);
-		while (index < HOT_ITEMS - 1 && emptied.has(hotSortKey(index))) index++;
-		return index;
-	});
-}
+/** The stable sort keys the churn writes around, spread over the hot items of the fixture. */
+const churnRegions = (fixture: Fixture): number[] =>
+	[0.1, 0.35, 0.6, 0.85].map((fraction) => Math.floor(fraction * fixture.hotSortKeys.length));
 
 /**
  * Whether one page shows a child that answers from its source. A leaf is listed once per sub-query
@@ -196,14 +194,51 @@ function churnRegions(fixture: Fixture): number[] {
  */
 const readsThroughToSource = (names: readonly string[]) => new Set(names).size < names.length;
 
+/**
+ * A text that changes with every split of the hot key. A response names only the leaves that fit in
+ * its route data, so the names alone can miss a split late in the walk. `partitionsVisited` counts
+ * every leaf that answered, so a split changes it immediately.
+ */
+async function topologyOf(fixture: Fixture): Promise<string> {
+	const page = await untilAvailable(() => fixture.db.queryItems({ queries: [{ hashKey: HOT_HASH_KEY }], select: "count", limit: 100_000 }));
+	return `${page.meta.partitionsVisited}:${page.partitionMetas.map((meta) => meta.servedByActorName).join()}`;
+}
+
+/** Polls the topology of the hot key until it is not `before`, or until the last attempt. */
+async function awaitTopologyChange(fixture: Fixture, before: string, attempts: number): Promise<void> {
+	for (let attempt = 0; attempt < attempts; attempt++) {
+		if ((await topologyOf(fixture)) !== before) return;
+		await sleep(25);
+	}
+}
+
+/** A range tree and the churn that keeps it splitting. */
+type Tree = { fixture: Fixture; churn: Churn };
+
+async function buildTree(): Promise<Tree> {
+	const fixture = await buildSplittingFixture();
+	return { fixture, churn: new Churn(fixture, churnRegions(fixture)) };
+}
+
+/** Runs a property `numRuns` times, on a new tree for each batch of `RUNS_PER_TREE` runs. */
+async function assertOnSplittingTrees(
+	numRuns: number,
+	run: (tree: Tree, request: { queries: Query[]; budget: number }) => Promise<void>,
+): Promise<void> {
+	for (let done = 0; done < numRuns; done += RUNS_PER_TREE) {
+		const tree = await buildTree();
+		await fc.assert(
+			fc.asyncProperty(makeArbRequest(tree.fixture, tree.churn.bounds()), (request) => run(tree, request)),
+			{ numRuns: Math.min(RUNS_PER_TREE, numRuns - done) },
+		);
+	}
+}
+
 // ─── The suite ────────────────────────────────────────────────────────────────
 
 describe("FokosDB queryItems while a range tree splits — model-based properties", () => {
-	let fixture: Fixture;
-	let churn: Churn;
-
 	/** Counts the whole hot key and says whether a page came from a source instead of its child. */
-	async function probeHotKey(): Promise<{ count: number; readThrough: boolean }> {
+	async function probeHotKey(fixture: Fixture): Promise<{ count: number; readThrough: boolean }> {
 		let count = 0;
 		let readThrough = false;
 		let cursor: string | undefined;
@@ -218,18 +253,12 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 		return { count, readThrough };
 	}
 
-	const hotCount = () => expectedItems(fixture.model, { hashKey: HOT_HASH_KEY }).length;
-
-	beforeAll(async () => {
-		fixture = await buildFixture();
-		expect(new Set(fixture.leaves).size, "the hot key must be spread over several range leaves").toBeGreaterThanOrEqual(4);
-		churn = new Churn(fixture, churnRegions(fixture));
-	}, SUITE_TIMEOUT_MS);
-
 	// This runs first, and it is the one test that proves the window exists. If a query never meets
 	// an importing child, the properties below still pass and cover nothing new, so the suite says so
 	// here instead of a report of a silent success.
 	it("a query answers from the source while the children of a split still import", { timeout: SUITE_TIMEOUT_MS }, async () => {
+		const { fixture, churn } = await buildTree();
+		const hotCount = () => expectedItems(fixture.model, { hashKey: HOT_HASH_KEY }).length;
 		for (let split = 0; split < 6; split++) {
 			const pushed = await churn.push();
 			expect(pushed, "the churn must be able to fill a leaf past its cap").not.toBe("budget");
@@ -237,7 +266,7 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 			// import that completes. Every probe must also agree with the model: an importing child
 			// answers from its source, and that answer is the same answer.
 			for (let probe = 0; probe < 80; probe++) {
-				const { count, readThrough } = await probeHotKey();
+				const { count, readThrough } = await probeHotKey(fixture);
 				expect(count, "the count of the hot key must not change while its leaves split").toBe(hotCount());
 				if (readThrough) return;
 				await sleep(5);
@@ -246,51 +275,43 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 		throw new Error("no page ever showed a child reading through its source; the suite covers nothing new");
 	});
 
-	it("a drained request returns exactly the model's items, in key order", { timeout: SUITE_TIMEOUT_MS }, async () => {
-		await fc.assert(
-			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
-				await churn.push();
-				const expected = expectedAnswer(fixture.model, queries);
-				await expectDrainedAnswer(fixture.db, expected, { queries, ...budgetFor(budget, expected, fixture) });
-			}),
-			{ numRuns: propertyRuns(20) },
-		);
+	it("a drained request returns exactly the model's items, in key order", { timeout: timeoutFor(propertyRuns(20)) }, async () => {
+		await assertOnSplittingTrees(propertyRuns(20), async ({ fixture, churn }, { queries, budget }) => {
+			await churn.push();
+			const expected = expectedAnswer(fixture.model, queries);
+			await expectDrainedAnswer(fixture.db, expected, { queries, ...budgetFor(budget, expected, fixture) });
+		});
 	});
 
-	it("count mode counts the same items and materializes none", { timeout: SUITE_TIMEOUT_MS }, async () => {
-		await fc.assert(
-			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
-				await churn.push();
-				const expected = expectedAnswer(fixture.model, queries);
-				await expectDrainedAnswer(fixture.db, expected, { queries, ...budgetFor(budget, expected, fixture), select: "count" });
-			}),
-			{ numRuns: propertyRuns(10) },
-		);
+	it("count mode counts the same items and materializes none", { timeout: timeoutFor(propertyRuns(10)) }, async () => {
+		await assertOnSplittingTrees(propertyRuns(10), async ({ fixture, churn }, { queries, budget }) => {
+			await churn.push();
+			const expected = expectedAnswer(fixture.model, queries);
+			await expectDrainedAnswer(fixture.db, expected, { queries, ...budgetFor(budget, expected, fixture), select: "count" });
+		});
 	});
 
-	it("a cursor minted before a split resumes exactly after it", { timeout: SUITE_TIMEOUT_MS }, async () => {
-		await fc.assert(
-			fc.asyncProperty(makeArbRequest(fixture, churn.bounds()), async ({ queries, budget }) => {
-				await churn.push();
-				const expected = expectedAnswer(fixture.model, queries);
-				const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture) };
+	it("a cursor minted before a split resumes exactly after it", { timeout: timeoutFor(propertyRuns(10)) }, async () => {
+		await assertOnSplittingTrees(propertyRuns(10), async ({ fixture, churn }, { queries, budget }) => {
+			const pushed = await churn.push();
+			const expected = expectedAnswer(fixture.model, queries);
+			const opts: QueryItemsOptions = { queries, ...budgetFor(budget, expected, fixture) };
 
-				const before = await leavesOf(fixture.db, { queries: [{ hashKey: HOT_HASH_KEY }] });
-				const first = await untilAvailable(() => fixture.db.queryItems(opts));
-				if (first.cursor === undefined) return;
-				// The cursor names a position in the topology that the first page walked. A wait for the
-				// leaves to change redeems it in another topology, where the child it stopped in is two
-				// children and the position it carries has to resolve to the same place. A window that
-				// closes before the leaves move leaves the rest of the property just as valid, so nothing
-				// is asserted here.
-				await pollLeaves(fixture.db, (now) => now.join() !== before.join(), 20);
+			const before = await topologyOf(fixture);
+			const first = await untilAvailable(() => fixture.db.queryItems(opts));
+			if (first.cursor === undefined) return;
+			// The cursor names a position in the topology that the first page walked. A wait for the
+			// leaves to change redeems it in another topology, where the child it stopped in is two
+			// children and the position it carries has to resolve to the same place. A window that
+			// closes before the leaves move leaves the rest of the property just as valid, so nothing
+			// is asserted here. A push that queued no split cannot move the leaves, so the wait
+			// operates only after a queued split.
+			if (pushed === "queued") await awaitTopologyChange(fixture, before, 20);
 
-				const rest = await drainFromCursor(fixture.db, opts, first.cursor, expected.length);
-				const expectedPublic = expected.map(publicItem);
-				expect(first.items).toEqual(expectedPublic.slice(0, first.items.length));
-				expect([...first.items, ...rest]).toEqual(expectedPublic);
-			}),
-			{ numRuns: propertyRuns(10) },
-		);
+			const rest = await drainFromCursor(fixture.db, opts, first.cursor, expected.length);
+			const expectedPublic = expected.map(publicItem);
+			expect(first.items).toEqual(expectedPublic.slice(0, first.items.length));
+			expect([...first.items, ...rest]).toEqual(expectedPublic);
+		});
 	});
 });
