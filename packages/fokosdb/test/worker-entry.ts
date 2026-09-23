@@ -25,6 +25,9 @@ export class CustomPartitionDO extends PartitionDO {}
 export { ControlledPartitionDO } from "./controlled-partition-do.js";
 export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
 
+// The example host of the sharding runtime. It uses no FokosDB module.
+export { CounterPartitionDO } from "./sharding/counter-host.js";
+
 export default {
 	async fetch(): Promise<Response> {
 		return new Response("fokos library test worker", { status: 404 });

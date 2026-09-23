@@ -7,9 +7,9 @@
 **Status:** M1 to M4 are built (section 3 records what each one changed). `FokosShardingRuntime`, `dispatch`,
 the five shapes, the envelope, the scheduler, and the sharding error module exist in
 `packages/fokosdb/src/sharding/` and are exported from `fokosdb/sharding`. `PartitionDO` is a host: every public
-method is one `dispatch`, and the `PartitionDO` suites drive the runtime. The example host and the coordinator
-host (M5, M6) are not built. The prototype in `packages/fokosdb/test/sharding-prototype/` compiles against the
-real runtime.
+method is one `dispatch`, and the `PartitionDO` suites drive the runtime. M5 is partly built: the example host
+runs hash splits and the ownership property test exists (section 3). The coordinator host (M6) is not built. The
+prototype in `packages/fokosdb/test/sharding-prototype/` compiles against the real runtime.
 
 ## Table of contents
 
@@ -365,6 +365,21 @@ Deliverables:
   FokosDB. It runs a hash split, a range split, a key promotion, and a `range` walk.
 - The interval-frontier and ownership property tests of section 4.2.20.
 - The FokosDB suites of section 4.2.20 pass unchanged where they go through the client.
+
+**Partly done.** These parts are built:
+
+- `packages/fokosdb/test/sharding/counter-host.ts` is the example host `CounterPartitionDO`. It imports only the
+  sharding entry. Each hash key is one counter row in one SQL table, and a partition that holds more than one key
+  splits after `maxRequests` local writes. The test worker binds it as `COUNTER_PARTITION_DO`.
+- `counter-host.test.ts` runs a hash split, a second level of hash splits, a kill of the split source, and a
+  partition with one hot key that does not split. After each run it checks that the owners hold each key once,
+  with the value of every write that succeeded.
+- `packages/fokosdb/test/property-based/ownership.test.ts` is the ownership property test. On a router, for random
+  keys, exactly one target of the split plan accepts the key in `belongsToTarget`, and that target is the one
+  `resolveOwner` gives. It runs on a hash plan of the counter host and on a range plan of `PartitionDO`.
+- The frontier property test is `packages/fokosdb/src/sharding/range-frontier.test.ts`.
+
+These parts stay open: a range split, a key promotion, and a `range` walk in the example host.
 
 ### M6 — The coordinator becomes a host
 
