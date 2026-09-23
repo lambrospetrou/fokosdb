@@ -74,13 +74,3 @@ export async function fetchColoInfo(): Promise<ColoInfo> {
 			};
 		});
 }
-
-/**
- * The retry rule of one participant in a fan-out. A request retries until its deadline, so it always
- * waits the full budget before it leaves a participant behind. The alarm and the recovery paths have
- * no deadline, so they stop after 10 attempts.
- */
-export function retryable(deadlineMs: number, maxAttemptsFallback = 100): (err: unknown, nextAttempt: number) => boolean {
-	if (deadlineMs === Number.POSITIVE_INFINITY) return (_err, nextAttempt) => nextAttempt <= maxAttemptsFallback;
-	return () => Date.now() <= deadlineMs;
-}

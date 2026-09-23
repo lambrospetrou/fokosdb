@@ -35,16 +35,13 @@ function stubOptions(ctx: FokosDbStubContext): DurableObjectNamespaceGetDurableO
 }
 
 export function partitionStub(env: Env, ctx: FokosDbStubContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
-	const options = stubOptions(ctx);
-	return partitionNamespace(env, ctx).get(id, options);
+	return partitionNamespace(env, ctx).get(id, stubOptions(ctx));
 }
 
 export function partitionStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<PartitionDO> {
-	const options = stubOptions(ctx);
-	return partitionNamespace(env, ctx).getByName(doName, options);
+	return partitionNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
 export function txCoordinatorStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
-	const options = stubOptions(ctx);
-	return txCoordinatorNamespace(env, ctx).getByName(doName, options);
+	return txCoordinatorNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }

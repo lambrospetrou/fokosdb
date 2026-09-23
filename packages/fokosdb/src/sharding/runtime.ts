@@ -55,7 +55,6 @@ import {
 	type FokosRouteContext,
 	type FokosStoredPolicy,
 } from "./route-context.js";
-export { FOKOS_HASH_PARTITIONS_MAX } from "./route-context.js";
 import type {
 	FokosChild,
 	FokosEnvelope,

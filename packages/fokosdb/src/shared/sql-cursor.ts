@@ -18,3 +18,8 @@ export function one<T>(cursor: Iterable<T>, message?: string): T {
 	for (const row of cursor) return row;
 	invariant(false, message ?? "expected at least one row from query");
 }
+
+/** True when the query returned at least one row. It reads one row and stops. */
+export function exists(cursor: Iterable<unknown>): boolean {
+	return tryOne(cursor) !== undefined;
+}

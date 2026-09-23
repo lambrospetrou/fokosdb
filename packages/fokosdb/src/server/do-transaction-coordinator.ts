@@ -49,7 +49,7 @@ import {
 	type FokosErrorWire,
 } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
-import { one, tryOne } from "../shared/sql-cursor.js";
+import { exists, one, tryOne } from "../shared/sql-cursor.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
 import {
@@ -61,7 +61,6 @@ import {
 	txOrderTimestampNow,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
-import { retryable } from "../shared/cf-utils.js";
 
 type TcStateRow = {
 	transaction_id: string;
@@ -215,13 +214,13 @@ function tokenKey(token: string): RouteKey {
  * The operations of the coordinator. Both are keyed by the idempotency token, and both handlers
  * await partitions, so each durable transition tests ownership itself (see `transition`).
  */
-export type CoordinatorOps = {
+type CoordinatorOps = {
 	initiateWrite: { req: InitiateWriteRequest; res: InitiateWriteResponseEncoded };
 	recoverTransaction: { req: RecoverTransactionRequest; res: RecoverTransactionResult };
 };
 
-/** The RPC surface of the class. `db.ts` and the partitions type their stubs with it. */
-export type CoordinatorRpc = FokosShardingRpc & {
+/** The RPC surface of the class. */
+type CoordinatorRpc = FokosShardingRpc & {
 	[K in keyof CoordinatorOps]: (
 		ctx: FokosDbRouteContext,
 		req: CoordinatorOps[K]["req"],
@@ -241,7 +240,7 @@ type MigratedTransaction = {
  * Past this deadline the coordinator stops dispatching participant RPCs and leaves the unconfirmed
  * participant behind: a commit leaves the transaction in COMMITTING and the caller receives the
  * commit-pending error, a cancel leaves it in CANCELLING and the caller receives the cancelled
- * outcome it is already entitled to. The alarm then finishes the fan-out with the full retry
+ * outcome it is already entitled to. The `tx_recovery` job then finishes the fan-out with the full retry
  * budget, because nothing waits on it. Without the budget, one unreachable participant would hold
  * the request, and the shard, for tens of seconds.
  */
@@ -472,7 +471,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					canRun: () => this.canDriveLocally(),
 					deadline: () => {
 						const earliest = this.earliestCompletedAt();
-						return earliest === null ? null : earliest + IDEMPOTENCY_WINDOW_MS + 1;
+						return earliest === null ? null : sweepDueAt(earliest);
 					},
 					runStep: () => ({ nextRunAt: this.sweepExpiredTransactions() }),
 				},
@@ -662,11 +661,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 *   (nothing transitions PREPARED → CANCELLING; both writers of CANCELLING guard on state =
 	 *   'PREPARING'), so the transaction WILL commit — but some participant has not applied it yet.
 	 *   Answering "committed" would let a caller read a stale value from that participant, so these
-	 *   states throw the commit-pending error instead. `alarm()` finishes the fan-out, and a retry
+	 *   states throw the commit-pending error instead. The `tx_recovery` job finishes the fan-out, and a retry
 	 *   with the same token answers "committed" once the last participant confirms.
 	 * - CANCELLING / CANCELLED: a cancelled transaction applied nothing anywhere, so outstanding
 	 *   cleanup cannot change what the caller observes, and the answer follows the decision. Only
-	 *   the lock release lags, and `alarm()` drives that too.
+	 *   the lock release lags, and the `tx_recovery` job drives that too.
 	 * - CREATED / PREPARING: genuinely undecided — those, and only those, ask the caller to retry.
 	 */
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
@@ -711,7 +710,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			}
 			case "CREATED":
 			case "PREPARING":
-				// No decision yet — the alarm will drive it. The outcome can still go either way, so
+				// No decision yet — the `tx_recovery` job drives it. The outcome can still go either way, so
 				// this answer promises nothing and only asks the caller to retry.
 				throw new FokosTransactionPendingError(TRANSACTION_PENDING_CODES.transaction_undecided, {
 					message: "transaction outcome is not yet decided, retry later",
@@ -734,11 +733,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		);
 	}
 
-	private completeTransaction(
+	/**
+	 * Moves the transaction to its terminal state, and schedules the `idempotency_sweep` job for the
+	 * end of its idempotency window. It does nothing when the transaction already left its
+	 * COMMITTING or CANCELLING state.
+	 */
+	private async completeTransaction(
 		transactionId: string,
 		idempotencyToken: string,
 		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
-	): number | null {
+	): Promise<void> {
 		const expectedState = terminalState === "COMMITTED" ? "COMMITTING" : "CANCELLING";
 		const completedAt = this.fokosNow();
 		let transitioned = false;
@@ -755,7 +759,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE transaction_id = ?`, transactionId);
 			transitioned = true;
 		});
-		return transitioned ? completedAt : null;
+		if (transitioned) {
+			await this.fokos.scheduleJob(JOB_IDEMPOTENCY_SWEEP, sweepDueAt(completedAt));
+		}
 	}
 
 	/**
@@ -906,11 +912,29 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		);
 	}
 
+	/** The reference that each participant stores in its lock, and calls back on recovery. */
+	private coordinatorRef(idempotencyToken: string): CoordinatorRef {
+		return { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
+	}
+
+	/** Moves PREPARING to PREPARED, the point of no return, and removes the payload that the prepare no longer needs. */
+	private markPrepared(transactionId: string, idempotencyToken: string): void {
+		this.transition(idempotencyToken, () => {
+			const transition = this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
+				transactionId,
+			);
+			if (transition.rowsWritten > 0) {
+				this.stripPayload(transactionId);
+			}
+		});
+	}
+
 	/**
 	 * `fanout` is the in-memory form of the rows `initiateWrite` has just written. It is passed only
 	 * on that path, where the rows are already durable and identical to it, so the prepare does not
 	 * read them back and parse every plan and context again. Every other caller (a resumed CREATED
-	 * transaction, the alarm, recovery) has no in-memory copy and loads the fan-out from SQLite.
+	 * transaction, the `tx_recovery` job, recovery) has no in-memory copy and loads the fan-out from SQLite.
 	 */
 	private async drivePrepare(
 		transactionId: string,
@@ -924,7 +948,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
 		// Each participant stores this reference in its lock, and calls it back on recovery.
-		const coordinator: CoordinatorRef = { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
+		const coordinator = this.coordinatorRef(idempotencyToken);
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
@@ -958,13 +982,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		if (allAccepted) {
 			// All accepted — PREPARED is the point of no return
-			this.transition(idempotencyToken, () => {
-				const transition = this.ctx.storage.sql.exec(
-					`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
-					transactionId,
-				);
-				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
-			});
+			this.markPrepared(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
 				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) throw e;
@@ -985,7 +1003,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * `requestBudgetMs` bounds the fan-out when a request waits on it (see
-	 * TX_FANOUT_REQUEST_BUDGET_MS). Undefined — the alarm and the recovery paths — means no
+	 * TX_FANOUT_REQUEST_BUDGET_MS). Undefined — the `tx_recovery` job and the recovery paths — means no
 	 * deadline, so those keep the full retry budget.
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
@@ -1019,7 +1037,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					async () => {
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
 						// the transaction stays in COMMITTING, the caller receives the commit-pending
-						// error, and the alarm finishes the fan-out.
+						// error, and the `tx_recovery` job finishes the fan-out.
 						if (this.fokosNow() > deadlineMs) return;
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCommit(pCtx, {
 							transactionId,
@@ -1046,8 +1064,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			),
 		).n;
 		if (uncommitted === 0) {
-			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
-			if (completedAt !== null) await this.fokos.scheduleJob(JOB_IDEMPOTENCY_SWEEP, completedAt + IDEMPOTENCY_WINDOW_MS + 1);
+			await this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
 		}
 	}
 
@@ -1077,7 +1094,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				await tryWhile(
 					async () => {
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
-						// the transaction stays in CANCELLING, and the alarm finishes the fan-out. The
+						// the transaction stays in CANCELLING, and the `tx_recovery` job finishes the fan-out. The
 						// caller still receives the cancelled outcome, which applied nothing anywhere.
 						if (this.fokosNow() > deadlineMs) return;
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCancel(pCtx, {
@@ -1097,7 +1114,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		);
 
 		// Only advance to CANCELLED once every eligible participant is confirmed — otherwise leave
-		// in CANCELLING so the alarm retries the remaining ones.
+		// in CANCELLING so the `tx_recovery` job retries the remaining ones.
 		const stillPending = one(
 			this.ctx.storage.sql.exec<{ n: number }>(
 				`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
@@ -1105,8 +1122,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			),
 		).n;
 		if (stillPending === 0) {
-			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "CANCELLED");
-			if (completedAt !== null) await this.fokos.scheduleJob(JOB_IDEMPOTENCY_SWEEP, completedAt + IDEMPOTENCY_WINDOW_MS + 1);
+			await this.completeTransaction(transactionId, idempotencyToken, "CANCELLED");
 		}
 	}
 
@@ -1116,7 +1132,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const items = this.loadItems(transactionId);
 		const itemsByPartition = groupByPartition(items);
-		const coordinator: CoordinatorRef = { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
+		const coordinator = this.coordinatorRef(idempotencyToken);
 
 		const existingParticipants = this.loadParticipants(transactionId);
 
@@ -1151,7 +1167,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const allParticipants = this.loadParticipants(transactionId);
 		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
-		// nothing, so the transaction stays PREPARING for the alarm to drive with the full retry budget.
+		// nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive with the full retry budget.
 		// Only a real rejection or exceeding the hold deadline commits the transaction to cancelling;
 		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
@@ -1159,19 +1175,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const heldTooLong = this.fokosNow() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
 
 		if (allAccepted) {
-			this.transition(idempotencyToken, () => {
-				const transition = this.ctx.storage.sql.exec(
-					`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
-					transactionId,
-				);
-				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
-			});
+			this.markPrepared(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
 		} else if (anyRejected || heldTooLong) {
 			this.cancelTransactionInStore(transactionId, idempotencyToken);
 			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		}
-		// If some participants still NULL and under the hold deadline, leave in PREPARING; alarm will retry
+		// If some participants are still NULL and under the hold deadline, leave in PREPARING; the `tx_recovery` job retries it.
 	}
 
 	/**
@@ -1210,12 +1220,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			}
 		}
 
-		const hasNonTerminalRows =
-			tryOne(
-				this.ctx.storage.sql.exec<{ found: number }>(
-					`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`,
-				),
-			) !== undefined;
+		const hasNonTerminalRows = exists(
+			this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`),
+		);
 		return hasNonTerminalRows ? this.fokosNow() + STALE_THRESHOLD_MS : null;
 	}
 
@@ -1267,9 +1274,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			});
 		}
 
-		const hasExpiredRows =
-			tryOne(this.ctx.storage.sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)) !==
-			undefined;
+		const hasExpiredRows = exists(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff));
 		return hasExpiredRows ? this.fokosNow() : null;
 	}
 
@@ -1426,7 +1431,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		for (const table of ["tc_items", "tc_participants", "tc_results", "tc_state"]) {
 			sql.exec(`DELETE FROM ${table} WHERE transaction_id IN (${batch})`);
 		}
-		return tryOne(sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state LIMIT 1`)) === undefined;
+		return !exists(sql.exec(`SELECT 1 FROM tc_state LIMIT 1`));
 	}
 
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
@@ -1441,7 +1446,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/** One seek of the unique token index, and no row read: the admission hook needs only to know that a row exists. */
 	private hasStateRowForToken(idempotencyToken: string): boolean {
-		return tryOne(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE idempotency_token = ? LIMIT 1`, idempotencyToken)) !== undefined;
+		return exists(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE idempotency_token = ? LIMIT 1`, idempotencyToken));
 	}
 
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
@@ -1506,6 +1511,24 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			)
 			.toArray();
 	}
+}
+
+/** The maximum number of attempts for one participant when the fan-out has no deadline. */
+const MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE = 100;
+
+/**
+ * The retry rule of one participant in a fan-out. A request retries until its deadline, so it always
+ * waits the full budget before it leaves a participant behind. The `tx_recovery` job and the recovery
+ * paths have no deadline, so they stop after `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` attempts.
+ */
+function retryable(deadlineMs: number): (err: unknown, nextAttempt: number) => boolean {
+	if (deadlineMs === Number.POSITIVE_INFINITY) return (_err, nextAttempt) => nextAttempt <= MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE;
+	return () => Date.now() <= deadlineMs;
+}
+
+/** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */
+function sweepDueAt(completedAt: number): number {
+	return completedAt + IDEMPOTENCY_WINDOW_MS + 1;
 }
 
 /** The size of one migrated transaction, near its serialized size: the payloads and the text columns. */
