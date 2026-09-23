@@ -83,22 +83,22 @@ export function refOf(ctx: FokosPartitionRef): FokosPartitionRef {
 	return { partitionId: ctx.partitionId, doName: ctx.doName };
 }
 
-/** Names FokosDB reserves for its own Durable Objects. A host shard group must not start with it. */
-export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
-
 function invalid(option: string, value: unknown, message: string): FokosValidationError {
 	return new FokosValidationError(VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 }
+
+/**
+ * The maximum number of root partitions of a shard group. The partition ID keeps the root index in
+ * two bytes, so the value must stay below 65536.
+ */
+export const FOKOS_HASH_PARTITIONS_MAX = 65_000;
 
 export function validateTopology(topology: FokosTopology): void {
 	if (typeof topology.shardGroup !== "string" || topology.shardGroup.length === 0) {
 		throw invalid("shardGroup", topology.shardGroup, "shardGroup must be a non-empty string");
 	}
-	if (topology.shardGroup.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
-		throw invalid("shardGroup", topology.shardGroup, `shardGroup must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
-	}
-	if (!Number.isInteger(topology.rootTreesN) || topology.rootTreesN < 1 || topology.rootTreesN > 65000) {
-		throw invalid("rootTreesN", topology.rootTreesN, "rootTreesN must be between 1 and 65000");
+	if (!Number.isInteger(topology.rootTreesN) || topology.rootTreesN < 1 || topology.rootTreesN > FOKOS_HASH_PARTITIONS_MAX) {
+		throw invalid("rootTreesN", topology.rootTreesN, `rootTreesN must be between 1 and ${FOKOS_HASH_PARTITIONS_MAX}`);
 	}
 	if (!Number.isInteger(topology.hashSplitN) || topology.hashSplitN < 2 || topology.hashSplitN > 255) {
 		throw invalid("hashSplitN", topology.hashSplitN, "hashSplitN must be between 2 and 255");

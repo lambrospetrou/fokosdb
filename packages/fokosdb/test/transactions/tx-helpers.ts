@@ -8,13 +8,13 @@ import { expect, vi } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { type FokosDbRouteContext, PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { type FokosDbPolicy, type FokosDbRouteContext, PartitionContextCreator } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO, TxOp, TxRequest } from "../controlled-partition-do.js";
 import type { ControlledTransactionCoordinatorDO } from "../controlled-transaction-coordinator-do.js";
 import { openedRpc } from "../partition-do/helpers.js";
-import { testPartitionStub } from "../stub-helpers.js";
+import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import type {
@@ -89,13 +89,13 @@ export type MakeDBOptions = {
 	singlePartitionFastPath?: boolean;
 	maxSizeMb?: number;
 	rootTreesN?: number;
-	numTxCoordinators?: number;
+	coordinatorRootsN?: number;
 	/** Fixes the table name. Routing is a pure function of it, so two clients built with the same
 	 *  name share one topology. Omit it for a table no other test touches. */
 	tableName?: string;
 	/**
 	 * Puts the table on `ControlledPartitionDO` and `ControlledTransactionCoordinatorDO`, so that a
-	 * test can use their test controls. The coordinator pool defaults to one coordinator, which
+	 * test can use their test controls. The coordinator pool defaults to one root coordinator, which
 	 * `controlledCoordinator` reaches.
 	 */
 	controlled?: boolean;
@@ -115,7 +115,7 @@ export function makeDB(opts?: MakeDBOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const topology = new FokosRouter(base.topology, base.rangeConfig, base.policy);
-	return new FokosDB({ topology, ...(controlled ? { numTxCoordinators: 1 } : {}), ...dbOptions });
+	return new FokosDB({ topology, ...(controlled ? { coordinatorRootsN: 1 } : {}), ...dbOptions });
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
@@ -180,13 +180,22 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 	return (await Promise.all([...partitions.values()].map((p) => p.testTxCalls(op)))).flat() as TxRequest<Op>[];
 }
 
-/** The test controls of the one coordinator of a `controlled` table. */
+/** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<shardGroup>`. */
+export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDbPolicy> {
+	const { topology, coordinatorRootsN } = db.options();
+	return new FokosRouter(
+		{ ...topology.topology, shardGroup: `fokos.tc.${topology.topology.shardGroup}`, rootTreesN: coordinatorRootsN },
+		topology.rangeConfig,
+		topology.policy,
+	);
+}
+
+/** The test controls of the one root coordinator of a `controlled` table. */
 export function controlledCoordinator(db: FokosDB): DurableObjectStub<ControlledTransactionCoordinatorDO> {
-	const { topology, numTxCoordinators } = db.options();
+	const { topology, coordinatorRootsN } = db.options();
 	expect(topology.policy.nsTx, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
-	expect(numTxCoordinators, "the coordinator test controls need a pool of one coordinator").toBe(1);
-	// The pool names each coordinator `<shardGroupName>-<shard>`, and FokosDB sets the group name.
-	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(`fokos_tc.${topology.topology.shardGroup}-0`);
+	expect(coordinatorRootsN, "the coordinator test controls need a pool of one root coordinator").toBe(1);
+	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(coordinatorRouter(db).allRoots()[0].doName);
 }
 
 /**
@@ -203,7 +212,7 @@ export async function holdPendingLock(
 	const keys = { hashKey: KeyCodec.encode(key.hashKey), sortKey: KeyCodec.encode(key.sortKey) };
 	const res = await rpc.txPrepare(pCtx, {
 		transactionId,
-		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+		coordinator: testCoordinatorRef(),
 		transactionTimestamp: txOrderTimestampNow(),
 		items: [{ opIndex: 0, ...keys, ...item }],
 	});

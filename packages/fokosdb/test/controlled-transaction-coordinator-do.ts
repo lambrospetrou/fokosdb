@@ -12,9 +12,9 @@ export class ControlledTransactionCoordinatorDO extends TransactionCoordinatorDO
 	#initiateWriteCalls = 0;
 	#fanoutBudgetMs: number | null = null;
 
-	override async initiateWrite(request: Parameters<TransactionCoordinatorDO["initiateWrite"]>[0]) {
+	override async initiateWrite(...args: Parameters<TransactionCoordinatorDO["initiateWrite"]>) {
 		this.#initiateWriteCalls++;
-		return await super.initiateWrite(request);
+		return await super.initiateWrite(...args);
 	}
 
 	override fokosFanoutRequestBudgetMs(): number {

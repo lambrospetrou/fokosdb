@@ -1,9 +1,9 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
-import { testPartitionStub } from "../../../test/stub-helpers.js";
+import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "./partition-store.js";
-import { TransactionParticipant } from "./transaction-participant.js";
+import { parseCoordinatorRef, TransactionParticipant } from "./transaction-participant.js";
 import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
@@ -50,10 +50,12 @@ function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): TransactionItem
 	return items.map((item, i) => ({ ...item, opIndex: i }));
 }
 
+const COORDINATOR = testCoordinatorRef("tok-test");
+
 function prepareReq(overrides: Omit<Partial<PrepareRequest>, "items"> & { items: Omit<TransactionItem, "opIndex">[] }): PrepareRequest {
 	return {
 		transactionId: overrides.transactionId ?? crypto.randomUUID(),
-		coordinatorDoId: overrides.coordinatorDoId ?? "tc-test",
+		coordinator: overrides.coordinator ?? COORDINATOR,
 		transactionTimestamp: overrides.transactionTimestamp ?? (BASE_NOW + 100) * TX_ORDER_TS_UNITS_PER_MS,
 		items: withOpIndex(overrides.items),
 	};
@@ -61,11 +63,13 @@ function prepareReq(overrides: Omit<Partial<PrepareRequest>, "items"> & { items:
 
 describe("TransactionParticipant - prepare", () => {
 	// A lock is released only by the outcome of its transaction, and the recovery job reaches that
-	// outcome through these two ids alone. A lock created without them can never be released, so
+	// outcome through these values alone. A lock created without them can never be released, so
 	// prepare must refuse rather than store one.
 	it.each([
 		["transactionId", { transactionId: "" }],
-		["coordinatorDoId", { coordinatorDoId: "" }],
+		["coordinator.v", { coordinator: { ...COORDINATOR, v: 2 as never } }],
+		["coordinator.idempotencyToken", { coordinator: { ...COORDINATOR, idempotencyToken: "" } }],
+		["coordinator.route", { coordinator: { ...COORDINATOR, route: { ...COORDINATOR.route, doName: "" } } }],
 	])("refuses to lock an item when %s is empty, so no unreleasable lock is created", async (_name, override) => {
 		await withParticipant(({ participant, store }) => {
 			const request = prepareReq({
@@ -993,12 +997,34 @@ describe("TransactionParticipant - readForTransaction", () => {
 				kind: null,
 				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
-				coordinator_do_id: "tc",
+				coordinator_json: JSON.stringify(COORDINATOR),
 				created_at: BASE_NOW,
 				guarded_at: null,
 			});
 			expect(hasPendingWrite()).toBe(true);
 		});
+	});
+});
+
+describe("parseCoordinatorRef", () => {
+	it("reads back the reference that prepare stores", () => {
+		expect(parseCoordinatorRef(JSON.stringify(COORDINATOR), "tx")).toEqual(COORDINATOR);
+	});
+
+	// A lock row can outlive the code that wrote it, so a reference that this code cannot read must
+	// fail with a code that names the lock, and never reach a stub with an undefined name.
+	it.each([
+		["is not JSON", "{not json"],
+		["has an unknown version", "null"],
+		["has an unknown version", JSON.stringify({ ...COORDINATOR, v: 2 })],
+		["has an unknown version", JSON.stringify({ route: COORDINATOR.route, idempotencyToken: "tok" })],
+		["has no idempotency token", JSON.stringify({ ...COORDINATOR, idempotencyToken: "" })],
+		["has no valid route context", JSON.stringify({ ...COORDINATOR, route: { ...COORDINATOR.route, doName: "" } })],
+		["has no valid route context", JSON.stringify({ ...COORDINATOR, route: { ...COORDINATOR.route, policy: {} } })],
+	])("refuses a reference that %s", (detail, json) => {
+		expect(() => parseCoordinatorRef(json, "tx-bad")).toThrow(
+			fokosErrorWith("unexpected_transaction_state", { detail: `the coordinator reference of a lock ${detail}`, transactionId: "tx-bad" }),
+		);
 	});
 });
 
@@ -1018,7 +1044,7 @@ describe("TransactionParticipant - stale transactions", () => {
 
 			clock.now += 5_001;
 			expect(participant.listStaleTransactions(5_000, 10)).toEqual([
-				{ transaction_id: request.transactionId, coordinator_do_id: "tc-test" },
+				{ transaction_id: request.transactionId, coordinator_json: JSON.stringify(COORDINATOR) },
 			]);
 		});
 	});

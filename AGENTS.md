@@ -36,7 +36,7 @@ A cohesive folder stays whole inside `shared/` even when only one side uses it. 
 ## Architecture
 
 - **`PartitionDO`** (`src/server/do-partition.ts`) — holds items in SQLite, one DO per partition shard. It serves single-item reads and writes, acts as a resource manager in 2PC, and splits itself when it grows past its cap. It hosts `FokosShardingRuntime` (`src/sharding/runtime.ts`): the runtime owns identity, routing, the route caches, the repartition flow, the read-through, and the alarm; the class owns its SQLite schema, its operations, its admission and split policy, its migration pages, and its TTL timer.
-- **`TransactionCoordinatorDO`** (`src/server/do-transaction-coordinator.ts`) — one DO per write transaction, named by the idempotency token. It drives 2PC. A read transaction runs in the Worker instead.
+- **`TransactionCoordinatorDO`** (`src/server/do-transaction-coordinator.ts`) — the second host of the sharding runtime. It drives 2PC for a write transaction. The idempotency token is its route key, and its shard group is `fokos.tc.<shardGroup>`: `coordinatorRootsN` roots that split by hash when they grow past `hashSplitConditions.maxSizeMb`. A read transaction runs in the Worker instead.
 - **`FokosDB`** (`src/client/db.ts`) — the client entry point. It routes with `FokosRouter`, sends a multi-partition write to a coordinator, and drives a multi-partition read itself.
 
 Every partition RPC answers a `FokosEnvelope<T>`: `value` is the result and `routing` is the route evidence. `FokosRouter.unwrap` opens it, and `client/partition-info.ts` builds the public `PartitionInfo` from `routing.servedBy` and `routing.forwardCount`. An error a partition raises carries its `routing` as an own property, and `withFokosErrors` in `db.ts` turns it into the same public `meta` and drops the routing.
@@ -73,7 +73,9 @@ The model follows the DynamoDB papers: [ATC 2023, Idziorek et al.](https://www.u
 - `prepare`, `commit` and `cancel` are idempotent. The `items` table holds committed state only, and `pending_transactions` holds the locks of the in-flight transactions.
 - A non-transactional write to a locked item is REFUSED, not delayed.
 - A read transaction reads twice and compares `found`, `version` and the partition's `deleteRevision`. Any change aborts it with `read_conflict`.
-- `clientRequestToken` names the coordinator DO and gives idempotency. A retry must use the same coordinator pool size.
+- `clientRequestToken` routes to the coordinator and gives idempotency. `db.ts` always sends a token, and generates one when the caller gave none. A retry must use the same `coordinatorRootsN`.
+- Every durable transition of the coordinator runs `fokos.owns(token)` inside its `transactionSync`. After a split cutover the transition writes nothing and throws `partition_migrating`, and `db.ts` retries with the same token until the child resumes the transaction.
+- A lock row stores a `CoordinatorRef` (the route context of its coordinator and the token) as one JSON column. The stale-recovery job calls `recoverTransaction` on that coordinator, and a coordinator that has split forwards the call.
 
 ## Rules for PartitionDO operations
 

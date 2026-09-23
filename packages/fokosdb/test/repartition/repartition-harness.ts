@@ -274,7 +274,7 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 		kind: "text",
 		conditions_json: null,
 		ttl_epoch_utc_seconds: null,
-		coordinator_do_id: "tc-1",
+		coordinator_json: '{"doName":"tc-1"}',
 		created_at: 1,
 		guarded_at: null,
 	});

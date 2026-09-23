@@ -104,7 +104,7 @@ describe("the validation codes of the item operations", () => {
 			() => db.transactWriteItems({ clientRequestToken: " ", items: [{ operation: "put", hashKey: "h", data: "x" }] }),
 			"client_request_token_invalid",
 		],
-		["a numTxCoordinators of zero", () => makeDB({ numTxCoordinators: 0 }), "num_tx_coordinators_invalid"],
+		["a coordinatorRootsN of zero", () => makeDB({ coordinatorRootsN: 0 }), "num_tx_coordinators_invalid"],
 	];
 
 	it.each(cases)("reports %s as a validation error", async (_name, call, code) => {

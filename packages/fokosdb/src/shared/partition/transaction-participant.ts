@@ -1,23 +1,26 @@
-import type {
-	CommitRequest,
-	CommitResponse,
-	ParticipantOperationResultEncoded,
-	PrepareRequest,
-	PrepareResponse,
-	ReadForTransactionItemResultEncoded,
-	ReadForTransactionRequest,
-	ReadForTransactionResponse,
-	RejectionReasonEncoded,
-	SingleShotRequest,
-	SingleShotResponse,
-	TransactionItem,
-	TransactionItemKey,
-	TransactionTimestamp,
+import {
+	COORDINATOR_REF_VERSION,
+	type CommitRequest,
+	type CommitResponse,
+	type CoordinatorRef,
+	type ParticipantOperationResultEncoded,
+	type PrepareRequest,
+	type PrepareResponse,
+	type ReadForTransactionItemResultEncoded,
+	type ReadForTransactionRequest,
+	type ReadForTransactionResponse,
+	type RejectionReasonEncoded,
+	type SingleShotRequest,
+	type SingleShotResponse,
+	type TransactionItem,
+	type TransactionItemKey,
+	type TransactionTimestamp,
 } from "../transaction-wire-types.js";
 import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
+import { unexpectedTransactionStateError } from "../errors-operations.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import type { PartitionStore } from "./partition-store.js";
+import type { PartitionStore, StalePendingTx } from "./partition-store.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -27,6 +30,29 @@ import {
 	TX_ORDER_TS_UNITS_PER_MS,
 } from "../transaction-limits.js";
 import type { UpdateProbeResult } from "../expression/runtime.js";
+
+/**
+ * Reads the coordinator reference of a lock row. The value comes from storage, and a lock row can
+ * outlive the code that wrote it, so this refuses a version it does not know and a reference without
+ * a field that a call to the coordinator uses. A reference it cannot read throws
+ * `unexpected_transaction_state`: nothing can reach the coordinator of that lock, so the lock stays
+ * until an operator resolves it with `debugForceResolveTransaction`.
+ */
+export function parseCoordinatorRef(json: string, transactionId: string): CoordinatorRef {
+	const invalid = (detail: string, attributes: Record<string, unknown> = {}) =>
+		unexpectedTransactionStateError(`the coordinator reference of a lock ${detail}`, { transactionId, ...attributes });
+
+	let ref: Partial<CoordinatorRef> | null;
+	try {
+		ref = JSON.parse(json);
+	} catch {
+		throw invalid("is not JSON");
+	}
+	if (ref?.v !== COORDINATOR_REF_VERSION) throw invalid("has an unknown version", { v: ref?.v });
+	if (!ref.idempotencyToken) throw invalid("has no idempotency token");
+	if (!ref.route?.doName || !ref.route.topology || !ref.route.policy?.nsTx) throw invalid("has no valid route context");
+	return ref as CoordinatorRef;
+}
 
 // A pending check cannot change the item, so a transactional read may serialize on either side of it.
 // Allowlist the read-only operations: an operation the code does not know counts as a pending write.
@@ -151,13 +177,16 @@ export class TransactionParticipant {
 	}
 
 	prepareLocal(request: PrepareRequest): PrepareResponse {
-		// A lock is only ever released by the outcome of its transaction, and the two ids below are the
+		// A lock is only ever released by the outcome of its transaction, and the values below are the
 		// whole thread back to that outcome: the recovery job selects locks by transaction_id and calls
-		// the TC named by coordinator_do_id (it skips a row whose id is empty, and nothing else in the
-		// system can supply one). A lock missing either is therefore unreleasable — it would block every
+		// the coordinator that the stored route context and token name (nothing else in the system can
+		// supply them). A lock missing one is therefore unreleasable — it would block every
 		// non-transactional write to its key for the life of the partition. Refuse to create it.
 		invariant(request.transactionId.length > 0, "fokos/partition.prepare: transactionId is required");
-		invariant(request.coordinatorDoId.length > 0, "fokos/partition.prepare: coordinatorDoId is required");
+		invariant(request.coordinator?.v === COORDINATOR_REF_VERSION, "fokos/partition.prepare: the coordinator reference version is required");
+		invariant(request.coordinator.idempotencyToken, "fokos/partition.prepare: the coordinator idempotencyToken is required");
+		invariant(request.coordinator.route?.doName, "fokos/partition.prepare: the coordinator route context is required");
+		const coordinatorJson = JSON.stringify(request.coordinator);
 
 		const now = this.#now();
 
@@ -275,7 +304,7 @@ export class TransactionParticipant {
 						transaction_id: request.transactionId,
 						transaction_ts: request.transactionTimestamp,
 						created_at: this.#now(),
-						coordinator_do_id: request.coordinatorDoId,
+						coordinator_json: coordinatorJson,
 						plan: item.update,
 						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
 						ttlAt: item.ttlAt,
@@ -292,7 +321,7 @@ export class TransactionParticipant {
 						kind: item.kind ?? null,
 						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
 						ttl_epoch_utc_seconds: item.ttlAt ?? null,
-						coordinator_do_id: request.coordinatorDoId,
+						coordinator_json: coordinatorJson,
 						created_at: this.#now(),
 						guarded_at: null,
 					});
@@ -565,7 +594,7 @@ export class TransactionParticipant {
 	}
 
 	/** Transactions whose locks are older than `staleMs` — the DO drives recovery via the TC. */
-	listStaleTransactions(staleMs: number, limit: number): { transaction_id: string; coordinator_do_id: string }[] {
+	listStaleTransactions(staleMs: number, limit: number): StalePendingTx[] {
 		return this.#store.listStalePendingTx(this.#now() - staleMs, limit);
 	}
 }

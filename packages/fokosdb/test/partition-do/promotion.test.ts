@@ -6,6 +6,7 @@ import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import { SHARDING_INTERNAL_CODES } from "../../src/sharding/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
+import { testCoordinatorRef } from "../stub-helpers.js";
 import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
@@ -50,7 +51,7 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
@@ -82,7 +83,7 @@ describe.concurrent("PartitionDO — promotion cutover deferral and routing", ()
 		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
@@ -229,7 +230,7 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
@@ -312,7 +313,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 		const prepare = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: txTs,
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "v", kind: "text" },
 				{ hashKey: kb("hot"), sortKey: kb("sk1"), operation: "put", data: PROMOTION_BIG_DATA, kind: "text" },

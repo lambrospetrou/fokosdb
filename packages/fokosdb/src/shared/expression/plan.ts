@@ -36,7 +36,7 @@ export const UPDATE_FIXED_BINDING_COUNT = 2;
 /**
  * The widest statement-local tail any statement appends AFTER an update plan's parameters — today
  * `PartitionStore.insertPendingUpdateLock`, with the transaction id, its timestamp, the created-at
- * stamp, the coordinator id, the condition JSON, and the TTL of an operation that sets one.
+ * stamp, the coordinator reference, the condition JSON, and the TTL of an operation that sets one.
  *
  * The compiler charges it to every plan, because one plan is embedded by every statement and its
  * parameter numbering is fixed when it compiles. Raising a statement's tail therefore lowers the

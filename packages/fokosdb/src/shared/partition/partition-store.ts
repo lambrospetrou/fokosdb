@@ -178,10 +178,14 @@ export type PendingTransactionRow = {
 	kind: DataKind | null;
 	conditions_json: string | null;
 	ttl_epoch_utc_seconds: number | null;
-	coordinator_do_id: string;
+	/** The JSON `CoordinatorRef` of the coordinator that drives the transaction. */
+	coordinator_json: string;
 	created_at: number;
 	guarded_at: number | null;
 };
+
+/** One stale transaction of the lock table, with what the recovery job needs to reach its coordinator. */
+export type StalePendingTx = Pick<PendingTransactionRow, "transaction_id" | "coordinator_json">;
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
@@ -493,7 +497,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_id        TEXT    NOT NULL,
                 transaction_ts        INTEGER NOT NULL,
 				created_at            INTEGER NOT NULL,
-				coordinator_do_id     TEXT    NOT NULL DEFAULT '',
+				coordinator_json      TEXT    NOT NULL DEFAULT '',
                 operation             TEXT    NOT NULL,
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
                 conditions_json       TEXT,
@@ -1252,7 +1256,7 @@ export class PartitionStore {
 			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
 			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
 			`INSERT OR IGNORE INTO pending_transactions
-			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at, guarded_at)
+			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_json, created_at, guarded_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
@@ -1263,7 +1267,7 @@ export class PartitionStore {
 			codeFromNullableKind(row.kind),
 			row.conditions_json,
 			row.ttl_epoch_utc_seconds,
-			row.coordinator_do_id,
+			row.coordinator_json,
 			row.created_at,
 			row.guarded_at,
 		);
@@ -1289,7 +1293,7 @@ export class PartitionStore {
 		transaction_id: string;
 		transaction_ts: number;
 		created_at: number;
-		coordinator_do_id: string;
+		coordinator_json: string;
 		plan: CompiledUpdatePlan;
 		conditions_json: string | null;
 		ttlAt?: number;
@@ -1299,7 +1303,7 @@ export class PartitionStore {
 		const transactionIdParam = tail.param(opts.transaction_id);
 		const transactionTsParam = tail.param(opts.transaction_ts);
 		const createdAtParam = tail.param(opts.created_at);
-		const coordinatorParam = tail.param(opts.coordinator_do_id);
+		const coordinatorParam = tail.param(opts.coordinator_json);
 		const conditionsParam = tail.param(opts.conditions_json);
 		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
 		// here, so the statement carries the branch it needs instead of testing a flag at run time. The
@@ -1308,7 +1312,7 @@ export class PartitionStore {
 
 		const res = this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO pending_transactions (
-				hk, sk, transaction_id, transaction_ts, created_at, coordinator_do_id,
+				hk, sk, transaction_id, transaction_ts, created_at, coordinator_json,
 				operation, data_kind, conditions_json, ttl_epoch_utc_seconds, guarded_at, data
 			)
 			SELECT ?1, ?2, ${transactionIdParam}, ${transactionTsParam}, ${createdAtParam}, ${coordinatorParam},
@@ -1519,16 +1523,16 @@ export class PartitionStore {
 	 * 9,000 rows read for 10 results — `limit` x rows-per-transaction.
 	 *
 	 * Two alternatives were measured and are worse. Widening `pending_transactions_created_at` to
-	 * `(created_at, transaction_id, coordinator_do_id)` makes the plan covering but reads the same
-	 * 9,000 rows, and costs 1.35 MB per 20k rows because `coordinator_do_id` is a long string. A
+	 * `(created_at, transaction_id, coordinator_json)` makes the plan covering but reads the same
+	 * 9,000 rows, and costs several MB per 20k rows because `coordinator_json` is a long string. A
 	 * `GROUP BY transaction_id ... HAVING MIN(created_at) < ?` walks the `transaction_id` index, which
 	 * cannot use `created_at` at all: 10,000 rows read in the same case, and the whole table in the
 	 * common case where few rows are stale.
 	 */
-	listStalePendingTx(staleBeforeTs: number, limit: number): { transaction_id: string; coordinator_do_id: string }[] {
+	listStalePendingTx(staleBeforeTs: number, limit: number): StalePendingTx[] {
 		return this.#storage.sql
-			.exec<{ transaction_id: string; coordinator_do_id: string }>(
-				`SELECT DISTINCT transaction_id, coordinator_do_id
+			.exec<StalePendingTx>(
+				`SELECT DISTINCT transaction_id, coordinator_json
                      FROM pending_transactions WHERE created_at < ? AND guarded_at IS NULL LIMIT ?`,
 				staleBeforeTs,
 				limit,
@@ -1582,12 +1586,12 @@ export class PartitionStore {
 			data_kind: number | null;
 			conditions_json: string | null;
 			ttl_epoch_utc_seconds: number | null;
-			coordinator_do_id: string;
+			coordinator_json: string;
 			created_at: number;
 			guarded_at: number | null;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_do_id, created_at, guarded_at`;
+		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_json, created_at, guarded_at`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
 			sqlCursor = this.#storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);

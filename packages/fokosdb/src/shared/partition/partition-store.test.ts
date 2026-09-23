@@ -981,7 +981,7 @@ describe("PartitionStore - TTL deletion", () => {
 				kind: "text",
 				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
-				coordinator_do_id: "tc",
+				coordinator_json: "{}",
 				created_at: 1,
 				guarded_at: null,
 			});
@@ -1134,7 +1134,7 @@ describe("PartitionStore - pending transactions", () => {
 			kind: "text" as const,
 			conditions_json: null,
 			ttl_epoch_utc_seconds: null,
-			coordinator_do_id: "tc-1",
+			coordinator_json: '{"doName":"tc-1"}',
 			created_at: 1000,
 			guarded_at: null,
 		};
@@ -1181,7 +1181,7 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock({ ...lockRow("a", "1", "tx-old"), created_at: 1000 });
 			store.insertPendingLock({ ...lockRow("b", "1", "tx-new"), created_at: 5000 });
 			const stale = store.listStalePendingTx(2000, 10);
-			expect(stale).toEqual([{ transaction_id: "tx-old", coordinator_do_id: "tc-1" }]);
+			expect(stale).toEqual([{ transaction_id: "tx-old", coordinator_json: '{"doName":"tc-1"}' }]);
 		});
 	});
 
@@ -1196,7 +1196,7 @@ describe("PartitionStore - pending transactions", () => {
 			expect(store.listStalePendingTx(5000, 10)).toEqual([]);
 
 			store.clearPendingTxGuard("tx-guarded");
-			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-guarded", coordinator_do_id: "tc-1" }]);
+			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-guarded", coordinator_json: '{"doName":"tc-1"}' }]);
 		});
 	});
 
@@ -1207,7 +1207,7 @@ describe("PartitionStore - pending transactions", () => {
 				store.insertPendingLock(lockRow(`hk-${i}`, "1", transactionId));
 				if (i < 10) store.guardPendingTx(transactionId, 2000);
 			}
-			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_do_id: "tc-1" }]);
+			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_json: '{"doName":"tc-1"}' }]);
 		});
 	});
 

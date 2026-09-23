@@ -1,14 +1,15 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import { FokosDB } from "../../src/client/db.js";
 import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { encodeHashKey } from "../../src/shared/transaction-limits.js";
 import {
 	betweenPhases,
+	coordinatorRouter,
 	countDistinctPartitions,
 	holdPendingLock,
 	keysAcrossPartitions,
@@ -805,13 +806,13 @@ describe("transactions - end-to-end", () => {
 	});
 
 	it("coordinator distribution: 10 transactions across 3 coordinators land on multiple TCs", async () => {
-		// Intercept idFromName on the TC namespace to record which shard name each transaction
-		// is routed to. StaticShardedDO calls idFromName exactly once per transactWriteItems.
-		const idFromNameSpy = vi.spyOn(env.TRANSACTION_COORDINATOR_DO, "idFromName");
+		// Intercept getByName on the TC namespace to record which coordinator each transaction is
+		// routed to. FokosDB calls getByName exactly once per transactWriteItems.
+		const getByNameSpy = vi.spyOn(env.TRANSACTION_COORDINATOR_DO, "getByName");
 
 		try {
 			const dbName = `tcdist.${crypto.randomUUID()}`;
-			const db = makeDB({ tableName: dbName, numTxCoordinators: 3 });
+			const db = makeDB({ tableName: dbName, coordinatorRootsN: 3 });
 
 			for (let i = 0; i < 10; i++) {
 				const result = await writeOutcome(
@@ -830,38 +831,37 @@ describe("transactions - end-to-end", () => {
 				expect(result.outcome).toBe("committed");
 			}
 
-			// One idFromName call per transactWriteItems.
-			const calledTCNames = idFromNameSpy.mock.calls.map(([name]) => name);
+			// One getByName call per transactWriteItems, and each names a root coordinator of the table.
+			const calledTCNames = getByNameSpy.mock.calls.map(([name]) => name);
 			expect(calledTCNames).toHaveLength(10);
-
-			// StaticShardedDO names shards as `${shardGroupName}-${index}`.
-			const expectedTCNames = new Set([`fokos_tc.${dbName}-0`, `fokos_tc.${dbName}-1`, `fokos_tc.${dbName}-2`]);
+			const expectedTCNames = new Set(
+				coordinatorRouter(db)
+					.allRoots()
+					.map((root) => root.doName),
+			);
 			for (const name of calledTCNames) {
 				expect(expectedTCNames.has(name)).toBe(true);
 			}
 
-			// With 10 transactions across 3 shards, we are asserting >= 2 distinct TCs per coordinator.
+			// With 10 transactions across 3 roots, we are asserting >= 2 distinct TCs.
 			const uniqueTCNames = new Set(calledTCNames);
 			expect(uniqueTCNames.size).toBeGreaterThanOrEqual(2);
 		} finally {
-			idFromNameSpy.mockRestore();
+			getByNameSpy.mockRestore();
 		}
 	});
 
-	it("keeps token replay on the same shard only when the pool size is unchanged", async () => {
+	it("keeps token replay on the same coordinator only when coordinatorRootsN is unchanged", async () => {
 		// Both clients name the same table, so they route to the same partitions and differ only in
-		// how many coordinator shards they spread transactions over.
+		// how many root coordinators they spread transactions over.
 		const tableName = `tcpool.${crypto.randomUUID()}`;
-		const db2 = makeDB({ tableName, rootTreesN: 1, numTxCoordinators: 2 });
-		const db3 = makeDB({ tableName, rootTreesN: 1, numTxCoordinators: 3 });
-		const shardFor = async (token: string, size: number) => {
-			const pool = new StaticShardedDO(env.TRANSACTION_COORDINATOR_DO, { numShards: size, shardGroupName: `fokos_tc.${tableName}` });
-			return (await pool.tryOne(token, async () => undefined)).shard;
-		};
+		const db2 = makeDB({ tableName, rootTreesN: 1, coordinatorRootsN: 2 });
+		const db3 = makeDB({ tableName, rootTreesN: 1, coordinatorRootsN: 3 });
+		const rootFor = (db: FokosDB, token: string) => coordinatorRouter(db).rootContext(encodeHashKey(token)).doName;
 		let token = "";
 		for (let i = 0; i < 100 && token === ""; i++) {
 			const candidate = `pool-token-${i}`;
-			if ((await shardFor(candidate, 2)) !== (await shardFor(candidate, 3))) token = candidate;
+			if (rootFor(db2, candidate) !== rootFor(db3, candidate)) token = candidate;
 		}
 		expect(token).not.toBe("");
 		const operation = { hashKey: "pool-replay", operation: "put" as const, data: "value" };

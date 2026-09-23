@@ -18,7 +18,7 @@ const table = PartitionContextCreator.create({
 const router = new FokosRouter(table.topology, table.rangeConfig, table.policy);
 
 function db(): FokosDB {
-	return new FokosDB({ topology: router, numTxCoordinators: 1 });
+	return new FokosDB({ topology: router, coordinatorRootsN: 1 });
 }
 
 /** The trace of one item request, from the partition information that FokosDB returns. */

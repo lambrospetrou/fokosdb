@@ -36,22 +36,15 @@ function stubOptions(ctx: FokosDbStubContext): DurableObjectNamespaceGetDurableO
 
 export function partitionStub(env: Env, ctx: FokosDbStubContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
 	const options = stubOptions(ctx);
-	return options === undefined ? partitionNamespace(env, ctx).get(id) : partitionNamespace(env, ctx).get(id, options);
+	return partitionNamespace(env, ctx).get(id, options);
 }
 
 export function partitionStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<PartitionDO> {
 	const options = stubOptions(ctx);
-	return options === undefined ? partitionNamespace(env, ctx).getByName(doName) : partitionNamespace(env, ctx).getByName(doName, options);
+	return partitionNamespace(env, ctx).getByName(doName, options);
 }
 
-export function txCoordinatorStub(
-	env: Env,
-	ctx: FokosDbStubContext,
-	doId: DurableObjectId | string,
-): DurableObjectStub<TransactionCoordinatorDO> {
-	const ns = txCoordinatorNamespace(env, ctx);
-	const targetId = typeof doId === "string" ? ns.idFromString(doId) : doId;
+export function txCoordinatorStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
 	const options = stubOptions(ctx);
-	// A string is the stringified form of an id, never a name: no caller resolves a coordinator by name.
-	return options === undefined ? ns.get(targetId) : ns.get(targetId, options);
+	return txCoordinatorNamespace(env, ctx).getByName(doName, options);
 }

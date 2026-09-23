@@ -1,6 +1,6 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { testPartitionStub } from "../stub-helpers.js";
+import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
 import { openedRpc } from "../partition-do/helpers.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
@@ -109,7 +109,7 @@ async function lockItem(db: ReturnType<typeof makeDB>, key: Key): Promise<() => 
 	const transactionId = crypto.randomUUID().replaceAll("-", "");
 	await rpc.txPrepare(partitionContext, {
 		transactionId,
-		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+		coordinator: testCoordinatorRef(),
 		transactionTimestamp: Date.now(),
 		items: [{ opIndex: 0, hashKey, sortKey, operation: "put", data: "held", kind: "text" }],
 	});

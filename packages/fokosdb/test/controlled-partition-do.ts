@@ -66,6 +66,7 @@ export class ControlledPartitionDO extends PartitionDO {
 	};
 	#txRules: { [Op in TxOp]?: TxResponseRule<Op> } = {};
 	#readGate: (Gate & { parked: boolean }) | null = null;
+	#prepareGate: (Gate & { parked: boolean }) | null = null;
 	#staleTransactionMs: number | null = null;
 
 	/**
@@ -98,6 +99,16 @@ export class ControlledPartitionDO extends PartitionDO {
 
 	override txExecuteSingleShot(ctx: FokosDbRouteContext, req: TxRequest<"txExecuteSingleShot">) {
 		return this.#tx("txExecuteSingleShot", req, () => super.txExecuteSingleShot(ctx, req));
+	}
+
+	override async txPrepare(ctx: FokosDbRouteContext, req: Parameters<PartitionDO["txPrepare"]>[1]) {
+		const response = await super.txPrepare(ctx, req);
+		const prepareGate = this.#prepareGate;
+		if (prepareGate && !prepareGate.parked) {
+			prepareGate.parked = true;
+			await prepareGate.held;
+		}
+		return response;
 	}
 
 	override txCommit(ctx: FokosDbRouteContext, req: TxRequest<"txCommit">) {
@@ -190,6 +201,23 @@ export class ControlledPartitionDO extends PartitionDO {
 	async testReleaseReadPhase(): Promise<void> {
 		this.#readGate?.release();
 		this.#readGate = null;
+	}
+
+	/**
+	 * Holds the answer of the next `txPrepare` after the prepare applies, until `testReleasePrepare`.
+	 * The lock is then written, and the coordinator still waits for the answer.
+	 */
+	async testHoldPrepare(): Promise<void> {
+		this.#prepareGate = { ...gate(), parked: false };
+	}
+
+	async testPrepareParked(): Promise<boolean> {
+		return this.#prepareGate?.parked ?? false;
+	}
+
+	async testReleasePrepare(): Promise<void> {
+		this.#prepareGate?.release();
+		this.#prepareGate = null;
 	}
 
 	/** Replaces the stale-transaction time of this partition. `null` restores the shipped value. */

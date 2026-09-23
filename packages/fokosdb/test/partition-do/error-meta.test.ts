@@ -5,6 +5,7 @@ import { routedError } from "../../src/sharding/envelope.js";
 import type { FokosRouting } from "../../src/sharding/runtime-types.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { fokosErrorWith } from "../errors-matchers.js";
+import { testCoordinatorRef } from "../stub-helpers.js";
 import { kb, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition, makePartition } from "./partition-harness.js";
 
@@ -22,7 +23,7 @@ async function lockItem(node: TestPartition, keys: ItemKeys): Promise<() => Prom
 	const res = await node.rpc.txPrepare(node.ctx, {
 		transactionId,
 		transactionTimestamp: txOrderTimestampNow(),
-		coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+		coordinator: testCoordinatorRef(),
 		items: withOpIndex([{ ...keys, operation: "put", data: "pending", kind: "text" }]),
 	});
 	expect(res.outcome).toBe("accepted");

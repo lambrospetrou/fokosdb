@@ -6,6 +6,7 @@ import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
+import { testCoordinatorRef } from "../stub-helpers.js";
 import { compiledCondition, kb, makeStub, openedRpc, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
@@ -24,11 +25,11 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
-		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const coordinator = testCoordinatorRef();
 		const prepareResp = await rpc.txPrepare(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: coordId,
+			coordinator,
 			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
@@ -61,11 +62,11 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const rangeRoot = await partition.awaitPromoted("alice");
 
 		const txId = crypto.randomUUID();
-		const coordId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const coordinator = testCoordinatorRef();
 		const prepareResp = await rpc.txPrepare(ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: coordId,
+			coordinator,
 			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "alice-data", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
@@ -88,7 +89,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 		const prepareResp2 = await rpc.txPrepare(ctx, {
 			transactionId: txId2,
 			transactionTimestamp: Date.now() + 1,
-			coordinatorDoId: coordId,
+			coordinator,
 			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "retried", kind: "text" },
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "retried", kind: "text" },
@@ -122,7 +123,7 @@ describe("PartitionDO — transaction routing separates backpressure from mis-ro
 			.txPrepare(ctx, {
 				transactionId: crypto.randomUUID(),
 				transactionTimestamp: Date.now(),
-				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+				coordinator: testCoordinatorRef(),
 				items: txItems,
 			})
 			.then(
@@ -233,7 +234,7 @@ describe("PartitionDO — single-shot transaction", () => {
 		const prepared = await rpc.txPrepare(ctx, {
 			transactionId,
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "two-phase", kind: "text" }]),
 		});
 		expect(prepared.outcome).toBe("accepted");
@@ -308,7 +309,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 			await rpc.txPrepare(ctx, {
 				transactionId,
 				transactionTimestamp,
-				coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+				coordinator: testCoordinatorRef(),
 				items,
 			}),
 		).toEqual({ outcome: "accepted" });
@@ -333,7 +334,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		const partition = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const { ctx, stub, rpc } = partition;
 		const data = "x".repeat(64 * 1024);
-		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const coordinator = testCoordinatorRef();
 
 		for (let i = 0; i < 40; i++) {
 			const transactionId = crypto.randomUUID();
@@ -341,7 +342,7 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 				{ hashKey: kb(`commit-split-${i}`), sortKey: kb("sk"), operation: "put" as const, data, kind: "bytes" as const },
 			]);
 			const transactionTimestamp = Date.now() + i;
-			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinatorDoId, items })).toEqual({ outcome: "accepted" });
+			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinator, items })).toEqual({ outcome: "accepted" });
 			await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
 			if ((await rpc.status(ctx)).splitStatus) break;
 		}
@@ -383,7 +384,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 		const prepared = await rpc.txPrepare(ctx, {
 			transactionId: crypto.randomUUID(),
 			transactionTimestamp: Date.now(),
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("snap-locked"), sortKey: kb("sk"), operation: "put", data: "pending", kind: "text" }]),
 		});
 		expect(prepared.outcome).toBe("accepted");

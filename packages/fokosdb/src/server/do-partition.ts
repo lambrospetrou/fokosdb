@@ -38,7 +38,7 @@ import {
 	type PromotedKeyStatus,
 } from "../shared/partition/partition-store.js";
 import type { RepartitionState } from "../sharding/sharding-store.js";
-import { TransactionParticipant, type PromotionCandidate } from "../shared/partition/transaction-participant.js";
+import { parseCoordinatorRef, TransactionParticipant, type PromotionCandidate } from "../shared/partition/transaction-participant.js";
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -78,7 +78,7 @@ import {
 import { QueryPageBudget } from "../shared/query/page-budget.js";
 import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
-import { partitionStubByName, txCoordinatorStub } from "../shared/do-stubs.js";
+import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -970,11 +970,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	private async recoverStaleTransactions(): Promise<void> {
 		const staleTxRows = this.#participant.listStaleTransactions(this.fokosStaleTransactionMs(), 10);
 		for (const row of staleTxRows) {
-			if (!row.coordinator_do_id) continue;
 			try {
 				const ctx = this.fokos.routeContext();
-				const tcStub = txCoordinatorStub(this.env, ctx, row.coordinator_do_id);
-				const result = await tcStub.recoverTransaction(row.transaction_id);
+				// The coordinator that drove the transaction, either the original DO or a child that now owns the token.
+				const { route, idempotencyToken } = parseCoordinatorRef(row.coordinator_json, row.transaction_id);
+				const result = (
+					await txCoordinatorStubByName(this.env, route, route.doName).recoverTransaction(route, {
+						transactionId: row.transaction_id,
+						idempotencyToken,
+					})
+				).value;
 
 				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 				if (pendingRows.length === 0) continue;
@@ -1003,7 +1008,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 								...this.logParams(),
 								message: "fokos/partition: lock-age guard: over-age lock with not_found",
 								transactionId: row.transaction_id,
-								coordinatorDoId: row.coordinator_do_id,
+								coordinatorDoName: route.doName,
+								idempotencyToken,
 								keys: pendingRows.map((pending) => ({
 									hashKey: pending.hk.toBase64({ alphabet: "base64url" }),
 									sortKey: pending.sk.toBase64({ alphabet: "base64url" }),

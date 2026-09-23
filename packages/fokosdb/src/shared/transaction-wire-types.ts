@@ -51,10 +51,25 @@ export type TransactionItem = TransactionItemKey & {
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
+/** The version of the `CoordinatorRef` shape that this code writes and reads. */
+export const COORDINATOR_REF_VERSION = 1;
+
+/**
+ * What a participant needs to call the coordinator of a transaction back. The partition stores it as
+ * one JSON value in `pending_transactions`, and the stale-recovery job calls `recoverTransaction` with
+ * it. A new field needs no schema change. A change that an older reader cannot read increments `v`.
+ */
+export type CoordinatorRef = {
+	v: typeof COORDINATOR_REF_VERSION;
+	/** The route context of the coordinator that drove the prepare. */
+	route: FokosDbRouteContext;
+	/** The route key of the transaction. A coordinator that has split forwards the call to the child that owns it. */
+	idempotencyToken: IdempotencyToken;
+};
+
 export type PrepareRequest = {
 	transactionId: TransactionId;
-	/** DO name of the TC. Stored in pending_transactions so the recovery alarm can call it. */
-	coordinatorDoId: string;
+	coordinator: CoordinatorRef;
 	transactionTimestamp: TransactionTimestamp;
 	/** All items in this partition that the transaction touches. */
 	items: TransactionItem[];
@@ -252,6 +267,9 @@ export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COM
 
 export type TCTerminalState = Extract<TCState, "COMMITTED" | "CANCELLED">;
 
+/** The token routes the call to the coordinator that owns it, and the transaction id selects the row. */
+export type RecoverTransactionRequest = { transactionId: TransactionId; idempotencyToken: IdempotencyToken };
+
 export type RecoverTransactionResult =
 	| { state: TCTerminalState }
 	/** TC has no record of this transaction — caller should treat it as cancelled. */
@@ -280,8 +298,11 @@ export type TCWriteOperation = {
 };
 
 export type InitiateWriteRequest = {
-	/** When provided, used as idempotencyToken and TC DO name for deduplication. */
-	clientRequestToken?: string;
+	/**
+	 * The idempotency token, and the route key of the coordinator. `db.ts` always sends one: it generates
+	 * a token when the caller gave none, because the runtime resolves the owner before the handler runs.
+	 */
+	clientRequestToken: IdempotencyToken;
 	items: TCWriteOperation[];
 };
 

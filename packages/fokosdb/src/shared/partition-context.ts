@@ -52,6 +52,12 @@ export type FokosDbPolicy = {
 
 export type FokosDbRouteContext = FokosRouteContext<FokosDbPolicy>;
 
+/**
+ * FokosDB names its own shard groups with this prefix, so a table name must not start with it. The
+ * coordinator group of a table is `fokos.tc.<tableName>`.
+ */
+export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
+
 /** The part of a route context that selects a namespace and a stub: enough for a Worker with no partition in mind. */
 export type FokosDbStubContext = Pick<FokosDbRouteContext, "topology" | "policy">;
 
@@ -107,6 +113,9 @@ export class PartitionContextCreator {
 			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
 		};
 		validateTopology(topology);
+		if (topology.shardGroup.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
+			throw invalid("shardGroup", topology.shardGroup, `shardGroup must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
+		}
 
 		const rangeConfig: FokosRangeConfig = { rangeSplitN: opts.rangeSplitN, rangeAncestors: opts.rangeAncestorsConfig };
 		validateRangeConfig(rangeConfig);

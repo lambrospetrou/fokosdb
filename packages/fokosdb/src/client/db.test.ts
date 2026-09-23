@@ -1,5 +1,4 @@
 import { env } from "cloudflare:workers";
-import { StaticShardedDO } from "durable-utils/do-sharding";
 import { describe, expect, it, vi } from "vitest";
 import { FokosDB } from "./db.js";
 import { FokosStd } from "./fokos-std.js";
@@ -811,37 +810,35 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	});
 
 	describe("FokosDB — transaction coordinator pool", () => {
-		it("derives two coordinators per root partition", () => {
-			expect(makeDBFor(ns, { rootTreesN: 1 }).options().numTxCoordinators).toBe(2);
-			expect(makeDBFor(ns, { rootTreesN: 3 }).options().numTxCoordinators).toBe(6);
+		it("derives two coordinator roots per root partition", () => {
+			expect(makeDBFor(ns, { rootTreesN: 1 }).options().coordinatorRootsN).toBe(2);
+			expect(makeDBFor(ns, { rootTreesN: 3 }).options().coordinatorRootsN).toBe(6);
+			expect(makeDBFor(ns, { rootTreesN: 32_501 }).options().coordinatorRootsN).toBe(65_000);
+			expect(makeDBFor(ns, { rootTreesN: 65_000 }).options().coordinatorRootsN).toBe(65_000);
 		});
 
-		it("uses and validates an explicit numTxCoordinators value", () => {
-			expect(makeDBFor(ns, { rootTreesN: 3, numTxCoordinators: 5 }).options().numTxCoordinators).toBe(5);
-			for (const numTxCoordinators of [0, -1, 1.5]) {
-				expect(() => makeDBFor(ns, { numTxCoordinators })).toThrow(fokosErrorWith("num_tx_coordinators_invalid"));
+		it("uses and validates an explicit coordinatorRootsN value", () => {
+			expect(makeDBFor(ns, { rootTreesN: 3, coordinatorRootsN: 5 }).options().coordinatorRootsN).toBe(5);
+			for (const coordinatorRootsN of [0, -1, 1.5, 65001]) {
+				expect(() => makeDBFor(ns, { coordinatorRootsN })).toThrow(fokosErrorWith("num_tx_coordinators_invalid"));
 			}
 		});
 
-		it("destroys coordinator pools larger than 1,000 shards in filtered batches", async () => {
-			const db = makeDBFor(ns, { rootTreesN: 501 });
-			const some = vi.spyOn(StaticShardedDO.prototype, "some").mockResolvedValue([]);
-			const all = vi.spyOn(StaticShardedDO.prototype, "all");
-			const traverse = vi.spyOn(db.options().topology, "walk").mockResolvedValue();
+		it("destroys the coordinator group of the table first, and then the partitions", async () => {
+			const db = makeDBFor(ns, { rootTreesN: 2 });
+			const walked: Array<{ shardGroup: string; rootTreesN: number }> = [];
+			const walk = vi.spyOn(FokosRouter.prototype, "walk").mockImplementation(async function (this: FokosRouter<unknown>) {
+				walked.push({ shardGroup: this.topology.shardGroup, rootTreesN: this.topology.rootTreesN });
+			});
 			try {
 				await expect(db.destroy()).resolves.toEqual({ ok: true });
-				expect(all).not.toHaveBeenCalled();
-				expect(some).toHaveBeenCalledTimes(2);
-				const calls = (some as unknown as { mock: { calls: Array<[unknown, { filterFn: (shard: number) => boolean }]> } }).mock.calls;
-				const firstFilter = calls[0][1].filterFn;
-				const secondFilter = calls[1][1].filterFn;
-				expect([firstFilter(0), firstFilter(999), firstFilter(1000)]).toEqual([true, true, false]);
-				expect([secondFilter(999), secondFilter(1000), secondFilter(1001)]).toEqual([false, true, true]);
-				expect(traverse).toHaveBeenCalledTimes(1);
+				const table = db.options().topology.topology.shardGroup;
+				expect(walked).toEqual([
+					{ shardGroup: `fokos.tc.${table}`, rootTreesN: 4 },
+					{ shardGroup: table, rootTreesN: 2 },
+				]);
 			} finally {
-				some.mockRestore();
-				all.mockRestore();
-				traverse.mockRestore();
+				walk.mockRestore();
 			}
 		});
 	});
@@ -1217,7 +1214,7 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 // Builds a FokosDB over a fresh, isolated table for the given partition DO namespace. Generous split
 // thresholds keep every key on a single root partition so these tests exercise FokosDB.queryItems'
 // cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in test/partition-do/query-items.test.ts).
-function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; numTxCoordinators?: number }) {
+function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; coordinatorRootsN?: number }) {
 	const tableName = `test.${crypto.randomUUID()}`;
 	const base = PartitionContextCreator.create({
 		ns,
@@ -1231,7 +1228,7 @@ function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; n
 	});
 	return new FokosDB({
 		topology: new FokosRouter(base.topology, base.rangeConfig, base.policy),
-		numTxCoordinators: options?.numTxCoordinators,
+		coordinatorRootsN: options?.coordinatorRootsN,
 	});
 }
 

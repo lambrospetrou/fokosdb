@@ -46,16 +46,6 @@ export const MAX_ITEM_BYTES = 400 * 1024; // 400 KB
 export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
-/**
- * The size above which a coordinator refuses to start a new transaction. It is half of the 10 GB a
- * Durable Object holds, and the other half is headroom the refusal needs to be useful: a coordinator
- * that stopped taking work must still drive every transaction it already accepted to a terminal
- * state, and each of those writes state before it sends its outbound RPCs. A guard near the ceiling
- * would refuse new work and then wedge on the old.
- *
- * FIXME: Implement coordinator auto scaling out.
- */
-export const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024; // 5 GB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const SWEEP_BATCH_ROWS = 1_000;

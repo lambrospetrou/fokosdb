@@ -8,8 +8,8 @@
 the five shapes, the envelope, the scheduler, and the sharding error module exist in
 `packages/fokosdb/src/sharding/` and are exported from `fokosdb/sharding`. `PartitionDO` is a host: every public
 method is one `dispatch`, and the `PartitionDO` suites drive the runtime. M5 is partly built: the example host
-runs hash splits and the ownership property test exists (section 3). The coordinator host (M6) is not built. The
-prototype in `packages/fokosdb/test/sharding-prototype/` compiles against the real runtime.
+runs hash splits and the ownership property test exists (section 3). `TransactionCoordinatorDO` is the second host
+(M6). The prototype in `packages/fokosdb/test/sharding-prototype/` compiles against the real runtime.
 
 ## Table of contents
 
@@ -393,6 +393,47 @@ Deliverables:
 - `db.ts` builds a second `FokosRouter` for `fokos.tc.<shardGroup>`, `StaticShardedDO` and `numTxCoordinators`
   are removed, and `destroy` walks both shard groups.
 - The coordinator tests of section 4.2.20.
+
+**Done.** The tests are in `packages/fokosdb/test/transactions/tx-coordinator-split.test.ts`. These decisions were
+made during the implementation and differ from, or add to, the text of sections 4.2.2 and 4.2.21:
+
+- `validateTopology` no longer refuses a shard group that starts with `fokos.`. The prefix is a FokosDB naming
+  rule, so `PartitionContextCreator` refuses a table name with it, and `RESERVED_SHARD_GROUP_PREFIX` lives in
+  `shared/partition-context.ts`. The coordinator group `fokos.tc.<shardGroup>` then passes the runtime and the router.
+- The coordinator splits above `hashSplitConditions.maxSizeMb` of its table, and `admit` refuses a new
+  transaction with `coordinator_over_size` above 110% of it. Above that size `admit` reads the ledger for the token,
+  so a replay still gets its answer. `MAX_TC_DATABASE_BYTES` is removed. A table with a very small threshold thus
+  also refuses transactions at its coordinator.
+- `FokosDBOptions.coordinatorRootsN` replaces `numTxCoordinators`, with the same default of two per table root.
+  An invalid value keeps the code `num_tx_coordinators_invalid`. The coordinator group takes the topology of the
+  table (hash split fan-out and jurisdiction), with its own shard group and root count.
+- `db.ts` retries `initiateWrite` on `partition_migrating` for at most 15 seconds, with jittered backoff (100 ms
+  base, 2 s maximum). The budget is longer than the 5-second fallback alarm of the runtime.
+- `initiateWrite` calls `scheduleJob` and `requestSplitEvaluation` directly after the `CREATED` insert, and not
+  through `call.signal`. The handler often ends with a thrown answer (`transaction_commit_pending`), and a thrown
+  handler drops its signals.
+- The `tx_recovery` job has a `deadline()` only for transactions that a migration page brought: `applyPage`
+  writes the host KV key `tc/recovery_due_at` when a page holds a non-terminal transaction, and the job step
+  deletes it. A request that creates a transaction schedules the job, and each step returns its next run while a
+  non-terminal transaction remains. A deadline read from the non-terminal rows would stay in the past while a
+  participant is down, and the job would run again at once after each step. `idempotency_sweep` has the
+  `deadline()` of the spec.
+- The ownership test guards the state transitions of section 4.2.21 only. The writes of participant answers and
+  outcomes are not guarded: a write that the target does not receive makes the target send that prepare, commit,
+  or cancel again, and each of those is idempotent on the partition.
+- A job runs on an owner whose import is `active` or `imported`, as the TTL sweep of `PartitionDO` does.
+- `cleanupSourceStep` deletes the ledger of a split source in batches of `SWEEP_BATCH_ROWS` transactions.
+- A migration page reads at most `FOKOS_PAGE_ROWS` ledger rows and stops before the transaction that would
+  cross `FOKOS_PAGE_BYTES`. It always holds at least one transaction.
+- `PrepareRequest.coordinator` is a `CoordinatorRef`: `{ v: 1, route, idempotencyToken }`. The lock row stores it
+  as one JSON value in `coordinator_json`, in place of `coordinator_do_id`. The partition does not read its fields
+  except to call the coordinator back, so a new field needs no schema change, and the update-lock statement
+  keeps its 6 trailing parameters. `parseCoordinatorRef` checks the version and each field that the call uses,
+  and throws `unexpected_transaction_state` for a reference it cannot read. The stale-recovery job then logs the
+  error and keeps the lock for `debugForceResolveTransaction`. A change that an older reader cannot read
+  increments `v`.
+- `destroyCoordinator` is removed. `FokosDB.destroy` walks the coordinator group with `FokosRouter.walk` and
+  `fokosDestroy`, and then the table.
 
 ## 4. Proposed solution
 

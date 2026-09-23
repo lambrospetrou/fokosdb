@@ -251,28 +251,36 @@ describe("transactions - single-partition fast path", () => {
 		expect(replay).toEqual(first);
 	});
 
-	it("reports a write past the size cap as a cancel with partition_over_size on its operation, on both paths", async () => {
+	it("reports a write past the size cap as a cancel with partition_over_size on its operation", async () => {
 		// An empty SQLite database is already several KB, so this cap is exceeded before anything is
 		// written and every write is refused for size.
-		const overSize = { maxSizeMb: 0.000_001 };
+		const db = makeDB({ maxSizeMb: 0.000_001 });
 		const items = [{ hashKey: "over-size", operation: "put" as const, data: "d" }];
 
-		for (const db of [makeDB(overSize), makeDB({ ...overSize, singlePartitionFastPath: false })]) {
-			const err = await db.transactWriteItems({ items }).catch((e: unknown) => e);
-			expect(FokosTransactionCancelledError.is(err)).toBe(true);
-			// The only failure is a full partition, which clears on its own, so the cancel is a service condition.
-			expect(err).toMatchObject({
-				code: "transaction_cancelled",
-				origin: "service",
-				httpStatusHint: 503,
-				results: [
-					{
-						outcome: "rejected",
-						reason: { code: "partition_over_size", hashKey: "over-size", error_id: expect.stringMatching(/^e_49j6ez_/) },
-					},
-				],
-			});
-		}
+		const err = await db.transactWriteItems({ items }).catch((e: unknown) => e);
+		expect(FokosTransactionCancelledError.is(err)).toBe(true);
+		// The only failure is a full partition, which clears on its own, so the cancel is a service condition.
+		expect(err).toMatchObject({
+			code: "transaction_cancelled",
+			origin: "service",
+			httpStatusHint: 503,
+			results: [
+				{
+					outcome: "rejected",
+					reason: { code: "partition_over_size", hashKey: "over-size", error_id: expect.stringMatching(/^e_49j6ez_/) },
+				},
+			],
+		});
+	});
+
+	it("refuses a write on the coordinator path when the coordinator is past the size cap", async () => {
+		// A coordinator uses the hash split threshold of its table, so this cap refuses a new transaction
+		// at the coordinator, before any partition sees it.
+		const db = makeDB({ maxSizeMb: 0.000_001, singlePartitionFastPath: false });
+		const items = [{ hashKey: "over-size", operation: "put" as const, data: "d" }];
+
+		const err = await db.transactWriteItems({ items }).catch((e: unknown) => e);
+		expect(err).toMatchObject({ code: "coordinator_over_size", origin: "service" });
 	});
 
 	it("runs the coordinator path for a write when the partition cannot execute the whole set", async () => {

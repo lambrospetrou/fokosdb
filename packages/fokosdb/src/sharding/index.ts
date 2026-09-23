@@ -17,7 +17,6 @@ export type { BloomFilterSnapshot } from "./bloom-filter.js";
 // ─── Identity and context ─────────────────────────────────────────────────────
 
 export {
-	RESERVED_SHARD_GROUP_PREFIX,
 	isHashPartition,
 	isRangePartition,
 	refOf,

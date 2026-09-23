@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
-import { testCoordinatorStub, testPartitionStub } from "../stub-helpers.js";
+import { testCoordinatorContext, testCoordinatorStubByName, testPartitionStub } from "../stub-helpers.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
@@ -24,7 +24,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 	function insertStalePendingLock(
 		state: DurableObjectState,
 		transactionId: string,
-		coordinatorDoId: string,
+		coordinator: FokosDbRouteContext,
 		options?: { createdAt?: number; hashKey?: string; data?: string; guardedAt?: number | null; transactionTimestamp?: number },
 	): PartitionStore {
 		const createdAt = options?.createdAt ?? Date.now() - 10_000;
@@ -39,7 +39,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			kind: "text",
 			conditions_json: null,
 			ttl_epoch_utc_seconds: null,
-			coordinator_do_id: coordinatorDoId,
+			coordinator_json: JSON.stringify({ v: 1, route: coordinator, idempotencyToken: `token-${transactionId}` }),
 			created_at: createdAt,
 			guarded_at: options?.guardedAt ?? null,
 		});
@@ -49,14 +49,13 @@ describe("PartitionDO — stale transaction recovery", () => {
 	/**
 	 * Substitutes the coordinator stub with a fake that answers `not_found`.
 	 *
-	 * The substitution is at the `txCoordinatorStub` helper, not at the class prototype: the helper
-	 * returns an RPC stub whose target runs outside this isolate, so a prototype spy records nothing.
-	 * It also lets these tests store sentinel coordinator ids such as "missing-tc" in a lock row,
-	 * which a real `idFromString` would reject as malformed. The partial fake is why the cast is here.
+	 * The substitution is at the `txCoordinatorStubByName` helper, not at the class prototype: the
+	 * helper returns an RPC stub whose target runs outside this isolate, so a prototype spy records
+	 * nothing. The partial fake is why the cast is here.
 	 */
 	function mockCoordinatorRecovery() {
-		const recoverTransaction = vi.fn(async () => ({ state: "not_found" as const }));
-		vi.spyOn(doStubs, "txCoordinatorStub").mockReturnValue({
+		const recoverTransaction = vi.fn(async () => ({ value: { state: "not_found" as const } }));
+		vi.spyOn(doStubs, "txCoordinatorStubByName").mockReturnValue({
 			recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		return recoverTransaction;
@@ -68,7 +67,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		await rpc.status(ctx);
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
-		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const coordinator = testCoordinatorContext();
 		const childPartitionContexts: FokosDbRouteContext[] = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((child) => ({
 			...ctx,
 			doName: child.doName,
@@ -93,7 +92,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 					nextAttemptAt: now,
 				});
 			});
-			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
+			const store = insertStalePendingLock(state, transactionId, coordinator);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -122,14 +121,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
-		const coordinatorDoId = env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString();
+		const coordinator = testCoordinatorContext();
 
 		await runInDurableObject(childStub, async (instance: PartitionDO, state: DurableObjectState) => {
 			const record = state.storage.kv.get<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT)!;
 			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: importState });
 			// This test cannot reach the source, so the import step fails and logs. The case is about
 			// recovery staying away, and not about how far the import gets.
-			const store = insertStalePendingLock(state, transactionId, coordinatorDoId);
+			const store = insertStalePendingLock(state, transactionId, coordinator);
 
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
@@ -151,7 +150,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, "missing-tc", { createdAt: now - IDEMPOTENCY_WINDOW_MS });
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionId)).toBe(0);
 		});
@@ -166,11 +165,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = mockCoordinatorRecovery();
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
-		const coordinatorDoId = "missing-tc";
+		const coordinator = testCoordinatorContext();
 		const hashKey = `guard-${transactionId}`;
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, coordinatorDoId, {
+			const store = insertStalePendingLock(state, transactionId, coordinator, {
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				hashKey,
 			});
@@ -186,7 +185,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 		expect(guardLogs).toHaveLength(1);
 		expect(guardLogs[0]).toMatchObject({
 			transactionId,
-			coordinatorDoId,
+			coordinatorDoName: coordinator.doName,
+			idempotencyToken: `token-${transactionId}`,
 			keys: [
 				{
 					hashKey: kb(hashKey).toBase64({ alphabet: "base64url" }),
@@ -209,14 +209,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = vi.fn(async () => {
 			throw new Error("coordinator unavailable");
 		});
-		vi.spyOn(doStubs, "txCoordinatorStub").mockReturnValue({
+		vi.spyOn(doStubs, "txCoordinatorStubByName").mockReturnValue({
 			recoverTransaction,
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		const consoleError = captureConsoleError();
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, "unreachable-tc", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
 			expect(store.listPendingTxItems(transactionId)[0].guarded_at).toBeNull();
@@ -230,6 +230,38 @@ describe("PartitionDO — stale transaction recovery", () => {
 		);
 	});
 
+	it("keeps a lock whose coordinator reference it cannot read, and logs why", async () => {
+		const now = 2_000_000_000_000;
+		vi.spyOn(Date, "now").mockReturnValue(now);
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		const recoverTransaction = mockCoordinatorRecovery();
+		const consoleError = captureConsoleError();
+		const transactionId = crypto.randomUUID();
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - 10_000 });
+			// A reference that a later version of the code wrote.
+			state.storage.sql.exec(
+				`UPDATE pending_transactions SET coordinator_json = json_set(coordinator_json, '$.v', 2) WHERE transaction_id = ?`,
+				transactionId,
+			);
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			expect(store.pendingTxCountFor(transactionId)).toBe(1);
+			store.deletePendingTx(transactionId);
+			await state.storage.deleteAlarm();
+		});
+
+		expect(recoverTransaction).not.toHaveBeenCalled();
+		expect(consoleError.spy).toHaveBeenCalledWith(
+			expect.objectContaining({
+				message: "fokos/partition: failed to poke stale TC",
+				transactionId,
+				error: expect.stringContaining("unexpected_transaction_state"),
+			}),
+		);
+	});
+
 	it("deletes a not_found lock directly when all its keys route away", async () => {
 		const now = 2_000_000_000_000;
 		vi.spyOn(Date, "now").mockReturnValue(now);
@@ -239,7 +271,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, "missing-tc", { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			// Every key of the lock now belongs to another partition.
 			const owns = vi.spyOn(instance.fokos, "owns").mockReturnValue(false);
 			const cancel = vi.spyOn(instance, "txCancel");
@@ -262,7 +294,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
 			for (const [index, transactionId] of transactionIds.entries()) {
-				insertStalePendingLock(state, transactionId, "missing-tc", {
+				insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
 					createdAt: index < 10 ? now - IDEMPOTENCY_WINDOW_MS - 1 : now - 5_001,
 					hashKey: `starvation-${index}`,
 				});
@@ -290,7 +322,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const transactionId = crypto.randomUUID();
 		const hashKey = `debug-${outcome}-${transactionId}`;
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
-			const store = insertStalePendingLock(state, transactionId, "missing-tc", {
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
 				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
 				hashKey,
 				data: "resolved-value",
@@ -312,14 +344,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 		});
 	});
 
-	it("recovers by stored coordinator ID and commits the TTL in a stale pending row", async () => {
+	it("recovers through the stored coordinator route context and commits the TTL in a stale pending row", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.status(ctx);
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now() - 10_000;
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
-		const tcId = env.TRANSACTION_COORDINATOR_DO.newUniqueId();
-		const tcStub = testCoordinatorStub(tcId);
+		const coordinator = testCoordinatorContext();
+		const tcStub = testCoordinatorStubByName(coordinator.doName);
 
 		await runInDurableObject(tcStub, async (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
@@ -332,7 +364,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				"0000000000000000",
 			);
 		});
-		const getCoordinatorById = vi.spyOn(doStubs, "txCoordinatorStub");
+		const getCoordinatorByName = vi.spyOn(doStubs, "txCoordinatorStubByName");
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const store = new PartitionStore(state.storage);
 			store.insertPendingLock({
@@ -345,7 +377,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				kind: "text",
 				conditions_json: null,
 				ttl_epoch_utc_seconds: ttlAt,
-				coordinator_do_id: tcId.toString(),
+				coordinator_json: JSON.stringify({ v: 1, route: coordinator, idempotencyToken: `stale-${transactionId}` }),
 				created_at: transactionTimestamp,
 				guarded_at: null,
 			});
@@ -354,7 +386,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		await runDurableObjectAlarm(stub);
 		await vi.waitFor(async () => {
-			expect(getCoordinatorById).toHaveBeenCalledWith(env, expect.objectContaining({ doName: ctx.doName }), tcId.toString());
+			expect(getCoordinatorByName).toHaveBeenCalledWith(env, coordinator, coordinator.doName);
 			expect(await rpc.apiGetItem(ctx, { hashKey: kb("stale-ttl"), sortKey: kb("sk") })).toMatchObject({
 				found: true,
 				item: { data: "value", ttlAt },

@@ -1,23 +1,41 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import { tryWhile } from "durable-utils/retries";
-import type { FokosDbRouteContext } from "../shared/partition-context.js";
+import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
+import { FokosShardingRuntime } from "../sharding/runtime.js";
+import type { FokosEnvelope, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
+import type {
+	FokosExecuteLocalRequest,
+	FokosInitRequest,
+	FokosMigrationAckRequest,
+	FokosMigrationPage,
+	FokosMigrationPullRequest,
+	FokosPrepareDestroyRequest,
+	FokosRequestPromotionRequest,
+	FokosShardingRpc,
+	FokosStartImportRequest,
+	FokosStatusRequest,
+} from "../sharding/repartition-types.js";
+import { FOKOS_PAGE_BYTES, FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
-import type {
-	InitiateWriteRequest,
-	InitiateWriteResponseEncoded,
-	ParticipantOperationResultEncoded,
-	PrepareResponse,
-	RecoverTransactionResult,
-	RejectionReasonEncoded,
-	TCState,
-	TransactWriteOperationResultEncoded,
-	TransactionItem,
-	TransactionItemKey,
+import {
+	COORDINATOR_REF_VERSION,
+	type CoordinatorRef,
+	type InitiateWriteRequest,
+	type InitiateWriteResponseEncoded,
+	type ParticipantOperationResultEncoded,
+	type PrepareResponse,
+	type RecoverTransactionRequest,
+	type RecoverTransactionResult,
+	type RejectionReasonEncoded,
+	type TCState,
+	type TransactWriteOperationResultEncoded,
+	type TransactionItem,
+	type TransactionItemKey,
 } from "../shared/transaction-wire-types.js";
-import { partitionStubByName } from "../shared/do-stubs.js";
+import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import {
 	FokosError,
 	FokosInternalError,
@@ -30,7 +48,7 @@ import {
 	VALIDATION_CODES,
 	type FokosErrorWire,
 } from "../shared/errors.js";
-import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
+import invariant from "../shared/invariant.js";
 import { one, tryOne } from "../shared/sql-cursor.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
@@ -38,11 +56,12 @@ import {
 	ALARM_RECOVERY_BUDGET_MS,
 	applyImageCap,
 	decodeItemKeys,
+	encodeHashKey,
 	IDEMPOTENCY_WINDOW_MS,
-	MAX_TC_DATABASE_BYTES,
 	txOrderTimestampNow,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
+import { retryable } from "../shared/cf-utils.js";
 
 type TcStateRow = {
 	transaction_id: string;
@@ -167,6 +186,55 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 
 const STALE_THRESHOLD_MS = 5_000;
 const MAX_PREPARING_HOLD_MS = Math.min(5 * STALE_THRESHOLD_MS, IDEMPOTENCY_WINDOW_MS);
+/**
+ * The maximum database size of one coordinator. It is half of the 10 GB storage limit of a Durable
+ * Object. The coordinator uses this limit when the table has no size threshold, or when the size
+ * threshold of the table is larger.
+ */
+const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024;
+
+/** The host job that drives the non-terminal transactions that no request drives. */
+const JOB_TX_RECOVERY = "tx_recovery";
+/** The host job that deletes the transactions whose idempotency window has passed. */
+const JOB_IDEMPOTENCY_SWEEP = "idempotency_sweep";
+
+/**
+ * A host KV key: the time at which the `tx_recovery` job must run, because a migration page brought
+ * non-terminal transactions that no request drives. The job step deletes it.
+ */
+const RECOVERY_DUE_KEY = "tc/recovery_due_at";
+
+const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
+
+/** The route key of a coordinator. The idempotency token selects the coordinator that owns a transaction. */
+function tokenKey(token: string): RouteKey {
+	return { hashKey: encodeHashKey(token), sortKey: NO_SORT_KEY };
+}
+
+/**
+ * The operations of the coordinator. Both are keyed by the idempotency token, and both handlers
+ * await partitions, so each durable transition tests ownership itself (see `transition`).
+ */
+export type CoordinatorOps = {
+	initiateWrite: { req: InitiateWriteRequest; res: InitiateWriteResponseEncoded };
+	recoverTransaction: { req: RecoverTransactionRequest; res: RecoverTransactionResult };
+};
+
+/** The RPC surface of the class. `db.ts` and the partitions type their stubs with it. */
+export type CoordinatorRpc = FokosShardingRpc & {
+	[K in keyof CoordinatorOps]: (
+		ctx: FokosDbRouteContext,
+		req: CoordinatorOps[K]["req"],
+	) => Promise<FokosEnvelope<CoordinatorOps[K]["res"]>>;
+};
+
+/** One transaction and its rows in the four tables, as a migration page carries it. */
+type MigratedTransaction = {
+	state: TcStateRow;
+	items: TcItemRow[];
+	participants: TcParticipantRow[];
+	results: TcResultRow[];
+};
 
 /**
  * Wall-clock budget for a participant fan-out that a request waits on, commit and cancel alike.
@@ -252,7 +320,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	},
 ];
 
-export class TransactionCoordinatorDO extends DurableObject<Env> {
+export class TransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
+	/** The sharding runtime: identity, routing, splits, and the alarm. The pool grows by hash splits. */
+	readonly fokos: FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>;
 	#migrations: SQLSchemaMigrations;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -261,8 +331,183 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			migrations: sqlMigrations,
 			doStorage: ctx.storage,
 		});
+		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
+		this.fokos = new FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>({
+			ctx,
+			stub: (routeCtx, doName) => txCoordinatorStubByName(env, routeCtx, doName),
+			hooks: this.hooks(),
+			operations: this.operations(),
+		});
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#migrations.runAllSync();
+		});
+	}
+
+	// ═══ the RPC surface: one dispatch per method ════════════════════════════
+
+	initiateWrite(ctx: FokosDbRouteContext, req: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>> {
+		return this.fokos.dispatch("initiateWrite", ctx, req);
+	}
+
+	/**
+	 * Called by a partition whose lock is stale, with the route context and the token it stored at
+	 * prepare. A coordinator that has split forwards the call to the child that owns the token.
+	 */
+	recoverTransaction(ctx: FokosDbRouteContext, req: RecoverTransactionRequest): Promise<FokosEnvelope<RecoverTransactionResult>> {
+		return this.fokos.dispatch("recoverTransaction", ctx, req);
+	}
+
+	fokosInit(req: FokosInitRequest): Promise<void> {
+		return this.fokos.fokosInit(req);
+	}
+	fokosStartImport(req: FokosStartImportRequest): Promise<void> {
+		return this.fokos.fokosStartImport(req);
+	}
+	fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
+		return this.fokos.fokosMigrationPull(req);
+	}
+	fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
+		return this.fokos.fokosMigrationAck(req);
+	}
+	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>> {
+		return this.fokos.fokosExecuteLocal(req);
+	}
+	fokosRequestPromotion(req: FokosRequestPromotionRequest) {
+		return this.fokos.fokosRequestPromotion(req);
+	}
+	fokosStatus(req: FokosStatusRequest) {
+		return this.fokos.fokosStatus(req);
+	}
+	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
+		return this.fokos.fokosPrepareDestroy(req);
+	}
+	/**
+	 * Wipes this coordinator. `FokosDB.destroy()` calls it for every coordinator of the table. The
+	 * idempotency window lives in `tc_state`, so a coordinator that survives a destroy answers a replayed
+	 * `clientRequestToken` with the OLD transaction's outcome — "committed" for data that no longer
+	 * exists. That is why destroy must reach the coordinators and not the partitions alone.
+	 */
+	fokosDestroy(): Promise<void> {
+		return this.fokos.fokosDestroy();
+	}
+
+	/** The runtime owns the alarm. The host work runs as the jobs `tx_recovery` and `idempotency_sweep`. */
+	async alarm(info: AlarmInvocationInfo): Promise<void> {
+		await this.fokos.alarm(info);
+	}
+
+	// ═══ operations ══════════════════════════════════════════════════════════
+
+	private operations(): FokosOperations<CoordinatorOps> {
+		return {
+			initiateWrite: {
+				shape: "point",
+				whileMigrating: "retry",
+				localMode: "async",
+				admissionTag: "write",
+				key: (req) => tokenKey(req.clientRequestToken),
+				local: async (req) => await this.initiateWriteLocal(req),
+			},
+			recoverTransaction: {
+				shape: "point",
+				whileMigrating: "retry",
+				localMode: "async",
+				key: (req) => tokenKey(req.idempotencyToken),
+				local: async (req) => await this.recoverTransactionLocal(req.transactionId),
+			},
+		};
+	}
+
+	// ═══ hooks ═══════════════════════════════════════════════════════════════
+
+	private hooks(): FokosShardingHooks<FokosDbPolicy> {
+		const sql = this.ctx.storage.sql;
+		// The split threshold. A missing or zero `maxSizeMb` gives only the size limit of the coordinator.
+		// The limit is divided by 1.1, so the 10% admission margin below stops at MAX_TC_DATABASE_BYTES.
+		const maxBytes = (policy: FokosDbPolicy) =>
+			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, MAX_TC_DATABASE_BYTES / 1.1);
+		return {
+			// The coordinator splits above the hash split threshold of its table. It also splits above
+			// its own size limit, when that limit is smaller.
+			evaluateSplit: ({ policy }) => (sql.databaseSize > maxBytes(policy) ? {} : false),
+
+			// A coordinator accepts up to 10% above its split threshold, so the requests that trigger the
+			// split complete. Above that it refuses a NEW transaction only: a replay reads the ledger and
+			// writes nothing, so it still gets its answer. The ledger read runs only above the threshold.
+			admit: ({ admissionTag, keys, policy }) => {
+				if (admissionTag !== "write" || sql.databaseSize <= maxBytes(policy) * 1.1) return "allow";
+				const token = KeyCodec.decode(keys[0].hashKey) as string;
+				if (this.hasStateRowForToken(token)) return "allow";
+				return {
+					reject: new FokosUnavailableError(UNAVAILABLE_CODES.coordinator_over_size, {
+						message: "transaction coordinator exceeded its storage limit, please retry later",
+					}),
+				};
+			},
+			migration: {
+				buildPage: (cursor, _slice, belongsToTarget) => this.buildMigrationPage(cursor as string | null, belongsToTarget),
+				applyPage: (page) => this.applyMigrationPage(page as MigratedTransaction[]),
+				validatePage: (_cursor, page) => {
+					invariant(Array.isArray(page), "fokos/tc: a migration page must be an array of transactions");
+				},
+			},
+			// Every child has acknowledged its import, so the rows of this router are old copies.
+			cleanupSourceStep: () => this.deleteMigratedRowsStep(),
+			jobs: [
+				{
+					name: JOB_TX_RECOVERY,
+					canRun: () => this.canDriveLocally(),
+					// Only the imported transactions set a deadline. A request that creates a transaction
+					// schedules the job itself, and the step schedules its next run. A deadline read from the
+					// non-terminal rows would stay in the past while a participant is down, and the job would
+					// run again at once after each step.
+					deadline: () => this.ctx.storage.kv.get<number>(RECOVERY_DUE_KEY) ?? null,
+					runStep: async () => {
+						this.ctx.storage.kv.delete(RECOVERY_DUE_KEY);
+						return { nextRunAt: await this.recoverStaleTransactions() };
+					},
+				},
+				{
+					name: JOB_IDEMPOTENCY_SWEEP,
+					canRun: () => this.canDriveLocally(),
+					deadline: () => {
+						const earliest = this.earliestCompletedAt();
+						return earliest === null ? null : earliest + IDEMPOTENCY_WINDOW_MS + 1;
+					},
+					runStep: () => ({ nextRunAt: this.sweepExpiredTransactions() }),
+				},
+			],
+		};
+	}
+
+	/**
+	 * True when this coordinator drives its own transactions. A router owns no token, a target that
+	 * still imports holds an incomplete ledger, and a fenced coordinator makes no transition.
+	 */
+	private canDriveLocally(): boolean {
+		if (!this.fokos.initialized()) return false;
+		const lifecycle = this.fokos.lifecycle();
+		if (lifecycle.destroying || lifecycle.role === "router") return false;
+		return lifecycle.import === null || lifecycle.import.state === "active" || lifecycle.import.state === "imported";
+	}
+
+	/**
+	 * One durable transition of the state machine. The ownership test runs in the same synchronous
+	 * block as the write, so a split cannot cut over between them. After a cutover the target owns the
+	 * token, and it pulls the rows of this coordinator after the cutover, so it receives the last state
+	 * this coordinator wrote. A transition here would be lost, so it writes nothing and throws
+	 * `partition_migrating`. The client retries with the same token, and the target resumes the
+	 * transaction from its copy of the row.
+	 */
+	private transition<T>(idempotencyToken: string, write: () => T): T {
+		return this.ctx.storage.transactionSync(() => {
+			if (!this.fokos.owns(tokenKey(idempotencyToken))) {
+				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+					message: "the transaction coordinator split, retry with the same clientRequestToken",
+					attributes: { idempotencyToken },
+				});
+			}
+			return write();
 		});
 	}
 
@@ -282,15 +527,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	// Transaction methods.
 	//////////////////////////////
 
-	private async ensureAlarmAt(targetMs: number): Promise<void> {
-		const existing = await this.ctx.storage.getAlarm();
-		if (existing === null || targetMs < existing) await this.ctx.storage.setAlarm(targetMs);
-	}
-
-	async initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
+	/** The local handler of `initiateWrite`. The runtime has already resolved this coordinator as the owner of the token. */
+	private async initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-		const idempotencyToken = request.clientRequestToken ?? transactionId;
-		const coordinatorDoId = this.ctx.id.toString();
+		const idempotencyToken = request.clientRequestToken;
 
 		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
 		const operationsHash = hashTransactionOperations(request.items);
@@ -307,12 +547,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				});
 			}
 			return await this.resumeTransaction(existingRow, idempotencyToken);
-		}
-
-		if (this.ctx.storage.sql.databaseSize > MAX_TC_DATABASE_BYTES) {
-			throw new FokosUnavailableError(UNAVAILABLE_CODES.coordinator_over_size, {
-				message: "transaction coordinator exceeded its storage limit, please retry later",
-			});
 		}
 
 		// Key/operation validation is the client's single boundary (FokosDB.transactWriteItems); the TC
@@ -335,7 +569,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			participant.items.push(item);
 		}
 
-		this.ctx.storage.transactionSync(() => {
+		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
 				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, operations_hash)
                  VALUES (?, ?, 'CREATED', ?, ?, ?)`,
@@ -374,9 +608,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}
 		});
 
-		await this.ensureAlarmAt(Date.now() + STALE_THRESHOLD_MS);
+		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
+		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
+		// so these calls do not go through `call.signal`.
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, Date.now() + STALE_THRESHOLD_MS);
+		this.fokos.requestSplitEvaluation();
 
-		return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs(), {
+		return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs(), {
 			transactionTs,
 			participants: [...participantsByDoName.values()],
 		});
@@ -402,10 +640,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				await this.runCancel(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
-			case "CREATED": {
-				const coordinatorDoId = this.ctx.id.toString();
-				return await this.drivePrepare(transactionId, idempotencyToken, coordinatorDoId, this.fokosFanoutRequestBudgetMs());
-			}
+			case "CREATED":
+				return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
 		}
 	}
 
@@ -490,11 +726,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		);
 	}
 
-	private completeTransaction(transactionId: string, terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">): number | null {
+	private completeTransaction(
+		transactionId: string,
+		idempotencyToken: string,
+		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
+	): number | null {
 		const expectedState = terminalState === "COMMITTED" ? "COMMITTING" : "CANCELLING";
 		const completedAt = Date.now();
 		let transitioned = false;
-		this.ctx.storage.transactionSync(() => {
+		this.transition(idempotencyToken, () => {
 			const transition = this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = ?, completed_at = ? WHERE transaction_id = ? AND state = ?`,
 				terminalState,
@@ -565,8 +805,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 * Both drivePrepare and runPrepareRecovery call it, so the two writers of CANCELLING cannot merge
 	 * differently: the answers come from storage, never from what the caller still holds in memory.
 	 */
-	private cancelTransactionInStore(transactionId: string): void {
-		this.ctx.storage.transactionSync(() => {
+	private cancelTransactionInStore(transactionId: string, idempotencyToken: string): void {
+		this.transition(idempotencyToken, () => {
 			const items = this.loadItems(transactionId);
 			const itemsByPartition = groupByPartition(items);
 
@@ -667,13 +907,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	private async drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
-		coordinatorDoId: string,
 		requestBudgetMs?: number,
 		fanout?: PrepareFanout,
 	): Promise<InitiateWriteResponseEncoded> {
-		this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId);
+		this.transition(idempotencyToken, () =>
+			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId),
+		);
 
 		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
+		// Each participant stores this reference in its lock, and calls it back on recovery.
+		const coordinator: CoordinatorRef = { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
@@ -682,7 +925,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						const r = (
 							await partitionStubByName(this.env, p.context, p.doName).txPrepare(p.context, {
 								transactionId,
-								coordinatorDoId,
+								coordinator,
 								transactionTimestamp: transactionTs,
 								items: p.items,
 							})
@@ -707,25 +950,27 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		if (allAccepted) {
 			// All accepted — PREPARED is the point of no return
-			this.ctx.storage.transactionSync(() => {
+			this.transition(idempotencyToken, () => {
 				const transition = this.ctx.storage.sql.exec(
 					`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
 					transactionId,
 				);
 				if (transition.rowsWritten > 0) this.stripPayload(transactionId);
 			});
-			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e) =>
+			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
+				// A split moved the token: the client retries, and the new owner commits.
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) throw e;
 				console.error({
 					message: "fokos/tc: background commit failed",
 					transactionId,
 					idempotencyToken,
 					error: String(e),
-				}),
-			);
+				});
+			});
 			return this.loadFinalResponse(transactionId, idempotencyToken);
 		}
 
-		this.cancelTransactionInStore(transactionId);
+		this.cancelTransactionInStore(transactionId, idempotencyToken);
 		await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		return this.loadFinalResponse(transactionId, idempotencyToken);
 	}
@@ -736,9 +981,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 	 * deadline, so those keep the full retry budget.
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
-		this.ctx.storage.sql.exec(
-			`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
-			transactionId,
+		this.transition(idempotencyToken, () =>
+			this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
+				transactionId,
+			),
 		);
 
 		const stateRow = this.loadStateRow(transactionId)!;
@@ -777,7 +1024,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							p.partition_do_name,
 						);
 					},
-					(_err, nextAttempt) => nextAttempt <= 10,
+					retryable(deadlineMs),
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 			}),
@@ -791,8 +1038,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			),
 		).n;
 		if (uncommitted === 0) {
-			const completedAt = this.completeTransaction(transactionId, "COMMITTED");
-			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
+			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
+			if (completedAt !== null) await this.fokos.scheduleJob(JOB_IDEMPOTENCY_SWEEP, completedAt + IDEMPOTENCY_WINDOW_MS + 1);
 		}
 	}
 
@@ -835,7 +1082,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 							p.partition_do_name,
 						);
 					},
-					(_err, nextAttempt) => nextAttempt <= 10,
+					retryable(deadlineMs),
 					{ baseDelayMs: 100, maxDelayMs: 2_000 },
 				);
 			}),
@@ -850,8 +1097,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			),
 		).n;
 		if (stillPending === 0) {
-			const completedAt = this.completeTransaction(transactionId, "CANCELLED");
-			if (completedAt !== null) await this.ensureAlarmAt(completedAt + IDEMPOTENCY_WINDOW_MS + 1);
+			const completedAt = this.completeTransaction(transactionId, idempotencyToken, "CANCELLED");
+			if (completedAt !== null) await this.fokos.scheduleJob(JOB_IDEMPOTENCY_SWEEP, completedAt + IDEMPOTENCY_WINDOW_MS + 1);
 		}
 	}
 
@@ -861,7 +1108,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 
 		const items = this.loadItems(transactionId);
 		const itemsByPartition = groupByPartition(items);
-		const coordinatorDoId = this.ctx.id.toString();
+		const coordinator: CoordinatorRef = { v: COORDINATOR_REF_VERSION, route: this.fokos.routeContext(), idempotencyToken };
 
 		const existingParticipants = this.loadParticipants(transactionId);
 
@@ -876,7 +1123,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 						const r = (
 							await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
 								transactionId,
-								coordinatorDoId,
+								coordinator,
 								transactionTimestamp: stateRow.transaction_ts,
 								items: toTransactionItems(partitionItems),
 							})
@@ -904,7 +1151,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const heldTooLong = Date.now() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
 
 		if (allAccepted) {
-			this.ctx.storage.transactionSync(() => {
+			this.transition(idempotencyToken, () => {
 				const transition = this.ctx.storage.sql.exec(
 					`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
 					transactionId,
@@ -913,13 +1160,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			});
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
 		} else if (anyRejected || heldTooLong) {
-			this.cancelTransactionInStore(transactionId);
+			this.cancelTransactionInStore(transactionId, idempotencyToken);
 			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
 		}
 		// If some participants still NULL and under the hold deadline, leave in PREPARING; alarm will retry
 	}
 
-	async alarm(): Promise<void> {
+	/**
+	 * One step of the `tx_recovery` job: drives the non-terminal transactions older than the stale
+	 * threshold, oldest first, within the recovery budget. Returns when the job must run again: while a
+	 * non-terminal transaction remains, one stale threshold from now.
+	 */
+	private async recoverStaleTransactions(): Promise<number | null> {
 		const recoveryStartedAt = Date.now();
 		const rows = this.ctx.storage.sql
 			.exec<{
@@ -939,25 +1191,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		for (const row of rows) {
 			if (Date.now() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) break;
 			try {
-				const coordinatorDoId = this.ctx.id.toString();
-				switch (row.state) {
-					case "CREATED":
-						await this.drivePrepare(row.transaction_id, row.idempotency_token, coordinatorDoId);
-						break;
-					case "PREPARING":
-						await this.runPrepareRecovery(row.transaction_id, row.idempotency_token);
-						break;
-					case "PREPARED":
-					case "COMMITTING":
-						await this.runCommit(row.transaction_id, row.idempotency_token);
-						break;
-					case "CANCELLING":
-						await this.runCancel(row.transaction_id, row.idempotency_token);
-						break;
-				}
+				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state);
 			} catch (e) {
 				console.error({
-					message: "fokos/tc: alarm recovery failed",
+					message: "fokos/tc: recovery failed",
 					transactionId: row.transaction_id,
 					state: row.state,
 					error: String(e),
@@ -965,8 +1202,41 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			}
 		}
 
-		const now = Date.now();
-		const cutoff = now - IDEMPOTENCY_WINDOW_MS;
+		const hasNonTerminalRows =
+			tryOne(
+				this.ctx.storage.sql.exec<{ found: number }>(
+					`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`,
+				),
+			) !== undefined;
+		return hasNonTerminalRows ? Date.now() + STALE_THRESHOLD_MS : null;
+	}
+
+	/** Drives one non-terminal transaction from its stored state, with the full retry budget. */
+	private async driveTransaction(transactionId: string, idempotencyToken: string, state: TCState): Promise<void> {
+		switch (state) {
+			case "CREATED":
+				await this.drivePrepare(transactionId, idempotencyToken);
+				break;
+			case "PREPARING":
+				await this.runPrepareRecovery(transactionId, idempotencyToken);
+				break;
+			case "PREPARED":
+			case "COMMITTING":
+				await this.runCommit(transactionId, idempotencyToken);
+				break;
+			case "CANCELLING":
+				await this.runCancel(transactionId, idempotencyToken);
+				break;
+		}
+	}
+
+	/**
+	 * One step of the `idempotency_sweep` job: deletes one batch of the transactions whose idempotency
+	 * window has passed. Returns now while expired rows remain, else null: the `deadline` of the job
+	 * gives the next expiry.
+	 */
+	private sweepExpiredTransactions(): number | null {
+		const cutoff = Date.now() - IDEMPOTENCY_WINDOW_MS;
 		const expiredBatch = this.ctx.storage.sql
 			.exec<{
 				transaction_id: string;
@@ -992,56 +1262,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		const hasExpiredRows =
 			tryOne(this.ctx.storage.sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)) !==
 			undefined;
-		const hasNonTerminalRows =
-			tryOne(
-				this.ctx.storage.sql.exec<{ found: number }>(
-					`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`,
-				),
-			) !== undefined;
-		const earliestCompletedAt = one(
+		return hasExpiredRows ? Date.now() : null;
+	}
+
+	private earliestCompletedAt(): number | null {
+		return one(
 			this.ctx.storage.sql.exec<{ completed_at: number | null }>(
 				`SELECT MIN(completed_at) AS completed_at FROM tc_state WHERE completed_at IS NOT NULL`,
 			),
 		).completed_at;
-
-		let nextAlarmAt: number | null = hasNonTerminalRows ? now + STALE_THRESHOLD_MS : null;
-		if (earliestCompletedAt != null) {
-			const sweepAt = earliestCompletedAt + IDEMPOTENCY_WINDOW_MS + 1;
-			nextAlarmAt = nextAlarmAt === null ? sweepAt : Math.min(nextAlarmAt, sweepAt);
-		}
-		if (hasExpiredRows) nextAlarmAt = now;
-		if (nextAlarmAt !== null) {
-			await this.ensureAlarmAt(Math.max(now, nextAlarmAt));
-		}
 	}
 
-	/**
-	 * Wipes this coordinator shard. Called by `FokosDB.destroy()` for every shard of the table.
-	 *
-	 * The idempotency window lives in `tc_state`, so a shard that survives a destroy answers a replayed
-	 * `clientRequestToken` with the OLD transaction's outcome — "committed" for data that no longer
-	 * exists. That is why destroy must reach the coordinators and not the partitions alone.
-	 *
-	 * Mirrors `PartitionDO.destroyPartition`, including the `abort()` eviction: the migration bookkeeping
-	 * lives in the storage being wiped, and the in-memory `#migrations` would otherwise still believe the
-	 * tables exist.
-	 */
-	async destroyCoordinator(): Promise<void> {
-		console.warn({ message: "fokos/tc: Destroying transaction coordinator — deleting all storage.", doId: this.ctx.id.toString() });
-
-		await this.ctx.blockConcurrencyWhile(async () => {
-			// Cancel the recovery alarm before wiping storage, so it cannot fire on the evicted instance
-			// and try to drive transactions whose rows are gone.
-			await this.ctx.storage.deleteAlarm();
-			await this.ctx.storage.deleteAll();
-		});
-
-		// Evict the instance so the next caller gets a fresh one with re-ran migrations. This throws on
-		// the caller side with the sentinel message, which FokosDB.destroy() catches and ignores.
-		this.ctx.abort(DESTROY_ABORT_SENTINEL);
-	}
-
-	async recoverTransaction(transactionId: string): Promise<RecoverTransactionResult> {
+	/** The local handler of `recoverTransaction`. */
+	private async recoverTransactionLocal(transactionId: string): Promise<RecoverTransactionResult> {
 		const row = tryOne(
 			this.ctx.storage.sql.exec<{
 				idempotency_token: string;
@@ -1053,33 +1286,139 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 		if (row.state === "COMMITTED" || row.state === "CANCELLED") return { state: row.state };
 
 		try {
-			const coordinatorDoId = this.ctx.id.toString();
-			switch (row.state) {
-				case "CREATED":
-					await this.drivePrepare(transactionId, row.idempotency_token, coordinatorDoId);
-					break;
-				case "PREPARING":
-					await this.runPrepareRecovery(transactionId, row.idempotency_token);
-					break;
-				case "PREPARED":
-				case "COMMITTING":
-					await this.runCommit(transactionId, row.idempotency_token);
-					break;
-				case "CANCELLING":
-					await this.runCancel(transactionId, row.idempotency_token);
-					break;
-			}
+			await this.driveTransaction(transactionId, row.idempotency_token, row.state);
 		} catch (e) {
 			console.error({
-				message: "fokos/tc: recoverTransaction failed, scheduling alarm",
+				message: "fokos/tc: recoverTransaction failed, scheduling recovery",
 				transactionId,
 				error: String(e),
 			});
-			if (!(await this.ctx.storage.getAlarm())) {
-				await this.ctx.storage.setAlarm(Date.now());
-			}
+			await this.fokos.scheduleJob(JOB_TX_RECOVERY, Date.now());
 		}
 		return { state: "driving" };
+	}
+
+	// ═══ migration ═══════════════════════════════════════════════════════════
+
+	/**
+	 * One page of the transactions that a split target owns, with their rows in all four tables. The
+	 * cursor is the last `transaction_id` read. A page reads at most `FOKOS_PAGE_ROWS` ledger rows and
+	 * keeps its payload near `FOKOS_PAGE_BYTES`: it stops before the transaction that would cross that
+	 * budget, and always holds at least one.
+	 */
+	private buildMigrationPage(
+		cursor: string | null,
+		belongsToTarget: (key: RouteKey) => boolean,
+	): { page: MigratedTransaction[]; nextCursor: string | null } {
+		const rows = this.ctx.storage.sql.exec<TcStateRow>(
+			`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
+             FROM tc_state WHERE transaction_id > ? ORDER BY transaction_id LIMIT ?`,
+			cursor ?? "",
+			FOKOS_PAGE_ROWS + 1,
+		);
+		const page: MigratedTransaction[] = [];
+		let bytes = 0;
+		let scanned = 0;
+		let last: string | null = null;
+		for (const row of rows) {
+			// The extra row only shows that the ledger continues after this page.
+			if (scanned === FOKOS_PAGE_ROWS) return { page, nextCursor: last };
+			if (belongsToTarget(tokenKey(row.idempotency_token))) {
+				const tx: MigratedTransaction = {
+					state: row,
+					items: this.loadItems(row.transaction_id),
+					participants: this.loadParticipants(row.transaction_id),
+					results: this.loadResultImages(row.transaction_id),
+				};
+				const txBytes = migratedTransactionBytes(tx);
+				if (page.length > 0 && bytes + txBytes > FOKOS_PAGE_BYTES) return { page, nextCursor: last };
+				page.push(tx);
+				bytes += txBytes;
+			}
+			scanned += 1;
+			last = row.transaction_id;
+		}
+		return { page, nextCursor: null };
+	}
+
+	/**
+	 * Writes the rows of one page. Idempotent: a page applied twice leaves the same rows. A
+	 * non-terminal transaction makes the `tx_recovery` job due, because no request of this coordinator
+	 * drives it.
+	 */
+	private applyMigrationPage(page: MigratedTransaction[]): void {
+		const sql = this.ctx.storage.sql;
+		if (page.some((tx) => tx.state.completed_at === null) && this.ctx.storage.kv.get(RECOVERY_DUE_KEY) === undefined) {
+			this.ctx.storage.kv.put(RECOVERY_DUE_KEY, Date.now());
+		}
+		for (const { state, items, participants, results } of page) {
+			sql.exec(
+				`INSERT OR REPLACE INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				state.transaction_id,
+				state.idempotency_token,
+				state.state,
+				state.transaction_ts,
+				state.created_at,
+				state.completed_at,
+				state.results_json,
+				state.operations_hash,
+			);
+			for (const r of items) {
+				sql.exec(
+					`INSERT OR REPLACE INTO tc_items (transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+					r.transaction_id,
+					r.hk,
+					r.sk,
+					r.op_index,
+					r.operation,
+					r.data,
+					r.data_kind,
+					r.ttl_epoch_utc_seconds,
+					r.conditions_json,
+					r.update_json,
+					r.partition_do_name,
+					r.return_values_on_condition_check_failure,
+				);
+			}
+			for (const r of participants) {
+				sql.exec(
+					`INSERT OR REPLACE INTO tc_participants (transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+					r.transaction_id,
+					r.partition_do_name,
+					r.partition_context_json,
+					r.prepare_outcome,
+					r.commit_outcome,
+					r.cancel_outcome,
+					r.answer_json,
+					r.error_json,
+				);
+			}
+			for (const r of results) {
+				sql.exec(
+					`INSERT OR REPLACE INTO tc_results (transaction_id, op_index, image_kind, image_version, image_ttl_epoch_utc_seconds, image_data)
+					 VALUES (?, ?, ?, ?, ?, ?)`,
+					r.transaction_id,
+					r.op_index,
+					r.image_kind,
+					r.image_version,
+					r.image_ttl_epoch_utc_seconds,
+					r.image_data,
+				);
+			}
+		}
+	}
+
+	/** One bounded step of the cleanup of a split source. Returns true when no ledger row is left. */
+	private deleteMigratedRowsStep(): boolean {
+		const sql = this.ctx.storage.sql;
+		const batch = `SELECT transaction_id FROM tc_state ORDER BY transaction_id LIMIT ${SWEEP_BATCH_ROWS}`;
+		for (const table of ["tc_items", "tc_participants", "tc_results", "tc_state"]) {
+			sql.exec(`DELETE FROM ${table} WHERE transaction_id IN (${batch})`);
+		}
+		return tryOne(sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state LIMIT 1`)) === undefined;
 	}
 
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
@@ -1090,6 +1429,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 				transactionId,
 			),
 		);
+	}
+
+	/** One seek of the unique token index, and no row read: the admission hook needs only to know that a row exists. */
+	private hasStateRowForToken(idempotencyToken: string): boolean {
+		return tryOne(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE idempotency_token = ? LIMIT 1`, idempotencyToken)) !== undefined;
 	}
 
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
@@ -1154,6 +1498,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> {
 			)
 			.toArray();
 	}
+}
+
+/** The size of one migrated transaction, near its serialized size: the payloads and the text columns. */
+function migratedTransactionBytes(tx: MigratedTransaction): number {
+	const size = (v: string | ArrayBuffer | null) => (v === null ? 0 : typeof v === "string" ? v.length : v.byteLength);
+	let bytes = 256 + size(tx.state.results_json);
+	for (const r of tx.items) bytes += 128 + r.hk.byteLength + r.sk.byteLength + size(r.data) + size(r.conditions_json) + size(r.update_json);
+	for (const r of tx.participants) bytes += 128 + size(r.partition_context_json) + size(r.answer_json) + size(r.error_json);
+	for (const r of tx.results) bytes += 64 + size(r.image_data);
+	return bytes;
 }
 
 function deserializePartitionContext(json: string): FokosDbRouteContext {

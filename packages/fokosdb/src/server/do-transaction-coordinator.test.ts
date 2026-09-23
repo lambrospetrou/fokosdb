@@ -3,10 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
-import { testCoordinatorStubByName } from "../../test/stub-helpers.js";
+import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
-import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, MAX_TC_DATABASE_BYTES, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
+import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
 	InitiateWriteRequest,
@@ -16,7 +16,9 @@ import type {
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
-import type { FokosEnvelope } from "../sharding/runtime-types.js";
+import { FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
+import type { FokosEnvelope, FokosShardingHooks } from "../sharding/runtime-types.js";
+import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -33,6 +35,12 @@ function enveloped<T>(value: T): FokosEnvelope<T> {
 	return { value, routing: { servedBy: [self], forwardCount: 0, servedByTruncated: false } };
 }
 
+/**
+ * A database size above the admission limit of the coordinator: 110% of the hash split threshold of
+ * its table. `testCoordinatorContext` sets that threshold to 100 MB.
+ */
+const OVER_SIZE_BYTES = 100 * 1024 * 1024 * 1.1 + 1;
+
 const TX_ID = "tx-1";
 const TOKEN = "tok-1";
 const BASE_TIME = 2_000_000_000_000;
@@ -45,17 +53,24 @@ afterEach(() => {
 // transition helpers. The states under test are otherwise reachable only by exhausting participant
 // retry budgets. Direct calls keep the tests deterministic and isolate each storage transition.
 type CoordinatorInternals = {
-	alarm(): Promise<void>;
-	initiateWrite(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
-	recoverTransaction(transactionId: string): Promise<unknown>;
+	/** The public RPC: it goes through the runtime, admission included. */
+	initiateWrite(ctx: FokosDbRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
+	fokos: TransactionCoordinatorDO["fokos"];
+	hooks(): FokosShardingHooks<FokosDbPolicy>;
+	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
+	recoverTransactionLocal(transactionId: string): Promise<unknown>;
+	/** The step of the `tx_recovery` job. */
+	recoverStaleTransactions(): Promise<number | null>;
+	/** The step of the `idempotency_sweep` job. */
+	sweepExpiredTransactions(): number | null;
+	earliestCompletedAt(): number | null;
+	buildMigrationPage(
+		cursor: string | null,
+		belongsToTarget: (key: { hashKey: Uint8Array }) => boolean,
+	): { page: Array<{ state: { transaction_id: string } }>; nextCursor: string | null };
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
-	cancelTransactionInStore(transactionId: string): void;
-	drivePrepare(
-		transactionId: string,
-		idempotencyToken: string,
-		coordinatorDoId: string,
-		commitRequestBudgetMs?: number,
-	): Promise<InitiateWriteResponseEncoded>;
+	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
+	drivePrepare(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<void>;
 	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void>;
 	runCancel(transactionId: string, idempotencyToken: string): Promise<void>;
@@ -165,11 +180,25 @@ function tableNames(state: DurableObjectState): string[] {
 		.map((r) => r.name);
 }
 
-async function withCoordinator(fn: (tc: CoordinatorInternals, state: DurableObjectState) => void | Promise<void>): Promise<void> {
-	const stub = testCoordinatorStubByName(`tc-test.${crypto.randomUUID()}`);
+/**
+ * Runs `fn` inside a root coordinator that owns every token. A first request gives the runtime its
+ * identity, because each transition of the state machine tests that the coordinator owns the token.
+ */
+async function withCoordinator(
+	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDbRouteContext) => void | Promise<void>,
+): Promise<void> {
+	const ctx = testCoordinatorContext();
+	const stub = testCoordinatorStubByName(ctx.doName);
+	await stub.recoverTransaction(ctx, { transactionId: "no-such-transaction", idempotencyToken: TOKEN });
 	await runInDurableObject(stub, async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
-		await fn(instance as unknown as CoordinatorInternals, state);
+		await fn(instance as unknown as CoordinatorInternals, state, ctx);
 	});
+}
+
+/** One pass of both host jobs, in the order the scheduler runs them. */
+async function runJobs(tc: CoordinatorInternals): Promise<void> {
+	await tc.recoverStaleTransactions();
+	tc.sweepExpiredTransactions();
 }
 
 describe("TransactionCoordinatorDO - loadFinalResponse: committed only after every participant confirmed", () => {
@@ -243,17 +272,36 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 });
 
 describe("TransactionCoordinatorDO - bounded transaction storage", () => {
-	it("refuses a new transaction when the coordinator is above its database size guard", async () => {
-		await withCoordinator(async (tc, state) => {
-			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+	it.each([{ maxItems: 20 }, { maxSizeMb: 10_000 }])(
+		"splits and refuses new transactions before the storage limit with hashSplitConditions %j",
+		async (hashSplitConditions) => {
+			await withCoordinator(async (tc, state, ctx) => {
+				const policy = { ...ctx.policy, hashSplitConditions };
+				// One byte above the size limit of a coordinator. Each policy has no size threshold, or a
+				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
+				vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(5 * 1024 * 1024 * 1024 + 1);
+				expect(tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy })).not.toBe(false);
+				await expect(tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
+					fokosErrorWith("coordinator_over_size"),
+				);
+				expect(countRows(state, "tc_state")).toBe(0);
+			});
+		},
+	);
 
-			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items: [] })).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
+	it("refuses a new transaction when the coordinator is above its database size guard", async () => {
+		await withCoordinator(async (tc, state, ctx) => {
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
+
+			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
+				fokosErrorWith("coordinator_over_size"),
+			);
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
 	});
 
 	it("answers a replay when the coordinator is above its database size guard", async () => {
-		await withCoordinator(async (tc, state) => {
+		await withCoordinator(async (tc, state, ctx) => {
 			const items: InitiateWriteRequest["items"] = [];
 			insertState(state, {
 				token: TOKEN,
@@ -263,9 +311,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				completedAt: BASE_TIME,
 				operationsHash: hashTransactionOperations(items),
 			});
-			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			await expect(tc.initiateWrite({ clientRequestToken: TOKEN, items })).resolves.toEqual({
+			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, items })).value).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -273,14 +321,14 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("still drives recovery and runs its alarm above the database size guard", async () => {
+	it("still drives recovery and runs its recovery job above the database size guard", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
-			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(MAX_TC_DATABASE_BYTES + 1);
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
 
-			await tc.recoverTransaction(TX_ID);
-			await tc.alarm();
+			await tc.recoverTransactionLocal(TX_ID);
+			await tc.recoverStaleTransactions();
 
 			expect(recover).toHaveBeenCalledTimes(2);
 		});
@@ -332,7 +380,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
 			vi.spyOn(tc, "runCommit").mockResolvedValue();
 
-			await expect(tc.drivePrepare(TX_ID, TOKEN, "coordinator-id", 0)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
+			await expect(tc.drivePrepare(TX_ID, TOKEN, 0)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
 
 			const stateRow = state.storage.sql
 				.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN)
@@ -354,7 +402,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("alarm recovery keeps PREPARING payload until prepare receives it", async () => {
+	it("the recovery job keeps PREPARING payload until prepare receives it", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			insertParticipant(state, {});
@@ -365,7 +413,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.alarm();
+			await tc.recoverStaleTransactions();
 
 			expect(txPrepare).toHaveBeenCalledTimes(1);
 			expect(txCommit).toHaveBeenCalledTimes(1);
@@ -426,7 +474,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			});
 			insertImage(state, TX_ID, 1, "image-1");
 
-			tc.cancelTransactionInStore(TX_ID);
+			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
@@ -477,7 +525,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			const response = await tc.drivePrepare(TX_ID, TOKEN, "coordinator-id");
+			const response = await tc.drivePrepare(TX_ID, TOKEN);
 
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
@@ -680,7 +728,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				largeData,
 			);
 
-			tc.cancelTransactionInStore(TX_ID);
+			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const stateRow = state.storage.sql
 				.exec<{ results_json: string }>(`SELECT results_json FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -718,7 +766,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				}),
 			);
 
-			tc.cancelTransactionInStore(TX_ID);
+			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
@@ -752,7 +800,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 });
 
 describe("TransactionCoordinatorDO - idempotency sweep", () => {
-	it("deletes one batch and re-arms immediately while expired rows remain", async () => {
+	it("deletes one batch and runs again at once while expired rows remain", async () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
 			for (let i = 0; i < SWEEP_BATCH_ROWS + 3; i++) {
@@ -765,12 +813,10 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				});
 			}
 
-			await tc.alarm();
-
+			expect(tc.sweepExpiredTransactions()).toBe(BASE_TIME);
 			expect(countRows(state, "tc_state")).toBe(3);
-			expect(await state.storage.getAlarm()).toBe(BASE_TIME);
-			await state.storage.deleteAlarm();
-			await tc.alarm();
+
+			expect(tc.sweepExpiredTransactions()).toBeNull();
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
 	});
@@ -798,7 +844,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			});
 			insertImage(state, "tx-live", 0, "live-image-0");
 
-			await tc.alarm();
+			tc.sweepExpiredTransactions();
 
 			const remaining = state.storage.sql
 				.exec<{ transaction_id: string }>(`SELECT transaction_id FROM tc_results ORDER BY op_index`)
@@ -809,7 +855,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
-	it("re-arms an idle shard until its last completed row expires", async () => {
+	it("reports the next expiry as the deadline of the sweep until the last completed row expires", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
 			vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -821,15 +867,14 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				completedAt: BASE_TIME,
 			});
 
-			await tc.alarm();
+			expect(tc.sweepExpiredTransactions()).toBeNull();
 			expect(countRows(state, "tc_state")).toBe(1);
-			expect(await state.storage.getAlarm()).toBe(BASE_TIME + IDEMPOTENCY_WINDOW_MS + 1);
+			expect(tc.earliestCompletedAt()).toBe(BASE_TIME);
 
 			now = BASE_TIME + IDEMPOTENCY_WINDOW_MS + 1;
-			await state.storage.deleteAlarm();
-			await tc.alarm();
+			expect(tc.sweepExpiredTransactions()).toBeNull();
 			expect(countRows(state, "tc_state")).toBe(0);
-			expect(await state.storage.getAlarm()).toBeNull();
+			expect(tc.earliestCompletedAt()).toBeNull();
 		});
 	});
 
@@ -845,8 +890,8 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				completedAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
 			});
 
-			await tc.alarm();
-			const result = await tc.initiateWrite({ clientRequestToken: TOKEN, items: [] });
+			tc.sweepExpiredTransactions();
+			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, items: [] });
 
 			expect(result.outcome).toBe("committed");
 			expect(result.transactionId).not.toBe(oldTransactionId);
@@ -854,7 +899,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
-	it("runs the sweep after the recovery budget is exhausted", async () => {
+	it("runs the sweep job after the recovery job exhausts its budget", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
 			vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -881,7 +926,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				now += ALARM_RECOVERY_BUDGET_MS;
 			});
 
-			await tc.alarm();
+			await runJobs(tc);
 
 			expect(recover).toHaveBeenCalledTimes(1);
 			expect(
@@ -981,7 +1026,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			seed(state, "PREPARED", undefined, Date.now() - 30_000);
 			insertParticipant(state, { name: "p1", prepare: "accepted" });
 
-			tc.cancelTransactionInStore(TX_ID);
+			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
 			expect(row.state).toBe("PREPARED");
@@ -1054,22 +1099,42 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				Date.now() - IDEMPOTENCY_WINDOW_MS - 1,
 				TX_ID,
 			);
-			await state.storage.deleteAlarm();
-			await tc.alarm();
+			tc.sweepExpiredTransactions();
 
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
 	});
 });
 
-describe("TransactionCoordinatorDO - destroyCoordinator", () => {
+describe("TransactionCoordinatorDO - migration pages", () => {
+	it("pages the ledger FOKOS_PAGE_ROWS transactions at a time, and keeps only the transactions the target owns", async () => {
+		await withCoordinator((tc, state) => {
+			const ids = Array.from({ length: 2 * FOKOS_PAGE_ROWS + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			for (const id of ids) insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
+
+			const all = () => true;
+			const first = tc.buildMigrationPage(null, all);
+			expect(first.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(0, FOKOS_PAGE_ROWS));
+			expect(first.nextCursor).toBe(ids[FOKOS_PAGE_ROWS - 1]);
+			const second = tc.buildMigrationPage(first.nextCursor, all);
+			expect(second.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(FOKOS_PAGE_ROWS, 2 * FOKOS_PAGE_ROWS));
+			const last = tc.buildMigrationPage(second.nextCursor, all);
+			expect(last.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(2 * FOKOS_PAGE_ROWS));
+			expect(last.nextCursor).toBeNull();
+
+			// A page that the target owns no row of still advances the cursor past the rows it read.
+			const none = tc.buildMigrationPage(null, () => false);
+			expect(none).toEqual({ page: [], nextCursor: ids[FOKOS_PAGE_ROWS - 1] });
+		});
+	});
+});
+
+describe("TransactionCoordinatorDO - fokosDestroy", () => {
 	// The idempotency window lives in tc_state. A coordinator that survives FokosDB.destroy() answers a
 	// replayed clientRequestToken with the old transaction's outcome — "committed" for data that was
 	// wiped with the partitions.
 	it("wipes the idempotency window and the alarm, then evicts the instance", async () => {
-		const stub = testCoordinatorStubByName(`tc-destroy.${crypto.randomUUID()}`);
-
-		await runInDurableObject(stub, async (tc: TransactionCoordinatorDO, state: DurableObjectState) => {
+		await withCoordinator(async (tc, state) => {
 			seed(state, "COMMITTED");
 			await state.storage.setAlarm(Date.now() + 60_000);
 			expect(countRows(state, "tc_state")).toBe(1);
@@ -1081,7 +1146,7 @@ describe("TransactionCoordinatorDO - destroyCoordinator", () => {
 			// the next caller re-run the migrations) without killing the run.
 			const abort = vi.spyOn(state, "abort").mockImplementation(() => {});
 
-			await tc.destroyCoordinator();
+			await (tc as unknown as TransactionCoordinatorDO).fokosDestroy();
 
 			expect(abort).toHaveBeenCalledWith("__special_destroy_sentinel");
 			// deleteAll() drops the tables themselves, migration bookkeeping included — which is exactly
@@ -1100,7 +1165,7 @@ describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () =
 
 	function cancelWith(state: DurableObjectState, tc: CoordinatorInternals) {
 		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
-		tc.cancelTransactionInStore(TX_ID);
+		tc.cancelTransactionInStore(TX_ID, TOKEN);
 		const response = tc.loadFinalResponse(TX_ID, TOKEN);
 		if (response.outcome !== "cancelled") throw new Error("the transaction did not cancel");
 		return response;

@@ -151,7 +151,7 @@ describe("FokosRouter.rootContext", () => {
 		expect(
 			() =>
 				new FokosRouter(
-					{ shardGroup: "fokos.x", rootTreesN: 1, hashSplitN: 2 },
+					{ shardGroup: "", rootTreesN: 1, hashSplitN: 2 },
 					{ rangeSplitN: 2, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } },
 					{},
 				),

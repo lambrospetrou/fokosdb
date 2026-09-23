@@ -119,8 +119,8 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 		// holds the coordinator that can release it.
 		await runInDurableObject(parent.stub, (_i: PartitionDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO pending_transactions (hk, sk, transaction_id, transaction_ts, created_at, coordinator_do_id, operation)
-				 VALUES (?, ?, 'tx-stale', 1, 1000, 'tc-1', 'put')`,
+				`INSERT INTO pending_transactions (hk, sk, transaction_id, transaction_ts, created_at, coordinator_json, operation)
+				 VALUES (?, ?, 'tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 'put')`,
 				kb(HELD_KEY),
 				kb("sk"),
 			);

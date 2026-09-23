@@ -1,5 +1,4 @@
 import { env } from "cloudflare:workers";
-import { StaticShardedDO } from "durable-utils/do-sharding";
 import { tryWhile } from "durable-utils/retries";
 import {
 	DataKind,
@@ -26,9 +25,9 @@ import {
 	SortKey,
 } from "../shared/types.js";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
-import { partitionStubByName, txCoordinatorNamespace } from "../shared/do-stubs.js";
-import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { FokosRouter } from "../sharding/router.js";
+import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
+import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
+import { FokosRouter } from "../sharding/router.js";
 import type {
 	ExecutionFailureCode,
 	RejectionReason,
@@ -106,10 +105,16 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
+import { RESERVED_SHARD_GROUP_PREFIX, type FokosDbPolicy, type FokosDbRouteContext } from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
-const TX_COORDINATOR_DESTROY_BATCH_SIZE = 1_000;
+
+/**
+ * How long `transactWriteItems` sends a write again while its coordinator answers `partition_migrating`.
+ * It is longer than the 5-second fallback alarm of the runtime, so an import that a crash stopped can
+ * finish inside it.
+ */
+const TX_COORDINATOR_MIGRATING_RETRY_MS = 15_000;
 
 // The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
@@ -280,11 +285,12 @@ export type FokosDBOptions = {
 	topology: FokosRouter<FokosDbPolicy>;
 
 	/**
-	 * Coordinator pool size. Defaults to two coordinators per root partition. Retries with the same
-	 * clientRequestToken must use the same value. In-flight recovery uses the coordinator ID stored in
-	 * participant locks and does not depend on this value.
+	 * The root coordinators of the table. Defaults to two per root partition, with a maximum of
+	 * `FOKOS_HASH_PARTITIONS_MAX`. Each root splits by hash when it grows larger than `hashSplitConditions.maxSizeMb` of
+	 * the table, or larger than the size limit of a coordinator. Thus the pool grows automatically.
+	 * The value must not change for a table that exists, as `rootTreesN` must not.
 	 */
-	numTxCoordinators?: number;
+	coordinatorRootsN?: number;
 
 	/**
 	 * Runs a transaction whose items are all owned by ONE partition against that partition directly,
@@ -304,26 +310,33 @@ function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): Ope
 
 export class FokosDB {
 	#options: Required<FokosDBOptions>;
-	#staticShardedTCs: StaticShardedDO<TransactionCoordinatorDO>;
+	/** The router of the coordinator group of the table, `fokos.tc.<shardGroup>`. */
+	#coordinators: FokosRouter<FokosDbPolicy>;
 
 	constructor(options: FokosDBOptions) {
-		const { topology, policy } = options.topology;
+		const { topology, rangeConfig, policy } = options.topology;
+		// The default has the same maximum as the check below, so a large `rootTreesN` does not fail.
 		this.#options = {
 			...options,
-			numTxCoordinators: options.numTxCoordinators ?? TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN,
+			coordinatorRootsN:
+				options.coordinatorRootsN ?? Math.min(TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN, FOKOS_HASH_PARTITIONS_MAX),
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 		};
-		if (!Number.isInteger(this.#options.numTxCoordinators) || this.#options.numTxCoordinators <= 0) {
+		const { coordinatorRootsN } = this.#options;
+		if (!Number.isInteger(coordinatorRootsN) || coordinatorRootsN < 1 || coordinatorRootsN > FOKOS_HASH_PARTITIONS_MAX) {
 			throw new FokosValidationError(VALIDATION_CODES.num_tx_coordinators_invalid, {
-				message: "numTxCoordinators must be an integer greater or equal to 1",
-				attributes: { numTxCoordinators: this.#options.numTxCoordinators },
+				message: `coordinatorRootsN must be an integer between 1 and ${FOKOS_HASH_PARTITIONS_MAX}`,
+				attributes: { coordinatorRootsN },
 			});
 		}
-		this.#staticShardedTCs = new StaticShardedDO(txCoordinatorNamespace(env, { topology, policy }), {
-			numShards: this.#options.numTxCoordinators,
-			shardGroupName: `fokos_tc.${topology.shardGroup}`,
-			...(policy.locationHint === undefined ? {} : { shardLocationHintFn: () => policy.locationHint }),
-		});
+		// The coordinators take the topology of the table except its shard group and its number of roots:
+		// the same hash split fan-out, and the same jurisdiction. The range config is not used, because
+		// a coordinator has no range tree.
+		this.#coordinators = new FokosRouter(
+			{ ...topology, shardGroup: `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup}`, rootTreesN: coordinatorRootsN },
+			rangeConfig,
+			policy,
+		);
 	}
 
 	options() {
@@ -496,15 +509,22 @@ export class FokosDB {
 			if (fastPathResult) return fastPathResult;
 		}
 
-		// TODO: Catch the DO errors and retry with a different idempotency token, which routes to another
-		// TC when the chosen one is overloaded or down. A write makes this hard.
+		// The token is the route key of the coordinator, so a request always carries one.
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
+		const ctx = this.#coordinators.rootContext(encodeHashKey(idempotencyToken));
 
+		// A coordinator answers `partition_migrating` while it splits: its root forwards the request to
+		// the child that owns the token, and that child refuses it until its import is complete. The
+		// request carries the token, so a retry resumes the same transaction and never starts a second one.
+		const deadline = Date.now() + TX_COORDINATOR_MIGRATING_RETRY_MS;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
-		const encoded = await this.#staticShardedTCs.one(idempotencyToken, async (tcStub: DurableObjectStub<TransactionCoordinatorDO>) => {
-			return await tcStub.initiateWrite({ clientRequestToken: idempotencyToken, items });
-		});
+		const encoded = await tryWhile(
+			async () =>
+				(await txCoordinatorStubByName(env, ctx, ctx.doName).initiateWrite(ctx, { clientRequestToken: idempotencyToken, items })).value,
+			(err) => FokosError.isCode(err, UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
+			{ baseDelayMs: 100, maxDelayMs: 2_000 },
+		);
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
 		// method returns, and a cancelled one raises instead.
 		if (encoded.outcome === "committed") {
@@ -959,25 +979,23 @@ export class FokosDB {
 		// Coordinators first, partitions second. A transaction still in flight is driven BY a coordinator,
 		// so wiping the coordinators stops the drivers before the data goes; the reverse order lets a live
 		// coordinator commit into a partition that was just emptied and leave rows behind the traversal has
-		// already passed. Every shard is swept, not only the ones that hold rows: the shard for a given
-		// idempotency token is not knowable from here, and a shard with no rows costs one wipe of empty
-		// storage. Batches use `some` because `StaticShardedDO.all` rejects pools larger than 1,000 shards.
-		const destroyCoordinator = async (tcStub: DurableObjectStub<TransactionCoordinatorDO>, shard: number) => {
-			try {
-				await tcStub.destroyCoordinator();
-			} catch (e) {
-				// destroyCoordinator ends in ctx.abort(), which always surfaces here as a throw.
-				if (!isDestroyAbortError(e)) throw e;
-			}
-			console.warn(`Destroyed transaction coordinator shard ${shard}`);
-		};
-		for (let start = 0; start < this.#options.numTxCoordinators; start += TX_COORDINATOR_DESTROY_BATCH_SIZE) {
-			const end = Math.min(start + TX_COORDINATOR_DESTROY_BATCH_SIZE, this.#options.numTxCoordinators);
-			await this.#staticShardedTCs.some(destroyCoordinator, { filterFn: (shard) => shard >= start && shard < end });
-		}
-
-		// The router owns the traversal: the fence, the target order and the dedup. FokosDB supplies the
+		// already passed. Every root and every child is wiped, not only the ones that hold rows: the
+		// coordinator of a given idempotency token is not knowable from here.
+		//
+		// Each router owns its traversal: the fence, the target order and the dedup. FokosDB supplies the
 		// stub and the destroy call.
+		await this.#coordinators.walk(
+			(ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
+			async (ctx, stub) => {
+				try {
+					await stub.fokosDestroy();
+				} catch (e) {
+					if (!isDestroyAbortError(e)) throw e;
+				}
+				console.warn(`Destroyed transaction coordinator ${ctx.doName}`);
+			},
+		);
+
 		await this.#options.topology.walk(
 			(ctx, doName) => partitionStubByName(env, ctx, doName),
 			async (ctx, stub) => {

@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { testPartitionStub } from "./stub-helpers.js";
+import { testCoordinatorRef, testPartitionStub } from "./stub-helpers.js";
 import { openedRpc } from "./partition-do/helpers.js";
 import { FokosConflictError, FokosError, FokosInternalError, FokosValidationError } from "../src/shared/errors.js";
 import { isFokosAnyError } from "../src/shared/errors-operations.js";
@@ -37,7 +37,7 @@ describe("the errors of a partition, through the public API", () => {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		await rpc.txPrepare(partitionContext, {
 			transactionId,
-			coordinatorDoId: env.TRANSACTION_COORDINATOR_DO.newUniqueId().toString(),
+			coordinator: testCoordinatorRef(),
 			transactionTimestamp: Date.now(),
 			items: [{ opIndex: 0, hashKey, sortKey, operation: "put", data: "held", kind: "text" }],
 		});
