@@ -56,6 +56,7 @@ type CoordinatorInternals = {
 	/** The public RPC: it goes through the runtime, admission included. */
 	initiateWrite(ctx: FokosDbRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
 	fokos: TransactionCoordinatorDO["fokos"];
+	fokosNow(): number;
 	hooks(): FokosShardingHooks<FokosDbPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
 	recoverTransactionLocal(transactionId: string): Promise<unknown>;
@@ -802,7 +803,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	it("deletes one batch and runs again at once while expired rows remain", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			for (let i = 0; i < SWEEP_BATCH_ROWS + 3; i++) {
 				insertState(state, {
 					token: `expired-${i}`,
@@ -825,7 +826,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	// tables by it. A tc_results row that outlived its tc_state row would be unreachable and unswept.
 	it("deletes the images of every transaction it sweeps, and leaves the rest alone", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			insertState(state, {
 				token: "expired-token",
 				transactionId: "tx-expired",
@@ -858,7 +859,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	it("reports the next expiry as the deadline of the sweep until the last completed row expires", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
-			vi.spyOn(Date, "now").mockImplementation(() => now);
+			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
 			insertState(state, {
 				token: "idle-token",
 				transactionId: "idle-tx",
@@ -880,7 +881,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 
 	it("treats a token as a new transaction after its completed row expires", async () => {
 		await withCoordinator(async (tc, state) => {
-			vi.spyOn(Date, "now").mockReturnValue(BASE_TIME);
+			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			const oldTransactionId = "expired-replay-tx";
 			insertState(state, {
 				token: TOKEN,
@@ -902,7 +903,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	it("runs the sweep job after the recovery job exhausts its budget", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
-			vi.spyOn(Date, "now").mockImplementation(() => now);
+			vi.spyOn(tc, "fokosNow").mockImplementation(() => now);
 			insertState(state, {
 				token: "recover-1",
 				transactionId: "recover-tx-1",

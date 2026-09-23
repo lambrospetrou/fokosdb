@@ -523,6 +523,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return TX_FANOUT_REQUEST_BUDGET_MS;
 	}
 
+	/**
+	 * The clock of this coordinator, in milliseconds. Read at each use, so a test can replace it on one
+	 * instance and avoid global mocks.
+	 */
+	fokosNow(): number {
+		return Date.now();
+	}
+
 	//////////////////////////////
 	// Transaction methods.
 	//////////////////////////////
@@ -576,7 +584,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				idempotencyToken,
 				transactionTs,
-				Date.now(),
+				this.fokosNow(),
 				operationsHash,
 			);
 			for (const op of request.items) {
@@ -611,7 +619,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
 		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
 		// so these calls do not go through `call.signal`.
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, Date.now() + STALE_THRESHOLD_MS);
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + STALE_THRESHOLD_MS);
 		this.fokos.requestSplitEvaluation();
 
 		return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs(), {
@@ -732,7 +740,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		terminalState: Extract<TCState, "COMMITTED" | "CANCELLED">,
 	): number | null {
 		const expectedState = terminalState === "COMMITTED" ? "COMMITTING" : "CANCELLING";
-		const completedAt = Date.now();
+		const completedAt = this.fokosNow();
 		let transitioned = false;
 		this.transition(idempotencyToken, () => {
 			const transition = this.ctx.storage.sql.exec(
@@ -993,7 +1001,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
-		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + requestBudgetMs;
+		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : this.fokosNow() + requestBudgetMs;
 
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
@@ -1012,7 +1020,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
 						// the transaction stays in COMMITTING, the caller receives the commit-pending
 						// error, and the alarm finishes the fan-out.
-						if (Date.now() > deadlineMs) return;
+						if (this.fokosNow() > deadlineMs) return;
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCommit(pCtx, {
 							transactionId,
 							transactionTimestamp: stateRow.transaction_ts,
@@ -1049,7 +1057,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
-		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : Date.now() + requestBudgetMs;
+		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : this.fokosNow() + requestBudgetMs;
 
 		// Cancel any participant not yet committed and not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
@@ -1071,7 +1079,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
 						// the transaction stays in CANCELLING, and the alarm finishes the fan-out. The
 						// caller still receives the cancelled outcome, which applied nothing anywhere.
-						if (Date.now() > deadlineMs) return;
+						if (this.fokosNow() > deadlineMs) return;
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCancel(pCtx, {
 							transactionId,
 							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
@@ -1148,7 +1156,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
-		const heldTooLong = Date.now() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
+		const heldTooLong = this.fokosNow() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
 
 		if (allAccepted) {
 			this.transition(idempotencyToken, () => {
@@ -1172,7 +1180,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * non-terminal transaction remains, one stale threshold from now.
 	 */
 	private async recoverStaleTransactions(): Promise<number | null> {
-		const recoveryStartedAt = Date.now();
+		const recoveryStartedAt = this.fokosNow();
 		const rows = this.ctx.storage.sql
 			.exec<{
 				idempotency_token: string;
@@ -1189,7 +1197,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		// FIXME: drive these transactions concurrently with a bounded fan-out.
 		for (const row of rows) {
-			if (Date.now() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) break;
+			if (this.fokosNow() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) break;
 			try {
 				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state);
 			} catch (e) {
@@ -1208,7 +1216,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					`SELECT 1 AS found FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`,
 				),
 			) !== undefined;
-		return hasNonTerminalRows ? Date.now() + STALE_THRESHOLD_MS : null;
+		return hasNonTerminalRows ? this.fokosNow() + STALE_THRESHOLD_MS : null;
 	}
 
 	/** Drives one non-terminal transaction from its stored state, with the full retry budget. */
@@ -1236,7 +1244,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * gives the next expiry.
 	 */
 	private sweepExpiredTransactions(): number | null {
-		const cutoff = Date.now() - IDEMPOTENCY_WINDOW_MS;
+		const cutoff = this.fokosNow() - IDEMPOTENCY_WINDOW_MS;
 		const expiredBatch = this.ctx.storage.sql
 			.exec<{
 				transaction_id: string;
@@ -1262,7 +1270,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const hasExpiredRows =
 			tryOne(this.ctx.storage.sql.exec<{ found: number }>(`SELECT 1 AS found FROM tc_state WHERE completed_at < ? LIMIT 1`, cutoff)) !==
 			undefined;
-		return hasExpiredRows ? Date.now() : null;
+		return hasExpiredRows ? this.fokosNow() : null;
 	}
 
 	private earliestCompletedAt(): number | null {
@@ -1293,7 +1301,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				error: String(e),
 			});
-			await this.fokos.scheduleJob(JOB_TX_RECOVERY, Date.now());
+			await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
 		}
 		return { state: "driving" };
 	}
@@ -1349,7 +1357,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private applyMigrationPage(page: MigratedTransaction[]): void {
 		const sql = this.ctx.storage.sql;
 		if (page.some((tx) => tx.state.completed_at === null) && this.ctx.storage.kv.get(RECOVERY_DUE_KEY) === undefined) {
-			this.ctx.storage.kv.put(RECOVERY_DUE_KEY, Date.now());
+			this.ctx.storage.kv.put(RECOVERY_DUE_KEY, this.fokosNow());
 		}
 		for (const { state, items, participants, results } of page) {
 			sql.exec(

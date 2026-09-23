@@ -269,7 +269,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
-		this.#participant = new TransactionParticipant({ store: this.#store });
+		this.#participant = new TransactionParticipant({ store: this.#store, now: () => this.fokosNow() });
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
 			canSweep: () => this.canSweepLocally(),
@@ -424,6 +424,14 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 
 	/**
+	 * The clock of the transaction locks and of the stale transaction recovery, in milliseconds. Read at
+	 * each use, so a test can replace it on one instance and avoid global mocks.
+	 */
+	fokosNow(): number {
+		return Date.now();
+	}
+
+	/**
 	 * Overrideable method to get the location info.
 	 */
 	async fokosGetColoInfo(): Promise<ColoInfo> {
@@ -509,7 +517,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
-						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: Date.now() + this.fokosStaleTransactionMs() }] });
+						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.fokosNow() + this.fokosStaleTransactionMs() }] });
 					}
 					return response;
 				},
@@ -999,7 +1007,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 						continue;
 					}
 
-					const now = Date.now();
+					const now = this.fokosNow();
 					const lockCreatedAt = Math.min(...pendingRows.map((pending) => pending.created_at));
 					const lockAgeMs = now - lockCreatedAt;
 					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
