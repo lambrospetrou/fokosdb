@@ -14,7 +14,9 @@
 - (video) [How to write your own Deterministic Simulator](https://www.youtube.com/watch?v=JoYjji1DZCE)
 - (video) [Testing Distributed Systems w/ Deterministic Simulation by Will Wilson](https://www.youtube.com/watch?v=4fFDFbi3toc)
 
-## Chaos and fault injection
+## Property based testing and Chaos fault injection
+
+- https://fizzbee.io/testing/ - With Model-based testing (MBT), instead of writing tests, you define how your system should behave. FizzBee then generates and runs lots and lots of scenarios, automatically checking your implementation against the model. It’s like property-based testing for stateful, concurrent systems.
 
 - Custom RPC / Durable Object fault injection proxy.
 
