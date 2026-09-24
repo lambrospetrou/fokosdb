@@ -1,12 +1,14 @@
 import { env, runInDurableObject, SELF } from "cloudflare:test";
-import type { CounterPartitionDO } from "../counter-host.js";
+import type { CounterPartitionDO } from "../src/demo2/counter-host.js";
 import { describe, expect, it } from "vitest";
+
+const TOKEN_HEADER = { "x-fokos-secret-token": "test-token" };
 
 /** Runs one control-panel action, as a button of the UI does. */
 async function post(tile: string, action: string, body: object = {}): Promise<any> {
-	const res = await SELF.fetch(`https://example.com/api/${tile}/${action}`, {
+	const res = await SELF.fetch(`https://example.com/api/demo2/${tile}/${action}`, {
 		method: "POST",
-		headers: { "content-type": "application/json" },
+		headers: { ...TOKEN_HEADER, "content-type": "application/json" },
 		body: JSON.stringify(body),
 	});
 	expect(res.status).toBe(200);
@@ -14,7 +16,7 @@ async function post(tile: string, action: string, body: object = {}): Promise<an
 }
 
 async function topology(tile = "demo1"): Promise<any> {
-	const res = await SELF.fetch(`https://example.com/api/${tile}/topology`);
+	const res = await SELF.fetch(`https://example.com/api/demo2/${tile}/topology`, { headers: TOKEN_HEADER });
 	expect(res.status).toBe(200);
 	return res.json();
 }
@@ -34,10 +36,9 @@ async function waitForTopology(tile: string, done: (t: any) => boolean): Promise
 	throw new Error(`the topology did not settle: ${JSON.stringify(top.summary)} ${JSON.stringify(top.reconciliation)}`);
 }
 
-it("responds to /api/health", async () => {
-	const res = await SELF.fetch("https://example.com/api/health");
-	expect(res.status).toBe(200);
-	expect(await res.json()).toEqual({ status: "ok" });
+it("rejects a demo request with no token", async () => {
+	const res = await SELF.fetch("https://example.com/api/demo2/demo1/topology");
+	expect(res.status).toBe(401);
 });
 
 describe("Demo 1: counter host", () => {
@@ -198,22 +199,5 @@ describe("Demo 2: search host", () => {
 		const res = await post("demo2", "search", { tenant: "beta", query: "failover AND" });
 		expect(res.success).toBe(false);
 		expect(res.error).toMatch(/syntax error/);
-	});
-});
-
-describe("Demo 3: FokosDB table", () => {
-	it("draws the root partitions and writes and reads an item", async () => {
-		const top = await topology("demo3");
-		expect(top.roots.length).toBe(2);
-
-		const put = await post("demo3", "put-item", { hashKey: "user#1", sortKey: "profile", data: "test data" });
-		expect(put.trace.forwardCount).toBe(0);
-
-		const get = await post("demo3", "get-item", { hashKey: "user#1", sortKey: "profile" });
-		expect(get.result.found).toBe(true);
-		expect(get.result.item.data).toBe("test data");
-
-		const seed = await post("demo3", "seed", { count: 4 });
-		expect(seed.result.seeded).toBe(4);
 	});
 });

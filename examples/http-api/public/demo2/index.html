@@ -42,6 +42,12 @@
 				font-size: 0.85rem;
 				margin: 0;
 			}
+			.tile-nav input {
+				width: 12rem;
+				margin: 0;
+				padding: 0.4rem 0.6rem;
+				font-size: 0.85rem;
+			}
 			.tile-nav button.active {
 				background: var(--pico-primary);
 				color: var(--pico-primary-inverse);
@@ -173,6 +179,10 @@
 				margin: 0;
 				padding: 0.5rem 0.8rem;
 				font-size: 0.85rem;
+			}
+			.tile-keys {
+				font-size: 0.85rem;
+				color: var(--pico-muted-color);
 			}
 			.stats-grid {
 				display: grid;
@@ -361,23 +371,25 @@
 					id: "demo1",
 					name: "Demo 1: Request Volume Split",
 					desc: "A hash-only host. A partition splits after 5 writes. A kill crashes the partition that splits, and the migration continues by itself.",
+					keys: "The hash key is one of 32 counter names (counter-0 to counter-31), and there is no sort key.",
 				},
 				{
 					id: "demo2",
 					name: "Demo 2: Multi-Tenant FTS5",
 					desc: "Tenants share one hash partition. A large tenant is promoted to its own range tree, which splits by date.",
-				},
-				{
-					id: "demo3",
-					name: "Demo 3: FokosDB Topology",
-					desc: "The PartitionDO topology of a real FokosDB table.",
+					keys: "The hash key is the tenant (acme or beta), and the sort key is <date>#<id>, for example 2026-03-14#a1b2c3d4.",
 				},
 			];
 
 			// ── State ─────────────────────────────────────────────────────────────────────
-			// The URL hash (#demo1, #demo2, #demo3) names the active tile, so a shared link or a refresh opens the same tile.
+			// The URL hash (#demo1, #demo2) names the active tile, so a shared link or a refresh opens the same tile.
 			const tileFromHash = () => TILES.find((t) => `#${t.id}` === location.hash)?.id ?? TILES[0].id;
 			const activeTile = signal(tileFromHash());
+			// The API needs the secret token. The /demo/ page keeps it in the same localStorage key.
+			const secretToken = signal(localStorage.getItem("fokos-secret-token") ?? "");
+			effect(() => {
+				localStorage.setItem("fokos-secret-token", secretToken.value);
+			});
 			window.addEventListener("hashchange", () => (activeTile.value = tileFromHash()));
 			const topologyData = signal(null);
 			const isLoading = signal(false);
@@ -397,7 +409,9 @@
 			// ── Topology polling ──────────────────────────────────────────────────────────
 			async function fetchTopology() {
 				try {
-					const res = await fetch(`/api/${activeTile.value}/topology`);
+					const res = await fetch(`/api/demo2/${activeTile.value}/topology`, {
+						headers: { "x-fokos-secret-token": secretToken.value },
+					});
 					if (!res.ok) throw new Error(`HTTP ${res.status}`);
 					const data = await res.json();
 					topologyData.value = data;
@@ -425,9 +439,9 @@
 				isLoading.value = true;
 				searchResult.value = null;
 				try {
-					const res = await fetch(`/api/${activeTile.value}/${action}`, {
+					const res = await fetch(`/api/demo2/${activeTile.value}/${action}`, {
 						method: "POST",
-						headers: { "content-type": "application/json" },
+						headers: { "content-type": "application/json", "x-fokos-secret-token": secretToken.value },
 						body: JSON.stringify(payload),
 					});
 					const json = await res.json();
@@ -755,6 +769,7 @@
 				return html`
 					<div class="control-card">
 						<h3>${tile.name}</h3>
+						${tile.keys && html`<p class="tile-keys">${tile.keys}</p>`}
 						<p>${tile.desc}</p>
 
 						<div class="stats-grid">
@@ -772,7 +787,7 @@
 							</div>
 							<div class="stat-item">
 								<small>State</small>
-								<strong>${summary?.routerCount ? "Split / Routed" : "Single Root"}</strong>
+								<strong>${summary?.routerCount ? "Splitted" : "Single Root"}</strong>
 							</div>
 						</div>
 
@@ -839,26 +854,6 @@
 								splits by document date. A date window is a sort-key range, so a search visits only the partitions of that window.
 							</small>
 						`}
-						${id === "demo3" &&
-						html`
-							<div class="btn-row">
-								<button
-									class="primary"
-									disabled=${isLoading.value}
-									onClick=${() =>
-										executeAction("put-item", { hashKey: `user#${Math.floor(Math.random() * 30)}`, sortKey: "profile", data: "live demo" })}
-								>
-									💾 FokosDB putItem
-								</button>
-								<button disabled=${isLoading.value} onClick=${() => executeAction("get-item", { hashKey: "user#1", sortKey: "profile" })}>
-									🔎 FokosDB getItem
-								</button>
-								<button class="secondary" disabled=${isLoading.value} onClick=${() => executeAction("seed", { count: 8 })}>
-									🌱 Pre-seed Shard Group
-								</button>
-								<button class="outline" disabled=${isLoading.value} onClick=${() => executeAction("reset")}>↺ Reset FokosDB Table</button>
-							</div>
-						`}
 
 						<!-- Activity log -->
 						<div style="margin-top: 1rem;">
@@ -905,6 +900,13 @@
 										</button>
 									`,
 								)}
+								<input
+									type="password"
+									placeholder="x-fokos-secret-token"
+									aria-label="Secret token"
+									value=${secretToken.value}
+									onInput=${(e) => (secretToken.value = e.target.value)}
+								/>
 							</div>
 						</header>
 

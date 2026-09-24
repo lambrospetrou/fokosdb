@@ -5,7 +5,7 @@
 {
 	"$schema": "../../node_modules/wrangler/config-schema.json",
 	"name": "fokos-svc-alpha",
-	"main": "index.ts",
+	"main": "src/index.ts",
 	"compatibility_date": "2026-05-23",
 	"assets": {
 		"directory": "./public/",
@@ -16,6 +16,10 @@
 		{
 			"new_sqlite_classes": ["PartitionDO", "TransactionCoordinatorDO", "CustomPartitionDO"],
 			"tag": "v1",
+		},
+		{
+			"new_sqlite_classes": ["CounterPartitionDO", "SearchPartitionDO"],
+			"tag": "v2",
 		},
 	],
 	"durable_objects": {
@@ -31,6 +35,14 @@
 			{
 				"class_name": "CustomPartitionDO",
 				"name": "CUSTOM_PARTITION_DO",
+			},
+			{
+				"class_name": "CounterPartitionDO",
+				"name": "COUNTER_PARTITION_DO",
+			},
+			{
+				"class_name": "SearchPartitionDO",
+				"name": "SEARCH_PARTITION_DO",
 			},
 		],
 	},

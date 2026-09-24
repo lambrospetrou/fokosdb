@@ -31,9 +31,15 @@ published range:
 }
 ```
 
+## Source layout
+
+`src/index.ts` is the Worker entry. It holds the error handler and the middleware, and it mounts one
+route module for each top-level path under `/api`. `src/<path>/` holds the code of `/api/<path>`.
+`src/shared.ts` holds the table setup that `rpc` and `databases` both use.
+
 ## Durable Objects
 
-`index.ts` re-exports the classes because wrangler resolves bindings against the Worker's own entry
+`src/index.ts` re-exports the classes because wrangler resolves bindings against the Worker's own entry
 module:
 
 ```ts
@@ -44,6 +50,9 @@ export { PartitionDO, TransactionCoordinatorDO } from "fokosdb/server";
 carries its own binding and its own entry in the `new_sqlite_classes` migration, exactly as any
 subclass must.
 
+`CounterPartitionDO` and `SearchPartitionDO` are the two custom hosts of `FokosShardingRuntime` that
+the sharding demo uses. `src/demo2/` holds them.
+
 ## HTTP surface
 
 | Method   | Path                             | Purpose                                                                                    |
@@ -51,6 +60,11 @@ subclass must.
 | `GET`    | `/api/hello/:name`               | Health check behind the auth middleware                                                    |
 | `POST`   | `/api/rpc/:tableName/:rpcAction` | `putItem`, `getItem`, `deleteItem`, `queryItems`, `transactWriteItems`, `transactGetItems` |
 | `DELETE` | `/api/databases/:tableName`      | Destroy every partition of a table                                                         |
+| `GET`    | `/api/demo2/:demo/topology`      | The partition tree of one sharding demo (`demo1` or `demo2`)                               |
+| `POST`   | `/api/demo2/:demo/:action`       | One control-panel action of one sharding demo                                              |
+
+`public/demo/` and `public/demo2/` are the two demo UIs. Wrangler serves them as static assets at
+`/demo/` and `/demo2/`.
 
 Every request needs an `x-fokos-secret-token` header matching one of `FOKOS_API_TOKENS`.
 
