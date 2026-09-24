@@ -103,7 +103,6 @@ searchRoutes.post("/search", async (c) => {
 });
 
 searchRoutes.post("/reset", async (c) => {
-	// Read the tree first, because a reset parent forgets its children.
-	await resetTree(await collectSearchTree(c.env), (doName) => stub(c.env, doName).resetAll());
+	await resetTree(router, (doName) => stub(c.env, doName));
 	return c.json({ success: true });
 });

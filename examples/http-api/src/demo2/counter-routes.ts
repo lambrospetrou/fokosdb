@@ -94,7 +94,6 @@ counterRoutes.post("/kill", async (c) => {
 });
 
 counterRoutes.post("/reset", async (c) => {
-	// Read the tree first, because a reset parent forgets its children.
-	await resetTree(await collectCounterTree(c.env), (doName) => stub(c.env, doName).resetAll());
+	await resetTree(router, (doName) => stub(c.env, doName));
 	return c.json({ success: true });
 });

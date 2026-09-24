@@ -1,5 +1,6 @@
 import type { Context } from "hono";
-import type { FokosPartitionRef, FokosPublicRouting } from "fokosdb/sharding";
+import type { FokosPartitionRef, FokosPublicRouting, FokosRouter, FokosWalkStub } from "fokosdb/sharding";
+import { RESET_ABORT_MESSAGE } from "./sharded-do.js";
 
 /** The types and helpers that the three demos share. The UI reads the types as JSON. */
 
@@ -83,12 +84,25 @@ export function topologyOf<S extends { children: FokosPartitionRef[] }>(
 }
 
 /**
- * Resets each partition in the list, parents first. When a split source is still alive, it can
- * initialize a child again after the reset of that child. `ctx.abort()` ends each reset call with
- * an error, so the error means success.
+ * Resets every partition of the tree, in the same order as `FokosDB.destroy()`. The walk fences each
+ * partition, reads its children from its storage, and resets the children before the parent. Thus a
+ * reset that stops halfway can run again, because each parent that remains still knows its children.
+ * `resetAll` ends each call with the abort error. Every other error stops the reset.
  */
-export async function resetTree<S>(nodes: TreeNode<S>[], reset: (doName: string) => Promise<void>): Promise<void> {
-	for (const node of nodes) await reset(node.ref.doName).catch(() => {});
+export async function resetTree<TPolicy, S extends FokosWalkStub & { resetAll(): Promise<void> }>(
+	router: FokosRouter<TPolicy>,
+	stub: (doName: string) => S,
+): Promise<void> {
+	await router.walk(
+		(_ctx, doName) => stub(doName),
+		async (_ctx, s) => {
+			try {
+				await s.resetAll();
+			} catch (e) {
+				if (!String(e).includes(RESET_ABORT_MESSAGE)) throw e;
+			}
+		},
+	);
 }
 
 /** How long a write waits for an import. It must be longer than the 5-second fallback alarm of the runtime. */
