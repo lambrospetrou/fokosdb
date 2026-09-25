@@ -1,4 +1,5 @@
-import { env, runInDurableObject, SELF } from "cloudflare:test";
+import { runInDurableObject } from "cloudflare:test";
+import { env, exports } from "cloudflare:workers";
 import type { CounterPartitionDO } from "../src/demo2/counter-host.js";
 import { describe, expect, it } from "vitest";
 
@@ -6,7 +7,7 @@ const TOKEN_HEADER = { "x-fokos-secret-token": "test-token" };
 
 /** Runs one control-panel action, as a button of the UI does. */
 async function post(tile: string, action: string, body: object = {}): Promise<any> {
-	const res = await SELF.fetch(`https://example.com/api/demo2/${tile}/${action}`, {
+	const res = await exports.default.fetch(`https://example.com/api/demo2/${tile}/${action}`, {
 		method: "POST",
 		headers: { ...TOKEN_HEADER, "content-type": "application/json" },
 		body: JSON.stringify(body),
@@ -16,7 +17,7 @@ async function post(tile: string, action: string, body: object = {}): Promise<an
 }
 
 async function topology(tile = "demo1"): Promise<any> {
-	const res = await SELF.fetch(`https://example.com/api/demo2/${tile}/topology`, { headers: TOKEN_HEADER });
+	const res = await exports.default.fetch(`https://example.com/api/demo2/${tile}/topology`, { headers: TOKEN_HEADER });
 	expect(res.status).toBe(200);
 	return res.json();
 }
@@ -37,7 +38,7 @@ async function waitForTopology(tile: string, done: (t: any) => boolean): Promise
 }
 
 it("rejects a demo request with no token", async () => {
-	const res = await SELF.fetch("https://example.com/api/demo2/demo1/topology");
+	const res = await exports.default.fetch("https://example.com/api/demo2/demo1/topology");
 	expect(res.status).toBe(401);
 });
 
