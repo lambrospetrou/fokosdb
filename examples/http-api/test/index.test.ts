@@ -1,4 +1,4 @@
-import { SELF } from "cloudflare:test";
+import { exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 
 // These requests go through the worker's default export, so they exercise the built `dist/` output
@@ -9,7 +9,7 @@ const TOKEN = "test-token";
 const headers = { "x-fokos-secret-token": TOKEN, "content-type": "application/json" };
 
 async function rpc(table: string, action: string, body: unknown): Promise<Response> {
-	return await SELF.fetch(`https://example.com/api/rpc/${table}/${action}`, {
+	return await exports.default.fetch(`https://example.com/api/rpc/${table}/${action}`, {
 		method: "POST",
 		headers,
 		body: JSON.stringify(body),
@@ -18,12 +18,12 @@ async function rpc(table: string, action: string, body: unknown): Promise<Respon
 
 describe("http-api example worker", () => {
 	it("rejects a request with no token", async () => {
-		const res = await SELF.fetch("https://example.com/api/hello/world");
+		const res = await exports.default.fetch("https://example.com/api/hello/world");
 		expect(res.status).toBe(401);
 	});
 
 	it("serves an authenticated route", async () => {
-		const res = await SELF.fetch("https://example.com/api/hello/world", { headers });
+		const res = await exports.default.fetch("https://example.com/api/hello/world", { headers });
 		expect(res.status).toBe(200);
 		expect(await res.json()).toEqual({ message: "Hello, world!" });
 	});

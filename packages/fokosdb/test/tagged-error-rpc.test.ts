@@ -125,14 +125,20 @@ describe("a FokosError across an RPC hop", () => {
 });
 
 describe("a foreign error across an RPC hop", () => {
-	// The runtime adds `remote: true` to an error that crossed a hop.
+	// The runtime adds `remote: true` to an error that crossed a hop, and `durableObjectId` when a
+	// Durable Object raised it.
 	it("keeps the runtime markers as own properties, and wrap moves them into attributes", async () => {
 		const raw = await catchOverRpc("foreign", (s) => s.raiseForeign());
 		expect(FokosError.is(raw)).toBe(false);
 
 		const err = FokosError.wrap(raw);
 		expect([err.code, err.origin, err.httpStatusHint]).toEqual(["foreign_error", "service", 503]);
-		expect(err.attributes).toEqual({ retryable: true, overloaded: false, remote: true });
+		expect(err.attributes).toEqual({
+			retryable: true,
+			overloaded: false,
+			remote: true,
+			durableObjectId: expect.stringMatching(/^[0-9a-f]{64}$/),
+		});
 		expect(err.cause).toBe(raw);
 	});
 });

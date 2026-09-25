@@ -100,7 +100,7 @@ Apply a terminal outcome through `this.fokos.dispatch("txCommit" | "txCancel", t
 
 ## Testing
 
-Tests run in the real Workers runtime through `@cloudflare/vitest-pool-workers`. Each suite makes its own namespace with a `crypto.randomUUID()` prefix.
+Tests run in the real Workers runtime through `@cloudflare/vitest-plugin`. Each suite makes its own namespace with a `crypto.randomUUID()` prefix.
 
 - `test/partition-do/` holds one file per `PartitionDO` behaviour, `test/transactions/` the transaction suites, and `test/repartition/` the repartition flows.
 - Use `makeStub` (`test/partition-do/helpers.ts`) for an ordinary test. Use `TestPartition` (`partition-harness.ts`) only when the test drives a split, a migration, or a promotion, with `triggerHashSplit`, `triggerRangeSplit`, `splitHash`, `splitRange`, `makeRangeRoot`, `runAlarm` and `drainUntil`.

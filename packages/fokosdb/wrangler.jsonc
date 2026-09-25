@@ -2,7 +2,7 @@
  * Wrangler configuration for library development and tests.
  *
  * This worker is never deployed. It exists so that `vitest` (via
- * @cloudflare/vitest-pool-workers) and `wrangler types` have an entrypoint that
+ * @cloudflare/vitest-plugin) and `wrangler types` have an entrypoint that
  * exports the library Durable Objects. The deployable example worker has its own
  * configuration in examples/http-api/wrangler.jsonc.
  */

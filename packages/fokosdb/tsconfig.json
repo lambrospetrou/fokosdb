@@ -39,7 +39,7 @@
 		"types": [
 			"./worker-configuration.d.ts",
 			"node",
-			"@cloudflare/vitest-pool-workers/types" // provides `cloudflare:test` and `cloudflare:workers` types
+			"@cloudflare/vitest-plugin/types" // provides `cloudflare:test` and `cloudflare:workers` types
 		]
 	},
 	// output of `wrangler types`
