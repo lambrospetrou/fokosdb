@@ -29,8 +29,7 @@ function makeDB(tableName: string) {
 	});
 }
 
-// FIXME: Skipped because the vitest integration hangs forever after a destroy() call, even though the test completes.
-describe.skip("FokosDB.destroy()", () => {
+describe("FokosDB.destroy()", () => {
 	it("destroys all partitions in DFS postfix order, including children created by splits", async ({ expect }) => {
 		const tableName = `destroytest.${crypto.randomUUID().replaceAll("-", "")}`;
 		const db = makeDB(tableName);
@@ -58,7 +57,6 @@ describe.skip("FokosDB.destroy()", () => {
 			await runDurableObjectAlarm(testPartitionStub(doName));
 		}
 
-		// Destroy twice: the second call must be a no-op on an already-destroyed database.
 		await expect(db.destroy()).resolves.toEqual({ ok: true });
 
 		console.log("BOOM 💥 — verifying all partitions were destroyed in DFS postfix order", {
