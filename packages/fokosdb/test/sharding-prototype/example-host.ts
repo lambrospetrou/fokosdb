@@ -76,7 +76,7 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 		return {
 			put: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				key: (req) => req,
 				local: (req, call) => {
 					sql.exec("INSERT OR REPLACE INTO docs (hk, sk, body) VALUES (?, ?, ?)", req.hashKey, req.sortKey, req.body);

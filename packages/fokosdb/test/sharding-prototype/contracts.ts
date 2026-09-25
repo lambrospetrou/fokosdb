@@ -29,13 +29,13 @@ type Ops = { echo: { req: { n: number }; res: { n: number } } };
 
 const wrongResult: FokosOperations<Ops> = {
 	// @ts-expect-error `local` must return the response of the spec
-	echo: { shape: "point", whileMigrating: "retry", key: () => todo("key"), local: (req) => ({ text: String(req.n) }) },
+	echo: { shape: "point", whileMigrating: "throw", key: () => todo("key"), local: (req) => ({ text: String(req.n) }) },
 };
 
 // @ts-expect-error a range operation is read-through only
 const rangeMustReadSource: FokosOperation<{ n: number }, { n: number }> = {
 	shape: "range",
-	whileMigrating: "retry",
+	whileMigrating: "throw",
 	readOnly: true,
 	range: () => todo("range"),
 	clip: (req) => req,

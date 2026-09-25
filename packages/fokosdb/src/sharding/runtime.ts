@@ -227,7 +227,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	async #dispatch(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
 		if (descriptor.shape === "local") {
-			if (descriptor.whileMigrating === "retry" && this.#target.isImporting()) {
+			if (descriptor.whileMigrating === "throw" && this.#target.isImporting()) {
 				// The same gate the other shapes take, under the name of this operation: the request nudges
 				// the import on before it is refused.
 				this.#scheduler.wake();
@@ -266,10 +266,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	async #whileImporting(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
 		this.#scheduler.wake();
 		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
-		// `dispatch` gates a `local` operation with `whileMigrating: "retry"` before this point and runs
+		// `dispatch` gates a `local` operation with `whileMigrating: "throw"` before this point and runs
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");
-		if (descriptor.whileMigrating === "retry") {
+		if (descriptor.whileMigrating === "throw") {
 			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
 				message: "partition split in progress, please retry later",
 				attributes: { operation: op },

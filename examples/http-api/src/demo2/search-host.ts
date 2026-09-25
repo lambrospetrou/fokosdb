@@ -162,7 +162,7 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 		return {
 			addDoc: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req, call) => {
 					const tenant = KeyCodec.decode(req.hashKey) as string;

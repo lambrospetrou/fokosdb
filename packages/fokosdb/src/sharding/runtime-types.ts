@@ -160,12 +160,14 @@ export type FokosSignals = {
  */
 export type FokosLocalCall = { signal(signals: FokosSignals): void };
 
+export type FokosOperationWhileMigrating = "throw" | "read_source";
+
 export type FokosOperationBase<Req, Res> = {
 	/**
-	 * "retry": while this partition imports, throw `partition_migrating`.
+	 * "throw": while this partition imports, throw `partition_migrating`.
 	 * "read_source": while this partition imports, run the same operation on the source partition.
 	 */
-	whileMigrating: "retry" | "read_source";
+	whileMigrating: FokosOperationWhileMigrating;
 	/** The operation never writes partitioned data. Required for `whileMigrating: "read_source"`. */
 	readOnly?: boolean;
 	/** Opaque to the runtime. Passed to `hooks.admit`. */
@@ -211,7 +213,7 @@ export type FokosOperation<Req, Res> =
 	  })
 	| (FokosOperationBase<Req, Res> & {
 			shape: "range";
-			whileMigrating: "read_source";
+			whileMigrating: Extract<FokosOperationWhileMigrating, "read_source">;
 			readOnly: true;
 			range(req: Req): FokosRangeInput;
 			/** Restricts the request to one planned visit. */
@@ -244,10 +246,10 @@ export type FokosOperation<Req, Res> =
 			 */
 			allowedWhileDestroying?: boolean;
 			/**
-			 * "retry": while this partition imports, throw `partition_migrating`. Unset: a `local`
+			 * "throw": while this partition imports, throw `partition_migrating`. Unset: a `local`
 			 * operation runs during an import, which only a handler that touches no imported rows can do.
 			 */
-			whileMigrating?: "retry";
+			whileMigrating?: Extract<FokosOperationWhileMigrating, "throw">;
 	  };
 
 /** The host's own declaration of its operations. Every other signature derives from it. */

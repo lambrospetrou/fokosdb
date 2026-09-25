@@ -225,7 +225,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 	return {
 		apiPutItem: {
 			shape: "point",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "write",
 			key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 			local: (req, call) => {
@@ -238,7 +238,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		apiDeleteItem: {
 			shape: "point",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "ignore_size_reject",
 			key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 			local: (_req, call) => {
@@ -271,7 +271,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txPrepare: {
 			shape: "group",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "write",
 			failurePolicy: "fail_fast",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -287,7 +287,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txCommit: {
 			shape: "group",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "ignore_size_reject",
 			failurePolicy: "attempt_all",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -302,7 +302,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txCancel: {
 			shape: "group",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "ignore_size_reject",
 			failurePolicy: "attempt_all",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -317,7 +317,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txReadForTransaction: {
 			shape: "group",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "read",
 			failurePolicy: "fail_fast",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -327,7 +327,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txReadSnapshot: {
 			shape: "single_owner",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "read",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item) })),
 			notApplicable: { outcome: "not_applicable" },
@@ -340,7 +340,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 		},
 		txExecuteSingleShot: {
 			shape: "single_owner",
-			whileMigrating: "retry",
+			whileMigrating: "throw",
 			admissionTag: "write",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item) })),
 			notApplicable: { outcome: "not_applicable" },

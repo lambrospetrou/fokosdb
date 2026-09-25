@@ -167,7 +167,7 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 		return {
 			increment: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: NO_SORT_KEY }),
 				local: (req, call) => {
 					const key = KeyCodec.decode(req.hashKey) as string;

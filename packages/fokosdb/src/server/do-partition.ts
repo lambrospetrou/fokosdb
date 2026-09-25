@@ -475,14 +475,14 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return {
 			apiPutItem: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "write",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req, call) => this.putItemLocal(req, call),
 			},
 			apiDeleteItem: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "delete",
 				key: (req) => ({ hashKey: req.hashKey, sortKey: req.sortKey }),
 				local: (req) => this.deleteItemLocal(req),
@@ -507,7 +507,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			},
 			txPrepare: {
 				shape: "group",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "write",
 				failurePolicy: "fail_fast",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -528,7 +528,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// `items` and drops the pending row. Size backpressure here would wedge a decided transaction.
 			txCommit: {
 				shape: "group",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "ignore_size_reject",
 				failurePolicy: "attempt_all",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -546,7 +546,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// that brings an over-size partition back under its cap.
 			txCancel: {
 				shape: "group",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "ignore_size_reject",
 				failurePolicy: "attempt_all",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -566,7 +566,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			},
 			txReadForTransaction: {
 				shape: "group",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "read",
 				failurePolicy: "fail_fast",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
@@ -579,7 +579,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// only to detect interleaving ACROSS partitions, and here there is none to detect.
 			txReadSnapshot: {
 				shape: "single_owner",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "read",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item) })),
 				notApplicable: { outcome: "not_applicable" },
@@ -593,7 +593,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			},
 			txExecuteSingleShot: {
 				shape: "single_owner",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				admissionTag: "write",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item) })),
 				notApplicable: { outcome: "not_applicable" },
@@ -607,7 +607,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// Re-enters `dispatch`, so the commit or cancel of each key is applied on its current owner.
 			debugForceResolveTransaction: {
 				shape: "local",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				local: async (req) => {
 					const pendingRows = this.#store.listPendingTxItems(req.transactionId);
 					const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
@@ -626,7 +626,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			},
 			debugForcePromoteKey: {
 				shape: "local",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				local: async (req) => {
 					const result = await this.fokos.requestPromotion(req.hashKey);
 					if (result.queued) return { queued: true, status: promotedKeyStatusOf(result.state) };

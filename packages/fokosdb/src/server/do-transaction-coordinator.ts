@@ -408,7 +408,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return {
 			initiateWrite: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				localMode: "async",
 				admissionTag: "write",
 				key: (req) => tokenKey(req.clientRequestToken),
@@ -416,7 +416,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			},
 			recoverTransaction: {
 				shape: "point",
-				whileMigrating: "retry",
+				whileMigrating: "throw",
 				localMode: "async",
 				key: (req) => tokenKey(req.idempotencyToken),
 				local: async (req) => await this.recoverTransactionLocal(req.transactionId),
