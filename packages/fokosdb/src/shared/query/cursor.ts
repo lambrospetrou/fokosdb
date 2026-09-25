@@ -47,15 +47,16 @@ export function encodeCursor(c: DecodedCursor): string {
 }
 
 export function decodeCursor(s: string): DecodedCursor {
-	let wire: CursorWire;
+	let parsed: unknown;
 	try {
-		wire = JSON.parse(decoder.decode(Uint8Array.fromBase64(s, { alphabet: "base64url" })));
+		parsed = JSON.parse(decoder.decode(Uint8Array.fromBase64(s, { alphabet: "base64url" })));
 	} catch (e) {
 		throw cursorMalformed("cursor is not valid base64url-encoded JSON", e);
 	}
-	if (typeof wire !== "object" || wire === null) {
+	if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
 		throw cursorMalformed("cursor is not valid base64url-encoded JSON");
 	}
+	const wire = parsed as CursorWire;
 	if (wire.v !== CURSOR_VERSION) {
 		throw new FokosValidationError(VALIDATION_CODES.cursor_version_unknown, {
 			message: "unknown cursor version",

@@ -11,6 +11,13 @@ export default defineConfig({
 		"typescript/no-floating-promises": "error",
 		"typescript/no-misused-promises": "error",
 		"typescript/return-await": ["error", "always"],
-		// "typescript/no-unsafe-assignment": "warn",
 	},
+	overrides: [
+		{
+			files: ["src/**/*[!test].ts"],
+			rules: {
+				"typescript/no-unsafe-assignment": "error",
+			},
+		},
+	],
 });

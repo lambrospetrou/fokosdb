@@ -61,6 +61,8 @@ import {
 	txOrderTimestampNow,
 	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
+import { CompiledConditionPlan, CompiledUpdatePlan } from "../shared/expression/plan.js";
+import { parseJSONTrusted } from "../shared/tsutils.js";
 
 type TcStateRow = {
 	transaction_id: string;
@@ -1635,8 +1637,8 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
 		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
 		ttlAt: row.ttl_epoch_utc_seconds ?? undefined,
-		condition: row.conditions_json ? JSON.parse(row.conditions_json) : undefined,
-		update: row.update_json ? JSON.parse(row.update_json) : undefined,
+		condition: row.conditions_json ? parseJSONTrusted<CompiledConditionPlan>(row.conditions_json) : undefined,
+		update: row.update_json ? parseJSONTrusted<CompiledUpdatePlan>(row.update_json) : undefined,
 		returnValuesOnConditionCheckFailure: row.return_values_on_condition_check_failure === 1 ? "all_old" : undefined,
 	}));
 }

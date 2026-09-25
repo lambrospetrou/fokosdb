@@ -66,7 +66,7 @@ export class TtlExpiry {
 						this.arm();
 					}
 				})
-				.catch((error) => {
+				.catch((error: unknown) => {
 					let logParams: Record<string, unknown> = {};
 					try {
 						logParams = this.#logParams();

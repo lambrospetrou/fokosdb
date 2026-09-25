@@ -12,6 +12,7 @@ import type {
 	UpdateAction,
 	UpdateTarget,
 } from "./types.js";
+import { isArray } from "../tsutils.js";
 import { utf8WithinLimit } from "./utf8.js";
 
 class IdentityWriter {
@@ -112,7 +113,7 @@ class IdentityWriter {
 	}
 
 	writeUpdate(update: readonly UpdateAction[]): void {
-		if (!Array.isArray(update) || update.length === 0) {
+		if (!isArray(update) || update.length === 0) {
 			throw new ExpressionError("invalid_ast", "update expression must contain at least one action");
 		}
 		if (update.length > EXPRESSION_LIMITS.updateActions) {
