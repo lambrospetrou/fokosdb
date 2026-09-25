@@ -1,6 +1,5 @@
 import type { Context } from "hono";
-import type { FokosPartitionRef, FokosPublicRouting, FokosRouter, FokosWalkStub } from "fokosdb/sharding";
-import { RESET_ABORT_MESSAGE } from "./sharded-do.js";
+import { isDestroyAbortError, type FokosPartitionRef, type FokosPublicRouting, type FokosRouter, type FokosWalkStub } from "fokosdb/sharding";
 
 /** The types and helpers that the three demos share. The UI reads the types as JSON. */
 
@@ -84,12 +83,12 @@ export function topologyOf<S extends { children: FokosPartitionRef[] }>(
 }
 
 /**
- * Resets every partition of the tree, in the same order as `FokosDB.destroy()`. The walk fences each
- * partition, reads its children from its storage, and resets the children before the parent. Thus a
- * reset that stops halfway can run again, because each parent that remains still knows its children.
- * `resetAll` ends each call with the abort error. Every other error stops the reset.
+ * Destroys every partition of the tree with `fokosDestroy`, in the same order as `FokosDB.destroy()`.
+ * The walk fences each partition, reads its children from its storage, and destroys the children
+ * before the parent. Thus a reset that stops halfway can run again, because each parent that remains
+ * still knows its children. Every error other than the abort error stops the reset.
  */
-export async function resetTree<TPolicy, S extends FokosWalkStub & { resetAll(): Promise<void> }>(
+export async function resetTree<TPolicy, S extends FokosWalkStub & { fokosDestroy(): Promise<void> }>(
 	router: FokosRouter<TPolicy>,
 	stub: (doName: string) => S,
 ): Promise<void> {
@@ -97,9 +96,9 @@ export async function resetTree<TPolicy, S extends FokosWalkStub & { resetAll():
 		(_ctx, doName) => stub(doName),
 		async (_ctx, s) => {
 			try {
-				await s.resetAll();
+				await s.fokosDestroy();
 			} catch (e) {
-				if (!String(e).includes(RESET_ABORT_MESSAGE)) throw e;
+				if (!isDestroyAbortError(e)) throw e;
 			}
 		},
 	);

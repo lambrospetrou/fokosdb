@@ -17,9 +17,6 @@ import type {
 	FokosStatusRequest,
 } from "fokosdb/sharding";
 
-/** The message of the `ctx.abort()` in `resetAll`. The caller sees an error with this text. */
-export const RESET_ABORT_MESSAGE = "demo reset";
-
 /**
  * The base class of a Durable Object that hosts `FokosShardingRuntime`.
  *
@@ -68,18 +65,5 @@ export abstract class ShardedDurableObject<TPolicy, Ops extends FokosOperationSp
 
 	async alarm(info: AlarmInvocationInfo): Promise<void> {
 		return this.fokos.alarm(info);
-	}
-
-	/**
-	 * Demo control. Deletes all storage, then evicts the instance, so the next call starts empty.
-	 * With a compatibility date of 2026-02-24 or later, `deleteAll()` also deletes the alarm.
-	 * `retryAlarm: false` prevents a new run of an alarm that the abort interrupts.
-	 *
-	 * The reset uses this method, not `fokosDestroy`. `fokosDestroy` logs an object before
-	 * `ctx.abort()`, and then the vitest pool for Workers does not exit after the tests.
-	 */
-	async resetAll(): Promise<void> {
-		await this.ctx.storage.deleteAll();
-		this.ctx.abort(RESET_ABORT_MESSAGE, { retryAlarm: false });
 	}
 }
