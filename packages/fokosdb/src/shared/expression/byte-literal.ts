@@ -13,7 +13,9 @@ export type ByteLiteral = {
 const decoded = new WeakMap<object, ByteLiteral>();
 
 export function decodeBase64Bytes(text: unknown): Uint8Array {
-	if (typeof text !== "string") throw new ExpressionError("invalid_literal", "byte literal must be base64 text");
+	if (typeof text !== "string") {
+		throw new ExpressionError("invalid_literal", "byte literal must be base64 text");
+	}
 	if (!utf8WithinLimit(text, EXPRESSION_LIMITS.canonicalPayloadBytes)) {
 		throw new ExpressionError("complexity_limit", "byte literal exceeds the payload limit");
 	}
@@ -23,13 +25,17 @@ export function decodeBase64Bytes(text: unknown): Uint8Array {
 	} catch (error) {
 		throw new ExpressionError("invalid_literal", "byte literal is not valid base64", { cause: error });
 	}
-	if (bytes.byteLength === 0) throw new ExpressionError("invalid_literal", "empty byte literal is not allowed");
+	if (bytes.byteLength === 0) {
+		throw new ExpressionError("invalid_literal", "empty byte literal is not allowed");
+	}
 	return bytes;
 }
 
 export function decodeByteLiteral(node: { b64: unknown }): ByteLiteral {
 	const cached = decoded.get(node);
-	if (cached !== undefined) return cached;
+	if (cached !== undefined) {
+		return cached;
+	}
 	const bytes = decodeBase64Bytes(node.b64);
 	const literal: ByteLiteral = { bytes, canonical: bytes.toBase64() };
 	decoded.set(node, literal);

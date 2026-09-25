@@ -81,7 +81,9 @@ export function evaluateConditionPlan(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) throw error;
+		if (error instanceof ExpressionError) {
+			throw error;
+		}
 		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
 	}
 }
@@ -106,7 +108,9 @@ export function readProjectedItem(
 			sortKey,
 		);
 		const row = tryOne(cursor);
-		if (row === undefined) return { row: undefined, rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
+		if (row === undefined) {
+			return { row: undefined, rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
+		}
 		return {
 			row: {
 				projected: decodeProjectedRow(row, plan.names.length),
@@ -117,7 +121,9 @@ export function readProjectedItem(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) throw error;
+		if (error instanceof ExpressionError) {
+			throw error;
+		}
 		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
 	}
 }
@@ -181,7 +187,9 @@ export function validateQueryPlan(plan: CompiledQueryPlan): void {
 	if (plan.filterSql === null && plan.projection === null) {
 		throw new ExpressionError("runtime_capability", "query plan has neither a filter nor a projection");
 	}
-	if (plan.projection !== null) assertProjectionShape(plan.projection);
+	if (plan.projection !== null) {
+		assertProjectionShape(plan.projection);
+	}
 	const widest = composeQueryStatement(plan, {
 		select: "projection",
 		direction: "desc",
@@ -268,7 +276,9 @@ export function probeUpdatePlan(
 			rowsWritten: cursor.rowsWritten,
 		};
 	} catch (error) {
-		if (error instanceof ExpressionError) throw error;
+		if (error instanceof ExpressionError) {
+			throw error;
+		}
 		throw new ExpressionError("runtime_capability", "Workers SQLite could not evaluate the compiled expression", { cause: error });
 	}
 }

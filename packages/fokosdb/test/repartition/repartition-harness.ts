@@ -121,7 +121,9 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		base,
 		node(ctx) {
 			const existing = nodes.get(ctx.doName);
-			if (existing) return existing;
+			if (existing) {
+				return existing;
+			}
 			const node = makeNode(ctx);
 			nodes.set(ctx.doName, node);
 			return node;
@@ -214,14 +216,20 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
 				beforeCutover: (plan) => plan.kind !== "key_promotion" || store.pendingLockCountForHashKey(promotedKeyOf(plan)) === 0,
 				beforeComplete: (plan) => {
-					if (plan.kind !== "key_promotion") store.deleteAllPendingTx();
+					if (plan.kind !== "key_promotion") {
+						store.deleteAllPendingTx();
+					}
 				},
 				cleanupSourceStep: (plan) => {
-					if (plan.kind !== "key_promotion") return true;
+					if (plan.kind !== "key_promotion") {
+						return true;
+					}
 					const hashKey = promotedKeyOf(plan);
 					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
 					store.deletePendingTxForHashKey(hashKey);
-					if (store.hasItemsForHashKey(hashKey)) return false;
+					if (store.hasItemsForHashKey(hashKey)) {
+						return false;
+					}
 					store.deleteKeySizeEstimate(hashKey);
 					return true;
 				},

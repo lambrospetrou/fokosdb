@@ -32,7 +32,9 @@ class IdentityWriter {
 	}
 
 	writeValue(value: ExpressionValue): void {
-		if (typeof value !== "object" || value === null) throw new ExpressionError("invalid_ast", "invalid expression value");
+		if (typeof value !== "object" || value === null) {
+			throw new ExpressionError("invalid_ast", "invalid expression value");
+		}
 		if ("val" in value) {
 			this.#out += '{"val":';
 			this.#writeScalar(value.val);
@@ -47,10 +49,14 @@ class IdentityWriter {
 			this.#writeReference(value);
 			return;
 		}
-		if (!("fn" in value) || !Array.isArray(value.args)) throw new ExpressionError("invalid_ast", "invalid expression value");
+		if (!("fn" in value) || !Array.isArray(value.args)) {
+			throw new ExpressionError("invalid_ast", "invalid expression value");
+		}
 		this.#out += `{"fn":${JSON.stringify(value.fn)},"args":[`;
 		for (let i = 0; i < value.args.length; i++) {
-			if (i > 0) this.#out += ",";
+			if (i > 0) {
+				this.#out += ",";
+			}
 			this.writeValue(value.args[i]);
 		}
 		this.#out += "]}";
@@ -60,9 +66,14 @@ class IdentityWriter {
 		this.#out += `{"op":${JSON.stringify(condition.op)},"args":[`;
 		const nestedConditions = condition.op === "and" || condition.op === "or" || condition.op === "not";
 		for (let i = 0; i < condition.args.length; i++) {
-			if (i > 0) this.#out += ",";
-			if (nestedConditions) this.writeCondition(condition.args[i] as ConditionExpression);
-			else this.writeValue(condition.args[i] as ExpressionValue);
+			if (i > 0) {
+				this.#out += ",";
+			}
+			if (nestedConditions) {
+				this.writeCondition(condition.args[i] as ConditionExpression);
+			} else {
+				this.writeValue(condition.args[i] as ExpressionValue);
+			}
 		}
 		this.#out += "]}";
 	}
@@ -71,10 +82,14 @@ class IdentityWriter {
 		this.#out += "[";
 		for (let i = 0; i < projection.length; i++) {
 			const entry = projection[i];
-			if (i > 0) this.#out += ",";
+			if (i > 0) {
+				this.#out += ",";
+			}
 			this.#out += '{"expr":';
 			this.writeValue(entry.expr);
-			if (entry.as !== undefined) this.#out += `,"as":${JSON.stringify(entry.as)}`;
+			if (entry.as !== undefined) {
+				this.#out += `,"as":${JSON.stringify(entry.as)}`;
+			}
 			this.#out += "}";
 		}
 		this.#out += "]";
@@ -85,10 +100,14 @@ class IdentityWriter {
 			throw new ExpressionError("invalid_ast", "invalid update target");
 		}
 		for (const field in target) {
-			if (field !== "ref" && field !== "path") throw new ExpressionError("invalid_ast", "invalid update target fields");
+			if (field !== "ref" && field !== "path") {
+				throw new ExpressionError("invalid_ast", "invalid update target fields");
+			}
 		}
 		const segments = validateWriteJsonPath(target.path, { allowAppend });
-		if (segments.length === 0) throw new ExpressionError("invalid_path", "target path must not be root");
+		if (segments.length === 0) {
+			throw new ExpressionError("invalid_path", "target path must not be root");
+		}
 		this.#out += `{"ref":"data","path":${JSON.stringify(target.path)}}`;
 	}
 
@@ -102,8 +121,12 @@ class IdentityWriter {
 		this.#out += "[";
 		for (let i = 0; i < update.length; i++) {
 			const action = update[i];
-			if (typeof action !== "object" || action === null) throw new ExpressionError("invalid_ast", "invalid update action");
-			if (i > 0) this.#out += ",";
+			if (typeof action !== "object" || action === null) {
+				throw new ExpressionError("invalid_ast", "invalid update action");
+			}
+			if (i > 0) {
+				this.#out += ",";
+			}
 			if (action.action === "set") {
 				for (const field in action) {
 					if (field !== "action" && field !== "target" && field !== "value") {

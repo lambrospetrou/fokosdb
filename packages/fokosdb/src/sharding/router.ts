@@ -47,7 +47,9 @@ export class FokosRouter<TPolicy> {
 
 	#root(idx: number): FokosRouteContext<TPolicy> {
 		const cached = this.#roots.get(idx);
-		if (cached) return cached;
+		if (cached) {
+			return cached;
+		}
 		const { doName, opaque } = PartitionIdHelper.fromHashIdxs(this.topology.shardGroup, [idx]).encode(true);
 		assertExists(doName);
 		const ctx: FokosRouteContext<TPolicy> = {
@@ -87,7 +89,9 @@ export class FokosRouter<TPolicy> {
 		const visited = new Set<string>();
 
 		const walkPartition = async (ref: FokosPartitionRef, rootContext?: FokosRouteContext<TPolicy>): Promise<void> => {
-			if (visited.has(ref.doName)) return;
+			if (visited.has(ref.doName)) {
+				return;
+			}
 			visited.add(ref.doName);
 			const ctx = rootContext ?? { ...this.#root(0), ...ref };
 			const s = stub(ctx, ref.doName);
@@ -96,7 +100,9 @@ export class FokosRouter<TPolicy> {
 			do {
 				const page = await s.fokosStatus({ cursor, rootContext });
 				for (const entry of page.entries) {
-					if (entry.target) await walkPartition(entry.target.ref);
+					if (entry.target) {
+						await walkPartition(entry.target.ref);
+					}
 				}
 				cursor = page.nextCursor;
 			} while (cursor !== null);

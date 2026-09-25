@@ -16,10 +16,14 @@ export type SkInterval = {
 export function rangeIntersects(childStart: KeyBytes, childEnd: KeyBytes | null, interval: SkInterval): boolean {
 	if (interval.upper !== undefined) {
 		const cmp = KeyCodec.compare(interval.upper.value, childStart);
-		if (cmp < 0 || (cmp === 0 && !interval.upper.inclusive)) return false;
+		if (cmp < 0 || (cmp === 0 && !interval.upper.inclusive)) {
+			return false;
+		}
 	}
 	if (interval.lower !== undefined && childEnd !== null) {
-		if (KeyCodec.compare(interval.lower.value, childEnd) >= 0) return false;
+		if (KeyCodec.compare(interval.lower.value, childEnd) >= 0) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -129,7 +133,9 @@ export function normalizeSkInterval(sort: SortKeyCondition | undefined, encode: 
 		case "between": {
 			const lo = encode(sort.lower);
 			const hi = encode(sort.upper);
-			if (KeyCodec.compare(lo, hi) > 0) return null;
+			if (KeyCodec.compare(lo, hi) > 0) {
+				return null;
+			}
 			return { lower: { value: lo, inclusive: true }, upper: { value: hi, inclusive: true } };
 		}
 		case "begins_with": {
@@ -146,7 +152,9 @@ export function normalizeSkInterval(sort: SortKeyCondition | undefined, encode: 
 			const up = sort.upper ? { value: encode(sort.upper.value), inclusive: sort.upper.inclusive } : undefined;
 			if (lo && up) {
 				const cmp = KeyCodec.compare(lo.value, up.value);
-				if (cmp > 0 || (cmp === 0 && (!lo.inclusive || !up.inclusive))) return null;
+				if (cmp > 0 || (cmp === 0 && (!lo.inclusive || !up.inclusive))) {
+					return null;
+				}
 			}
 			return { lower: lo, upper: up };
 		}

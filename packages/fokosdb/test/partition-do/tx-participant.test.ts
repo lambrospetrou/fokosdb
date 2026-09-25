@@ -282,7 +282,9 @@ describe("PartitionDO — single-shot transaction", () => {
 				items: withOpIndex([{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }]),
 			});
 			expect(res.outcome).toBe("committed");
-			if ((await rpc.status(ctx)).splitStatus) break;
+			if ((await rpc.status(ctx)).splitStatus) {
+				break;
+			}
 		}
 
 		// Only the write paths that call checkSplits can queue a split — the background job runs one
@@ -343,7 +345,9 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 			const transactionTimestamp = Date.now() + i;
 			expect(await rpc.txPrepare(ctx, { transactionId, transactionTimestamp, coordinator, items })).toEqual({ outcome: "accepted" });
 			await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })) });
-			if ((await rpc.status(ctx)).splitStatus) break;
+			if ((await rpc.status(ctx)).splitStatus) {
+				break;
+			}
 		}
 
 		// The background job only RUNS a queued split, so a status here proves commit queued one.
@@ -444,7 +448,9 @@ describe("PartitionDO — single-partition read snapshot", () => {
 					items: withOpIndex(spanning.map((key) => ({ ...key, operation: "put" as const, data: "never", kind: "text" as const }))),
 				}),
 			).toEqual({ outcome: "not_applicable" });
-			for (const key of spanning) expect(await rpc.apiGetItem(ctx, key)).toMatchObject({ found: false });
+			for (const key of spanning) {
+				expect(await rpc.apiGetItem(ctx, key)).toMatchObject({ found: false });
+			}
 		});
 	});
 });

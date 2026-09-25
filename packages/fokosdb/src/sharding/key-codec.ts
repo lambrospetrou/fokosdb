@@ -156,9 +156,13 @@ function publicSuccessor(prefix: string | Uint8Array): string | Uint8Array | und
 	}
 	const codePoints = Array.from(prefix, (c) => c.codePointAt(0)!);
 	for (let i = codePoints.length - 1; i >= 0; i--) {
-		if (codePoints[i] >= 0x10ffff) continue;
+		if (codePoints[i] >= 0x10ffff) {
+			continue;
+		}
 		let next = codePoints[i] + 1;
-		if (next >= 0xd800 && next <= 0xdfff) next = 0xe000;
+		if (next >= 0xd800 && next <= 0xdfff) {
+			next = 0xe000;
+		}
 		return String.fromCodePoint(...codePoints.slice(0, i), next);
 	}
 	return undefined;
@@ -188,8 +192,12 @@ function shortestSeparator(lo: KeyBytes, hi: KeyBytes): KeyBytes {
  * used for comparison or identity — display only. Raw `KeyBytes` must never print as a bare array.
  */
 function keyForLog(k: KeyBytes): string {
-	if (k.length === 0) return "<empty>";
-	if (k[0] === BINARY_TAG) return `b64:${k.toBase64({ alphabet: "base64url" })}`;
+	if (k.length === 0) {
+		return "<empty>";
+	}
+	if (k[0] === BINARY_TAG) {
+		return `b64:${k.toBase64({ alphabet: "base64url" })}`;
+	}
 	try {
 		// fatal:true throws on invalid UTF-8, so the catch falls back to base64 and no U+FFFD reaches a log.
 		// TODO: Return the decoded string directly, if the quoting adds nothing for the reader.

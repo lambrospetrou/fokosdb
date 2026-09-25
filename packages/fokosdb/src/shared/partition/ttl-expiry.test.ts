@@ -85,7 +85,9 @@ describe("TtlExpiry", () => {
 
 	it("applies row and byte sleep budgets through wait", async () => {
 		await withStore(async (store) => {
-			for (let index = 0; index < 3; index++) putExpired(store, `row-${index}`, index + 1);
+			for (let index = 0; index < 3; index++) {
+				putExpired(store, `row-${index}`, index + 1);
+			}
 			const rowWaits: number[] = [];
 			const rowBudget = makeExpiry(store, {
 				config: config({ chunkSize: 1, maxRowsBeforeSleep: 2 }),
@@ -112,7 +114,9 @@ describe("TtlExpiry", () => {
 
 	it("checks sweep permission before the first chunk and between chunks", async () => {
 		await withStore(async (store, state) => {
-			for (let index = 0; index < 3; index++) putExpired(store, `k${index}`, index + 1);
+			for (let index = 0; index < 3; index++) {
+				putExpired(store, `k${index}`, index + 1);
+			}
 			let blockedChecks = 0;
 			const blocked = makeExpiry(store, {
 				canSweep: () => {
@@ -153,7 +157,9 @@ describe("TtlExpiry", () => {
 				config: config({ chunkSize: 1 }),
 				wait: async () => {
 					waitCalls++;
-					if (waitCalls === 1) await gate;
+					if (waitCalls === 1) {
+						await gate;
+					}
 				},
 			});
 
@@ -191,10 +197,14 @@ describe("TtlExpiry", () => {
 			putExpired(store, "kept", 1);
 			const invalid: Array<[keyof TtlSweepConfig, number]> = [];
 			for (const name of ["chunkSize", "maxRowsBeforeSleep", "maxBytesBeforeSleep", "maxRowsPerCycle"] as const) {
-				for (const value of [0, -1, 1.5]) invalid.push([name, value]);
+				for (const value of [0, -1, 1.5]) {
+					invalid.push([name, value]);
+				}
 			}
 			for (const name of ["sleepMs", "initialDelayMs"] as const) {
-				for (const value of [-1, 0.5]) invalid.push([name, value]);
+				for (const value of [-1, 0.5]) {
+					invalid.push([name, value]);
+				}
 			}
 			let checks = 0;
 

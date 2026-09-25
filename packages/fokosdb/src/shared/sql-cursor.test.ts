@@ -3,7 +3,9 @@ import { one, tryOne } from "./sql-cursor.js";
 
 function* rows(values: number[], onStop: () => void): Generator<{ n: number }> {
 	try {
-		for (const n of values) yield { n };
+		for (const n of values) {
+			yield { n };
+		}
 	} finally {
 		onStop();
 	}

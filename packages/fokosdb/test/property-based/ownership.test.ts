@@ -75,7 +75,9 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 describe("Property: belongsToTarget and resolveOwner agree", () => {
 	it("routes and filters every hash key to the same child of a hash split", async () => {
 		const table = makeCounterTable();
-		for (let i = 0; i < 5; i++) await table.increment(`k-${i}`);
+		for (let i = 0; i < 5; i++) {
+			await table.increment(`k-${i}`);
+		}
 		await table.settle((n) => n[0].stats.role === "router");
 
 		await runInDurableObject(stub(table.root.doName), (instance: CounterPartitionDO, state) => {

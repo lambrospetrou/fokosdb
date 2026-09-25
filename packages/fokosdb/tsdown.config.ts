@@ -76,7 +76,9 @@ export default defineConfig({
 			generateBundle(_options, bundle) {
 				const graphs = Object.values(bundle).flatMap((entry) => {
 					// The declaration build emits its own bundle, which holds no JavaScript entry.
-					if (entry.type !== "chunk" || !entry.isEntry || !entry.fileName.endsWith(".js")) return [];
+					if (entry.type !== "chunk" || !entry.isEntry || !entry.fileName.endsWith(".js")) {
+						return [];
+					}
 
 					const chunks = new Set([entry]);
 					const externals = new Set<string>();
@@ -95,7 +97,9 @@ export default defineConfig({
 					}
 					return [{ entry, chunks: [...chunks], externals: [...externals] }];
 				});
-				if (graphs.length === 0) return;
+				if (graphs.length === 0) {
+					return;
+				}
 
 				for (const { entry, chunks, externals } of graphs) {
 					if (entry.name === "sharding/index") {
@@ -114,7 +118,9 @@ export default defineConfig({
 						}
 						continue;
 					}
-					if (entry.name !== "client/index") continue;
+					if (entry.name !== "client/index") {
+						continue;
+					}
 
 					const serverModules = chunks
 						.flatMap((chunk) => chunk.moduleIds)

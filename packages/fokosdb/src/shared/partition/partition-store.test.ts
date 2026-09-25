@@ -295,7 +295,9 @@ describe("PartitionStore - items", () => {
 			let cursor: { hk: KeyBytes; sk: KeyBytes } | null = null;
 			for (;;) {
 				const page = store.queryItemsPage(cursor, 1);
-				if (page.length === 0) break;
+				if (page.length === 0) {
+					break;
+				}
 				const row = page[0];
 				seen.push(`${keyLabel(row.hk)}/${keyLabel(row.sk)}`);
 				cursor = { hk: row.hk, sk: row.sk };
@@ -518,7 +520,9 @@ describe("PartitionStore - items", () => {
 			// The public-read projection decodes JSONB back to JSON text.
 			expect(items.get("j")).toMatchObject({ data: jsonText, kind: "json" });
 			// The items.item_id link key stays inside the store: a query result never carries it.
-			for (const r of projRows) expect(r.payload).not.toHaveProperty("item_id");
+			for (const r of projRows) {
+				expect(r.payload).not.toHaveProperty("item_id");
+			}
 		});
 	});
 
@@ -1172,7 +1176,9 @@ describe("PartitionStore - pending transactions", () => {
 	it("hasAnyPendingTx answers from a single row", async () => {
 		await withStore((store, _state) => {
 			expect(store.hasAnyPendingTx()).toBe(false);
-			for (const sk of ["1", "2", "3"]) store.insertPendingLock(lockRow("hk", sk, "tx1"));
+			for (const sk of ["1", "2", "3"]) {
+				store.insertPendingLock(lockRow("hk", sk, "tx1"));
+			}
 			expect(store.hasAnyPendingTx()).toBe(true);
 
 			store.deletePendingTxForHashKey(kb("hk"));
@@ -1209,7 +1215,9 @@ describe("PartitionStore - pending transactions", () => {
 			for (let i = 0; i < 11; i++) {
 				const transactionId = `tx-${i}`;
 				store.insertPendingLock(lockRow(`hk-${i}`, "1", transactionId));
-				if (i < 10) store.guardPendingTx(transactionId, 2000);
+				if (i < 10) {
+					store.guardPendingTx(transactionId, 2000);
+				}
 			}
 			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_json: '{"doName":"tc-1"}' }]);
 		});

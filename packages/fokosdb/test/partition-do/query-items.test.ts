@@ -415,7 +415,9 @@ describe("PartitionDO — range split", () => {
 						),
 					);
 					seen.push(...result.items.map((item) => KeyCodec.decode((item as StoredItem).sk) as string));
-					if (result.nextCursor === null) break;
+					if (result.nextCursor === null) {
+						break;
+					}
 					cursor = result.nextCursor;
 				}
 				const expected = direction === "asc" ? ["a", "b", "c"] : ["c", "b", "a"];
@@ -486,9 +488,15 @@ describe("PartitionDO — range split", () => {
 				count += res.count;
 				scannedCount += res.scannedCount;
 				rowsReturned += res.rowsReturned;
-				for (const it of res.items) out.push(KeyCodec.decode((it as StoredItem).sk));
-				for (const m of res.partitionMetas) leaves.add(m.servedByActorName);
-				if (res.nextCursor === null) break;
+				for (const it of res.items) {
+					out.push(KeyCodec.decode((it as StoredItem).sk));
+				}
+				for (const m of res.partitionMetas) {
+					leaves.add(m.servedByActorName);
+				}
+				if (res.nextCursor === null) {
+					break;
+				}
 				cursor = res.nextCursor;
 				invariant(pages < 1000, "queryItems pagination did not terminate");
 			}
@@ -586,7 +594,9 @@ describe("PartitionDO — range split", () => {
 					await root.awaitSplitStarted();
 					await waitForAllChildRequests();
 					const children = await root.children();
-					for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
+					for (const child of children) {
+						expect((await child.status()).migrationStatus).toBe("migration_migrating");
+					}
 
 					const caller = children[0];
 					const result = opened(

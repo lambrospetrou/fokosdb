@@ -10,7 +10,9 @@ const condition = (expression: unknown) => validateConditionExpression(expressio
 
 function nestedNot(depth: number): unknown {
 	let result: unknown = { op: "exists", args: [{ ref: "v" }] };
-	for (let i = 1; i < depth; i++) result = { op: "not", args: [result] };
+	for (let i = 1; i < depth; i++) {
+		result = { op: "not", args: [result] };
+	}
 	return result;
 }
 

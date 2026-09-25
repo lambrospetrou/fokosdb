@@ -74,7 +74,9 @@ describe("FokosDB item CRUD — model-based property", () => {
 
 		await fc.assert(
 			fc.asyncProperty(arbCommands, async (run) => {
-				for (const key of run.keys) await db.deleteItem(key);
+				for (const key of run.keys) {
+					await db.deleteItem(key);
+				}
 				const setup = () => ({ model: { items: new Map() } as Model, real: db });
 				await fc.asyncModelRun(setup, run.cmds);
 			}),

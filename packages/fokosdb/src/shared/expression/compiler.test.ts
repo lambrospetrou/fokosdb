@@ -117,7 +117,9 @@ describe("condition SQLite compiler", () => {
 			const plan = compileConditionExpression(condition);
 			const indexes = new Set([...plan.sql.matchAll(/\?(\d+)/g)].map((match) => Number(match[1])));
 			expect(indexes.size, message).toBe(plan.bindingCount);
-			for (let i = 0; i < plan.bindingCount; i++) expect(indexes.has(3 + i), message).toBe(true);
+			for (let i = 0; i < plan.bindingCount; i++) {
+				expect(indexes.has(3 + i), message).toBe(true);
+			}
 			expect(composeConditionStatement(plan.sql).match(/\?(?!\d)/g)?.length, message).toBe(2);
 		}
 	});
@@ -291,8 +293,12 @@ describe("update SQLite compiler", () => {
 		];
 		const plan = compileUpdateExpression(update);
 		const allParams = new Set<number>();
-		for (const match of plan.documentSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
-		for (const match of plan.applicableSql.matchAll(/\?(\d+)/g)) allParams.add(Number(match[1]));
+		for (const match of plan.documentSql.matchAll(/\?(\d+)/g)) {
+			allParams.add(Number(match[1]));
+		}
+		for (const match of plan.applicableSql.matchAll(/\?(\d+)/g)) {
+			allParams.add(Number(match[1]));
+		}
 		expect(plan.completeBindingCount).toBe(UPDATE_FIXED_BINDING_COUNT + plan.bindingCount);
 		expect([...allParams].sort((a, b) => a - b)).toEqual(
 			Array.from({ length: plan.bindingCount }, (_, i) => UPDATE_FIXED_BINDING_COUNT + i + 1),

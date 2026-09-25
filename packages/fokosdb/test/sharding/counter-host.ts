@@ -204,10 +204,14 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 					};
 				},
 				applyPage: (page) => {
-					for (const r of page as CounterRow[]) sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", r.key, r.val);
+					for (const r of page as CounterRow[]) {
+						sql.exec("INSERT OR REPLACE INTO counters (key, val) VALUES (?, ?)", r.key, r.val);
+					}
 				},
 				validatePage: (_cursor, page) => {
-					if (!Array.isArray(page)) throw new Error("counter migration page must be an array");
+					if (!Array.isArray(page)) {
+						throw new Error("counter migration page must be an array");
+					}
 				},
 			},
 			// Every child has acknowledged its import, so the rows of this router are old copies.

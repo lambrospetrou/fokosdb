@@ -62,7 +62,9 @@ export class FokosScheduler {
 
 	/** Runs a pass in this isolate soon, without an alarm. A pending timer absorbs a second call. */
 	wake(): void {
-		if (this.#fastPath !== null) return;
+		if (this.#fastPath !== null) {
+			return;
+		}
 		this.#fastPath = setTimeout(() => {
 			this.#fastPath = null;
 			this.runDueWork().catch((error: unknown) => {
@@ -73,7 +75,9 @@ export class FokosScheduler {
 
 	/** Stops the fast path. The alarm is the caller's to delete. */
 	stop(): void {
-		if (this.#fastPath !== null) clearTimeout(this.#fastPath);
+		if (this.#fastPath !== null) {
+			clearTimeout(this.#fastPath);
+		}
 		this.#fastPath = null;
 	}
 
@@ -86,20 +90,28 @@ export class FokosScheduler {
 		const moved = this.#deps.store.transactionSync(() => {
 			const record = this.#deps.store.getJobs();
 			const current = record[name]?.nextRunAt;
-			if (current !== undefined && current <= runAt) return false;
+			if (current !== undefined && current <= runAt) {
+				return false;
+			}
 			record[name] = { nextRunAt: runAt };
 			this.#deps.store.putJobs(record);
 			return true;
 		});
-		if (!moved) return;
+		if (!moved) {
+			return;
+		}
 		await this.ensureAlarmAtMost(runAt);
-		if (runAt <= Date.now()) this.wake();
+		if (runAt <= Date.now()) {
+			this.wake();
+		}
 	}
 
 	/** Sets the alarm to `at` when no alarm exists or the existing one is later. */
 	async ensureAlarmAtMost(at: number): Promise<void> {
 		const existing = await this.#deps.storage.getAlarm();
-		if (existing === null || at < existing) await this.#deps.storage.setAlarm(at);
+		if (existing === null || at < existing) {
+			await this.#deps.storage.setAlarm(at);
+		}
 	}
 
 	/**
@@ -107,13 +119,17 @@ export class FokosScheduler {
 	 * alarm-storage error escapes, so the platform retries the alarm.
 	 */
 	async #pass(): Promise<void> {
-		if (this.#deps.isFenced()) return;
+		if (this.#deps.isFenced()) {
+			return;
+		}
 		const now = Date.now();
 		const runnable = this.#runnable();
 		const due = this.#deadlines(runnable).filter(({ at }) => at <= now);
 
 		const earliest = this.#earliest(runnable);
-		if (earliest === null) return;
+		if (earliest === null) {
+			return;
+		}
 		if (due.length === 0) {
 			await this.ensureAlarmAtMost(earliest);
 			return;
@@ -125,7 +141,9 @@ export class FokosScheduler {
 		await this.ensureAlarmAtMost(now + this.#deps.fallbackAlarmMs);
 
 		for (const { job } of due) {
-			if (this.#deps.isFenced()) return;
+			if (this.#deps.isFenced()) {
+				return;
+			}
 			let nextRunAt: number | null;
 			try {
 				nextRunAt = (await job.runStep()).nextRunAt;
@@ -143,17 +161,23 @@ export class FokosScheduler {
 			this.#deps.store.transactionSync(() => {
 				const record = this.#deps.store.getJobs();
 				if (nextRunAt === null) {
-					if (!(job.name in record)) return;
+					if (!(job.name in record)) {
+						return;
+					}
 					delete record[job.name];
 				} else {
-					if (record[job.name]?.nextRunAt === nextRunAt) return;
+					if (record[job.name]?.nextRunAt === nextRunAt) {
+						return;
+					}
 					record[job.name] = { nextRunAt };
 				}
 				this.#deps.store.putJobs(record);
 			});
 		}
 
-		if (this.#deps.isFenced()) return;
+		if (this.#deps.isFenced()) {
+			return;
+		}
 		// This write REPLACES the fallback the pass armed, and it can move the alarm later. The pass is
 		// over here, so the earlier fallback protects nothing.
 		//
@@ -165,7 +189,9 @@ export class FokosScheduler {
 			return;
 		}
 		await this.#deps.storage.setAlarm(next);
-		if (next <= Date.now()) this.wake();
+		if (next <= Date.now()) {
+			this.wake();
+		}
 	}
 
 	/** The jobs that can run now, built-ins first. Asked again whenever the answer can have changed. */
@@ -181,7 +207,9 @@ export class FokosScheduler {
 			const scheduled = record[job.name]?.nextRunAt ?? null;
 			const own = job.deadline?.() ?? null;
 			const at = scheduled === null ? own : own === null ? scheduled : Math.min(scheduled, own);
-			if (at !== null) out.push({ job, at });
+			if (at !== null) {
+				out.push({ job, at });
+			}
 		}
 		return out;
 	}
@@ -190,7 +218,9 @@ export class FokosScheduler {
 		// FIXME: Index the jobs in a smarter way to avoid scanning all deadlines every time.
 		let earliest: number | null = null;
 		for (const { at } of this.#deadlines(runnable)) {
-			if (earliest === null || at < earliest) earliest = at;
+			if (earliest === null || at < earliest) {
+				earliest = at;
+			}
 		}
 		return earliest;
 	}

@@ -49,7 +49,9 @@ export class RouteCollector {
 	 */
 	add(node: FokosRouteNode): void {
 		const held = this.#nodes.get(node.ref.partitionId);
-		if (!held || ROLE_RANK[node.role] > ROLE_RANK[held.role]) this.#nodes.set(node.ref.partitionId, node);
+		if (!held || ROLE_RANK[node.role] > ROLE_RANK[held.role]) {
+			this.#nodes.set(node.ref.partitionId, node);
+		}
 	}
 
 	/** True while the list names no partition, so an error can still name the partition that raised it. */
@@ -68,7 +70,9 @@ export class RouteCollector {
 		const rest = [...this.#nodes].filter(([id]) => id !== node.ref.partitionId);
 		this.#nodes.clear();
 		this.#nodes.set(node.ref.partitionId, held && ROLE_RANK[held.role] > ROLE_RANK[node.role] ? held : node);
-		for (const [id, other] of rest) this.#nodes.set(id, other);
+		for (const [id, other] of rest) {
+			this.#nodes.set(id, other);
+		}
 	}
 
 	/**
@@ -79,7 +83,9 @@ export class RouteCollector {
 	mergeForwarded(routing: FokosRouting, stamp?: (node: FokosRouteNode) => FokosRouteNode): void {
 		this.#forwardCount += routing.forwardCount + 1;
 		this.#truncated ||= routing.servedByTruncated;
-		for (const node of routing.servedBy) this.add(stamp ? stamp(node) : node);
+		for (const node of routing.servedBy) {
+			this.add(stamp ? stamp(node) : node);
+		}
 	}
 
 	/**

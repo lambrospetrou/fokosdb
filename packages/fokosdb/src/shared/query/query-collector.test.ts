@@ -56,10 +56,14 @@ function collect(
 		pulled++;
 		const decode = () => {
 			decoded++;
-			if (c.payload === null) throw new Error("decoded a candidate without a payload");
+			if (c.payload === null) {
+				throw new Error("decoded a candidate without a payload");
+			}
 			return c.payload;
 		};
-		if (!collector.consume(KeyCodec.encode(c.sk), c.estRowBytes, c.matched, decode)) break;
+		if (!collector.consume(KeyCodec.encode(c.sk), c.estRowBytes, c.matched, decode)) {
+			break;
+		}
 	}
 	return { state: collector.state, pulled, decoded };
 }

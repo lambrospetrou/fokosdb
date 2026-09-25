@@ -107,7 +107,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	transition(token: string, write: () => void): void {
 		this.ctx.storage.transactionSync(() => {
-			if (!this.fokos.owns(tokenKey(token))) throw todo("FokosUnavailableError(coordinator_moved), retryable");
+			if (!this.fokos.owns(tokenKey(token))) {
+				throw todo("FokosUnavailableError(coordinator_moved), retryable");
+			}
 			write();
 		});
 	}
@@ -164,7 +166,9 @@ function coordinatorOperations(host: TransactionCoordinatorDO): FokosOperations<
 			local: async (req, call) => {
 				const token = req.clientRequestToken!;
 				const existing = todo<TcStateRow | undefined>("loadStateRowByToken(token)");
-				if (existing) return await host.drive(existing);
+				if (existing) {
+					return await host.drive(existing);
+				}
 				// The insert is the first transition, so it is ownership-guarded like the others. The prepare
 				// request hands every participant this coordinator's own route context, which the partition
 				// stores in its lock row and calls back on recovery.
@@ -181,8 +185,12 @@ function coordinatorOperations(host: TransactionCoordinatorDO): FokosOperations<
 			key: (req) => tokenKey(req.idempotencyToken),
 			local: async (req) => {
 				const row = todo<TcStateRow | undefined>(`loadStateRow(${req.transactionId})`);
-				if (!row) return { state: "not_found" };
-				if (row.state === "COMMITTED" || row.state === "CANCELLED") return { state: row.state };
+				if (!row) {
+					return { state: "not_found" };
+				}
+				if (row.state === "COMMITTED" || row.state === "CANCELLED") {
+					return { state: row.state };
+				}
 				void host.drive(row).catch(() => host.fokos.scheduleJob(JOB_RECOVERY, Date.now()));
 				return { state: "driving" };
 			},

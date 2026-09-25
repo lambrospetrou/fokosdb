@@ -251,7 +251,9 @@ function kindFromNullableCode(code: number | null): DataKind | null {
 	return code === null ? null : kindFromCode(code);
 }
 function codeFromNullableKind(kind: DataKind | null): number | null {
-	if (kind === null) return null;
+	if (kind === null) {
+		return null;
+	}
 	const code = DATA_KINDS.indexOf(kind);
 	invariant(code !== -1, `fokos/partition-store: unknown data kind`);
 	return code;
@@ -286,10 +288,15 @@ export function estimateItemBytes(item: StoredItem): number {
 export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
 	let bytes = ITEM_ENVELOPE_BYTES;
 	for (const cell of row) {
-		if (typeof cell === "string") bytes += cell.length * 2;
-		else if (cell instanceof Uint8Array) bytes += cell.byteLength;
-		else if (cell !== null && typeof cell === "object") bytes += cell.json.length * 2;
-		else bytes += 8;
+		if (typeof cell === "string") {
+			bytes += cell.length * 2;
+		} else if (cell instanceof Uint8Array) {
+			bytes += cell.byteLength;
+		} else if (cell !== null && typeof cell === "object") {
+			bytes += cell.json.length * 2;
+		} else {
+			bytes += 8;
+		}
 	}
 	return bytes;
 }
@@ -306,7 +313,9 @@ export function estimatePendingTxBytes(row: PendingTransactionRow): number {
 export function fromSqlData(value: string | ArrayBuffer): string | Uint8Array;
 export function fromSqlData(value: string | ArrayBuffer | null): string | Uint8Array | null;
 export function fromSqlData(value: string | ArrayBuffer | null): string | Uint8Array | null {
-	if (value === null) return null;
+	if (value === null) {
+		return null;
+	}
 	return typeof value === "string" ? value : new Uint8Array(value);
 }
 
@@ -592,7 +601,9 @@ export class PartitionStore {
 			sk,
 		);
 		const row = tryOne(res);
-		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		if (!row) {
+			return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		}
 		const { data_kind, ...rest } = row; // data_kind → the readable `kind`; don't leak the raw code
 		return {
 			row: { ...rest, data: fromSqlData(row.data), kind: kindFromCode(data_kind) },
@@ -625,7 +636,9 @@ export class PartitionStore {
 			sk,
 		);
 		const row = tryOne(res);
-		if (!row) return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		if (!row) {
+			return { row: undefined, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
+		}
 		return {
 			row: {
 				data: fromSqlData(row.data),
@@ -790,7 +803,9 @@ export class PartitionStore {
 			MAX_ITEM_BYTES,
 		);
 		const rows = writeRes.toArray();
-		if (rows.length === 0) throwItemTooLarge(opts.hk, opts.sk);
+		if (rows.length === 0) {
+			throwItemTooLarge(opts.hk, opts.sk);
+		}
 		const version = rows[0].v;
 		invariant(
 			typeof version === "number" && Number.isInteger(version) && version >= 1,
@@ -878,8 +893,11 @@ export class PartitionStore {
 				const hk = fromSqlKey(row.hk);
 				const key = hk.toBase64({ alphabet: "base64url" });
 				const current = bytesByHashKey.get(key);
-				if (current) current.bytes += row.est_row_bytes;
-				else bytesByHashKey.set(key, { hk, bytes: row.est_row_bytes });
+				if (current) {
+					current.bytes += row.est_row_bytes;
+				} else {
+					bytesByHashKey.set(key, { hk, bytes: row.est_row_bytes });
+				}
 				deletedBytes += row.est_row_bytes;
 				maxExpirySeconds = Math.max(maxExpirySeconds, row.ttl_epoch_utc_seconds);
 			}
@@ -973,7 +991,9 @@ export class PartitionStore {
 			const B =
 				tryOne(this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey))
 					?.est_bytes ?? 0;
-			if (B <= 0) return null;
+			if (B <= 0) {
+				return null;
+			}
 
 			// Cheap "≥ N items" guard, O(N) not O(cnt): each child needs ≥ 1 item, so probe with a bounded
 			// count rather than a full pass. Fewer than N items ⇒ cannot split into N non-empty children.
@@ -1037,7 +1057,9 @@ export class PartitionStore {
 					// several thresholds at once, the scan still emits one boundary and re-anchors here, so no
 					// two boundaries land on the same adjacent-key pair. It also gives each child ≥ 1 row.
 					threshold = acc + step;
-					if (boundaries.length === N - 1) break;
+					if (boundaries.length === N - 1) {
+						break;
+					}
 				}
 				prev = sk;
 			}
@@ -1046,7 +1068,9 @@ export class PartitionStore {
 			// children). On skewed data the scan may yield fewer than N-1 boundaries; treat any shortfall or
 			// validation failure as "cannot split yet" and return null (the split retries later). This
 			// is the safety net that makes estimate inaccuracy harmless.
-			if (boundaries.length !== N - 1) return null;
+			if (boundaries.length !== N - 1) {
+				return null;
+			}
 			for (let i = 0; i < boundaries.length; i++) {
 				invariant(
 					KeyCodec.compare(boundaries[i], lower) > 0,
@@ -1215,7 +1239,9 @@ export class PartitionStore {
 		const decodePayload = (): StoredItem | ProjectedWireRow => {
 			const row = current!;
 			invariant(mode !== "none", "fokos/partition-store.scanQueryPage: a count scan has no payload to decode");
-			if (mode === "projected") return decodeProjectedRow(row, entryCount);
+			if (mode === "projected") {
+				return decodeProjectedRow(row, entryCount);
+			}
 			return {
 				hk: fromSqlKey(row.hk as ArrayBuffer),
 				sk: currentSk!,
@@ -1233,7 +1259,9 @@ export class PartitionStore {
 			currentSk = fromSqlKey(row.sk as ArrayBuffer);
 			// Without a plan the statement yields no `matched` column; every candidate matches.
 			const matched = plan === null ? true : row.matched === 1;
-			if (!consumer(currentSk, row.est_row_bytes as number, matched, decodePayload)) break;
+			if (!consumer(currentSk, row.est_row_bytes as number, matched, decodePayload)) {
+				break;
+			}
 		}
 		return { rowsRead: cursor.rowsRead, rowsWritten: cursor.rowsWritten };
 	}
@@ -1679,7 +1707,9 @@ export class PartitionStore {
 	 * rows free.
 	 */
 	addKeySizeEstimate(hk: KeyBytes, bytes: number): void {
-		if (bytes <= 0) return;
+		if (bytes <= 0) {
+			return;
+		}
 		this.#storage.sql.exec(
 			`INSERT INTO key_size_estimates (hk, est_bytes) VALUES (?, ?)
 			 ON CONFLICT(hk) DO UPDATE SET est_bytes = est_bytes + excluded.est_bytes`,

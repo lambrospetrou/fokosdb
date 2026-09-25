@@ -140,7 +140,9 @@ describe("transactions - single-partition fast path", () => {
 		const db = sharedDb;
 		const keys = keysAcrossPartitions(db, 2, "span");
 		expect(countDistinctPartitions(db, keys)).toBe(2);
-		for (const key of keys) await db.putItem({ ...key, data: "v" });
+		for (const key of keys) {
+			await db.putItem({ ...key, data: "v" });
+		}
 
 		const calls = await countCalls([db], keys);
 		const result = await db.transactGetItems({ items: keys });
@@ -152,7 +154,9 @@ describe("transactions - single-partition fast path", () => {
 	it("runs the Worker two-phase path when the partition cannot execute the whole set", async () => {
 		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-fallback");
-		for (const key of keys) await db.putItem({ ...key, data: `data-${key.hashKey}` });
+		for (const key of keys) {
+			await db.putItem({ ...key, data: `data-${key.hashKey}` });
+		}
 
 		// A partition answers this when the items straddle a split or a promotion below it. Standing in
 		// for that setup here keeps the test on what db.ts owns: recognising the answer and finishing the
@@ -170,7 +174,9 @@ describe("transactions - single-partition fast path", () => {
 	it("surfaces a fast-path transport failure instead of starting the two-phase path", async () => {
 		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-transport");
-		for (const key of keys) await db.putItem({ ...key, data: "v" });
+		for (const key of keys) {
+			await db.putItem({ ...key, data: "v" });
+		}
 
 		const calls = await countCalls([db], keys);
 		await controlledPartition(db, keys[0]).testTxResponse("txReadSnapshot", { error: "Network connection lost.", times: 1 });

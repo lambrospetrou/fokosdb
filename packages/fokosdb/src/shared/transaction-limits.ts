@@ -143,7 +143,9 @@ function isEmptyKey(k: string | Uint8Array): boolean {
  * the content rules must, or a key rejected on write would be accepted as a query bound.
  */
 export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint8Array): void {
-	if (typeof k !== "string") return;
+	if (typeof k !== "string") {
+		return;
+	}
 	if (k.includes("\0")) {
 		throw new FokosValidationError(VALIDATION_CODES.key_contains_nul, {
 			message: `${name} must not contain the NUL (\\0) character`,
@@ -192,7 +194,9 @@ export function encodeHashKey(k: string | Uint8Array): KeyBytes {
 
 /** Encodes a sort key to canonical bytes (absent ⇒ the empty sentinel), enforcing the size cap. */
 export function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
-	if (k === undefined) return KeyCodec.encodeOptional(undefined);
+	if (k === undefined) {
+		return KeyCodec.encodeOptional(undefined);
+	}
 	const bytes = KeyCodec.encode(k);
 	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
 		throw new FokosValidationError(VALIDATION_CODES.sort_key_too_large, {
@@ -247,7 +251,9 @@ export function validateTransactWriteOperations(
 				attributes: { opIndex, operation: op.operation, hashKey: op.hashKey, sortKey: op.sortKey },
 			});
 		if (op.operation === "put") {
-			if (op.data == null) throw invalidFields(`transactWriteItems "put" operation requires data`);
+			if (op.data == null) {
+				throw invalidFields(`transactWriteItems "put" operation requires data`);
+			}
 		} else if (op.data != null) {
 			throw invalidFields(`transactWriteItems "${op.operation}" operation must not carry data`);
 		}
@@ -280,8 +286,12 @@ export function validateTransactWriteOperations(
 			validateItemDataSize(op.data, "transactWriteItems");
 			totalBytes += itemDataBytes(op.data);
 		}
-		if (op.condition) totalBytes += itemDataBytes(JSON.stringify(op.condition));
-		if (op.update) totalBytes += itemDataBytes(JSON.stringify(op.update));
+		if (op.condition) {
+			totalBytes += itemDataBytes(JSON.stringify(op.condition));
+		}
+		if (op.update) {
+			totalBytes += itemDataBytes(JSON.stringify(op.update));
+		}
 		encodedKeys.push({ hashKey, sortKey });
 	}
 	if (totalBytes > MAX_PAYLOAD_BYTES_PER_TX) {
@@ -346,10 +356,14 @@ export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[])
 export function singlePartitionTarget<T extends { partitionContext: FokosDbRouteContext }>(
 	items: readonly T[],
 ): FokosDbRouteContext | null {
-	if (items.length === 0) return null;
+	if (items.length === 0) {
+		return null;
+	}
 	const target = items[0].partitionContext;
 	for (const item of items) {
-		if (item.partitionContext.doName !== target.doName) return null;
+		if (item.partitionContext.doName !== target.doName) {
+			return null;
+		}
 	}
 	return target;
 }
@@ -388,7 +402,9 @@ export function conditionFailedReason(
 	keys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
 	imageRow?: { data: string | Uint8Array; kind: DataKind; version: number; ttlAt?: number },
 ): RejectionReasonEncoded {
-	if (!imageRow) return { code: "condition_failed", ...keys };
+	if (!imageRow) {
+		return { code: "condition_failed", ...keys };
+	}
 	return {
 		code: "condition_failed",
 		...keys,
@@ -420,10 +436,14 @@ export function applyImageCap(
 	let runningBytes = 0;
 	let exceeded = false;
 	for (const r of results) {
-		if (r.outcome !== "rejected" || r.itemOmitted || r.imageBytes === undefined) continue;
+		if (r.outcome !== "rejected" || r.itemOmitted || r.imageBytes === undefined) {
+			continue;
+		}
 		if (exceeded || runningBytes + r.imageBytes > cap) {
 			exceeded = true;
-			if (r.reason.code === "condition_failed") delete r.reason.item;
+			if (r.reason.code === "condition_failed") {
+				delete r.reason.item;
+			}
 			r.itemOmitted = "response_too_large";
 		} else {
 			runningBytes += r.imageBytes;

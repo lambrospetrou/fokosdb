@@ -157,7 +157,9 @@ function parseTagged<T>(json: string): T {
 }
 
 function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEncoded {
-	if (reason.code !== "condition_failed" || reason.item === undefined) return reason;
+	if (reason.code !== "condition_failed" || reason.item === undefined) {
+		return reason;
+	}
 	const stripped = { ...reason };
 	delete stripped.item;
 	return stripped;
@@ -171,7 +173,9 @@ function reasonWithoutImage(reason: RejectionReasonEncoded): RejectionReasonEnco
  * the cap at CANCELLING without reading the images back.
  */
 function stripImagesFromPrepareResponse(r: PrepareResponse): PrepareResponse {
-	if (r.outcome === "accepted") return r;
+	if (r.outcome === "accepted") {
+		return r;
+	}
 	return {
 		outcome: "rejected",
 		results: r.results.map((res) => (res.outcome === "rejected" ? { ...res, reason: reasonWithoutImage(res.reason) } : res)),
@@ -359,7 +363,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * with no identity has no ledger, so it has no record of the transaction.
 	 */
 	async recoverTransactionForParticipant(req: RecoverTransactionRequest): Promise<RecoverTransactionResult> {
-		if (!this.fokos.initialized()) return { state: "not_found" };
+		if (!this.fokos.initialized()) {
+			return { state: "not_found" };
+		}
 		return (await this.recoverTransaction(this.fokos.routeContext(), req)).value;
 	}
 
@@ -441,9 +447,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			// split complete. Above that it refuses a NEW transaction only: a replay reads the ledger and
 			// writes nothing, so it still gets its answer. The ledger read runs only above the threshold.
 			admit: ({ admissionTag, keys, policy }) => {
-				if (admissionTag !== "write" || sql.databaseSize <= maxBytes(policy) * 1.1) return "allow";
+				if (admissionTag !== "write" || sql.databaseSize <= maxBytes(policy) * 1.1) {
+					return "allow";
+				}
 				const token = KeyCodec.decode(keys[0].hashKey) as string;
-				if (this.hasStateRowForToken(token)) return "allow";
+				if (this.hasStateRowForToken(token)) {
+					return "allow";
+				}
 				return {
 					reject: new FokosUnavailableError(UNAVAILABLE_CODES.coordinator_over_size, {
 						message: "transaction coordinator exceeded its storage limit, please retry later",
@@ -491,9 +501,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * still imports holds an incomplete ledger, and a fenced coordinator makes no transition.
 	 */
 	private canDriveLocally(): boolean {
-		if (!this.fokos.initialized()) return false;
+		if (!this.fokos.initialized()) {
+			return false;
+		}
 		const lifecycle = this.fokos.lifecycle();
-		if (lifecycle.destroying || lifecycle.role === "router") return false;
+		if (lifecycle.destroying || lifecycle.role === "router") {
+			return false;
+		}
 		return lifecycle.import === null || lifecycle.import.state === "active" || lifecycle.import.state === "imported";
 	}
 
@@ -703,7 +717,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				// the array was stored, so a replay answers with exactly the images the first call did.
 				for (const img of this.loadResultImages(transactionId)) {
 					const res = results[img.op_index];
-					if (res?.outcome !== "rejected" || res.reason.code !== "condition_failed") continue;
+					if (res?.outcome !== "rejected" || res.reason.code !== "condition_failed") {
+						continue;
+					}
 					res.reason.item = {
 						hashKey: res.reason.hashKey,
 						...(res.reason.sortKey !== undefined ? { sortKey: res.reason.sortKey } : {}),
@@ -761,7 +777,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				expectedState,
 			);
-			if (transition.rowsWritten === 0) return;
+			if (transition.rowsWritten === 0) {
+				return;
+			}
 			this.ctx.storage.sql.exec(`DELETE FROM tc_items WHERE transaction_id = ?`, transactionId);
 			this.ctx.storage.sql.exec(`DELETE FROM tc_participants WHERE transaction_id = ?`, transactionId);
 			transitioned = true;
@@ -786,9 +804,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				partitionDoName,
 			);
-			if (answer.outcome !== "rejected") return;
+			if (answer.outcome !== "rejected") {
+				return;
+			}
 			for (const res of answer.results) {
-				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item) continue;
+				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item) {
+					continue;
+				}
 				const img = res.reason.item;
 				// image_data is an ANY column: text and JSON text bind as TEXT, bytes bind as a BLOB, exactly
 				// as the partition returned them. Nothing JSON-encodes an image anywhere on this path.
@@ -860,7 +882,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					}));
 				}
 				for (const r of answered) {
-					if (r.opIndex >= 0 && r.opIndex < merged.length) merged[r.opIndex] = r;
+					if (r.opIndex >= 0 && r.opIndex < merged.length) {
+						merged[r.opIndex] = r;
+					}
 				}
 			}
 
@@ -891,7 +915,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			);
 			// Another writer already decided this transaction. Its results_json names the images that are
 			// on disk, so deleting any of them here would strand its answer without one.
-			if (transition.rowsWritten === 0) return;
+			if (transition.rowsWritten === 0) {
+				return;
+			}
 
 			this.stripPayload(transactionId);
 			for (const opIndex of cappedOutOpIndexes) {
@@ -910,7 +936,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		if (p.prepare_outcome === "rejected") {
 			return FokosError.toWire(unexpectedTransactionStateError("a rejected prepare answer cannot be read back"));
 		}
-		if (p.error_json) return parseTagged<FokosErrorWire>(p.error_json);
+		if (p.error_json) {
+			return parseTagged<FokosErrorWire>(p.error_json);
+		}
 		return FokosError.toWire(
 			new FokosUnavailableError(UNAVAILABLE_CODES.prepare_unanswered, {
 				message: "a participant did not answer the prepare",
@@ -992,7 +1020,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			this.markPrepared(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
-				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) throw e;
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+					throw e;
+				}
 				console.error({
 					message: "fokos/tc: background commit failed",
 					transactionId,
@@ -1045,7 +1075,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
 						// the transaction stays in COMMITTING, the caller receives the commit-pending
 						// error, and the `tx_recovery` job finishes the fan-out.
-						if (this.fokosNow() > deadlineMs) return;
+						if (this.fokosNow() > deadlineMs) {
+							return;
+						}
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCommit(pCtx, {
 							transactionId,
 							transactionTimestamp: stateRow.transaction_ts,
@@ -1103,7 +1135,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						// Past the request budget, stop dispatching: this participant stays unconfirmed,
 						// the transaction stays in CANCELLING, and the `tx_recovery` job finishes the fan-out. The
 						// caller still receives the cancelled outcome, which applied nothing anywhere.
-						if (this.fokosNow() > deadlineMs) return;
+						if (this.fokosNow() > deadlineMs) {
+							return;
+						}
 						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCancel(pCtx, {
 							transactionId,
 							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
@@ -1135,7 +1169,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
 		const stateRow = this.loadStateRow(transactionId);
-		if (!stateRow) return;
+		if (!stateRow) {
+			return;
+		}
 
 		const items = this.loadItems(transactionId);
 		const itemsByPartition = groupByPartition(items);
@@ -1214,7 +1250,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		// FIXME: drive these transactions concurrently with a bounded fan-out.
 		for (const row of rows) {
-			if (this.fokosNow() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) break;
+			if (this.fokosNow() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) {
+				break;
+			}
 			try {
 				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state);
 			} catch (e) {
@@ -1302,8 +1340,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			}>(`SELECT idempotency_token, state FROM tc_state WHERE transaction_id = ?`, transactionId),
 		);
 
-		if (!row) return { state: "not_found" };
-		if (row.state === "COMMITTED" || row.state === "CANCELLED") return { state: row.state };
+		if (!row) {
+			return { state: "not_found" };
+		}
+		if (row.state === "COMMITTED" || row.state === "CANCELLED") {
+			return { state: row.state };
+		}
 
 		try {
 			await this.driveTransaction(transactionId, row.idempotency_token, row.state);
@@ -1342,7 +1384,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		let last: string | null = null;
 		for (const row of rows) {
 			// The extra row only shows that the ledger continues after this page.
-			if (scanned === FOKOS_PAGE_ROWS) return { page, nextCursor: last };
+			if (scanned === FOKOS_PAGE_ROWS) {
+				return { page, nextCursor: last };
+			}
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
 				const tx: MigratedTransaction = {
 					state: row,
@@ -1351,7 +1395,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					results: this.loadResultImages(row.transaction_id),
 				};
 				const txBytes = migratedTransactionBytes(tx);
-				if (page.length > 0 && bytes + txBytes > FOKOS_PAGE_BYTES) return { page, nextCursor: last };
+				if (page.length > 0 && bytes + txBytes > FOKOS_PAGE_BYTES) {
+					return { page, nextCursor: last };
+				}
 				page.push(tx);
 				bytes += txBytes;
 			}
@@ -1529,7 +1575,9 @@ const MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE = 100;
  * paths have no deadline, so they stop after `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` attempts.
  */
 function retryable(deadlineMs: number): (err: unknown, nextAttempt: number) => boolean {
-	if (deadlineMs === Number.POSITIVE_INFINITY) return (_err, nextAttempt) => nextAttempt <= MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE;
+	if (deadlineMs === Number.POSITIVE_INFINITY) {
+		return (_err, nextAttempt) => nextAttempt <= MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE;
+	}
 	return () => Date.now() <= deadlineMs;
 }
 
@@ -1542,9 +1590,15 @@ function sweepDueAt(completedAt: number): number {
 function migratedTransactionBytes(tx: MigratedTransaction): number {
 	const size = (v: string | ArrayBuffer | null) => (v === null ? 0 : typeof v === "string" ? v.length : v.byteLength);
 	let bytes = 256 + size(tx.state.results_json);
-	for (const r of tx.items) bytes += 128 + r.hk.byteLength + r.sk.byteLength + size(r.data) + size(r.conditions_json) + size(r.update_json);
-	for (const r of tx.participants) bytes += 128 + size(r.partition_context_json) + size(r.answer_json) + size(r.error_json);
-	for (const r of tx.results) bytes += 64 + size(r.image_data);
+	for (const r of tx.items) {
+		bytes += 128 + r.hk.byteLength + r.sk.byteLength + size(r.data) + size(r.conditions_json) + size(r.update_json);
+	}
+	for (const r of tx.participants) {
+		bytes += 128 + size(r.partition_context_json) + size(r.answer_json) + size(r.error_json);
+	}
+	for (const r of tx.results) {
+		bytes += 64 + size(r.image_data);
+	}
 	return bytes;
 }
 

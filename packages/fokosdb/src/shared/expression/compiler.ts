@@ -409,7 +409,9 @@ function renderProjectionValue(value: ExpressionValue, context: CompileContext):
 function renderProjectionType(value: ExpressionValue, context: CompileContext): string {
 	const present = renderPresent(value, context);
 	const type = renderType(value, context);
-	if (present === "1") return type;
+	if (present === "1") {
+		return type;
+	}
 	return `CASE WHEN (${present}) THEN ${type} ELSE 'missing' END`;
 }
 
@@ -430,7 +432,9 @@ function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAc
 
 	for (let i = 0; i < actions.length; i++) {
 		const action = actions[i];
-		if (action.action !== "remove") continue;
+		if (action.action !== "remove") {
+			continue;
+		}
 		const segments = validateWriteJsonPath(action.target.path, { allowAppend: false });
 		const last = segments[segments.length - 1];
 		if (last.kind === "index") {
@@ -454,14 +458,20 @@ function orderUpdateActions(actions: readonly UpdateAction[]): readonly UpdateAc
 				}
 			}
 		}
-		if (needsReorder) break;
+		if (needsReorder) {
+			break;
+		}
 	}
 
-	if (!needsReorder) return actions;
+	if (!needsReorder) {
+		return actions;
+	}
 
 	const result = [...actions];
 	for (const group of groups.values()) {
-		if (group.length <= 1) continue;
+		if (group.length <= 1) {
+			continue;
+		}
 		const sorted = [...group].sort((a, b) => b.index - a.index);
 		for (let i = 0; i < group.length; i++) {
 			result[group[i].actionIndex] = sorted[i].action;
@@ -511,7 +521,9 @@ function valueTypeGuardSql(value: ExpressionValue, context: CompileContext): str
 	const typeSql = renderType(value, context);
 	const constType = constTypeName(typeSql);
 	if (constType !== undefined) {
-		if (constType === "bytes") throw new ExpressionError("invalid_type", "an update value must not be bytes");
+		if (constType === "bytes") {
+			throw new ExpressionError("invalid_type", "an update value must not be bytes");
+		}
 		return "1";
 	}
 	return `(${typeSql} <> 'bytes')`;
@@ -533,9 +545,13 @@ function compactPlanParameters(sqlList: string[], context: CompileContext): stri
 	}
 	const used = new Set<number>();
 	for (const sql of sqlList) {
-		for (const match of sql.matchAll(/\?(\d+)/g)) used.add(Number(match[1]));
+		for (const match of sql.matchAll(/\?(\d+)/g)) {
+			used.add(Number(match[1]));
+		}
 	}
-	if (used.size === context.bindings.length) return sqlList;
+	if (used.size === context.bindings.length) {
+		return sqlList;
+	}
 	const remap = new Map<number, number>();
 	const survivors: ExpressionBindingDescriptor[] = [];
 	for (const index of [...used].sort((a, b) => a - b)) {
@@ -555,9 +571,13 @@ function compactPoolParameters(sqlList: string[], context: CompileContext): stri
 	const elementPattern = new RegExp(String.raw`\?${context.poolParam}, '\$\[(\d+)\]'`, "g");
 	const used = new Set<number>();
 	for (const sql of sqlList) {
-		for (const match of sql.matchAll(elementPattern)) used.add(Number(match[1]));
+		for (const match of sql.matchAll(elementPattern)) {
+			used.add(Number(match[1]));
+		}
 	}
-	if (used.size === context.bindings.length) return sqlList;
+	if (used.size === context.bindings.length) {
+		return sqlList;
+	}
 	const remap = new Map<number, number>();
 	const survivors: ExpressionBindingDescriptor[] = [];
 	for (const index of [...used].sort((a, b) => a - b)) {
@@ -603,8 +623,12 @@ function compileCondition(condition: ConditionExpression, context: CompileContex
 
 /** Appends one AND term; drops constant-true terms and reports a constant-false term. */
 function addTerm(terms: string[], term: string): boolean {
-	if (term === "0") return false;
-	if (term !== "1") terms.push(term);
+	if (term === "0") {
+		return false;
+	}
+	if (term !== "1") {
+		terms.push(term);
+	}
 	return true;
 }
 
@@ -626,12 +650,16 @@ function pushTypeGuards(terms: string[], leftType: string, rightType: string, al
 	const leftConst = constTypeName(leftType);
 	const rightConst = constTypeName(rightType);
 	if (leftConst !== undefined && rightConst !== undefined) {
-		if (leftConst !== rightConst) return false;
+		if (leftConst !== rightConst) {
+			return false;
+		}
 	} else {
 		terms.push(`${leftType} = ${rightType}`);
 	}
 	const knownType = leftConst ?? rightConst;
-	if (knownType !== undefined) return allowed.includes(knownType);
+	if (knownType !== undefined) {
+		return allowed.includes(knownType);
+	}
 	terms.push(`${leftType} IN (${typeListSql(allowed)})`);
 	return true;
 }
@@ -644,12 +672,18 @@ function compileComparison(
 ): string {
 	const [leftMode, rightMode] = comparisonModes(left, right);
 	const terms: string[] = [];
-	if (!addTerm(terms, renderPresent(left, context))) return "(0)";
-	if (!addTerm(terms, renderPresent(right, context))) return "(0)";
+	if (!addTerm(terms, renderPresent(left, context))) {
+		return "(0)";
+	}
+	if (!addTerm(terms, renderPresent(right, context))) {
+		return "(0)";
+	}
 	const leftType = renderType(left, context);
 	const rightType = renderType(right, context);
 	const allowedTypes = op === "eq" || op === "ne" ? EQUALITY_TYPE_NAMES : ORDERED_TYPE_NAMES;
-	if (!pushTypeGuards(terms, leftType, rightType, allowedTypes)) return "(0)";
+	if (!pushTypeGuards(terms, leftType, rightType, allowedTypes)) {
+		return "(0)";
+	}
 	const leftValue = renderValue(left, leftMode, context);
 	const rightValue = renderValue(right, rightMode, context);
 	const comparison =
@@ -682,11 +716,15 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 	if (firstType !== undefined && firstType !== "null" && choices.every((choice) => literalNativeType(choice) === firstType)) {
 		const mode: ValueMode = isDirectKeyReference(target) && (firstType === "text" || firstType === "bytes") ? "key" : "logical";
 		const terms: string[] = [];
-		if (!addTerm(terms, renderPresent(target, context))) return "(0)";
+		if (!addTerm(terms, renderPresent(target, context))) {
+			return "(0)";
+		}
 		const type = renderType(target, context);
 		const typeConst = constTypeName(type);
 		if (typeConst !== undefined) {
-			if (typeConst !== firstType) return "(0)";
+			if (typeConst !== firstType) {
+				return "(0)";
+			}
 		} else {
 			terms.push(`${type} = '${firstType}'`);
 		}
@@ -700,11 +738,17 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 function compileBeginsWith(value: ExpressionValue, prefix: ExpressionValue, context: CompileContext): string {
 	const [valueMode, prefixMode] = comparisonModes(value, prefix);
 	const terms: string[] = [];
-	if (!addTerm(terms, renderPresent(value, context))) return "(0)";
-	if (!addTerm(terms, renderPresent(prefix, context))) return "(0)";
+	if (!addTerm(terms, renderPresent(value, context))) {
+		return "(0)";
+	}
+	if (!addTerm(terms, renderPresent(prefix, context))) {
+		return "(0)";
+	}
 	const valueType = renderType(value, context);
 	const prefixType = renderType(prefix, context);
-	if (!pushTypeGuards(terms, valueType, prefixType, PREFIX_TYPE_NAMES)) return "(0)";
+	if (!pushTypeGuards(terms, valueType, prefixType, PREFIX_TYPE_NAMES)) {
+		return "(0)";
+	}
 	const valueSql = renderValue(value, valueMode, context);
 	const prefixSql = renderValue(prefix, prefixMode, context);
 	terms.push(`substr(${valueSql}, 1, length(${prefixSql})) IS ${prefixSql}`);
@@ -737,19 +781,31 @@ function compileContains(container: ExpressionValue, search: ExpressionValue, co
 	const arrayGuards: string[] = [];
 	let arrayPossible = addTerm(arrayGuards, containerPresent) && addTerm(arrayGuards, searchPresent);
 	const containerConst = constTypeName(containerType);
-	if (arrayPossible && containerConst !== undefined) arrayPossible = containerConst === "array";
-	else if (arrayPossible) arrayGuards.push(`${containerType} = 'array'`);
+	if (arrayPossible && containerConst !== undefined) {
+		arrayPossible = containerConst === "array";
+	} else if (arrayPossible) {
+		arrayGuards.push(`${containerType} = 'array'`);
+	}
 	const searchConst = constTypeName(searchType);
-	if (arrayPossible && searchConst !== undefined) arrayPossible = ARRAY_SEARCH_TYPE_NAMES.includes(searchConst);
-	else if (arrayPossible) arrayGuards.push(`${searchType} IN (${typeListSql(ARRAY_SEARCH_TYPE_NAMES)})`);
+	if (arrayPossible && searchConst !== undefined) {
+		arrayPossible = ARRAY_SEARCH_TYPE_NAMES.includes(searchConst);
+	} else if (arrayPossible) {
+		arrayGuards.push(`${searchType} IN (${typeListSql(ARRAY_SEARCH_TYPE_NAMES)})`);
+	}
 	if (arrayPossible) {
 		const exists = `EXISTS (SELECT 1 FROM json_each(${renderValue(container, "logical", context)}) AS je WHERE ${JSON_EACH_TYPE_SQL} = ${searchType} AND je.value IS ${renderValue(search, "logical", context)})`;
 		array = arrayGuards.length > 0 ? `(CASE WHEN ${arrayGuards.join(" AND ")} THEN ${exists} ELSE 0 END)` : `(${exists})`;
 	}
 
-	if (scalar === "0" && array === "0") return "(0)";
-	if (array === "0") return scalar;
-	if (scalar === "0") return array;
+	if (scalar === "0" && array === "0") {
+		return "(0)";
+	}
+	if (array === "0") {
+		return scalar;
+	}
+	if (scalar === "0") {
+		return array;
+	}
 	return `(${scalar} OR ${array})`;
 }
 
@@ -763,24 +819,40 @@ function makeRenderers(context: CompileContext): OperationRenderers {
 }
 
 function renderPresent(value: ExpressionValue, context: CompileContext): string {
-	if ("val" in value) return "1";
-	if ("b64" in value) return "1";
-	if ("ref" in value) return referencePresent(value, context);
+	if ("val" in value) {
+		return "1";
+	}
+	if ("b64" in value) {
+		return "1";
+	}
+	if ("ref" in value) {
+		return referencePresent(value, context);
+	}
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
-		if (operation.renderPresent) return operation.renderPresent(value.args, makeRenderers(context));
+		if (operation.renderPresent) {
+			return operation.renderPresent(value.args, makeRenderers(context));
+		}
 		return "1";
 	}
 	throw new ExpressionError("invalid_function", "unknown expression function");
 }
 
 function renderType(value: ExpressionValue, context: CompileContext): string {
-	if ("val" in value) return `'${literalType(value.val as JsonPrimitive)}'`;
-	if ("b64" in value) return "'bytes'";
-	if ("ref" in value) return referenceType(value, context);
+	if ("val" in value) {
+		return `'${literalType(value.val as JsonPrimitive)}'`;
+	}
+	if ("b64" in value) {
+		return "'bytes'";
+	}
+	if ("ref" in value) {
+		return referenceType(value, context);
+	}
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
-		if (operation.renderType) return operation.renderType(value.args, makeRenderers(context));
+		if (operation.renderType) {
+			return operation.renderType(value.args, makeRenderers(context));
+		}
 		const call = `${operation.name.slice("sqlite.".length)}(${value.args.map((arg) => renderValue(arg, "sqlite", context)).join(", ")})`;
 		return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
 	}
@@ -790,9 +862,15 @@ function renderType(value: ExpressionValue, context: CompileContext): string {
 function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileContext): string {
 	if (mode === "json") {
 		if ("val" in value) {
-			if (value.val === true) return "jsonb('true')";
-			if (value.val === false) return "jsonb('false')";
-			if (value.val === null) return "NULL";
+			if (value.val === true) {
+				return "jsonb('true')";
+			}
+			if (value.val === false) {
+				return "jsonb('false')";
+			}
+			if (value.val === null) {
+				return "NULL";
+			}
 			return bindLiteral(value.val as JsonPrimitive, "logical", context);
 		}
 		// A byte literal has no JSON form. validateUpdateExpression refuses it before compilation, so
@@ -800,7 +878,9 @@ function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileCo
 		if ("b64" in value) {
 			throw new ExpressionError("invalid_type", "an update value must not be bytes");
 		}
-		if ("ref" in value) return referenceValue(value, "json", context);
+		if ("ref" in value) {
+			return referenceValue(value, "json", context);
+		}
 		const operation = getOperationDefinition(value.fn);
 		if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
 			// An operation that returns one of its arguments must render that argument in "json" mode
@@ -810,9 +890,15 @@ function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileCo
 		}
 		throw new ExpressionError("invalid_function", "unknown expression function");
 	}
-	if ("val" in value) return bindLiteral(value.val as JsonPrimitive, mode, context);
-	if ("b64" in value) return bindByteLiteral(value, mode, context);
-	if ("ref" in value) return referenceValue(value, mode, context);
+	if ("val" in value) {
+		return bindLiteral(value.val as JsonPrimitive, mode, context);
+	}
+	if ("b64" in value) {
+		return bindByteLiteral(value, mode, context);
+	}
+	if ("ref" in value) {
+		return referenceValue(value, mode, context);
+	}
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
 		return operation.renderValue(value.args, makeRenderers(context));
@@ -824,9 +910,15 @@ function renderSize(value: ExpressionValue, context: CompileContext): string {
 	const type = renderType(value, context);
 	const valueSql = renderValue(value, "logical", context);
 	const typeConst = constTypeName(type);
-	if (typeConst === "text" || typeConst === "bytes") return `octet_length(${valueSql})`;
-	if (typeConst === "array" || typeConst === "object") return `(SELECT count(*) FROM json_each(${valueSql}))`;
-	if (typeConst !== undefined) return "NULL";
+	if (typeConst === "text" || typeConst === "bytes") {
+		return `octet_length(${valueSql})`;
+	}
+	if (typeConst === "array" || typeConst === "object") {
+		return `(SELECT count(*) FROM json_each(${valueSql}))`;
+	}
+	if (typeConst !== undefined) {
+		return "NULL";
+	}
 	return `CASE WHEN ${type} IN ('text', 'bytes') THEN octet_length(${valueSql}) WHEN ${type} IN ('array', 'object') THEN (SELECT count(*) FROM json_each(${valueSql})) END`;
 }
 
@@ -893,7 +985,9 @@ function referenceValue(reference: ExpressionReference, mode: ValueMode, context
 			context.completeData = true;
 			// The stored JSONB is already the document form, so both modes read it verbatim: a SQLite
 			// function reads it as JSON, and jsonb_set stores it as a nested value.
-			if (mode === "sqlite" || mode === "json") return data;
+			if (mode === "sqlite" || mode === "json") {
+				return data;
+			}
 			return `CASE WHEN ${context.preImage.isJson} AND json_type(${data}) IN ('array', 'object') THEN ${data} WHEN ${context.preImage.isJson} THEN json_extract(${data}, '$') ELSE ${data} END`;
 		}
 	}
@@ -914,8 +1008,12 @@ function jsonTypeSql(jsonType: string): string {
 }
 
 function comparisonModes(left: ExpressionValue, right: ExpressionValue): readonly [ValueMode, ValueMode] {
-	if ((isDirectKeyReference(left) && isKeyLiteral(right)) || (isDirectKeyReference(right) && isKeyLiteral(left))) return ["key", "key"];
-	if (isDirectKeyReference(left) && isDirectKeyReference(right)) return ["key", "key"];
+	if ((isDirectKeyReference(left) && isKeyLiteral(right)) || (isDirectKeyReference(right) && isKeyLiteral(left))) {
+		return ["key", "key"];
+	}
+	if (isDirectKeyReference(left) && isDirectKeyReference(right)) {
+		return ["key", "key"];
+	}
 	return ["logical", "logical"];
 }
 
@@ -928,15 +1026,25 @@ function isKeyLiteral(value: ExpressionValue): boolean {
 }
 
 function literalNativeType(value: ExpressionValue): "null" | "boolean" | "number" | "text" | "bytes" | undefined {
-	if ("b64" in value) return "bytes";
-	if (!("val" in value)) return;
+	if ("b64" in value) {
+		return "bytes";
+	}
+	if (!("val" in value)) {
+		return;
+	}
 	return literalType(value.val as JsonPrimitive);
 }
 
 function literalType(value: JsonPrimitive): "null" | "boolean" | "number" | "text" {
-	if (value === null) return "null";
-	if (typeof value === "boolean") return "boolean";
-	if (typeof value === "number") return "number";
+	if (value === null) {
+		return "null";
+	}
+	if (typeof value === "boolean") {
+		return "boolean";
+	}
+	if (typeof value === "number") {
+		return "number";
+	}
 	return "text";
 }
 
@@ -988,6 +1096,9 @@ function bindDescriptor(descriptor: ExpressionBindingDescriptor, context: Compil
 }
 
 function recordDataReference(reference: Extract<ExpressionReference, { ref: "data" }>, context: CompileContext): void {
-	if (reference.path === undefined) context.completeData = true;
-	else context.paths.add(reference.path);
+	if (reference.path === undefined) {
+		context.completeData = true;
+	} else {
+		context.paths.add(reference.path);
+	}
 }

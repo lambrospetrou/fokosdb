@@ -120,7 +120,9 @@ export class FokosMigrationHost implements MigrationHost {
 		const bytesByKey = new Map<bigint, { hk: KeyBytes; bytes: number }[]>();
 		for (const item of items) {
 			const { inserted, estRowBytes } = store.insertItemIfAbsent(item);
-			if (!inserted) continue;
+			if (!inserted) {
+				continue;
+			}
 			const id = KeyCodec.mapKey(item.hk);
 			const bucket = bytesByKey.get(id);
 			if (bucket === undefined) {
@@ -168,7 +170,9 @@ export class FokosMigrationHost implements MigrationHost {
 
 	#applyPendingTx(page: Extract<FokosDbHostPage, { stream: "pending_tx" }>): void {
 		const { store } = this.deps;
-		for (const row of page.pendingTransactions) store.insertPendingLock(row);
+		for (const row of page.pendingTransactions) {
+			store.insertPendingLock(row);
+		}
 		store.mergeDeletionMetadata(page.deletionMetadata);
 	}
 }
@@ -179,7 +183,9 @@ export class FokosMigrationHost implements MigrationHost {
  * against a cursor from another stream.
  */
 function asHostCursor(cursor: unknown): FokosDbHostCursor {
-	if (cursor === null || cursor === undefined) return { stream: "items", cursor: null };
+	if (cursor === null || cursor === undefined) {
+		return { stream: "items", cursor: null };
+	}
 	const c = cursor as FokosDbHostCursor;
 	invariant(c.stream === "items" || c.stream === "pending_tx", () => `fokos/migration-host: unknown stream ${String(c.stream)}`);
 	return c;

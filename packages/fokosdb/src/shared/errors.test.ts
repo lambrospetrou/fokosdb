@@ -56,19 +56,27 @@ describe("the code tables", () => {
 	it("define every code once, under its own name", () => {
 		expect(new Set(ALL_DEFS.map((def) => def.code)).size).toBe(ALL_DEFS.length);
 		for (const table of FOKOS_LIBRARY_CODE_TABLES) {
-			for (const [key, def] of Object.entries(table)) expect(def.code).toBe(key);
+			for (const [key, def] of Object.entries(table)) {
+				expect(def.code).toBe(key);
+			}
 		}
 	});
 
 	it("take every segment from the unambiguous alphabet", () => {
-		for (const def of ALL_DEFS) expect(def.segment, def.code).toMatch(/^[a-hjkmnp-z2-9]{6}$/);
+		for (const def of ALL_DEFS) {
+			expect(def.segment, def.code).toMatch(/^[a-hjkmnp-z2-9]{6}$/);
+		}
 	});
 
 	it("give each table of this module one category, and every category a class", () => {
 		const tagsOfTables = FOKOS_CODE_TABLES.map((table) => [...new Set(Object.values(table).map((def) => def.tag))]);
-		for (const tags of tagsOfTables) expect(tags).toHaveLength(1);
+		for (const tags of tagsOfTables) {
+			expect(tags).toHaveLength(1);
+		}
 		const categories = [...FOKOS_ERROR_CATEGORIES.keys()];
-		for (const tag of tagsOfTables.flat()) expect(categories).toContain(tag);
+		for (const tag of tagsOfTables.flat()) {
+			expect(categories).toContain(tag);
+		}
 		// The routing category has no code of its own here: every routing code is a sharding code.
 		expect(categories.filter((tag) => !tagsOfTables.flat().includes(tag))).toEqual(["FokosRoutingError"]);
 	});
@@ -148,7 +156,9 @@ describe("the category classes", () => {
 
 describe("FokosError.is", () => {
 	it("holds for every category on the base class", () => {
-		for (const def of DEFS) expect(FokosError.is(errorOf(def)), def.code).toBe(true);
+		for (const def of DEFS) {
+			expect(FokosError.is(errorOf(def)), def.code).toBe(true);
+		}
 	});
 
 	it("holds for its own category only on a category class", () => {
@@ -167,7 +177,9 @@ describe("FokosError.is", () => {
 		expect(FokosError.is(new Error("x"))).toBe(false);
 		expect(FokosError.is(Object.assign(new Error("x"), { _tag: "FokosConflictError", code: "x" }))).toBe(false);
 		expect(FokosError.is(FokosError.toWire(errorOf(CONFLICT_CODES.read_conflict)))).toBe(false);
-		for (const value of [null, undefined, "FokosConflictError", 42]) expect(FokosError.is(value)).toBe(false);
+		for (const value of [null, undefined, "FokosConflictError", 42]) {
+			expect(FokosError.is(value)).toBe(false);
+		}
 	});
 });
 
@@ -175,7 +187,9 @@ describe("FokosError.isCode", () => {
 	it("holds for the code of a definition, and narrows the code to its literal", () => {
 		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
 		expect(FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)).toBe(true);
-		if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) throw new Error("unreachable");
+		if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+			throw new Error("unreachable");
+		}
 		const code: "partition_migrating" = e.code;
 		const tag: "FokosUnavailableError" = e._tag;
 		expect([code, tag]).toEqual(["partition_migrating", "FokosUnavailableError"]);
@@ -184,7 +198,9 @@ describe("FokosError.isCode", () => {
 	it("holds for a plain string, which compares the code only, and narrows the code as well", () => {
 		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
 		expect(FokosError.isCode(e, "partition_migrating")).toBe(true);
-		if (!FokosError.isCode(e, "partition_migrating")) throw new Error("unreachable");
+		if (!FokosError.isCode(e, "partition_migrating")) {
+			throw new Error("unreachable");
+		}
 		const code: "partition_migrating" = e.code;
 		expect(code).toBe("partition_migrating");
 	});
@@ -204,7 +220,9 @@ describe("FokosError.isCode", () => {
 
 describe("isFokosAnyError", () => {
 	it("holds for every code of the library", () => {
-		for (const def of DEFS) expect(isFokosAnyError(errorOf(def)), def.code).toBe(true);
+		for (const def of DEFS) {
+			expect(isFokosAnyError(errorOf(def)), def.code).toBe(true);
+		}
 	});
 
 	it("does not hold for a code that the library does not define, or for a code in the wrong category", () => {
@@ -216,7 +234,9 @@ describe("isFokosAnyError", () => {
 
 	it("narrows to the union, so a switch on _tag narrows the code", () => {
 		const e: unknown = errorOf(CONFLICT_CODES.item_locked_by_transaction);
-		if (!isFokosAnyError(e)) throw new Error("unreachable");
+		if (!isFokosAnyError(e)) {
+			throw new Error("unreachable");
+		}
 		switch (e._tag) {
 			case "FokosConflictError": {
 				const code: keyof typeof CONFLICT_CODES = e.code;
@@ -245,7 +265,9 @@ describe("an extension in another package", () => {
 	const moved = new FokosShardError(SHARD_CODES.shard_moved, { message: "shard moved" });
 
 	it("raises errors that every guard of this module reads", () => {
-		for (const e of [migrating, moved]) expect(FokosError.is(e)).toBe(true);
+		for (const e of [migrating, moved]) {
+			expect(FokosError.is(e)).toBe(true);
+		}
 		expect(FokosUnavailableError.is(migrating)).toBe(true);
 		expect(FokosShardError.is(moved)).toBe(true);
 		expect([migrating.origin, migrating.httpStatusHint, moved.origin, moved.httpStatusHint]).toEqual(["service", 503, "internal", 500]);
@@ -259,7 +281,9 @@ describe("an extension in another package", () => {
 
 	it("narrows a switch over its union to the codes of both packages", () => {
 		const e: unknown = migrating;
-		if (!isShardAnyError(e)) throw new Error("unreachable");
+		if (!isShardAnyError(e)) {
+			throw new Error("unreachable");
+		}
 		switch (e._tag) {
 			case "FokosUnavailableError": {
 				const code:

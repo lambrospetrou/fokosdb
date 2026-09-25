@@ -64,14 +64,18 @@ export function createQueryPageCollector(opts: {
 
 	const consume: QueryCandidateConsumer = (sk, estRowBytes, matched, decodePayload) => {
 		state.rowsReturned++;
-		if (remainingItems <= 0 || estRowBytes > remainingEvaluatedBytes) return stopBefore(sk);
+		if (remainingItems <= 0 || estRowBytes > remainingEvaluatedBytes) {
+			return stopBefore(sk);
+		}
 
 		let materialized: StoredItem | ProjectedWireRow | null = null;
 		let materializedBytes = 0;
 		if (matched && select === "projection") {
 			materialized = decodePayload();
 			materializedBytes = estimateResponseBytes(materialized);
-			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) return stopBefore(sk);
+			if (materializedBytes > remainingResponseBytes && !state.allowOversizedFirstItem) {
+				return stopBefore(sk);
+			}
 		}
 
 		state.scannedCount++;

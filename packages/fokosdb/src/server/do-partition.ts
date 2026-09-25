@@ -406,7 +406,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * between the fence and `fokosDestroy` must not start the timer again.
 	 */
 	#api<K extends keyof PartitionOps>(op: K, ctx: FokosDbRouteContext, req: PartitionOps[K]["req"]) {
-		if (!this.fokos.isFenced()) this.#ttl.arm();
+		if (!this.fokos.isFenced()) {
+			this.#ttl.arm();
+		}
 		return this.fokos.dispatch(op, ctx, req);
 	}
 
@@ -463,9 +465,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * no import and no repartition: reading storage to learn that is work the answer does not need.
 	 */
 	private canSweepLocally(): boolean {
-		if (!this.fokos.initialized()) return false;
+		if (!this.fokos.initialized()) {
+			return false;
+		}
 		const lifecycle = this.fokos.lifecycle();
-		if (lifecycle.destroying || lifecycle.role === "router") return false;
+		if (lifecycle.destroying || lifecycle.role === "router") {
+			return false;
+		}
 		return lifecycle.import === null || (lifecycle.import.state !== "awaiting_data" && lifecycle.import.state !== "importing");
 	}
 
@@ -513,7 +519,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 				subRequest: (req, items) => ({ ...req, items: items as TransactionItem[] }),
 				local: (req, call) => {
-					if (req.items.length === 0) return { outcome: "accepted" };
+					if (req.items.length === 0) {
+						return { outcome: "accepted" };
+					}
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
@@ -587,7 +595,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					const { items } = this.#participant.readForTransactionLocal(req);
 					// Parity with the two-phase path: an item locked by an in-progress transaction has a write
 					// that may or may not land, so the read cannot claim a committed snapshot.
-					if (items.some((item) => item.hasPendingWrite)) return { outcome: "aborted", reason: "pending_write" };
+					if (items.some((item) => item.hasPendingWrite)) {
+						return { outcome: "aborted", reason: "pending_write" };
+					}
 					return { outcome: "committed", items };
 				},
 			},
@@ -600,7 +610,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				local: (req, call) => {
 					invariant(req.items.length > 0, "fokos/partition.executeSingleShot: at least one item is required");
 					const { response, promotionCandidates } = this.#participant.executeSingleShot(req);
-					if (response.outcome !== "rejected") this.signalGrowth(call, promotionCandidates);
+					if (response.outcome !== "rejected") {
+						this.signalGrowth(call, promotionCandidates);
+					}
 					return response;
 				},
 			},
@@ -629,8 +641,12 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				whileMigrating: "throw",
 				local: async (req) => {
 					const result = await this.fokos.requestPromotion(req.hashKey);
-					if (result.queued) return { queued: true, status: promotedKeyStatusOf(result.state) };
-					if (result.reason === "already_promoted") return { queued: false, status: promotedKeyStatusOf(result.state) };
+					if (result.queued) {
+						return { queued: true, status: promotedKeyStatusOf(result.state) };
+					}
+					if (result.reason === "already_promoted") {
+						return { queued: false, status: promotedKeyStatusOf(result.state) };
+					}
 					// The owner still holds the key and a split row refused the promotion: the key moves soon.
 					// This is the answer a queued split has always given.
 					throw errExceededDatabaseSize("debugForcePromoteKey");
@@ -662,16 +678,22 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// Every target now holds the authoritative copy of its own locks, so the source's are
 			// redundant. A promotion moved one key of many and must not touch the rest.
 			beforeComplete: (plan) => {
-				if (plan.kind !== "key_promotion") this.#store.deleteAllPendingTx();
+				if (plan.kind !== "key_promotion") {
+					this.#store.deleteAllPendingTx();
+				}
 			},
 			// A split keeps its item rows. Only a promotion has rows to give back: its key moved, and
 			// the rest of its keys stay here.
 			cleanupSourceStep: (plan) => {
-				if (plan.kind !== "key_promotion") return true;
+				if (plan.kind !== "key_promotion") {
+					return true;
+				}
 				const hashKey = promotedKeyOf(plan);
 				this.#store.deleteItemsBatchForHashKey(hashKey, 1000);
 				this.#store.deletePendingTxForHashKey(hashKey);
-				if (this.#store.hasItemsForHashKey(hashKey)) return false;
+				if (this.#store.hasItemsForHashKey(hashKey)) {
+					return false;
+				}
 				this.#store.deleteKeySizeEstimate(hashKey);
 				return true;
 			},
@@ -683,10 +705,14 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			admit: ({ op, admissionTag, keys, policy }) => {
 				// An empty request grows nothing, so size cannot refuse it. The hook still runs for it,
 				// because an admission that does not look at keys can still apply.
-				if (admissionTag !== "write" || keys.length === 0) return "allow";
+				if (admissionTag !== "write" || keys.length === 0) {
+					return "allow";
+				}
 				const identity = this.fokos.identity();
 				const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
-				if (maxSizeMb && this.#store.databaseSize > maxSizeMb * 1.1 * 1024 * 1024) return { reject: errExceededDatabaseSize(op) };
+				if (maxSizeMb && this.#store.databaseSize > maxSizeMb * 1.1 * 1024 * 1024) {
+					return { reject: errExceededDatabaseSize(op) };
+				}
 				return "allow";
 			},
 			runtimeConfig: () => ({ importPagesPerPass: PartitionDO.IMPORT_PAGES_PER_PASS }),
@@ -715,7 +741,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 */
 	private signalGrowth(call: FokosLocalCall, candidates: readonly PromotionCandidate[]): void {
 		const promotionCandidates = this.promotionCandidates(candidates);
-		if (promotionCandidates.length > 0) call.signal({ promotionCandidates });
+		if (promotionCandidates.length > 0) {
+			call.signal({ promotionCandidates });
+		}
 		call.signal({ evaluateSplit: true });
 	}
 
@@ -725,14 +753,20 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * total after its own row.
 	 */
 	private promotionCandidates(candidates: readonly PromotionCandidate[]): { hashKey: KeyBytes }[] {
-		if (candidates.length === 0 || this.fokos.identity().kind !== "hash") return [];
+		if (candidates.length === 0 || this.fokos.identity().kind !== "hash") {
+			return [];
+		}
 		const threshold = (this.fokos.policy().hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
-		if (threshold <= 0) return [];
+		if (threshold <= 0) {
+			return [];
+		}
 		const largest = new Map<string, PromotionCandidate>();
 		for (const candidate of candidates) {
 			const id = candidate.hashKey.toBase64({ alphabet: "base64url" });
 			const seen = largest.get(id);
-			if (!seen || candidate.keyEstBytes > seen.keyEstBytes) largest.set(id, candidate);
+			if (!seen || candidate.keyEstBytes > seen.keyEstBytes) {
+				largest.set(id, candidate);
+			}
 		}
 		return [...largest.values()].filter((c) => c.keyEstBytes >= threshold).map(({ hashKey }) => ({ hashKey }));
 	}
@@ -952,7 +986,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		const promotedKeys: PartitionStatusView["promotedKeys"] = [];
 		const seen = new Set<string>();
 		for (const { repartition } of entries) {
-			if (repartition.kind !== "key_promotion" || repartition.hashKey === null || seen.has(repartition.id)) continue;
+			if (repartition.kind !== "key_promotion" || repartition.hashKey === null || seen.has(repartition.id)) {
+				continue;
+			}
 			seen.add(repartition.id);
 			promotedKeys.push({ hashKey: repartition.hashKey, status: promotedKeyStatusOf(repartition.state) });
 		}
@@ -989,7 +1025,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				});
 
 				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
-				if (pendingRows.length === 0) continue;
+				if (pendingRows.length === 0) {
+					continue;
+				}
 				const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
 
 				if (result.state === "COMMITTED") {
@@ -1128,7 +1166,9 @@ async function walkRangeVisits(
 		};
 		const part = visit.target === "local" ? await local(sub) : await forward(visit, sub);
 
-		if (req.select === "projection") out.items.push(...part.items);
+		if (req.select === "projection") {
+			out.items.push(...part.items);
+		}
 		out.partitionMetas.push(...part.partitionMetas);
 		out.count += part.count;
 		out.scannedCount += part.scannedCount;
@@ -1145,7 +1185,9 @@ async function walkRangeVisits(
 		// The visit drained as a shared budget reached zero: resume strictly after the last evaluated
 		// candidate (a leaf cursor carries no `inclusive` flag).
 		if (budget.budgetExhausted) {
-			if (hasLaterCandidate && out.lastEvaluatedCursor) out.nextCursor = out.lastEvaluatedCursor;
+			if (hasLaterCandidate && out.lastEvaluatedCursor) {
+				out.nextCursor = out.lastEvaluatedCursor;
+			}
 			break;
 		}
 		if (budget.visitsExhausted && hasLaterCandidate) {
@@ -1168,12 +1210,19 @@ async function walkRangeVisits(
  */
 function mergePrepare(parts: Array<FokosGroupPart<PrepareRequest, PrepareResponse>>): PrepareResponse {
 	const executionFailure = parts.find((p) => p.result.outcome === "rejected" && !p.result.results);
-	if (executionFailure) return executionFailure.result;
-	if (!parts.some((p) => p.result.outcome === "rejected")) return { outcome: "accepted" };
+	if (executionFailure) {
+		return executionFailure.result;
+	}
+	if (!parts.some((p) => p.result.outcome === "rejected")) {
+		return { outcome: "accepted" };
+	}
 	const merged: ParticipantOperationResultEncoded[] = [];
 	for (const { request, result } of parts) {
-		if (result.outcome === "accepted") merged.push(...request.items.map((item) => ({ outcome: "passed" as const, opIndex: item.opIndex })));
-		else merged.push(...result.results);
+		if (result.outcome === "accepted") {
+			merged.push(...request.items.map((item) => ({ outcome: "passed" as const, opIndex: item.opIndex })));
+		} else {
+			merged.push(...result.results);
+		}
 	}
 	applyImageCap(merged);
 	return { outcome: "rejected", results: merged };
@@ -1202,8 +1251,12 @@ function derivedMigrationStatus(state: FokosImportState | undefined): PartitionS
 
 /** The promotion status the partition suites read, taken from the repartition state. */
 function promotedKeyStatusOf(state: RepartitionState): PromotedKeyStatus {
-	if (state === "queued" || state === "planned") return "queued";
-	if (state === "cutover") return "promoting";
+	if (state === "queued" || state === "planned") {
+		return "queued";
+	}
+	if (state === "cutover") {
+		return "promoting";
+	}
 	return "promoted";
 }
 

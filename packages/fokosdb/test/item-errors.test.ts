@@ -139,7 +139,9 @@ describe("the validation codes of the item operations", () => {
 		expect(err.code).toBe("transact_duplicate_key");
 		expect(err.attributes).toEqual({ opIndex: 2, hashKey: "dup-hash-key", sortKey: "dup-sort-key" });
 		expect(err.message.startsWith("fokos/transact_duplicate_key: ")).toBe(true);
-		for (const detail of ["dup-hash-key", "dup-sort-key", "opIndex"]) expect(err.message).not.toContain(detail);
+		for (const detail of ["dup-hash-key", "dup-sort-key", "opIndex"]) {
+			expect(err.message).not.toContain(detail);
+		}
 	});
 });
 
@@ -179,7 +181,9 @@ describe("a failed condition of putItem and deleteItem", () => {
 		expect(conditionErr.reason).toEqual({ code: "condition_failed", ...key, item: { ...key, data: "stored", kind: "text", version: 1 } });
 		expect(conditionErr.meta.rowsRead).toBeGreaterThan(0);
 		expect(conditionErr.meta).not.toHaveProperty("_internal");
-		for (const field of ["reason", "meta"]) expect(Object.hasOwn(conditionErr, field)).toBe(true);
+		for (const field of ["reason", "meta"]) {
+			expect(Object.hasOwn(conditionErr, field)).toBe(true);
+		}
 	});
 
 	it("keeps the reason and the meta in fromWire, as own data", async () => {
@@ -194,7 +198,9 @@ describe("a failed condition of putItem and deleteItem", () => {
 		// and the category guard still hold on it.
 		const back = FokosError.fromWire(copy as FokosAnyError);
 		expect(FokosConditionCheckError.is(back)).toBe(true);
-		if (!FokosConditionCheckError.is(back)) throw new Error("unreachable");
+		if (!FokosConditionCheckError.is(back)) {
+			throw new Error("unreachable");
+		}
 		expect([back.error_id, back.reason, back.meta]).toEqual([err.error_id, err.reason, err.meta]);
 	});
 });

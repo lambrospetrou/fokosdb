@@ -20,9 +20,13 @@ function divergingKey(base: string, ownerAbsDepth: number, divergeAt: number, K:
 		const candidate = `${base}_alt${n}`;
 		// Must share every level before divergeAt.
 		const prefixMatches = basePath.slice(0, divergeAt).every((slot, i) => hashChildIndex(kb(candidate), ownerAbsDepth + i, K) === slot);
-		if (!prefixMatches) continue;
+		if (!prefixMatches) {
+			continue;
+		}
 		// Must diverge at the target level.
-		if (hashChildIndex(kb(candidate), ownerAbsDepth + divergeAt, K) !== basePath[divergeAt]) return candidate;
+		if (hashChildIndex(kb(candidate), ownerAbsDepth + divergeAt, K) !== basePath[divergeAt]) {
+			return candidate;
+		}
 	}
 	throw new Error("divergingKey: could not find a prefix-matching diverging key within 100 000 attempts");
 }

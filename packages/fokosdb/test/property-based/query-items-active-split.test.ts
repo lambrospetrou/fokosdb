@@ -123,12 +123,18 @@ class Churn {
 		// The regions rotate, so the splits happen over the whole tree and not in one stretch of it.
 		const region = this.regions[this.#pushes++ % this.regions.length];
 		for (let i = 0; i < MAX_PUTS_PER_PUSH; i++) {
-			if (this.#puts >= CHURN_PUT_BUDGET) return "budget";
+			if (this.#puts >= CHURN_PUT_BUDGET) {
+				return "budget";
+			}
 			const result = await this.#put(churnSortKey(region, this.#seq++));
-			if (result === "refused") return "refused";
+			if (result === "refused") {
+				return "refused";
+			}
 			this.#puts++;
 			await this.#trim();
-			if (result.meta.databaseSize > RANGE_CAP_BYTES) return "queued";
+			if (result.meta.databaseSize > RANGE_CAP_BYTES) {
+				return "queued";
+			}
 		}
 		return "under_cap";
 	}
@@ -137,7 +143,9 @@ class Churn {
 	async #put(sortKey: string): Promise<PutItemResult | "refused"> {
 		const data = churnData(sortKey);
 		const res = await this.#write(() => this.fixture.db.putItem({ hashKey: HOT_HASH_KEY, sortKey, data }));
-		if (res === "refused") return res;
+		if (res === "refused") {
+			return res;
+		}
 		recordItem(this.fixture.model, HOT_HASH_KEY, sortKey, data, res.version);
 		this.#live.push(sortKey);
 		return res;
@@ -151,7 +159,9 @@ class Churn {
 		while (this.#live.length > CHURN_LIVE_MAX) {
 			const sortKey = this.#live[0];
 			const res = await this.#write(() => this.fixture.db.deleteItem({ hashKey: HOT_HASH_KEY, sortKey }));
-			if (res === "refused") return;
+			if (res === "refused") {
+				return;
+			}
 			this.#live.shift();
 			this.fixture.model.delete(itemId(HOT_HASH_KEY, sortKey));
 		}
@@ -174,9 +184,15 @@ class Churn {
 			try {
 				return await op();
 			} catch (e) {
-				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) return "refused";
-				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) return "refused";
-				if (!FokosUnavailableError.is(e) || Date.now() >= deadline) throw e;
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) {
+					return "refused";
+				}
+				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+					return "refused";
+				}
+				if (!FokosUnavailableError.is(e) || Date.now() >= deadline) {
+					throw e;
+				}
 				await sleep(25);
 			}
 		}
@@ -207,7 +223,9 @@ async function topologyOf(fixture: Fixture): Promise<string> {
 /** Polls the topology of the hot key until it is not `before`, or until the last attempt. */
 async function awaitTopologyChange(fixture: Fixture, before: string, attempts: number): Promise<void> {
 	for (let attempt = 0; attempt < attempts; attempt++) {
-		if ((await topologyOf(fixture)) !== before) return;
+		if ((await topologyOf(fixture)) !== before) {
+			return;
+		}
 		await sleep(25);
 	}
 }
@@ -268,7 +286,9 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 			for (let probe = 0; probe < 80; probe++) {
 				const { count, readThrough } = await probeHotKey(fixture);
 				expect(count, "the count of the hot key must not change while its leaves split").toBe(hotCount());
-				if (readThrough) return;
+				if (readThrough) {
+					return;
+				}
 				await sleep(5);
 			}
 		}
@@ -299,14 +319,18 @@ describe("FokosDB queryItems while a range tree splits — model-based propertie
 
 			const before = await topologyOf(fixture);
 			const first = await untilAvailable(() => fixture.db.queryItems(opts));
-			if (first.cursor === undefined) return;
+			if (first.cursor === undefined) {
+				return;
+			}
 			// The cursor names a position in the topology that the first page walked. A wait for the
 			// leaves to change redeems it in another topology, where the child it stopped in is two
 			// children and the position it carries has to resolve to the same place. A window that
 			// closes before the leaves move leaves the rest of the property just as valid, so nothing
 			// is asserted here. A push that queued no split cannot move the leaves, so the wait
 			// operates only after a queued split.
-			if (pushed === "queued") await awaitTopologyChange(fixture, before, 20);
+			if (pushed === "queued") {
+				await awaitTopologyChange(fixture, before, 20);
+			}
 
 			const rest = await drainFromCursor(fixture.db, opts, first.cursor, expected.length);
 			const expectedPublic = expected.map(publicItem);

@@ -365,12 +365,16 @@ describe("transactions - end-to-end", () => {
 		if (tx1?.outcome === "committed") {
 			const a = await db.getItem({ hashKey: "c-only-a" });
 			expect(a.found).toBe(true);
-			if (a.found) expect(a.item.data).toBe("tx1-a");
+			if (a.found) {
+				expect(a.item.data).toBe("tx1-a");
+			}
 		}
 		if (tx2?.outcome === "committed") {
 			const b = await db.getItem({ hashKey: "c-only-b" });
 			expect(b.found).toBe(true);
-			if (b.found) expect(b.item.data).toBe("tx2-b");
+			if (b.found) {
+				expect(b.item.data).toBe("tx2-b");
+			}
 		}
 
 		// The shared key must reflect the committed transaction(s).
@@ -404,7 +408,9 @@ describe("transactions - end-to-end", () => {
 							items: [{ hashKey: "ser-key", operation: "put", data: "tx1" }],
 						}),
 					);
-					if (result.outcome !== "committed") throw result;
+					if (result.outcome !== "committed") {
+						throw result;
+					}
 					return result;
 				},
 				(_err, nextAttempt) => {
@@ -420,7 +426,9 @@ describe("transactions - end-to-end", () => {
 							items: [{ hashKey: "ser-key", operation: "put", data: "tx2" }],
 						}),
 					);
-					if (result.outcome !== "committed") throw result;
+					if (result.outcome !== "committed") {
+						throw result;
+					}
 					return result;
 				},
 				(_err, nextAttempt) => {
@@ -500,7 +508,9 @@ describe("transactions - end-to-end", () => {
 			expect(item.found).toBe(true);
 			invariant(item.found);
 			const hashKey = item.hashKey;
-			if (typeof hashKey !== "string") throw new Error("expected a string hash key");
+			if (typeof hashKey !== "string") {
+				throw new Error("expected a string hash key");
+			}
 			expect(item.data).toBe(`data-${hashKey}`);
 			// Each key was written exactly once above, so v=1 — the same version getItem reports, and
 			// the value a caller feeds back into an attribute_equals condition.
@@ -535,14 +545,22 @@ describe("transactions - end-to-end", () => {
 				const key = { hashKey: `ord-${i}`, sortKey: `sk-${i}` };
 				const name = partitionNameOf(db, key);
 				let bucket = buckets.get(name);
-				if (!bucket) buckets.set(name, (bucket = []));
-				if (bucket.length === perPartition) continue; // already filled and taken
+				if (!bucket) {
+					buckets.set(name, (bucket = []));
+				}
+				if (bucket.length === perPartition) {
+					continue;
+				} // already filled and taken
 				bucket.push(key);
-				if (bucket.length === perPartition) filled.push(bucket);
+				if (bucket.length === perPartition) {
+					filled.push(bucket);
+				}
 			}
 			const out: Key[] = [];
 			for (let i = 0; i < perPartition; i++) {
-				for (const bucket of filled) out.push(bucket[i]);
+				for (const bucket of filled) {
+					out.push(bucket[i]);
+				}
 			}
 			return out;
 		}
@@ -557,7 +575,9 @@ describe("transactions - end-to-end", () => {
 		// spread over all three partitions, so no partition returns a "clean" all-found reply.
 		const isWritten = (i: number) => i % 2 === 0;
 		for (const [i, k] of keys.entries()) {
-			if (isWritten(i)) await db.putItem({ ...k, data: `data-${k.hashKey}` });
+			if (isWritten(i)) {
+				await db.putItem({ ...k, data: `data-${k.hashKey}` });
+			}
 		}
 
 		const readResult = await db.transactGetItems({ items: keys });
@@ -570,7 +590,9 @@ describe("transactions - end-to-end", () => {
 			});
 		});
 		for (const [i, item] of readResult.items.entries()) {
-			if (item.found) expect(item.data).toBe(`data-${keys[i].hashKey}`);
+			if (item.found) {
+				expect(item.data).toBe(`data-${keys[i].hashKey}`);
+			}
 		}
 
 		// Two items naming one key are rejected: the two-phase driver pairs the phases by key, so a
@@ -599,7 +621,9 @@ describe("transactions - end-to-end", () => {
 		it("raises read_conflict when committed item state changes between the two phases", async () => {
 			const db = makeDB({ controlled: true });
 			const keys = keysAcrossPartitions(db, 2, "read-conflict");
-			for (const key of keys) await db.putItem({ ...key, data: "value" });
+			for (const key of keys) {
+				await db.putItem({ ...key, data: "value" });
+			}
 
 			const read = betweenPhases(
 				db,
@@ -863,7 +887,9 @@ describe("transactions - end-to-end", () => {
 		let token = "";
 		for (let i = 0; i < 100 && token === ""; i++) {
 			const candidate = `pool-token-${i}`;
-			if (rootFor(db2, candidate) !== rootFor(db3, candidate)) token = candidate;
+			if (rootFor(db2, candidate) !== rootFor(db3, candidate)) {
+				token = candidate;
+			}
 		}
 		expect(token).not.toBe("");
 		const operation = { hashKey: "pool-replay", operation: "put" as const, data: "value" };

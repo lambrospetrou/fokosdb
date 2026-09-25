@@ -49,7 +49,9 @@ export class QueryPageBudget implements QueryPageBudgetState {
 		this.remainingEvaluatedBytes -= res.evaluatedBytes;
 		this.remainingResponseBytes -= res.responseBytes;
 		this.remainingPartitionVisits -= res.partitionMetas.length;
-		if (res.items.length > 0) this.allowOversizedFirstItem = false;
+		if (res.items.length > 0) {
+			this.allowOversizedFirstItem = false;
+		}
 	}
 
 	/**

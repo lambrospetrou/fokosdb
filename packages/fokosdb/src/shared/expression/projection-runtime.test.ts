@@ -42,7 +42,9 @@ function readProjected(state: DurableObjectState, plan: CompiledProjectionPlan, 
 			Record<string, SqlStorageValue>
 		>(composeProjectionStatement(plan), ...materializeExpressionBindings(plan.bindings, "pool"), hk, sk)
 		.toArray()[0];
-	if (row === undefined) return undefined;
+	if (row === undefined) {
+		return undefined;
+	}
 	return projectedItemFromWireRow(plan.names, decodeProjectedRow(row, plan.names.length));
 }
 
@@ -51,7 +53,9 @@ async function project(item: StoredFixture | null, projection: readonly Projecti
 	return await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const hashKey = KeyCodec.encode(item?.hashKey ?? "missing-hash-key");
 		const sortKey = item?.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
-		if (item) putFixture(state.storage, hashKey, sortKey, item);
+		if (item) {
+			putFixture(state.storage, hashKey, sortKey, item);
+		}
 		return readProjected(state, compileProjectionExpression(projection), hashKey, sortKey);
 	});
 }
@@ -362,7 +366,9 @@ describe("pool and direct layouts agree", () => {
 			const sortKey = item.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
 			putFixture(state.storage, hashKey, sortKey, item);
 			const direct = evaluateConditionPlan(state.storage, compileConditionExpression(condition), hashKey, sortKey);
-			if (expected !== undefined) expect(direct.conditionOk).toBe(expected);
+			if (expected !== undefined) {
+				expect(direct.conditionOk).toBe(expected);
+			}
 			const poolPlan = compileQueryExpression({ filter: condition });
 			// Every plan parameter under the pool layout reads the one pool parameter ?1.
 			expect([...poolPlan.filterSql!.matchAll(/\?(\d+)/g)].map((match) => match[1]).every((n) => n === "1")).toBe(true);
@@ -409,12 +415,16 @@ describe("query statement", () => {
 			const names = plan.projection!.names;
 			expect(projectedItemFromWireRow(names, decodeProjectedRow(scanned[0], names.length))).toEqual({ sortKey: "a", "$.n": 1 });
 			expect(projectedItemFromWireRow(names, decodeProjectedRow(scanned[2], names.length))).toEqual({ sortKey: "c", "$.n": 3 });
-			for (const column of ["p0", "t0", "p1", "t1", "p2", "t2"]) expect(scanned[1][column]).toBeNull();
+			for (const column of ["p0", "t0", "p1", "t1", "p2", "t2"]) {
+				expect(scanned[1][column]).toBeNull();
+			}
 
 			const filterOnly = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "x" }] } });
 			const complete = scan(state, filterOnly, "projection");
 			expect(complete.map((row) => row.matched)).toEqual([1, 0, 1]);
-			for (const column of ["hk", "data", "data_kind", "v"]) expect(complete[1][column]).toBeNull();
+			for (const column of ["hk", "data", "data_kind", "v"]) {
+				expect(complete[1][column]).toBeNull();
+			}
 			expect(complete[0].data).toBe(JSON.stringify({ status: "x", n: 1 }));
 			expect(complete[0].v).toBe(1);
 

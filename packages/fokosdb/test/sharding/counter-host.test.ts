@@ -9,7 +9,9 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		expect(first.routing.forwardCount).toBe(0);
 
 		// Five writes to more than one key get to the split threshold of the root.
-		for (let i = 0; i < 4; i++) await table.increment(`k-${i}`);
+		for (let i = 0; i < 4; i++) {
+			await table.increment(`k-${i}`);
+		}
 		const nodes = await table.settle((n) => n[0].stats.role === "router");
 		expect(nodes[0].stats.children).toHaveLength(4);
 		expect(nodes).toHaveLength(5);
@@ -26,14 +28,18 @@ describe.concurrent("Sharding runtime — counter host", () => {
 
 	it("keeps every write when the children split again", async () => {
 		const table = makeCounterTable();
-		for (let i = 0; i < 30; i++) await table.increment(`user-${i % 8}`);
+		for (let i = 0; i < 30; i++) {
+			await table.increment(`user-${i % 8}`);
+		}
 		const nodes = await table.settle((n) => n.length > 5);
 		expect(nodes.some((n) => n.ref.doName !== table.root.doName && n.stats.role === "router")).toBe(true);
 	});
 
 	it("keeps every write when the source of a split is killed", async () => {
 		const table = makeCounterTable();
-		for (let i = 0; i < 5; i++) await table.increment(`k-${i}`);
+		for (let i = 0; i < 5; i++) {
+			await table.increment(`k-${i}`);
+		}
 
 		// The fifth write queued the split, so the root is now the source of a split.
 		const victim = (await table.tree()).find((n) => n.stats.repartitionState !== null);
@@ -43,13 +49,17 @@ describe.concurrent("Sharding runtime — counter host", () => {
 			.debugAbort()
 			.catch(() => {});
 
-		for (let i = 0; i < 10; i++) await table.increment(`after-${i}`);
+		for (let i = 0; i < 10; i++) {
+			await table.increment(`after-${i}`);
+		}
 		await table.settle((n) => n[0].stats.role === "router");
 	});
 
 	it("does not split a partition that holds one hot key", async () => {
 		const table = makeCounterTable();
-		for (let i = 0; i < 10; i++) await table.increment("hot");
+		for (let i = 0; i < 10; i++) {
+			await table.increment("hot");
+		}
 		const [root, ...rest] = await table.settle();
 		expect(rest).toEqual([]);
 		expect(root.stats.role).toBe("owner");

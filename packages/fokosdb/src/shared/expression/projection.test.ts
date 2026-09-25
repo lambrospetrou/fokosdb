@@ -27,7 +27,9 @@ function expectExpressionError(fn: () => unknown, code: ExpressionErrorCode, mes
 	}
 	expect(caught).toBeInstanceOf(ExpressionError);
 	expect((caught as ExpressionError).code).toBe(code);
-	if (message !== undefined) expect((caught as Error).message).toMatch(message);
+	if (message !== undefined) {
+		expect((caught as Error).message).toMatch(message);
+	}
 }
 
 function assertRoundTrips(plan: CompiledProjectionPlan | CompiledQueryPlan): void {

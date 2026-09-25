@@ -169,7 +169,9 @@ describe.each(CONFIGS)("BloomFilter — $name", ({ options, keys, postRestoreKey
 
 	it("has() returns true for all added keys (no false negatives)", () => {
 		const f = make();
-		for (const k of keys) f.add(k);
+		for (const k of keys) {
+			f.add(k);
+		}
 		for (const k of keys) {
 			expect(f.has(k)).toBe(true);
 		}
@@ -193,7 +195,9 @@ describe.each(CONFIGS)("BloomFilter — $name", ({ options, keys, postRestoreKey
 
 	it("creates the expected number of layers for the given key count", () => {
 		const f = make();
-		for (const k of keys) f.add(k);
+		for (const k of keys) {
+			f.add(k);
+		}
 		const layerCount = f.toSnapshot().layers.length;
 		expect(layerCount).toBeGreaterThanOrEqual(expectedMinLayers);
 		expect(layerCount).toBeLessThanOrEqual(expectedMaxLayers);
@@ -201,7 +205,9 @@ describe.each(CONFIGS)("BloomFilter — $name", ({ options, keys, postRestoreKey
 
 	it("toSnapshot/fromSnapshot: restored filter finds all previously added keys", () => {
 		const f = make();
-		for (const k of keys) f.add(k);
+		for (const k of keys) {
+			f.add(k);
+		}
 
 		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
 
@@ -212,7 +218,9 @@ describe.each(CONFIGS)("BloomFilter — $name", ({ options, keys, postRestoreKey
 
 	it("toSnapshot/fromSnapshot: keyCount is preserved", () => {
 		const f = make();
-		for (const k of keys) f.add(k);
+		for (const k of keys) {
+			f.add(k);
+		}
 
 		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
 		expect(restored.additionsCount()).toBe(keys.length);
@@ -231,13 +239,21 @@ describe.each(CONFIGS)("BloomFilter — $name", ({ options, keys, postRestoreKey
 
 	it("toSnapshot/fromSnapshot: restored filter correctly accepts new keys after restore", () => {
 		const f = make();
-		for (const k of keys) f.add(k);
+		for (const k of keys) {
+			f.add(k);
+		}
 
 		const restored = BloomFilter.fromSnapshot(f.toSnapshot());
-		for (const k of postRestoreKeys) restored.add(k);
+		for (const k of postRestoreKeys) {
+			restored.add(k);
+		}
 
-		for (const k of keys) expect(restored.has(k)).toBe(true);
-		for (const k of postRestoreKeys) expect(restored.has(k)).toBe(true);
+		for (const k of keys) {
+			expect(restored.has(k)).toBe(true);
+		}
+		for (const k of postRestoreKeys) {
+			expect(restored.has(k)).toBe(true);
+		}
 		expect(restored.additionsCount()).toBe(keys.length + postRestoreKeys.length);
 	});
 });
@@ -308,7 +324,9 @@ describe("BloomFilter — maxSizeBytes enforcement", () => {
 	it("add() returns AlreadyPresent for false-positive keys even when saturated", () => {
 		const f = BloomFilter.create({ maxSizeBytes: 300, initialCapacityN: 4, errorRate: 0.01 });
 		for (let i = 0; i < 100_000; i++) {
-			if (f.add(`key-${i}`) === AddResult.Full) break;
+			if (f.add(`key-${i}`) === AddResult.Full) {
+				break;
+			}
 		}
 		// extra-3 false-positives against existing bits — the filter correctly
 		// reports it as "already present".

@@ -21,8 +21,12 @@ export type Query = QueryItemsOptions["queries"][number];
 
 /** The canonical bytes of a key: raw UTF-8 for a string, a 0xFF tag ahead of a binary key, empty for an absent one. */
 function encodeKey(key: OptionalQueryKey): Uint8Array {
-	if (key === undefined) return new Uint8Array(0);
-	if (typeof key === "string") return textEncoder.encode(key);
+	if (key === undefined) {
+		return new Uint8Array(0);
+	}
+	if (typeof key === "string") {
+		return textEncoder.encode(key);
+	}
 	const out = new Uint8Array(key.byteLength + 1);
 	out[0] = 0xff;
 	out.set(key, 1);
@@ -33,7 +37,9 @@ function encodeKey(key: OptionalQueryKey): Uint8Array {
 function compareBytes(a: Uint8Array, b: Uint8Array): number {
 	const min = Math.min(a.length, b.length);
 	for (let i = 0; i < min; i++) {
-		if (a[i] !== b[i]) return a[i] - b[i];
+		if (a[i] !== b[i]) {
+			return a[i] - b[i];
+		}
 	}
 	return a.length - b.length;
 }
@@ -45,7 +51,9 @@ const isEmptyKey = (key: QueryKey): boolean => (typeof key === "string" ? key.le
 
 /** Whether one stored sort key satisfies the sort-key condition of a query. */
 function matchesSortKeyCondition(sortKey: Uint8Array, condition: SortKeyCondition | undefined): boolean {
-	if (condition === undefined) return true;
+	if (condition === undefined) {
+		return true;
+	}
 	const cmp = (bound: QueryKey) => compareBytes(sortKey, encodeKey(bound));
 	switch (condition.op) {
 		case "eq":
@@ -66,11 +74,15 @@ function matchesSortKeyCondition(sortKey: Uint8Array, condition: SortKeyConditio
 		case "range": {
 			if (condition.lower !== undefined) {
 				const c = cmp(condition.lower.value);
-				if (c < 0 || (c === 0 && !condition.lower.inclusive)) return false;
+				if (c < 0 || (c === 0 && !condition.lower.inclusive)) {
+					return false;
+				}
 			}
 			if (condition.upper !== undefined) {
 				const c = cmp(condition.upper.value);
-				if (c > 0 || (c === 0 && !condition.upper.inclusive)) return false;
+				if (c > 0 || (c === 0 && !condition.upper.inclusive)) {
+					return false;
+				}
 			}
 			return true;
 		}
@@ -122,7 +134,9 @@ export function expectedItems(model: QueryModel, query: Query): QueryModelItem[]
 		(item) => compareBytes(item.hashKeyBytes, hashKeyBytes) === 0 && matchesSortKeyCondition(item.sortKeyBytes, query.sortKeyCondition),
 	);
 	matched.sort((a, b) => compareBytes(a.sortKeyBytes, b.sortKeyBytes));
-	if (query.scanIndexForward === false) matched.reverse();
+	if (query.scanIndexForward === false) {
+		matched.reverse();
+	}
 	return matched;
 }
 
@@ -139,9 +153,14 @@ function expectPageInvariants(page: QueryItemsResult, opts: QueryItemsOptions): 
 	// that the evidence could not name. The client skips such a leaf instead of reporting a
 	// partition it cannot identify, so a page names no more partitions than it visited.
 	expect(page.meta.partitionsVisited).toBeGreaterThanOrEqual(page.partitionMetas.length);
-	if (opts.limit !== undefined) expect(page.scannedCount).toBeLessThanOrEqual(opts.limit);
-	if (opts.select === "count") expect(page.items).toHaveLength(0);
-	else expect(page.items).toHaveLength(page.count);
+	if (opts.limit !== undefined) {
+		expect(page.scannedCount).toBeLessThanOrEqual(opts.limit);
+	}
+	if (opts.select === "count") {
+		expect(page.items).toHaveLength(0);
+	} else {
+		expect(page.items).toHaveLength(page.count);
+	}
 }
 
 /** A page can stop between two sub-queries, so the bound holds one page per item and per sub-query. */
@@ -293,7 +312,9 @@ export async function leavesOf(db: FokosDB, opts: QueryItemsOptions): Promise<st
 export async function pollLeaves(db: FokosDB, accept: (leaves: string[]) => boolean, attempts = 600): Promise<string[] | undefined> {
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const leaves = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
-		if (accept(leaves)) return leaves;
+		if (accept(leaves)) {
+			return leaves;
+		}
 		await sleep(25);
 	}
 	return undefined;
@@ -302,7 +323,9 @@ export async function pollLeaves(db: FokosDB, accept: (leaves: string[]) => bool
 /** Polls as `pollLeaves` does, and fails the suite with `goal` when the tree never gets there. */
 async function awaitLeaves(db: FokosDB, accept: (leaves: string[]) => boolean, goal: string): Promise<string[]> {
 	const leaves = await pollLeaves(db, accept);
-	if (leaves === undefined) throw new Error(`the fixture never reached: ${goal}`);
+	if (leaves === undefined) {
+		throw new Error(`the fixture never reached: ${goal}`);
+	}
 	return leaves;
 }
 
@@ -329,8 +352,11 @@ async function findBoundaries(db: FokosDB, leaves: readonly string[], sorted: re
 		let hi = sorted.length - 1;
 		while (lo < hi) {
 			const mid = (lo + hi) >> 1;
-			if ((await ownerRank(db, leaves, sorted[mid])) >= rank) hi = mid;
-			else lo = mid + 1;
+			if ((await ownerRank(db, leaves, sorted[mid])) >= rank) {
+				hi = mid;
+			} else {
+				lo = mid + 1;
+			}
 		}
 		const boundary = sorted[lo];
 		expect(boundary, "a boundary key is never the absent sort key").toBeDefined();
@@ -375,11 +401,17 @@ async function scanBoundaries(db: FokosDB, sorted: readonly OptionalQueryKey[]):
 		try {
 			const boundaries = await findBoundaries(db, leaves, sorted);
 			const after = await leavesOf(db, { queries: [{ hashKey: HOT_HASH_KEY }] });
-			if (after.join() === leaves.join()) return { leaves, boundaries };
+			if (after.join() === leaves.join()) {
+				return { leaves, boundaries };
+			}
 		} catch (e) {
-			if (attempt >= attempts) throw e;
+			if (attempt >= attempts) {
+				throw e;
+			}
 		}
-		if (attempt >= attempts) throw new Error("the range tree did not stop its splits during the boundary scans");
+		if (attempt >= attempts) {
+			throw new Error("the range tree did not stop its splits during the boundary scans");
+		}
 	}
 }
 
@@ -478,7 +510,11 @@ function boundPool(fixture: Fixture): QueryKey[] {
 	for (const boundary of boundaries) {
 		const index = hotSortKeys.findIndex((key) => compareBytes(encodeKey(key), encodeKey(boundary)) === 0);
 		pool.push(boundary);
-		for (const neighbour of [hotSortKeys[index - 1], hotSortKeys[index + 1]]) if (neighbour !== undefined) pool.push(neighbour);
+		for (const neighbour of [hotSortKeys[index - 1], hotSortKeys[index + 1]]) {
+			if (neighbour !== undefined) {
+				pool.push(neighbour);
+			}
+		}
 		if (typeof boundary === "string") {
 			// One bound just inside the previous child, and one just inside this one.
 			pool.push(boundary.slice(0, -1), `${boundary}~`);
@@ -486,7 +522,9 @@ function boundPool(fixture: Fixture): QueryKey[] {
 	}
 	// A few ordinary keys, spread over the tree, and the ends of the key space. The pool also draws
 	// from the emptied leaf, so a bound lands inside the stretch that holds nothing.
-	for (let i = 0; i < hotSortKeys.length; i += Math.ceil(hotSortKeys.length / 6)) pool.push(hotSortKeys[i] as QueryKey);
+	for (let i = 0; i < hotSortKeys.length; i += Math.ceil(hotSortKeys.length / 6)) {
+		pool.push(hotSortKeys[i] as QueryKey);
+	}
 	const emptied = fixture.emptiedKeys;
 	if (emptied.length > 0) {
 		pool.push(emptied[0] as QueryKey, emptied[Math.floor(emptied.length / 2)] as QueryKey, emptied[emptied.length - 1] as QueryKey);
@@ -589,12 +627,16 @@ export function budgetFor(
 function countBeforeEmptyLeaf(expected: readonly QueryModelItem[], fixture: Fixture): number {
 	const emptied = fixture.emptiedKeys;
 	// A fixture without an emptied leaf has no such stop.
-	if (emptied.length === 0) return 0;
+	if (emptied.length === 0) {
+		return 0;
+	}
 	const start = encodeKey(emptied[0]);
 	const end = encodeKey(emptied[emptied.length - 1]);
 	const index = expected.findIndex((item) => compareBytes(item.sortKeyBytes, start) >= 0 && compareBytes(item.sortKeyBytes, end) <= 0);
 	// The answer never enters the emptied stretch, so no page can stop on it.
-	if (index >= 0) return 0;
+	if (index >= 0) {
+		return 0;
+	}
 	const before = expected.filter((item) => compareBytes(item.sortKeyBytes, start) < 0).length;
 	const after = expected.filter((item) => compareBytes(item.sortKeyBytes, end) > 0).length;
 	// The walk reaches the empty leaf from below when it scans upwards, and from above when it does not.

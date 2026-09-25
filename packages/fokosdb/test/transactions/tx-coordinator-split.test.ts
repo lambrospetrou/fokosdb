@@ -68,7 +68,9 @@ async function awaitSplitSettled(coordinator: FokosDbRouteContext, token: string
 			const { children, settled } = await runInDurableObject(stub, (instance: TransactionCoordinatorDO) => {
 				const lifecycle = instance.fokos.lifecycle();
 				const resolved = instance.fokos.resolveOwner(tokenKey(token));
-				if (resolved.kind === "remote") owner = resolved.target;
+				if (resolved.kind === "remote") {
+					owner = resolved.target;
+				}
 				return {
 					children: instance.fokos.children(),
 					settled: lifecycle.role === "router" && lifecycle.activeRepartition === null,

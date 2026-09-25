@@ -202,7 +202,9 @@ export class RepartitionSource {
 	 */
 	canQueue(request: { kind: RepartitionKind; hashKey?: KeyBytes }): boolean {
 		const { identity } = this.deps.identity();
-		if (this.store.getSplitRepartition()) return false;
+		if (this.store.getSplitRepartition()) {
+			return false;
+		}
 		switch (request.kind) {
 			case "hash_split":
 				return identity.kind === "hash" && !this.store.hasUnfinishedPromotion();
@@ -227,22 +229,34 @@ export class RepartitionSource {
 	queue(request: { kind: RepartitionKind; hashKey?: KeyBytes; data?: unknown }, now = Date.now()): RepartitionRow | undefined {
 		const { ctx, identity } = this.deps.identity();
 		const row = this.store.transactionSync((): RepartitionRow | undefined => {
-			if (this.store.getSplitRepartition()) return undefined;
+			if (this.store.getSplitRepartition()) {
+				return undefined;
+			}
 
 			switch (request.kind) {
 				case "hash_split":
-					if (identity.kind !== "hash") return undefined;
+					if (identity.kind !== "hash") {
+						return undefined;
+					}
 					// A promotion that has not finished still owns its key's move; a split would have to
 					// abandon or carry it, and neither is possible without a cancellation fence.
-					if (this.store.hasUnfinishedPromotion()) return undefined;
+					if (this.store.hasUnfinishedPromotion()) {
+						return undefined;
+					}
 					break;
 				case "range_split":
-					if (identity.kind !== "range") return undefined;
+					if (identity.kind !== "range") {
+						return undefined;
+					}
 					break;
 				case "key_promotion":
-					if (identity.kind !== "hash") return undefined;
+					if (identity.kind !== "hash") {
+						return undefined;
+					}
 					invariant(request.hashKey, "fokos/repartition.queue: a key promotion needs its hash key");
-					if (this.store.hasRouteOverride(request.hashKey)) return undefined;
+					if (this.store.hasRouteOverride(request.hashKey)) {
+						return undefined;
+					}
 					break;
 			}
 
@@ -259,7 +273,9 @@ export class RepartitionSource {
 			});
 			// The override exists from the moment the promotion is queued, so a second request for the
 			// same key finds it and no key is ever queued twice.
-			if (request.kind === "key_promotion") this.store.insertRouteOverride(request.hashKey!, id);
+			if (request.kind === "key_promotion") {
+				this.store.insertRouteOverride(request.hashKey!, id);
+			}
 			this.store.putPlanHead(id, {
 				schema: 1,
 				queue: { policy: ctx.policy, ...(request.data === undefined ? {} : { data: request.data }) },
@@ -312,7 +328,9 @@ export class RepartitionSource {
 	 */
 	async sourceStep(now = Date.now()): Promise<StepOutcome> {
 		const row = this.store.selectDueRepartition(now);
-		if (!row) return "idle";
+		if (!row) {
+			return "idle";
+		}
 		switch (row.state) {
 			case "queued":
 				return this.#plan(row, now);
@@ -400,7 +418,9 @@ export class RepartitionSource {
 
 		this.store.transactionSync(() => {
 			const current = this.store.getRepartition(row.id);
-			if (current?.state !== "queued") return;
+			if (current?.state !== "queued") {
+				return;
+			}
 			this.store.putPlanHead(row.id, { ...head, planned });
 			targets.forEach((t, index) => {
 				this.store.insertRepartitionTarget({
@@ -421,7 +441,9 @@ export class RepartitionSource {
 
 	async #advancePlanned(row: RepartitionRow, now: number): Promise<StepOutcome> {
 		const counts = this.store.countRepartitionTargets(row.id);
-		if (counts.total > 0 && counts.initialized === counts.total) return this.#cutover(row, now);
+		if (counts.total > 0 && counts.initialized === counts.total) {
+			return this.#cutover(row, now);
+		}
 		return await this.#initializeTargets(row, now);
 	}
 
@@ -450,7 +472,9 @@ export class RepartitionSource {
 
 		this.store.transactionSync(() => {
 			for (const target of due) {
-				if (target.initialization !== "pending") continue;
+				if (target.initialization !== "pending") {
+					continue;
+				}
 				this.store.setTargetInitialization(row.id, target.partitionId, "initializing", target.attempts, target.nextAttemptAt);
 			}
 		});
@@ -482,7 +506,9 @@ export class RepartitionSource {
 				}
 				this.store.refreshRepartitionDue(row.id, now);
 			});
-			if (result.status === "rejected") this.#logStepFailure("fokosInit", row, target, result.reason);
+			if (result.status === "rejected") {
+				this.#logStepFailure("fokosInit", row, target, result.reason);
+			}
 		});
 		return "progressed";
 	}
@@ -494,9 +520,13 @@ export class RepartitionSource {
 	#cutover(row: RepartitionRow, now: number): StepOutcome {
 		const outcome = this.store.transactionSync((): StepOutcome => {
 			const current = this.store.getRepartition(row.id);
-			if (current?.state !== "planned") return "idle";
+			if (current?.state !== "planned") {
+				return "idle";
+			}
 			const counts = this.store.countRepartitionTargets(row.id);
-			if (counts.total === 0 || counts.initialized !== counts.total) return "idle";
+			if (counts.total === 0 || counts.initialized !== counts.total) {
+				return "idle";
+			}
 
 			// Consulted again here, not only before initialization: the condition the hook tests can
 			// change while the targets are created, and moving ownership then would strand host state on
@@ -568,10 +598,14 @@ export class RepartitionSource {
 	 */
 	sourceCleanupStep(now = Date.now()): StepOutcome {
 		const row = this.store.selectDueCleanup(now);
-		if (!row) return "idle";
+		if (!row) {
+			return "idle";
+		}
 		return this.store.transactionSync((): StepOutcome => {
 			const current = this.store.getRepartition(row.id);
-			if (current?.state !== "completed") return "idle";
+			if (current?.state !== "completed") {
+				return "idle";
+			}
 			const done = this.deps.hooks.cleanupSourceStep?.(this.#hookPlan(current)) ?? true;
 			if (done) {
 				this.store.deletePlanChain(row.id);
@@ -591,7 +625,9 @@ export class RepartitionSource {
 	 * an interval chosen for polling. Returns false when no promotion was waiting.
 	 */
 	onRepartitionUnblocked(now = Date.now()): boolean {
-		if (!this.store.hasUnfinishedPromotion()) return false;
+		if (!this.store.hasUnfinishedPromotion()) {
+			return false;
+		}
 		this.store.transactionSync(() => this.store.markPromotionsDueNow(now));
 		return true;
 	}
@@ -600,8 +636,12 @@ export class RepartitionSource {
 	sourceDeadline(): number | null {
 		const step = this.store.earliestRepartitionDeadline();
 		const cleanup = this.store.earliestCleanupDeadline();
-		if (step === null) return cleanup;
-		if (cleanup === null) return step;
+		if (step === null) {
+			return cleanup;
+		}
+		if (cleanup === null) {
+			return step;
+		}
 		return Math.min(step, cleanup);
 	}
 
@@ -610,7 +650,9 @@ export class RepartitionSource {
 	 * depth plus one, which only the source knows, so it fills it in on the way out.
 	 */
 	materializeSlice(stored: RepartitionSlice): FokosSlice {
-		if (stored.kind !== "hash_child") return stored;
+		if (stored.kind !== "hash_child") {
+			return stored;
+		}
 		return { kind: "hash_child", childIndex: stored.childIndex, depth: identityDepth(this.deps.identity().identity) + 1 };
 	}
 
@@ -639,7 +681,9 @@ export class RepartitionSource {
 	#deferTargets(row: RepartitionRow, now: number, delayMs: number): void {
 		this.store.transactionSync(() => {
 			for (const target of this.store.listRepartitionTargets(row.id, row.kind)) {
-				if (target.initialization === "initialized") continue;
+				if (target.initialization === "initialized") {
+					continue;
+				}
 				this.store.setTargetAttempt(row.id, target.partitionId, target.attempts, now + delayMs);
 			}
 			this.store.refreshRepartitionDue(row.id, now);
@@ -689,7 +733,9 @@ export class RepartitionSource {
 							},
 			};
 			bytes += statusEntryBytes(entry);
-			if (bytes > maxBytes && entries.length > 0) break;
+			if (bytes > maxBytes && entries.length > 0) {
+				break;
+			}
 			entries.push(entry);
 		}
 		const last = rows[entries.length - 1];
@@ -707,14 +753,20 @@ export class RepartitionSource {
 	acceptAck(req: FokosMigrationAckRequest, now = Date.now()): void {
 		this.store.transactionSync(() => {
 			const { row } = this.#requireTarget(req.repartitionId, req.target);
-			if (row.state === "queued" || row.state === "planned") throw notCutOver(row.id);
+			if (row.state === "queued" || row.state === "planned") {
+				throw notCutOver(row.id);
+			}
 			// A repeated acknowledgement in cutover, completed or cleaned is a success: the target retries
 			// until the source answers, and it cannot know which attempt landed.
-			if (row.state !== "cutover") return;
+			if (row.state !== "cutover") {
+				return;
+			}
 
 			this.store.setTargetAcknowledged(row.id, req.target.partitionId);
 			const counts = this.store.countRepartitionTargets(row.id);
-			if (counts.acknowledged < counts.total) return;
+			if (counts.acknowledged < counts.total) {
+				return;
+			}
 
 			this.store.setRepartitionState(row.id, "completed", { completedAt: now });
 			// Every target now holds its own copy of the slice, so the host can drop what it kept for them.
@@ -730,7 +782,9 @@ export class RepartitionSource {
 	 */
 	resolveCallerSlice(repartitionId: string, caller: FokosPartitionRef): FokosSlice {
 		const { row, target } = this.#requireTarget(repartitionId, caller);
-		if (row.state === "queued" || row.state === "planned") throw notCutOver(row.id);
+		if (row.state === "queued" || row.state === "planned") {
+			throw notCutOver(row.id);
+		}
 		// A split source keeps its item rows for life, so it can still answer a read from them. A
 		// promotion gives the rows of its key back after every target acknowledges. From that moment
 		// its local copies are stale or already gone.
@@ -778,7 +832,9 @@ export class RepartitionSource {
 	 */
 	servePage(req: FokosMigrationPullRequest): FokosMigrationPage {
 		const { row, target } = this.#requireTarget(req.repartitionId, req.target);
-		if (row.state === "queued" || row.state === "planned") throw notCutOver(row.id);
+		if (row.state === "queued" || row.state === "planned") {
+			throw notCutOver(row.id);
+		}
 		if (row.state === "completed" || row.state === "cleaned") {
 			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
 				message: "the repartition is complete and the source no longer serves its pages",
@@ -788,7 +844,9 @@ export class RepartitionSource {
 
 		const slice = this.materializeSlice(target.slice);
 		const cursor: FokosMigrationCursor = req.cursor ?? { phase: "overrides", inner: null };
-		if (cursor.phase === "overrides") return this.#buildOverridesPage(row, slice, cursor.inner);
+		if (cursor.phase === "overrides") {
+			return this.#buildOverridesPage(row, slice, cursor.inner);
+		}
 
 		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice));
 		return { phase: "host", page, nextCursor: nextCursor === null ? null : { phase: "host", inner: nextCursor } };
@@ -811,7 +869,9 @@ export class RepartitionSource {
 	 * promoted-key slice is itself inside a range tree, which holds no overrides of its own.
 	 */
 	#buildOverridesPage(row: RepartitionRow, slice: FokosSlice, inner: PromotedKeyCursor | null): FokosMigrationPage {
-		if (row.kind !== "hash_split") return { phase: "overrides", overrides: [], nextCursor: { phase: "host", inner: null } };
+		if (row.kind !== "hash_split") {
+			return { phase: "overrides", overrides: [], nextCursor: { phase: "host", inner: null } };
+		}
 
 		const n = this.deps.identity().ctx.topology.hashSplitN;
 		const { rows, nextCursor } = collectBatch<{ hashKey: KeyBytes }, PromotedKeyCursor>({
@@ -854,8 +914,12 @@ export class RepartitionTarget {
 	 */
 	async importOnePage(now = Date.now()): Promise<StepOutcome> {
 		const rec = this.importRecord();
-		if (!rec || rec.state === "imported" || rec.state === "active") return "idle";
-		if (rec.nextAttemptAt > now) return "idle";
+		if (!rec || rec.state === "imported" || rec.state === "active") {
+			return "idle";
+		}
+		if (rec.nextAttemptAt > now) {
+			return "idle";
+		}
 
 		const peer = this.deps.getPeer(rec.source);
 		let page: FokosMigrationPage;
@@ -899,11 +963,18 @@ export class RepartitionTarget {
 			// revived after eviction, can hold a page the durable cursor has already moved past; applying
 			// it would re-insert rows a user deleted after the import finished.
 			const current = this.importRecord();
-			if (!current || current.state === "imported" || current.state === "active") return false;
-			if (current.repartitionId !== rec.repartitionId || !cursorsEqual(current.cursor, rec.cursor)) return false;
+			if (!current || current.state === "imported" || current.state === "active") {
+				return false;
+			}
+			if (current.repartitionId !== rec.repartitionId || !cursorsEqual(current.cursor, rec.cursor)) {
+				return false;
+			}
 
-			if (page.phase === "overrides") this.#applyOverrides(page.overrides, now);
-			else this.deps.hooks.migration.applyPage(page.page, current.slice);
+			if (page.phase === "overrides") {
+				this.#applyOverrides(page.overrides, now);
+			} else {
+				this.deps.hooks.migration.applyPage(page.page, current.slice);
+			}
 
 			this.#putImport({
 				...current,
@@ -936,10 +1007,14 @@ export class RepartitionTarget {
 	 * link — which is why it is written as a finished promotion rather than as a bare override.
 	 */
 	#applyOverrides(overrides: readonly { hashKey: KeyBytes }[], now: number): void {
-		if (overrides.length === 0) return;
+		if (overrides.length === 0) {
+			return;
+		}
 		const { ctx } = this.deps.identity();
 		for (const { hashKey } of overrides) {
-			if (this.store.hasRouteOverride(hashKey)) continue;
+			if (this.store.hasRouteOverride(hashKey)) {
+				continue;
+			}
 			const seq = this.store.nextRepartitionSeq();
 			const id = `r${seq}`;
 			this.store.insertRepartition({
@@ -1069,13 +1144,17 @@ export class RepartitionTarget {
 				attributes: { repartitionId: req.repartitionId, stored: rec.source.doName, received: req.source.doName },
 			});
 		}
-		if (rec.state === "imported" || rec.state === "active") return;
+		if (rec.state === "imported" || rec.state === "active") {
+			return;
+		}
 		// The source has cut over. That is new information, so it clears the deadline this target sits
 		// behind. Without it, a target that pulled too early waits out a backoff it earned before the
 		// source was ready.
 		this.store.transactionSync(() => {
 			const current = this.importRecord();
-			if (!current || current.state === "imported" || current.state === "active") return;
+			if (!current || current.state === "imported" || current.state === "active") {
+				return;
+			}
 			this.#putImport({ ...current, attempts: 0, nextAttemptAt: now, updatedAt: now });
 		});
 		await this.deps.ensureAlarmSet(now + IMPORT_RETRY_BASE_MS);
@@ -1088,8 +1167,12 @@ export class RepartitionTarget {
 	 */
 	async sendAck(now = Date.now()): Promise<StepOutcome> {
 		const rec = this.importRecord();
-		if (!rec || rec.state !== "imported") return "idle";
-		if (rec.nextAttemptAt > now) return "idle";
+		if (!rec || rec.state !== "imported") {
+			return "idle";
+		}
+		if (rec.nextAttemptAt > now) {
+			return "idle";
+		}
 
 		const peer = this.deps.getPeer(rec.source);
 		try {
@@ -1103,7 +1186,9 @@ export class RepartitionTarget {
 		}
 		this.store.transactionSync(() => {
 			const current = this.importRecord();
-			if (current?.state !== "imported") return;
+			if (current?.state !== "imported") {
+				return;
+			}
 			this.#putImport({ ...current, state: "active", attempts: 0, nextAttemptAt: now, updatedAt: now });
 		});
 		return "progressed";
@@ -1112,7 +1197,9 @@ export class RepartitionTarget {
 	/** The target's own next deadline, or null when it has no import work left. */
 	importDeadline(): number | null {
 		const rec = this.importRecord();
-		if (!rec || rec.state === "active") return null;
+		if (!rec || rec.state === "active") {
+			return null;
+		}
 		return rec.nextAttemptAt;
 	}
 
@@ -1125,7 +1212,9 @@ export class RepartitionTarget {
 		const delay = retryDelay(error, attempts, IMPORT_RETRY_BASE_MS, IMPORT_RETRY_MAX_MS, NOT_CUT_OVER_RETRY_MS);
 		this.store.transactionSync(() => {
 			const current = this.importRecord();
-			if (!current || current.state === "active") return;
+			if (!current || current.state === "active") {
+				return;
+			}
 			this.#putImport({ ...current, attempts, nextAttemptAt: now + delay, updatedAt: now });
 		});
 		console.error({
@@ -1143,7 +1232,9 @@ export class RepartitionTarget {
 }
 
 function retryDelay(error: unknown, attempts: number, base = SOURCE_RETRY_BASE_MS, max = SOURCE_RETRY_MAX_MS, flat?: number): number {
-	if (flat !== undefined && FokosError.isCode(error, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over)) return flat;
+	if (flat !== undefined && FokosError.isCode(error, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over)) {
+		return flat;
+	}
 	// A protocol defect no retry can fix still keeps its state and its identifiers; it simply waits
 	// long enough that it costs nothing while an operator looks at the log.
 	if (
@@ -1176,10 +1267,16 @@ function statusEntryBytes(entry: FokosStatusEntry): number {
 
 /** Compares two migration cursors by value. Both ends survive a KV structured-clone round trip. */
 function cursorsEqual(a: FokosMigrationCursor | null, b: FokosMigrationCursor | null): boolean {
-	if (a === null || b === null) return a === b;
-	if (a.phase !== b.phase) return false;
+	if (a === null || b === null) {
+		return a === b;
+	}
+	if (a.phase !== b.phase) {
+		return false;
+	}
 	if (a.phase === "overrides" && b.phase === "overrides") {
-		if (a.inner === null || b.inner === null) return a.inner === b.inner;
+		if (a.inner === null || b.inner === null) {
+			return a.inner === b.inner;
+		}
 		return KeyCodec.compare(a.inner.hashKey, b.inner.hashKey) === 0;
 	}
 	// The host cursor is opaque, so it is compared as its serialized form rather than field by field.
@@ -1187,7 +1284,9 @@ function cursorsEqual(a: FokosMigrationCursor | null, b: FokosMigrationCursor | 
 }
 
 function slicesEqual(a: FokosSlice, b: FokosSlice): boolean {
-	if (a.kind !== b.kind) return false;
+	if (a.kind !== b.kind) {
+		return false;
+	}
 	const keyEq = (x: KeyBytes | null, y: KeyBytes | null) => (x === null || y === null ? x === y : KeyCodec.compare(x, y) === 0);
 	switch (a.kind) {
 		case "hash_child":

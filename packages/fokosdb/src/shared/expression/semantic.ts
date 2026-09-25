@@ -101,7 +101,9 @@ export function validateProjectionExpression(expression: unknown): ProjectionExp
 		assertFields(entry, "expr", undefined, "as");
 		analyzeValue(entry.expr, 1, context);
 		const name = projectionEntryName(entry);
-		if (names.has(name)) throw new ExpressionError("invalid_ast", "duplicate projection name");
+		if (names.has(name)) {
+			throw new ExpressionError("invalid_ast", "duplicate projection name");
+		}
 		names.add(name);
 	}
 	return { names: [...names], requiredColumns: requiredColumnsFrom(context) };
@@ -109,16 +111,24 @@ export function validateProjectionExpression(expression: unknown): ProjectionExp
 
 function projectionEntryName(entry: Record<string, unknown>): string {
 	if (entry.as !== undefined) {
-		if (typeof entry.as !== "string") throw new ExpressionError("invalid_ast", "projection alias must be a string");
-		if (entry.as.length === 0) throw new ExpressionError("invalid_ast", "projection alias must not be empty");
+		if (typeof entry.as !== "string") {
+			throw new ExpressionError("invalid_ast", "projection alias must be a string");
+		}
+		if (entry.as.length === 0) {
+			throw new ExpressionError("invalid_ast", "projection alias must not be empty");
+		}
 		if (!utf8WithinLimit(entry.as, EXPRESSION_LIMITS.projectionAliasBytes)) {
 			throw new ExpressionError("complexity_limit", "projection alias exceeds the alias limit");
 		}
 		return entry.as;
 	}
 	const expr = entry.expr as Record<string, unknown>;
-	if (expr.ref === "data" && Object.hasOwn(expr, "path")) return expr.path as string;
-	if (typeof expr.ref === "string") return expr.ref;
+	if (expr.ref === "data" && Object.hasOwn(expr, "path")) {
+		return expr.path as string;
+	}
+	if (typeof expr.ref === "string") {
+		return expr.ref;
+	}
 	throw new ExpressionError("invalid_ast", "projection alias is required for a computed value");
 }
 
@@ -135,7 +145,9 @@ function orderedTypesFrom(types: ReadonlySet<ExpressionNativeType>): readonly Ex
 }
 
 function assertDepth(depth: number): void {
-	if (depth > EXPRESSION_LIMITS.astDepth) throw new ExpressionError("complexity_limit", "AST depth exceeds the limit");
+	if (depth > EXPRESSION_LIMITS.astDepth) {
+		throw new ExpressionError("complexity_limit", "AST depth exceeds the limit");
+	}
 }
 
 function countOperation(context: AnalysisContext): void {
@@ -146,7 +158,9 @@ function countOperation(context: AnalysisContext): void {
 }
 
 function assertNode(value: unknown, message: string): asserts value is Record<string, unknown> {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) throw new ExpressionError("invalid_ast", message);
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		throw new ExpressionError("invalid_ast", message);
+	}
 }
 
 function assertFields(record: Record<string, unknown>, required1: string, required2?: string, optional?: string): void {
@@ -161,18 +175,24 @@ function assertFields(record: Record<string, unknown>, required1: string, requir
 }
 
 function assertArgs(value: unknown): asserts value is readonly unknown[] {
-	if (!Array.isArray(value)) throw new ExpressionError("invalid_ast", "expression args must be an array");
+	if (!Array.isArray(value)) {
+		throw new ExpressionError("invalid_ast", "expression args must be an array");
+	}
 }
 
 function assertArity(args: readonly unknown[], minimum: number, maximum = minimum): void {
-	if (args.length < minimum || args.length > maximum) throw new ExpressionError("invalid_arity", "invalid expression argument count");
+	if (args.length < minimum || args.length > maximum) {
+		throw new ExpressionError("invalid_arity", "invalid expression argument count");
+	}
 }
 
 function analyzeCondition(expression: unknown, depth: number, context: AnalysisContext): void {
 	assertDepth(depth);
 	assertNode(expression, "invalid condition expression");
 	assertFields(expression, "op", "args");
-	if (typeof expression.op !== "string") throw new ExpressionError("invalid_ast", "invalid condition operator");
+	if (typeof expression.op !== "string") {
+		throw new ExpressionError("invalid_ast", "invalid condition operator");
+	}
 	assertArgs(expression.args);
 	const args = expression.args;
 	countOperation(context);
@@ -198,12 +218,18 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 			const upper = analyzeValue(args[2], depth + 1, context);
 			assertNoEmptyKeyLiteral(value, lower);
 			assertNoEmptyKeyLiteral(value, upper);
-			if (!hasCommonType3(value, lower, upper, orderedTypes)) throw new ExpressionError("invalid_type", "incompatible expression types");
+			if (!hasCommonType3(value, lower, upper, orderedTypes)) {
+				throw new ExpressionError("invalid_type", "incompatible expression types");
+			}
 			return;
 		}
 		case "in": {
-			if (args.length < 2) throw new ExpressionError("invalid_arity", "invalid expression argument count");
-			if (args.length - 1 > EXPRESSION_LIMITS.inChoices) throw new ExpressionError("complexity_limit", "in choice limit exceeded");
+			if (args.length < 2) {
+				throw new ExpressionError("invalid_arity", "invalid expression argument count");
+			}
+			if (args.length - 1 > EXPRESSION_LIMITS.inChoices) {
+				throw new ExpressionError("complexity_limit", "in choice limit exceeded");
+			}
 			const target = analyzeValue(args[0], depth + 1, context);
 			let byteChoice = false;
 			let scalarChoice = false;
@@ -211,16 +237,23 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 				const choice = analyzeValue(args[i], depth + 1, context);
 				assertNoEmptyKeyLiteral(target, choice);
 				assertCompatible(target, choice, equalityTypes);
-				if (choice.byteLiteral) byteChoice = true;
-				else if (Object.hasOwn(args[i] as object, "val")) scalarChoice = true;
+				if (choice.byteLiteral) {
+					byteChoice = true;
+				} else if (Object.hasOwn(args[i] as object, "val")) {
+					scalarChoice = true;
+				}
 			}
-			if (byteChoice && scalarChoice) throw new ExpressionError("invalid_type", "in choices must not mix byte and scalar literals");
+			if (byteChoice && scalarChoice) {
+				throw new ExpressionError("invalid_type", "in choices must not mix byte and scalar literals");
+			}
 			return;
 		}
 		case "and":
 		case "or":
 			assertArity(args, 2, Number.POSITIVE_INFINITY);
-			for (const arg of args) analyzeCondition(arg, depth + 1, context);
+			for (const arg of args) {
+				analyzeCondition(arg, depth + 1, context);
+			}
 			return;
 		case "not":
 			assertArity(args, 1);
@@ -244,7 +277,9 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 			const container = analyzeValue(args[0], depth + 1, context);
 			const search = analyzeValue(args[1], depth + 1, context);
 			assertNoEmptyKeyLiteral(container, search);
-			if (!canContain(container.types, search.types)) throw new ExpressionError("invalid_type", "incompatible contains types");
+			if (!canContain(container.types, search.types)) {
+				throw new ExpressionError("invalid_type", "incompatible contains types");
+			}
 			return;
 		}
 		default:
@@ -337,17 +372,25 @@ function analyzeUpdate(expression: unknown, context: AnalysisContext): void {
 
 	const removalsByParent: { parent: readonly PathSegment[]; hasPlain: boolean; hasReverse: boolean }[] = [];
 	for (const t of targets) {
-		if (t.action !== "remove") continue;
+		if (t.action !== "remove") {
+			continue;
+		}
 		const last = t.segments[t.segments.length - 1];
-		if (last.kind !== "index" && last.kind !== "reverseIndex") continue;
+		if (last.kind !== "index" && last.kind !== "reverseIndex") {
+			continue;
+		}
 		const parent = t.segments.slice(0, -1);
 		let entry = removalsByParent.find((e) => pathsEqual(e.parent, parent));
 		if (!entry) {
 			entry = { parent, hasPlain: false, hasReverse: false };
 			removalsByParent.push(entry);
 		}
-		if (last.kind === "index") entry.hasPlain = true;
-		if (last.kind === "reverseIndex") entry.hasReverse = true;
+		if (last.kind === "index") {
+			entry.hasPlain = true;
+		}
+		if (last.kind === "reverseIndex") {
+			entry.hasReverse = true;
+		}
 		if (entry.hasPlain && entry.hasReverse) {
 			throw new ExpressionError("invalid_path", "cannot mix plain and reverse index removals under the same parent");
 		}
@@ -366,8 +409,12 @@ function analyzeValue(expression: unknown, depth: number, context: AnalysisConte
 		decodeByteLiteral(expression as { b64: unknown });
 		return byteLiteralValue;
 	}
-	if (Object.hasOwn(expression, "ref")) return analyzeReferenceNode(expression, context);
-	if (Object.hasOwn(expression, "fn")) return analyzeFunction(expression, depth, context);
+	if (Object.hasOwn(expression, "ref")) {
+		return analyzeReferenceNode(expression, context);
+	}
+	if (Object.hasOwn(expression, "fn")) {
+		return analyzeFunction(expression, depth, context);
+	}
 	throw new ExpressionError("invalid_ast", "invalid expression value");
 }
 
@@ -379,30 +426,42 @@ function analyzeReference(expression: unknown, depth: number, context: AnalysisC
 
 function analyzeReferenceNode(expression: Record<string, unknown>, context: AnalysisContext): ValueFacts {
 	assertFields(expression, "ref", undefined, "path");
-	if (typeof expression.ref !== "string") throw new ExpressionError("invalid_ast", "invalid expression reference");
+	if (typeof expression.ref !== "string") {
+		throw new ExpressionError("invalid_ast", "invalid expression reference");
+	}
 	const hasPath = Object.hasOwn(expression, "path");
 
 	switch (expression.ref) {
 		case "hashKey":
-			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
+			if (hasPath) {
+				throw new ExpressionError("invalid_ast", "only data references can have a path");
+			}
 			context.requiredColumns.add("hk");
 			return hashKeyValue;
 		case "sortKey":
-			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
+			if (hasPath) {
+				throw new ExpressionError("invalid_ast", "only data references can have a path");
+			}
 			context.requiredColumns.add("sk");
 			return sortKeyValue;
 		case "v":
-			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
+			if (hasPath) {
+				throw new ExpressionError("invalid_ast", "only data references can have a path");
+			}
 			context.requiredColumns.add("v");
 			return versionValue;
 		case "ttlAt":
-			if (hasPath) throw new ExpressionError("invalid_ast", "only data references can have a path");
+			if (hasPath) {
+				throw new ExpressionError("invalid_ast", "only data references can have a path");
+			}
 			context.requiredColumns.add("ttl_epoch_utc_seconds");
 			return ttlValue;
 		case "data":
 			context.requiredColumns.add("data_kind");
 			context.requiredColumns.add("data");
-			if (!hasPath) return dataValue;
+			if (!hasPath) {
+				return dataValue;
+			}
 			validateReadJsonPath(expression.path);
 			return dataPathValue;
 		default:
@@ -412,7 +471,9 @@ function analyzeReferenceNode(expression: Record<string, unknown>, context: Anal
 
 function analyzeFunction(expression: Record<string, unknown>, depth: number, context: AnalysisContext): ValueFacts {
 	assertFields(expression, "fn", "args");
-	if (typeof expression.fn !== "string") throw new ExpressionError("invalid_ast", "invalid function name");
+	if (typeof expression.fn !== "string") {
+		throw new ExpressionError("invalid_ast", "invalid function name");
+	}
 	assertArgs(expression.args);
 	const args = expression.args;
 	countOperation(context);
@@ -451,9 +512,15 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 }
 
 function literalFacts(value: JsonPrimitive): ValueFacts {
-	if (value === null) return nullValue;
-	if (typeof value === "boolean") return booleanValue;
-	if (typeof value === "number") return numberValue;
+	if (value === null) {
+		return nullValue;
+	}
+	if (typeof value === "boolean") {
+		return booleanValue;
+	}
+	if (typeof value === "number") {
+		return numberValue;
+	}
 	return value.length === 0 ? emptyTextValue : textValue;
 }
 
@@ -469,28 +536,40 @@ function isKeyReference(value: ValueFacts): boolean {
 
 function assertCompatible(left: ValueFacts, right: ValueFacts, allowed: ReadonlySet<ExpressionNativeType>): void {
 	for (const type of allowed) {
-		if (left.types.has(type) && right.types.has(type)) return;
+		if (left.types.has(type) && right.types.has(type)) {
+			return;
+		}
 	}
 	throw new ExpressionError("invalid_type", "incompatible expression types");
 }
 
 function hasCommonType3(first: ValueFacts, second: ValueFacts, third: ValueFacts, allowed: ReadonlySet<ExpressionNativeType>): boolean {
 	for (const type of allowed) {
-		if (first.types.has(type) && second.types.has(type) && third.types.has(type)) return true;
+		if (first.types.has(type) && second.types.has(type) && third.types.has(type)) {
+			return true;
+		}
 	}
 	return false;
 }
 
 function hasAnyType(actual: ReadonlySet<ExpressionNativeType>, accepted: ReadonlySet<ExpressionNativeType>): boolean {
 	for (const type of accepted) {
-		if (actual.has(type)) return true;
+		if (actual.has(type)) {
+			return true;
+		}
 	}
 	return false;
 }
 
 function canContain(container: ReadonlySet<ExpressionNativeType>, search: ReadonlySet<ExpressionNativeType>): boolean {
-	if (container.has("text") && search.has("text")) return true;
-	if (container.has("bytes") && search.has("bytes")) return true;
-	if (container.has("array") && hasAnyType(search, arraySearchTypes)) return true;
+	if (container.has("text") && search.has("text")) {
+		return true;
+	}
+	if (container.has("bytes") && search.has("bytes")) {
+		return true;
+	}
+	if (container.has("array") && hasAnyType(search, arraySearchTypes)) {
+		return true;
+	}
 	return false;
 }

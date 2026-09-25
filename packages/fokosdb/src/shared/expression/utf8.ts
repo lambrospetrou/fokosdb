@@ -9,7 +9,11 @@ const textEncoder = new TextEncoder();
  * only for text in the narrow ambiguous band.
  */
 export function utf8WithinLimit(text: string, limit: number): boolean {
-	if (text.length > limit) return false;
-	if (text.length * 3 <= limit) return true;
+	if (text.length > limit) {
+		return false;
+	}
+	if (text.length * 3 <= limit) {
+		return true;
+	}
 	return textEncoder.encode(text).byteLength <= limit;
 }

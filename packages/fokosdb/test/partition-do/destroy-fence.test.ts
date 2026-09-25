@@ -176,9 +176,13 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 	it("waits for the target RPC a source step is parked in, and lets no transition follow it", async ({ expect }) => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
 		const children = partition.hashChildren().map((c) => c.controlled);
-		for (const child of children) await child.testHoldInit();
+		for (const child of children) {
+			await child.testHoldInit();
+		}
 		const release = async () => {
-			for (const child of children) await child.testReleaseInit();
+			for (const child of children) {
+				await child.testReleaseInit();
+			}
 		};
 		const initCalls = async () => (await Promise.all(children.map((c) => c.testInitCalls()))).reduce((a, b) => a + b, 0);
 

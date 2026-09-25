@@ -303,7 +303,9 @@ describe("PartitionDO — stale transaction recovery", () => {
 			expect(store.pendingTxCountFor(transactionIds[10])).toBe(1);
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionIds[10])).toBe(0);
-			for (const transactionId of transactionIds.slice(0, 10)) store.deletePendingTx(transactionId);
+			for (const transactionId of transactionIds.slice(0, 10)) {
+				store.deletePendingTx(transactionId);
+			}
 			await state.storage.deleteAlarm();
 		});
 

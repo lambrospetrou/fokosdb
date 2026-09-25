@@ -277,10 +277,13 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 			subRequest: (req, items) => ({ ...req, items: items as TransactionItem[] }),
 			local: (req, call) => {
-				if (req.items.length === 0) return { outcome: "accepted" };
+				if (req.items.length === 0) {
+					return { outcome: "accepted" };
+				}
 				const response = participant.prepareLocal(todo("PrepareReq to PrepareRequest, the coordinator field differs"));
-				if (response.outcome === "accepted")
+				if (response.outcome === "accepted") {
 					call.signal({ jobs: [{ name: JOB_STALE_TX, runAt: Date.now() + host.fokosStaleTransactionMs() }] });
+				}
 				return response;
 			},
 			merge: mergePrepare,
@@ -346,7 +349,9 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			notApplicable: { outcome: "not_applicable" },
 			local: (req, call) => {
 				const { response, promotionCandidates } = participant.executeSingleShot(req);
-				if (response.outcome !== "rejected") writeSignals(call, promotionCandidates, fokos.policy());
+				if (response.outcome !== "rejected") {
+					writeSignals(call, promotionCandidates, fokos.policy());
+				}
 				return response;
 			},
 		},
@@ -373,8 +378,12 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			shape: "local",
 			local: async (req) => {
 				const result = await fokos.requestPromotion(req.hashKey);
-				if (result.queued) return { queued: true, status: promotedKeyStatusOf(result.state) };
-				if (result.reason === "already_promoted") return { queued: false, status: promotedKeyStatusOf(result.state) };
+				if (result.queued) {
+					return { queued: true, status: promotedKeyStatusOf(result.state) };
+				}
+				if (result.reason === "already_promoted") {
+					return { queued: false, status: promotedKeyStatusOf(result.state) };
+				}
 				throw todo("errExceededDatabaseSize");
 			},
 		},
@@ -387,13 +396,20 @@ function promotedKeyStatusOf(state: Rpc.RepartitionState): PromotedKeyStatus {
 
 function mergePrepare(parts: Array<FokosGroupPart<PrepareReq, PrepareResponse>>): PrepareResponse {
 	const executionFailure = parts.find((p) => p.result.outcome === "rejected" && !p.result.results);
-	if (executionFailure) return executionFailure.result;
-	if (!parts.some((p) => p.result.outcome === "rejected")) return { outcome: "accepted" };
+	if (executionFailure) {
+		return executionFailure.result;
+	}
+	if (!parts.some((p) => p.result.outcome === "rejected")) {
+		return { outcome: "accepted" };
+	}
 	// This node answers for every operation it was given. An accepted part sends no array, so its operations passed.
 	const merged: ParticipantOperationResultEncoded[] = [];
 	for (const { request, result } of parts) {
-		if (result.outcome === "accepted") merged.push(...request.items.map((item) => ({ outcome: "passed" as const, opIndex: item.opIndex })));
-		else merged.push(...result.results);
+		if (result.outcome === "accepted") {
+			merged.push(...request.items.map((item) => ({ outcome: "passed" as const, opIndex: item.opIndex })));
+		} else {
+			merged.push(...result.results);
+		}
 	}
 	return { outcome: "rejected", results: merged };
 }
@@ -447,7 +463,9 @@ async function walkRange(
 		};
 		const part = visit.target === "local" ? await local(sub) : await forward(visit, sub);
 
-		if (req.select === "projection") out.items.push(...part.items);
+		if (req.select === "projection") {
+			out.items.push(...part.items);
+		}
 		out.partitionMetas.push(...part.partitionMetas);
 		out.count += part.count;
 		out.scannedCount += part.scannedCount;
@@ -462,7 +480,9 @@ async function walkRange(
 			break;
 		}
 		if (budget.budgetExhausted) {
-			if (hasLaterCandidate && out.lastEvaluatedCursor) out.nextCursor = out.lastEvaluatedCursor;
+			if (hasLaterCandidate && out.lastEvaluatedCursor) {
+				out.nextCursor = out.lastEvaluatedCursor;
+			}
 			break;
 		}
 		if (budget.visitsExhausted && hasLaterCandidate) {
@@ -490,7 +510,9 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
 		beforeComplete: (plan) => (plan.kind === "key_promotion" ? undefined : todo("onSplitCompleted")),
 		cleanupSourceStep: (plan) => (plan.kind === "key_promotion" ? todo<boolean>("delete promoted rows, one bounded step") : true),
 		admit: ({ admissionTag, policy }) => {
-			if (admissionTag !== "write") return "allow";
+			if (admissionTag !== "write") {
+				return "allow";
+			}
 			const cap = policy.hashSplitConditions.maxSizeMb * 1024 * 1024 * 1.1;
 			return store.databaseSize > cap ? { reject: todo("errExceededDatabaseSize") } : "allow";
 		},
@@ -516,7 +538,9 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
 							idempotencyToken: pending.idempotencyToken,
 						});
 						const rows = store.listPendingTxItems(row.transaction_id);
-						if (rows.length === 0) continue;
+						if (rows.length === 0) {
+							continue;
+						}
 						const items = rows.map((p) => ({ hashKey: p.hk, sortKey: p.sk }));
 						const ctx = fokos.routeContext();
 						if (result.value.state === "COMMITTED") {

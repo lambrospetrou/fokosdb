@@ -42,8 +42,12 @@ function hashKeyInSlice(slice: FokosSlice, hashKey: KeyBytes, hashSplitN: number
  * target receives exactly the rows it owns and nothing a sibling owns.
  */
 export function sliceIncludesItem(slice: FokosSlice, hashKey: KeyBytes, sortKey: KeyBytes, hashSplitN: number): boolean {
-	if (!hashKeyInSlice(slice, hashKey, hashSplitN)) return false;
-	if (slice.kind !== "range") return true;
+	if (!hashKeyInSlice(slice, hashKey, hashSplitN)) {
+		return false;
+	}
+	if (slice.kind !== "range") {
+		return true;
+	}
 	return KeyCodec.compare(sortKey, sliceStart(slice.start)) >= 0 && (slice.end === null || KeyCodec.compare(sortKey, slice.end) < 0);
 }
 

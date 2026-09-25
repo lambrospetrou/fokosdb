@@ -145,7 +145,9 @@ export class BloomFilter {
 
 	add(key: string | Uint8Array): AddResult {
 		for (let i = 0; i < this.layers.length - 1; i++) {
-			if (layerHas(this.layers[i], key)) return AddResult.AlreadyPresent;
+			if (layerHas(this.layers[i], key)) {
+				return AddResult.AlreadyPresent;
+			}
 		}
 
 		let current = this.layers[this.layers.length - 1];
@@ -155,7 +157,9 @@ export class BloomFilter {
 		}
 
 		// Current layer is at capacity — check if key already exists before growing.
-		if (layerHas(current, key)) return AddResult.AlreadyPresent;
+		if (layerHas(current, key)) {
+			return AddResult.AlreadyPresent;
+		}
 
 		const nextIndex = this.layers.length;
 		const nextBytes = layerByteSize(computeLayerBitCount(nextIndex, this.errorRate, this.initialCapacityN));
@@ -172,7 +176,9 @@ export class BloomFilter {
 
 	has(key: string | Uint8Array): boolean {
 		for (let i = 0; i < this.layers.length; i++) {
-			if (layerHas(this.layers[i], key)) return true;
+			if (layerHas(this.layers[i], key)) {
+				return true;
+			}
 		}
 		return false;
 	}
@@ -291,7 +297,9 @@ function layerAddIfAbsent(layer: Layer, key: string | Uint8Array): AddResult {
 			layer.bits[byteIdx] |= bitMask;
 		}
 	}
-	if (allSet) return AddResult.AlreadyPresent;
+	if (allSet) {
+		return AddResult.AlreadyPresent;
+	}
 	layer.count++;
 	return AddResult.Added;
 }
@@ -305,7 +313,9 @@ function layerHas(layer: Layer, key: string | Uint8Array): boolean {
 	const h2 = hash32(key, layer.layerIndex * 2 + 1) || 1;
 	for (let i = 0; i < layer.k; i++) {
 		const pos = (h1 + i * h2) % layer.m;
-		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) return false;
+		if ((layer.bits[pos >> 3] & (1 << (pos & 7))) === 0) {
+			return false;
+		}
 	}
 	return true;
 }

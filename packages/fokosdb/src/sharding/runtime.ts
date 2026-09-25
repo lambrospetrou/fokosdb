@@ -198,9 +198,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#store.runMigrations();
 			const identity = this.#store.getIdentity();
 			const stored = this.#store.getPolicy<TPolicy>();
-			if (identity && stored) this.#setIdentity(identity, stored);
+			if (identity && stored) {
+				this.#setIdentity(identity, stored);
+			}
 			const bloom = this.#store.getPromotionBloom();
-			if (bloom) this.#bloom = PartialRangeTopology.fromSnapshot(bloom);
+			if (bloom) {
+				this.#bloom = PartialRangeTopology.fromSnapshot(bloom);
+			}
 		});
 	}
 
@@ -243,7 +247,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 
-		if (this.#target.isImporting()) return await this.#whileImporting(op, descriptor, req, collector);
+		if (this.#target.isImporting()) {
+			return await this.#whileImporting(op, descriptor, req, collector);
+		}
 
 		switch (descriptor.shape) {
 			case "point":
@@ -282,7 +288,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#assertCanOwnRange(op, descriptor.range(req));
 		} else {
 			for (const key of this.#scopeRouteKeys(descriptor, req)) {
-				if (!this.#ownsByTopology(key)) throw misrouted(op, "key outside this partition");
+				if (!this.#ownsByTopology(key)) {
+					throw misrouted(op, "key outside this partition");
+				}
 			}
 		}
 		const record = this.#target.importRecord();
@@ -311,7 +319,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	): Promise<FokosEnvelope<unknown>> {
 		const key = descriptor.key(req);
 		const resolution = this.#resolve(key, { bloom: true, learnedRange: true });
-		if (resolution.kind === "out_of_range") throw misrouted(op, "key outside this partition");
+		if (resolution.kind === "out_of_range") {
+			throw misrouted(op, "key outside this partition");
+		}
 		if (resolution.kind === "local") {
 			this.#admit(op, descriptor, [key]);
 			const before = this.#beforeForward(descriptor, req);
@@ -363,8 +373,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return await this.#forwardTo(collector, resolution.target, op, req, [key.hashKey]);
 		} catch (e) {
 			const next = this.#fallbackAfterMiss(key, resolution, e, descriptor.readOnly === true);
-			if (!next || retries >= MAX_FORWARD_RETRIES) throw e;
-			if (next.kind === "out_of_range") throw misrouted(op, "key outside this partition");
+			if (!next || retries >= MAX_FORWARD_RETRIES) {
+				throw e;
+			}
+			if (next.kind === "out_of_range") {
+				throw misrouted(op, "key outside this partition");
+			}
 			if (next.kind === "local") {
 				this.#admit(op, descriptor, [key]);
 				const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
@@ -395,7 +409,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			FokosError.isCode(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized)
 		) {
 			const arena = this.#arena();
-			if (arena?.invalidate(key.hashKey, resolution.relDepth!)) this.#store.putHashArena(arena.toSnapshot());
+			if (arena?.invalidate(key.hashKey, resolution.relDepth!)) {
+				this.#store.putHashArena(arena.toSnapshot());
+			}
 			return this.#resolve(key, { bloom: true, learnedRange: true });
 		}
 		return null;
@@ -421,7 +437,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const remote = new Map<string, { target: FokosPartitionRef; items: unknown[]; keys: KeyBytes[] }>();
 		for (const entry of items) {
 			const resolution = this.#resolve(entry.key, EXACT);
-			if (resolution.kind === "out_of_range") throw misrouted(op, "item outside this partition");
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, "item outside this partition");
+			}
 			if (resolution.kind === "local") {
 				local.push(entry);
 				continue;
@@ -430,7 +448,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (group) {
 				group.items.push(entry.item);
 				group.keys.push(entry.key.hashKey);
-			} else remote.set(resolution.target.partitionId, { target: resolution.target, items: [entry.item], keys: [entry.key.hashKey] });
+			} else {
+				remote.set(resolution.target.partitionId, { target: resolution.target, items: [entry.item], keys: [entry.key.hashKey] });
+			}
 		}
 
 		// Admission, `beforeForward`, the local work, and the start of every remote call run in the same
@@ -460,7 +480,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			try {
 				localCall = { request, value: this.#runLocal(descriptor, request, call), signals: own };
 			} catch (error) {
-				if (!attemptAll) throw error;
+				if (!attemptAll) {
+					throw error;
+				}
 				localFailure = { error };
 			}
 		}
@@ -479,7 +501,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				localCall.value = await localCall.value;
 				signals.push(...localCall.signals);
 			} catch (error) {
-				if (!attemptAll) throw error;
+				if (!attemptAll) {
+					throw error;
+				}
 				localFailure = { error };
 				localCall = undefined;
 			}
@@ -488,7 +512,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		// The merge over remote parts makes this partition a router of the request. A partition that also
 		// ran the handler keeps its `executed` role.
-		if (remoteCalls.length > 0) collector.add(this.#selfNode("merged"));
+		if (remoteCalls.length > 0) {
+			collector.add(this.#selfNode("merged"));
+		}
 		if (descriptor.failurePolicy === "fail_fast") {
 			const results = await Promise.all(remoteCalls.map((c) => c.promise));
 			results.forEach((result, i) => parts.push({ target: remoteCalls[i].target, request: remoteCalls[i].request, result }));
@@ -496,7 +522,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			const settled = await Promise.allSettled(remoteCalls.map((c) => c.promise));
 			const failures = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
 			// The local part is the more specific answer, and every remote group has been attempted by now.
-			if (localFailure) throw localFailure.error;
+			if (localFailure) {
+				throw localFailure.error;
+			}
 			if (failures.length > 0) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_fanout_failed, {
 					message: "a remote group of the operation failed",
@@ -512,11 +540,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				});
 			}
 			settled.forEach((result, i) => {
-				if (result.status === "fulfilled")
+				if (result.status === "fulfilled") {
 					parts.push({ target: remoteCalls[i].target, request: remoteCalls[i].request, result: result.value });
+				}
 			});
 		}
-		if (localCall) parts.push({ target: "local", request: localCall.request, result: localCall.value });
+		if (localCall) {
+			parts.push({ target: "local", request: localCall.request, result: localCall.value });
+		}
 		return envelope(descriptor.merge(parts), collector.build());
 	}
 
@@ -532,10 +563,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		let spansPartitions = false;
 		for (const key of keys) {
 			const resolution = this.#resolve(key, EXACT);
-			if (resolution.kind === "out_of_range") throw misrouted(op, "item outside this partition");
-			if (resolution.kind === "local") localCount++;
-			else if (remote === null) remote = resolution.target;
-			else if (remote.partitionId !== resolution.target.partitionId) spansPartitions = true;
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, "item outside this partition");
+			}
+			if (resolution.kind === "local") {
+				localCount++;
+			} else if (remote === null) {
+				remote = resolution.target;
+			} else if (remote.partitionId !== resolution.target.partitionId) {
+				spansPartitions = true;
+			}
 		}
 		if (remote === null) {
 			this.#admit(op, descriptor, keys);
@@ -572,7 +609,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const input = descriptor.range(req);
 		const planned = this.#planRange(op, input, true);
 		const visits = planned.map((p) => p.visit);
-		if (visits.some((visit) => visit.target === "local")) this.#admit(op, descriptor, [{ hashKey: input.hashKey, sortKey: NO_SORT_KEY }]);
+		if (visits.some((visit) => visit.target === "local")) {
+			this.#admit(op, descriptor, [{ hashKey: input.hashKey, sortKey: NO_SORT_KEY }]);
+		}
 		const signals = this.#beforeForward(descriptor, req);
 		const value = await descriptor.walk({
 			request: req,
@@ -598,19 +637,25 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	// ═══ the primitive API ══════════════════════════════════════════════════
 
 	identity(): FokosPartitionIdentity {
-		if (!this.#identity) throw this.#notInitialized();
+		if (!this.#identity) {
+			throw this.#notInitialized();
+		}
 		return this.#identity;
 	}
 
 	/** The stored host policy: the live value that the last request updated. */
 	policy(): TPolicy {
-		if (!this.#stored) throw this.#notInitialized();
+		if (!this.#stored) {
+			throw this.#notInitialized();
+		}
 		return this.#stored.policy;
 	}
 
 	/** The stored route context of this partition: its identity plus the mutable part the last request left. */
 	routeContext(): FokosRouteContext<TPolicy> {
-		if (!this.#routeCtx) throw this.#notInitialized();
+		if (!this.#routeCtx) {
+			throw this.#notInitialized();
+		}
 		return this.#routeCtx;
 	}
 
@@ -663,7 +708,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** This router's direct targets in `target_index` order. Empty on an owner. */
 	children(): FokosChild[] {
-		if (!this.#source.routerRole()) return [];
+		if (!this.#source.routerRole()) {
+			return [];
+		}
 		return this.#source.splitTargets().map((t) => ({
 			ref: { partitionId: t.partitionId, doName: t.doName },
 			start: t.slice.kind === "range" ? t.slice.start : null,
@@ -779,7 +826,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		if (descriptor.shape === "point") {
 			const key = descriptor.key(req.request);
-			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, hashSplitN)) throw misrouted(req.op, "key outside the caller slice");
+			if (!sliceIncludesItem(slice, key.hashKey, key.sortKey, hashSplitN)) {
+				throw misrouted(req.op, "key outside the caller slice");
+			}
 			// A promoted key's rows live in the range tree; the local copies are stale or already
 			// collected. Only a hash-child caller can reach one: a range or promoted-key slice is itself
 			// inside a range tree.
@@ -795,14 +844,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 		invariant(descriptor.shape === "range", "fokos/runtime: read_source is allowed for point and range operations only");
 		const input = descriptor.range(req.request);
-		if (!sliceIncludesHashKey(slice, input.hashKey, hashSplitN)) throw misrouted(req.op, "hash key outside the caller slice");
+		if (!sliceIncludesHashKey(slice, input.hashKey, hashSplitN)) {
+			throw misrouted(req.op, "hash key outside the caller slice");
+		}
 		let request = req.request;
 		if (slice.kind === "range") {
 			const start = slice.start ?? NO_SORT_KEY;
-			if (!rangeIntersects(start, slice.end, input.interval)) throw misrouted(req.op, "interval disjoint from the caller slice");
+			if (!rangeIntersects(start, slice.end, input.interval)) {
+				throw misrouted(req.op, "interval disjoint from the caller slice");
+			}
 			// The caller proves its slice with the cursor too: one that lies outside it asks for rows of
 			// another caller, which is a routing defect, not a rescan.
-			if (input.cursor && !cursorFallsInChild(start, slice.end, input.cursor)) throw misrouted(req.op, "cursor outside the caller slice");
+			if (input.cursor && !cursorFallsInChild(start, slice.end, input.cursor)) {
+				throw misrouted(req.op, "cursor outside the caller slice");
+			}
 			request = descriptor.clip(req.request, { target: "local", start: slice.start, end: slice.end, speculative: false });
 		}
 		if (slice.kind === "hash_child" && this.#store.hasTerminalRouteOverride(input.hashKey)) {
@@ -824,7 +879,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult> {
 		return await this.#guard("fokosRequestPromotion", async () => {
-			if (!this.#identity) throw this.#notInitialized(req.target);
+			if (!this.#identity) {
+				throw this.#notInitialized(req.target);
+			}
 			if (this.#identity.ref.partitionId !== req.target.partitionId || this.#identity.ref.doName !== req.target.doName) {
 				throw contextMismatch({ doName: req.target.doName, expected: this.#identity.ref.doName });
 			}
@@ -842,7 +899,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			});
 		}
 		// A range partition serves the key from its own tree: the key is promoted for good.
-		if (identity.kind === "range") return { owner, queued: false, reason: "already_promoted", state: "cleaned" };
+		if (identity.kind === "range") {
+			return { owner, queued: false, reason: "already_promoted", state: "cleaned" };
+		}
 
 		const override = this.#store.routeOverrideFor(hashKey);
 		if (override) {
@@ -855,16 +914,22 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return { owner, queued: false, reason: "already_promoted", state: override.state };
 		}
 		const resolution = this.#resolve({ hashKey, sortKey: NO_SORT_KEY }, EXACT);
-		if (resolution.kind === "out_of_range") throw misrouted("fokosRequestPromotion", "key outside this partition");
+		if (resolution.kind === "out_of_range") {
+			throw misrouted("fokosRequestPromotion", "key outside this partition");
+		}
 		if (resolution.kind === "remote") {
 			return await this.#peer(resolution.target).fokosRequestPromotion({ target: resolution.target, hashKey, data });
 		}
-		if (!this.#source.canQueue({ kind: "key_promotion", hashKey })) return { owner, queued: false, reason: "split_in_progress" };
+		if (!this.#source.canQueue({ kind: "key_promotion", hashKey })) {
+			return { owner, queued: false, reason: "split_in_progress" };
+		}
 		// The fallback alarm moves earlier BEFORE the queue transaction, so a crash between the two
 		// leaves an alarm that reads the new row. A failed alarm write creates no row.
 		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
 		const row = this.#source.queue({ kind: "key_promotion", hashKey, data });
-		if (!row) return { owner, queued: false, reason: "split_in_progress" };
+		if (!row) {
+			return { owner, queued: false, reason: "split_in_progress" };
+		}
 		console.log({
 			...this.#logParams(),
 			message: "fokos/runtime: key queued for promotion.",
@@ -882,9 +947,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return await this.#guard("fokosStatus", async () => {
-			if (req.rootContext) this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>)();
+			if (req.rootContext) {
+				this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>)();
+			}
 			const destroying = this.#store.isDestroying();
-			if (!this.#identity) return { initialized: false, destroying, ref: null, importState: null, entries: [], nextCursor: null };
+			if (!this.#identity) {
+				return { initialized: false, destroying, ref: null, importState: null, entries: [], nextCursor: null };
+			}
 			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, STATUS_PAGE_ENTRIES, STATUS_PAGE_BYTES);
 			return { initialized: true, destroying, ref: this.#identity.ref, importState: this.#target.importState(), entries, nextCursor };
 		});
@@ -900,7 +969,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return await this.#guard("fokosPrepareDestroy", async () => {
 			let commitIdentity = NO_COMMIT;
 			this.#store.transactionSync(() => {
-				if (req.rootContext) commitIdentity = this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
+				if (req.rootContext) {
+					commitIdentity = this.#ensureIdentity(req.rootContext as FokosRouteContext<TPolicy>);
+				}
 				this.#store.setDestroying();
 			});
 			commitIdentity();
@@ -919,7 +990,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				// Clears every timer of the instance: setTimeout returns a numeric ID that increments on
 				// each call, so the newest ID gives the upper bound to clear from.
 				const highestId = setTimeout(() => {
-					for (let i = Number(highestId); i >= 0; i--) clearTimeout(i);
+					for (let i = Number(highestId); i >= 0; i--) {
+						clearTimeout(i);
+					}
 				}, 0);
 				// The alarm goes before the storage, so the platform does not fire it on the evicted instance.
 				await this.#ctx.storage.deleteAlarm();
@@ -956,9 +1029,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			});
 		}
 		if (!this.#identity) {
-			if (isRangePartition(routeCtx)) throw this.#notInitialized(routeCtx);
+			if (isRangePartition(routeCtx)) {
+				throw this.#notInitialized(routeCtx);
+			}
 			invariant(routeCtx.partitionId.length > 0, "fokos/runtime: partitionId must not be empty");
-			if (PartitionIdHelper.depth(Uint8Array.fromHex(routeCtx.partitionId)) > 0) throw this.#notInitialized(routeCtx);
+			if (PartitionIdHelper.depth(Uint8Array.fromHex(routeCtx.partitionId)) > 0) {
+				throw this.#notInitialized(routeCtx);
+			}
 			return this.#writeIdentity(routeCtx);
 		}
 		const identity = this.#identity;
@@ -970,7 +1047,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			throw contextMismatch({ doName: routeCtx.doName, expected: identity.ref.doName });
 		}
 		const stored = this.#stored!;
-		if (structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) && structurallyEqual(stored.policy, routeCtx.policy)) return NO_COMMIT;
+		if (structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) && structurallyEqual(stored.policy, routeCtx.policy)) {
+			return NO_COMMIT;
+		}
 		validateRangeConfig(routeCtx.rangeConfig);
 		const next: FokosStoredPolicy<TPolicy> = { rangeConfig: routeCtx.rangeConfig, policy: routeCtx.policy };
 		this.#store.transactionSync(() => this.#store.putPolicy(next));
@@ -983,7 +1062,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	#applyTargetIdentity(req: FokosInitRequest): () => void {
 		const target = req.target as FokosRouteContext<TPolicy>;
-		if (this.#identity) return this.#ensureIdentity(target);
+		if (this.#identity) {
+			return this.#ensureIdentity(target);
+		}
 		let range: { depth: number; ancestors: RangeAncestorInfo[] } | undefined;
 		if (isRangePartition(target)) {
 			invariant(req.rangeDepth !== undefined, "fokos/runtime.fokosInit: a range target needs its depth");
@@ -1052,18 +1133,26 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#assertCanOwnRange(op: string, input: FokosRangeInput): void {
 		const identity = this.identity();
 		if (identity.kind === "hash") {
-			if (!this.#hashesHere(input.hashKey, identity)) throw misrouted(op, "hash key outside this partition");
+			if (!this.#hashesHere(input.hashKey, identity)) {
+				throw misrouted(op, "hash key outside this partition");
+			}
 			return;
 		}
 		const range = identity.range!;
-		if (KeyCodec.compare(input.hashKey, range.hashKey) !== 0) throw misrouted(op, "hash key outside this range partition");
-		if (!intervalInside(input.interval, range.start, range.end)) throw misrouted(op, "interval outside this range partition");
+		if (KeyCodec.compare(input.hashKey, range.hashKey) !== 0) {
+			throw misrouted(op, "hash key outside this range partition");
+		}
+		if (!intervalInside(input.interval, range.start, range.end)) {
+			throw misrouted(op, "interval outside this range partition");
+		}
 	}
 
 	/** Hash step 1 and range step 1: can this partition own the key at all, by its identity alone. */
 	#ownsByTopology(key: RouteKey): boolean {
 		const identity = this.identity();
-		if (identity.kind === "hash") return this.#hashesHere(key.hashKey, identity);
+		if (identity.kind === "hash") {
+			return this.#hashesHere(key.hashKey, identity);
+		}
 		const range = identity.range!;
 		return (
 			KeyCodec.compare(key.hashKey, range.hashKey) === 0 &&
@@ -1075,20 +1164,29 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#hashesHere(hashKey: KeyBytes, identity: FokosPartitionIdentity): boolean {
 		const hash = identity.hash!;
 		const { rootTreesN, hashSplitN } = identity.topology;
-		if (hashRootIndex(hashKey, rootTreesN) !== hash.rootIndex) return false;
+		if (hashRootIndex(hashKey, rootTreesN) !== hash.rootIndex) {
+			return false;
+		}
 		return hash.path.every((idx, depth) => hashChildIndex(hashKey, depth, hashSplitN) === idx);
 	}
 
 	#resolve(key: RouteKey, opts: ResolveOptions): Resolution {
 		const identity = this.identity();
-		if (!this.#ownsByTopology(key)) return { kind: "out_of_range" };
+		if (!this.#ownsByTopology(key)) {
+			return { kind: "out_of_range" };
+		}
 
 		if (identity.kind === "hash") {
 			const override = this.#store.routeOverrideFor(key.hashKey);
-			if (override && cutOver(override.state)) return this.#rangeOwner(key.hashKey, key.sortKey, "override", false, opts.learnedRange);
-			if (opts.bloom && this.#bloom?.maybePromoted(key.hashKey))
+			if (override && cutOver(override.state)) {
+				return this.#rangeOwner(key.hashKey, key.sortKey, "override", false, opts.learnedRange);
+			}
+			if (opts.bloom && this.#bloom?.maybePromoted(key.hashKey)) {
 				return this.#rangeOwner(key.hashKey, key.sortKey, "bloom", true, opts.learnedRange);
-			if (!this.#source.routerRole()) return { kind: "local" };
+			}
+			if (!this.#source.routerRole()) {
+				return { kind: "local" };
+			}
 			const relDepth = Math.max(1, this.#arena()?.findLeaf(key.hashKey) ?? 0);
 			return {
 				kind: "remote",
@@ -1100,7 +1198,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			};
 		}
 
-		if (!this.#source.routerRole()) return { kind: "local" };
+		if (!this.#source.routerRole()) {
+			return { kind: "local" };
+		}
 		const range = identity.range!;
 		const child = this.#rangeChildFor(key.sortKey);
 		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.hashKey, key.sortKey) : null;
@@ -1140,8 +1240,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#rangeChildFor(sortKey: KeyBytes): FokosChild {
 		let best: FokosChild | null = null;
 		for (const child of this.children()) {
-			if (KeyCodec.compare(child.start ?? NO_SORT_KEY, sortKey) <= 0 && (best === null || startCmp(child.start, best.start) > 0))
+			if (KeyCodec.compare(child.start ?? NO_SORT_KEY, sortKey) <= 0 && (best === null || startCmp(child.start, best.start) > 0)) {
 				best = child;
+			}
 		}
 		invariant(best !== null, () => `fokos/runtime: no range child owns ${KeyCodec.keyForLog(sortKey)}`);
 		return best;
@@ -1149,9 +1250,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** The hash arena of a router, created the first time this partition forwards. Null on an owner. */
 	#arena(): HashTopology | null {
-		if (this.#hashArena) return this.#hashArena;
+		if (this.#hashArena) {
+			return this.#hashArena;
+		}
 		const identity = this.identity();
-		if (identity.kind !== "hash" || !this.#source.routerRole()) return null;
+		if (identity.kind !== "hash" || !this.#source.routerRole()) {
+			return null;
+		}
 		const snapshot = this.#store.getHashArena();
 		const opts = this.#hashArenaBytes === undefined ? undefined : { budgetBytes: this.#hashArenaBytes };
 		this.#hashArena = snapshot
@@ -1197,7 +1302,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const planned = planRangeFrontier(bases, learned, input.interval, input.descending, (start, end) =>
 			refOf(resolveRangePartitionContext(routeCtx, input.hashKey, start, end)),
 		);
-		for (const p of planned) this.#plans.set(p.visit, p);
+		for (const p of planned) {
+			this.#plans.set(p.visit, p);
+		}
 		return planned;
 	}
 
@@ -1302,7 +1409,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					this.#learn(routed.routing.servedBy, hashKeys);
 				} catch {}
 				collector.mergeForwarded(routed.routing, stamp);
-				if (raiser) collector.addRaiser(stamp ? stamp(raiser) : raiser);
+				if (raiser) {
+					collector.addRaiser(stamp ? stamp(raiser) : raiser);
+				}
 				routed.routing = collector.build();
 			}
 			throw e;
@@ -1316,7 +1425,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	#rangeDepthStamp(): ((node: FokosRouteNode) => FokosRouteNode) | undefined {
 		const identity = this.identity();
-		if (identity.kind !== "hash") return undefined;
+		if (identity.kind !== "hash") {
+			return undefined;
+		}
 		const hashDepth = identityDepth(identity);
 		return (node) => (isRangePartition(node.ref) ? { ...node, hashDepth } : node);
 	}
@@ -1335,7 +1446,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		let bloomChanged = false;
 		const learnDepth = (hashKey: KeyBytes, hashDepth: number) => {
 			const relDepth = hashDepth - myDepth;
-			if (arena && relDepth > 0) arenaChanged = arena.updateFromHint(hashKey, relDepth) || arenaChanged;
+			if (arena && relDepth > 0) {
+				arenaChanged = arena.updateFromHint(hashKey, relDepth) || arenaChanged;
+			}
 		};
 		for (const node of nodes) {
 			const bytes = Uint8Array.fromHex(node.ref.partitionId);
@@ -1346,10 +1459,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				for (const ancestor of node._rangeAncestors ?? []) {
 					this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
 				}
-				if (identity.kind !== "hash") continue;
+				if (identity.kind !== "hash") {
+					continue;
+				}
 				const added = this.#bloomForLearning().learnPromotedKey(hashKey);
-				if (added === AddResult.Added) bloomChanged = true;
-				else if (added === AddResult.Full) {
+				if (added === AddResult.Added) {
+					bloomChanged = true;
+				} else if (added === AddResult.Full) {
 					console.info({
 						...this.#logParams(),
 						message: "fokos/runtime: the promotion Bloom filter is full, cannot learn a promoted key.",
@@ -1359,11 +1475,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				continue;
 			}
 			for (const hashKey of hashKeys) {
-				if (hashPathOwns(bytes, hashKey, identity.topology)) learnDepth(hashKey, node.hashDepth);
+				if (hashPathOwns(bytes, hashKey, identity.topology)) {
+					learnDepth(hashKey, node.hashDepth);
+				}
 			}
 		}
-		if (arenaChanged && arena) this.#store.putHashArena(arena.toSnapshot());
-		if (bloomChanged) this.#store.putPromotionBloom(this.#bloom!.toSnapshot());
+		if (arenaChanged && arena) {
+			this.#store.putHashArena(arena.toSnapshot());
+		}
+		if (bloomChanged) {
+			this.#store.putPromotionBloom(this.#bloom!.toSnapshot());
+		}
 	}
 
 	#bloomForLearning(): PartialRangeTopology {
@@ -1396,14 +1518,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** Runs `beforeForward` when the descriptor has it, and returns the signals it reported. */
 	#beforeForward(descriptor: Exclude<AnyOperation, { shape: "local" }>, req: unknown): FokosSignals[] {
-		if (!descriptor.beforeForward) return [];
+		if (!descriptor.beforeForward) {
+			return [];
+		}
 		const { call, signals } = this.#localCall();
 		descriptor.beforeForward(req, call);
 		return signals;
 	}
 
 	#admit(op: string, descriptor: Exclude<AnyOperation, { shape: "local" }>, keys: RouteKey[]): void {
-		if (!this.#hooks.admit) return;
+		if (!this.#hooks.admit) {
+			return;
+		}
 		const rl = () => this.lifecycle();
 		const decision = this.#hooks.admit({
 			op,
@@ -1416,7 +1542,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			},
 			policy: this.policy(),
 		});
-		if (decision !== "allow") throw decision.reject;
+		if (decision !== "allow") {
+			throw decision.reject;
+		}
 	}
 
 	/** The hash keys a request names, which a forward learns against. */
@@ -1444,10 +1572,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	async #applySignals(signals: readonly FokosSignals[]): Promise<void> {
 		try {
 			for (const s of signals) {
-				if (s.evaluateSplit) await this.#evaluateSplit();
-				for (const candidate of s.promotionCandidates ?? []) await this.#requestPromotion(candidate.hashKey, candidate.data);
-				if (s.repartitionUnblocked && this.#source.onRepartitionUnblocked()) this.#scheduler.wake();
-				for (const job of s.jobs ?? []) await this.#scheduler.scheduleJob(job.name, job.runAt);
+				if (s.evaluateSplit) {
+					await this.#evaluateSplit();
+				}
+				for (const candidate of s.promotionCandidates ?? []) {
+					await this.#requestPromotion(candidate.hashKey, candidate.data);
+				}
+				if (s.repartitionUnblocked && this.#source.onRepartitionUnblocked()) {
+					this.#scheduler.wake();
+				}
+				for (const job of s.jobs ?? []) {
+					await this.#scheduler.scheduleJob(job.name, job.runAt);
+				}
 			}
 		} catch (error) {
 			console.error({
@@ -1462,15 +1598,23 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	async #evaluateSplit(): Promise<void> {
 		const identity = this.identity();
 		// A router has nothing to split: its targets own the keys.
-		if (this.#source.routerRole()) return;
+		if (this.#source.routerRole()) {
+			return;
+		}
 		const decision = this.#hooks.evaluateSplit({ identity, policy: this.policy() });
-		if (decision === false) return;
+		if (decision === false) {
+			return;
+		}
 		const kind = identity.kind === "hash" ? "hash_split" : "range_split";
 		// The synchronous precheck rejects an ineligible attempt without an alarm write.
-		if (!this.#source.canQueue({ kind })) return;
+		if (!this.#source.canQueue({ kind })) {
+			return;
+		}
 		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
 		const row = this.#source.queue({ kind, data: decision.data });
-		if (!row) return;
+		if (!row) {
+			return;
+		}
 		console.log({ ...this.#logParams(), message: "fokos/runtime: split conditions met.", repartitionId: row.id, kind: row.kind });
 		this.#scheduler.wake();
 	}
@@ -1499,8 +1643,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				},
 				runStep: async () => {
 					for (let i = 0; i < this.#importPagesPerPass(); i++) {
-						if (this.#store.isDestroying()) break;
-						if ((await this.#target.importOnePage()) !== "progressed") break;
+						if (this.#store.isDestroying()) {
+							break;
+						}
+						if ((await this.#target.importOnePage()) !== "progressed") {
+							break;
+						}
 					}
 					return { nextRunAt: null };
 				},
@@ -1595,8 +1743,12 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					attributes: { operation: name },
 				});
 			}
-			if (descriptor.shape === "local") continue;
-			if (descriptor.whileMigrating !== "read_source") continue;
+			if (descriptor.shape === "local") {
+				continue;
+			}
+			if (descriptor.whileMigrating !== "read_source") {
+				continue;
+			}
 			if (descriptor.readOnly !== true || (descriptor.shape !== "point" && descriptor.shape !== "range")) {
 				throw new FokosInternalError(SHARDING_INTERNAL_CODES.sharding_operation_invalid, {
 					message: "a read_source operation must be readOnly and of the point or range shape",
@@ -1633,21 +1785,33 @@ function isThenable(value: unknown): value is PromiseLike<unknown> {
 /** True when `hashKey` hashes along the whole path a hash partition id encodes: the root index, then one child index per level. */
 function hashPathOwns(idBytes: Uint8Array, hashKey: KeyBytes, topology: { rootTreesN: number; hashSplitN: number }): boolean {
 	const decoded = PartitionIdHelper.decode(idBytes);
-	if (decoded.schema !== PartitionIdHelper.SCHEMA_HASH_V1) return false;
-	if (hashRootIndex(hashKey, topology.rootTreesN) !== decoded.rootIdx) return false;
+	if (decoded.schema !== PartitionIdHelper.SCHEMA_HASH_V1) {
+		return false;
+	}
+	if (hashRootIndex(hashKey, topology.rootTreesN) !== decoded.rootIdx) {
+		return false;
+	}
 	for (let d = 0; d < decoded.depth; d++) {
-		if (hashChildIndex(hashKey, d, topology.hashSplitN) !== idBytes[4 + d]) return false;
+		if (hashChildIndex(hashKey, d, topology.hashSplitN) !== idBytes[4 + d]) {
+			return false;
+		}
 	}
 	return true;
 }
 
 /** True when the request interval lies inside the half-open `[start, end)` of a range partition. */
 function intervalInside(interval: SkInterval, start: KeyBytes | null, end: KeyBytes | null): boolean {
-	if (start !== null && (interval.lower === undefined || KeyCodec.compare(interval.lower.value, start) < 0)) return false;
+	if (start !== null && (interval.lower === undefined || KeyCodec.compare(interval.lower.value, start) < 0)) {
+		return false;
+	}
 	if (end !== null) {
-		if (interval.upper === undefined) return false;
+		if (interval.upper === undefined) {
+			return false;
+		}
 		const cmp = KeyCodec.compare(interval.upper.value, end);
-		if (cmp > 0 || (cmp === 0 && interval.upper.inclusive)) return false;
+		if (cmp > 0 || (cmp === 0 && interval.upper.inclusive)) {
+			return false;
+		}
 	}
 	return true;
 }
@@ -1666,7 +1830,9 @@ function misrouted(operation: string, reason: string): FokosRoutingError {
  * RPC hop drops it, so the code and the error id of the original travel here instead.
  */
 function causeAttributes(reason: unknown): Record<string, unknown> {
-	if (!FokosError.is(reason)) return { causeMessage: String(reason) };
+	if (!FokosError.is(reason)) {
+		return { causeMessage: String(reason) };
+	}
 	return { causeCode: reason.code, causeErrorId: reason.error_id, causeMessage: reason.message };
 }
 
@@ -1677,7 +1843,9 @@ function contextMismatch(attributes: Record<string, unknown>): FokosInternalErro
 /** The range a partition owns, rendered for a log line. KeyBytes never appear as bare Uint8Array. */
 function rangeForLog(identity: FokosPartitionIdentity | undefined): Record<string, unknown> | undefined {
 	const range = identity?.range;
-	if (!range) return undefined;
+	if (!range) {
+		return undefined;
+	}
 	return {
 		hashKey: KeyCodec.keyForLog(range.hashKey),
 		start: range.start === null ? null : KeyCodec.keyForLog(range.start),

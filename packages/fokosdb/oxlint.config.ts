@@ -7,6 +7,7 @@ export default defineConfig({
 		typeCheck: true,
 	},
 	rules: {
+		curly: "error",
 		"typescript/no-floating-promises": "error",
 		"typescript/no-misused-promises": "error",
 		"typescript/return-await": ["error", "always"],

@@ -66,7 +66,9 @@ describe("SQLite scalar function allowlist", () => {
 		expect([...SQLITE_SCALAR_FUNCTIONS].sort()).toEqual(Object.keys(calls).sort());
 		const stub = testPartitionStub(`expression-functions.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
-			for (const call of Object.values(calls)) expect(() => state.storage.sql.exec(`SELECT ${call} AS value`).one()).not.toThrow();
+			for (const call of Object.values(calls)) {
+				expect(() => state.storage.sql.exec(`SELECT ${call} AS value`).one()).not.toThrow();
+			}
 		});
 	});
 });

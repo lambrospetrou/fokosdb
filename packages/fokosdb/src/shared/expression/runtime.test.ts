@@ -26,7 +26,9 @@ async function evaluate(item: StoredFixture | null, condition: ConditionExpressi
 	return await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 		const hashKey = KeyCodec.encode(item?.hashKey ?? "missing-hash-key");
 		const sortKey = item?.sortKey === undefined ? KeyCodec.encodeOptional(undefined) : KeyCodec.encode(item.sortKey);
-		if (item) putFixture(state.storage, hashKey, sortKey, item);
+		if (item) {
+			putFixture(state.storage, hashKey, sortKey, item);
+		}
 		return evaluateConditionPlan(state.storage, compileConditionExpression(condition), hashKey, sortKey);
 	});
 }

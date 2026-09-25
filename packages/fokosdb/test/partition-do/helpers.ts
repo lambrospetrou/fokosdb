@@ -38,7 +38,9 @@ export type Opened<R> = R extends { partitionMetas: unknown[] }
 export function opened<R>(envelope: FokosEnvelope<R>): Opened<R> {
 	const { value, routing } = envelope;
 	const pub: FokosPublicRouting = { servedBy: routing.servedBy, forwardCount: routing.forwardCount };
-	if (typeof value !== "object" || value === null) return value as Opened<R>;
+	if (typeof value !== "object" || value === null) {
+		return value as Opened<R>;
+	}
 	if ("partitionMetas" in value && Array.isArray(value.partitionMetas)) {
 		const leaves = value.partitionMetas as Array<OperationMetrics & { partitionId: string }>;
 		const metrics = leaves.reduce(
@@ -51,7 +53,9 @@ export function opened<R>(envelope: FokosEnvelope<R>): Opened<R> {
 			partitionMetas: leaves.flatMap((leaf) => leafPartitionInfo(leaf, pub) ?? []),
 		} as Opened<R>;
 	}
-	if ("meta" in value) return { ...value, meta: { ...(value.meta as OperationMetrics), ...partitionInfoOf(pub) } } as Opened<R>;
+	if ("meta" in value) {
+		return { ...value, meta: { ...(value.meta as OperationMetrics), ...partitionInfoOf(pub) } } as Opened<R>;
+	}
 	return value as Opened<R>;
 }
 

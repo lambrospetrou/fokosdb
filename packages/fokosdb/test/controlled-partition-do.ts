@@ -37,7 +37,9 @@ function gate(): Gate {
 
 /** The stream a pull asks for, read from the opaque cursor of the flow. */
 export function streamOf(req: FokosMigrationPullRequest): MigrationStream {
-	if (req.cursor === null || req.cursor.phase === "overrides") return "overrides";
+	if (req.cursor === null || req.cursor.phase === "overrides") {
+		return "overrides";
+	}
 	return (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx" ? "pending_tx" : "items";
 }
 
@@ -76,8 +78,12 @@ export class ControlledPartitionDO extends PartitionDO {
 	#tx<Op extends TxOp>(op: Op, req: TxRequest<Op>, work: () => Promise<TxResponse<Op>>): Promise<TxResponse<Op>> {
 		(this.#txCalls[op] as TxRequest<Op>[]).push(req);
 		const rule = this.#txRules[op] as TxResponseRule<Op> | undefined;
-		if (!rule) return work();
-		if (rule.times !== undefined && --rule.times <= 0) delete this.#txRules[op];
+		if (!rule) {
+			return work();
+		}
+		if (rule.times !== undefined && --rule.times <= 0) {
+			delete this.#txRules[op];
+		}
 		return "error" in rule ? Promise.reject(new Error(rule.error)) : Promise.resolve(rule.value);
 	}
 
@@ -130,8 +136,12 @@ export class ControlledPartitionDO extends PartitionDO {
 			pullGate !== null && streamOf(req) === pullGate.spec.stream && (pullGate.spec.target ?? req.target.doName) === req.target.doName;
 		let page: FokosMigrationPage | undefined;
 		if (matches) {
-			if (pullGate.spec.afterRead) page = await super.fokosMigrationPull(req);
-			if (!this.#pullStats.heldTargets.includes(req.target.doName)) this.#pullStats.heldTargets.push(req.target.doName);
+			if (pullGate.spec.afterRead) {
+				page = await super.fokosMigrationPull(req);
+			}
+			if (!this.#pullStats.heldTargets.includes(req.target.doName)) {
+				this.#pullStats.heldTargets.push(req.target.doName);
+			}
 			await pullGate.held;
 		}
 		return page ?? (await super.fokosMigrationPull(req));
@@ -140,7 +150,9 @@ export class ControlledPartitionDO extends PartitionDO {
 	override async fokosInit(req: FokosInitRequest): Promise<void> {
 		await super.fokosInit(req);
 		this.#initCalls++;
-		if (this.#initGate) await this.#initGate.held;
+		if (this.#initGate) {
+			await this.#initGate.held;
+		}
 	}
 
 	/** Holds each pull that matches `spec` until `testReleasePulls`. */

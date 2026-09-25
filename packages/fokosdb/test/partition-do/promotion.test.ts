@@ -167,7 +167,9 @@ describe.concurrent("PartitionDO — hash-child migration excludes promoted keys
 		const aliceChildren: TestPartition[] = [];
 		for (const child of children) {
 			expect(await child.localItemCount("alice"), `alice's data must not be migrated locally into hash child ${child.doName}`).toBe(0);
-			if ((await child.promotedKeyStatus("alice")) === "promoted") aliceChildren.push(child);
+			if ((await child.promotedKeyStatus("alice")) === "promoted") {
+				aliceChildren.push(child);
+			}
 		}
 
 		// Exactly one hash child inherited alice's promoted-key entry; reading alice through THAT child
@@ -356,7 +358,9 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 					// `partition_fanout_failed`, with `partition_migrating` as its cause. The coordinator
 					// retries both errors, thus the test accepts both.
 					const migrating = FokosError.isCode(error, SHARDING_INTERNAL_CODES.partition_fanout_failed) ? error.cause : error;
-					if (!FokosError.isCode(migrating, UNAVAILABLE_CODES.partition_migrating)) throw error;
+					if (!FokosError.isCode(migrating, UNAVAILABLE_CODES.partition_migrating)) {
+						throw error;
+					}
 					return false;
 				}
 			},

@@ -34,7 +34,9 @@ describe("the code tables of the library", () => {
 	});
 
 	it("hold at least one table for each category of the library, and one category per table", () => {
-		for (const table of FOKOS_LIBRARY_CODE_TABLES) expect(new Set(Object.values(table).map((def) => def.tag)).size).toBe(1);
+		for (const table of FOKOS_LIBRARY_CODE_TABLES) {
+			expect(new Set(Object.values(table).map((def) => def.tag)).size).toBe(1);
+		}
 		const tags = [...new Set(FOKOS_LIBRARY_CODE_TABLES.map((table) => Object.values(table)[0].tag))].sort((a, b) => a.localeCompare(b));
 		const categories = [...FOKOS_ERROR_CATEGORIES.keys(), FokosConditionCheckError.tag, FokosTransactionCancelledError.tag];
 		expect(tags).toEqual(categories.sort((a, b) => a.localeCompare(b)));
@@ -65,7 +67,9 @@ describe("the categories of errors-operations", () => {
 			[condition, ["reason", "meta"]],
 			[transaction, ["results"]],
 		] as const) {
-			for (const field of fields) expect(Object.hasOwn(e, field), field).toBe(true);
+			for (const field of fields) {
+				expect(Object.hasOwn(e, field), field).toBe(true);
+			}
 		}
 	});
 });
@@ -102,7 +106,9 @@ describe("FokosTransactionCancelledError", () => {
 		const copy = Object.assign(new Error(e.message), e);
 		const back = FokosError.fromWire(copy);
 		expect(FokosTransactionCancelledError.is(back)).toBe(true);
-		if (!FokosTransactionCancelledError.is(back)) throw new Error("unreachable");
+		if (!FokosTransactionCancelledError.is(back)) {
+			throw new Error("unreachable");
+		}
 		expect([back.error_id, back.results]).toEqual([e.error_id, e.results]);
 	});
 });

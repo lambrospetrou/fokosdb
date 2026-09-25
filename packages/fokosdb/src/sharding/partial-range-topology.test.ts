@@ -135,7 +135,9 @@ describe("PartialRangeTopology", () => {
 			let lastResult: AddResult = AddResult.Added;
 			for (let i = 0; i < 10_000 && lastResult !== AddResult.Full; i++) {
 				lastResult = prt.learnPromotedKey(kb(`key-${i}`));
-				if (lastResult !== AddResult.Full) added++;
+				if (lastResult !== AddResult.Full) {
+					added++;
+				}
 			}
 			expect(lastResult).toBe(AddResult.Full);
 			expect(added).toBeGreaterThan(0);
@@ -152,7 +154,9 @@ describe("PartialRangeTopology", () => {
 			});
 			// Fill it up.
 			for (let i = 0; i < 10_000; i++) {
-				if (prt.learnPromotedKey(kb(`fill-${i}`)) === AddResult.Full) break;
+				if (prt.learnPromotedKey(kb(`fill-${i}`)) === AddResult.Full) {
+					break;
+				}
 			}
 			// Attempting to learn more returns false (no modification).
 			expect(prt.learnPromotedKeys(["new-a", "new-b"].map(kb))).toBe(false);

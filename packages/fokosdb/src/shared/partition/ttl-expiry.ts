@@ -54,13 +54,17 @@ export class TtlExpiry {
 	}
 
 	arm(delayMs?: number): void {
-		if (this.#timer !== null) return;
+		if (this.#timer !== null) {
+			return;
+		}
 		const delay = delayMs ?? 500;
 		this.#timer = setTimeout(() => {
 			this.#timer = null;
 			void this.runCycle()
 				.then((result) => {
-					if (result.more) this.arm();
+					if (result.more) {
+						this.arm();
+					}
 				})
 				.catch((error) => {
 					let logParams: Record<string, unknown> = {};
@@ -80,13 +84,17 @@ export class TtlExpiry {
 	}
 
 	disarm(): void {
-		if (this.#timer === null) return;
+		if (this.#timer === null) {
+			return;
+		}
 		clearTimeout(this.#timer);
 		this.#timer = null;
 	}
 
 	async runCycle(): Promise<TtlSweepResult> {
-		if (this.#running) return { deletedRows: 0, deletedBytes: 0, more: false };
+		if (this.#running) {
+			return { deletedRows: 0, deletedBytes: 0, more: false };
+		}
 		this.#running = true;
 		try {
 			const config = this.#config();
@@ -98,20 +106,30 @@ export class TtlExpiry {
 			let bytesSinceSleep = 0;
 
 			for (;;) {
-				if (!this.#canSweep()) return { deletedRows, deletedBytes, more: false };
-				if (deletedRows >= config.maxRowsPerCycle) return { deletedRows, deletedBytes, more: true };
+				if (!this.#canSweep()) {
+					return { deletedRows, deletedBytes, more: false };
+				}
+				if (deletedRows >= config.maxRowsPerCycle) {
+					return { deletedRows, deletedBytes, more: true };
+				}
 
 				const limit = Math.min(config.chunkSize, config.maxRowsPerCycle - deletedRows);
 				const result = this.#store.deleteExpiredItems(this.#nowSec(), limit);
-				if (result.deletedRows === 0) return { deletedRows, deletedBytes, more: false };
+				if (result.deletedRows === 0) {
+					return { deletedRows, deletedBytes, more: false };
+				}
 
 				deletedRows += result.deletedRows;
 				deletedBytes += result.deletedBytes;
 				rowsSinceSleep += result.deletedRows;
 				bytesSinceSleep += result.deletedBytes;
 
-				if (deletedRows >= config.maxRowsPerCycle) return { deletedRows, deletedBytes, more: true };
-				if (result.deletedRows < limit) return { deletedRows, deletedBytes, more: false };
+				if (deletedRows >= config.maxRowsPerCycle) {
+					return { deletedRows, deletedBytes, more: true };
+				}
+				if (result.deletedRows < limit) {
+					return { deletedRows, deletedBytes, more: false };
+				}
 
 				if (rowsSinceSleep >= config.maxRowsBeforeSleep || bytesSinceSleep >= config.maxBytesBeforeSleep) {
 					await this.#wait(config.sleepMs);

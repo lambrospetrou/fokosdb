@@ -137,14 +137,22 @@ export function topologiesEqual(a: FokosTopology, b: FokosTopology): boolean {
  * an object built with and one built without the optional field compare equal.
  */
 export function structurallyEqual(a: unknown, b: unknown): boolean {
-	if (a === b) return true;
-	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+	if (a === b) {
+		return true;
+	}
+	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) {
+		return false;
+	}
 	if (Array.isArray(a) || Array.isArray(b)) {
-		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+		if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
+			return false;
+		}
 		return a.every((value, i) => structurallyEqual(value, b[i]));
 	}
 	const keysA = Object.keys(a).filter((k) => (a as Record<string, unknown>)[k] !== undefined);
 	const keysB = Object.keys(b).filter((k) => (b as Record<string, unknown>)[k] !== undefined);
-	if (keysA.length !== keysB.length) return false;
+	if (keysA.length !== keysB.length) {
+		return false;
+	}
 	return keysA.every((k) => structurallyEqual((a as Record<string, unknown>)[k], (b as Record<string, unknown>)[k]));
 }

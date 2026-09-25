@@ -14,7 +14,9 @@ function makeTable(rows: Row[]) {
 		fetchPage: (cursor: Cursor | null, pageSize: number): Row[] => {
 			fetchCalls.push({ cursor, pageSize });
 			const start = cursor === null ? 0 : sorted.findIndex((r) => r.id > cursor.afterId);
-			if (start === -1) return [];
+			if (start === -1) {
+				return [];
+			}
 			return sorted.slice(start, start + pageSize);
 		},
 	};

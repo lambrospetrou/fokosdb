@@ -6,7 +6,9 @@ import invariant from "./invariant.js";
  * primary-key lookup.
  */
 export function tryOne<T>(cursor: Iterable<T>): T | undefined {
-	for (const row of cursor) return row;
+	for (const row of cursor) {
+		return row;
+	}
 	return undefined;
 }
 
@@ -15,7 +17,9 @@ export function tryOne<T>(cursor: Iterable<T>): T | undefined {
  * `invariant_failed` when the query returned no row.
  */
 export function one<T>(cursor: Iterable<T>, message?: string): T {
-	for (const row of cursor) return row;
+	for (const row of cursor) {
+		return row;
+	}
 	invariant(false, message ?? "expected at least one row from query");
 }
 

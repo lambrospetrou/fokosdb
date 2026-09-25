@@ -46,7 +46,9 @@ function expectCursorHasSomewhereToGo(
 	matchedSoFar: number,
 	expectedCount: number,
 ): void {
-	if (queries.length !== 1 || page.cursor === undefined || matchedSoFar < expectedCount) return;
+	if (queries.length !== 1 || page.cursor === undefined || matchedSoFar < expectedCount) {
+		return;
+	}
 	const lastChildOfTheWalk = queries[0].scanIndexForward === false ? fixture.leaves[0] : fixture.leaves[fixture.leaves.length - 1];
 	expect(
 		page.partitionMetas.map((meta) => meta.servedByActorName),
@@ -100,7 +102,9 @@ describe("FokosDB queryItems over a range tree — model-based properties", () =
 				// A cursor that carries a child boundary must resolve to that same position on every send,
 				// whichever child the walk enters it from.
 				const first = await fixture.db.queryItems(opts);
-				if (first.cursor === undefined) return;
+				if (first.cursor === undefined) {
+					return;
+				}
 				const again: QueryItemsResult = await fixture.db.queryItems({ ...opts, cursor: first.cursor });
 				const onceMore: QueryItemsResult = await fixture.db.queryItems({ ...opts, cursor: first.cursor });
 

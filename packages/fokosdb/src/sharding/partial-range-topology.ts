@@ -38,7 +38,9 @@ export class PartialRangeTopology {
 	learnPromotedKeys(hashKeys: Iterable<KeyBytes>): boolean {
 		let anyAdded = false;
 		for (const key of hashKeys) {
-			if (this.bloom.add(key) === AddResult.Added) anyAdded = true;
+			if (this.bloom.add(key) === AddResult.Added) {
+				anyAdded = true;
+			}
 		}
 		return anyAdded;
 	}

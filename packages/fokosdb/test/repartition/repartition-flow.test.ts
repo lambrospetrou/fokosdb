@@ -29,7 +29,9 @@ function expectBackoffWindow(actual: number, now: number, attempt: number, base 
 function keyForChild(childIndex: number, hashSplitN: number, prefix = "k"): string {
 	for (let i = 0; i < 100_000; i++) {
 		const key = `${prefix}-${i}`;
-		if (hashChildIndex(kb(key), 0, hashSplitN) === childIndex) return key;
+		if (hashChildIndex(kb(key), 0, hashSplitN) === childIndex) {
+			return key;
+		}
 	}
 	throw new Error("no key found for child");
 }
@@ -160,7 +162,9 @@ describe("Repartition — planning", () => {
 		const root = c.hashNode([0]);
 		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
 		await rangeRoot.enter(async ({ source, store, sharding }) => {
-			for (const sk of ["s1", "s2", "s3", "s4"]) putItem(store, "alice", sk, "x".repeat(200));
+			for (const sk of ["s1", "s2", "s3", "s4"]) {
+				putItem(store, "alice", sk, "x".repeat(200));
+			}
 			source.queue({ kind: "range_split" });
 			expect(await source.sourceStep()).toBe("progressed");
 
@@ -371,7 +375,9 @@ describe("Repartition — the migration protocol", () => {
 		const childB = c.node({ ...c.base, doName: targets[1].doName, partitionId: targets[1].partitionId });
 
 		// Each child pulls one page at a time until its own record says imported.
-		for (const child of [childA, childB]) await drainImport(child);
+		for (const child of [childA, childB]) {
+			await drainImport(child);
+		}
 
 		await childA.enter(({ store, target }) => {
 			expect(target.importState()).toBe("imported");
@@ -389,7 +395,9 @@ describe("Repartition — the migration protocol", () => {
 		});
 
 		// The acknowledgements complete the source, which then drops its now-redundant lock copies.
-		for (const child of [childA, childB]) await child.enter(async ({ target }) => void (await target.sendAck()));
+		for (const child of [childA, childB]) {
+			await child.enter(async ({ target }) => void (await target.sendAck()));
+		}
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
@@ -629,7 +637,9 @@ describe("Repartition — promotions", () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
-			for (const sk of ["s1", "s2", "s3"]) putItem(store, "alice", sk);
+			for (const sk of ["s1", "s2", "s3"]) {
+				putItem(store, "alice", sk);
+			}
 			putItem(store, "bob", "s1");
 			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
 		});
@@ -776,7 +786,9 @@ type QueueRequest = { kind: RepartitionKind; hashKey?: KeyBytes };
 
 /** Queues if needed, then plans, leaving every target `pending`. */
 async function plan(node: Node, request?: QueueRequest, now = T0): Promise<void> {
-	if (request) await node.enter(({ source }) => void source.queue(request, now));
+	if (request) {
+		await node.enter(({ source }) => void source.queue(request, now));
+	}
 	await node.enter(async ({ source }) => void (await source.sourceStep(now)));
 }
 
@@ -788,17 +800,23 @@ async function plan(node: Node, request?: QueueRequest, now = T0): Promise<void>
  * short and let the test assert against a source that never cut over.
  */
 async function cutOver(node: Node, request?: QueueRequest, now = T0): Promise<void> {
-	if (request) await node.enter(({ source }) => void source.queue(request, now));
+	if (request) {
+		await node.enter(({ source }) => void source.queue(request, now));
+	}
 	for (let i = 0; i < 20; i++) {
 		const at = now + i * 30_000;
 		const state = await node.enter(({ sharding }) => {
 			const id = activeRepartitionId(sharding);
-			if (!id) return "none";
+			if (!id) {
+				return "none";
+			}
 			const row = sharding.getRepartition(id)!;
 			const counts = sharding.countRepartitionTargets(id);
 			return row.state === "cutover" && counts.total > 0 && counts.startNotified === counts.total ? "done" : "pending";
 		});
-		if (state === "done") return;
+		if (state === "done") {
+			return;
+		}
 		await node.enter(async ({ source }) => void (await source.sourceStep(at)));
 	}
 	const rows = await node.enter(({ sharding }) => sharding.queryRepartitionStatusPage(null, 50));
@@ -808,7 +826,9 @@ async function cutOver(node: Node, request?: QueueRequest, now = T0): Promise<vo
 /** The one repartition this source is still working on, if any. */
 function activeRepartitionId(sharding: FokosShardingStore): string | undefined {
 	for (const row of sharding.queryRepartitionStatusPage(null, 500)) {
-		if (row.state === "queued" || row.state === "planned" || row.state === "cutover") return row.id;
+		if (row.state === "queued" || row.state === "planned" || row.state === "cutover") {
+			return row.id;
+		}
 	}
 	return undefined;
 }
@@ -823,8 +843,12 @@ function activeRepartitionId(sharding: FokosShardingStore): string | undefined {
 async function drainImport(node: Node): Promise<void> {
 	for (let i = 0; i < 40; i++) {
 		const outcome = await node.enter(async ({ target }) => await target.importOnePage());
-		if (outcome === "stopped") throw new Error(`${node.doName}: the import stopped before it completed`);
-		if (outcome === "idle") break;
+		if (outcome === "stopped") {
+			throw new Error(`${node.doName}: the import stopped before it completed`);
+		}
+		if (outcome === "idle") {
+			break;
+		}
 	}
 	const state = await node.enter(({ target }) => target.importState());
 	if (state !== "imported" && state !== "active") {

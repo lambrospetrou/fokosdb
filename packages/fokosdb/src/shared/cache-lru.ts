@@ -22,7 +22,9 @@ export class LRUCache<K, V> {
 
 	get(key: K): V | undefined {
 		const value = this.map.get(key);
-		if (value === undefined) return undefined;
+		if (value === undefined) {
+			return undefined;
+		}
 		// Move the accessed key to the end to mark it as recently used.
 		this.map.delete(key);
 		this.map.set(key, value);

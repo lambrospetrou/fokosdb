@@ -58,7 +58,9 @@ declare const __FOKOS_PROPERTY_RUNS__: string;
  */
 export function propertyRuns(defaultRuns: number): number {
 	const configured = __FOKOS_PROPERTY_RUNS__;
-	if (configured === "") return defaultRuns;
+	if (configured === "") {
+		return defaultRuns;
+	}
 	const runs = Number(configured);
 	if (!Number.isSafeInteger(runs) || runs <= 0) {
 		throw new Error(`FOKOS_PROPERTY_RUNS must be a positive integer, got ${JSON.stringify(configured)}`);
@@ -104,8 +106,12 @@ export function keyId(key: ItemKey): string {
 
 /** The `kind` that a read returns for the data a write accepted. */
 export function expectedDataKind(data: ItemData): DataKind {
-	if (data instanceof Uint8Array) return "bytes";
-	if (typeof data === "string") return "text";
+	if (data instanceof Uint8Array) {
+		return "bytes";
+	}
+	if (typeof data === "string") {
+		return "text";
+	}
 	return "json";
 }
 
@@ -128,7 +134,9 @@ export const arbItemKey: fc.Arbitrary<ItemKey> = fc.record({ hashKey: arbHashKey
 
 /** `hashKey` with `prefix` in front, so a run on a shared table writes in a key space of its own. */
 export function prefixHashKey(prefix: string, hashKey: string | Uint8Array): string | Uint8Array {
-	if (typeof hashKey === "string") return `${prefix}:${hashKey}`;
+	if (typeof hashKey === "string") {
+		return `${prefix}:${hashKey}`;
+	}
 	const head = textEncoder.encode(`${prefix}:`);
 	const out = new Uint8Array(head.length + hashKey.byteLength);
 	out.set(head);
@@ -192,7 +200,9 @@ async function retryWhile<T>(fn: () => Promise<T>, clears: (e: unknown) => boole
 		try {
 			return await fn();
 		} catch (e) {
-			if (!clears(e) || attempt >= RETRY_LIMIT) throw e;
+			if (!clears(e) || attempt >= RETRY_LIMIT) {
+				throw e;
+			}
 			onRetry?.();
 			await sleep(RETRY_DELAY_MS);
 		}
@@ -254,14 +264,21 @@ function applyPut(m: Model, key: ItemKey, data: ItemData): number {
  * an array does not give; and a `remove` of a field an array cannot hold changes nothing.
  */
 function updatedDocument(item: ModelItem | undefined, actions: readonly ModelUpdateAction[]): JsonComposite | null {
-	if (item !== undefined && item.kind !== "json") return null;
+	if (item !== undefined && item.kind !== "json") {
+		return null;
+	}
 	const preImage = (item?.data ?? {}) as JsonComposite;
-	if (Array.isArray(preImage)) return actions.some((a) => a.action === "set") ? null : preImage;
+	if (Array.isArray(preImage)) {
+		return actions.some((a) => a.action === "set") ? null : preImage;
+	}
 
 	const document: { [field: string]: JsonValue } = { ...(preImage as { [field: string]: JsonValue }) };
 	for (const action of actions) {
-		if (action.action === "set") document[action.field] = action.value;
-		else delete document[action.field];
+		if (action.action === "set") {
+			document[action.field] = action.value;
+		} else {
+			delete document[action.field];
+		}
 	}
 	return document;
 }
@@ -270,7 +287,9 @@ function updatedDocument(item: ModelItem | undefined, actions: readonly ModelUpd
 function applyUpdate(m: Model, key: ItemKey, actions: readonly ModelUpdateAction[]): void {
 	const id = keyId(key);
 	const document = updatedDocument(m.items.get(id), actions);
-	if (document === null) throw new Error("an update that does not apply must not commit");
+	if (document === null) {
+		throw new Error("an update that does not apply must not commit");
+	}
 	m.items.set(id, { data: document, kind: "json", version: (m.items.get(id)?.version ?? 0) + 1 });
 }
 
@@ -305,9 +324,13 @@ export type TxOp = { key: ItemKey; expectExists?: boolean } & (
 /** Applies the operations of a committed transaction to the model. */
 function applyTxOps(m: Model, ops: readonly TxOp[]): void {
 	for (const op of ops) {
-		if (op.operation === "put") applyPut(m, op.key, op.data);
-		else if (op.operation === "delete") m.items.delete(keyId(op.key));
-		else if (op.operation === "update") applyUpdate(m, op.key, op.actions);
+		if (op.operation === "put") {
+			applyPut(m, op.key, op.data);
+		} else if (op.operation === "delete") {
+			m.items.delete(keyId(op.key));
+		} else if (op.operation === "update") {
+			applyUpdate(m, op.key, op.actions);
+		}
 	}
 }
 
@@ -333,8 +356,12 @@ function existsCondition(expectExists: boolean): ConditionExpression {
 /** Translates one operation of the model into the request that the public API takes. */
 function toTransactWriteItem(op: TxOp): TransactWriteItem {
 	const condition = op.expectExists === undefined ? undefined : existsCondition(op.expectExists);
-	if (op.operation === "put") return { operation: "put", ...op.key, data: op.data, condition };
-	if (op.operation === "delete") return { operation: "delete", ...op.key, condition };
+	if (op.operation === "put") {
+		return { operation: "put", ...op.key, data: op.data, condition };
+	}
+	if (op.operation === "delete") {
+		return { operation: "delete", ...op.key, condition };
+	}
 	if (op.operation === "update") {
 		const update: UpdateExpression = op.actions.map((action) =>
 			action.action === "set"
@@ -360,7 +387,9 @@ const premiseCode = (r: TransactWriteOperationResult): string | undefined =>
  */
 function expectedRejection(m: Model, op: TxOp): string[] | null {
 	const codes: string[] = [];
-	if (op.expectExists !== undefined && op.expectExists !== m.items.has(keyId(op.key))) codes.push("condition_failed");
+	if (op.expectExists !== undefined && op.expectExists !== m.items.has(keyId(op.key))) {
+		codes.push("condition_failed");
+	}
 	if (op.operation === "update" && updatedDocument(m.items.get(keyId(op.key)), op.actions) === null) {
 		codes.push("update_not_applicable");
 	}
@@ -418,17 +447,22 @@ async function recordTransaction(
 	stats: TransactionStats | undefined,
 	send: () => Promise<TransactWriteOperationResult[] | undefined>,
 ): Promise<TransactWriteOperationResult[] | undefined> {
-	if (stats === undefined) return await send();
+	if (stats === undefined) {
+		return await send();
+	}
 	stats.started++;
 	stats.inFlight++;
 	stats.peakInFlight = Math.max(stats.peakInFlight, stats.inFlight);
 	try {
 		const results = await send();
-		if (results === undefined) stats.committed++;
-		else {
+		if (results === undefined) {
+			stats.committed++;
+		} else {
 			stats.cancelled++;
 			for (const r of results) {
-				if (r.outcome === "rejected") stats.rejections.set(r.reason.code, (stats.rejections.get(r.reason.code) ?? 0) + 1);
+				if (r.outcome === "rejected") {
+					stats.rejections.set(r.reason.code, (stats.rejections.get(r.reason.code) ?? 0) + 1);
+				}
 			}
 		}
 		return results;
@@ -496,7 +530,9 @@ function poolModel(items: readonly MaybeReadItem[], keys: readonly ItemKey[]): M
 	const model: Model = { items: new Map() };
 	keys.forEach((key, i) => {
 		const read = items[i];
-		if (read.found) model.items.set(keyId(key), { data: read.data as ItemData, kind: read.kind as DataKind, version: read.version });
+		if (read.found) {
+			model.items.set(keyId(key), { data: read.data as ItemData, kind: read.kind as DataKind, version: read.version });
+		}
 	});
 	return model;
 }
@@ -512,10 +548,15 @@ async function expectKeyUnlocked(m: Model, db: FokosDB, key: ItemKey, stats: Tra
 	const { value, waited } = await untilUnlocked<PutItemResult | DeleteItemResult>(() =>
 		item === undefined ? db.deleteItem(key) : db.putItem({ ...key, data: item.data }),
 	);
-	if (item === undefined) expect(value).toMatchObject({ item: key, deleted: false });
-	else expect(value).toMatchObject({ item: key, version: applyPut(m, key, item.data) });
+	if (item === undefined) {
+		expect(value).toMatchObject({ item: key, deleted: false });
+	} else {
+		expect(value).toMatchObject({ item: key, version: applyPut(m, key, item.data) });
+	}
 	stats.lockProbes++;
-	if (waited) stats.lockProbeWaits++;
+	if (waited) {
+		stats.lockProbeWaits++;
+	}
 }
 
 // ─── The commands ─────────────────────────────────────────────────────────────
@@ -605,7 +646,9 @@ export class TransactWrite extends ModelCommand {
 			untilAvailable(() => db.transactWriteItems({ items: this.ops.map(toTransactWriteItem) })).then(
 				() => undefined,
 				(e: unknown) => {
-					if (FokosTransactionCancelledError.is(e)) return e.results;
+					if (FokosTransactionCancelledError.is(e)) {
+						return e.results;
+					}
 					throw e;
 				},
 			),
@@ -616,13 +659,18 @@ export class TransactWrite extends ModelCommand {
 			// operation. Every participant answers its own operations at the same time, so a failing
 			// operation never stays `not_evaluated`. The model does not change.
 			expect(results, "a failing premise must cancel the transaction").toBeDefined();
-			if (results === undefined) return;
+			if (results === undefined) {
+				return;
+			}
 			expect(results).toHaveLength(this.ops.length);
 			rejections.forEach((codes, i) => {
 				// The participant must not blame an operation whose premises hold. It can still reject
 				// that operation for an order or an availability reason, which is another code.
-				if (codes === null) expect(premiseCode(results[i])).toBeUndefined();
-				else expect(codes).toContain(premiseCode(results[i]));
+				if (codes === null) {
+					expect(premiseCode(results[i])).toBeUndefined();
+				} else {
+					expect(codes).toContain(premiseCode(results[i]));
+				}
 			});
 			return;
 		}
@@ -630,7 +678,11 @@ export class TransactWrite extends ModelCommand {
 		if (results !== undefined) {
 			// Every premise held, so only an order or an availability reason cancels the transaction.
 			// The transaction is atomic, so the model does not change.
-			for (const r of results) if (r.outcome === "rejected") expect(ORDERING_CANCEL_CODES).toContain(r.reason.code);
+			for (const r of results) {
+				if (r.outcome === "rejected") {
+					expect(ORDERING_CANCEL_CODES).toContain(r.reason.code);
+				}
+			}
 			return;
 		}
 
@@ -756,10 +808,16 @@ class ConcurrentTransactWrites extends ModelCommand {
 		// The run awaits every transaction before it raises the first failure, so a failing batch
 		// never leaves the next command with a request of this one still in flight.
 		const settled = await Promise.allSettled(this.transactions.map((tx) => tx.run(m, db)));
-		for (const outcome of settled) if (outcome.status === "rejected") throw outcome.reason;
+		for (const outcome of settled) {
+			if (outcome.status === "rejected") {
+				throw outcome.reason;
+			}
+		}
 
 		for (const tx of this.transactions) {
-			for (const op of tx.ops) await expectKeyUnlocked(m, db, op.key, this.stats);
+			for (const op of tx.ops) {
+				await expectKeyUnlocked(m, db, op.key, this.stats);
+			}
 		}
 	}
 
@@ -833,7 +891,9 @@ const CONTENTION_CANCEL_CODES: ReadonlySet<string> = new Set([
 // says nothing about the value, so the canonical form sorts them. Text and bytes never compare
 // equal, because the signature below carries the `kind` of the item as well.
 function canonicalJson(value: JsonValue): string {
-	if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+	if (Array.isArray(value)) {
+		return `[${value.map(canonicalJson).join(",")}]`;
+	}
 	if (typeof value === "object" && value !== null) {
 		return `{${Object.keys(value)
 			.sort()
@@ -844,8 +904,12 @@ function canonicalJson(value: JsonValue): string {
 }
 
 function canonicalData(data: ItemData): string {
-	if (data instanceof Uint8Array) return [...data].map((b) => b.toString(16).padStart(2, "0")).join("");
-	if (typeof data === "string") return JSON.stringify(data);
+	if (data instanceof Uint8Array) {
+		return [...data].map((b) => b.toString(16).padStart(2, "0")).join("");
+	}
+	if (typeof data === "string") {
+		return JSON.stringify(data);
+	}
 	return canonicalJson(data);
 }
 
@@ -862,7 +926,9 @@ function stateSignature(m: Model, keys: readonly ItemKey[]): string {
 const cloneModel = (m: Model): Model => ({ items: new Map([...m.items].map(([id, item]) => [id, { ...item }])) });
 
 function permutations<T>(items: readonly T[]): T[][] {
-	if (items.length <= 1) return [[...items]];
+	if (items.length <= 1) {
+		return [[...items]];
+	}
 	return items.flatMap((item, i) => permutations([...items.slice(0, i), ...items.slice(i + 1)]).map((rest) => [item, ...rest]));
 }
 
@@ -870,7 +936,9 @@ function permutations<T>(items: readonly T[]): T[][] {
 function applyWhenPremisesHold(m: Model, ops: readonly TxOp[]): boolean {
 	// Every operation of a transaction reads the state the transaction starts from, and the keys of
 	// one transaction are unique, so the participant evaluates the premises before any of them applies.
-	if (ops.some((op) => expectedRejection(m, op) !== null)) return false;
+	if (ops.some((op) => expectedRejection(m, op) !== null)) {
+		return false;
+	}
 	applyTxOps(m, ops);
 	return true;
 }
@@ -900,7 +968,9 @@ async function sendPinned(db: FokosDB, ops: readonly TxOp[], token: string): Pro
 			await db.transactWriteItems({ items, clientRequestToken: token });
 			return undefined;
 		} catch (e) {
-			if (FokosTransactionCancelledError.is(e)) return e.results;
+			if (FokosTransactionCancelledError.is(e)) {
+				return e.results;
+			}
 			throw e;
 		}
 	};
@@ -909,7 +979,9 @@ async function sendPinned(db: FokosDB, ops: readonly TxOp[], token: string): Pro
 
 /** The outcome as one comparable string: a commit, or the answer to each operation in request order. */
 function describeOutcome(results: TransactWriteOperationResult[] | undefined): string {
-	if (results === undefined) return "committed";
+	if (results === undefined) {
+		return "committed";
+	}
 	return `cancelled(${results.map((r) => (r.outcome === "rejected" ? r.reason.code : r.outcome)).join(", ")})`;
 }
 
@@ -966,11 +1038,19 @@ class ContendingTransactWrites implements fc.AsyncCommand<Model, FokosDB> {
 		const settled = await Promise.allSettled(this.transactions.map((tx) => tx.send(db)));
 		// The run awaits every transaction before it raises the first failure, so a failing batch
 		// never leaves the next command with a request of this one still in flight.
-		for (const outcome of settled) if (outcome.status === "rejected") throw outcome.reason;
+		for (const outcome of settled) {
+			if (outcome.status === "rejected") {
+				throw outcome.reason;
+			}
+		}
 		const outcomes = settled.flatMap((outcome) => (outcome.status === "fulfilled" ? [outcome.value] : []));
 
 		for (const results of outcomes) {
-			for (const r of results ?? []) if (r.outcome === "rejected") expect(CONTENTION_CANCEL_CODES).toContain(r.reason.code);
+			for (const r of results ?? []) {
+				if (r.outcome === "rejected") {
+					expect(CONTENTION_CANCEL_CODES).toContain(r.reason.code);
+				}
+			}
 		}
 
 		const committed = this.transactions.filter((_, i) => outcomes[i] === undefined).map((tx) => tx.ops);
@@ -993,7 +1073,9 @@ class ContendingTransactWrites implements fc.AsyncCommand<Model, FokosDB> {
 		);
 
 		for (const tx of this.transactions) {
-			for (const op of tx.ops) await expectKeyUnlocked(m, db, op.key, this.stats);
+			for (const op of tx.ops) {
+				await expectKeyUnlocked(m, db, op.key, this.stats);
+			}
 		}
 	}
 

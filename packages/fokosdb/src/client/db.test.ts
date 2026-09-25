@@ -71,7 +71,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				await db.putItem({ hashKey: "ttl", sortKey: "item", data: "v2" });
 				const cleared = await db.getItem({ hashKey: "ttl", sortKey: "item" });
 				expect(cleared).toMatchObject({ found: true, item: { data: "v2" } });
-				if (cleared.found) expect(cleared.item.ttlAt).toBeUndefined();
+				if (cleared.found) {
+					expect(cleared.item.ttlAt).toBeUndefined();
+				}
 			});
 
 			it.each([0, -1, 1.5])("rejects invalid ttlAt %s for direct and transactional puts", async (ttlAt) => {
@@ -140,7 +142,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("rejects a cursor resumed with another projection or none", async () => {
 				const db = makeDB();
-				for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				for (const sk of ["a1", "a2", "a3", "a4"]) {
+					await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				}
 				const projectionA: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
 				const projectionB: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "sk" }];
 
@@ -161,7 +165,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				for (;;) {
 					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], projection: projectionA, cursor });
 					got.push(...res.items.map((item) => item.id));
-					if (res.cursor === undefined) break;
+					if (res.cursor === undefined) {
+						break;
+					}
 					cursor = res.cursor;
 				}
 				expect(got).toEqual(["a1", "a2", "a3", "a4"]);
@@ -169,8 +175,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("paginates projected rows across sub-queries without gaps or duplicates", async () => {
 				const db = makeDB();
-				for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-				for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+				for (const sk of ["a1", "a2", "a3"]) {
+					await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				}
+				for (const sk of ["b1", "b2", "b3"]) {
+					await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+				}
 
 				const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
 				const projection: ProjectionExpression[] = [{ expr: { ref: "sortKey" }, as: "id" }];
@@ -181,7 +191,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					const res = await db.queryItems({ queries, projection, limit: 2, cursor });
 					got.push(...res.items.map((item) => item.id));
 					pages++;
-					if (res.cursor === undefined) break;
+					if (res.cursor === undefined) {
+						break;
+					}
 					cursor = res.cursor;
 					expect(pages).toBeLessThan(50);
 				}
@@ -398,7 +410,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("a filter that rejects every candidate pages the whole interval", async () => {
 				const db = makeDB();
-				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				for (let i = 0; i < 5; i++) {
+					await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				}
 				const filter: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 999 }] };
 
 				const first = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, limit: 2 });
@@ -417,7 +431,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					count += res.count;
 					scannedCount += res.scannedCount;
 					pages++;
-					if (res.cursor === undefined) break;
+					if (res.cursor === undefined) {
+						break;
+					}
 					cursor = res.cursor;
 					expect(pages).toBeLessThan(50);
 				}
@@ -427,7 +443,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("count mode with a filter returns the matched count of the page", async () => {
 				const db = makeDB();
-				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				for (let i = 0; i < 5; i++) {
+					await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i } });
+				}
 				const filter: ConditionExpression = { op: "gte", args: [{ ref: "data", path: "$.n" }, { val: 3 }] };
 
 				const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter, select: "count" });
@@ -439,7 +457,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("rejects a filtered cursor resumed with another filter or none", async () => {
 				const db = makeDB();
-				for (const sk of ["a1", "a2", "a3", "a4"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				for (const sk of ["a1", "a2", "a3", "a4"]) {
+					await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+				}
 				const filterA: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a2" }] };
 				const filterB: ConditionExpression = { op: "gte", args: [{ ref: "sortKey" }, { val: "a1" }] };
 
@@ -463,7 +483,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					const res = await db.queryItems({ queries: [{ hashKey: "alice" }], filter: filterA, cursor });
 					got.push(...sksOf(res));
 					pages++;
-					if (res.cursor === undefined) break;
+					if (res.cursor === undefined) {
+						break;
+					}
 					cursor = res.cursor;
 					expect(pages).toBeLessThan(50);
 				}
@@ -472,7 +494,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("a filter and a projection compose in one request", async () => {
 				const db = makeDB();
-				for (let i = 0; i < 5; i++) await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i, s: `v${i}` } });
+				for (let i = 0; i < 5; i++) {
+					await db.putItem({ hashKey: "alice", sortKey: `s${i}`, data: { n: i, s: `v${i}` } });
+				}
 
 				const res = await db.queryItems({
 					queries: [{ hashKey: "alice" }],
@@ -494,7 +518,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			async function populateAndQuery(sortKeyCondition: Parameters<FokosDB["queryItems"]>[0]["queries"][0]["sortKeyCondition"]) {
 				const db = makeDB();
-				for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				for (const sk of ALL_SKS) {
+					await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				}
 				return await db.queryItems({ queries: [{ hashKey: "k", sortKeyCondition }] });
 			}
 
@@ -584,7 +610,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 			it("begins_with works correctly with scanIndexForward=false", async () => {
 				const db = makeDB();
-				for (const sk of ALL_SKS) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				for (const sk of ALL_SKS) {
+					await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				}
 				const res = await db.queryItems({
 					queries: [{ hashKey: "k", sortKeyCondition: { op: "begins_with", prefix: "a" }, scanIndexForward: false }],
 				});
@@ -602,7 +630,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			async function populate() {
 				const db = makeDB();
 				await db.putItem({ hashKey: "k", data: "x" });
-				for (const sk of ["a", "order#", "order#1", "order$", "p"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				for (const sk of ["a", "order#", "order#1", "order$", "p"]) {
+					await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+				}
 				await db.putItem({ hashKey: "k", sortKey: BIN, data: "x" });
 				return db;
 			}
@@ -630,7 +660,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 					const res = await db.queryItems({ queries, limit: 2, cursor });
 					seen.push(...sksOf(res));
 					pages++;
-					if (res.cursor === undefined) break;
+					if (res.cursor === undefined) {
+						break;
+					}
 					cursor = res.cursor;
 					expect(pages).toBeLessThan(50);
 				}
@@ -667,7 +699,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				expect(gotBytes).toMatchObject({ found: true, item: { kind: "bytes", data: bytes } });
 				expect(gotText).toMatchObject({ found: true, item: { kind: "text", data: "hello" } });
 				expect(gotJson).toMatchObject({ found: true, item: { kind: "json" } });
-				if (gotJson.found) expect(gotJson.item.data).toEqual(obj); // deep structural equality after JSONB round-trip
+				if (gotJson.found) {
+					expect(gotJson.item.data).toEqual(obj);
+				} // deep structural equality after JSONB round-trip
 			});
 
 			it("keeps a bare string as opaque text (not JSON-wrapped), byte-identical on read", async () => {
@@ -702,7 +736,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const read = await db.transactGetItems({ items: [{ hashKey: "t", sortKey: "j" }] });
 				expect(read.items[0]).toMatchObject({ found: true, kind: "json" });
 				const item = read.items[0];
-				if (item.found) expect(item.data).toEqual(obj);
+				if (item.found) {
+					expect(item.data).toEqual(obj);
+				}
 			});
 
 			it("rejects data that is not JSON-serializable", async () => {
@@ -845,8 +881,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 	describe("FokosDB.queryItems — multi sub-query fan-out", () => {
 		it("groups results per sub-query in request order, sk-ordered within each group", async () => {
 			const db = makeDB();
-			for (const sk of ["a3", "a1", "a2"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b2", "b1"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a3", "a1", "a2"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b2", "b1"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({ queries: [{ hashKey: "alice" }, { hashKey: "bob" }] });
 
@@ -862,8 +902,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("count selection returns the page count with no items", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1", "b2"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({ queries: [{ hashKey: "alice" }, { hashKey: "bob" }], select: "count" });
 
@@ -876,8 +920,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("reverses both the group contents and applies sk DESC within each group", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1", "b2"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({
 				queries: [
@@ -892,8 +940,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("supports mixed directions: one sub-query ascending, another descending", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1", "b2", "b3"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({
 				queries: [
@@ -907,7 +959,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("allows duplicate hash keys → two consecutive groups (union of disjoint ranges)", async () => {
 			const db = makeDB();
-			for (const sk of ["s1", "s2", "s3", "s4"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+			for (const sk of ["s1", "s2", "s3", "s4"]) {
+				await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({
 				queries: [
@@ -921,8 +975,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("skips an empty-interval sub-query but keeps the others in list order", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({
 				queries: [
@@ -940,8 +998,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const db = makeDB();
 			const aliceSks = ["a1", "a2", "a3"];
 			const bobSks = ["b1", "b2", "b3"];
-			for (const sk of aliceSks) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of bobSks) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of aliceSks) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of bobSks) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
 			const got: Array<string | Uint8Array | undefined> = [];
@@ -951,7 +1013,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const res = await db.queryItems({ queries, limit: 2, cursor });
 				got.push(...sksOf(res));
 				pages++;
-				if (res.cursor === undefined) break;
+				if (res.cursor === undefined) {
+					break;
+				}
 				cursor = res.cursor;
 				expect(pages).toBeLessThan(50);
 			}
@@ -966,8 +1030,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			const big = "x".repeat(20 * 1024);
 			const aliceSks = ["a1", "a2", "a3"];
 			const bobSks = ["b1", "b2"];
-			for (const sk of aliceSks) await db.putItem({ hashKey: "alice", sortKey: sk, data: big });
-			for (const sk of bobSks) await db.putItem({ hashKey: "bob", sortKey: sk, data: big });
+			for (const sk of aliceSks) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: big });
+			}
+			for (const sk of bobSks) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: big });
+			}
 
 			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
 			const got: Array<string | Uint8Array | undefined> = [];
@@ -977,7 +1045,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const res = await db.queryItems({ queries, maxResponseBytes: 25 * 1024, cursor });
 				got.push(...sksOf(res));
 				pages++;
-				if (res.cursor === undefined) break;
+				if (res.cursor === undefined) {
+					break;
+				}
 				cursor = res.cursor;
 				expect(pages).toBeLessThan(50);
 			}
@@ -989,7 +1059,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("rejects a cursor whose request fingerprint differs from the resumed request", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
 			await db.putItem({ hashKey: "bob", sortKey: "b1", data: "x" });
 
 			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], limit: 2 });
@@ -1003,7 +1075,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("rejects a cursor whose direction differs from the resumed request", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
 
 			const first = await db.queryItems({ queries: [{ hashKey: "alice" }], limit: 2 });
 			expect(first.cursor).toBeDefined();
@@ -1052,7 +1126,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("explicit projection selection returns the same page as the default", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({ queries: [{ hashKey: "alice" }], select: "projection" });
 			expect(sksOf(res)).toEqual(["a1", "a2", "a3"]);
@@ -1062,9 +1138,15 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("count selection spans multiple, duplicate, and empty sub-queries", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
-			for (const sk of ["s1", "s2", "s3", "s4"]) await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1", "b2"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["s1", "s2", "s3", "s4"]) {
+				await db.putItem({ hashKey: "k", sortKey: sk, data: "x" });
+			}
 
 			const res = await db.queryItems({
 				queries: [
@@ -1104,8 +1186,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 		it("count mode follows the same cursor as projection mode", async () => {
 			const db = makeDB();
-			for (const sk of ["a1", "a2", "a3"]) await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
-			for (const sk of ["b1", "b2", "b3"]) await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			for (const sk of ["a1", "a2", "a3"]) {
+				await db.putItem({ hashKey: "alice", sortKey: sk, data: "x" });
+			}
+			for (const sk of ["b1", "b2", "b3"]) {
+				await db.putItem({ hashKey: "bob", sortKey: sk, data: "x" });
+			}
 
 			const queries = [{ hashKey: "alice" }, { hashKey: "bob" }];
 			let count = 0;
@@ -1115,7 +1201,9 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 				const res = await db.queryItems({ queries, limit: 2, select: "count", cursor });
 				count += res.count;
 				pages++;
-				if (res.cursor === undefined) break;
+				if (res.cursor === undefined) {
+					break;
+				}
 				cursor = res.cursor;
 				expect(pages).toBeLessThan(50);
 			}

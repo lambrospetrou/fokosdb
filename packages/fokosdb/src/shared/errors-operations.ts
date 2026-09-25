@@ -85,14 +85,19 @@ export class FokosTransactionCancelledError<C extends string = string> extends F
 		let internal: FokosCodeDef | undefined;
 		let service: FokosCodeDef | undefined;
 		for (const r of options.results) {
-			if (r.outcome !== "rejected") continue;
+			if (r.outcome !== "rejected") {
+				continue;
+			}
 			const def = FOKOS_LIBRARY_CODES.get(r.reason.code);
 			if (def?.origin === "caller") {
 				caller = def;
 				break;
 			}
-			if (def?.origin === "internal") internal ??= def;
-			else if (def?.origin === "service") service ??= def;
+			if (def?.origin === "internal") {
+				internal ??= def;
+			} else if (def?.origin === "service") {
+				service ??= def;
+			}
 		}
 		const decisive = caller ?? internal ?? service;
 		super(code, { origin: decisive?.origin, httpStatusHint: decisive?.httpStatusHint, ...options });
@@ -139,7 +144,9 @@ export function withExpressionErrors<T>(fn: () => T): T {
 		return fn();
 	} catch (e) {
 		const expressionError = e as Partial<ExpressionError> | null;
-		if (expressionError?.name !== "ExpressionError") throw e;
+		if (expressionError?.name !== "ExpressionError") {
+			throw e;
+		}
 		throw new FokosExpressionError(EXPRESSION_CODES.expression_invalid, {
 			message: "expression is not valid",
 			cause: e,

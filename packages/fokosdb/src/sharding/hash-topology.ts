@@ -77,7 +77,9 @@ export class HashTopology {
 		while (true) {
 			const childIdx = hashChildIndex(hashKey, this.ownerAbsDepth + relDepth, this.K);
 			const ptr = this.arena[block + childIdx];
-			if (ptr === 0) break;
+			if (ptr === 0) {
+				break;
+			}
 			block = ptr;
 			relDepth++;
 		}
@@ -103,8 +105,12 @@ export class HashTopology {
 			// B3 hybrid eviction: depth cap first, then budget cap.
 			// rd + 1 is the depth of the block we're about to allocate; stop only when
 			// that would exceed maxDepth (inclusive), so maxDepth=3 allows findLeaf to return 3.
-			if (rd + 1 > this.maxDepth) break;
-			if (this.nextFree + this.K > this.maxSlots) break;
+			if (rd + 1 > this.maxDepth) {
+				break;
+			}
+			if (this.nextFree + this.K > this.maxSlots) {
+				break;
+			}
 			const newBlock = this.nextFree;
 			this.nextFree += this.K;
 			this.arena[block + childIdx] = newBlock;
@@ -121,15 +127,21 @@ export class HashTopology {
 	 * @return true if the cache was modified (caller should persist).
 	 */
 	invalidate(hashKey: KeyBytes, relDepth: number): boolean {
-		if (relDepth < 1) return false;
+		if (relDepth < 1) {
+			return false;
+		}
 		let block = 0;
 		for (let rd = 0; rd < relDepth - 1; rd++) {
 			const ptr = this.arena[block + hashChildIndex(hashKey, this.ownerAbsDepth + rd, this.K)];
-			if (ptr === 0) return false;
+			if (ptr === 0) {
+				return false;
+			}
 			block = ptr;
 		}
 		const slot = block + hashChildIndex(hashKey, this.ownerAbsDepth + relDepth - 1, this.K);
-		if (this.arena[slot] === 0) return false;
+		if (this.arena[slot] === 0) {
+			return false;
+		}
 		this.arena[slot] = 0;
 		return true;
 	}

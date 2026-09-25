@@ -53,15 +53,21 @@ export function decodeCursor(s: string): DecodedCursor {
 	} catch (e) {
 		throw cursorMalformed("cursor is not valid base64url-encoded JSON", e);
 	}
-	if (typeof wire !== "object" || wire === null) throw cursorMalformed("cursor is not valid base64url-encoded JSON");
+	if (typeof wire !== "object" || wire === null) {
+		throw cursorMalformed("cursor is not valid base64url-encoded JSON");
+	}
 	if (wire.v !== CURSOR_VERSION) {
 		throw new FokosValidationError(VALIDATION_CODES.cursor_version_unknown, {
 			message: "unknown cursor version",
 			attributes: { version: wire.v },
 		});
 	}
-	if (wire.d !== "fwd" && wire.d !== "rev") throw cursorMalformed("cursor has invalid direction");
-	if (!Number.isSafeInteger(wire.qi) || wire.qi < 0) throw cursorMalformed("cursor has invalid queryIdx");
+	if (wire.d !== "fwd" && wire.d !== "rev") {
+		throw cursorMalformed("cursor has invalid direction");
+	}
+	if (!Number.isSafeInteger(wire.qi) || wire.qi < 0) {
+		throw cursorMalformed("cursor has invalid queryIdx");
+	}
 	let fingerprint: bigint;
 	try {
 		fingerprint = BigInt(wire.fp);
@@ -100,7 +106,9 @@ export function computeCursorFingerprint(
 ): bigint {
 	const sizeOfBound = (b: { value: KeyBytes } | undefined) => (b ? 1 + 4 + b.value.byteLength : 0);
 	const sizeOfInterval = (q: (typeof queries)[number]) => {
-		if (q.interval === null) return 1;
+		if (q.interval === null) {
+			return 1;
+		}
 		return 1 + sizeOfBound(q.interval.lower) + 1 + sizeOfBound(q.interval.upper) + 1;
 	};
 
@@ -110,8 +118,12 @@ export function computeCursorFingerprint(
 			: [filterIdentity, projectionIdentity].map((id) => (id === null ? null : encoder.encode(id)));
 
 	let total = 4;
-	for (const q of queries) total += 4 + q.hashKey.byteLength + sizeOfInterval(q);
-	for (const id of identities) total += id === null ? 1 : 1 + 4 + id.byteLength;
+	for (const q of queries) {
+		total += 4 + q.hashKey.byteLength + sizeOfInterval(q);
+	}
+	for (const id of identities) {
+		total += id === null ? 1 : 1 + 4 + id.byteLength;
+	}
 
 	const buf = new Uint8Array(total);
 	const dv = new DataView(buf.buffer);

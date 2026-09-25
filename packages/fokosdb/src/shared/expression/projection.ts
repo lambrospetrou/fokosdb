@@ -44,7 +44,9 @@ export function projectedItemFromWireRow(names: readonly string[], row: Projecte
 	const entries: [string, ProjectedValue][] = [];
 	for (let k = 0; k < names.length; k++) {
 		const cell = row[k];
-		if (cell === undefined) continue;
+		if (cell === undefined) {
+			continue;
+		}
 		entries.push([names[k], cell !== null && typeof cell === "object" && "json" in cell ? (JSON.parse(cell.json) as JsonValue) : cell]);
 	}
 	return Object.fromEntries(entries);

@@ -52,7 +52,9 @@ describe("depth seeding decorrelates levels", () => {
 		const sampleKeys = KEYS.slice(0, 200);
 		const fingerprint = (d: number) => sampleKeys.map((k) => hashChildIndex(k, d, 251)).join(",");
 		const fps = new Set<string>();
-		for (let d = 0; d < 32; d++) fps.add(fingerprint(d));
+		for (let d = 0; d < 32; d++) {
+			fps.add(fingerprint(d));
+		}
 		expect(fps.size).toBe(32); // all 32 depths produce a distinct assignment ⇒ distinct seeds
 	});
 });
@@ -61,7 +63,9 @@ describe("distribution is roughly uniform", () => {
 	it("spreads a fixture key set across K root slots within tolerance", () => {
 		const K = 8;
 		const counts = Array.from({ length: K }, () => 0);
-		for (const k of KEYS) counts[hashRootIndex(k, K)]++;
+		for (const k of KEYS) {
+			counts[hashRootIndex(k, K)]++;
+		}
 		const expected = KEYS.length / K;
 		// Loose chi-square-free bound: no bucket should be wildly off (within 2.5x of expected).
 		for (const c of counts) {

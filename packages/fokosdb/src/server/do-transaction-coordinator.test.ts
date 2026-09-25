@@ -1111,7 +1111,9 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 	it("pages the ledger FOKOS_PAGE_ROWS transactions at a time, and keeps only the transactions the target owns", async () => {
 		await withCoordinator((tc, state) => {
 			const ids = Array.from({ length: 2 * FOKOS_PAGE_ROWS + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
-			for (const id of ids) insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
+			for (const id of ids) {
+				insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
+			}
 
 			const all = () => true;
 			const first = tc.buildMigrationPage(null, all);
@@ -1194,7 +1196,9 @@ describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () =
 		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 		tc.cancelTransactionInStore(TX_ID, TOKEN);
 		const response = tc.loadFinalResponse(TX_ID, TOKEN);
-		if (response.outcome !== "cancelled") throw new Error("the transaction did not cancel");
+		if (response.outcome !== "cancelled") {
+			throw new Error("the transaction did not cancel");
+		}
 		return response;
 	}
 

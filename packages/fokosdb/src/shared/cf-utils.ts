@@ -15,7 +15,9 @@ export const DESTROY_ABORT_SENTINEL = "__special_destroy_sentinel";
 export function isDestroyAbortError(e: unknown): boolean {
 	for (let current = e, depth = 0; current != null && depth < 8; current = (current as { cause?: unknown }).cause, depth++) {
 		// oxlint-disable-next-line typescript/no-base-to-string
-		if (String(current).includes(DESTROY_ABORT_SENTINEL)) return true;
+		if (String(current).includes(DESTROY_ABORT_SENTINEL)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -47,7 +49,9 @@ let coloInfo: ColoInfo | undefined;
  * an isolate runs in is fixed for its lifetime, so the value is cached indefinitely.
  */
 export async function getColoInfo(): Promise<ColoInfo> {
-	if (coloInfo !== undefined) return coloInfo;
+	if (coloInfo !== undefined) {
+		return coloInfo;
+	}
 	return await fetchColoInfo().then((info) => {
 		coloInfo = info;
 		return info;
@@ -62,7 +66,9 @@ export async function fetchColoInfo(): Promise<ColoInfo> {
 			const info: Record<string, string> = {};
 			for (const line of text.split("\n")) {
 				const idx = line.indexOf("=");
-				if (idx === -1) continue;
+				if (idx === -1) {
+					continue;
+				}
 				info[line.slice(0, idx)] = line.slice(idx + 1);
 			}
 			// `colo` is airport code, `loc` is the 2-letter country code: https://www.iso.org/obp/ui/#search

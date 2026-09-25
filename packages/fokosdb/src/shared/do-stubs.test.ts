@@ -92,7 +92,9 @@ describe("stub helpers", () => {
 			// No location hint is configured, so the options are undefined.
 			expect(target.getByName).toHaveBeenCalledWith("p0", undefined);
 			for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
-				if (other !== target) expect(other.getByName).not.toHaveBeenCalled();
+				if (other !== target) {
+					expect(other.getByName).not.toHaveBeenCalled();
+				}
 			}
 		},
 	);
@@ -105,7 +107,9 @@ describe("stub helpers", () => {
 		expect(target.get).toHaveBeenCalledTimes(1);
 		expect(target.get).toHaveBeenCalledWith(doId, undefined);
 		for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
-			if (other !== target) expect(other.get).not.toHaveBeenCalled();
+			if (other !== target) {
+				expect(other.get).not.toHaveBeenCalled();
+			}
 		}
 	});
 
@@ -119,7 +123,9 @@ describe("stub helpers", () => {
 			expect(target.getByName).toHaveBeenCalledTimes(1);
 			expect(target.getByName).toHaveBeenCalledWith("tc0", undefined);
 			for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
-				if (other !== target) expect(other.getByName).not.toHaveBeenCalled();
+				if (other !== target) {
+					expect(other.getByName).not.toHaveBeenCalled();
+				}
 			}
 		},
 	);
@@ -133,9 +139,13 @@ describe("stub helpers", () => {
 			expect(txCoordinatorStubForParticipant(env, { nsTx: "TRANSACTION_COORDINATOR_DO", jurisdiction }, "tc0")).toBe("stub-by-name:tc0");
 			expect(target.getByName).toHaveBeenCalledTimes(1);
 			expect(target.getByName).toHaveBeenCalledWith("tc0");
-			if (jurisdiction !== undefined) expect(coordinatorNs.jurisdiction).toHaveBeenCalledWith(jurisdiction);
+			if (jurisdiction !== undefined) {
+				expect(coordinatorNs.jurisdiction).toHaveBeenCalledWith(jurisdiction);
+			}
 			for (const other of [partitionNs, coordinatorNs, partitionSub, coordinatorSub]) {
-				if (other !== target) expect(other.getByName).not.toHaveBeenCalled();
+				if (other !== target) {
+					expect(other.getByName).not.toHaveBeenCalled();
+				}
 			}
 		},
 	);

@@ -38,7 +38,9 @@ export function makeCounterTable(maxRequests = 5) {
 				expected.set(key, (expected.get(key) ?? 0) + amount);
 				return result;
 			} catch (err) {
-				if (Date.now() > deadline || !FokosError.isCode(err, "partition_migrating")) throw err;
+				if (Date.now() > deadline || !FokosError.isCode(err, "partition_migrating")) {
+					throw err;
+				}
 				await scheduler.wait(POLL_MS);
 			}
 		}
@@ -50,7 +52,9 @@ export function makeCounterTable(maxRequests = 5) {
 		const walk = async (ref: FokosPartitionRef) => {
 			const stats = await stub(ref.doName).getCounterStats();
 			nodes.push({ ref, stats });
-			for (const child of stats.children) await walk(child);
+			for (const child of stats.children) {
+				await walk(child);
+			}
 		};
 		await walk(root);
 		return nodes;
@@ -66,8 +70,12 @@ export function makeCounterTable(maxRequests = 5) {
 		for (;;) {
 			nodes = await tree();
 			const idle = nodes.every((n) => n.stats.repartitionState === null && (n.stats.importState ?? "active") === "active");
-			if (idle && done(nodes)) break;
-			if (Date.now() > deadline) throw new Error(`the tree did not settle: ${JSON.stringify(nodes.map((n) => [n.ref.doName, n.stats]))}`);
+			if (idle && done(nodes)) {
+				break;
+			}
+			if (Date.now() > deadline) {
+				throw new Error(`the tree did not settle: ${JSON.stringify(nodes.map((n) => [n.ref.doName, n.stats]))}`);
+			}
 			await scheduler.wait(POLL_MS);
 		}
 		const rows = nodes.filter((n) => n.stats.role === "owner").flatMap((n) => n.stats.rows);

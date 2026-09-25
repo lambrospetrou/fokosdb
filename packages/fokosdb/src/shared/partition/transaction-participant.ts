@@ -48,9 +48,15 @@ export function parseCoordinatorRef(json: string, transactionId: string): Coordi
 	} catch {
 		throw invalid("is not JSON");
 	}
-	if (ref?.v !== COORDINATOR_REF_VERSION) throw invalid("has an unknown version", { v: ref?.v });
-	if (!ref.idempotencyToken) throw invalid("has no idempotency token");
-	if (!ref.doName) throw invalid("has no coordinator name");
+	if (ref?.v !== COORDINATOR_REF_VERSION) {
+		throw invalid("has an unknown version", { v: ref?.v });
+	}
+	if (!ref.idempotencyToken) {
+		throw invalid("has no idempotency token");
+	}
+	if (!ref.doName) {
+		throw invalid("has no coordinator name");
+	}
 	return ref as CoordinatorRef;
 }
 
@@ -65,7 +71,9 @@ type ItemStamp = { last_read_ts: number; last_write_ts: number };
  * found no row. Both columns are NOT NULL, so a live row always carries both values.
  */
 function itemStampOf(read: { itemPresent: boolean; lastReadTs: number | null; lastWriteTs: number | null }): ItemStamp | undefined {
-	if (!read.itemPresent) return undefined;
+	if (!read.itemPresent) {
+		return undefined;
+	}
 	invariant(read.lastReadTs !== null && read.lastWriteTs !== null, "fokos/partition.prepare: a live row has no item timestamps");
 	return { last_read_ts: read.lastReadTs, last_write_ts: read.lastWriteTs };
 }
@@ -121,7 +129,9 @@ export class TransactionParticipant {
 	 * condition, with no `await` between them, so it returns the row the condition compared.
 	 */
 	#imageForFailedCondition(item: TransactionItem, sk: KeyBytes, itemPresent: boolean) {
-		if (item.returnValuesOnConditionCheckFailure !== "all_old" || !itemPresent) return undefined;
+		if (item.returnValuesOnConditionCheckFailure !== "all_old" || !itemPresent) {
+			return undefined;
+		}
 		return this.#store.getItemImage(item.hashKey, sk).row;
 	}
 
@@ -379,7 +389,9 @@ export class TransactionParticipant {
 			const sk = item.sortKey;
 			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
 
-			if (!pendingRow) continue;
+			if (!pendingRow) {
+				continue;
+			}
 
 			if (pendingRow.operation === "put" || pendingRow.operation === "update") {
 				// A put/update always persisted both data and kind; assert together so upsertItem gets a real kind.

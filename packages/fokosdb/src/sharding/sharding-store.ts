@@ -474,8 +474,11 @@ export class FokosShardingStore {
 	}
 
 	putJobs(record: FokosJobsRecord): void {
-		if (Object.keys(record).length === 0) this.#storage.kv.delete(FOKOS_KV_KEYS.JOBS);
-		else this.#storage.kv.put<FokosJobsRecord>(FOKOS_KV_KEYS.JOBS, record);
+		if (Object.keys(record).length === 0) {
+			this.#storage.kv.delete(FOKOS_KV_KEYS.JOBS);
+		} else {
+			this.#storage.kv.put<FokosJobsRecord>(FOKOS_KV_KEYS.JOBS, record);
+		}
 	}
 
 	// ─── KV: route caches ───────────────────────────────────────────────────
@@ -945,12 +948,16 @@ export class FokosShardingStore {
 			now,
 			RANGE_HIERARCHY_REFRESH_MS,
 		);
-		if (res.rowsWritten === 0) return;
+		if (res.rowsWritten === 0) {
+			return;
+		}
 
 		// FIXME: Optimize this by using a more efficient eviction strategy rather than counting and deleting excess rows.
 		const excess =
 			one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n - this.#rangeHierarchyMaxRows;
-		if (excess <= 0) return;
+		if (excess <= 0) {
+			return;
+		}
 		this.#storage.sql.exec(
 			`DELETE FROM fokos_range_hierarchy WHERE (hk, sk_start_boundary, sk_end_boundary) IN (
 			     SELECT hk, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy ORDER BY learned_at, depth DESC LIMIT ?1)`,
@@ -1017,7 +1024,9 @@ export class FokosShardingStore {
 				unbounded,
 			),
 		);
-		if (!row) return null;
+		if (!row) {
+			return null;
+		}
 
 		const start = fromSqlKey(row.sk_start_boundary);
 		const end = fromSqlKey(row.sk_end_boundary);

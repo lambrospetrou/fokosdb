@@ -75,7 +75,9 @@ describe.concurrent("PartitionDO — routing on errors", () => {
 			// The root learned the depth of the leaf from the error, so it now skips the child.
 			expect((await readRouting(root, keys)).forwardCount).toBe(1);
 
-			for (const node of [leaf, child, root]) await expectSameRouting(node, keys);
+			for (const node of [leaf, child, root]) {
+				await expectSameRouting(node, keys);
+			}
 		} finally {
 			await release();
 		}
@@ -93,7 +95,9 @@ describe.concurrent("PartitionDO — routing on errors", () => {
 		await hash.get(keys);
 		const release = await lockItem(leaf, keys);
 		try {
-			for (const node of [leaf, rangeRoot, hash]) await expectSameRouting(node, keys);
+			for (const node of [leaf, rangeRoot, hash]) {
+				await expectSameRouting(node, keys);
+			}
 		} finally {
 			await release();
 		}

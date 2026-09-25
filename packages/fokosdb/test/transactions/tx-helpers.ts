@@ -47,7 +47,9 @@ export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Pr
 	try {
 		return { outcome: "committed", ...(await write) };
 	} catch (e) {
-		if (!FokosTransactionCancelledError.is(e)) throw e;
+		if (!FokosTransactionCancelledError.is(e)) {
+			throw e;
+		}
 		return {
 			outcome: "cancelled",
 			transactionId: e.attributes.transactionId as string,
@@ -151,7 +153,9 @@ export function keysInOnePartition(db: FokosDB, count: number, prefix: string): 
 		const bucket = buckets.get(partitionNameOf(db, key)) ?? [];
 		bucket.push(key);
 		buckets.set(partitionNameOf(db, key), bucket);
-		if (bucket.length === count) return bucket;
+		if (bucket.length === count) {
+			return bucket;
+		}
 	}
 }
 

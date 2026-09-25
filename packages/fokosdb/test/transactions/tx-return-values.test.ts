@@ -78,7 +78,9 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			);
 
 			expect(res.outcome).toBe("cancelled");
-			if (res.outcome !== "cancelled") return;
+			if (res.outcome !== "cancelled") {
+				return;
+			}
 
 			expect(res.results).toHaveLength(2);
 			expect(res.results[0]).toEqual({ outcome: "passed" });
@@ -126,7 +128,9 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			);
 
 			expect(res.outcome).toBe("cancelled");
-			if (res.outcome !== "cancelled") return;
+			if (res.outcome !== "cancelled") {
+				return;
+			}
 			expect(res.results).toHaveLength(1);
 			expect(res.results[0]).toMatchObject({
 				outcome: "rejected",
@@ -182,7 +186,9 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			);
 
 			expect(res.outcome).toBe("cancelled");
-			if (res.outcome !== "cancelled") return;
+			if (res.outcome !== "cancelled") {
+				return;
+			}
 
 			// 3 results in request order
 			expect(res.results).toHaveLength(3);
@@ -352,7 +358,9 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			);
 
 			expect(res.outcome).toBe("cancelled");
-			if (res.outcome !== "cancelled") return;
+			if (res.outcome !== "cancelled") {
+				return;
+			}
 
 			expect(res.results).toHaveLength(2);
 			const op0 = res.results[0];

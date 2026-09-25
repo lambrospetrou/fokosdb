@@ -27,7 +27,9 @@ export const RANGE_MAX = "~max";
 // cleanliness), and 0x7E ("~", reserved for the RANGE_MIN/RANGE_MAX sentinels). Control/high/binary
 // bytes (incl. the 0xFF binary-key tag) escape too — readable for ASCII text, reversible for any bytes.
 function isSafeNameByte(b: number): boolean {
-	if (b < 0x21 || b > 0x7d) return false; // control, space, DEL, and 0x7E (~, sentinel-reserved)
+	if (b < 0x21 || b > 0x7d) {
+		return false;
+	} // control, space, DEL, and 0x7E (~, sentinel-reserved)
 	return b !== 0x22 /* " */ && b !== 0x25 /* % */ && b !== 0x2e /* . */ && b !== 0x5c /* \\ */;
 }
 
@@ -236,7 +238,9 @@ export class PartitionIdHelper {
 		bytes[1] = (hashIdxs[0] >> 8) & 0xff; // root index high byte
 		bytes[2] = hashIdxs[0] & 0xff; // root index low byte
 		bytes[3] = depth; // sub-tree depth (u8)
-		for (let i = 0; i < depth; i++) bytes[4 + i] = hashIdxs[i + 1];
+		for (let i = 0; i < depth; i++) {
+			bytes[4 + i] = hashIdxs[i + 1];
+		}
 		return new PartitionIdHelper(shardGroup, bytes);
 	}
 
@@ -323,7 +327,9 @@ export class PartitionIdHelper {
 			const bsz = this.#bytes.length;
 			// bytes[0..2] = version + rootIdx — leave unchanged.
 			bytes[3] = bsz - 4 + this.#appendedHashIdxs.length; // new depth (u8)
-			for (let i = 0; i < this.#appendedHashIdxs.length; i++) bytes[bsz + i] = this.#appendedHashIdxs[i];
+			for (let i = 0; i < this.#appendedHashIdxs.length; i++) {
+				bytes[bsz + i] = this.#appendedHashIdxs[i];
+			}
 		} else {
 			// Fresh hash instance: appendedHashIdxs[0] is the root index (u16), rest are child indexes (u8 each).
 			const depth = this.#appendedHashIdxs.length - 1;
@@ -332,7 +338,9 @@ export class PartitionIdHelper {
 			bytes[1] = (this.#appendedHashIdxs[0] >> 8) & 0xff; // root high byte
 			bytes[2] = this.#appendedHashIdxs[0] & 0xff; // root low byte
 			bytes[3] = depth;
-			for (let i = 0; i < depth; i++) bytes[4 + i] = this.#appendedHashIdxs[i + 1];
+			for (let i = 0; i < depth; i++) {
+				bytes[4 + i] = this.#appendedHashIdxs[i + 1];
+			}
 		}
 		let doName: string | undefined;
 		if (includeDoName) {

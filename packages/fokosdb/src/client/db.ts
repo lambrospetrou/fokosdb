@@ -120,8 +120,12 @@ const TX_COORDINATOR_MIGRATING_RETRY_MS = 15_000;
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
 // so the DO only ever receives `string | Uint8Array` plus a kind discriminant.
 function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemData {
-	if (data instanceof Uint8Array) return { kind: "bytes", data };
-	if (typeof data === "string") return { kind: "text", data };
+	if (data instanceof Uint8Array) {
+		return { kind: "bytes", data };
+	}
+	if (typeof data === "string") {
+		return { kind: "text", data };
+	}
 	// `JsonComposite` is arrays and objects only.
 	// Accepting a primitive silently would make the declared type a lie, and taking it back later would be
 	// breaking — whereas relaxing this check later is not.
@@ -156,7 +160,9 @@ function encodeItemData(data: string | Uint8Array | JsonComposite): EncodedItemD
 // is malformed (a store/encoding bug, not user input), so surface it loudly rather than returning junk.
 function decodeItemData(kind: DataKind, data: string | Uint8Array | JsonValue): DecodedItemData {
 	// The store writes `data_kind` beside the value, so the pair is always the one that was written.
-	if (kind !== "json") return { kind, data } as DecodedItemData;
+	if (kind !== "json") {
+		return { kind, data } as DecodedItemData;
+	}
 	try {
 		return { kind, data: JSON.parse(data as string) as JsonValue };
 	} catch (err) {
@@ -215,8 +221,12 @@ function transactionCancelledError(fields: {
 }
 
 function decodeOperationResult(res: TransactWriteOperationResultEncoded): TransactWriteOperationResult {
-	if (res.outcome === "passed") return { outcome: "passed" };
-	if (res.outcome === "not_evaluated") return { outcome: "not_evaluated" };
+	if (res.outcome === "passed") {
+		return { outcome: "passed" };
+	}
+	if (res.outcome === "not_evaluated") {
+		return { outcome: "not_evaluated" };
+	}
 	return {
 		outcome: "rejected",
 		reason: decodeRejectionReason(res.reason),
@@ -257,7 +267,9 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
  * and the error keeps its original `error_id`, so one log line still joins the two ends.
  */
 function mapInternalErrorToPublic(err: FokosError): FokosError {
-	if (err.code !== SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code) return err;
+	if (err.code !== SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code) {
+		return err;
+	}
 	const mapped = new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
 		message: "partition split in progress, please retry later",
 		error_id: err.error_id,
@@ -271,7 +283,9 @@ function mapInternalErrorToPublic(err: FokosError): FokosError {
 }
 
 function validateTtlAt(ttlAt: number | undefined, where: string): void {
-	if (ttlAt === undefined) return;
+	if (ttlAt === undefined) {
+		return;
+	}
 	if (!Number.isInteger(ttlAt) || ttlAt <= 0) {
 		throw new FokosValidationError(VALIDATION_CODES.ttl_at_invalid, {
 			message: "ttlAt must be an integer greater than zero",
@@ -408,7 +422,9 @@ export class FokosDB {
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 			}),
 		);
-		if (res.outcome === "rejected") throw conditionCheckError(opts, res, routing);
+		if (res.outcome === "rejected") {
+			throw conditionCheckError(opts, res, routing);
+		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, version: res.version, meta: publicMeta(res.meta, routing) };
 	}
@@ -468,13 +484,17 @@ export class FokosDB {
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 			}),
 		);
-		if (res.outcome === "rejected") throw conditionCheckError(opts, res, routing);
+		if (res.outcome === "rejected") {
+			throw conditionCheckError(opts, res, routing);
+		}
 		// The DO returns no keys; the caller's own are the only ones it can recognise.
 		return { item: { hashKey: opts.hashKey, sortKey: opts.sortKey }, deleted: res.deleted, meta: publicMeta(res.meta, routing) };
 	}
 
 	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
-		if (opts.clientRequestToken !== undefined) validateClientRequestToken(opts.clientRequestToken);
+		if (opts.clientRequestToken !== undefined) {
+			validateClientRequestToken(opts.clientRequestToken);
+		}
 
 		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
 		// field set on a non-put by a non-TypeScript caller stays present so validation rejects it.
@@ -485,7 +505,9 @@ export class FokosDB {
 				const update = withExpressionErrors(() => compileUpdateExpression(item.update));
 				return { ...item, update, condition };
 			}
-			if (item.operation !== "put") return { ...item, condition };
+			if (item.operation !== "put") {
+				return { ...item, condition };
+			}
 			validateTtlAt(item.ttlAt, "transactWriteItems");
 			return { ...item, ...encodeItemData(item.data), condition };
 		});
@@ -506,7 +528,9 @@ export class FokosDB {
 			// recognise a token it has already executed and return that outcome, this restriction lifts and
 			// token-bearing single-partition transactions can take the same single round trip.
 			const fastPathResult = await this.#writeSingleShotFastPath(items);
-			if (fastPathResult) return fastPathResult;
+			if (fastPathResult) {
+				return fastPathResult;
+			}
 		}
 
 		// The token is the route key of the coordinator, so a request always carries one.
@@ -543,10 +567,14 @@ export class FokosDB {
 	 * stores it, and it exists only so the public response shape is the same on both paths.
 	 */
 	async #writeSingleShotFastPath(items: TCWriteOperation[]): Promise<TransactWriteItemsResult | null> {
-		if (!this.#options.singlePartitionFastPath) return null;
+		if (!this.#options.singlePartitionFastPath) {
+			return null;
+		}
 
 		const target = singlePartitionTarget(items);
-		if (!target) return null;
+		if (!target) {
+			return null;
+		}
 
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
 		const stub = partitionStubByName(env, target, target.doName);
@@ -617,7 +645,9 @@ export class FokosDB {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
-				if (!item.found) return { ...keys, ...item };
+				if (!item.found) {
+					return { ...keys, ...item };
+				}
 				if (item.kind === "projected") {
 					// items[i] answers request.items[i], so the record's names come from that item's own plan.
 					const plan = items[index].projection;
@@ -642,9 +672,13 @@ export class FokosDB {
 	 * says the keys span partitions, or the partition itself answered `not_applicable` because they do.
 	 */
 	async #readSnapshotFastPath(items: TCReadItem[]): Promise<InitiateReadResponseEncoded | null> {
-		if (!this.#options.singlePartitionFastPath) return null;
+		if (!this.#options.singlePartitionFastPath) {
+			return null;
+		}
 		const target = singlePartitionTarget(items);
-		if (!target) return null;
+		if (!target) {
+			return null;
+		}
 
 		const stub = partitionStubByName(env, target, target.doName);
 		const request = {
@@ -656,8 +690,12 @@ export class FokosDB {
 			(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
 		);
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
-		if (response.outcome === "not_applicable") return null;
-		if (response.outcome === "aborted") throw pendingWriteError();
+		if (response.outcome === "not_applicable") {
+			return null;
+		}
+		if (response.outcome === "aborted") {
+			throw pendingWriteError();
+		}
 		return response;
 	}
 
@@ -699,11 +737,15 @@ export class FokosDB {
 		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase1Settled) {
 			// A read applies nothing, so the error of a failed phase call is the answer, as the partition raised it.
-			if (r.status === "rejected") throw r.reason;
+			if (r.status === "rejected") {
+				throw r.reason;
+			}
 			phase1Flat.push(...r.value.value.items);
 		}
 
-		if (phase1Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
+		if (phase1Flat.some((item) => item.hasPendingWrite)) {
+			throw pendingWriteError();
+		}
 
 		// Phase 2 — verify no concurrent mutations
 		const phase2Settled = await Promise.allSettled(
@@ -726,11 +768,15 @@ export class FokosDB {
 
 		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase2Settled) {
-			if (r.status === "rejected") throw r.reason;
+			if (r.status === "rejected") {
+				throw r.reason;
+			}
 			phase2Flat.push(...r.value.value.items);
 		}
 
-		if (phase2Flat.some((item) => item.hasPendingWrite)) throw pendingWriteError();
+		if (phase2Flat.some((item) => item.hasPendingWrite)) {
+			throw pendingWriteError();
+		}
 
 		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
 		// flattens the replies, so result order is not request order. KeyCodec.pairKey is the ONE identity
@@ -746,8 +792,12 @@ export class FokosDB {
 		// sequence. An unrelated user delete in the same partition is a conservative conflict. An item
 		// absent in both phases compares equal and is not a conflict. Item timestamps are not compared.
 		const sameCommittedState = (a: ReadForTransactionItemResultEncoded, b: ReadForTransactionItemResultEncoded): boolean => {
-			if (a.found !== b.found) return false;
-			if (a.found && b.found && a.version !== b.version) return false;
+			if (a.found !== b.found) {
+				return false;
+			}
+			if (a.found && b.found && a.version !== b.version) {
+				return false;
+			}
 			return a.deleteRevision === b.deleteRevision;
 		};
 
@@ -756,9 +806,13 @@ export class FokosDB {
 		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
 		// request order is restored here, once, from the same pairKey identity.
 		const phase1ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
-		for (const r of phase1Flat) phase1ByKey.set(itemIdentity(r), r);
+		for (const r of phase1Flat) {
+			phase1ByKey.set(itemIdentity(r), r);
+		}
 		const phase2ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
-		for (const r of phase2Flat) phase2ByKey.set(itemIdentity(r), r);
+		for (const r of phase2Flat) {
+			phase2ByKey.set(itemIdentity(r), r);
+		}
 		const items: ReadForTransactionItemResultEncoded[] = [];
 		for (const requested of requestedItems) {
 			const key = KeyCodec.pairKey(requested.hashKey, requested.sortKey);
@@ -874,7 +928,9 @@ export class FokosDB {
 
 		for (let qi = startQueryIdx; qi < normalizedQueries.length; qi++) {
 			const query = normalizedQueries[qi];
-			if (query.interval === null) continue;
+			if (query.interval === null) {
+				continue;
+			}
 
 			const rpcCursor: ScanCursor | null =
 				qi === startQueryIdx && startInner !== null
@@ -926,7 +982,9 @@ export class FokosDB {
 				rowsRead += leaf.rowsRead;
 				partitionsVisited += 1;
 				const info = leafPartitionInfo(leaf, routing);
-				if (info) partitionMetas.push(info);
+				if (info) {
+					partitionMetas.push(info);
+				}
 			}
 			forwardCount += routing.forwardCount;
 			budget.consume(rpcResult);
@@ -990,7 +1048,9 @@ export class FokosDB {
 				try {
 					await stub.fokosDestroy();
 				} catch (e) {
-					if (!isDestroyAbortError(e)) throw e;
+					if (!isDestroyAbortError(e)) {
+						throw e;
+					}
 				}
 				console.warn(`Destroyed transaction coordinator ${ctx.doName}`);
 			},
@@ -1002,7 +1062,9 @@ export class FokosDB {
 				try {
 					await stub.fokosDestroy();
 				} catch (e) {
-					if (!isDestroyAbortError(e)) throw e;
+					if (!isDestroyAbortError(e)) {
+						throw e;
+					}
 				}
 				console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
 			},

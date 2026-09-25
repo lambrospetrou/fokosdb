@@ -50,7 +50,9 @@ export function defineCodes<T extends string, S extends Record<string, string>>(
 	segments: S,
 ): { readonly [C in keyof S & string]: FokosCodeDef<T, C> } {
 	const defs: Record<string, FokosCodeDef> = {};
-	for (const [code, segment] of Object.entries(segments)) defs[code] = { tag, code, segment, origin, httpStatusHint };
+	for (const [code, segment] of Object.entries(segments)) {
+		defs[code] = { tag, code, segment, origin, httpStatusHint };
+	}
 	return defs as { readonly [C in keyof S & string]: FokosCodeDef<T, C> };
 }
 
@@ -61,7 +63,11 @@ export function defineCodes<T extends string, S extends Record<string, string>>(
  */
 export function defineErrorGuard<U extends FokosError>(...tables: ReadonlyArray<Record<string, FokosCodeDef>>): (e: unknown) => e is U {
 	const tagOfCode = new Map<string, string>();
-	for (const table of tables) for (const def of Object.values(table)) tagOfCode.set(def.code, def.tag);
+	for (const table of tables) {
+		for (const def of Object.values(table)) {
+			tagOfCode.set(def.code, def.tag);
+		}
+	}
 	return (e: unknown): e is U => FokosError.is(e) && tagOfCode.get(e.code) === e._tag;
 }
 
@@ -148,7 +154,9 @@ export abstract class FokosError<T extends string = string, C extends string = s
 	static isCode<T extends string, C extends string>(e: unknown, code: FokosCodeDef<T, C>): e is FokosError<T, C>;
 	static isCode<C extends string>(e: unknown, code: C): e is FokosError<string, C>;
 	static isCode(e: unknown, code: FokosCodeDef | string): boolean {
-		if (!FokosError.is(e)) return false;
+		if (!FokosError.is(e)) {
+			return false;
+		}
 		return typeof code === "string" ? e.code === code : e._tag === code.tag && e.code === code.code;
 	}
 
@@ -163,7 +171,9 @@ export abstract class FokosError<T extends string = string, C extends string = s
 	 * defect.
 	 */
 	static wrap(e: unknown): FokosError {
-		if (FokosError.is(e)) return e;
+		if (FokosError.is(e)) {
+			return e;
+		}
 		const attributes: Record<string, unknown> = {};
 		if (typeof e === "object" && e !== null) {
 			for (const [key, value] of Object.entries(e)) {

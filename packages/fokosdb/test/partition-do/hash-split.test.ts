@@ -361,7 +361,9 @@ describe("PartitionDO - splitting", () => {
 		const probeKey = (slot: number) => {
 			for (let i = 0; ; i++) {
 				const key = `probe-${slot}-${i}`;
-				if (hashChildIndex(kb(key), 0, HASH_SPLIT_N) === slot) return key;
+				if (hashChildIndex(kb(key), 0, HASH_SPLIT_N) === slot) {
+					return key;
+				}
 			}
 		};
 
@@ -506,7 +508,9 @@ describe("PartitionDO - splitting", () => {
 				const keyLabel = `${KeyCodec.keyForLog(item.hashKey)}/${KeyCodec.keyForLog(item.sortKey)}`;
 				for (const childCtx of childContexts) {
 					const child = TestPartition.at(childCtx);
-					if ((await partition.childOwning(KeyCodec.decode(item.hashKey) as string)).doName !== child.doName) continue;
+					if ((await partition.childOwning(KeyCodec.decode(item.hashKey) as string)).doName !== child.doName) {
+						continue;
+					}
 					const result = await child.get({ hashKey: item.hashKey, sortKey: item.sortKey });
 					if (result.found) {
 						expect(foundInDoName, `${keyLabel} found in multiple children`).toBeUndefined();
@@ -542,7 +546,9 @@ describe("PartitionDO - splitting", () => {
 				await partition.awaitSplitStarted();
 				await waitForAllChildRequests();
 				children = await partition.children();
-				for (const child of children) expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				for (const child of children) {
+					expect((await child.status()).migrationStatus).toBe("migration_migrating");
+				}
 
 				// Simulate the item expiring mid-migration: the sweep must not run while a child is
 				// still migrating, so the expired row is still there until the hold releases.

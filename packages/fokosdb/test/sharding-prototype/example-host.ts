@@ -113,7 +113,9 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 						const sub = { ...request, limit: request.limit - rows.length };
 						const page = visit.target === "local" ? await local(sub) : await forward(visit, sub);
 						rows.push(...page.rows);
-						if (page.more || rows.length >= request.limit) return { rows: rows.slice(0, request.limit), more: true };
+						if (page.more || rows.length >= request.limit) {
+							return { rows: rows.slice(0, request.limit), more: true };
+						}
 					}
 					return { rows, more: false };
 				},
@@ -153,17 +155,24 @@ export class DocsDO extends DurableObject<Env> implements DocRpc {
 					return { page, nextCursor: rows.length < 1000 ? null : [rows.at(-1)!.hk, rows.at(-1)!.sk] };
 				},
 				applyPage: (page) => {
-					for (const r of page as Array<{ hk: KeyBytes; sk: KeyBytes; body: string }>)
+					for (const r of page as Array<{ hk: KeyBytes; sk: KeyBytes; body: string }>) {
 						sql.exec("INSERT OR REPLACE INTO docs (hk, sk, body) VALUES (?, ?, ?)", r.hk, r.sk, r.body);
+					}
 				},
 				validatePage: (_cursor, page) => {
-					if (!Array.isArray(page)) throw new Error("docs page must be an array");
+					if (!Array.isArray(page)) {
+						throw new Error("docs page must be an array");
+					}
 				},
 			},
 			cleanupSourceStep: (plan) => {
-				if (plan.kind !== "key_promotion") return true;
+				if (plan.kind !== "key_promotion") {
+					return true;
+				}
 				const slice = plan.targets[0].slice;
-				if (slice.kind !== "promoted_key") return true;
+				if (slice.kind !== "promoted_key") {
+					return true;
+				}
 				sql.exec("DELETE FROM docs WHERE hk = ?", slice.hashKey);
 				return true;
 			},

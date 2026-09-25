@@ -29,13 +29,17 @@ export type PlannedVisit = {
 
 /** Compares two start boundaries, where null is the unbounded lower edge. */
 export function startCmp(a: KeyBytes | null, b: KeyBytes | null): number {
-	if (a === null || b === null) return a === b ? 0 : a === null ? -1 : 1;
+	if (a === null || b === null) {
+		return a === b ? 0 : a === null ? -1 : 1;
+	}
 	return KeyCodec.compare(a, b);
 }
 
 /** Compares two end boundaries, where null is the unbounded upper edge. */
 export function endCmp(a: KeyBytes | null, b: KeyBytes | null): number {
-	if (a === null || b === null) return a === b ? 0 : a === null ? 1 : -1;
+	if (a === null || b === null) {
+		return a === b ? 0 : a === null ? 1 : -1;
+	}
 	return KeyCodec.compare(a, b);
 }
 
@@ -74,7 +78,9 @@ export function planRangeFrontier(
 ): PlannedVisit[] {
 	const visits: PlannedVisit[] = [];
 	for (const base of bases) {
-		if (!rangeIntersects(base.start ?? NO_KEY, base.end, interval)) continue;
+		if (!rangeIntersects(base.start ?? NO_KEY, base.end, interval)) {
+			continue;
+		}
 		const inside = learned.filter((slice) => isStrictSubSlice(slice, base.start, base.end));
 		if (inside.length === 0) {
 			visits.push({ visit: { target: base.target, start: base.start, end: base.end, speculative: base.speculative }, base, learned: null });
@@ -85,8 +91,12 @@ export function planRangeFrontier(
 		const points: KeyBytes[] = [];
 		for (const slice of inside) {
 			for (const point of [slice.startBoundary, slice.endBoundary]) {
-				if (point === null || startCmp(point, base.start) <= 0 || endCmp(point, base.end) >= 0) continue;
-				if (!points.some((p) => KeyCodec.compare(p, point) === 0)) points.push(point);
+				if (point === null || startCmp(point, base.start) <= 0 || endCmp(point, base.end) >= 0) {
+					continue;
+				}
+				if (!points.some((p) => KeyCodec.compare(p, point) === 0)) {
+					points.push(point);
+				}
 			}
 		}
 		points.sort(KeyCodec.compare);
@@ -102,8 +112,9 @@ export function planRangeFrontier(
 			}
 			let deepest: LearnedRangeSlice | null = null;
 			for (const slice of inside) {
-				if (contains(slice.startBoundary, slice.endBoundary, start, end) && (deepest === null || slice.depth > deepest.depth))
+				if (contains(slice.startBoundary, slice.endBoundary, start, end) && (deepest === null || slice.depth > deepest.depth)) {
 					deepest = slice;
+				}
 			}
 			const target = deepest ? refOf(deepest.startBoundary, deepest.endBoundary) : base.target;
 			if (previous && sameTarget(previous.visit.target, target) && endCmp(previous.visit.end, start) === 0) {
@@ -118,6 +129,8 @@ export function planRangeFrontier(
 }
 
 function sameTarget(a: FokosPartitionRef | "local", b: FokosPartitionRef | "local"): boolean {
-	if (a === "local" || b === "local") return a === b;
+	if (a === "local" || b === "local") {
+		return a === b;
+	}
 	return a.partitionId === b.partitionId;
 }

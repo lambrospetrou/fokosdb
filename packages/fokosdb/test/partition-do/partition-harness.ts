@@ -214,9 +214,13 @@ export class TestPartition {
 	/** This partition and each node below it that the split created. */
 	private async splitTree(): Promise<TestPartition[]> {
 		const state = await this.status();
-		if (!state.splitStatus || state.splitStatus.status === "split_queued") return [this];
+		if (!state.splitStatus || state.splitStatus.status === "split_queued") {
+			return [this];
+		}
 		const nodes: TestPartition[] = [this];
-		for (const child of await this.children()) nodes.push(...(await child.splitTree()));
+		for (const child of await this.children()) {
+			nodes.push(...(await child.splitTree()));
+		}
 		return nodes;
 	}
 
@@ -244,8 +248,12 @@ export class TestPartition {
 				// is also a failure, for example when a promotion in the queue prevents the split. The
 				// writes after it get the same rejection. Thus the loop reports the cause now, and not
 				// after all of its attempts.
-				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) throw e;
-				if (!(await writer.status(this.ctx)).splitStatus) throw e;
+				if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) {
+					throw e;
+				}
+				if (!(await writer.status(this.ctx)).splitStatus) {
+					throw e;
+				}
 			}
 			// Stop on the exact write that queues the split: the stored size at that moment decides
 			// which further writes a test can still land under the overage band.
@@ -317,7 +325,9 @@ export class TestPartition {
 			sks.push(sk);
 			// Stop on the exact write that queues the split: the byte-quantile boundaries depend on
 			// the stored rows, so extra writes would move them.
-			if ((await this.status()).splitStatus) return sks;
+			if ((await this.status()).splitStatus) {
+				return sks;
+			}
 		}
 		throw new Error(`${this.doName}: no range split after ${MAX_RANGE_FILLER_WRITES} writes; ${JSON.stringify(await this.status())}`);
 	}
@@ -346,7 +356,9 @@ export class TestPartition {
 		const keys = this.fillerHashKeys();
 		for (let i = 0; i < MAX_FILLER_WRITES; i++) {
 			const r = await this.put({ hashKey: kb(keys.next().value!), sortKey: kb("sk"), data: chunk, kind: "text" });
-			if (r.meta.databaseSize > target) return r.meta.databaseSize;
+			if (r.meta.databaseSize > target) {
+				return r.meta.databaseSize;
+			}
 		}
 		throw new Error(`${this.doName}: database never passed ${target} bytes`);
 	}
@@ -386,7 +398,9 @@ export class TestPartition {
 			const item: PutItemRpcRequest = { hashKey: kb(hashKey), sortKey: kb(sortKey), data, kind: "text" };
 			await this.put(item);
 			items.push(item);
-			if (await this.promotedKeyStatus(hashKey)) return items;
+			if (await this.promotedKeyStatus(hashKey)) {
+				return items;
+			}
 		}
 		throw new Error(`${this.doName}: no promotion after ${MAX_FILLER_WRITES} writes; ${JSON.stringify(await this.status())}`);
 	}
@@ -452,7 +466,9 @@ const MAX_PENDING_PAUSE_MS = 1000;
 async function driveUntil(nodes: () => Promise<TestPartition[]>, check: () => Promise<boolean>, label: string): Promise<void> {
 	let last: DrivePass[] = [];
 	for (let idle = 0; idle < IDLE_ROUNDS_BEFORE_FAILURE; ) {
-		if (await check()) return;
+		if (await check()) {
+			return;
+		}
 		last = [];
 		for (const node of await nodes()) {
 			last.push(await node.runDueWork());
@@ -469,7 +485,9 @@ async function driveUntil(nodes: () => Promise<TestPartition[]>, check: () => Pr
 			await scheduler.wait(IDLE_PAUSE_MS);
 		}
 	}
-	if (await check()) return;
+	if (await check()) {
+		return;
+	}
 	const report = last.map((pass) => `${pass.doName}: ${pass.snapshot}`).join("; ");
 	throw new Error(`${label}: no progress in ${IDLE_ROUNDS_BEFORE_FAILURE} rounds; ${report}`);
 }
@@ -482,18 +500,32 @@ export async function drainUntil(drive: TestPartition[], check: () => Promise<bo
 /** True when each node of the split tree completed its split and its migration. */
 async function isSplitTreeComplete(node: TestPartition): Promise<boolean> {
 	const state = await node.status();
-	if (state.parentPartitionContext && state.migrationStatus !== "migration_completed") return false;
-	if (!state.splitStatus) return true;
-	if (state.splitStatus.status !== "split_completed") return false;
-	for (const child of await node.children()) if (!(await isSplitTreeComplete(child))) return false;
+	if (state.parentPartitionContext && state.migrationStatus !== "migration_completed") {
+		return false;
+	}
+	if (!state.splitStatus) {
+		return true;
+	}
+	if (state.splitStatus.status !== "split_completed") {
+		return false;
+	}
+	for (const child of await node.children()) {
+		if (!(await isSplitTreeComplete(child))) {
+			return false;
+		}
+	}
 	return true;
 }
 
 /** Asserts that a split tree is complete and returns its number of split nodes. */
 export async function assertSplitTreeComplete(node: TestPartition): Promise<number> {
 	const state = await node.status();
-	if (state.parentPartitionContext) expect(state.migrationStatus, `${node.doName}: migration incomplete`).toBe("migration_completed");
-	if (!state.splitStatus) return 0;
+	if (state.parentPartitionContext) {
+		expect(state.migrationStatus, `${node.doName}: migration incomplete`).toBe("migration_completed");
+	}
+	if (!state.splitStatus) {
+		return 0;
+	}
 	expect(state.splitStatus.status, `DO ${node.doName} should be split_completed`).toBe("split_completed");
 	let count = 1;
 	for (const child of await node.children()) {
@@ -545,7 +577,9 @@ export async function withMigrationHeld<T>(
 				async () => {
 					const { heldTargets } = await source.testPullStats();
 					const missing = (await parent.children()).filter((child) => !heldTargets.includes(child.doName));
-					if (missing.length === 0) return;
+					if (missing.length === 0) {
+						return;
+					}
 					const names = missing.map((child) => child.doName).join(", ");
 					if (Date.now() < probeAfter) {
 						throw new Error(`migration RPC not received from ${names}`);
@@ -557,7 +591,9 @@ export async function withMigrationHeld<T>(
 		});
 	} finally {
 		await source.testReleasePulls();
-		if ((await parent.status()).splitStatus) await parent.awaitSplitCompleted();
+		if ((await parent.status()).splitStatus) {
+			await parent.awaitSplitCompleted();
+		}
 	}
 }
 

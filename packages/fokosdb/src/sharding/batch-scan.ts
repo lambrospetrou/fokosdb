@@ -62,7 +62,9 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 			break;
 		}
 		const page = fetchPage(cursor, remainingScan);
-		if (page.length === 0) break;
+		if (page.length === 0) {
+			break;
+		}
 
 		for (const row of page) {
 			if (!include || include(row)) {
@@ -90,9 +92,13 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 				break;
 			}
 		}
-		if (reachedLimit) break;
+		if (reachedLimit) {
+			break;
+		}
 
-		if (page.length < remainingScan) break;
+		if (page.length < remainingScan) {
+			break;
+		}
 	}
 
 	return { rows, nextCursor: reachedLimit ? cursor : null, totalBytes };

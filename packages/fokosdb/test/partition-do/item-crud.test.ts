@@ -201,7 +201,9 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true });
-			if (result.found) expect(result.item.ttlAt).toBeUndefined();
+			if (result.found) {
+				expect(result.item.ttlAt).toBeUndefined();
+			}
 		});
 
 		it("clears ttlAt when an item is overwritten without TTL", async ({ expect }) => {
@@ -219,7 +221,9 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 
 			expect(result).toMatchObject({ found: true, item: { data: "v2" } });
-			if (result.found) expect(result.item.ttlAt).toBeUndefined();
+			if (result.found) {
+				expect(result.item.ttlAt).toBeUndefined();
+			}
 		});
 
 		it("arms a new sweep from an RPC after the previous cycle stops", async ({ expect }) => {

@@ -162,7 +162,9 @@ function typeListSql(types: readonly string[]): string {
 
 function hasAnyType(actual: ReadonlySet<ExpressionNativeType>, accepted: ReadonlySet<ExpressionNativeType>): boolean {
 	for (const type of accepted) {
-		if (actual.has(type)) return true;
+		if (actual.has(type)) {
+			return true;
+		}
 	}
 	return false;
 }
@@ -198,14 +200,18 @@ const sqliteTextFunctions = new Set([
 ]);
 
 function stringLiteral(value: unknown): string | undefined {
-	if (typeof value !== "object" || value === null || Array.isArray(value)) return;
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return;
+	}
 	const literal = (value as { val?: unknown }).val;
 	return typeof literal === "string" ? literal : undefined;
 }
 
 function validatePatternArguments(name: string, args: readonly unknown[]): void {
 	const pattern = stringLiteral(args[0]);
-	if (pattern === undefined) throw new ExpressionError("invalid_type", `${name} pattern must be a string literal`);
+	if (pattern === undefined) {
+		throw new ExpressionError("invalid_type", `${name} pattern must be a string literal`);
+	}
 	if (!utf8WithinLimit(pattern, EXPRESSION_LIMITS.sqlitePatternBytes)) {
 		throw new ExpressionError("complexity_limit", "SQLite pattern limit exceeded");
 	}
@@ -233,14 +239,18 @@ function buildSqliteOperations(): OperationDefinition[] {
 	const operations: OperationDefinition[] = [];
 	for (const name of SQLITE_SCALAR_FUNCTIONS) {
 		const arity = SQLITE_FUNCTION_ARITY.get(name);
-		if (!arity) continue;
+		if (!arity) {
+			continue;
+		}
 		const valueArgsFrom = SQLITE_VALUE_PASSTHROUGH.get(name);
 
 		// SQLite's iif takes exactly three arguments. The two-argument form of the expression means a
 		// NULL else-branch, so it is spelled with an explicit NULL.
 		const argumentList = (args: readonly ExpressionValue[], renderers: OperationRenderers, jsonFrom?: number): string => {
 			const rendered = args.map((arg, i) => renderers.renderValue(arg, jsonFrom !== undefined && i >= jsonFrom ? "json" : "sqlite"));
-			if (name === "iif" && rendered.length === 2) rendered.push("NULL");
+			if (name === "iif" && rendered.length === 2) {
+				rendered.push("NULL");
+			}
 			return rendered.join(", ");
 		};
 
@@ -249,17 +259,27 @@ function buildSqliteOperations(): OperationDefinition[] {
 			contexts: EXPRESSION_CONTEXT_ALL,
 			arity,
 			typeRule: (argFacts, rawArgs) => {
-				if (name === "glob" || name === "like") validatePatternArguments(name, rawArgs);
-				if (sqliteNumberFunctions.has(name)) return nullNumberValue;
-				if (sqliteTextFunctions.has(name)) return nullTextValue;
-				if (name === "unhex") return nullBytesValue;
+				if (name === "glob" || name === "like") {
+					validatePatternArguments(name, rawArgs);
+				}
+				if (sqliteNumberFunctions.has(name)) {
+					return nullNumberValue;
+				}
+				if (sqliteTextFunctions.has(name)) {
+					return nullTextValue;
+				}
+				if (name === "unhex") {
+					return nullBytesValue;
+				}
 
 				let dynamicTypes: Set<ExpressionNativeType> | undefined;
 				for (let i = 0; i < argFacts.length; i++) {
 					if (name !== "nullif" || i === 0) {
 						dynamicTypes ??= new Set(["null"]);
 						for (const type of argFacts[i].types) {
-							if (type !== "missing") dynamicTypes.add(type);
+							if (type !== "missing") {
+								dynamicTypes.add(type);
+							}
 						}
 					}
 				}
@@ -270,7 +290,9 @@ function buildSqliteOperations(): OperationDefinition[] {
 				valueArgsFrom === undefined ? undefined : (args, renderers) => `${name}(${argumentList(args, renderers, valueArgsFrom)})`,
 			renderPresent: () => "1",
 			renderType: (args, renderers) => {
-				if (valueArgsFrom !== undefined) return renderPassthroughType(name, args, renderers);
+				if (valueArgsFrom !== undefined) {
+					return renderPassthroughType(name, args, renderers);
+				}
 				const call = `${name}(${args.map((arg) => renderers.renderValue(arg, "sqlite")).join(", ")})`;
 				return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
 			},
@@ -296,7 +318,9 @@ function renderPassthroughType(name: string, args: readonly ExpressionValue[], r
 // `'null'`. Every other value can be NULL under a constant type, `size` of a number for one.
 function nullOrType(arg: ExpressionValue, renderers: OperationRenderers): string {
 	const type = renderers.renderType(arg);
-	if ("val" in arg || "b64" in arg) return type;
+	if ("val" in arg || "b64" in arg) {
+		return type;
+	}
 	return `CASE WHEN ${renderers.renderValue(arg, "sqlite")} IS NULL THEN 'null' ELSE ${type} END`;
 }
 
@@ -324,9 +348,13 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 		arity: [1, 1],
 		typeRule: (argFacts) => {
 			const input = argFacts[0];
-			if (!hasAnyType(input.types, sizeInputTypes)) throw new ExpressionError("invalid_type", "invalid size input type");
+			if (!hasAnyType(input.types, sizeInputTypes)) {
+				throw new ExpressionError("invalid_type", "invalid size input type");
+			}
 			for (const type of input.types) {
-				if (!sizeInputTypes.has(type)) return missingNumberValue;
+				if (!sizeInputTypes.has(type)) {
+					return missingNumberValue;
+				}
 			}
 			return numberValue;
 		},
@@ -334,7 +362,9 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 		renderPresent: (args, renderers) => {
 			const inputType = renderers.renderType(args[0]);
 			const inputConst = constTypeName(inputType);
-			if (inputConst !== undefined) return SIZE_INPUT_TYPE_NAMES.includes(inputConst) ? "1" : "0";
+			if (inputConst !== undefined) {
+				return SIZE_INPUT_TYPE_NAMES.includes(inputConst) ? "1" : "0";
+			}
 			return `(${inputType} IN (${typeListSql(SIZE_INPUT_TYPE_NAMES)}))`;
 		},
 		renderType: () => "'number'",
@@ -348,7 +378,9 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			const fallbackTypes = argFacts[1].types;
 			const resultTypes = new Set<ExpressionNativeType>();
 			for (const t of pathTypes) {
-				if (t !== "missing") resultTypes.add(t);
+				if (t !== "missing") {
+					resultTypes.add(t);
+				}
 			}
 			for (const t of fallbackTypes) {
 				resultTypes.add(t);
@@ -364,7 +396,9 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			// decides the whole test, and folding it to "1" keeps a constant-true term out of the SQL.
 			const pathPresent = renderers.renderPresent(args[0]);
 			const fallbackPresent = renderers.renderPresent(args[1]);
-			if (pathPresent === "1" || fallbackPresent === "1") return "1";
+			if (pathPresent === "1" || fallbackPresent === "1") {
+				return "1";
+			}
 			return `(${pathPresent} OR ${fallbackPresent})`;
 		},
 		renderType: (args, renderers) =>
