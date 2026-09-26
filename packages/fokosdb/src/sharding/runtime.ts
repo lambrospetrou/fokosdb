@@ -1857,8 +1857,12 @@ function intervalInside(interval: SkInterval, start: KeyBytes | null, end: KeyBy
 
 /**
  * True when the lifecycle gate of a target in `awaiting_data` refused the request. The gate refuses
- * before any handler runs, so nothing applied. A target in `awaiting_data` has no children, so the
- * error comes from the partition that the sender called.
+ * before any handler runs, so nothing applied.
+ *
+ * The error can come from a partition below the one that the sender called. For example, a range root
+ * cuts over and splits, and its range child stays in `awaiting_data` until its first page arrives. The
+ * fallback is still safe: the exact resolution names the same range root again, and the error of the
+ * second forward goes to the caller. The node of the child stays in the routing of the request.
  */
 function isAwaitingData(e: unknown): boolean {
 	return FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating) && e.attributes.importState === "awaiting_data";

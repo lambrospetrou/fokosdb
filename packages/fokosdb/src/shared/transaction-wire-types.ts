@@ -6,7 +6,7 @@
 import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
-import type { FokosTopology } from "../sharding/route-context.js";
+import type { FokosDbTableConfig } from "./partition-context.js";
 import type { IdempotencyToken, RejectionReasonOf, TransactionId } from "./transaction-api-types.js";
 import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 
@@ -307,10 +307,10 @@ export type InitiateWriteRequest = {
 	 */
 	clientRequestToken: IdempotencyToken;
 	/**
-	 * The topology of the table. The coordinator resolves the participant of each item from it, with the
-	 * range config and the policy of its own route context.
+	 * The configuration of the table. The coordinator resolves the participant of each item from it, and
+	 * each participant receives it in its route context.
 	 */
-	topology: FokosTopology;
+	table: FokosDbTableConfig;
 	items: TCWriteOperation[];
 };
 

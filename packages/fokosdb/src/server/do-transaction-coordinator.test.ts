@@ -277,10 +277,12 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 });
 
 describe("TransactionCoordinatorDO - participant resolution", () => {
-	it("resolves each item to the root of its key in the table topology, and stores the root contexts", async () => {
+	it("resolves each item to the root of its key in the table config, and stores the root contexts", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			const topology = { ...ctx.topology, rootTreesN: 8 };
-			const table = new FokosRouter(topology, ctx.rangeConfig, ctx.policy);
+			// A policy that is not the policy of the coordinator: each participant must receive the policy of the table.
+			const policy = { ...ctx.policy, hashSplitConditions: { ...ctx.policy.hashSplitConditions, maxSizeMb: 123 } };
+			const table = new FokosRouter(topology, ctx.rangeConfig, policy);
 			// Keys under two different roots.
 			const hashKeys = Array.from({ length: 16 }, (_, i) => KeyCodec.encode(`hk-${i}`));
 			const first = table.rootContext(hashKeys[0]);
@@ -296,7 +298,7 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 			// Only the rows written before the first prepare are under test.
 			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
 
-			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology, items });
+			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: { topology, rangeConfig: ctx.rangeConfig, policy }, items });
 
 			const itemRows = state.storage.sql
 				.exec<{ op_index: number; partition_do_name: string }>(`SELECT op_index, partition_do_name FROM tc_items ORDER BY op_index`)
@@ -317,7 +319,7 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 	it("refuses an invalid table topology before it writes anything", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			await expect(
-				tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology: { ...ctx.topology, rootTreesN: 0 }, items: [] }),
+				tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: { ...ctx, topology: { ...ctx.topology, rootTreesN: 0 } }, items: [] }),
 			).rejects.toThrow(fokosErrorWith("partition_context_options_invalid"));
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
@@ -334,9 +336,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
 				vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(5 * 1024 * 1024 * 1024 + 1);
 				expect(tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy })).not.toBe(false);
-				await expect(
-					tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, topology: ctx.topology, items: [] }),
-				).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
+				await expect(tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, table: ctx, items: [] })).rejects.toThrow(
+					fokosErrorWith("coordinator_over_size"),
+				);
 				expect(countRows(state, "tc_state")).toBe(0);
 			});
 		},
@@ -346,7 +348,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, topology: ctx.topology, items: [] })).rejects.toThrow(
+			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items: [] })).rejects.toThrow(
 				fokosErrorWith("coordinator_over_size"),
 			);
 			expect(countRows(state, "tc_state")).toBe(0);
@@ -366,7 +368,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			});
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, topology: ctx.topology, items })).value).toEqual({
+			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items })).value).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -944,7 +946,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			});
 
 			tc.sweepExpiredTransactions();
-			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology: ctx.topology, items: [] });
+			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items: [] });
 
 			expect(result.outcome).toBe("committed");
 			expect(result.transactionId).not.toBe(oldTransactionId);

@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
+import type { FokosDbPolicy, FokosDbRouteContext, FokosDbTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosEnvelope, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
@@ -589,9 +589,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		// Group the operations by the root partition of each key. The same grouping feeds the tc_items and
 		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it has
-		// just written back from SQLite. The table shares the range config and the policy of this
-		// coordinator, and the client validates the topology before anything is written.
-		const partitions = this.partitionClient({ ...this.fokos.routeContext(), topology: request.topology });
+		// just written back from SQLite. The client validates the topology and the range config of the
+		// table before anything is written.
+		const partitions = this.partitionClient(request.table);
 		const participants: PrepareParticipant[] = partitions.resolveAll(request.items).map(({ ctx, indexes }) => ({
 			doName: ctx.doName,
 			context: ctx,
@@ -956,7 +956,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
-	private partitionClient(ctx: FokosDbRouteContext): FokosShardingClient<FokosDbPolicy, PartitionOps> {
+	private partitionClient(ctx: FokosDbTableConfig): FokosShardingClient<FokosDbPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
 		// TODO: The client should exploit cache of topology hierarchy to leapfrog partitions.
 		return new FokosShardingClient<FokosDbPolicy, PartitionOps>({

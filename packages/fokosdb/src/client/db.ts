@@ -558,12 +558,13 @@ export class FokosDB {
 		// the child that owns the token, and that child refuses it until its import is complete. The
 		// request carries the token, so a retry resumes the same transaction and never starts a second one.
 		const deadline = Date.now() + TX_COORDINATOR_MIGRATING_RETRY_MS;
+		const { topology, rangeConfig, policy } = this.#options.topology;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
 		const { value: encoded } = await this.#coordinators.point(
 			"initiateWrite",
 			{ hashKey: encodeHashKey(idempotencyToken), sortKey: encodeSortKey(undefined) },
-			{ clientRequestToken: idempotencyToken, topology: this.#options.topology.topology, items },
+			{ clientRequestToken: idempotencyToken, table: { topology, rangeConfig, policy }, items },
 			{ retry: { shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline } },
 		);
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this

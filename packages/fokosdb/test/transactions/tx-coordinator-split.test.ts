@@ -252,7 +252,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			await runInDurableObject(child, async (instance: TransactionCoordinatorDO) => {
 				const childCtx = instance.fokos.routeContext();
 				await expect(
-					instance.initiateWrite(childCtx, { clientRequestToken: token, topology: db.options().topology.topology, items: [] }),
+					instance.initiateWrite(childCtx, { clientRequestToken: token, table: db.options().topology, items: [] }),
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 				await expect(
 					instance.recoverTransaction(childCtx, { transactionId: first.transactionId, idempotencyToken: token }),
