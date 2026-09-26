@@ -82,26 +82,18 @@ export class PartitionContextCreator {
 		jurisdiction?: DurableObjectJurisdiction;
 		locationHint?: DurableObjectLocationHint;
 	}): FokosDbTableConfig {
-		// Assert the input options and default to reasonable values if not provided.
-		if (!opts.rangeSplitConditions) {
-			opts.rangeSplitN = 4;
-			opts.rangeSplitConditions = { maxSizeMb: 500 };
-		}
-		if (!opts.hashSplitConditions) {
-			opts.hashSplitN = 4;
-			opts.hashSplitConditions = { maxSizeMb: 100 };
-		}
-		if (!opts.rangeAncestorsConfig) {
-			opts.rangeAncestorsConfig = { fromRoot: 0, fromLeaf: 3 };
-		}
+		// Each option defaults on its own, so a value the caller gives is never replaced. The caller's
+		// object stays unchanged.
+		const hashSplitConditions = opts.hashSplitConditions ?? { maxSizeMb: 100 };
+		const rangeSplitN = opts.rangeSplitN ?? 4;
+		const rangeSplitConditions = opts.rangeSplitConditions ?? { maxSizeMb: 500 };
+		const rangeAncestors = opts.rangeAncestorsConfig ?? { fromRoot: 0, fromLeaf: 3 };
 		const invalid = (option: string, value: unknown, message: string) =>
 			new FokosValidationError(VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 
+		// No default: `hashSplitN` is part of the topology and must never change, so the caller states it.
 		if (!opts.hashSplitN) {
-			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be provided if hashSplitConditions is provided");
-		}
-		if (!opts.rangeSplitN) {
-			throw invalid("rangeSplitN", opts.rangeSplitN, "rangeSplitN must be provided if rangeSplitConditions is provided");
+			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be provided");
 		}
 
 		const topology: FokosTopology = {
@@ -117,17 +109,17 @@ export class PartitionContextCreator {
 			throw invalid("shardGroup", topology.shardGroup, `shardGroup must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
 		}
 
-		const rangeConfig: FokosRangeConfig = { rangeSplitN: opts.rangeSplitN, rangeAncestors: opts.rangeAncestorsConfig };
+		const rangeConfig: FokosRangeConfig = { rangeSplitN, rangeAncestors };
 		validateRangeConfig(rangeConfig);
 
-		validateSplitConditions("hashSplitConditions", opts.hashSplitConditions, invalid);
-		validateSplitConditions("rangeSplitConditions", opts.rangeSplitConditions, invalid);
+		validateSplitConditions("hashSplitConditions", hashSplitConditions, invalid);
+		validateSplitConditions("rangeSplitConditions", rangeSplitConditions, invalid);
 
 		const policy: FokosDbPolicy = {
 			ns: opts.ns,
 			nsTx: opts.nsTx,
-			hashSplitConditions: opts.hashSplitConditions,
-			rangeSplitConditions: opts.rangeSplitConditions,
+			hashSplitConditions,
+			rangeSplitConditions,
 			...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
 		};
 		return { topology, rangeConfig, policy };
