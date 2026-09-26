@@ -54,7 +54,7 @@ An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Arr
 - **`splitN` must never change after initialization.** A change breaks routing and loses data.
 - A partition refuses a write above 1.1 times its cap, and only a write that applies can queue the split that brings it back under.
 
-The repartition flow runs as the runtime job `source_repartition`. It initializes each child with `fokosInit` and cuts routing over, then each child pulls pages with `fokosMigrationPull`. The runtime moves the route overrides first; the host phase (`FokosMigrationHost`) then builds the item and pending-transaction pages and filters rows with the `belongsToTarget` predicate the runtime hands it. While a child imports, a read goes through the source and every other operation answers `partition_migrating`.
+The repartition flow runs as the runtime job `source_repartition`. It initializes each child with `fokosInit` and cuts routing over, then each child pulls pages with `fokosMigrationPull`. The runtime moves the route overrides first; the host phase (`FokosMigrationHost`) then builds the item and pending-transaction pages and filters rows with the `belongsToTarget` predicate the runtime hands it. While a child imports, a read goes through the source and every other operation answers `partition_migrating`. A child in `awaiting_data` adds `attributes.importState: "awaiting_data"`: a partition that sent the request there because of its Bloom filter then resolves the key again without the filter.
 
 **NOTE**: Once Durable Objects offer a native fork, clone, or snapshot of storage, the whole migration flow can go. The split stays the same.
 
@@ -83,7 +83,7 @@ Every public RPC method of `PartitionDO` is one `this.fokos.dispatch(op, ctx, re
 
 The runtime runs the two concurrent state machines: **import** (a target that still catches up from its source) and **repartition** (a source that now routes to its targets). A descriptor tells the runtime what to do, and the host never examines either state itself.
 
-- **Import** — `whileMigrating: "retry"` answers `partition_migrating` while this partition imports. `"read_source"` runs the same operation on the source through `fokosExecuteLocal`, and needs `readOnly: true` and a `point` or `range` shape. Only `apiGetItem` and `apiQueryItems` read through.
+- **Import** — `whileMigrating: "throw"` answers `partition_migrating` while this partition imports. `"read_source"` runs the same operation on the source through `fokosExecuteLocal`, and needs `readOnly: true` and a `point` or `range` shape. Only `apiGetItem` and `apiQueryItems` read through.
 - **Shape** — the shape routes the request: `point` (the item RPCs), `group` (`txPrepare`, `txCommit`, `txCancel`, `txReadForTransaction`), `single_owner` (`txReadSnapshot`, `txExecuteSingleShot`), `range` (`apiQueryItems`), and `local` (`status` and the two debug operations).
 - **Never swallow a group error** — a `group` with `failurePolicy: "attempt_all"` runs every remote group and throws `partition_fanout_failed` when one failed, so the coordinator stays non-terminal and retries. `txPrepare` and `txReadForTransaction` are `fail_fast`.
 - `txCancel` releases by transaction id in `beforeForward`, which runs on every hop before the remote groups start, so a router between cutover and completion clears its own pre-cutover lock rows.

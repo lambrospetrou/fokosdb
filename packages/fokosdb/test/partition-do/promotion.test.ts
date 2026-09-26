@@ -259,8 +259,8 @@ describe.concurrent("PartitionDO — debugForcePromoteKey", () => {
 	}, 30_000);
 });
 
-describe("PartitionDO — promotion read fallback", () => {
-	it("a read falls back to the local rows while the promotion waits for cutover; a write does not", async () => {
+describe("PartitionDO — a range root before its first page", () => {
+	it("serves a read and a write at the source when a Bloom false positive names a range root before its cutover", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 		await partition.splitHash();
 		const owner = await partition.childOwning("alice");
@@ -277,6 +277,9 @@ describe("PartitionDO — promotion read fallback", () => {
 		// another test can remove it. The class is private to the runtime, thus no test control can replace the
 		// spy. The spy is safe only because this `describe` is sequential and at the top level: vitest
 		// runs no other test of this file at the same time. Do not make it concurrent.
+		// The spy makes every Bloom filter say that the key is promoted, the filter of the source too. The
+		// range root answers `partition_awaiting_data`, and each sender resolves the key again without
+		// its filter, so the source runs the write itself.
 		const maybePromotedSpy = vi.spyOn(PartialRangeTopology.prototype, "maybePromoted").mockReturnValue(true);
 
 		const aliceRangeRoot = partition.rangeRoot("alice").controlled;
@@ -289,17 +292,65 @@ describe("PartitionDO — promotion read fallback", () => {
 			const g = await partition.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
 			expect(g).toMatchObject({ found: true, item: { data: "v" } });
 
-			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
-				await expect(
-					instance.apiPutItem(partition.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
-				).rejects.toThrow(fokosErrorWith("partition_migrating"));
-			});
+			// The source runs the write.
+			const put = await partition.put({ hashKey: kb("alice"), sortKey: kb("sk2"), data: "v2", kind: "text" });
+			expect(put.meta.servedByActorName).toBe(owner.doName);
+			expect(await owner.localItemCount("alice")).toBe(2);
 		} finally {
 			await aliceRangeRoot.testReleaseInit();
 			maybePromotedSpy.mockRestore();
 		}
 
 		await owner.awaitPromoted("alice");
+		// The import after the cutover brings the write to the range tree.
+		expect(await partition.get({ hashKey: kb("alice"), sortKey: kb("sk2") })).toMatchObject({ found: true, item: { data: "v2" } });
+	}, 30_000);
+
+	it("answers partition_migrating to a write sent directly to a range root before its first page", async () => {
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
+		const rangeRoot = partition.rangeRoot("alice");
+		// The source cuts over only after the range root answers `fokosInit`.
+		await rangeRoot.controlled.testHoldInit();
+		try {
+			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
+			await vi.waitFor(async () => expect(await rangeRoot.controlled.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+
+			await runInDurableObject(rangeRoot.stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.apiPutItem(rangeRoot.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
+				).rejects.toThrow(fokosErrorWith("partition_migrating", { importState: "awaiting_data" }));
+			});
+			// The range root applied nothing, and it sent nothing to the source.
+			expect(await partition.localItemCount("alice")).toBe(1);
+		} finally {
+			await rangeRoot.controlled.testReleaseInit();
+		}
+		await partition.awaitPromoted("alice");
+	}, 30_000);
+
+	it("does not resolve to the source again after the cutover, when the range root has no data yet", async () => {
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
+		const rangeRoot = partition.rangeRoot("alice");
+		// The first pull of the range root waits here, so the range root has no page after the cutover.
+		await partition.controlled.testHoldPulls({ stream: "overrides", target: rangeRoot.doName });
+		try {
+			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
+			await partition.awaitPromotedKeyStatus("alice", ["promoting"]);
+
+			// The route override of the source names the range root now, so the source forwards the write
+			// and does not run it itself.
+			await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
+				await expect(
+					instance.apiPutItem(partition.ctx, { hashKey: kb("alice"), sortKey: kb("sk2"), data: "v", kind: "text" }),
+				).rejects.toThrow(fokosErrorWith("partition_migrating", { importState: "awaiting_data" }));
+			});
+			expect(await partition.localItemCount("alice")).toBe(1);
+		} finally {
+			await partition.controlled.testReleasePulls();
+		}
+		await partition.awaitPromoted("alice");
 	}, 30_000);
 });
 

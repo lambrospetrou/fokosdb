@@ -76,6 +76,14 @@ export class RouteCollector {
 	}
 
 	/**
+	 * Removes the node of a partition that refused a forward before any handler ran, when the sender
+	 * resolves the request again. The forward still counts, because the RPC was sent.
+	 */
+	forget(partitionId: string): void {
+		this.#nodes.delete(partitionId);
+	}
+
+	/**
 	 * Counts one outbound RPC that carries the request. The sender calls it before it awaits the RPC, so
 	 * an RPC that fails without routing still counts.
 	 */

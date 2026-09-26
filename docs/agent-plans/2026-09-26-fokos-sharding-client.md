@@ -4,8 +4,7 @@
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
-**Status:** Nothing is built. `FokosRouter` in `packages/fokosdb/src/sharding/router.ts` is the only Worker-side
-routing code today.
+**Status:** M1, M2, and M3 are built. M4 is not built.
 
 ## Table of contents
 
@@ -65,13 +64,19 @@ const { value, routing } = router.unwrap(envelope);          // 4. drops the int
    the partition for good. A caller that only reads the tree cannot use it. So the demos and the tests write
    their own traversal.
 7. **A write can wait for as long as a promotion is held.** The problem has four steps:
-   1. A hash partition resolves key `k`. Its promotion Bloom filter gives a false positive for `k`.
-   2. The partition forwards the write to the range root of `k`. The promotion of `k` is planned but held before
-      its cutover, so that range root is a target in `awaiting_data`.
-   3. The target refuses the write with `partition_migrating`. `#fallbackAfterMiss` does not fall back on that
-      code, so the hash partition returns the error.
-   4. Every retry takes the same path until the source cuts over. A transaction lock can hold the cutover. A lock
-      in quarantine holds it until `debugForceResolveTransaction`.
+   1. A hash partition resolves key `k`. Its promotion Bloom filter gives a false positive for `k`, while the
+      promotion of `k` itself is `queued` or `planned`.
+   2. The partition forwards the write to the range root of `k`. The promotion is held before its cutover, so that
+      range root exists and is a target in `awaiting_data`.
+   3. The target answers `partition_migrating`. `#fallbackAfterMiss` does not fall back on that code, so the hash
+      partition returns the error.
+   4. Every retry takes the same path until the source cuts over. A promotion does not cut over while a
+      transaction lock is on its key (`beforeCutover` in `do-partition.ts`). A lock in quarantine holds it until
+      `debugForceResolveTransaction`.
+
+   This case is rare. Section 4.2.10 lists every path that sends a request to a target before its first page, and
+   shows that this is the only one now. The wait is long only because a promotion waits for the locks of its key.
+   `docs/ideas/2026-09-26-promotion-moves-its-locks.md` records that cause.
 
 This document solves problems 2, 3, 6, and 7. It also adds the caller layer where a caller-side route cache
 connects later. That cache solves problems 1 and 4. Section 4.3.1 gives an optional solution to problem 5. The cache is separate work (section 4.3.1), and it depends on
@@ -102,7 +107,7 @@ the fix of problem 7.
   retry rules move into retry policies without change.
 - The runtime counts every outbound RPC in `forwardCount`, and also an RPC that failed without routing.
 - The request to the coordinator carries the table topology once, and each item carries its keys only.
-- A target before its cutover sends a request to its source, and does not refuse it.
+- A partition that followed its Bloom filter to a target without data resolves the key again without the filter.
 - `fokosdb/sharding` exports every error category and every code that the sharding runtime raises. From M4,
   `fokosdb/sharding/client` exports them.
 - The sharding library has a client entry and a server entry, as FokosDB has.
@@ -158,18 +163,16 @@ Each milestone ships and is useful alone.
 - This milestone is separate because it changes the coordinator protocol code in
   `do-transaction-coordinator.ts`.
 
-### M3 — A target before its cutover asks its source
+### M3 — A Bloom hit that names a target without data resolves again
 
-- A target in `awaiting_data` sends every request that its lifecycle gate receives to its source, through
-  `fokosExecuteLocal`. The source runs the request while it still owns the slice (section 4.2.10).
-- A source that has cut over answers a write with `repartition_cut_over`. The target takes that answer as the
-  start notification. It starts its import and answers `partition_migrating`.
-- Remove the `repartition_not_cut_over` fallbacks of `#fallbackAfterMiss` and `#forwardRangeVisit`. After this
-  change, no request path raises that code.
-- This milestone comes after M1 and M2 because it changes the runtime and not the client. The caller-side route
-  cache depends on it.
-- Delivers: the fix of problem 7. The runtime also answers correctly when any hint names a target before its
-  cutover.
+- A target in `awaiting_data` adds `attributes.importState: "awaiting_data"` to the `partition_migrating` of its
+  lifecycle gate (section 4.2.10). The code does not change.
+- `#fallbackAfterMiss` and `#forwardRangeVisit` resolve again without the Bloom filter when a forward that the
+  Bloom filter selected gets that error.
+- The fallback removes the node of the target from the routing of the request, because the target ran no handler.
+- This milestone comes after M1 and M2 because it changes the runtime and not the client.
+- Delivers: the fix of problem 7. The caller-side route cache uses the same marker for its fallback
+  (section 4.3.1).
 
 ### M4 — The sharding library has a client entry and a server entry
 
@@ -211,8 +214,8 @@ positions. The caller sends one request for each group.
 
 `walk` reads the tree and changes nothing. `destroy` fences and deletes every partition.
 
-A target before its cutover does not refuse a request. It sends the request to its source. The source runs the
-request while it owns the slice. After the cutover, the source tells the target to start its import.
+A partition that follows its Bloom filter to a target without data resolves the key again without the filter.
+The exact resolution names the partition that owns the key now.
 
 ### 4.2 Technical details
 
@@ -581,59 +584,60 @@ The reasons:
 The stale-transaction recovery of a partition calls a coordinator with `txCoordinatorStubForParticipant`. That
 path does not change.
 
-#### 4.2.10 A target before its cutover asks its source (M3)
+#### 4.2.10 A Bloom hit that names a target without data (M3)
 
-**The lifecycle gate now.** A target in `awaiting_data` or `importing` runs `#whileImporting`:
+**The lifecycle gate before M3.** A target in `awaiting_data` or `importing` runs `#whileImporting`:
 
 - A `read_source` operation reads through its source with `fokosExecuteLocal`. While the source repartition is
-  `queued` or `planned`, `resolveCallerSlice` in the source refuses it with `repartition_not_cut_over`.
+  `queued` or `planned`, `resolveCallerSlice` in the source answers `repartition_not_cut_over`.
 - Every other operation answers `partition_migrating`.
 
-A target in `awaiting_data` cannot know if its source has cut over, because the start notification can be lost.
-Before the cutover, the source owns the slice and can serve every request. After the cutover, the target owns
-the slice. Two hints can send a request to a target before its cutover:
+A target in `awaiting_data` has no page yet. It cannot know if its source has cut over, because the start
+notification can be lost. Before the cutover, only the source can apply a write for the slice.
 
-- **A Bloom false positive** (problem 7). A hash partition sends a point or range request to the range root of a
-  promotion that is held before its cutover. A read falls back through `readOnly && notCutOver` in
-  `#fallbackAfterMiss`, or through `notCutOver` in `#forwardRangeVisit`. A write gets `partition_migrating` on
-  every retry.
-- **A caller-side route cache that outlives a destroy** (section 4.3.1). It can name a target of a new table with
-  the same topology.
+**The paths that send a request to a target before its first page.** A request gets to a partition by one of
+these paths. Only one of them gets to a target before its cutover:
 
-**The change.** In `awaiting_data`, the gate sends every operation that is not `local` to the source, through
-`fokosExecuteLocal`. Before M3, only a `read_source` operation goes there. The source decides:
+| Path | Can it name a target before its cutover? |
+| --- | --- |
+| The topology of a parent: a hash split or a range split. | No. A parent sends requests to its children only after its own cutover. |
+| The route override of a promotion source. | No. The override names the range root only after the cutover. Before it, the key resolves to the source. |
+| The hash arena and the learned range slices. | No. They learn a partition only from a response in which that partition served the request. A target before its cutover serves nothing. |
+| The Bloom filter, for a key that no promotion moves. | No. The range root of that key does not exist. It answers `range_partition_not_initialized` without routing, and `#fallbackAfterMiss` already resolves again without the filter. |
+| The Bloom filter, for a key whose own promotion is `queued` or `planned`. | Yes. The filter learns a key only from a response of a range partition, and that response comes only after the cutover. So a "yes" before the cutover is a false positive (1% by default), and it names a range root that exists. This is problem 7. |
+| The caller-side route cache (section 4.3.1). | Not in normal use: it learns only from responses too. A cache that outlives a destroy can name a partition of a new table with the same name. That case has other costs (section 4.3.1), and it is not a reason for this change. |
+| After the cutover, the topology or the override of the source. | Yes, and it is correct. The target owns the slice. `partition_migrating` is the right answer until the first page, and a retry to the same entry succeeds later. |
 
-| Source repartition state | A `read_source` operation | Any other operation |
-| --- | --- | --- |
-| `queued`, `planned` | The source runs it. | The source runs it. |
-| `cutover` or a later state | The source runs it, as now. | The source answers `repartition_cut_over`. |
+So the change must fix only the Bloom path, and must not change the answer after the cutover.
 
-- **The source runs the request as an owner.** It checks `owns(key)` for every route key. `owns` reads the
-  topology and the route overrides only, and never the Bloom filter. So the source never forwards the request back
-  to the target. The source then runs the admission, `beforeForward`, the local handler, and the signals, as for a
-  request that it resolved locally. No `await` comes between the ownership check and the local handler, so the
-  cutover of the source cannot come between the two. An `async` local handler keeps its own ownership checks, as
-  for a direct request to the source now.
-- **When a key is not owned, the source answers `repartition_cut_over`.** The slice of the target moves in one
-  cutover. So every key of one request has the same owner.
-- **The target takes `repartition_cut_over` as the start notification.** It moves to `importing`, as
-  `fokosStartImport` does, and answers `partition_migrating`. A retry to the same entry is then correct, because
-  the target owns the slice and imports it. A lost start notification now ends at the first write, and not at the
-  next fallback alarm.
-- **The routing.** The target lists itself as `read_through`, and the source lists itself as `executed`, as for a
-  read through now.
-- **`importing` does not change.** A `read_source` operation reads through the source, and every other operation
-  answers `partition_migrating`. The source has cut over, so the target owns the slice.
-- **`repartition_cut_over` is internal.** Only the target receives it, and it never leaves the gate.
+**The change.** The gate of a target in `awaiting_data` answers `partition_migrating`, as before, with
+`attributes.importState: "awaiting_data"`. A target in `importing` answers without it.
 
-After M3, no request path raises `repartition_not_cut_over`. M3 removes the two fallbacks that read it: the
-`readOnly && notCutOver` condition of `#fallbackAfterMiss`, and the `notCutOver` condition of
-`#forwardRangeVisit`. Their `range_partition_not_initialized` fallbacks stay. `servePage` and `acceptAck` keep
-their `repartition_not_cut_over` for the migration protocol, which is not a request path. The mapping of
-`repartition_not_cut_over` in `mapInternalErrorToPublic` stays, and the public codes do not change.
+- **`#fallbackAfterMiss`**: when the resolution came from the Bloom filter and the error is
+  `partition_migrating` with `importState: "awaiting_data"`, the partition resolves the key again without the
+  filter. `#forwardRangeVisit` does the same for a speculative visit.
+- **The exact resolution knows the cutover.** It reads the topology and the route overrides:
+  - Before the cutover, the route override of the key has a state that is not terminal, so the key resolves to
+    the source. The source applies the write.
+  - After the cutover, the key resolves to the target. The target answers the same error. This resolution did not
+    come from the Bloom filter, so there is no second fallback, and the caller gets `partition_migrating`. That is
+    correct, because the target owns the key now.
+- **The fallback is safe for a write.** The gate raises the error before any handler runs, and a target in
+  `awaiting_data` has no children, so the error comes from the partition that the sender called. Nothing applied.
+  A plain `partition_migrating` does not prove this: a handler can raise it after part of the request applied
+  (section 4.2.4). So the fallback reads the marker, and not the code alone.
+- **The routing.** The sender removes the node of the target from its routing, with `RouteCollector.forget`,
+  because the target ran no handler. The failed forward still counts in `forwardCount`.
+- **The public codes do not change.** Every caller still gets `partition_migrating`. The marker is a detail in
+  `attributes`.
+- **The existing read fallback stays.** A `read_source` read in `awaiting_data` still reads through the source.
+  Before the cutover, the source answers `repartition_not_cut_over`, and the `readOnly && notCutOver` fallback
+  resolves again.
+- **A lost start notification** ends as now: each refused request wakes the import of the target, and the
+  fallback alarm pulls a page. The first pull after the cutover succeeds.
 
-The cost: a request that reaches a target before its cutover pays one more RPC, from the target to the source.
-Only a hint sends a request there.
+The cost: a request that the Bloom filter sends to a target before its first page pays one more RPC. This is the
+same cost as the `range_partition_not_initialized` fallback.
 
 #### 4.2.11 The sharding client and server entries (M4)
 
@@ -665,8 +669,8 @@ or the public types need it.
 - The client sends the same RPCs as now, with the same retries.
 - `resolve` and `resolveAll` run in memory, with no I/O.
 - M2 removes the repeated route contexts from the coordinator request (section 4.2.9).
-- M3 adds one RPC to a request that reaches a target before its cutover. It removes the retries that such a write
-  pays now, which last until the cutover.
+- M3 adds one RPC to a request that the Bloom filter sends to a target before its first page. It removes the
+  retries that such a write pays now, which last until the cutover.
 
 #### 4.2.13 Deployment and rollback
 
@@ -678,8 +682,9 @@ or the public types need it.
   request form. A Worker and its coordinators must run the same version. The package is not released, so no
   compatibility period applies.
 - M2 does not change the coordinator tables. A transaction in flight keeps its stored root contexts.
-- M3 changes what `fokosExecuteLocal` accepts. The target and the source are instances of one class, so they run
-  the same version after a deploy. A rollback returns the target to `partition_migrating` for a write.
+- M3 adds one attribute to an error, and one fallback condition. The target and the sender are instances of one
+  class, so they run the same version after a deploy. A rollback returns the Bloom path to `partition_migrating`
+  for a write.
 - M4 changes the package entries only. A rollback is a code revert.
 
 #### 4.2.14 Testing
@@ -701,15 +706,15 @@ or the public types need it.
   succeeds. `forwardCount` includes the failed forward.
 - **Coordinator request.** `initiateWrite` items carry no `partitionContext`. The coordinator stores the root
   contexts that the current code stores, and the transaction commits.
-- **The target asks its source.**
-  - A runtime test drives a Bloom false positive for a write into the range root of a promotion that a lock holds
-    before its cutover. The source serves the write.
-  - A test sends a group operation directly to a target in `awaiting_data` before the cutover. The operation
-    applies at the source.
-  - A target in `awaiting_data` after the cutover has a lost start notification. It answers the first write with
-    `partition_migrating` and starts its import.
-  - A source whose Bloom filter says that the key is promoted runs the request locally. It does not forward the
-    request back to the target.
+- **A Bloom hit that names a target without data.**
+  - A runtime test drives a Bloom false positive for a read and a write into the range root of a promotion that is
+    held before its cutover. The Bloom filter of the source also says that the key is promoted. The source serves
+    both, and the public meta names the source.
+  - A write sent directly to a target in `awaiting_data` answers `partition_migrating` with
+    `importState: "awaiting_data"`, and nothing applies.
+  - After the cutover, a target without a page gets a write from the source through its route override. The
+    source does not resolve the key to itself again, and the caller gets the same error.
+  - `RouteCollector.forget` removes a node and keeps the forward count.
 - **resolveAll.** Keys under two roots give two groups, and the positions map the results back to the input.
 - **The errors.** A test imports `FokosError` and `SHARDING_UNAVAILABLE_CODES` from `fokosdb/sharding` (from M4,
   `fokosdb/sharding/client`), and a policy that uses `FokosError.isCode` retries a `partition_migrating` error that crossed an RPC hop. The current
@@ -722,16 +727,20 @@ or the public types need it.
 #### 4.3.1 The caller-side route cache
 
 A later document adds a route cache to the client. The cache changes only `resolve`, `resolveRange`, and
-`resolveAll`. It learns from the internal routing before `unwrap`. It depends on M3. That work must keep these
-rules:
+`resolveAll`. It learns from the internal routing before `unwrap`. It uses the marker of M3. That work must keep
+these rules:
 
 - **A cache hint never changes a result.** A miss, an old entry, a full cache, or no cache changes latency only.
   Partitions only split and never merge, so a partition that exists is a correct entry for the keys of its scope.
-  After M3, that is also true for a target before its cutover.
+  A target before its first page is the one exception: it cannot apply a write. It answers `partition_migrating`
+  with `importState: "awaiting_data"`, and the fallback test below treats that answer from the entry as a miss.
 - **The fallback test.** A `hash_partition_not_initialized` or `range_partition_not_initialized` error without
   routing comes from the entry itself. A partition without an identity attaches no routing, and it refuses before
   it forwards. Nothing applied anywhere, so a fallback is safe for every operation. The same code with routing
-  comes from below the entry. The entry hint is then still valid, and the client must not remove it.
+  comes from below the entry. The entry hint is then still valid, and the client must not remove it. A
+  `partition_migrating` with `importState: "awaiting_data"` whose raiser is the entry is also safe: the gate
+  raises it before any handler runs. The client removes that hint and falls back, as `#fallbackAfterMiss` does
+  for the Bloom filter.
 - **The fallback removes one hint, and never a whole cache or a whole key.** A bulk removal sends every request of
   the removed keys to the roots, and overloads them.
 - **The client classifies an entry from its `partitionId`, not from a record of how it resolved the entry.** A hash
@@ -819,14 +828,24 @@ out of scope now.
 
 ## 5. Alternative options
 
-- **The target refuses with `repartition_not_cut_over`, and the caller falls back to a shallower entry.** A
-  caller cannot tell the refusal of its entry from the refusal of a partition below it. So it removes valid hints,
-  and it can empty the cache of a key. A read with `whileMigrating: "throw"` also needs the same refusal. Only the
-  target knows its source, so M3 lets the target ask its source.
+- **The target sends every request to its source before its first page.** The source runs the request as its
+  owner before the cutover, and answers a new internal code after it. This fixes the Bloom path too, but it adds a
+  second way into the source dispatch, only for a rare case. The sender already knows the cutover from its route
+  overrides, so the fallback of M3 is enough. An earlier version of M3 built this, and it was replaced.
+- **A new public code, for example `partition_awaiting_data`, in place of the marker.** A target in
+  `awaiting_data` also gets every forward that comes after the cutover, which is the normal path until its first
+  page. The new code would then reach every caller in place of `partition_migrating`: the retry policies, and the
+  reasons of a cancelled transaction. The marker keeps the code.
+- **Fall back on every `partition_migrating` after a Bloom forward.** A handler can raise that code after part of
+  the request applied (section 4.2.4), so a fallback could apply a write twice. The marker comes only from the
+  gate, before any handler.
+- **The target asks its source in the background if the cutover happened.** This helps only a lost start
+  notification, which the import wake and the fallback alarm already cover. A write before the cutover still
+  fails on every retry.
 - **A table generation in `FokosTopology`, against a cache that outlives a destroy.** The generation is part of
   every partition name, so an entry of the old table names no partition of the new table. It changes the
-  identity of every partition, and each caller must get the new generation before it uses the new table. M3
-  covers the same case, and it also fixes the Bloom path.
+  identity of every partition, and each caller must get the new generation before it uses the new table. This
+  spec does not address that case.
 - **A default retry of `partition_migrating` in the client.** A `fail_fast` group and `initiateWrite` can raise
   that code after part of the request applied. A default retry applies a non-idempotent operation twice.
 - **Callers group keys themselves for a batch.** Each caller needs the positions of its items in each group.
@@ -839,15 +858,21 @@ out of scope now.
 ## 6. Frequently asked questions
 
 **Why is there no route cache in this document?** The cache needs a representation that fits a Worker isolate.
-It also needs the fallback rules of section 4.3.1, and the fix of M3. This document builds the client that the
-cache connects to, and it fixes the runtime first.
+It also needs the fallback rules of section 4.3.1, and the marker of M3. This document builds the client that
+the cache connects to, and it fixes the runtime first.
 
 **Why does the client not retry by default?** A refusal does not prove that nothing applied (section 4.2.4). The
 caller knows if its operation is idempotent. `FokosDB` and the demos pass their current rules as policies.
 
-**Can the source forward the request of its target back to the target?** No. The source checks ownership with
-`owns`, which never reads the Bloom filter. For a key that the source does not own, it answers
-`repartition_cut_over`. The source never forwards the request.
+**Why does a target without data not send a write to its source?** The sender can fix it with less. Only a Bloom
+false positive sends a request to a target before its cutover (section 4.2.10). The sender resolves the key again
+without the filter, and its route overrides name the owner: the source before the cutover, the target after it.
+
+**Why can a promotion wait for a long time before its cutover?** The FokosDB host holds a promotion while a
+transaction lock is on its key (`beforeCutover`). A split does not wait: it copies its locks to its children in the
+`pending_tx` stream, and that stream already copies the locks of a promoted key too.
+`docs/ideas/2026-09-26-promotion-moves-its-locks.md` records the change that removes the wait, and what to check
+first.
 
 **Does the client change the public `meta` of `FokosDB`?** Only the count of `forwardCount`: a failed forward
 without routing now counts 1. `meta` comes from `FokosPublicRouting`, which the client returns as
@@ -862,6 +887,7 @@ References:
 - `docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md`
 - `docs/ideas/range-partition-id-hierarchy-encoding.md`
 - `docs/ideas/topology-propagation-via-piggyback.md`
+- `docs/ideas/2026-09-26-promotion-moves-its-locks.md`
 - `packages/fokosdb/src/sharding/router.ts`
 - `packages/fokosdb/src/sharding/runtime.ts`
 - `packages/fokosdb/src/sharding/repartition-flow.ts`

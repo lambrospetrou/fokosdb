@@ -275,10 +275,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// `dispatch` gates a `local` operation with `whileMigrating: "throw"` before this point and runs
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");
+		const record = this.#target.importRecord();
+		invariant(record, "fokos/runtime: importing without an import record");
 		if (descriptor.whileMigrating === "throw") {
+			// `importState` tells a sender that followed its Bloom filter here that this partition has no
+			// page yet. That sender resolves the key again without the filter (see `#fallbackAfterMiss`).
 			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "partition split in progress, please retry later",
-				attributes: { operation: op },
+				attributes: { operation: op, importState: record.state },
 			});
 		}
 
@@ -293,8 +297,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				}
 			}
 		}
-		const record = this.#target.importRecord();
-		invariant(record, "fokos/runtime: importing without an import record");
 		// This partition owns the scope and its source executes for it: both facts reach the caller, and
 		// the source's list travels unchanged. A hash target writes its own depth on the range nodes the
 		// source reached through a promotion: the target owns the promoted key, so its depth is the one a
@@ -394,6 +396,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (!next || retries >= MAX_FORWARD_RETRIES) {
 				throw e;
 			}
+			// Every error that starts a fallback comes before any handler ran on the target.
+			collector.forget(resolution.target.partitionId);
 			if (next.kind === "out_of_range") {
 				throw misrouted(op, "key outside this partition");
 			}
@@ -414,11 +418,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#fallbackAfterMiss(key: RouteKey, resolution: Extract<Resolution, { kind: "remote" }>, e: unknown, readOnly: boolean): Resolution | null {
 		const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 		const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
+		const awaitingData = isAwaitingData(e);
 		if (resolution.learned && notInitialized) {
 			this.#store.deleteLearnedRangeSlice(key.hashKey, resolution.learned.startBoundary, resolution.learned.endBoundary);
 			return this.#resolve(key, { bloom: resolution.via === "bloom", learnedRange: true });
 		}
-		if (resolution.via === "bloom" && (notInitialized || (readOnly && notCutOver))) {
+		// A Bloom hit can name the range root of a key whose promotion has not cut over. The exact
+		// resolution reads the route overrides, so it names the partition that owns the key now.
+		if (resolution.via === "bloom" && (notInitialized || awaitingData || (readOnly && notCutOver))) {
 			return this.#resolve(key, { bloom: false, learnedRange: true });
 		}
 		if (
@@ -1364,6 +1371,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 				const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 				const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
+				const awaitingData = isAwaitingData(e);
 				if (plan.learned && notInitialized) {
 					this.#store.deleteLearnedRangeSlice(input.hashKey, plan.learned.startBoundary, plan.learned.endBoundary);
 					invariant(plan.base.target !== "local", "fokos/runtime.forwardRangeVisit: a learned slice never overlays a local base");
@@ -1371,7 +1379,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					plan = { visit, base: plan.base, learned: null };
 					continue;
 				}
-				if (plan.base.speculative && (notInitialized || notCutOver)) {
+				if (plan.base.speculative && (notInitialized || notCutOver || awaitingData)) {
+					// Every error that starts this fallback comes before any handler ran on the target.
+					collector.forget(target.partitionId);
 					const again = this.#planRange(op, input, false);
 					invariant(again.length === 1, "fokos/runtime.forwardRangeVisit: a hash partition plans one base visit");
 					const fallback = again[0];
@@ -1843,6 +1853,15 @@ function intervalInside(interval: SkInterval, start: KeyBytes | null, end: KeyBy
 		}
 	}
 	return true;
+}
+
+/**
+ * True when the lifecycle gate of a target in `awaiting_data` refused the request. The gate refuses
+ * before any handler runs, so nothing applied. A target in `awaiting_data` has no children, so the
+ * error comes from the partition that the sender called.
+ */
+function isAwaitingData(e: unknown): boolean {
+	return FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating) && e.attributes.importState === "awaiting_data";
 }
 
 /** Never transient: the key reached a partition that can neither own nor route it. */

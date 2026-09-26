@@ -125,6 +125,17 @@ describe("RouteCollector", () => {
 		expect(collector.build().servedByTruncated).toBe(true);
 	});
 
+	it("forgets the node of a partition that refused a forward, and keeps the count of the RPC", () => {
+		const collector = new RouteCollector();
+		collector.countForward();
+		collector.mergeForwarded(routingOf([node("target")], 0));
+		collector.forget(node("target").ref.partitionId);
+		collector.add(node("self", "executed"));
+		const routing = collector.build();
+		expect(routing.servedBy.map((n) => n.ref.doName)).toEqual(["t.h.self"]);
+		expect(routing.forwardCount).toBe(1);
+	});
+
 	it("counts an RPC that failed without routing", () => {
 		const collector = new RouteCollector();
 		collector.countForward();
