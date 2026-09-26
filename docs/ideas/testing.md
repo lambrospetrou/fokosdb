@@ -2,6 +2,7 @@
 
 ## General
 
+- [Testing approaches for FokosDB and the Fokos Sharding Runtime](./2026-09-26-testing-approaches.md): the techniques to add, with an order of priority.
 - [TigerStyle](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/TIGER_STYLE.md)
 
 ## Deterministic Simulation Testing - DST
