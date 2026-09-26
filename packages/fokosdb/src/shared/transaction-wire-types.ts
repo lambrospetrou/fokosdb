@@ -6,7 +6,7 @@
 import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
-import type { FokosDbRouteContext } from "./partition-context.js";
+import type { FokosTopology } from "../sharding/route-context.js";
 import type { IdempotencyToken, RejectionReasonOf, TransactionId } from "./transaction-api-types.js";
 import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 
@@ -298,8 +298,6 @@ export type TCWriteOperation = {
 	condition?: CompiledConditionPlan;
 	update?: CompiledUpdatePlan;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
-	/** Resolved partition context for the PartitionDO that owns this key. */
-	partitionContext: FokosDbRouteContext;
 };
 
 export type InitiateWriteRequest = {
@@ -308,6 +306,11 @@ export type InitiateWriteRequest = {
 	 * a token when the caller gave none, because the runtime resolves the owner before the handler runs.
 	 */
 	clientRequestToken: IdempotencyToken;
+	/**
+	 * The topology of the table. The coordinator resolves the participant of each item from it, with the
+	 * range config and the policy of its own route context.
+	 */
+	topology: FokosTopology;
 	items: TCWriteOperation[];
 };
 

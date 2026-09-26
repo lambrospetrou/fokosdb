@@ -7,6 +7,7 @@ import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/st
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
+import { FokosRouter } from "../sharding/router.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
@@ -152,9 +153,11 @@ function insertParticipant(
 	state.storage.sql.exec(
 		`INSERT INTO tc_participants
 			(transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome, answer_json, error_json)
-		 VALUES (?, ?, '{}', ?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		TX_ID,
 		outcome.name ?? "p1",
+		// A valid route context, because the coordinator builds its partition client from it.
+		JSON.stringify({ ...testCoordinatorContext(), doName: outcome.name ?? "p1" }),
 		outcome.prepare ?? null,
 		outcome.commit ?? null,
 		outcome.cancel ?? null,
@@ -273,6 +276,54 @@ describe("TransactionCoordinatorDO - loadFinalResponse: committed only after eve
 	});
 });
 
+describe("TransactionCoordinatorDO - participant resolution", () => {
+	it("resolves each item to the root of its key in the table topology, and stores the root contexts", async () => {
+		await withCoordinator(async (tc, state, ctx) => {
+			const topology = { ...ctx.topology, rootTreesN: 8 };
+			const table = new FokosRouter(topology, ctx.rangeConfig, ctx.policy);
+			// Keys under two different roots.
+			const hashKeys = Array.from({ length: 16 }, (_, i) => KeyCodec.encode(`hk-${i}`));
+			const first = table.rootContext(hashKeys[0]);
+			const second = hashKeys.find((hk) => table.rootContext(hk).doName !== first.doName)!;
+			const items: InitiateWriteRequest["items"] = [hashKeys[0], second].map((hashKey, opIndex) => ({
+				opIndex,
+				hashKey,
+				sortKey: KeyCodec.encodeOptional(undefined),
+				operation: "put",
+				data: "v",
+				kind: "text",
+			}));
+			// Only the rows written before the first prepare are under test.
+			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
+
+			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology, items });
+
+			const itemRows = state.storage.sql
+				.exec<{ op_index: number; partition_do_name: string }>(`SELECT op_index, partition_do_name FROM tc_items ORDER BY op_index`)
+				.toArray();
+			expect(itemRows.map((r) => r.partition_do_name)).toEqual(items.map((i) => table.rootContext(i.hashKey).doName));
+			const participantRows = state.storage.sql
+				.exec<{
+					partition_do_name: string;
+					partition_context_json: string;
+				}>(`SELECT partition_do_name, partition_context_json FROM tc_participants`)
+				.toArray();
+			expect(new Map(participantRows.map((r) => [r.partition_do_name, JSON.parse(r.partition_context_json)]))).toEqual(
+				new Map(items.map((i) => [table.rootContext(i.hashKey).doName, JSON.parse(JSON.stringify(table.rootContext(i.hashKey)))])),
+			);
+		});
+	});
+
+	it("refuses an invalid table topology before it writes anything", async () => {
+		await withCoordinator(async (tc, state, ctx) => {
+			await expect(
+				tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology: { ...ctx.topology, rootTreesN: 0 }, items: [] }),
+			).rejects.toThrow(fokosErrorWith("partition_context_options_invalid"));
+			expect(countRows(state, "tc_state")).toBe(0);
+		});
+	});
+});
+
 describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 	it.each([{ maxItems: 20 }, { maxSizeMb: 10_000 }])(
 		"splits and refuses new transactions before the storage limit with hashSplitConditions %j",
@@ -283,9 +334,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
 				vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(5 * 1024 * 1024 * 1024 + 1);
 				expect(tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy })).not.toBe(false);
-				await expect(tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
-					fokosErrorWith("coordinator_over_size"),
-				);
+				await expect(
+					tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, topology: ctx.topology, items: [] }),
+				).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
 				expect(countRows(state, "tc_state")).toBe(0);
 			});
 		},
@@ -295,7 +346,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, items: [] })).rejects.toThrow(
+			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, topology: ctx.topology, items: [] })).rejects.toThrow(
 				fokosErrorWith("coordinator_over_size"),
 			);
 			expect(countRows(state, "tc_state")).toBe(0);
@@ -315,7 +366,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			});
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, items })).value).toEqual({
+			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, topology: ctx.topology, items })).value).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -412,7 +463,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				expect(request.items[0].data).toBe("v");
 				return enveloped({ outcome: "accepted" as const });
 			});
-			const txCommit = vi.fn(async () => ({ outcome: "committed" as const }));
+			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.recoverStaleTransactions();
@@ -881,7 +932,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	});
 
 	it("treats a token as a new transaction after its completed row expires", async () => {
-		await withCoordinator(async (tc, state) => {
+		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
 			const oldTransactionId = "expired-replay-tx";
 			insertState(state, {
@@ -893,7 +944,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			});
 
 			tc.sweepExpiredTransactions();
-			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, items: [] });
+			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, topology: ctx.topology, items: [] });
 
 			expect(result.outcome).toBe("committed");
 			expect(result.transactionId).not.toBe(oldTransactionId);
@@ -947,7 +998,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txPrepare = vi.fn(async () => {
 				throw new Error("partition unreachable");
 			});
-			const txCancel = vi.fn(async () => {});
+			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);
@@ -1045,8 +1096,8 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txPrepare = vi.fn(async () => {
 				throw new Error("p2 unreachable");
 			});
-			const txCancelP1 = vi.fn(async () => {});
-			const txCancelP2 = vi.fn(async () => {});
+			const txCancelP1 = vi.fn(async () => enveloped(undefined));
+			const txCancelP2 = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
 				(_env, _ctx, name) =>
 					({
@@ -1084,7 +1135,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txPrepare = vi.fn(async () => {
 				throw new Error("p1 unreachable");
 			});
-			const txCancel = vi.fn(async () => {});
+			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
 			await tc.runPrepareRecovery(TX_ID, TOKEN);

@@ -64,6 +64,18 @@ export type FokosWalkNode<TPolicy> = {
 type OperationStub = Record<string, (ctx: unknown, req: unknown) => Promise<FokosEnvelope<unknown>>>;
 
 /**
+ * Removes the fields of `FokosCallCost` that a failed call put on `e`. A caller that stores an error, or
+ * passes it on as its own, calls it first: `FokosError.wrap` copies the own properties of a foreign
+ * error into `attributes`.
+ */
+export function dropCallCost(e: unknown): void {
+	if (typeof e === "object" && e !== null) {
+		delete (e as Partial<FokosCallCost>).clientRpcs;
+		delete (e as Partial<FokosCallCost>).totalForwardCount;
+	}
+}
+
+/**
  * The caller side of one shard group. It resolves the entry partition of a request, gets the stub,
  * sends the operation, retries by the policy of the caller, and removes the internal route hints.
  *
@@ -139,7 +151,8 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	}
 
 	/**
-	 * Sends to an entry that the caller selected. `keys` are the route keys of the request.
+	 * Sends to an entry that the caller selected. `keys` are the route keys of the request. The client
+	 * does not read them now.
 	 *
 	 * On an error, the client replaces the `routing` of the error with the public form, adds the
 	 * fields of `FokosCallCost` to the error object, and throws the same error.

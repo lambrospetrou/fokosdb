@@ -26,7 +26,7 @@ import {
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
 import type { FokosRouter } from "../sharding/router.js";
-import { FokosShardingClient, type FokosRetryPolicy } from "../sharding/client.js";
+import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "../server/do-partition.js";
 import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
 import type {
@@ -253,12 +253,8 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
-		// The cost of the call is not part of the public error. It goes before `wrap`, which copies the
-		// own properties of a foreign error into `attributes`.
-		if (typeof e === "object" && e !== null) {
-			delete (e as { clientRpcs?: unknown }).clientRpcs;
-			delete (e as { totalForwardCount?: unknown }).totalForwardCount;
-		}
+		// The cost of the call is not part of the public error.
+		dropCallCost(e);
 		const err = mapInternalErrorToPublic(FokosError.wrap(e));
 		// A partition attaches its routing to its error. The routing state stops here, as it does on a
 		// result: the public error carries the same `meta` a result would, and the internal hints go.
@@ -538,8 +534,7 @@ export class FokosDB {
 		const keys = validateTransactWriteOperations(prepared);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
-			const partitionContext = this.#partitions.resolve({ hashKey, sortKey });
-			return { ...item, opIndex: i, hashKey, sortKey, partitionContext };
+			return { ...item, opIndex: i, hashKey, sortKey };
 		});
 
 		if (!opts.clientRequestToken) {
@@ -568,7 +563,7 @@ export class FokosDB {
 		const { value: encoded } = await this.#coordinators.point(
 			"initiateWrite",
 			{ hashKey: encodeHashKey(idempotencyToken), sortKey: encodeSortKey(undefined) },
-			{ clientRequestToken: idempotencyToken, items },
+			{ clientRequestToken: idempotencyToken, topology: this.#options.topology.topology, items },
 			{ retry: { shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline } },
 		);
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
@@ -601,7 +596,7 @@ export class FokosDB {
 		}
 
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-		const request = { items: items.map(({ partitionContext: _partitionContext, ...item }) => item) };
+		const request = { items };
 
 		let response: SingleShotResponse;
 		try {

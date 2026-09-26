@@ -251,9 +251,9 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			// leak as an unhandled rejection at the worker level.
 			await runInDurableObject(child, async (instance: TransactionCoordinatorDO) => {
 				const childCtx = instance.fokos.routeContext();
-				await expect(instance.initiateWrite(childCtx, { clientRequestToken: token, items: [] })).rejects.toThrow(
-					fokosErrorWith("partition_migrating"),
-				);
+				await expect(
+					instance.initiateWrite(childCtx, { clientRequestToken: token, topology: db.options().topology.topology, items: [] }),
+				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 				await expect(
 					instance.recoverTransaction(childCtx, { transactionId: first.transactionId, idempotencyToken: token }),
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));

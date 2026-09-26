@@ -92,7 +92,5 @@ function put(hashKey: string, sortKey: string, data: string): TCWriteOperation {
 		// Never read by the fingerprint: the fold is ordered, so the position of the operation in the
 		// array already carries the request order that opIndex repeats.
 		opIndex: 0,
-		// Never read by the fingerprint — routing is not part of the request's identity.
-		partitionContext: undefined as never,
 	};
 }

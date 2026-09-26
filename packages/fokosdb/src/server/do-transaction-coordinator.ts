@@ -1,6 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import { tryWhile } from "durable-utils/retries";
 import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
@@ -19,6 +18,8 @@ import type {
 } from "../sharding/repartition-types.js";
 import { FOKOS_PAGE_BYTES, FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
+import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
+import type { PartitionOps } from "./do-partition.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
 import {
@@ -586,18 +587,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// The low three decimal digits stay zero; a later change can allocate them to tie-breaking.
 		const transactionTs = txOrderTimestampNow();
 
-		// Group the operations by partition (doName → context and items). The same grouping feeds the
-		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it
-		// has just written back from SQLite.
-		const participantsByDoName = new Map<string, PrepareParticipant>();
-		for (const op of request.items) {
-			let participant = participantsByDoName.get(op.partitionContext.doName);
-			if (!participant) {
-				participant = { doName: op.partitionContext.doName, context: op.partitionContext, items: [] };
-				participantsByDoName.set(participant.doName, participant);
+		// Group the operations by the root partition of each key. The same grouping feeds the tc_items and
+		// tc_participants rows below and the prepare fan-out, so the happy path never reads the rows it has
+		// just written back from SQLite. The table shares the range config and the policy of this
+		// coordinator, and the client validates the topology before anything is written.
+		const partitions = this.partitionClient({ ...this.fokos.routeContext(), topology: request.topology });
+		const participants: PrepareParticipant[] = partitions.resolveAll(request.items).map(({ ctx, indexes }) => ({
+			doName: ctx.doName,
+			context: ctx,
+			items: indexes.map((i) => request.items[i]),
+		}));
+		const participantOf: string[] = [];
+		for (const p of participants) {
+			for (const item of p.items) {
+				participantOf[item.opIndex] = p.doName;
 			}
-			const { partitionContext: _, ...item } = op;
-			participant.items.push(item);
 		}
 
 		this.transition(idempotencyToken, () => {
@@ -625,11 +629,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					op.ttlAt ?? null,
 					op.condition ? JSON.stringify(op.condition) : null,
 					op.update ? JSON.stringify(op.update) : null,
-					op.partitionContext.doName,
+					participantOf[op.opIndex],
 					op.returnValuesOnConditionCheckFailure === "all_old" ? 1 : 0,
 				);
 			}
-			for (const p of participantsByDoName.values()) {
+			for (const p of participants) {
 				this.ctx.storage.sql.exec(
 					`INSERT INTO tc_participants (transaction_id, partition_do_name, partition_context_json) VALUES (?, ?, ?)`,
 					transactionId,
@@ -647,7 +651,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs(), {
 			transactionTs,
-			participants: [...participantsByDoName.values()],
+			participants,
 		});
 	}
 
@@ -836,6 +840,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * participant that has answered keeps its answer, and recovery can still re-prepare one that has not.
 	 */
 	private storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void {
+		dropCallCost(err);
 		this.ctx.storage.sql.exec(
 			`UPDATE tc_participants SET error_json = ? WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 			stringifyTagged(FokosError.toWire(err)),
@@ -950,6 +955,27 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		);
 	}
 
+	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
+	private partitionClient(ctx: FokosDbRouteContext): FokosShardingClient<FokosDbPolicy, PartitionOps> {
+		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
+		// TODO: The client should exploit cache of topology hierarchy to leapfrog partitions.
+		return new FokosShardingClient<FokosDbPolicy, PartitionOps>({
+			topology: ctx.topology,
+			rangeConfig: ctx.rangeConfig,
+			policy: ctx.policy,
+			stub: (c, doName) => partitionStubByName(this.env, c, doName),
+		});
+	}
+
+	/**
+	 * The retry rule of a commit or a cancel fan-out. It also stops at the request budget on the clock
+	 * of this coordinator, so a participant past the budget stays unconfirmed for the `tx_recovery` job.
+	 */
+	private fanoutRetry(deadlineMs: number): FokosRetryPolicy {
+		const rule = retryable(deadlineMs);
+		return { shouldRetry: (err, nextAttempt) => rule(err, nextAttempt) && this.fokosNow() <= deadlineMs };
+	}
+
 	/** The reference that each participant stores in its lock, and calls back on recovery. */
 	private coordinatorRef(idempotencyToken: string): CoordinatorRef {
 		return { v: COORDINATOR_REF_VERSION, doName: this.fokos.routeContext().doName, idempotencyToken };
@@ -990,28 +1016,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
-				const result = await tryWhile(
-					async () => {
-						const r = (
-							await partitionStubByName(this.env, p.context, p.doName).txPrepare(p.context, {
-								transactionId,
-								coordinator,
-								transactionTimestamp: transactionTs,
-								items: p.items,
-							})
-						).value;
-						this.storePrepareAnswer(transactionId, p.doName, r);
-						return r;
-					},
-					// Backpressure is deterministic for the life of this transaction: the partition is over
-					// its cap, and a split will not land inside a retry budget of a few seconds. Retrying
-					// only adds latency before the same cancellation.
-					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 3,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				).catch((err: unknown) => {
-					this.storePrepareError(transactionId, p.doName, err);
-					throw err;
-				});
+				const { value: result } = await this.partitionClient(p.context)
+					.send(
+						"txPrepare",
+						p.context,
+						{ transactionId, coordinator, transactionTimestamp: transactionTs, items: p.items },
+						p.items,
+						// Backpressure is deterministic for the life of this transaction: the partition is over
+						// its cap, and a split will not land inside a retry budget of a few seconds. Retrying
+						// only adds latency before the same cancellation.
+						{ retry: prepareRetry(3) },
+					)
+					.catch((err: unknown) => {
+						this.storePrepareError(transactionId, p.doName, err);
+						throw err;
+					});
+				this.storePrepareAnswer(transactionId, p.doName, result);
 				return { partitionDoName: p.doName, result };
 			}),
 		);
@@ -1071,29 +1091,25 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		await Promise.allSettled(
 			pendingParticipants.map(async (p) => {
+				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
+				// transaction stays in COMMITTING, the caller receives the commit-pending error, and the
+				// `tx_recovery` job finishes the fan-out.
+				if (this.fokosNow() > deadlineMs) {
+					return;
+				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const partitionKeys = keysByPartition.get(p.partition_do_name) ?? [];
-				await tryWhile(
-					async () => {
-						// Past the request budget, stop dispatching: this participant stays unconfirmed,
-						// the transaction stays in COMMITTING, the caller receives the commit-pending
-						// error, and the `tx_recovery` job finishes the fan-out.
-						if (this.fokosNow() > deadlineMs) {
-							return;
-						}
-						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCommit(pCtx, {
-							transactionId,
-							transactionTimestamp: stateRow.transaction_ts,
-							items: toTransactionItemKeys(partitionKeys),
-						});
-						this.ctx.storage.sql.exec(
-							`UPDATE tc_participants SET commit_outcome = 'committed' WHERE transaction_id = ? AND partition_do_name = ?`,
-							transactionId,
-							p.partition_do_name,
-						);
-					},
-					retryable(deadlineMs),
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
+				const keys = toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []);
+				await this.partitionClient(pCtx).send(
+					"txCommit",
+					pCtx,
+					{ transactionId, transactionTimestamp: stateRow.transaction_ts, items: keys },
+					keys,
+					{ retry: this.fanoutRetry(deadlineMs) },
+				);
+				this.ctx.storage.sql.exec(
+					`UPDATE tc_participants SET commit_outcome = 'committed' WHERE transaction_id = ? AND partition_do_name = ?`,
+					transactionId,
+					p.partition_do_name,
 				);
 			}),
 		);
@@ -1132,27 +1148,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		await Promise.allSettled(
 			pendingParticipants.map(async (p) => {
+				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
+				// transaction stays in CANCELLING, and the `tx_recovery` job finishes the fan-out. The caller
+				// still receives the cancelled outcome, which applied nothing anywhere.
+				if (this.fokosNow() > deadlineMs) {
+					return;
+				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				await tryWhile(
-					async () => {
-						// Past the request budget, stop dispatching: this participant stays unconfirmed,
-						// the transaction stays in CANCELLING, and the `tx_recovery` job finishes the fan-out. The
-						// caller still receives the cancelled outcome, which applied nothing anywhere.
-						if (this.fokosNow() > deadlineMs) {
-							return;
-						}
-						await partitionStubByName(this.env, pCtx, p.partition_do_name).txCancel(pCtx, {
-							transactionId,
-							items: toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []),
-						});
-						this.ctx.storage.sql.exec(
-							`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE transaction_id = ? AND partition_do_name = ?`,
-							transactionId,
-							p.partition_do_name,
-						);
-					},
-					retryable(deadlineMs),
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
+				const keys = toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []);
+				await this.partitionClient(pCtx).send("txCancel", pCtx, { transactionId, items: keys }, keys, {
+					retry: this.fanoutRetry(deadlineMs),
+				});
+				this.ctx.storage.sql.exec(
+					`UPDATE tc_participants SET cancel_outcome = 'cancelled' WHERE transaction_id = ? AND partition_do_name = ?`,
+					transactionId,
+					p.partition_do_name,
 				);
 			}),
 		);
@@ -1187,27 +1197,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		await Promise.allSettled(
 			nullParticipants.map(async (p) => {
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const partitionItems = itemsByPartition.get(p.partition_do_name) ?? [];
-				await tryWhile(
-					async () => {
-						const r = (
-							await partitionStubByName(this.env, pCtx, p.partition_do_name).txPrepare(pCtx, {
-								transactionId,
-								coordinator,
-								transactionTimestamp: stateRow.transaction_ts,
-								items: toTransactionItems(partitionItems),
-							})
-						).value;
-						this.storePrepareAnswer(transactionId, p.partition_do_name, r);
-						return r;
-					},
-					// Same as the first prepare pass: an over-size partition will not clear by retrying.
-					(err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= 5,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				).catch((err: unknown) => {
-					this.storePrepareError(transactionId, p.partition_do_name, err);
-					throw err;
-				});
+				const partitionItems = toTransactionItems(itemsByPartition.get(p.partition_do_name) ?? []);
+				const { value: r } = await this.partitionClient(pCtx)
+					.send(
+						"txPrepare",
+						pCtx,
+						{ transactionId, coordinator, transactionTimestamp: stateRow.transaction_ts, items: partitionItems },
+						partitionItems,
+						// Same as the first prepare pass: an over-size partition will not clear by retrying.
+						{ retry: prepareRetry(5) },
+					)
+					.catch((err: unknown) => {
+						this.storePrepareError(transactionId, p.partition_do_name, err);
+						throw err;
+					});
+				this.storePrepareAnswer(transactionId, p.partition_do_name, r);
 			}),
 		);
 
@@ -1582,6 +1586,13 @@ function retryable(deadlineMs: number): (err: unknown, nextAttempt: number) => b
 		return (_err, nextAttempt) => nextAttempt <= MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE;
 	}
 	return () => Date.now() <= deadlineMs;
+}
+
+/** The retry rule of a prepare: every error except `partition_over_size`, up to `maxAttempts` attempts. */
+function prepareRetry(maxAttempts: number): FokosRetryPolicy {
+	return {
+		shouldRetry: (err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= maxAttempts,
+	};
 }
 
 /** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */
