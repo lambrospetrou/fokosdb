@@ -30,9 +30,13 @@
 			"types": "./dist/server/index.d.ts",
 			"import": "./dist/server/index.js"
 		},
-		"./sharding": {
-			"types": "./dist/sharding/index.d.ts",
-			"import": "./dist/sharding/index.js"
+		"./sharding/client": {
+			"types": "./dist/sharding/client/index.d.ts",
+			"import": "./dist/sharding/client/index.js"
+		},
+		"./sharding/server": {
+			"types": "./dist/sharding/server/index.d.ts",
+			"import": "./dist/sharding/server/index.js"
 		}
 	},
 	"files": [

@@ -23,11 +23,12 @@ This is a pnpm workspace. Run the scripts of the root `package.json` from the re
 
 ## Package layout
 
-`packages/fokosdb/src` has three parts. Convention keeps them apart, not the module system.
+`packages/fokosdb/src` has four parts. Convention keeps them apart, not the module system.
 
 - `client/` — `db.ts` and the entry barrel. Published as `fokosdb/client`.
 - `server/` — the two Durable Object classes. Published as `fokosdb/server`.
 - `shared/` — what both sides use.
+- `sharding/` — the sharding library, which uses no FokosDB module. `index-client.ts` is published as `fokosdb/sharding/client` (the caller side: `FokosShardingClient`, routing types, errors), and `index-server.ts` as `fokosdb/sharding/server` (the runtime, the store, the repartition flow, and a re-export of the client entry). `pnpm build` fails when the client entry reaches a runtime module.
 
 **The client must never import a Durable Object class as a value.** That pulls the whole server implementation into `dist/client`. Use the type-only helpers in `shared/do-stubs.ts` and keep every class import `import type`. `pnpm build` enforces the rule, pins the packages the client may import, and holds the client bundle under a size budget.
 

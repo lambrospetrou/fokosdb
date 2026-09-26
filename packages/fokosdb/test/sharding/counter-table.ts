@@ -7,7 +7,7 @@ import {
 	SHARDING_UNAVAILABLE_CODES,
 	type FokosPartitionRef,
 	type RouteKey,
-} from "../../src/sharding/index.js";
+} from "../../src/sharding/index-client.js";
 import type { CounterOps, CounterPartitionDO, CounterPolicy, CounterStats } from "./counter-host.js";
 
 /** How long a test waits for the runtime to finish a split. The fallback alarm of the runtime is 5 seconds. */

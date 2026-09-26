@@ -1,10 +1,11 @@
 # RFC — FokosShardingClient: one caller layer that resolves, sends, and retries for the sharding runtime
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
-**Status:** M1, M2, and M3 are built. M4 is not built.
+**Status:** M1, M2, M3, and M4 are built. The text of each milestone describes the code before that milestone as
+"now".
 
 ## Table of contents
 
@@ -760,8 +761,9 @@ these rules:
   created, 1 MiB by default, and it never frees a block. One instance for each root index does not fit the 128 MB
   memory limit of a Worker isolate
   ([Workers limits](https://developers.cloudflare.com/workers/platform/limits/)).
-- **One default cache for each isolate.** tsdown puts a module that both entries import into a shared chunk. Now,
-  `dist/client/index.js` and `dist/sharding/index.js` both import `dist/router-*.js`. So a module-scope default
+- **One default cache for each isolate.** tsdown puts a module that more than one entry imports into a shared
+  chunk. Now, `dist/client/index.js`, `dist/sharding/client/index.js`, and `dist/sharding/server/index.js` all
+  import the one chunk that holds `router.ts` (`dist/sk-interval-*.js`). So a module-scope default
   instance in `route-cache.ts` is one instance for the isolate. A build check asserts that `route-cache.ts` is in
   a shared chunk, as `check-client-bundle` asserts the client imports.
 - **A stale hint can create an empty object.** After a destroy, a cache in another isolate still names the deep

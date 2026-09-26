@@ -15,7 +15,7 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusPage,
 	FokosStatusRequest,
-} from "fokosdb/sharding";
+} from "fokosdb/sharding/server";
 
 /**
  * The base class of a Durable Object that hosts `FokosShardingRuntime`.

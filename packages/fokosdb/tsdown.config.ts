@@ -9,8 +9,8 @@ const CLIENT_FORBIDDEN_SRC = "src/server/";
 const CLIENT_ALLOWED_EXTERNALS = [/^cloudflare:workers$/, /^xxhash-wasm$/, /^durable-utils\//];
 
 /**
- * Source directories and files that the sharding entry must never reach: the FokosDB data model. The
- * sharding layer moves ownership between partitions and knows nothing about items, expressions, or
+ * Source directories and files that the two sharding entries must never reach: the FokosDB data model.
+ * The sharding layer moves ownership between partitions and knows nothing about items, expressions, or
  * transactions.
  */
 const SHARDING_FORBIDDEN_SRC = [
@@ -23,7 +23,19 @@ const SHARDING_FORBIDDEN_SRC = [
 ];
 
 /**
- * The generic `src/shared/` modules that the sharding entry may reach. Every other `src/shared/`
+ * Sharding modules that the sharding client entry must never reach: the runtime and its parts. A
+ * Worker that only calls partitions ships none of them.
+ */
+const SHARDING_CLIENT_FORBIDDEN_SRC = [
+	"src/sharding/runtime.ts",
+	"src/sharding/repartition-flow.ts",
+	"src/sharding/sharding-store.ts",
+	"src/sharding/scheduler.ts",
+	"src/sharding/batch-scan.ts",
+];
+
+/**
+ * The generic `src/shared/` modules that the sharding entries may reach. Every other `src/shared/`
  * module is FokosDB code.
  */
 const SHARDING_ALLOWED_SHARED = [
@@ -50,11 +62,15 @@ function isUnlistedShared(id: string): boolean {
  */
 const CLIENT_MAX_BYTES = 90 * 1024;
 
+/** Upper bound for the sharding client entry and every chunk that it imports, in MINIFIED bytes. */
+const SHARDING_CLIENT_MAX_BYTES = 30 * 1024;
+
 export default defineConfig({
 	entry: {
 		"client/index": "src/client/index.ts",
 		"server/index": "src/server/index.ts",
-		"sharding/index": "src/sharding/index.ts",
+		"sharding/client/index": "src/sharding/index-client.ts",
+		"sharding/server/index": "src/sharding/index-server.ts",
 	},
 	format: ["esm"],
 	dts: true,
@@ -102,9 +118,9 @@ export default defineConfig({
 				}
 
 				for (const { entry, chunks, externals } of graphs) {
-					if (entry.name === "sharding/index") {
-						const fokosModules = chunks
-							.flatMap((chunk) => chunk.moduleIds)
+					if (entry.name === "sharding/client/index" || entry.name === "sharding/server/index") {
+						const moduleIds = chunks.flatMap((chunk) => chunk.moduleIds);
+						const fokosModules = moduleIds
 							.filter(
 								(id) =>
 									SHARDING_FORBIDDEN_SRC.some((rule) => (typeof rule === "string" ? id.includes(rule) : rule.test(id))) ||
@@ -113,7 +129,22 @@ export default defineConfig({
 							.sort();
 						if (fokosModules.length > 0) {
 							this.error(
-								`The sharding bundle contains FokosDB modules. Import them with \`import type\` only, or move the generic part behind a hook:\n  ${fokosModules.join("\n  ")}`,
+								`The ${entry.name} bundle contains FokosDB modules. Import them with \`import type\` only, or move the generic part behind a hook:\n  ${fokosModules.join("\n  ")}`,
+							);
+						}
+						if (entry.name === "sharding/server/index") {
+							continue;
+						}
+						const runtimeModules = moduleIds.filter((id) => SHARDING_CLIENT_FORBIDDEN_SRC.some((rule) => id.endsWith(rule))).sort();
+						if (runtimeModules.length > 0) {
+							this.error(
+								`The sharding client bundle contains runtime modules. Import them with \`import type\` only:\n  ${runtimeModules.join("\n  ")}`,
+							);
+						}
+						const bytes = minifiedBytes(chunks);
+						if (bytes > SHARDING_CLIENT_MAX_BYTES) {
+							this.error(
+								`The sharding client bundle is ${(bytes / 1024).toFixed(1)} kB minified, over the ${SHARDING_CLIENT_MAX_BYTES / 1024} kB budget.`,
 							);
 						}
 						continue;
@@ -181,7 +212,7 @@ function bundleSizeReport(graphs: Array<{ entry: { fileName: string }; chunks: A
 		const rawBytes = chunks.reduce((total, chunk) => total + Buffer.byteLength(chunk.code), 0);
 		const minBytes = minified.reduce((total, code) => total + Buffer.byteLength(code), 0);
 		const gzipBytes = gzipSync(minified.join("\n")).byteLength;
-		return `  ${entry.fileName.padEnd(16)}${kB(rawBytes)} raw${kB(minBytes)} min${kB(gzipBytes)} min+gzip`;
+		return `  ${entry.fileName.padEnd(26)}${kB(rawBytes)} raw${kB(minBytes)} min${kB(gzipBytes)} min+gzip`;
 	});
 	return `Bundle sizes (entry and imported chunks):\n${lines.join("\n")}`;
 }

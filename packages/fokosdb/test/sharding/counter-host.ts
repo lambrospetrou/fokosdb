@@ -19,7 +19,7 @@ import {
 	type FokosStatusPage,
 	type FokosStatusRequest,
 	type KeyBytes,
-} from "../../src/sharding/index.js";
+} from "../../src/sharding/index-server.js";
 
 /**
  * An example host of `FokosShardingRuntime` that uses no FokosDB module. It imports only the

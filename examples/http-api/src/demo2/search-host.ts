@@ -7,7 +7,7 @@ import {
 	type FokosRouteContext,
 	type FokosShardingHooks,
 	type KeyBytes,
-} from "fokosdb/sharding";
+} from "fokosdb/sharding/server";
 import { ShardedDurableObject } from "./sharded-do.js";
 
 /**

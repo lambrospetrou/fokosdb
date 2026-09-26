@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { FokosShardingClient, KeyCodec } from "fokosdb/sharding";
+import { FokosShardingClient, KeyCodec } from "fokosdb/sharding/client";
 import type { SearchOps, SearchPolicy, SearchStats } from "./search-host.js";
 import { collectTree, jsonBody, retryWhileMigrating, topologyOf, traceOf, type TreeNode } from "./shared.js";
 

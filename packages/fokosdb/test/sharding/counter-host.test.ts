@@ -1,6 +1,6 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
-import { FokosError, FokosShardingStore, HashTopology, KeyCodec, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/index.js";
+import { FokosError, FokosShardingStore, HashTopology, KeyCodec, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/index-server.js";
 import { counterKey, makeCounterTable, stub } from "./counter-table.js";
 
 describe.concurrent("Sharding runtime — counter host", () => {

@@ -7,7 +7,7 @@ import {
 	type FokosPublicRouting,
 	type FokosRetryPolicy,
 	type FokosShardingClient,
-} from "fokosdb/sharding";
+} from "fokosdb/sharding/client";
 
 /** The types and helpers that the three demos share. The UI reads the types as JSON. */
 

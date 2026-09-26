@@ -1,49 +1,18 @@
 /**
- * Sharding entry point: identity, routing, topology caches, and the repartition flow that moves
- * ownership between partitions.
+ * Sharding server entry point, `fokosdb/sharding/server`: what a host Durable Object needs. It holds
+ * the runtime, the store, the scheduler, the repartition flow, and the host option and hook types. It
+ * also re-exports `fokosdb/sharding/client`, so a host imports one entry.
  *
  * Nothing here reads FokosDB items, expressions, or transactions. The `check-client-bundle` plugin in
  * `tsdown.config.ts` fails the build when a module of this entry reaches one of those.
  */
 
-// ─── Keys and hashing ─────────────────────────────────────────────────────────
+export * from "./index-client.js";
 
-export { KeyCodec } from "./key-codec.js";
-export type { KeyBytes } from "./key-codec.js";
-export { GOLDEN_RATIO, GOLDEN_RATIO_BIGINT, hash32, hash64, hashChildIndex, hashRootIndex } from "./hash-primitives.js";
+// ─── Bloom filter ─────────────────────────────────────────────────────────────
+
 export { AddResult, BloomFilter } from "./bloom-filter.js";
 export type { BloomFilterSnapshot } from "./bloom-filter.js";
-
-// ─── Identity and context ─────────────────────────────────────────────────────
-
-export {
-	isHashPartition,
-	isRangePartition,
-	refOf,
-	structurallyEqual,
-	topologiesEqual,
-	validateRangeConfig,
-	validateTopology,
-} from "./route-context.js";
-export type {
-	FokosPartitionIdentity,
-	FokosPartitionRef,
-	FokosRangeConfig,
-	FokosRouteContext,
-	FokosStoredPolicy,
-	FokosTopology,
-} from "./route-context.js";
-export {
-	PartitionIdHelper,
-	RANGE_MAX,
-	RANGE_MIN,
-	identityDepth,
-	partitionIdentityFrom,
-	resolveDescendantHashPartitionContext,
-	resolveHashChildPartitionContexts,
-	resolveRangePartitionContext,
-} from "./partition-id.js";
-export type { PartitionNodeId, RangeAncestorInfo, SplitStatus, SplitType } from "./types.js";
 
 // ─── The runtime ──────────────────────────────────────────────────────────────
 
@@ -52,25 +21,17 @@ export { isDestroyAbortError } from "../shared/cf-utils.js";
 export type { FokosRuntimeConstructorOptions } from "./runtime.js";
 export type {
 	FokosChild,
-	FokosEnvelope,
 	FokosGroupPart,
 	FokosJob,
 	FokosLifecycle,
 	FokosLocalCall,
 	FokosOperation,
 	FokosOperationBase,
-	FokosOperationSpec,
 	FokosOperations,
 	FokosOwner,
-	FokosPublicRoute,
-	FokosPublicRouting,
-	FokosRangeInput,
 	FokosRangeVisit,
 	FokosRepartitionPlan,
 	FokosRequestPromotionResult,
-	FokosRouteNode,
-	FokosRouting,
-	FokosServedRole,
 	FokosRuntimeConfigOverrides,
 	FokosRuntimeOptions,
 	FokosShardingHooks,
@@ -83,54 +44,13 @@ export type { FrontierBase, PlannedVisit } from "./range-frontier.js";
 export { FokosScheduler } from "./scheduler.js";
 export type { FokosSchedulerDeps } from "./scheduler.js";
 
-// ─── Errors ───────────────────────────────────────────────────────────────────
-
-export {
-	FOKOS_SHARDING_CODE_TABLES,
-	SHARDING_INTERNAL_CODES,
-	SHARDING_ROUTING_CODES,
-	SHARDING_UNAVAILABLE_CODES,
-	SHARDING_VALIDATION_CODES,
-} from "./errors.js";
-export type { FokosShardingError } from "./errors.js";
-export {
-	CORE_INTERNAL_CODES,
-	FokosError,
-	FokosInternalError,
-	FokosRoutingError,
-	FokosUnavailableError,
-	FokosValidationError,
-	isRuntimeRetryableError,
-} from "../shared/errors.js";
-export type { FokosErrorOrigin, FokosErrorWire } from "../shared/errors.js";
-
 // ─── Routing and caches ───────────────────────────────────────────────────────
 
-export { FokosRouter } from "./router.js";
-export { FokosShardingClient } from "./client.js";
-export type {
-	FokosCallCost,
-	FokosCallOptions,
-	FokosCallResult,
-	FokosResolvedGroup,
-	FokosRetryPolicy,
-	FokosShardingClientOptions,
-	FokosWalkNode,
-} from "./client.js";
 export { HashTopology } from "./hash-topology.js";
 export type { HashTopologySnapshot } from "./hash-topology.js";
 export { PartialRangeTopology } from "./partial-range-topology.js";
 export type { PartialRangeTopologySnapshot } from "./partial-range-topology.js";
 export { selectRangeAncestors } from "./range-ancestors.js";
-export {
-	clipToChildRange,
-	cursorFallsInChild,
-	isChildFullyBeforeCursor,
-	makeBoundaryCursor,
-	normalizeSkInterval,
-	rangeIntersects,
-} from "./sk-interval.js";
-export type { SkInterval } from "./sk-interval.js";
 
 // ─── Sharding store ───────────────────────────────────────────────────────────
 
@@ -139,7 +59,6 @@ export type {
 	FokosShardingStoreOptions,
 	LearnedRangeSlice,
 	PromotedKeyCursor,
-	RepartitionKind,
 	RepartitionRow,
 	RepartitionSlice,
 	RepartitionState,
@@ -171,7 +90,6 @@ export { sliceIncludesHashKey, sliceIncludesItem } from "./repartition-slice.js"
 export type {
 	FokosExecuteLocalRequest,
 	FokosImportRecord,
-	FokosImportState,
 	FokosInitRequest,
 	FokosMigrationAckRequest,
 	FokosMigrationCursor,
@@ -190,7 +108,6 @@ export type {
 	FokosStatusPage,
 	FokosStatusRequest,
 	MigrationHost,
-	RouteKey,
 } from "./repartition-types.js";
 export { collectBatch } from "./batch-scan.js";
 export type { CollectBatchOptions, CollectBatchResult } from "./batch-scan.js";

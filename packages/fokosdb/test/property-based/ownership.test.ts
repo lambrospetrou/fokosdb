@@ -22,7 +22,7 @@ import {
 	type FokosShardingRuntime,
 	type RepartitionSourceDeps,
 	type RouteKey,
-} from "../../src/sharding/index.js";
+} from "../../src/sharding/index-server.js";
 import { kb } from "../partition-do/helpers.js";
 import { makeTriggeredRangeRoot } from "../partition-do/partition-harness.js";
 import type { CounterPartitionDO } from "../sharding/counter-host.js";

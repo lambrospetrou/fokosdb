@@ -1,5 +1,5 @@
 import { Hono } from "hono";
-import { FokosShardingClient, KeyCodec, type RouteKey } from "fokosdb/sharding";
+import { FokosShardingClient, KeyCodec, type RouteKey } from "fokosdb/sharding/client";
 import type { CounterOps, CounterPolicy, CounterStats } from "./counter-host.js";
 import { collectTree, jsonBody, retryWhileMigrating, topologyOf, traceOf, type ActionTrace, type TreeNode } from "./shared.js";
 
