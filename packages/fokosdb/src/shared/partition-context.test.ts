@@ -64,6 +64,27 @@ describe("PartitionContextCreator.create — the split of one table configuratio
 	});
 });
 
+describe("PartitionContextCreator.create — defaults", () => {
+	it("keeps a given rangeSplitN when rangeSplitConditions is omitted", () => {
+		const cfg = PartitionContextCreator.create(makeOpts({ rangeSplitN: 8 }));
+		expect(cfg.rangeConfig.rangeSplitN).toBe(8);
+		expect(cfg.policy.rangeSplitConditions).toEqual({ maxSizeMb: 500 });
+	});
+
+	it("defaults rangeSplitN when only rangeSplitConditions is given", () => {
+		const cfg = PartitionContextCreator.create(makeOpts({ rangeSplitConditions: { maxSizeMb: 200 } }));
+		expect(cfg.rangeConfig.rangeSplitN).toBe(4);
+		expect(cfg.policy.rangeSplitConditions).toEqual({ maxSizeMb: 200 });
+	});
+
+	it("does not change the options object of the caller", () => {
+		const opts = makeOpts({ hashSplitN: 8 });
+		const before = structuredClone(opts);
+		PartitionContextCreator.create(opts);
+		expect(opts).toEqual(before);
+	});
+});
+
 describe("structurallyEqual over the mutable parts", () => {
 	it("treats equal range configs as equal and different ones as unequal", () => {
 		const a = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig: { fromRoot: 2, fromLeaf: 2 } }));
