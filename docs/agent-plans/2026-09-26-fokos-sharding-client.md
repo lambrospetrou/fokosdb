@@ -73,8 +73,8 @@ const { value, routing } = router.unwrap(envelope);          // 4. drops the int
    4. Every retry takes the same path until the source cuts over. A transaction lock can hold the cutover. A lock
       in quarantine holds it until `debugForceResolveTransaction`.
 
-This document solves problems 2, 3, 5, 6, and 7. It also adds the caller layer where a caller-side route cache
-connects later. That cache solves problems 1 and 4. The cache is separate work (section 4.3.1), and it depends on
+This document solves problems 2, 3, 6, and 7. It also adds the caller layer where a caller-side route cache
+connects later. That cache solves problems 1 and 4. Section 4.3.1 gives an optional solution to problem 5. The cache is separate work (section 4.3.1), and it depends on
 the fix of problem 7.
 
 ### Glossary
@@ -103,6 +103,9 @@ the fix of problem 7.
 - The runtime counts every outbound RPC in `forwardCount`, and also an RPC that failed without routing.
 - The request to the coordinator carries the table topology once, and each item carries its keys only.
 - A target before its cutover sends a request to its source, and does not refuse it.
+- `fokosdb/sharding` exports every error category and every code that the sharding runtime raises. From M4,
+  `fokosdb/sharding/client` exports them.
+- The sharding library has a client entry and a server entry, as FokosDB has.
 
 ### 2.2 Out of scope
 
@@ -139,6 +142,8 @@ Each milestone ships and is useful alone.
 - Add `FokosRetryPolicy`. Move the retry rules of `FokosDB` and of the demos into policies.
 - Count every outbound RPC in `forwardCount` (section 4.2.4).
 - Add `role` to `FokosStatusPage`, so that `walk` reads the role and does not derive it from repartition states.
+- Move the codes that the sharding runtime raises into tables of the sharding library, and export them and the
+  error classes from `fokosdb/sharding` (section 4.2.1).
 - Remove `FokosRouter.walk`. `FokosRouter` keeps `rootContext`, `allRoots`, and `unwrap`.
 - Move `FokosDB`, the demos, and `test/sharding/counter-table.ts` to the client. `FokosDB.destroy` calls
   `destroy()` on its coordinator client, then on its partition client.
@@ -161,10 +166,19 @@ Each milestone ships and is useful alone.
   start notification. It starts its import and answers `partition_migrating`.
 - Remove the `repartition_not_cut_over` fallbacks of `#fallbackAfterMiss` and `#forwardRangeVisit`. After this
   change, no request path raises that code.
-- This milestone comes last because it changes the runtime and not the client. The caller-side route cache
-  depends on it.
+- This milestone comes after M1 and M2 because it changes the runtime and not the client. The caller-side route
+  cache depends on it.
 - Delivers: the fix of problem 7. The runtime also answers correctly when any hint names a target before its
   cutover.
+
+### M4 — The sharding library has a client entry and a server entry
+
+- Replace `fokosdb/sharding` with `fokosdb/sharding/client` and `fokosdb/sharding/server` (section 4.2.11). This is
+  a breaking change of the package entries.
+- A build check makes sure that the sharding client entry never reaches the runtime, the store, or the repartition
+  flow.
+- This milestone comes last because it moves only exports and changes no behavior.
+- Delivers: a Worker that only calls partitions bundles the client part of the sharding library only.
 
 ## 4. Proposed solution
 
@@ -178,7 +192,7 @@ and the request. The client does the rest:
 2. It gets the stub from the callback. It calls the method that has the name of the operation.
 3. On an error, it asks the retry policy. When the policy allows it, the client sends again to the same entry.
 4. It removes the internal hints from the routing.
-5. It returns the value, the public routing, the entry, and the cost of the call.
+5. It returns the value, the public routing, and the cost of the call.
 
 ```
  Worker isolate                                         Durable Objects
@@ -205,10 +219,55 @@ request while it owns the slice. After the cutover, the source tells the target 
 #### 4.2.1 Placement
 
 - `src/sharding/client.ts` holds `FokosShardingClient` and `FokosRetryPolicy`.
-- `fokosdb/sharding` exports them. `fokosdb/client` re-exports them, as it re-exports `FokosRouter` now.
+- `fokosdb/sharding` exports them. `fokosdb/client` re-exports them, as it re-exports `FokosRouter` now. From M4,
+  `fokosdb/sharding/client` exports them (section 4.2.11).
 - `db.ts` imports them by path. The `check-client-bundle` plugin and the size budget in `tsdown.config.ts` apply.
 - The module does not import `runtime.ts`, `repartition-flow.ts`, or `sharding-store.ts` as a value. It uses
   `tryWhile` from `durable-utils/retries`. Both entries can import that package.
+
+**The errors of the sharding runtime.** A caller of the runtime must check an error by its code with
+`FokosError.isCode`, and not by its text. `FokosError.isCode` reads own properties only, so it works after an RPC
+hop. Now, `fokosdb/sharding` exports only the `SHARDING_*` code tables. It does not export `FokosError` or the
+category classes. The runtime also raises codes that are in the FokosDB tables of `shared/errors.ts`.
+
+In M1, the sharding library owns every code that it raises:
+
+| Code | Now | After M1 |
+| --- | --- | --- |
+| `partition_migrating` | `UNAVAILABLE_CODES` | `SHARDING_UNAVAILABLE_CODES` |
+| `key_encode_empty`, `key_not_well_formed_utf`, `partition_context_options_invalid` | `VALIDATION_CODES` | A new `SHARDING_VALIDATION_CODES` table in `sharding/errors.ts` |
+| `invariant_failed`, `foreign_error` | `INTERNAL_CODES` | A new `CORE_INTERNAL_CODES` table in `shared/errors.ts` |
+
+- **The code value, the category, and the segment of each code do not change.** So `FokosError.isCode` gives the
+  same result, the `error_id` values do not change, and the public codes of FokosDB do not change.
+- **`invariant_failed` and `foreign_error` stay in `shared/errors.ts`.** They are codes of the error system itself:
+  `FokosError.wrap` raises `foreign_error`, and `shared/invariant.ts` and `shared/sql-cursor.ts` raise
+  `invariant_failed`. `shared/errors.ts` imports nothing, and `sharding/errors.ts` imports it. So a move into
+  `sharding/errors.ts` makes an import cycle. `CORE_INTERNAL_CODES` holds only these two codes, and
+  `FOKOS_CODE_TABLES` includes it.
+- **Each code is in one table only.** The move deletes the code from its old table. The segment uniqueness test in
+  `errors-operations.test.ts` fails when a code is in two tables.
+- **FokosDB checks the moved codes as now.** `client/db.ts`, `server/do-transaction-coordinator.ts`,
+  `shared/partition-context.ts`, and `shared/transaction-limits.ts` import the definitions from their new tables.
+  `FokosAnyError` already includes `FokosShardingError`, and `FOKOS_LIBRARY_CODE_TABLES` already includes
+  `FOKOS_SHARDING_CODE_TABLES`. So `FokosErrorCode`, `isFokosAnyError`, and a `switch` on the code still cover
+  every moved code. `FokosAnyError` also gets `FokosInternalError<FokosCodesOf<typeof CORE_INTERNAL_CODES>>`.
+- **`FokosShardingError` covers every code that the runtime raises.** It includes the new
+  `SHARDING_VALIDATION_CODES` and `CORE_INTERNAL_CODES`. `FOKOS_SHARDING_CODE_TABLES` includes
+  `SHARDING_VALIDATION_CODES`.
+- The comment at the top of `sharding/errors.ts` changes. The current comment says that the codes a client
+  handles stay in `shared/errors.ts`, and that stops being true.
+
+`fokosdb/sharding` then also exports:
+
+- `FokosError`, and the categories that the runtime raises: `FokosValidationError`, `FokosUnavailableError`,
+  `FokosRoutingError`, and `FokosInternalError`.
+- `isRuntimeRetryableError`.
+- The types `FokosErrorOrigin` and `FokosErrorWire`.
+- `SHARDING_VALIDATION_CODES` and `CORE_INTERNAL_CODES`, next to the `SHARDING_*` tables that it exports now.
+
+It exports no FokosDB code table. `shared/errors.ts` is already on the allow list of the sharding bundle, so the
+build check does not change.
 
 #### 4.2.2 The client API
 
@@ -245,7 +304,7 @@ export type FokosCallCost = {
 	totalForwardCount: number;
 };
 
-export type FokosCallResult<T> = FokosCallCost & { value: T; routing: FokosPublicRouting; entry: FokosPartitionRef };
+export type FokosCallResult<T> = FokosCallCost & { value: T; routing: FokosPublicRouting };
 
 export type FokosResolvedGroup<TPolicy> = { ctx: FokosRouteContext<TPolicy>; indexes: number[] };
 
@@ -304,10 +363,10 @@ const search = new FokosShardingClient<SearchPolicy, SearchOps>({
 });
 
 const deadline = Date.now() + 15_000;
-const migrating = {
-	shouldRetry: (err: unknown) => String(err).includes("partition_migrating") && Date.now() < deadline,
+const migrating: FokosRetryPolicy = {
+	shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
 };
-const { value, routing, entry } = await search.point("addDoc", { hashKey, sortKey }, req, { retry: migrating });
+const { value, routing } = await search.point("addDoc", { hashKey, sortKey }, req, { retry: migrating });
 const hits = await search.range("search", { hashKey, interval, descending: true }, req);
 ```
 
@@ -335,7 +394,7 @@ For `point`, `range`, and `send`:
    `tryWhile` has this behavior.
 3. Unwrap the result with `FokosRouter.unwrap`. On an error, replace `routing` with the public form, then throw
    the same error object.
-4. Return `{ value, routing, entry }` and the cost fields.
+4. Return `{ value, routing }` and the cost fields.
 
 **The caller decides the retry, because a refusal does not prove that nothing applied:**
 
@@ -400,7 +459,7 @@ Each call site keeps its current rule and its current delays:
 | coordinator call (`initiateWrite`) | `partition_migrating`, while `Date.now()` is before the deadline of `TX_COORDINATOR_MIGRATING_RETRY_MS`. |
 | coordinator `txPrepare` | Every code except `partition_over_size`, and `nextAttempt <= 3`, as now. |
 | coordinator `txCommit`, `txCancel` | The current rules of `runCommit` and `runCancel`. |
-| demo writes | `partition_migrating`, for `RETRY_FOR_MS` (15 s). |
+| demo writes | `partition_migrating`, for `RETRY_FOR_MS` (15 s). The check becomes `FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating)` in place of the text match. |
 
 #### 4.2.6 walk
 
@@ -576,7 +635,32 @@ their `repartition_not_cut_over` for the migration protocol, which is not a requ
 The cost: a request that reaches a target before its cutover pays one more RPC, from the target to the source.
 Only a hint sends a request there.
 
-#### 4.2.11 Performance
+#### 4.2.11 The sharding client and server entries (M4)
+
+**Now.** `fokosdb/sharding` is one entry. It exports the runtime, the store, the repartition flow, and the
+routing helpers together. A Worker that only calls partitions imports the same entry as a host Durable Object.
+`fokosdb/client` re-exports `FokosRouter` from it.
+
+**After M4.** The package has two sharding entries, as FokosDB has `fokosdb/client` and `fokosdb/server`:
+
+| Entry | What it exports |
+| --- | --- |
+| `fokosdb/sharding/client` | `FokosShardingClient`, `FokosRetryPolicy`, `FokosRouter`, the route context types and validators, `PartitionIdHelper` and the context resolvers, `KeyCodec`, the hash primitives, the envelope and routing types (`FokosPublicRouting`, `FokosOperationSpec`, `FokosRangeInput`, `RouteKey`), the status types that `walk` yields, the sort-key interval helpers, and the errors of section 4.2.1. |
+| `fokosdb/sharding/server` | `FokosShardingRuntime`, `FokosScheduler`, `FokosShardingStore`, `RepartitionSource`, `RepartitionTarget`, `RouteCollector`, `HashTopology`, `PartialRangeTopology`, `BloomFilter`, `collectBatch`, the host option and hook types, and every other export of `fokosdb/sharding` now. It also re-exports the client entry, so a host imports one entry. |
+
+- `fokosdb/sharding` goes. The package is not released, so no compatibility period applies.
+- `fokosdb/client` re-exports from `fokosdb/sharding/client`, and never from the server entry.
+- The `check-client-bundle` plugin gets one more rule. The sharding client entry must never reach `runtime.ts`,
+  `repartition-flow.ts`, `sharding-store.ts`, `scheduler.ts`, or `batch-scan.ts`. The rule of the current sharding
+  entry, that it never reaches FokosDB modules, applies to both sharding entries.
+- The sharding client entry gets a size budget, as the client entry of FokosDB has.
+- A type-only import of a server type into a client module stays allowed, as now.
+
+The code of `src/sharding/` does not move. Only the entry files and the build checks change. The exact export
+list of each entry comes from the import graph: a module goes into the client entry when the client, `FokosRouter`,
+or the public types need it.
+
+#### 4.2.12 Performance
 
 - The client sends the same RPCs as now, with the same retries.
 - `resolve` and `resolveAll` run in memory, with no I/O.
@@ -584,7 +668,7 @@ Only a hint sends a request there.
 - M3 adds one RPC to a request that reaches a target before its cutover. It removes the retries that such a write
   pays now, which last until the cutover.
 
-#### 4.2.12 Deployment and rollback
+#### 4.2.13 Deployment and rollback
 
 - M1 changes no RPC and no stored state. A rollback is a code revert.
 - M1 adds `role` to `FokosStatusPage`. An older caller ignores the field.
@@ -596,8 +680,9 @@ Only a hint sends a request there.
 - M2 does not change the coordinator tables. A transaction in flight keeps its stored root contexts.
 - M3 changes what `fokosExecuteLocal` accepts. The target and the source are instances of one class, so they run
   the same version after a deploy. A rollback returns the target to `partition_migrating` for a write.
+- M4 changes the package entries only. A rollback is a code revert.
 
-#### 4.2.13 Testing
+#### 4.2.14 Testing
 
 - **M1 equivalence.** The `FokosDB` suites and `examples/http-api/test/demo2.test.ts` pass with no change to their
   expectations.
@@ -626,7 +711,11 @@ Only a hint sends a request there.
   - A source whose Bloom filter says that the key is promoted runs the request locally. It does not forward the
     request back to the target.
 - **resolveAll.** Keys under two roots give two groups, and the positions map the results back to the input.
-- **The bundle.** `pnpm build` passes the client bundle check and the size budget.
+- **The errors.** A test imports `FokosError` and `SHARDING_UNAVAILABLE_CODES` from `fokosdb/sharding` (from M4,
+  `fokosdb/sharding/client`), and a policy that uses `FokosError.isCode` retries a `partition_migrating` error that crossed an RPC hop. The current
+  FokosDB error tests pass with no change to their expectations.
+- **The bundle.** `pnpm build` passes the client bundle check and the size budget. After M4, the build fails when
+  the sharding client entry reaches a server module.
 
 ### 4.3 Future extensions
 
@@ -670,6 +759,19 @@ rules:
   partitions of the old table. A send to one of them starts the object, and its constructor writes the schema.
   The object has no identity, so no `walk` and no `destroy` reaches it. Its storage stays until a later split
   creates the same name. Section 4.3.6 removes this cost.
+
+**An optional entry node in the routing, for traces.** With the cache, the entry can be a deeper partition, and
+the caller cannot know which one the client selected. A router does not list itself in `servedBy`, so the routing
+does not show the entry when the entry forwarded the whole request (problem 5). The cache work can add this:
+
+- `FokosCallOptions.includeEntry?: boolean`. Default false. Only a caller that shows a trace or writes a debug log
+  sets it.
+- The client marks the first RPC of each attempt. The runtime does not copy the mark when it forwards.
+- An entry that receives the mark adds its own node to `servedBy` with the role `entry`. `entry` has the lowest
+  rank of the roles. So an entry that also served a scope keeps its `executed`, `merged`, or `read_through` node.
+- `FokosPublicRouting` keeps the `entry` node. The `FokosDB` `meta` ignores it.
+
+Until then, a caller that needs the entry calls `resolve(key)`, which gives the same root that the client sends to.
 
 #### 4.3.2 The coordinator reaches the participant leaves
 
