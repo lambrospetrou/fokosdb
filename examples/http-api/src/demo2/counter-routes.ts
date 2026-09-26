@@ -1,18 +1,30 @@
 import { Hono } from "hono";
-import { FokosRouter } from "fokosdb/client";
-import { KeyCodec } from "fokosdb/sharding";
-import type { CounterPolicy, CounterStats } from "./counter-host.js";
-import { collectTree, jsonBody, resetTree, retryWhileMigrating, topologyOf, traceOf, type ActionTrace, type TreeNode } from "./shared.js";
+import { FokosShardingClient, KeyCodec, type RouteKey } from "fokosdb/sharding";
+import type { CounterOps, CounterPolicy, CounterStats } from "./counter-host.js";
+import { collectTree, jsonBody, retryWhileMigrating, topologyOf, traceOf, type ActionTrace, type TreeNode } from "./shared.js";
 
 /** Demo 1 routes: counter writes, the kill of a splitting partition, and the reconciliation of the writes. */
 
 const MAX_REQUESTS = 5;
-const router = new FokosRouter<CounterPolicy>(
-	{ shardGroup: "counter_demo", rootTreesN: 1, hashSplitN: 4 },
-	{ rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } },
-	{ maxRequests: MAX_REQUESTS },
-);
-const root = router.allRoots()[0];
+
+function client(env: Env) {
+	return new FokosShardingClient<CounterPolicy, CounterOps>({
+		topology: { shardGroup: "counter_demo", rootTreesN: 1, hashSplitN: 4 },
+		rangeConfig: { rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } },
+		policy: { maxRequests: MAX_REQUESTS },
+		stub: (_ctx, doName) => stub(env, doName),
+	});
+}
+
+/** A counter key has no sort key. */
+function counterKey(key: string): RouteKey {
+	return { hashKey: KeyCodec.encode(key), sortKey: KeyCodec.encodeOptional(undefined) };
+}
+
+/** The table has one root, so every key resolves to it. */
+function rootOf(env: Env) {
+	return client(env).resolve(counterKey("root"));
+}
 
 /**
  * A write goes to a random key of 32 keys, so the writes spread over the partitions. The hash of a
@@ -22,11 +34,11 @@ const KEY_COUNT = 32;
 const randomKey = () => `counter-${Math.floor(Math.random() * KEY_COUNT)}`;
 
 function stub(env: Env, doName: string) {
-	return env.COUNTER_PARTITION_DO.get(env.COUNTER_PARTITION_DO.idFromName(doName));
+	return env.COUNTER_PARTITION_DO.getByName(doName);
 }
 
 function collectCounterTree(env: Env): Promise<TreeNode<CounterStats>[]> {
-	return collectTree(root, (doName) => stub(env, doName).getCounterStats());
+	return collectTree(client(env), rootOf(env), (doName) => stub(env, doName).getCounterStats());
 }
 
 /**
@@ -35,7 +47,7 @@ function collectCounterTree(env: Env): Promise<TreeNode<CounterStats>[]> {
  * its parent in the list, so the last value for a key is the current value.
  */
 async function reconcile(env: Env, nodes: TreeNode<CounterStats>[]) {
-	const acknowledgedWrites = await stub(env, root.doName).getAcknowledged();
+	const acknowledgedWrites = await stub(env, rootOf(env).doName).getAcknowledged();
 	const values = new Map<string, number>();
 	for (const node of nodes) for (const r of node.stats.rows) values.set(r.key, r.val);
 	const presentWrites = [...values.values()].reduce((a, b) => a + b, 0);
@@ -43,13 +55,16 @@ async function reconcile(env: Env, nodes: TreeNode<CounterStats>[]) {
 }
 
 async function increment(env: Env, key: string, amount: number) {
-	const hashKey = KeyCodec.encode(key);
-	const ctx = router.rootContext(hashKey);
-	const { value, routing } = await retryWhileMigrating(async () =>
-		router.unwrap<{ key: string; val: number }>(await stub(env, ctx.doName).increment(ctx, { hashKey, amount })),
+	const routeKey = counterKey(key);
+	const counters = client(env);
+	const { value, routing } = await counters.point(
+		"increment",
+		routeKey,
+		{ hashKey: routeKey.hashKey, amount },
+		{ retry: retryWhileMigrating() },
 	);
-	await stub(env, root.doName).recordAcknowledged(amount);
-	return { value, trace: traceOf(ctx, routing) };
+	await stub(env, rootOf(env).doName).recordAcknowledged(amount);
+	return { value, trace: traceOf(counters.resolve(routeKey), routing) };
 }
 
 export const counterRoutes = new Hono<{ Bindings: Env }>();
@@ -94,6 +109,6 @@ counterRoutes.post("/kill", async (c) => {
 });
 
 counterRoutes.post("/reset", async (c) => {
-	await resetTree(router, (doName) => stub(c.env, doName));
+	await client(c.env).destroy();
 	return c.json({ success: true });
 });

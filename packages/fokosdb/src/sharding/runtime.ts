@@ -9,7 +9,7 @@
  * forwarding decision, and the Durable Object alarm. The host keeps its storage, its RPC surface, and
  * its data semantics.
  */
-import { FokosError, FokosInternalError, FokosRoutingError, FokosUnavailableError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { FokosError, FokosInternalError, FokosRoutingError, FokosUnavailableError } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
 import { AddResult } from "./bloom-filter.js";
@@ -236,7 +236,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				// the import on before it is refused.
 				this.#scheduler.wake();
 				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
-				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "partition split in progress, please retry later",
 					attributes: { operation: op },
 				});
@@ -276,7 +276,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");
 		if (descriptor.whileMigrating === "throw") {
-			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "partition split in progress, please retry later",
 				attributes: { operation: op },
 			});
@@ -300,12 +300,30 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// source reached through a promotion: the target owns the promoted key, so its depth is the one a
 		// router above must learn, not the shallower depth of the source that read on its behalf.
 		collector.add(this.#selfNode("read_through"));
-		const result = (await this.#peer(record.source).fokosExecuteLocal({
-			op,
-			repartitionId: record.repartitionId,
-			caller: this.identity().ref,
-			request: req,
-		})) as FokosEnvelope<unknown>;
+		collector.countForward();
+		let result: FokosEnvelope<unknown>;
+		try {
+			result = await this.#peer(record.source).fokosExecuteLocal({
+				op,
+				repartitionId: record.repartitionId,
+				caller: this.identity().ref,
+				request: req,
+			});
+		} catch (e) {
+			// As in `#forwardTo`: the error carries the routing of the source and of this hop, and the
+			// partition that raised the error stays at the head of the list.
+			const routed = routedError(e);
+			if (routed) {
+				const stamp = this.#rangeDepthStamp();
+				const raiser = routed.routing.servedBy[0];
+				collector.mergeForwarded(routed.routing, stamp);
+				if (raiser) {
+					collector.addRaiser(stamp ? stamp(raiser) : raiser);
+				}
+				routed.routing = collector.build();
+			}
+			throw e;
+		}
 		this.#learn(result.routing.servedBy, this.#scopeKeys(descriptor, req));
 		collector.mergeForwarded(result.routing, this.#rangeDepthStamp());
 		return envelope(result.value, collector.build());
@@ -893,7 +911,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const identity = this.identity();
 		const owner = identity.ref;
 		if (this.#target.isImporting()) {
-			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "the owner of the key is still importing, please retry later",
 				attributes: { operation: "fokosRequestPromotion" },
 			});
@@ -952,10 +970,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			const destroying = this.#store.isDestroying();
 			if (!this.#identity) {
-				return { initialized: false, destroying, ref: null, importState: null, entries: [], nextCursor: null };
+				return { initialized: false, destroying, ref: null, role: null, importState: null, entries: [], nextCursor: null };
 			}
 			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, STATUS_PAGE_ENTRIES, STATUS_PAGE_BYTES);
-			return { initialized: true, destroying, ref: this.#identity.ref, importState: this.#target.importState(), entries, nextCursor };
+			return {
+				initialized: true,
+				destroying,
+				ref: this.#identity.ref,
+				role: this.#source.routerRole() ? "router" : "owner",
+				importState: this.#target.importState(),
+				entries,
+				nextCursor,
+			};
 		});
 	}
 
@@ -1381,6 +1407,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		invariant(descriptor && descriptor.shape !== "local", () => `fokos/runtime: ${op} cannot be forwarded`);
 		const targetCtx: FokosRouteContext<TPolicy> = { ...this.routeContext(), partitionId: target.partitionId, doName: target.doName };
 		const stub = this.#stub(targetCtx, target.doName);
+		collector.countForward();
 		const call = descriptor.forward
 			? descriptor.forward(stub, targetCtx, req)
 			: ((stub as unknown as Record<string, (ctx: unknown, req: unknown) => Promise<FokosEnvelope<unknown>>>)[op](
@@ -1422,6 +1449,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * A range partition has no hash depth of its own. The hash partition that enters the range tree
 	 * writes its own depth on every range node it merges, so a hash router above learns where the
 	 * promoted key left the hash tree. A range partition changes nothing.
+	 *
+	 * TODO: Rename this to be clearer that it's about adding the HASH depth.
 	 */
 	#rangeDepthStamp(): ((node: FokosRouteNode) => FokosRouteNode) | undefined {
 		const identity = this.identity();
@@ -1703,7 +1732,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				name === "fokosDestroy" ||
 				(descriptor?.shape === "local" && descriptor.allowedWhileDestroying === true);
 			if (this.#store.isDestroying() && !allowedWhileDestroying) {
-				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "partition destroy in progress, please retry later",
 					attributes: { operation: name },
 				});

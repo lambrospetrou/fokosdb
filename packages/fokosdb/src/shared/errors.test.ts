@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	CONFLICT_CODES,
+	CORE_INTERNAL_CODES,
 	FOKOS_CODE_TABLES,
 	FOKOS_ERROR_CATEGORIES,
 	FokosConflictError,
@@ -8,7 +9,6 @@ import {
 	FokosInternalError,
 	FokosUnavailableError,
 	FokosValidationError,
-	INTERNAL_CODES,
 	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
 	defineCodes,
@@ -18,7 +18,7 @@ import {
 	type FokosErrorOptions,
 } from "./errors.js";
 import { FOKOS_LIBRARY_CODE_TABLES, isFokosAnyError, type FokosAnyError } from "./errors-operations.js";
-import { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES } from "../sharding/errors.js";
+import { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 
 /** Every code of the library, the sharding and the operation tables included, so the uniqueness checks cover them all. */
 const ALL_DEFS: FokosCodeDef[] = FOKOS_LIBRARY_CODE_TABLES.flatMap((table) => Object.values(table));
@@ -126,7 +126,7 @@ describe("the category classes", () => {
 		const code: "hash_key_empty" = e.code;
 		expect(code).toBe("hash_key_empty");
 		// @ts-expect-error foreign_error is a code of the internal category
-		expect(new FokosValidationError(INTERNAL_CODES.foreign_error, { message: "x" })._tag).toBe("FokosInternalError");
+		expect(new FokosValidationError(CORE_INTERNAL_CODES.foreign_error, { message: "x" })._tag).toBe("FokosInternalError");
 	});
 
 	it("start the message with the code, then the fixed phrase", () => {
@@ -141,7 +141,7 @@ describe("the category classes", () => {
 	});
 
 	it("keep an error_id that the call site passes", () => {
-		expect(errorOf(INTERNAL_CODES.foreign_error, { error_id: "e_jvufz5_abc" }).error_id).toBe("e_jvufz5_abc");
+		expect(errorOf(CORE_INTERNAL_CODES.foreign_error, { error_id: "e_jvufz5_abc" }).error_id).toBe("e_jvufz5_abc");
 	});
 
 	it("take the origin and the hint from the code definition unless the call site passes others", () => {
@@ -149,7 +149,7 @@ describe("the category classes", () => {
 			const e = errorOf(def);
 			expect([e.origin, e.httpStatusHint], def.code).toEqual([def.origin, def.httpStatusHint]);
 		}
-		const e = errorOf(INTERNAL_CODES.foreign_error, { origin: "service", httpStatusHint: 503 });
+		const e = errorOf(CORE_INTERNAL_CODES.foreign_error, { origin: "service", httpStatusHint: 503 });
 		expect([e.origin, e.httpStatusHint]).toEqual(["service", 503]);
 	});
 });
@@ -185,9 +185,9 @@ describe("FokosError.is", () => {
 
 describe("FokosError.isCode", () => {
 	it("holds for the code of a definition, and narrows the code to its literal", () => {
-		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
-		expect(FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)).toBe(true);
-		if (!FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+		const e: unknown = errorOf(SHARDING_UNAVAILABLE_CODES.partition_migrating);
+		expect(FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)).toBe(true);
+		if (!FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 			throw new Error("unreachable");
 		}
 		const code: "partition_migrating" = e.code;
@@ -196,7 +196,7 @@ describe("FokosError.isCode", () => {
 	});
 
 	it("holds for a plain string, which compares the code only, and narrows the code as well", () => {
-		const e: unknown = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		const e: unknown = errorOf(SHARDING_UNAVAILABLE_CODES.partition_migrating);
 		expect(FokosError.isCode(e, "partition_migrating")).toBe(true);
 		if (!FokosError.isCode(e, "partition_migrating")) {
 			throw new Error("unreachable");
@@ -206,13 +206,13 @@ describe("FokosError.isCode", () => {
 	});
 
 	it("does not hold for another code, a code of the same name in another category, or a value that is not a FokosError", () => {
-		const e = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		const e = errorOf(SHARDING_UNAVAILABLE_CODES.partition_migrating);
 		const [sameNameOtherCategory] = Object.values(defineCodes("FokosRoutingError", "internal", 500, { partition_migrating: "zzzzzz" }));
 		expect(FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)).toBe(false);
 		expect(FokosError.isCode(e, "partition_over_size")).toBe(false);
 		expect(FokosError.isCode(e, sameNameOtherCategory)).toBe(false);
 		for (const value of [new Error("partition_migrating"), { code: "partition_migrating" }, undefined, null]) {
-			expect(FokosError.isCode(value, UNAVAILABLE_CODES.partition_migrating)).toBe(false);
+			expect(FokosError.isCode(value, SHARDING_UNAVAILABLE_CODES.partition_migrating)).toBe(false);
 			expect(FokosError.isCode(value, "partition_migrating")).toBe(false);
 		}
 	});
@@ -276,7 +276,7 @@ describe("an extension in another package", () => {
 	it("is claimed by the guard of its own union, and not by the guard of this library", () => {
 		expect([isFokosAnyError(migrating), isFokosAnyError(moved)]).toEqual([false, false]);
 		expect([isShardAnyError(migrating), isShardAnyError(moved)]).toEqual([true, true]);
-		expect(isShardAnyError(errorOf(UNAVAILABLE_CODES.partition_migrating))).toBe(true);
+		expect(isShardAnyError(errorOf(UNAVAILABLE_CODES.partition_over_size))).toBe(true);
 	});
 
 	it("narrows a switch over its union to the codes of both packages", () => {
@@ -318,7 +318,7 @@ describe("an extension in another package", () => {
 
 describe("FokosError.wrap", () => {
 	it("returns a FokosError unchanged", () => {
-		const e = errorOf(UNAVAILABLE_CODES.partition_migrating);
+		const e = errorOf(SHARDING_UNAVAILABLE_CODES.partition_migrating);
 		expect(FokosError.wrap(e)).toBe(e);
 	});
 
@@ -403,7 +403,7 @@ describe("isRuntimeRetryableError", () => {
 	});
 
 	it("does not hold for an error without the marker, or for a value that is not an object", () => {
-		for (const e of [new Error("x"), errorOf(UNAVAILABLE_CODES.partition_migrating), undefined, null, "retryable"]) {
+		for (const e of [new Error("x"), errorOf(SHARDING_UNAVAILABLE_CODES.partition_migrating), undefined, null, "retryable"]) {
 			expect(isRuntimeRetryableError(e)).toBe(false);
 		}
 	});

@@ -1,5 +1,13 @@
 import type { Context } from "hono";
-import { isDestroyAbortError, type FokosPartitionRef, type FokosPublicRouting, type FokosRouter, type FokosWalkStub } from "fokosdb/sharding";
+import {
+	FokosError,
+	SHARDING_UNAVAILABLE_CODES,
+	type FokosOperationSpec,
+	type FokosPartitionRef,
+	type FokosPublicRouting,
+	type FokosRetryPolicy,
+	type FokosShardingClient,
+} from "fokosdb/sharding";
 
 /** The types and helpers that the three demos share. The UI reads the types as JSON. */
 
@@ -37,20 +45,26 @@ export async function jsonBody<T>(c: Context): Promise<Partial<T>> {
 	return (await c.req.json().catch(() => ({}))) as Partial<T>;
 }
 
-export type TreeNode<S> = { ref: FokosPartitionRef; stats: S };
+export type TreeNode<S> = { ref: FokosPartitionRef; parent: FokosPartitionRef | null; stats: S };
 
-/** Reads every partition of one tree. A parent comes before its children in the list. */
-export async function collectTree<S extends { children: FokosPartitionRef[] }>(
+/**
+ * Reads every partition of the tree with `walk`. A parent comes before its children in the list. A
+ * root without an identity, before the first write or after a reset, is not in the walk, so the list
+ * then holds `root` alone and the UI draws an empty root.
+ */
+export async function collectTree<S, TPolicy, Ops extends FokosOperationSpec>(
+	client: FokosShardingClient<TPolicy, Ops>,
 	root: FokosPartitionRef,
 	read: (doName: string) => Promise<S>,
 ): Promise<TreeNode<S>[]> {
 	const nodes: TreeNode<S>[] = [];
-	const walk = async (ref: FokosPartitionRef): Promise<void> => {
-		const stats = await read(ref.doName);
-		nodes.push({ ref, stats });
-		for (const child of stats.children) await walk(child);
-	};
-	await walk(root);
+	for await (const node of client.walk()) {
+		const ref = { partitionId: node.ctx.partitionId, doName: node.ctx.doName };
+		nodes.push({ ref, parent: node.parent?.ref ?? null, stats: await read(ref.doName) });
+	}
+	if (nodes.length === 0) {
+		nodes.push({ ref: root, parent: null, stats: await read(root.doName) });
+	}
 	return nodes;
 }
 
@@ -67,7 +81,7 @@ export function summaryOf(roots: TopologyItem[]): TileTopology["summary"] {
 }
 
 /** Makes the topology that the UI draws from the list of `collectTree`. The first node is the root. */
-export function topologyOf<S extends { children: FokosPartitionRef[] }>(
+export function topologyOf<S>(
 	tile: string,
 	nodes: TreeNode<S>[],
 	item: (node: TreeNode<S>) => Omit<TopologyItem, "id" | "doName" | "children">,
@@ -76,36 +90,15 @@ export function topologyOf<S extends { children: FokosPartitionRef[] }>(
 		id: node.ref.partitionId,
 		doName: node.ref.doName,
 		...item(node),
-		children: nodes.filter((n) => node.stats.children.some((ch) => ch.doName === n.ref.doName)).map(build),
+		children: nodes.filter((n) => n.parent?.doName === node.ref.doName).map(build),
 	});
 	const roots = [build(nodes[0])];
 	return { tile, roots, summary: summaryOf(roots) };
 }
 
-/**
- * Destroys every partition of the tree with `fokosDestroy`, in the same order as `FokosDB.destroy()`.
- * The walk fences each partition, reads its children from its storage, and destroys the children
- * before the parent. Thus a reset that stops halfway can run again, because each parent that remains
- * still knows its children. Every error other than the abort error stops the reset.
- */
-export async function resetTree<TPolicy, S extends FokosWalkStub & { fokosDestroy(): Promise<void> }>(
-	router: FokosRouter<TPolicy>,
-	stub: (doName: string) => S,
-): Promise<void> {
-	await router.walk(
-		(_ctx, doName) => stub(doName),
-		async (_ctx, s) => {
-			try {
-				await s.fokosDestroy();
-			} catch (e) {
-				if (!isDestroyAbortError(e)) throw e;
-			}
-		},
-	);
-}
-
 /** How long a write waits for an import. It must be longer than the 5-second fallback alarm of the runtime. */
 const RETRY_FOR_MS = 15_000;
+/** The longest wait between two sends. */
 const RETRY_EVERY_MS = 100;
 
 /**
@@ -113,16 +106,13 @@ const RETRY_EVERY_MS = 100;
  * imports refuses writes, and the runtime moves the import on by itself. After a kill, the fallback
  * alarm of the runtime starts the partition again within 5 seconds.
  */
-export async function retryWhileMigrating<T>(send: () => Promise<T>): Promise<T> {
+export function retryWhileMigrating(): FokosRetryPolicy {
 	const deadline = Date.now() + RETRY_FOR_MS;
-	for (;;) {
-		try {
-			return await send();
-		} catch (err) {
-			if (Date.now() > deadline || !String(err).includes("partition_migrating")) throw err;
-			await scheduler.wait(RETRY_EVERY_MS);
-		}
-	}
+	return {
+		shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
+		baseDelayMs: 50,
+		maxDelayMs: RETRY_EVERY_MS,
+	};
 }
 
 /** The hops of one request. A router does not list itself in `servedBy`, so this adds the entry partition. */

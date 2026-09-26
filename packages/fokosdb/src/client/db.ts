@@ -1,5 +1,4 @@
 import { env } from "cloudflare:workers";
-import { tryWhile } from "durable-utils/retries";
 import {
 	DataKind,
 	DecodedItemData,
@@ -24,10 +23,12 @@ import {
 	QuerySelect,
 	SortKey,
 } from "../shared/types.js";
-import { isDestroyAbortError } from "../shared/cf-utils.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
-import { FokosRouter } from "../sharding/router.js";
+import type { FokosRouter } from "../sharding/router.js";
+import { FokosShardingClient, type FokosRetryPolicy } from "../sharding/client.js";
+import type { PartitionOps } from "../server/do-partition.js";
+import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
 import type {
 	ExecutionFailureCode,
 	RejectionReason,
@@ -43,9 +44,9 @@ import type {
 	ReadForTransactionItemResultEncoded,
 	RejectionReasonEncoded,
 	SingleShotResponse,
-	TCReadItem,
 	TCWriteOperation,
 	TransactWriteOperationResultEncoded,
+	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import {
 	encodeHashKey,
@@ -54,7 +55,6 @@ import {
 	validateItemDataSize,
 	validateItemKeys,
 	validateReturnValuesOnConditionCheckFailure,
-	singlePartitionTarget,
 	validateTransactGetItemCount,
 	validateTransactGetItemKeys,
 	validateTransactWriteOperations,
@@ -68,8 +68,8 @@ import {
 	FokosInternalError,
 	FokosUnavailableError,
 	FokosValidationError,
+	CORE_INTERNAL_CODES,
 	INTERNAL_CODES,
-	UNAVAILABLE_CODES,
 	VALIDATION_CODES,
 	isRuntimeRetryableError,
 } from "../shared/errors.js";
@@ -105,7 +105,7 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { RESERVED_SHARD_GROUP_PREFIX, type FokosDbPolicy, type FokosDbRouteContext } from "../shared/partition-context.js";
+import { RESERVED_SHARD_GROUP_PREFIX, type FokosDbPolicy } from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
@@ -115,6 +115,15 @@ const TX_COORDINATORS_PER_ROOT_TREE = 2;
  * finish inside it.
  */
 const TX_COORDINATOR_MIGRATING_RETRY_MS = 15_000;
+
+/** A read applies nothing, so each phase of a read transaction sends again after any error. */
+const READ_TRANSACTION_RETRY: FokosRetryPolicy = { shouldRetry: (_err, nextAttempt) => nextAttempt <= 5 };
+
+/** The snapshot read sends again only after a transient fault of the runtime. */
+const READ_SNAPSHOT_RETRY: FokosRetryPolicy = {
+	shouldRetry: (err, nextAttempt) => isRuntimeRetryableError(err) && nextAttempt <= 3,
+	maxDelayMs: 3_000,
+};
 
 // The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
@@ -244,6 +253,12 @@ async function withFokosErrors<T>(fn: () => Promise<T>): Promise<T> {
 	try {
 		return await fn();
 	} catch (e) {
+		// The cost of the call is not part of the public error. It goes before `wrap`, which copies the
+		// own properties of a foreign error into `attributes`.
+		if (typeof e === "object" && e !== null) {
+			delete (e as { clientRpcs?: unknown }).clientRpcs;
+			delete (e as { totalForwardCount?: unknown }).totalForwardCount;
+		}
 		const err = mapInternalErrorToPublic(FokosError.wrap(e));
 		// A partition attaches its routing to its error. The routing state stops here, as it does on a
 		// result: the public error carries the same `meta` a result would, and the internal hints go.
@@ -270,7 +285,7 @@ function mapInternalErrorToPublic(err: FokosError): FokosError {
 	if (err.code !== SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over.code) {
 		return err;
 	}
-	const mapped = new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+	const mapped = new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 		message: "partition split in progress, please retry later",
 		error_id: err.error_id,
 		cause: err.cause,
@@ -324,8 +339,10 @@ function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): Ope
 
 export class FokosDB {
 	#options: Required<FokosDBOptions>;
-	/** The router of the coordinator group of the table, `fokos.tc.<shardGroup>`. */
-	#coordinators: FokosRouter<FokosDbPolicy>;
+	/** The partitions of the table. */
+	#partitions: FokosShardingClient<FokosDbPolicy, PartitionOps>;
+	/** The coordinator group of the table, `fokos.tc.<shardGroup>`. */
+	#coordinators: FokosShardingClient<FokosDbPolicy, CoordinatorOps>;
 
 	constructor(options: FokosDBOptions) {
 		const { topology, rangeConfig, policy } = options.topology;
@@ -346,11 +363,22 @@ export class FokosDB {
 		// The coordinators take the topology of the table except its shard group and its number of roots:
 		// the same hash split fan-out, and the same jurisdiction. The range config is not used, because
 		// a coordinator has no range tree.
-		this.#coordinators = new FokosRouter(
-			{ ...topology, shardGroup: `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup}`, rootTreesN: coordinatorRootsN },
+		this.#partitions = new FokosShardingClient({
+			topology,
 			rangeConfig,
 			policy,
-		);
+			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
+		});
+		this.#coordinators = new FokosShardingClient({
+			topology: {
+				...topology,
+				shardGroup: `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup}`,
+				rootTreesN: coordinatorRootsN,
+			},
+			rangeConfig,
+			policy,
+			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
+		});
 	}
 
 	options() {
@@ -409,10 +437,10 @@ export class FokosDB {
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
-		const partitionContext = this.#options.topology.rootContext(hashKey);
-		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const { value: res, routing } = this.#options.topology.unwrap(
-			await stub.apiPutItem(partitionContext, {
+		const { value: res, routing } = await this.#partitions.point(
+			"apiPutItem",
+			{ hashKey, sortKey },
+			{
 				hashKey,
 				sortKey,
 				data: encoded.data,
@@ -420,7 +448,7 @@ export class FokosDB {
 				ttlAt: opts.ttlAt,
 				condition,
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
-			}),
+			},
 		);
 		if (res.outcome === "rejected") {
 			throw conditionCheckError(opts, res, routing);
@@ -435,10 +463,10 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey);
 		const projection =
 			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
-		const partitionContext = this.#options.topology.rootContext(hashKey);
-		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const { value: res, routing } = this.#options.topology.unwrap(
-			await stub.apiGetItem(partitionContext, { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) }),
+		const { value: res, routing } = await this.#partitions.point(
+			"apiGetItem",
+			{ hashKey, sortKey },
+			{ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) },
 		);
 		const meta = publicMeta(res.meta, routing);
 		// The DO returns no keys; supply the caller's own and preserve the found/not-found discriminant.
@@ -474,15 +502,10 @@ export class FokosDB {
 		const hashKey = encodeHashKey(opts.hashKey);
 		const sortKey = encodeSortKey(opts.sortKey);
 		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
-		const partitionContext = this.#options.topology.rootContext(hashKey);
-		const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-		const { value: res, routing } = this.#options.topology.unwrap(
-			await stub.apiDeleteItem(partitionContext, {
-				hashKey,
-				sortKey,
-				condition,
-				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
-			}),
+		const { value: res, routing } = await this.#partitions.point(
+			"apiDeleteItem",
+			{ hashKey, sortKey },
+			{ hashKey, sortKey, condition, returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure },
 		);
 		if (res.outcome === "rejected") {
 			throw conditionCheckError(opts, res, routing);
@@ -515,7 +538,7 @@ export class FokosDB {
 		const keys = validateTransactWriteOperations(prepared);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
-			const partitionContext = this.#options.topology.rootContext(hashKey);
+			const partitionContext = this.#partitions.resolve({ hashKey, sortKey });
 			return { ...item, opIndex: i, hashKey, sortKey, partitionContext };
 		});
 
@@ -535,7 +558,6 @@ export class FokosDB {
 
 		// The token is the route key of the coordinator, so a request always carries one.
 		const idempotencyToken = opts.clientRequestToken ?? crypto.randomUUID().replaceAll("-", "");
-		const ctx = this.#coordinators.rootContext(encodeHashKey(idempotencyToken));
 
 		// A coordinator answers `partition_migrating` while it splits: its root forwards the request to
 		// the child that owns the token, and that child refuses it until its import is complete. The
@@ -543,11 +565,11 @@ export class FokosDB {
 		const deadline = Date.now() + TX_COORDINATOR_MIGRATING_RETRY_MS;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
-		const encoded = await tryWhile(
-			async () =>
-				(await txCoordinatorStubByName(env, ctx, ctx.doName).initiateWrite(ctx, { clientRequestToken: idempotencyToken, items })).value,
-			(err) => FokosError.isCode(err, UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
-			{ baseDelayMs: 100, maxDelayMs: 2_000 },
+		const { value: encoded } = await this.#coordinators.point(
+			"initiateWrite",
+			{ hashKey: encodeHashKey(idempotencyToken), sortKey: encodeSortKey(undefined) },
+			{ clientRequestToken: idempotencyToken, items },
+			{ retry: { shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline } },
 		);
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
 		// method returns, and a cancelled one raises instead.
@@ -571,25 +593,26 @@ export class FokosDB {
 			return null;
 		}
 
-		const target = singlePartitionTarget(items);
-		if (!target) {
+		// A hint only: a split or a promotion below the entry can still spread the items over several
+		// partitions. The partition then answers `not_applicable`.
+		const groups = this.#partitions.resolveAll(items);
+		if (groups.length !== 1) {
 			return null;
 		}
 
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-		const stub = partitionStubByName(env, target, target.doName);
 		const request = { items: items.map(({ partitionContext: _partitionContext, ...item }) => item) };
 
 		let response: SingleShotResponse;
 		try {
 			// No retry, matching the coordinator path, which does not retry a write either.
-			response = (await stub.txExecuteSingleShot(target, request)).value;
+			response = (await this.#partitions.send("txExecuteSingleShot", groups[0].ctx, request, items)).value;
 		} catch (err) {
 			// The partition does not throw after its apply commits, so an error that partition code raised
 			// means nothing applied: the transaction cancelled, and that one partition owns every operation,
 			// as the coordinator reports the same refusal of a prepare. A foreign error can be a reply lost
 			// after the apply, so its outcome is unknown.
-			if (FokosError.is(err) && !FokosError.isCode(err, INTERNAL_CODES.foreign_error)) {
+			if (FokosError.is(err) && !FokosError.isCode(err, CORE_INTERNAL_CODES.foreign_error)) {
 				throw transactionCancelledError({
 					transactionId,
 					idempotencyToken: transactionId,
@@ -618,14 +641,13 @@ export class FokosDB {
 		validateTransactGetItemCount(opts.items.length);
 		// Each item is built explicitly: the raw projection AST never crosses the RPC boundary, only the
 		// compiled plan does, and only when the caller asked for one.
-		const items: TCReadItem[] = opts.items.map((item) => {
+		const items: TransactionReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
 			const hashKey = encodeHashKey(item.hashKey);
 			const sortKey = encodeSortKey(item.sortKey);
 			const projection =
 				item.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(item.projection!));
-			const partitionContext = this.#options.topology.rootContext(hashKey);
-			return { hashKey, sortKey, partitionContext, ...(projection === undefined ? {} : { projection }) };
+			return { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) };
 		});
 		validateTransactGetItemKeys(items);
 
@@ -671,24 +693,20 @@ export class FokosDB {
 	 * when the fast path does not apply, so the caller runs the two-phase path: either the client hint
 	 * says the keys span partitions, or the partition itself answered `not_applicable` because they do.
 	 */
-	async #readSnapshotFastPath(items: TCReadItem[]): Promise<InitiateReadResponseEncoded | null> {
+	async #readSnapshotFastPath(items: TransactionReadItem[]): Promise<InitiateReadResponseEncoded | null> {
 		if (!this.#options.singlePartitionFastPath) {
 			return null;
 		}
-		const target = singlePartitionTarget(items);
-		if (!target) {
+		// A hint only, as on the write fast path.
+		const groups = this.#partitions.resolveAll(items);
+		if (groups.length !== 1) {
 			return null;
 		}
 
-		const stub = partitionStubByName(env, target, target.doName);
-		const request = {
-			items: items.map(({ hashKey, sortKey, projection }) => ({ hashKey, sortKey, ...(projection === undefined ? {} : { projection }) })),
-		};
 		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
-		const response = await tryWhile(
-			async () => (await stub.txReadSnapshot(target, request)).value,
-			(err: unknown, nextAttempt: number) => isRuntimeRetryableError(err) && nextAttempt <= 3,
-		);
+		const { value: response } = await this.#partitions.send("txReadSnapshot", groups[0].ctx, { items }, items, {
+			retry: READ_SNAPSHOT_RETRY,
+		});
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
 		if (response.outcome === "not_applicable") {
 			return null;
@@ -699,40 +717,22 @@ export class FokosDB {
 		return response;
 	}
 
-	async #readTransaction(requestedItems: TCReadItem[]): Promise<InitiateReadResponseEncoded> {
+	async #readTransaction(requestedItems: TransactionReadItem[]): Promise<InitiateReadResponseEncoded> {
 		const transactionId = crypto.randomUUID().replaceAll("-", "");
-
-		// Group items by partition, keeping the context alongside.
-		const partitionMap = new Map<string, { pCtx: FokosDbRouteContext; items: TCReadItem[] }>();
-		for (const item of requestedItems) {
-			const doName = item.partitionContext.doName;
-			let entry = partitionMap.get(doName);
-			if (!entry) {
-				entry = { pCtx: item.partitionContext, items: [] };
-				partitionMap.set(doName, entry);
-			}
-			entry.items.push(item);
-		}
-		const partitionEntries = [...partitionMap.values()];
+		// Both phases send the same groups.
+		const groups = this.#partitions.resolveAll(requestedItems).map(({ ctx, indexes }) => {
+			const items = indexes.map((i) => requestedItems[i]);
+			return { ctx, items };
+		});
+		const readPhase = () =>
+			Promise.allSettled(
+				groups.map(({ ctx, items }) =>
+					this.#partitions.send("txReadForTransaction", ctx, { transactionId, items }, items, { retry: READ_TRANSACTION_RETRY }),
+				),
+			);
 
 		// Phase 1
-		const phase1Settled = await Promise.allSettled(
-			partitionEntries.map(({ pCtx, items }) =>
-				tryWhile(
-					async () =>
-						await partitionStubByName(env, pCtx, pCtx.doName).txReadForTransaction(pCtx, {
-							transactionId,
-							items: items.map((i) => ({
-								hashKey: i.hashKey,
-								sortKey: i.sortKey,
-								...(i.projection === undefined ? {} : { projection: i.projection }),
-							})),
-						}),
-					(_err, nextAttempt) => nextAttempt <= 5,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				),
-			),
-		);
+		const phase1Settled = await readPhase();
 
 		const phase1Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase1Settled) {
@@ -748,23 +748,7 @@ export class FokosDB {
 		}
 
 		// Phase 2 — verify no concurrent mutations
-		const phase2Settled = await Promise.allSettled(
-			partitionEntries.map(({ pCtx, items }) =>
-				tryWhile(
-					async () =>
-						await partitionStubByName(env, pCtx, pCtx.doName).txReadForTransaction(pCtx, {
-							transactionId,
-							items: items.map((i) => ({
-								hashKey: i.hashKey,
-								sortKey: i.sortKey,
-								...(i.projection === undefined ? {} : { projection: i.projection }),
-							})),
-						}),
-					(_err, nextAttempt) => nextAttempt <= 5,
-					{ baseDelayMs: 100, maxDelayMs: 2_000 },
-				),
-			),
-		);
+		const phase2Settled = await readPhase();
 
 		const phase2Flat: ReadForTransactionItemResultEncoded[] = [];
 		for (const r of phase2Settled) {
@@ -937,11 +921,10 @@ export class FokosDB {
 					? { hk: startInner.hashKey, sk: startInner.sortKey, inclusive: startInner.inclusive }
 					: null;
 
-			const partitionContext = this.#options.topology.rootContext(query.hashKey);
-			const stub = partitionStubByName(env, partitionContext, partitionContext.doName);
-
-			const { value: rpcResult, routing } = this.#options.topology.unwrap(
-				await stub.apiQueryItems(partitionContext, {
+			const { value: rpcResult, routing } = await this.#partitions.range(
+				"apiQueryItems",
+				{ hashKey: query.hashKey, interval: query.interval, descending: query.direction === "desc" },
+				{
 					hashKey: query.hashKey,
 					interval: query.interval,
 					direction: query.direction,
@@ -953,7 +936,7 @@ export class FokosDB {
 					cursor: rpcCursor,
 					select,
 					plan,
-				}),
+				},
 			);
 
 			count += rpcResult.count;
@@ -1040,35 +1023,11 @@ export class FokosDB {
 		// already passed. Every root and every child is wiped, not only the ones that hold rows: the
 		// coordinator of a given idempotency token is not knowable from here.
 		//
-		// Each router owns its traversal: the fence, the target order and the dedup. FokosDB supplies the
-		// stub and the destroy call.
-		await this.#coordinators.walk(
-			(ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
-			async (ctx, stub) => {
-				try {
-					await stub.fokosDestroy();
-				} catch (e) {
-					if (!isDestroyAbortError(e)) {
-						throw e;
-					}
-				}
-				console.warn(`Destroyed transaction coordinator ${ctx.doName}`);
-			},
-		);
-
-		await this.#options.topology.walk(
-			(ctx, doName) => partitionStubByName(env, ctx, doName),
-			async (ctx, stub) => {
-				try {
-					await stub.fokosDestroy();
-				} catch (e) {
-					if (!isDestroyAbortError(e)) {
-						throw e;
-					}
-				}
-				console.warn(`Destroyed partition DO ${ctx.doName} (partitionId=${ctx.partitionId})`);
-			},
-		);
+		// The client owns the traversal: the fence, the target order and the dedup.
+		await this.#coordinators.destroy({ onDestroyed: (ref) => console.warn(`Destroyed transaction coordinator ${ref.doName}`) });
+		await this.#partitions.destroy({
+			onDestroyed: (ref) => console.warn(`Destroyed partition DO ${ref.doName} (partitionId=${ref.partitionId})`),
+		});
 
 		return { ok: true };
 	}

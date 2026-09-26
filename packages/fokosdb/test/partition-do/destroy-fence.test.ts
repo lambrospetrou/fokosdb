@@ -48,6 +48,7 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 			initialized: false,
 			destroying: false,
 			ref: null,
+			role: null,
 			importState: null,
 			entries: [],
 			nextCursor: null,

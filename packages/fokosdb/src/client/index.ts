@@ -96,6 +96,8 @@ export { PartitionContextCreator } from "../shared/partition-context.js";
 export type { FokosDbPolicy, FokosDbRouteContext, FokosDbTableConfig, SplitConditions } from "../shared/partition-context.js";
 
 export { FokosRouter } from "../sharding/router.js";
+export { FokosShardingClient } from "../sharding/client.js";
+export type { FokosRetryPolicy } from "../sharding/client.js";
 export type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 
 // ─── Errors ───────────────────────────────────────────────────────────────────

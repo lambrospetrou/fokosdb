@@ -9,7 +9,6 @@ import {
 	type FokosMigrationPage,
 	type FokosMigrationPullRequest,
 	type FokosOperations,
-	type FokosPartitionRef,
 	type FokosPrepareDestroyRequest,
 	type FokosRequestPromotionRequest,
 	type FokosRequestPromotionResult,
@@ -49,7 +48,6 @@ export type CounterStats = {
 	repartitionState: string | null;
 	requestCount: number;
 	rows: CounterRow[];
-	children: FokosPartitionRef[];
 };
 
 type CounterRow = { key: string; val: number };
@@ -142,7 +140,6 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 			repartitionState: lifecycle?.activeRepartition?.state ?? null,
 			requestCount: this.requestCount,
 			rows: this.ctx.storage.sql.exec<CounterRow>("SELECT key, val FROM counters").toArray(),
-			children: lifecycle ? this.fokos.children().map((c) => c.ref) : [],
 		};
 	}
 

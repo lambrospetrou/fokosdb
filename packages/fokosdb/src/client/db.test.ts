@@ -14,6 +14,8 @@ import {
 } from "../shared/query/page-budget.js";
 import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-context.js";
 import { FokosRouter } from "../sharding/router.js";
+import { FokosShardingClient } from "../sharding/client.js";
+import type { FokosOperationSpec } from "../sharding/runtime-types.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { ConditionExpression, ProjectionExpression } from "../shared/expression/types.js";
@@ -862,8 +864,11 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 		it("destroys the coordinator group of the table first, and then the partitions", async () => {
 			const db = makeDBFor(ns, { rootTreesN: 2 });
 			const walked: Array<{ shardGroup: string; rootTreesN: number }> = [];
-			const walk = vi.spyOn(FokosRouter.prototype, "walk").mockImplementation(async function (this: FokosRouter<unknown>) {
-				walked.push({ shardGroup: this.topology.shardGroup, rootTreesN: this.topology.rootTreesN });
+			const walk = vi.spyOn(FokosShardingClient.prototype, "destroy").mockImplementation(async function (
+				this: FokosShardingClient<unknown, FokosOperationSpec>,
+			) {
+				const { topology } = this.resolve({ hashKey: KeyCodec.encode("k"), sortKey: KeyCodec.encodeOptional(undefined) });
+				walked.push({ shardGroup: topology.shardGroup, rootTreesN: topology.rootTreesN });
 			});
 			try {
 				await expect(db.destroy()).resolves.toEqual({ ok: true });

@@ -199,6 +199,8 @@ export type FokosStatusPage = {
 	destroying: boolean;
 	/** The identity of this partition, or null before it has one. */
 	ref: FokosPartitionRef | null;
+	/** The role of this partition, as `FokosLifecycle.role` gives it, or null before it has an identity. */
+	role: "owner" | "router" | null;
 	importState: FokosImportState | null;
 	entries: FokosStatusEntry[];
 	nextCursor: FokosStatusCursor | null;

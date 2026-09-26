@@ -18,6 +18,7 @@ import type {
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
 import { FOKOS_PAGE_BYTES, FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { DATA_KINDS, type DataKind } from "../shared/types.js";
 import type { ExecutionFailureCode } from "../shared/transaction-api-types.js";
 import {
@@ -220,7 +221,7 @@ function tokenKey(token: string): RouteKey {
  * The operations of the coordinator. Both are keyed by the idempotency token, and both handlers
  * await partitions, so each durable transition tests ownership itself (see `transition`).
  */
-type CoordinatorOps = {
+export type CoordinatorOps = {
 	initiateWrite: { req: InitiateWriteRequest; res: InitiateWriteResponseEncoded };
 	recoverTransaction: { req: RecoverTransactionRequest; res: RecoverTransactionResult };
 };
@@ -524,7 +525,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private transition<T>(idempotencyToken: string, write: () => T): T {
 		return this.ctx.storage.transactionSync(() => {
 			if (!this.fokos.owns(tokenKey(idempotencyToken))) {
-				throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "the transaction coordinator split, retry with the same clientRequestToken",
 					attributes: { idempotencyToken },
 				});
@@ -1022,7 +1023,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			this.markPrepared(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
-				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+				if (FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 					throw e;
 				}
 				console.error({

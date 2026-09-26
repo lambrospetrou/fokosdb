@@ -8,7 +8,8 @@
  */
 import type { KeyBytes } from "./key-codec.js";
 import type { RangeAncestorInfo } from "./types.js";
-import { FokosValidationError, VALIDATION_CODES } from "../shared/errors.js";
+import { FokosValidationError } from "../shared/errors.js";
+import { SHARDING_VALIDATION_CODES } from "./errors.js";
 
 export type FokosTopology = {
 	shardGroup: string;
@@ -84,7 +85,7 @@ export function refOf(ctx: FokosPartitionRef): FokosPartitionRef {
 }
 
 function invalid(option: string, value: unknown, message: string): FokosValidationError {
-	return new FokosValidationError(VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
+	return new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 }
 
 /**

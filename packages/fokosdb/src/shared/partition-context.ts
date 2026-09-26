@@ -13,7 +13,8 @@ import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
 import { validateRangeConfig, validateTopology } from "../sharding/route-context.js";
-import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
+import { FokosValidationError } from "./errors.js";
+import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 
 export type SplitConditions = {
 	/** The size in megabytes that makes the partition split. */
@@ -89,7 +90,7 @@ export class PartitionContextCreator {
 		const rangeSplitConditions = opts.rangeSplitConditions ?? { maxSizeMb: 500 };
 		const rangeAncestors = opts.rangeAncestorsConfig ?? { fromRoot: 0, fromLeaf: 3 };
 		const invalid = (option: string, value: unknown, message: string) =>
-			new FokosValidationError(VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
+			new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 
 		// No default: `hashSplitN` is part of the topology and must never change, so the caller states it.
 		if (!opts.hashSplitN) {

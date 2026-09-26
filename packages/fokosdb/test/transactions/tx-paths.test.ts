@@ -151,6 +151,23 @@ describe("transactions - single-partition fast path", () => {
 		expect(await calls()).toMatchObject({ txReadSnapshot: 0, txReadForTransaction: 4 });
 	});
 
+	it("sends a phase of a multi-partition read again after a transport failure", async () => {
+		const db = sharedDb;
+		const keys = keysAcrossPartitions(db, 2, "span-retry");
+		for (const key of keys) {
+			await db.putItem({ ...key, data: `data-${key.hashKey}` });
+		}
+
+		const calls = await countCalls([db], keys);
+		await controlledPartition(db, keys[0]).testTxResponse("txReadForTransaction", { error: "Network connection lost.", times: 2 });
+
+		const result = await db.transactGetItems({ items: keys });
+
+		expect(result.items.map((i) => (i.found ? i.data : null))).toEqual(keys.map((k) => `data-${k.hashKey}`));
+		// Phase 1 sends three times to the first partition and once to the second, and phase 2 once to each.
+		expect(await calls()).toMatchObject({ txReadSnapshot: 0, txReadForTransaction: 6 });
+	});
+
 	it("runs the Worker two-phase path when the partition cannot execute the whole set", async () => {
 		const db = sharedDb;
 		const keys = keysInOnePartition(db, 2, "fast-fallback");

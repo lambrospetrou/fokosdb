@@ -76,12 +76,20 @@ export class RouteCollector {
 	}
 
 	/**
-	 * Merges the routing of one outbound RPC: its nodes, its forward count, plus one for the RPC
-	 * itself. `stamp` rewrites a node before the merge; a hash partition that enters a range tree uses
-	 * it to write its own hash depth on the range nodes.
+	 * Counts one outbound RPC that carries the request. The sender calls it before it awaits the RPC, so
+	 * an RPC that fails without routing still counts.
+	 */
+	countForward(): void {
+		this.#forwardCount += 1;
+	}
+
+	/**
+	 * Merges the routing of one outbound RPC: its nodes and its forward count. `countForward` counts the
+	 * RPC itself. `stamp` rewrites a node before the merge; a hash partition that enters a range tree
+	 * uses it to write its own hash depth on the range nodes.
 	 */
 	mergeForwarded(routing: FokosRouting, stamp?: (node: FokosRouteNode) => FokosRouteNode): void {
-		this.#forwardCount += routing.forwardCount + 1;
+		this.#forwardCount += routing.forwardCount;
 		this.#truncated ||= routing.servedByTruncated;
 		for (const node of routing.servedBy) {
 			this.add(stamp ? stamp(node) : node);

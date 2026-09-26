@@ -185,7 +185,7 @@ export abstract class FokosError<T extends string = string, C extends string = s
 				} catch {}
 			}
 		}
-		return new FokosInternalError(INTERNAL_CODES.foreign_error, {
+		return new FokosInternalError(CORE_INTERNAL_CODES.foreign_error, {
 			message: "unexpected error occurred",
 			cause: e,
 			attributes,
@@ -306,10 +306,8 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	hash_key_empty: "2fzzq9",
 	sort_key_empty: "2gjvju",
 	key_contains_nul: "42r8z7",
-	key_not_well_formed_utf16: "4767pp",
 	hash_key_too_large: "4v2p4p",
 	sort_key_too_large: "58daxm",
-	key_encode_empty: "58sjts",
 	item_data_too_large: "6z7eb3",
 	item_data_wrong_type: "7vxpb8",
 	item_data_not_json_serializable: "bfvvtt",
@@ -333,7 +331,6 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	cursor_direction_mismatch: "sfcvks",
 	cursor_fingerprint_mismatch: "t3kbec",
 	num_tx_coordinators_invalid: "uc9fkn",
-	partition_context_options_invalid: "nr8nsg",
 	item_too_large: "ynzx4p",
 	update_not_applicable: "yysds3",
 	update_value_is_bytes: "z9ar7e",
@@ -364,17 +361,23 @@ export const TRANSACTION_PENDING_CODES = defineCodes("FokosTransactionPendingErr
 
 export const UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "service", 503, {
 	partition_over_size: "49j6ez",
-	partition_migrating: "4rpgyu",
 	coordinator_over_size: "tg8r62",
 	prepare_unanswered: "mpncbz",
 });
 
-export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
+/**
+ * The codes of the error system itself. `FokosError.wrap` raises `foreign_error`, and `invariant` raises
+ * `invariant_failed`. They are here and not in `sharding/errors.ts`, because this module imports nothing.
+ */
+export const CORE_INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
 	invariant_failed: "85quf8",
+	foreign_error: "jvufz5",
+});
+
+export const INTERNAL_CODES = defineCodes("FokosInternalError", "internal", 500, {
 	item_data_parse_failed: "dx9mht",
 	commit_keyset_mismatch: "e3kh5s",
 	unexpected_transaction_state: "j6uhd6",
-	foreign_error: "jvufz5",
 });
 
 /**
@@ -387,5 +390,6 @@ export const FOKOS_CODE_TABLES = [
 	CONFLICT_CODES,
 	TRANSACTION_PENDING_CODES,
 	UNAVAILABLE_CODES,
+	CORE_INTERNAL_CODES,
 	INTERNAL_CODES,
 ] as const;

@@ -3,11 +3,9 @@ import {
 	KeyCodec,
 	type FokosEnvelope,
 	type FokosOperations,
-	type FokosPartitionRef,
 	type FokosRangeVisit,
 	type FokosRouteContext,
 	type FokosShardingHooks,
-	type FokosStatusCursor,
 	type KeyBytes,
 } from "fokosdb/sharding";
 import { ShardedDurableObject } from "./sharded-do.js";
@@ -61,8 +59,6 @@ export type SearchStats = {
 	tenants: Array<{ tenant: string; docs: number }>;
 	/** The tenant and the sort-key interval of a range partition. Null is an open edge. */
 	range: { tenant: string; start: string | null; end: string | null } | null;
-	/** The split children first, then the range roots of the tenants that this partition promoted. */
-	children: FokosPartitionRef[];
 };
 
 type DocRow = { tenant_id: string; sort_key: string; title: string; body: string };
@@ -129,7 +125,6 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 			range: range
 				? { tenant: KeyCodec.decode(range.hashKey) as string, start: decodeEdge(range.start), end: decodeEdge(range.end) }
 				: null,
-			children: identity ? [...this.fokos.children().map((c) => c.ref), ...(await this.promotedRangeRoots())] : [],
 		};
 	}
 
@@ -141,18 +136,6 @@ export class SearchPartitionDO extends ShardedDurableObject<SearchPolicy, Search
 
 	private tenantDocCount(tenant: string): number {
 		return this.ctx.storage.sql.exec<{ n: number }>("SELECT COUNT(*) AS n FROM docs WHERE tenant_id = ?", tenant).one().n;
-	}
-
-	/** The range roots that this partition created by promotion. The status pages of the runtime list them. */
-	private async promotedRangeRoots(): Promise<FokosPartitionRef[]> {
-		const refs: FokosPartitionRef[] = [];
-		let cursor: FokosStatusCursor | null = null;
-		do {
-			const page = await this.fokos.fokosStatus({ cursor });
-			for (const e of page.entries) if (e.repartition.kind === "key_promotion" && e.target) refs.push(e.target.ref);
-			cursor = page.nextCursor;
-		} while (cursor);
-		return refs;
 	}
 
 	// ── Runtime wiring ────────────────────────────────────────────────────────

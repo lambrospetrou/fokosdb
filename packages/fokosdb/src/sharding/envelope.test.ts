@@ -72,7 +72,9 @@ describe("RouteCollector", () => {
 		const other = node("other", "executed", 2);
 		const collector = new RouteCollector();
 		collector.add(node("self", "merged"));
+		collector.countForward();
 		collector.mergeForwarded(routingOf([leaf, other], 1));
+		collector.countForward();
 		collector.mergeForwarded(routingOf([leaf], 0));
 		const routing = collector.build();
 		// Two RPCs, and the first child had forwarded once itself.
@@ -105,6 +107,7 @@ describe("RouteCollector", () => {
 		let nodes = 0;
 		for (let i = 0; i < 20; i++) {
 			const leaf = { ...node(`leaf${i}`, "executed", 1), _rangeAncestors: [{ depth: 1, startBoundary: boundary, endBoundary: boundary }] };
+			collector.countForward();
 			collector.mergeForwarded(routingOf([leaf]));
 			nodes++;
 		}
@@ -120,6 +123,14 @@ describe("RouteCollector", () => {
 		const collector = new RouteCollector();
 		collector.mergeForwarded({ ...routingOf([node("leaf")]), servedByTruncated: true });
 		expect(collector.build().servedByTruncated).toBe(true);
+	});
+
+	it("counts an RPC that failed without routing", () => {
+		const collector = new RouteCollector();
+		collector.countForward();
+		collector.countForward();
+		collector.mergeForwarded(routingOf([node("leaf")], 2));
+		expect(collector.build().forwardCount).toBe(4);
 	});
 });
 

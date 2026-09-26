@@ -3,7 +3,6 @@ import {
 	KeyCodec,
 	type FokosEnvelope,
 	type FokosOperations,
-	type FokosPartitionRef,
 	type FokosRouteContext,
 	type FokosShardingHooks,
 	type KeyBytes,
@@ -36,7 +35,6 @@ export type CounterStats = {
 	repartitionState: string | null;
 	requestCount: number;
 	rows: CounterRow[];
-	children: FokosPartitionRef[];
 };
 
 type CounterRow = { key: string; val: number };
@@ -86,7 +84,6 @@ export class CounterPartitionDO extends ShardedDurableObject<CounterPolicy, Coun
 			repartitionState: lifecycle?.activeRepartition?.state ?? null,
 			requestCount: this.requestCount,
 			rows: this.ctx.storage.sql.exec<CounterRow>("SELECT key, val FROM counters").toArray(),
-			children: lifecycle ? this.fokos.children().map((c) => c.ref) : [],
 		};
 	}
 

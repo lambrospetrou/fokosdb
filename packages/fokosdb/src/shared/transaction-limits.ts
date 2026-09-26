@@ -9,7 +9,6 @@
  * encoding are one step and cannot drift apart.
  */
 
-import type { FokosDbRouteContext } from "./partition-context.js";
 import type {
 	ParticipantOperationResultEncoded,
 	RejectionReasonEncoded,
@@ -21,6 +20,7 @@ import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/pla
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
+import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
@@ -153,7 +153,7 @@ export function validateKeyContent(name: "hashKey" | "sortKey", k: string | Uint
 		});
 	}
 	if (k.isWellFormed?.() === false) {
-		throw new FokosValidationError(VALIDATION_CODES.key_not_well_formed_utf16, {
+		throw new FokosValidationError(SHARDING_VALIDATION_CODES.key_not_well_formed_utf16, {
 			message: `${name} string contains a lone surrogate (not well-formed UTF-16)`,
 			attributes: { key: name },
 		});
@@ -342,30 +342,6 @@ export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[])
 		}
 		seen.add(identity);
 	}
-}
-
-/**
- * The single-partition eligibility hint used by the transaction fast paths: returns the shared
- * partition context when EVERY item resolves to the same PartitionDO, else null.
- *
- * This is a client-side hint only. It is necessary but not sufficient — the resolved context names
- * the partition at the top of a forwarding chain, and a split or a promotion below that node can
- * still spread the items over several DOs. The partition itself is the authority and raises a
- * fallback error when it cannot execute the whole set alone.
- */
-export function singlePartitionTarget<T extends { partitionContext: FokosDbRouteContext }>(
-	items: readonly T[],
-): FokosDbRouteContext | null {
-	if (items.length === 0) {
-		return null;
-	}
-	const target = items[0].partitionContext;
-	for (const item of items) {
-		if (item.partitionContext.doName !== target.doName) {
-			return null;
-		}
-	}
-	return target;
 }
 
 export function validateReturnValuesOnConditionCheckFailure(value?: string): void {

@@ -34,7 +34,7 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { refOf, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { identityDepth, PartitionIdHelper, resolveHashChildPartitionContexts, resolveRangePartitionContext } from "./partition-id.js";
 import { selectRangeAncestors } from "./range-ancestors.js";
-import { FokosInternalError, FokosUnavailableError, FokosError, UNAVAILABLE_CODES } from "../shared/errors.js";
+import { FokosInternalError, FokosUnavailableError, FokosError } from "../shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import type {
 	FokosShardingStore,
@@ -836,7 +836,7 @@ export class RepartitionSource {
 			throw notCutOver(row.id);
 		}
 		if (row.state === "completed" || row.state === "cleaned") {
-			throw new FokosUnavailableError(UNAVAILABLE_CODES.partition_migrating, {
+			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "the repartition is complete and the source no longer serves its pages",
 				attributes: { repartitionId: row.id, state: row.state },
 			});

@@ -4,7 +4,7 @@
  */
 import { encodeHashKey } from "../../src/shared/transaction-limits.js";
 import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js";
-import { FokosRouter, todo } from "./api.js";
+import { FokosRouter, FokosShardingClient, todo } from "./api.js";
 import type { FokosPublicRoute, FokosPublicRouting, FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
 import type { CoordinatorRpc, InitiateWriteReq } from "./fokosdb-coordinator-host.js";
 import type { FokosDbPolicy, FokosDbRouteContext, LeafMetrics, PartitionRpc, QueryReq } from "./fokosdb-partition-host.js";
@@ -95,13 +95,19 @@ export class FokosDB {
 
 	/** Destroy walks both shard groups. The fence comes first in each. */
 	async destroy(): Promise<void> {
-		await this.partitions.walk(
-			(ctx, doName) => todo(`partitionStubByName(${ctx.policy.ns}, ${doName})`),
-			async (_ctx, stub) => await (stub as unknown as PartitionRpc).fokosDestroy(),
-		);
-		await this.coordinators.walk(
-			(ctx, doName) => todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${doName})`),
-			async (_ctx, stub) => await (stub as unknown as CoordinatorRpc).fokosDestroy(),
-		);
+		const { topology, rangeConfig, policy } = this.partitions;
+		await new FokosShardingClient({
+			topology,
+			rangeConfig,
+			policy,
+			stub: (ctx, doName) => todo(`partitionStubByName(${ctx.policy.ns}, ${doName})`),
+		}).destroy();
+		const coordinators = this.coordinators;
+		await new FokosShardingClient({
+			topology: coordinators.topology,
+			rangeConfig: coordinators.rangeConfig,
+			policy: coordinators.policy,
+			stub: (ctx, doName) => todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${doName})`),
+		}).destroy();
 	}
 }

@@ -82,13 +82,41 @@ export { planRangeFrontier } from "./range-frontier.js";
 export type { FrontierBase, PlannedVisit } from "./range-frontier.js";
 export { FokosScheduler } from "./scheduler.js";
 export type { FokosSchedulerDeps } from "./scheduler.js";
-export { FOKOS_SHARDING_CODE_TABLES, SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
+
+// ─── Errors ───────────────────────────────────────────────────────────────────
+
+export {
+	FOKOS_SHARDING_CODE_TABLES,
+	SHARDING_INTERNAL_CODES,
+	SHARDING_ROUTING_CODES,
+	SHARDING_UNAVAILABLE_CODES,
+	SHARDING_VALIDATION_CODES,
+} from "./errors.js";
 export type { FokosShardingError } from "./errors.js";
+export {
+	CORE_INTERNAL_CODES,
+	FokosError,
+	FokosInternalError,
+	FokosRoutingError,
+	FokosUnavailableError,
+	FokosValidationError,
+	isRuntimeRetryableError,
+} from "../shared/errors.js";
+export type { FokosErrorOrigin, FokosErrorWire } from "../shared/errors.js";
 
 // ─── Routing and caches ───────────────────────────────────────────────────────
 
 export { FokosRouter } from "./router.js";
-export type { FokosWalkStub } from "./router.js";
+export { FokosShardingClient } from "./client.js";
+export type {
+	FokosCallCost,
+	FokosCallOptions,
+	FokosCallResult,
+	FokosResolvedGroup,
+	FokosRetryPolicy,
+	FokosShardingClientOptions,
+	FokosWalkNode,
+} from "./client.js";
 export { HashTopology } from "./hash-topology.js";
 export type { HashTopologySnapshot } from "./hash-topology.js";
 export { PartialRangeTopology } from "./partial-range-topology.js";

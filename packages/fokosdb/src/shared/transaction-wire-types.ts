@@ -325,16 +325,6 @@ export type InitiateWriteResponseEncoded =
 			results: TransactWriteOperationResultEncoded[];
 	  };
 
-// Worker read-driver item: keys are canonical KeyBytes (sortKey [] = absent).
-export type TCReadItem = TransactionReadItem & {
-	/** Resolved partition context for the PartitionDO that owns this key. */
-	partitionContext: FokosDbRouteContext;
-};
-
-export type InitiateReadRequest = {
-	items: TCReadItem[];
-};
-
 /**
  * On "committed", `items` is positionally matched to the request: `items[i]` answers
  * `request.items[i]`, one entry per requested key.

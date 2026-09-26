@@ -2,8 +2,8 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
-import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
-import { SHARDING_INTERNAL_CODES } from "../../src/sharding/errors.js";
+import { FokosError } from "../../src/shared/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
 import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
@@ -358,7 +358,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 					// `partition_fanout_failed`, with `partition_migrating` as its cause. The coordinator
 					// retries both errors, thus the test accepts both.
 					const migrating = FokosError.isCode(error, SHARDING_INTERNAL_CODES.partition_fanout_failed) ? error.cause : error;
-					if (!FokosError.isCode(migrating, UNAVAILABLE_CODES.partition_migrating)) {
+					if (!FokosError.isCode(migrating, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 						throw error;
 					}
 					return false;

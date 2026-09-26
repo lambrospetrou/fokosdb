@@ -1,6 +1,6 @@
 // Adapted from https://github.com/alexreardon/tiny-invariant/blob/master/src/tiny-invariant.ts.
 
-import { FokosInternalError, INTERNAL_CODES } from "./errors.js";
+import { CORE_INTERNAL_CODES, FokosInternalError } from "./errors.js";
 
 /**
  * 💥 `invariant` will `throw` a `FokosInternalError` with the code `invariant_failed` if the `condition` is [falsey](https://github.com/getify/You-Dont-Know-JS/blob/bdbe570600d4e1107d0b131787903ca1c9ec8140/up%20%26%20going/ch2.md#truthy--falsy)
@@ -26,7 +26,7 @@ export default function invariant(
 
 	// The text can hold dynamic detail and internal names, so it goes to the attributes and the message stays fixed.
 	const detail: string | undefined = typeof message === "function" ? message() : message;
-	throw new FokosInternalError(INTERNAL_CODES.invariant_failed, {
+	throw new FokosInternalError(CORE_INTERNAL_CODES.invariant_failed, {
 		message: "an internal invariant failed",
 		attributes: detail === undefined ? {} : { detail },
 	});

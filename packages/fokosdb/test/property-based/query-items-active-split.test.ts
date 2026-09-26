@@ -28,6 +28,7 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { FokosError, FokosUnavailableError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import type { PutItemResult, QueryItemsOptions } from "../../src/shared/types.js";
 import { propertyRuns, sleep, untilAvailable } from "./harness.js";
 import {
@@ -187,7 +188,7 @@ class Churn {
 				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_over_size)) {
 					return "refused";
 				}
-				if (FokosError.isCode(e, UNAVAILABLE_CODES.partition_migrating)) {
+				if (FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
 					return "refused";
 				}
 				if (!FokosUnavailableError.is(e) || Date.now() >= deadline) {

@@ -1,11 +1,27 @@
 /**
- * The error codes that only partitions exchange: routing, identity, and the repartition protocol.
+ * The error codes that the sharding runtime raises: the key and context validation, routing, identity,
+ * and the repartition protocol.
  *
  * They extend the categories of `shared/errors.ts` with `defineCodes`, as `shared/errors-operations.ts`
- * does for the FokosDB operations. A client never matches on one of these codes directly: the codes a
- * client handles (`partition_migrating`, `partition_over_size`) stay in `shared/errors.ts`.
+ * does for the FokosDB operations. A caller of the runtime checks a code with `FokosError.isCode` and a
+ * definition of these tables. The runtime also raises `invariant_failed` and `foreign_error`, which stay
+ * in `CORE_INTERNAL_CODES` of `shared/errors.ts`.
  */
-import { defineCodes, type FokosCodesOf, FokosInternalError, FokosRoutingError, FokosUnavailableError } from "../shared/errors.js";
+import {
+	CORE_INTERNAL_CODES,
+	defineCodes,
+	type FokosCodesOf,
+	FokosInternalError,
+	FokosRoutingError,
+	FokosUnavailableError,
+	FokosValidationError,
+} from "../shared/errors.js";
+
+export const SHARDING_VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 400, {
+	key_not_well_formed_utf16: "4767pp",
+	key_encode_empty: "58sjts",
+	partition_context_options_invalid: "nr8nsg",
+});
 
 export const SHARDING_ROUTING_CODES = defineCodes("FokosRoutingError", "internal", 500, {
 	/** The key cannot belong to this partition or to the caller slice. A routing defect, not backpressure. */
@@ -17,6 +33,8 @@ export const SHARDING_ROUTING_CODES = defineCodes("FokosRoutingError", "internal
 });
 
 export const SHARDING_UNAVAILABLE_CODES = defineCodes("FokosUnavailableError", "service", 503, {
+	/** The partition imports, or it moved the key after a split cutover. A retry to the same entry succeeds later. */
+	partition_migrating: "4rpgyu",
 	/** The repartition source still owns the slice, so the target must ask again after cutover. */
 	repartition_not_cut_over: "spf2v8",
 });
@@ -39,10 +57,17 @@ export const SHARDING_INTERNAL_CODES = defineCodes("FokosInternalError", "intern
 });
 
 /** Every code table of this module. */
-export const FOKOS_SHARDING_CODE_TABLES = [SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES, SHARDING_INTERNAL_CODES] as const;
+export const FOKOS_SHARDING_CODE_TABLES = [
+	SHARDING_VALIDATION_CODES,
+	SHARDING_ROUTING_CODES,
+	SHARDING_UNAVAILABLE_CODES,
+	SHARDING_INTERNAL_CODES,
+] as const;
 
-/** Every error the sharding runtime raises with a code of its own. */
+/** Every error that the sharding runtime raises. */
 export type FokosShardingError =
+	| FokosValidationError<FokosCodesOf<typeof SHARDING_VALIDATION_CODES>>
+	| FokosInternalError<FokosCodesOf<typeof CORE_INTERNAL_CODES>>
 	| FokosRoutingError<FokosCodesOf<typeof SHARDING_ROUTING_CODES>>
 	| FokosUnavailableError<FokosCodesOf<typeof SHARDING_UNAVAILABLE_CODES>>
 	| FokosInternalError<FokosCodesOf<typeof SHARDING_INTERNAL_CODES>>;

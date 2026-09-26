@@ -5,6 +5,7 @@ import type { PartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
+import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
@@ -1189,7 +1190,8 @@ describe("TransactionCoordinatorDO - fokosDestroy", () => {
 
 describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () => {
 	function unavailableWire(code: "partition_migrating" | "partition_over_size"): FokosErrorWire {
-		return FokosError.toWire(new FokosUnavailableError(UNAVAILABLE_CODES[code], { message: "refused" }));
+		const def = code === "partition_migrating" ? SHARDING_UNAVAILABLE_CODES.partition_migrating : UNAVAILABLE_CODES.partition_over_size;
+		return FokosError.toWire(new FokosUnavailableError(def, { message: "refused" }));
 	}
 
 	function cancelWith(state: DurableObjectState, tc: CoordinatorInternals) {

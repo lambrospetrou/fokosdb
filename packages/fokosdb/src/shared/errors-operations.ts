@@ -8,6 +8,7 @@
 
 import {
 	CONFLICT_CODES,
+	CORE_INTERNAL_CODES,
 	EXPRESSION_CODES,
 	FOKOS_CODE_TABLES,
 	FokosConflictError,
@@ -115,6 +116,7 @@ export type FokosAnyError =
 	| FokosTransactionPendingError<FokosCodesOf<typeof TRANSACTION_PENDING_CODES>>
 	| FokosUnavailableError<FokosCodesOf<typeof UNAVAILABLE_CODES>>
 	| FokosInternalError<FokosCodesOf<typeof INTERNAL_CODES>>
+	| FokosInternalError<FokosCodesOf<typeof CORE_INTERNAL_CODES>>
 	| FokosShardingError;
 
 export type FokosErrorCode = FokosAnyError["code"];
