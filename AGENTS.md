@@ -27,7 +27,7 @@ This is a pnpm workspace. Run the scripts of the root `package.json` from the re
 
 - `client/` — `db.ts` and the entry barrel. Published as `fokosdb/client`.
 - `server/` — the two Durable Object classes. Published as `fokosdb/server`.
-- `shared/` — what both sides use. tsdown inlines it into whichever entry reaches it.
+- `shared/` — what both sides use.
 
 **The client must never import a Durable Object class as a value.** That pulls the whole server implementation into `dist/client`. Use the type-only helpers in `shared/do-stubs.ts` and keep every class import `import type`. `pnpm build` enforces the rule, pins the packages the client may import, and holds the client bundle under a size budget.
 
