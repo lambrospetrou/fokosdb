@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { KeyCodec } from "./key-codec.js";
+import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import {
 	identityDepth,
 	partitionIdentityFrom,
@@ -147,7 +147,8 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 		}
 
 		// Opaque round-trip.
-		const decoded2 = PartitionIdHelper.decode(Uint8Array.fromHex(opaque));
+		expect(opaque).toMatch(/^01[A-Za-z0-9_-]+\.$/);
+		const decoded2 = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(opaque));
 		expect(decoded2).toEqual(decoded);
 	});
 
@@ -194,10 +195,100 @@ describe("PartitionIdHelper — range schema (SCHEMA_RANGE_V1)", () => {
 		}
 	});
 
-	it("doName dispatches correctly for range ID loaded from opaque hex", () => {
+	it("doName dispatches correctly for range ID loaded from its opaque ID", () => {
 		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("mykey"), kb("start1"), kb("end1")).encode(false);
-		const bytes = Uint8Array.fromHex(opaque);
+		const bytes = PartitionIdHelper.partitionIdToBytes(opaque);
 		expect(PartitionIdHelper.doName(base, bytes)).toBe("iddb.r.mykey.start1.end1");
+	});
+});
+
+describe("PartitionIdHelper — range ID base64url parts", () => {
+	const bin = (...values: number[]) => KeyCodec.asKeyBytes(new Uint8Array(values));
+	const cases: [string, KeyBytes, KeyBytes | null, KeyBytes | null][] = [
+		["root", kb("alice"), null, null],
+		["null start", kb("alice"), null, kb("m")],
+		["null end", kb("alice"), kb("m"), null],
+		["two bounds", kb("alice"), kb("b1"), kb("b2")],
+		["unicode", kb("café☕"), kb("töst"), kb("zünd")],
+		["reserved DO-name bytes", kb("a.b%c~d"), kb('x"y\\z'), kb("~max")],
+		["binary", KeyCodec.encode(new Uint8Array([0, 0xff, 0x2e])), bin(0xff, 0x00, 0x7e), bin(0xff, 0xfe)],
+		["empty boundaries", kb("k"), bin(), bin()],
+	];
+
+	it.each(cases)("round-trips byte for byte: %s", (_, hashKey, start, end) => {
+		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], hashKey, start, end);
+		const { bytes, opaque, doName } = PartitionIdHelper.fromRangePartition(base, hashKey, start, end).encode(true);
+		expect(ctx.partitionId).toBe(opaque);
+		expect(ctx.doName).toBe(doName);
+		expect(opaque).toMatch(/^01[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*$/);
+		expect(PartitionIdHelper.partitionIdToBytes(opaque)).toEqual(bytes);
+		expect(PartitionIdHelper.decode(bytes)).toEqual({ schema: 1, hashKey, startBoundary: start, endBoundary: end });
+		expect(PartitionIdHelper.rangeHashKey(opaque)).toEqual(hashKey);
+		// The name from the keys equals the name from a full ID decode.
+		expect(PartitionIdHelper.doName(base, PartitionIdHelper.partitionIdToBytes(opaque))).toBe(ctx.doName);
+		expect(new PartitionIdHelper(base, opaque).encode(true)).toEqual({ bytes, opaque, doName });
+	});
+
+	it("keeps the flat byte layout and puts the boundaries in the second part only", () => {
+		const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, kb("hk"), kb("s"), kb("e")).encode(false);
+		const hk = kb("hk");
+		const s = kb("s");
+		const e = kb("e");
+		const first = new Uint8Array([0x03, hk.length, 0, 0, 0, s.length, 0, 0, 0, ...hk]);
+		const second = new Uint8Array([...s, ...e]);
+		expect(bytes).toEqual(new Uint8Array([0x01, ...first, ...second]));
+		expect(opaque).toBe(
+			"01" +
+				first.toBase64({ alphabet: "base64url", omitPadding: true }) +
+				"." +
+				second.toBase64({ alphabet: "base64url", omitPadding: true }),
+		);
+	});
+
+	it("reads the hash key without the boundary part", () => {
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), kb("b2")).encode(false);
+		const firstOnly = opaque.slice(0, opaque.indexOf(".") + 1) + "!!!";
+		expect(PartitionIdHelper.rangeHashKey(firstOnly)).toEqual(kb("alice"));
+		expect(() => PartitionIdHelper.partitionIdToBytes(firstOnly)).toThrow(invariantFailure(/not canonical base64url/));
+	});
+
+	it("rejects malformed separators and non-canonical base64url", () => {
+		const { opaque } = PartitionIdHelper.fromRangePartition(base, kb("alice"), kb("b1"), kb("b2")).encode(false);
+		const [firstText, secondText] = opaque.slice(2).split(".");
+		const decode = (id: string) => () => PartitionIdHelper.partitionIdToBytes(id);
+		expect(decode("01" + firstText + secondText)).toThrow(invariantFailure(/no separator/));
+		expect(decode(opaque + ".")).toThrow(invariantFailure(/canonical/));
+		expect(decode("01" + firstText + "." + secondText + "==")).toThrow(invariantFailure(/base64url/));
+		expect(decode("01" + firstText + "." + "+/AA")).toThrow(invariantFailure(/base64url/));
+		expect(decode("01" + firstText + "." + " " + secondText)).toThrow(invariantFailure(/base64url/));
+		expect(decode("01" + firstText + ".A")).toThrow(invariantFailure(/canonical/));
+		expect(decode("01" + firstText + ".AA==")).toThrow(invariantFailure(/canonical/));
+		// "AB" and "AA" both decode to one zero byte; only "AA" is canonical.
+		expect(decode("01" + firstText + ".AB")).toThrow(invariantFailure(/canonical/));
+	});
+
+	it("rejects invalid flags and inconsistent lengths", () => {
+		const b64 = (...values: number[]) => new Uint8Array(values).toBase64({ alphabet: "base64url", omitPadding: true });
+		const decode = (first: number[], second: number[]) => () =>
+			PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes("01" + b64(...first) + "." + b64(...second)));
+		// flags, hkLen u32 LE, startLen u32 LE, hash key
+		expect(decode([0x03, 1, 0, 0, 0, 1, 0, 0, 0, 0x6b], [0x61, 0x62])).not.toThrow();
+		expect(decode([0x04, 1, 0, 0, 0, 0, 0, 0, 0, 0x6b], [])).toThrow(invariantFailure(/invalid range partition ID flags/));
+		expect(decode([0x00, 2, 0, 0, 0, 0, 0, 0, 0, 0x6b], [])).toThrow(invariantFailure(/hash-key length/));
+		expect(decode([0x00, 1, 0, 0, 0, 0, 0, 0], [])).toThrow(invariantFailure(/too short/));
+		expect(decode([0x00, 1, 0, 0, 0, 1, 0, 0, 0, 0x6b], [0x61])).toThrow(invariantFailure(/without a start/));
+		expect(decode([0x01, 1, 0, 0, 0, 2, 0, 0, 0, 0x6b], [0x61])).toThrow(invariantFailure(/start length/));
+		expect(decode([0x01, 1, 0, 0, 0, 1, 0, 0, 0, 0x6b], [0x61, 0x62])).toThrow(invariantFailure(/without an end/));
+		expect(decode([0x00, 1, 0, 0, 0, 0, 0, 0, 0, 0x6b], [0x61])).toThrow(invariantFailure(/without an end/));
+		expect(() => PartitionIdHelper.rangeHashKey("01" + b64(0x08, 1, 0, 0, 0, 0, 0, 0, 0, 0x6b) + ".")).toThrow(
+			invariantFailure(/invalid range partition ID flags/),
+		);
+	});
+
+	it("partitionIdentityFrom decodes both parts of a range ID", () => {
+		const ctx = resolveRangePartitionContext(makeRouter().allRoots()[0], kb("alice"), kb("b1"), null);
+		const identity = partitionIdentityFrom(ctx, { depth: 1, ancestors: [] });
+		expect(identity.range).toEqual({ hashKey: kb("alice"), start: kb("b1"), end: null, depth: 1, ancestors: [] });
 	});
 });
 

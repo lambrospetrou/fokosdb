@@ -60,11 +60,10 @@ export function resolveRangePartitionContext<P>(
 	startBoundary: KeyBytes | null,
 	endBoundary: KeyBytes | null,
 ): FokosRouteContext<P> {
-	const { opaque, doName } = PartitionIdHelper.fromRangePartition(base.topology.shardGroup, hashKey, startBoundary, endBoundary).encode(
-		true,
-	);
-	assertExists(doName);
-	return { ...base, doName, partitionId: opaque };
+	// The ID and the DO name come from the same keys, so no ID decode is necessary.
+	const partitionId = rangeBytesToPartitionId(encodeRangeBytes(hashKey, startBoundary, endBoundary));
+	const doName = rangePartitionDoName(base.topology.shardGroup, hashKey, startBoundary, endBoundary);
+	return { ...base, doName, partitionId };
 }
 
 /** The route contexts of the N hash children of a splitting hash parent. */
@@ -95,7 +94,7 @@ export function partitionIdentityFrom(
 	ctx: FokosRouteContext<unknown>,
 	range?: { depth: number; ancestors: RangeAncestorInfo[] },
 ): FokosPartitionIdentity {
-	const bytes = Uint8Array.fromHex(ctx.partitionId);
+	const bytes = PartitionIdHelper.partitionIdToBytes(ctx.partitionId);
 	const decoded = PartitionIdHelper.decode(bytes);
 	const ref = { partitionId: ctx.partitionId, doName: ctx.doName };
 	if (decoded.schema === PartitionIdHelper.SCHEMA_HASH_V1) {
@@ -122,6 +121,101 @@ export function identityDepth(identity: FokosPartitionIdentity): number {
 	return identity.hash ? identity.hash.path.length : identity.range!.depth;
 }
 
+// The range ID is "01" + base64url(first) + "." + base64url(second), both parts unpadded. The dot is
+// a separator, not base64url data. The flat bytes are 0x01 + first + second:
+//   first:  flags u8 (bit0 = has start, bit1 = has end), hkLen u32 LE, startLen u32 LE (0 when no
+//           start), then hkLen hash-key bytes
+//   second: startLen start bytes when the start flag is set, then the end bytes when the end flag is set
+// A range root has an empty second part, so its ID ends with the dot. The first part holds all of the
+// hash key, so a reader can get the hash key without the boundary bytes.
+const RANGE_HEADER_LEN = 9;
+const RANGE_FLAG_START = 0x01;
+const RANGE_FLAG_END = 0x02;
+
+function writeU32LE(bytes: Uint8Array, offset: number, value: number): void {
+	bytes[offset] = value & 0xff;
+	bytes[offset + 1] = (value >>> 8) & 0xff;
+	bytes[offset + 2] = (value >>> 16) & 0xff;
+	bytes[offset + 3] = (value >>> 24) & 0xff;
+}
+
+function readU32LE(bytes: Uint8Array, offset: number): number {
+	return (bytes[offset] | (bytes[offset + 1] << 8) | (bytes[offset + 2] << 16) | (bytes[offset + 3] << 24)) >>> 0;
+}
+
+function toBase64Url(bytes: Uint8Array): string {
+	return bytes.toBase64({ alphabet: "base64url", omitPadding: true });
+}
+
+/** The byte count of `length` characters of unpadded base64url. */
+function base64UrlByteLength(length: number): number {
+	return Math.floor((length * 3) / 4);
+}
+
+/**
+ * Decodes canonical, unpadded base64url text into all of `target`, which has the byte count of the
+ * text. Strict mode rejects non-zero trailing bits. Whitespace and "=" decode to fewer bytes than
+ * the text length gives.
+ */
+function decodeBase64UrlInto(text: string, target: Uint8Array): void {
+	const padded = text.padEnd(Math.ceil(text.length / 4) * 4, "=");
+	let canonical = false;
+	try {
+		const { read, written } = target.setFromBase64(padded, { alphabet: "base64url", lastChunkHandling: "strict" });
+		canonical = read === padded.length && written === target.length;
+	} catch {
+		// Text that is not base64url stays not canonical.
+	}
+	invariant(canonical, "fokos/topology: a range partition ID part is not canonical base64url");
+}
+
+const NO_BYTES = Object.freeze(new Uint8Array(0));
+
+/** The flat bytes of a range ID. null is an unbounded edge. */
+function encodeRangeBytes(hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): Uint8Array {
+	const start = startBoundary ?? NO_BYTES;
+	const end = endBoundary ?? NO_BYTES;
+	const split = 1 + RANGE_HEADER_LEN + hashKey.length;
+	const bytes = new Uint8Array(split + start.length + end.length);
+	bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
+	bytes[1] = (startBoundary ? RANGE_FLAG_START : 0) | (endBoundary ? RANGE_FLAG_END : 0);
+	writeU32LE(bytes, 2, hashKey.length);
+	writeU32LE(bytes, 6, start.length);
+	bytes.set(hashKey, 1 + RANGE_HEADER_LEN);
+	bytes.set(start, split);
+	bytes.set(end, split + start.length);
+	return bytes;
+}
+
+/** Checks the header of a first part and returns its hash key and the start length. */
+function readRangeFirst(first: Uint8Array): { flags: number; hashKey: KeyBytes; startLen: number } {
+	invariant(first.length >= RANGE_HEADER_LEN, "fokos/topology: a range partition ID header is too short");
+	const flags = first[0];
+	invariant((flags & ~(RANGE_FLAG_START | RANGE_FLAG_END)) === 0, `fokos/topology: invalid range partition ID flags: ${flags}`);
+	const hkLen = readU32LE(first, 1);
+	const startLen = readU32LE(first, 5);
+	invariant(first.length === RANGE_HEADER_LEN + hkLen, "fokos/topology: a range partition ID hash-key length is inconsistent");
+	invariant((flags & RANGE_FLAG_START) !== 0 || startLen === 0, "fokos/topology: a range partition ID without a start has a start length");
+	return { flags, hashKey: KeyCodec.asKeyBytes(first.subarray(RANGE_HEADER_LEN)), startLen };
+}
+
+/**
+ * Splits a range ID at its first dot. The scan stops at the dot, so it does not read the boundary
+ * part. A second dot is not base64url, so a decode of the second part rejects it.
+ */
+function splitRangePartitionId(partitionId: string): [string, string] {
+	const dot = partitionId.indexOf(".");
+	invariant(dot >= 0, "fokos/topology: a range partition ID has no separator");
+	return [partitionId.slice(PartitionIdHelper.SCHEMA_RANGE_V1_STR.length, dot), partitionId.slice(dot + 1)];
+}
+
+/** The range ID of the flat range bytes. */
+function rangeBytesToPartitionId(bytes: Uint8Array): string {
+	const hkLen = readU32LE(bytes, 2);
+	const split = 1 + RANGE_HEADER_LEN + hkLen;
+	return PartitionIdHelper.SCHEMA_RANGE_V1_STR + toBase64Url(bytes.subarray(1, split)) + "." + toBase64Url(bytes.subarray(split));
+}
+
 // Re-exported from hash-primitives.ts (lives there to break the circular dependency with hash-topology.ts).
 export const GOLDEN_RATIO = _GOLDEN_RATIO;
 export const hashChildIndex = _hashChildIndex;
@@ -134,8 +228,29 @@ export class PartitionIdHelper {
 	static readonly SCHEMA_RANGE_V1 = 0x01 as const;
 	static readonly SCHEMA_RANGE_V1_STR = "01" as const;
 
+	/** The flat bytes of an opaque partition ID. `decode` checks the layout of the bytes. */
 	static partitionIdToBytes(partitionId: PartitionNodeId): Uint8Array {
-		return Uint8Array.fromHex(partitionId);
+		if (!partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR)) {
+			return Uint8Array.fromHex(partitionId);
+		}
+		const [firstText, secondText] = splitRangePartitionId(partitionId);
+		const split = 1 + base64UrlByteLength(firstText.length);
+		const bytes = new Uint8Array(split + base64UrlByteLength(secondText.length));
+		bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
+		decodeBase64UrlInto(firstText, bytes.subarray(1, split));
+		decodeBase64UrlInto(secondText, bytes.subarray(split));
+		return bytes;
+	}
+
+	/**
+	 * The hash key of a range ID, from its first part only. The boundary part is not read, so the
+	 * cost does not grow with the boundaries.
+	 */
+	static rangeHashKey(partitionId: PartitionNodeId): KeyBytes {
+		const [firstText] = splitRangePartitionId(partitionId);
+		const first = new Uint8Array(base64UrlByteLength(firstText.length));
+		decodeBase64UrlInto(firstText, first);
+		return readRangeFirst(first).hashKey;
 	}
 
 	static isHashPartition(partitionId: PartitionNodeId): boolean {
@@ -177,23 +292,16 @@ export class PartitionIdHelper {
 			return { schema: 0, rootIdx: (bytes[1] << 8) | bytes[2], depth: bytes[3] };
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology.decode: unsupported schema version: ${bytes[0]}`);
-		// SCHEMA_RANGE_V1 wire format (both boundaries are immutable identity; null = unbounded edge).
-		// hashKey/start/end are stored as RAW canonical KeyBytes (no re-encoding — they already are bytes):
-		//   byte[0]     = 0x01
-		//   byte[1]     = flags: bit0 = hasStartBoundary, bit1 = hasEndBoundary (absent bit ⇒ unbounded)
-		//   byte[2..5]  = uint32 LE length of hashKey bytes (hkLen)
-		//   byte[6..9]  = uint32 LE length of startBoundary bytes (startLen; 0 if !hasStart)
-		//   byte[10..]  = hashKey bytes, then startBoundary bytes (startLen), then endBoundary bytes (rest, if hasEnd)
-		const hasStart = (bytes[1] & 0x01) !== 0;
-		const hasEnd = (bytes[1] & 0x02) !== 0;
-		const hkLen = bytes[2] | (bytes[3] << 8) | (bytes[4] << 16) | (bytes[5] << 24);
-		const startLen = bytes[6] | (bytes[7] << 8) | (bytes[8] << 16) | (bytes[9] << 24);
-		const hkStart = 10;
-		const skStart = hkStart + hkLen;
-		const endStart = skStart + startLen;
-		const hashKey = KeyCodec.asKeyBytes(bytes.subarray(hkStart, skStart));
-		const startBoundary = hasStart ? KeyCodec.asKeyBytes(bytes.subarray(skStart, endStart)) : null;
-		const endBoundary = hasEnd ? KeyCodec.asKeyBytes(bytes.subarray(endStart)) : null;
+		// SCHEMA_RANGE_V1: 0x01, then the first part and the second part of the range ID, see
+		// `encodeRangeBytes`. The keys and the boundaries are raw canonical KeyBytes.
+		const split = 1 + RANGE_HEADER_LEN + readU32LE(bytes, 2);
+		const { flags, hashKey, startLen } = readRangeFirst(bytes.subarray(1, split));
+		const second = bytes.subarray(split);
+		invariant(second.length >= startLen, "fokos/topology.decode: a range partition ID start length is inconsistent");
+		const hasEnd = (flags & RANGE_FLAG_END) !== 0;
+		invariant(hasEnd || second.length === startLen, "fokos/topology.decode: a range partition ID without an end has end bytes");
+		const startBoundary = (flags & RANGE_FLAG_START) !== 0 ? KeyCodec.asKeyBytes(second.subarray(0, startLen)) : null;
+		const endBoundary = hasEnd ? KeyCodec.asKeyBytes(second.subarray(startLen)) : null;
 		return { schema: 1, hashKey, startBoundary, endBoundary };
 	}
 
@@ -205,28 +313,7 @@ export class PartitionIdHelper {
 		endBoundary: KeyBytes | null,
 	): PartitionIdHelper {
 		// Boundaries are already canonical KeyBytes — store them raw (no TextEncoder).
-		const hkBytes = hashKey;
-		const hasStart = startBoundary !== null;
-		const hasEnd = endBoundary !== null;
-		const skBytes = hasStart ? startBoundary : new Uint8Array(0);
-		const endBytes = hasEnd ? endBoundary : new Uint8Array(0);
-		const bytes = new Uint8Array(10 + hkBytes.length + skBytes.length + endBytes.length);
-		bytes[0] = PartitionIdHelper.SCHEMA_RANGE_V1;
-		bytes[1] = (hasStart ? 0x01 : 0x00) | (hasEnd ? 0x02 : 0x00);
-		const hkLen = hkBytes.length;
-		bytes[2] = hkLen & 0xff;
-		bytes[3] = (hkLen >> 8) & 0xff;
-		bytes[4] = (hkLen >> 16) & 0xff;
-		bytes[5] = (hkLen >> 24) & 0xff;
-		const startLen = skBytes.length;
-		bytes[6] = startLen & 0xff;
-		bytes[7] = (startLen >> 8) & 0xff;
-		bytes[8] = (startLen >> 16) & 0xff;
-		bytes[9] = (startLen >> 24) & 0xff;
-		bytes.set(hkBytes, 10);
-		bytes.set(skBytes, 10 + hkLen);
-		bytes.set(endBytes, 10 + hkLen + startLen);
-		return new PartitionIdHelper(shardGroup, bytes);
+		return new PartitionIdHelper(shardGroup, encodeRangeBytes(hashKey, startBoundary, endBoundary));
 	}
 
 	static fromHashIdxs(shardGroup: string, hashIdxs: number[]): PartitionIdHelper {
@@ -294,7 +381,7 @@ export class PartitionIdHelper {
 		partitionIdOpaque?: string | Uint8Array,
 	) {
 		if (partitionIdOpaque) {
-			this.#bytes = partitionIdOpaque instanceof Uint8Array ? partitionIdOpaque : Uint8Array.fromHex(partitionIdOpaque);
+			this.#bytes = partitionIdOpaque instanceof Uint8Array ? partitionIdOpaque : PartitionIdHelper.partitionIdToBytes(partitionIdOpaque);
 		}
 		this.#appendedHashIdxs = [];
 	}
@@ -346,6 +433,7 @@ export class PartitionIdHelper {
 		if (includeDoName) {
 			doName = PartitionIdHelper.doName(this.shardGroup, bytes);
 		}
-		return { bytes, opaque: bytes.toHex(), doName };
+		const opaque = bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1 ? rangeBytesToPartitionId(bytes) : bytes.toHex();
+		return { bytes, opaque, doName };
 	}
 }

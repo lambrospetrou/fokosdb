@@ -32,7 +32,10 @@ export type FokosRangeConfig = {
 export type FokosRouteContext<TPolicy> = {
 	/** 2: the shape differs from the earlier partition context, and a reader must reject the old record. */
 	schema: 2;
-	/** Immutable identity of the target partition: hex-encoded opaque bytes, the wire format of `PartitionIdHelper`. */
+	/**
+	 * Immutable identity of the target partition, the wire format of `PartitionIdHelper`: hex text for
+	 * a hash partition, and `"01"` and two base64url parts for a range partition.
+	 */
 	partitionId: string;
 	/** `<shardGroup>.h.<root>[.<child>...]` or `<shardGroup>.r.<hk>.<start>.<end>`. */
 	doName: string;

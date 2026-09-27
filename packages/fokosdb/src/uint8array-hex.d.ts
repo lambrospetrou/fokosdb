@@ -2,6 +2,10 @@
 interface Uint8Array {
 	toHex(): string;
 	toBase64(options: { alphabet?: "base64" | "base64url"; omitPadding?: boolean } = { alphabet: "base64", omitPadding: false }): string;
+	setFromBase64(
+		b64: string,
+		options?: { alphabet?: "base64" | "base64url"; lastChunkHandling?: "loose" | "strict" | "stop-before-partial" },
+	): { read: number; written: number };
 }
 
 interface Uint8ArrayConstructor {

@@ -1490,11 +1490,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 		};
 		for (const node of nodes) {
-			const bytes = Uint8Array.fromHex(node.ref.partitionId);
 			if (isRangePartition(node.ref)) {
-				const decoded = PartitionIdHelper.decode(bytes);
-				invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/runtime.learn: a range node decodes to a range id");
-				const hashKey = decoded.hashKey;
+				// Only the first part of the ID: the boundaries come from `_rangeAncestors`.
+				const hashKey = PartitionIdHelper.rangeHashKey(node.ref.partitionId);
 				for (const ancestor of node._rangeAncestors ?? []) {
 					this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
 				}
@@ -1513,6 +1511,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				learnDepth(hashKey, node.hashDepth);
 				continue;
 			}
+			const bytes = Uint8Array.fromHex(node.ref.partitionId);
 			for (const hashKey of hashKeys) {
 				if (hashPathOwns(bytes, hashKey, identity.topology)) {
 					learnDepth(hashKey, node.hashDepth);
