@@ -1,8 +1,13 @@
 # RFC — Recovery of an over-size partition that cannot queue its split
 
-**State:** Proposed
+**State:** Superseded
 **Date:** 2026-09-20
 **Author:** Lambros Petrou
+
+> Superseded by `docs/agent-plans/2026-09-27-over-size-split-trigger.md`. This document describes the code before
+> the sharding runtime refactor: `checkSplits`, `shouldSplit`, `shouldAllow`, `withSplitForwarding` and
+> `scheduleNextPass` no longer exist. Its guard of "two routable keys" is also wrong for both kinds. A range split
+> needs `rangeSplitN` items, and a hash leaf with one large key needs a promotion, not the floor.
 
 ## Table of contents
 
