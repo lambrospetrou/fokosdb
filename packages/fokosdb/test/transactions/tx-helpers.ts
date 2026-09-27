@@ -8,7 +8,12 @@ import { expect, vi } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { type FokosDbPolicy, type FokosDbRouteContext, PartitionContextCreator } from "../../src/shared/partition-context.js";
+import {
+	coordinatorShardGroup,
+	type FokosDbPolicy,
+	type FokosDbRouteContext,
+	PartitionContextCreator,
+} from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO, TxOp, TxRequest } from "../controlled-partition-do.js";
@@ -184,11 +189,11 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 	return (await Promise.all([...partitions.values()].map((p) => p.testTxCalls(op)))).flat() as TxRequest<Op>[];
 }
 
-/** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<shardGroup>`. */
+/** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>`. */
 export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDbPolicy> {
 	const { topology, coordinatorRootsN } = db.options();
 	return new FokosRouter(
-		{ ...topology.topology, shardGroup: `fokos.tc.${topology.topology.shardGroup}`, rootTreesN: coordinatorRootsN },
+		{ ...topology.topology, shardGroup: coordinatorShardGroup(topology.topology), rootTreesN: coordinatorRootsN },
 		topology.rangeConfig,
 		topology.policy,
 	);

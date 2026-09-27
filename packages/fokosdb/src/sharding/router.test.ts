@@ -28,7 +28,7 @@ describe("FokosRouter.rootContext", () => {
 		expect(ctx.topology).toBe(router.topology);
 		expect(ctx.rangeConfig).toBe(router.rangeConfig);
 		expect(ctx.policy).toBe(router.policy);
-		expect(ctx.doName).toBe(`${router.topology.shardGroup}.h.${ctx.doName.split(".h.")[1]}`);
+		expect(ctx.doName).toBe(`${router.topology.shardGroup}~h.${ctx.doName.split("~h.")[1]}`);
 		expect(new Set(router.allRoots().map((r) => r.doName)).size).toBe(3);
 	});
 

@@ -18,7 +18,7 @@ describe("PartitionDO - partitionId encoding", () => {
 		const children = PartitionIdHelper.calculateHashChildPartitionIds(ctx);
 		for (let i = 0; i < children.length; i++) {
 			expect(Uint8Array.fromHex(children[i].partitionIdOpaque)).toEqual(new Uint8Array([0, 0, 0, 1, i]));
-			expect(children[i].doName).toBe(`${ctx.topology.shardGroup}.h.0.${i}`);
+			expect(children[i].doName).toBe(`${ctx.topology.shardGroup}~h.0.${i}`);
 		}
 	});
 

@@ -436,8 +436,8 @@ async function promotedTable(): Promise<{ db: FokosDB; model: QueryModel }> {
 	const db = makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
 	const model: QueryModel = new Map();
 	await putHotRange(db, model, 0, PROMOTE_ITEMS);
-	// The range root must exist before the rest of the payload arrives. Its name carries ".r.".
-	await awaitLeaves(db, (leaves) => leaves.some((name) => name.includes(".r.")), "the hot key is promoted");
+	// The range root must exist before the rest of the payload arrives. Its name carries "~r.".
+	await awaitLeaves(db, (leaves) => leaves.some((name) => name.includes("~r.")), "the hot key is promoted");
 	return { db, model };
 }
 

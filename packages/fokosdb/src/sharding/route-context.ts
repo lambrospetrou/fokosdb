@@ -11,6 +11,12 @@ import type { RangeAncestorInfo } from "./types.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
 
+/**
+ * The separator between the shard group and the rest of a DO name. A shard group must not contain
+ * it (`validateTopology`), so the first "~" of a name always ends the shard group.
+ */
+export const SHARD_GROUP_SEPARATOR = "~";
+
 export type FokosTopology = {
 	shardGroup: string;
 	rootTreesN: number;
@@ -37,7 +43,7 @@ export type FokosRouteContext<TPolicy> = {
 	 * a hash partition, and `"01"` and two base64url parts for a range partition.
 	 */
 	partitionId: string;
-	/** `<shardGroup>.h.<root>[.<child>...]` or `<shardGroup>.r.<hk>.<start>.<end>`. */
+	/** `<shardGroup>~h.<root>[.<child>...]` or `<shardGroup>~r.<hk>.<start>.<end>`. */
 	doName: string;
 	/** Immutable topology of the shard group. Persisted at creation. A later mismatch is an error. */
 	topology: FokosTopology;
@@ -100,6 +106,9 @@ export const FOKOS_HASH_PARTITIONS_MAX = 65_000;
 export function validateTopology(topology: FokosTopology): void {
 	if (typeof topology.shardGroup !== "string" || topology.shardGroup.length === 0) {
 		throw invalid("shardGroup", topology.shardGroup, "shardGroup must be a non-empty string");
+	}
+	if (topology.shardGroup.includes(SHARD_GROUP_SEPARATOR)) {
+		throw invalid("shardGroup", topology.shardGroup, `shardGroup must not contain "${SHARD_GROUP_SEPARATOR}"`);
 	}
 	if (!Number.isInteger(topology.rootTreesN) || topology.rootTreesN < 1 || topology.rootTreesN > FOKOS_HASH_PARTITIONS_MAX) {
 		throw invalid("rootTreesN", topology.rootTreesN, `rootTreesN must be between 1 and ${FOKOS_HASH_PARTITIONS_MAX}`);

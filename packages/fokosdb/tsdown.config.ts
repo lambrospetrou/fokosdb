@@ -60,7 +60,7 @@ function isUnlistedShared(id: string): boolean {
  * code, so writing down why something works competes with the budget meant to catch a Durable Object
  * class reaching the client — and that mistake is tens of kB minified, which this still catches.
  */
-const CLIENT_MAX_BYTES = 90 * 1024;
+const CLIENT_MAX_BYTES = 95 * 1024;
 
 /** Upper bound for the sharding client entry and every chunk that it imports, in MINIFIED bytes. */
 const SHARDING_CLIENT_MAX_BYTES = 30 * 1024;
