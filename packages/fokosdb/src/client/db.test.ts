@@ -872,10 +872,12 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			});
 			try {
 				await expect(db.destroy()).resolves.toEqual({ ok: true });
-				const table = db.options().topology.topology.shardGroup;
+				const partitions = db.options().topology.topology.shardGroup;
+				expect(partitions).toMatch(/^fokos\.p\./);
+				const table = partitions.slice("fokos.p.".length);
 				expect(walked).toEqual([
 					{ shardGroup: `fokos.tc.${table}`, rootTreesN: 4 },
-					{ shardGroup: table, rootTreesN: 2 },
+					{ shardGroup: partitions, rootTreesN: 2 },
 				]);
 			} finally {
 				walk.mockRestore();

@@ -15,6 +15,7 @@ import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../shar
 import { validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
+import invariant from "./invariant.js";
 
 export type SplitConditions = {
 	/** The size in megabytes that makes the partition split. */
@@ -55,9 +56,20 @@ export type FokosDbRouteContext = FokosRouteContext<FokosDbPolicy>;
 
 /**
  * FokosDB names its own shard groups with this prefix, so a table name must not start with it. The
- * coordinator group of a table is `fokos.tc.<tableName>`.
+ * partition group of a table is `fokos.p.<tableName>`, and its coordinator group is `fokos.tc.<tableName>`.
  */
 export const RESERVED_SHARD_GROUP_PREFIX = "fokos.";
+
+const PARTITION_SHARD_GROUP_PREFIX = `${RESERVED_SHARD_GROUP_PREFIX}p.`;
+
+/** The coordinator group of a table, `fokos.tc.<tableName>`, from the partition group of the table. */
+export function coordinatorShardGroup(topology: FokosTopology): string {
+	invariant(
+		topology.shardGroup.startsWith(PARTITION_SHARD_GROUP_PREFIX),
+		`fokos/partition-context: the partition shard group must start with "${PARTITION_SHARD_GROUP_PREFIX}"`,
+	);
+	return `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup.slice(PARTITION_SHARD_GROUP_PREFIX.length)}`;
+}
 
 /** The part of a route context that selects a namespace and a stub: enough for a Worker with no partition in mind. */
 export type FokosDbStubContext = Pick<FokosDbRouteContext, "topology" | "policy">;
@@ -97,8 +109,14 @@ export class PartitionContextCreator {
 			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be provided");
 		}
 
+		if (typeof opts.tableName !== "string" || opts.tableName.length === 0) {
+			throw invalid("tableName", opts.tableName, "tableName must be a non-empty string");
+		}
+		if (opts.tableName.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
+			throw invalid("tableName", opts.tableName, `tableName must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
+		}
 		const topology: FokosTopology = {
-			shardGroup: opts.tableName,
+			shardGroup: `${PARTITION_SHARD_GROUP_PREFIX}${opts.tableName}`,
 			rootTreesN: opts.rootTreesN,
 			hashSplitN: opts.hashSplitN,
 			// A table that selects no jurisdiction stores a topology byte-identical to one built without
@@ -106,9 +124,6 @@ export class PartitionContextCreator {
 			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
 		};
 		validateTopology(topology);
-		if (topology.shardGroup.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
-			throw invalid("shardGroup", topology.shardGroup, `shardGroup must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
-		}
 
 		const rangeConfig: FokosRangeConfig = { rangeSplitN, rangeAncestors };
 		validateRangeConfig(rangeConfig);

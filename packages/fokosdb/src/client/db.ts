@@ -105,7 +105,7 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { RESERVED_SHARD_GROUP_PREFIX, type FokosDbPolicy } from "../shared/partition-context.js";
+import { coordinatorShardGroup, type FokosDbPolicy } from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
@@ -337,7 +337,7 @@ export class FokosDB {
 	#options: Required<FokosDBOptions>;
 	/** The partitions of the table. */
 	#partitions: FokosShardingClient<FokosDbPolicy, PartitionOps>;
-	/** The coordinator group of the table, `fokos.tc.<shardGroup>`. */
+	/** The coordinator group of the table, `fokos.tc.<tableName>`. */
 	#coordinators: FokosShardingClient<FokosDbPolicy, CoordinatorOps>;
 
 	constructor(options: FokosDBOptions) {
@@ -368,7 +368,7 @@ export class FokosDB {
 		this.#coordinators = new FokosShardingClient({
 			topology: {
 				...topology,
-				shardGroup: `${RESERVED_SHARD_GROUP_PREFIX}tc.${topology.shardGroup}`,
+				shardGroup: coordinatorShardGroup(topology),
 				rootTreesN: coordinatorRootsN,
 			},
 			rangeConfig,

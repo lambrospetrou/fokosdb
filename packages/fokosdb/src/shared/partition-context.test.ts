@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { PartitionContextCreator } from "./partition-context.js";
+import { coordinatorShardGroup, PartitionContextCreator } from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
+import { FokosRouter } from "../sharding/router.js";
+import { KeyCodec } from "../sharding/key-codec.js";
 
 function makeOpts(overrides?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
 	return {
@@ -46,7 +48,7 @@ describe("PartitionContextCreator.create — rangeAncestorsConfig", () => {
 describe("PartitionContextCreator.create — the split of one table configuration", () => {
 	it("puts the immutable fields in the topology and the FokosDB fields in the policy", () => {
 		const cfg = PartitionContextCreator.create(makeOpts({ jurisdiction: "eu", locationHint: "weur" }));
-		expect(cfg.topology).toEqual({ shardGroup: "testdb", rootTreesN: 1, hashSplitN: 4, jurisdiction: "eu" });
+		expect(cfg.topology).toEqual({ shardGroup: "fokos.p.testdb", rootTreesN: 1, hashSplitN: 4, jurisdiction: "eu" });
 		expect(cfg.rangeConfig).toEqual({ rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } });
 		expect(cfg.policy).toEqual({
 			ns: "PARTITION_DO",
@@ -61,6 +63,19 @@ describe("PartitionContextCreator.create — the split of one table configuratio
 		const cfg = PartitionContextCreator.create(makeOpts());
 		expect("jurisdiction" in cfg.topology).toBe(false);
 		expect("locationHint" in cfg.policy).toBe(false);
+	});
+});
+
+describe("PartitionContextCreator.create — the shard groups of a table", () => {
+	it("names the partitions fokos.p.<tableName> and the coordinators fokos.tc.<tableName>", () => {
+		const cfg = PartitionContextCreator.create(makeOpts({ tableName: "orders" }));
+		expect(cfg.topology.shardGroup).toBe("fokos.p.orders");
+		expect(coordinatorShardGroup(cfg.topology)).toBe("fokos.tc.orders");
+		const hk = KeyCodec.encode("hk");
+		const partitions = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy);
+		expect(partitions.rootContext(hk).doName).toMatch(/^fokos\.p\.orders~h\.\d+$/);
+		const coordinators = new FokosRouter({ ...cfg.topology, shardGroup: coordinatorShardGroup(cfg.topology) }, cfg.rangeConfig, cfg.policy);
+		expect(coordinators.rootContext(hk).doName).toMatch(/^fokos\.tc\.orders~h\.\d+$/);
 	});
 });
 
@@ -116,8 +131,9 @@ describe("PartitionContextCreator.create option errors", () => {
 	it.each([
 		["rootTreesN", { rootTreesN: 0 }, 0],
 		["hashSplitN", { hashSplitN: 1 }, 1],
-		["shardGroup", { tableName: "fokos.mine" }, "fokos.mine"],
-		["shardGroup", { tableName: "" }, ""],
+		["tableName", { tableName: "fokos.mine" }, "fokos.mine"],
+		["tableName", { tableName: "" }, ""],
+		["shardGroup", { tableName: "a~b" }, "fokos.p.a~b"],
 		["hashSplitConditions.maxItems", { hashSplitConditions: { maxSizeMb: 100, maxItems: -1 } }, -1],
 		["rangeAncestors.fromLeaf", { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 11 } }, 11],
 	])("reports an invalid %s as partition_context_options_invalid", (option, overrides, value) => {

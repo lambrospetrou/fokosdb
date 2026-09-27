@@ -7,6 +7,10 @@
  */
 import { expect, it } from "vitest";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
+import { encodeRangeComponent } from "../../src/sharding/partition-id.js";
+
+// The encoder of partition-id.ts: a view only for an incomplete tail, a test, and a scan only on a match.
+const encodeComponent = (bytes: Uint8Array) => encodeRangeComponent(KeyCodec.asKeyBytes(bytes));
 
 const MIN_BATCH_MS = 200;
 const SAMPLES = 7;
@@ -199,27 +203,6 @@ function encoderC(bytes: Uint8Array): string {
 		return "~b" + base64url(bytes);
 	}
 	text = escapeScan(text);
-	for (let i = tail; i < bytes.length; i++) {
-		text += HEX[bytes[i]];
-	}
-	return text;
-}
-
-/** The encoder of the RFC: a view only for an incomplete tail, a test, and a scan only on a match. */
-function encodeComponent(bytes: Uint8Array): string {
-	if (bytes[0] === 0xff) {
-		return "~b" + base64url(bytes);
-	}
-	const tail = tailStart(bytes);
-	let text: string;
-	try {
-		text = decoder.decode(tail === bytes.length ? bytes : bytes.subarray(0, tail));
-	} catch {
-		return "~b" + base64url(bytes);
-	}
-	if (ESCAPE_TEST.test(text)) {
-		text = escapeScan(text);
-	}
 	for (let i = tail; i < bytes.length; i++) {
 		text += HEX[bytes[i]];
 	}

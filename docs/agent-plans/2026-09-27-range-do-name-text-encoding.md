@@ -1,10 +1,12 @@
 # RFC — Unambiguous and readable partition DO names
 
-**State:** Draft  
+**State:** Implemented  
 **Date:** 2026-09-27  
 **Author:** Lambros Petrou
 
-**Status:** No code change exists yet.
+**Status:** Implemented: the text encoding of the range components, the `~` shard group separator, and the
+`fokos.p.` partition shard group. Milestone 4 is a release step: it deletes the Worker and all its Durable Objects
+before it deploys the new version.
 
 ## Table of contents
 
@@ -389,7 +391,8 @@ The tests must pin exact names, because each name is a permanent address.
 - A leading U+FEFF, which must stay in the name as `%EF%BB%BF`.
 - Bytes that are not valid UTF-8 before the tail, which must give the `~b` form.
 - A string key that equals `~min`, `~max`, or starts with `~b`, which must not collide with the reserved forms.
-- A property test over random byte strings: a test-only parser must rebuild the original bytes from each name.
+- A property test (`test/property-based/partition-names.test.ts`): a test-only parser must rebuild the original bytes
+  from each name component, and the shard group and the identity from each DO name.
 
 ## 5. Alternative options
 

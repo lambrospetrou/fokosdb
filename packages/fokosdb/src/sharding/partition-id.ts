@@ -1,6 +1,6 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
-import type { FokosPartitionIdentity, FokosRouteContext } from "./route-context.js";
+import { SHARD_GROUP_SEPARATOR, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { assertExists } from "../shared/tsutils.js";
@@ -14,43 +14,162 @@ import invariant from "../shared/invariant.js";
  */
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
-// routing comparisons — there boundaries stay `KeyBytes | null` with null = unbounded). Collision-proof
-// by construction: encodeRangeComponent escapes the byte 0x7E ("~") to "%7E", so a "~"-prefixed token
-// can never equal an encoded real boundary. No "exclude from valid sk" validation is required.
+// routing comparisons — there boundaries stay `KeyBytes | null` with null = unbounded). The component
+// encoding escapes "~", and base64url has no "~", so an encoded boundary never starts with "~m".
 export const RANGE_MIN = "~min";
 export const RANGE_MAX = "~max";
 
-// Byte-correct percent-encoder for range DO names (SPEC sharp-edge #3). Each byte either passes through
-// literally (safe-set: printable ASCII 0x21–0x7D minus the reserved bytes below) or becomes %XX. This
-// is identity/serialization ONLY — never sorted or range-compared (ordering is always on KeyBytes).
-// Reserved (always escaped): % (the escape), . (our DO-name component delimiter), " and \ (JSON/log
-// cleanliness), and 0x7E ("~", reserved for the RANGE_MIN/RANGE_MAX sentinels). Control/high/binary
-// bytes (incl. the 0xFF binary-key tag) escape too — readable for ASCII text, reversible for any bytes.
-function isSafeNameByte(b: number): boolean {
-	if (b < 0x21 || b > 0x7d) {
-		return false;
-	} // control, space, DEL, and 0x7E (~, sentinel-reserved)
-	return b !== 0x22 /* " */ && b !== 0x25 /* % */ && b !== 0x2e /* . */ && b !== 0x5c /* \\ */;
+// The marker of a component in the base64url form.
+const BINARY_COMPONENT_MARKER = "~b";
+
+// The "%XX" escape of each byte, with uppercase hex digits.
+const PERCENT_HEX: string[] = [];
+for (let b = 0; b < 256; b++) {
+	PERCENT_HEX.push("%" + b.toString(16).padStart(2, "0").toUpperCase());
 }
 
-// No matching decoder by design: the DO name is identity/serialization ONLY and is never decoded back
-// to keys in business logic — the in-memory range identity comes from the opaque partitionId.
-function encodeRangeComponent(bytes: KeyBytes): string {
-	let out = "";
-	for (const b of bytes) {
-		out += isSafeNameByte(b) ? String.fromCharCode(b) : "%" + b.toString(16).padStart(2, "0").toUpperCase();
+// The escape set of the text form, as fixed code point ranges. A change to this set, or to
+// `isEscapedCodeUnit`, changes DO names and makes the data of the partitions unreachable. Do not use
+// Unicode properties here: their content changes with the Unicode version of the runtime.
+// U+0000–U+0020 controls and space, `"`, `%`, `.`, `\`, U+007E–U+009F (`~`, DEL, C1 controls),
+// zero-width and direction marks, line and paragraph separators, bidirectional controls, and U+FEFF.
+// oxlint-disable-next-line no-control-regex
+const ESCAPE_SET = /[\u0000-\u0020\u0022\u0025\u002e\u005c\u007e-\u009f\u200b-\u200f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]/;
+
+/** True when the code unit is in the escape set. It must agree with `ESCAPE_SET`. */
+function isEscapedCodeUnit(cu: number): boolean {
+	if (cu < 0xa0) {
+		return cu <= 0x20 || cu >= 0x7e || cu === 0x22 || cu === 0x25 || cu === 0x2e || cu === 0x5c;
 	}
-	return out;
+	return (
+		(cu >= 0x200b && cu <= 0x200f) ||
+		cu === 0x2028 ||
+		cu === 0x2029 ||
+		(cu >= 0x202a && cu <= 0x202e) ||
+		(cu >= 0x2066 && cu <= 0x2069) ||
+		cu === 0xfeff
+	);
+}
+
+/**
+ * The "%XX" escapes of the UTF-8 bytes of a code unit of the escape set. It writes the UTF-8 bytes
+ * directly, with no `TextEncoder` call:
+ *
+ *   U+0000–U+007F: 1 byte   0xxxxxxx
+ *   U+0080–U+07FF: 2 bytes  110xxxxx 10xxxxxx
+ *   U+0800–U+FFFF: 3 bytes  1110xxxx 10xxxxxx 10xxxxxx
+ *
+ * The lead byte holds the high bits of the code unit after its length marker (0xC0 or 0xE0). Each
+ * continuation byte holds the next 6 bits after the marker 0x80. Each code point of the escape set is
+ * below U+10000 and is not a surrogate, so one code unit is the whole character, and the 4-byte form
+ * of UTF-8 does not occur.
+ */
+function escapeCodeUnit(cu: number): string {
+	if (cu < 0x80) {
+		return PERCENT_HEX[cu];
+	}
+	if (cu < 0x800) {
+		// The high 5 bits, then the low 6 bits.
+		return PERCENT_HEX[0xc0 | (cu >> 6)] + PERCENT_HEX[0x80 | (cu & 0x3f)];
+	}
+	// The high 4 bits, then the middle 6 bits, then the low 6 bits.
+	return PERCENT_HEX[0xe0 | (cu >> 12)] + PERCENT_HEX[0x80 | ((cu >> 6) & 0x3f)] + PERCENT_HEX[0x80 | (cu & 0x3f)];
+}
+
+/** Escapes each code unit of the escape set, and appends the text between two escapes as one slice. */
+function escapeText(text: string): string {
+	let out = "";
+	let last = 0;
+	for (let i = 0; i < text.length; i++) {
+		const cu = text.charCodeAt(i);
+		if (isEscapedCodeUnit(cu)) {
+			out += text.slice(last, i) + escapeCodeUnit(cu);
+			last = i + 1;
+		}
+	}
+	return out + text.slice(last);
+}
+
+/**
+ * The start of the incomplete UTF-8 character at the end of `bytes`, or `bytes.length` when the last
+ * character is complete.
+ *
+ * A range boundary is a byte prefix of a string key, so the cut can stop inside a multi-byte
+ * character. For example, "録" is E9 8C B2, and a boundary can end with E9 or E9 8C. The encoder
+ * decodes the bytes before the tail as text, and writes each tail byte as "%XX".
+ *
+ * How it works: a UTF-8 character is one lead byte and then 0 to 3 continuation bytes (10xxxxxx). The
+ * loop goes back over the continuation bytes at the end, at most 3, to the last lead byte. The lead
+ * byte gives the length of its character: 110xxxxx is 2 bytes, 1110xxxx is 3, and 11110xxx is 4. When
+ * fewer bytes follow the lead byte than that length, the character is incomplete and the tail starts
+ * at the lead byte.
+ *
+ * Invariant: the tail has 0 to 3 bytes, it is only at the end, and it is the start of a character
+ * that the cut stopped. Thus for a valid UTF-8 string cut at any byte, the bytes before the tail are
+ * valid UTF-8, and the decode succeeds. For any other bytes the result is still a correct index, but
+ * the decode can fail, and then the encoder uses the "~b" form. Examples:
+ *
+ *   61 E9 8C        lead E9 needs 3 bytes, 2 are present  --> tail starts at index 1
+ *   61 F0 9F 8E 89  lead F0 needs 4 bytes, 4 are present  --> no tail
+ *   61 62           the last byte is ASCII                --> no tail
+ *   61 F8           F8 is not a lead byte                 --> no tail, and the decode fails
+ */
+function incompleteTailStart(bytes: Uint8Array): number {
+	for (let i = bytes.length - 1; i >= Math.max(0, bytes.length - 3); i--) {
+		const b = bytes[i];
+		// A continuation byte (10xxxxxx): continue back to the lead byte.
+		if ((b & 0xc0) === 0x80) {
+			continue;
+		}
+		// The length of the character that starts here. 1 for ASCII and for a byte that starts no character.
+		const length = b >= 0xc0 && b <= 0xdf ? 2 : b >= 0xe0 && b <= 0xef ? 3 : b >= 0xf0 && b <= 0xf7 ? 4 : 1;
+		return bytes.length - i < length ? i : bytes.length;
+	}
+	// The last 3 bytes are continuation bytes. They end a complete 4-byte character, or the bytes are
+	// not UTF-8 and the decode fails.
+	return bytes.length;
+}
+
+// `ignoreBOM` keeps a leading U+FEFF, so that the escape step writes it into the name.
+const UTF8_DECODER = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+
+/**
+ * The DO name form of one range component. It is deterministic and injective, and it never contains ".":
+ * - A binary key (first byte 0xFF) gives "~b" and the unpadded base64url of all its bytes.
+ * - A string key gives its text. Each code unit of the escape set becomes "%XX" for each of its UTF-8
+ *   bytes, and each byte of an incomplete UTF-8 sequence at the end becomes "%XX". "%" is in the
+ *   escape set, so each "%XX" is exactly one byte.
+ * - Bytes that are not valid UTF-8 before the tail give the "~b" form. No string key gives them.
+ * The DO name is the address of the partition data, so this encoding must never change.
+ */
+export function encodeRangeComponent(bytes: KeyBytes): string {
+	if (bytes[0] === 0xff) {
+		return BINARY_COMPONENT_MARKER + toBase64Url(bytes);
+	}
+	const tail = incompleteTailStart(bytes);
+	let text: string;
+	try {
+		text = UTF8_DECODER.decode(tail === bytes.length ? bytes : bytes.subarray(0, tail));
+	} catch {
+		return BINARY_COMPONENT_MARKER + toBase64Url(bytes);
+	}
+	if (ESCAPE_SET.test(text)) {
+		text = escapeText(text);
+	}
+	for (let i = tail; i < bytes.length; i++) {
+		text += PERCENT_HEX[bytes[i]];
+	}
+	return text;
 }
 
 // Range DO name. null start/end render to the ~min/~max sentinels so every DO has the identical
-// three-component shape (the range root is db.r.<hk>.~min.~max, addressable from hashKey alone).
-// The ".r." namespace marker keeps range and hash DO names disjoint (hash = "db.h.…", range = "db.r.…").
+// three-component shape (the range root is <shardGroup>~r.<hk>.~min.~max, addressable from hashKey
+// alone). The "r." and "h." markers after the separator keep range and hash DO names disjoint.
 function rangePartitionDoName(shardGroup: string, hashKey: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): string {
 	const hk = encodeRangeComponent(hashKey);
 	const start = startBoundary === null ? RANGE_MIN : encodeRangeComponent(startBoundary);
 	const end = endBoundary === null ? RANGE_MAX : encodeRangeComponent(endBoundary);
-	return `${shardGroup}.r.${hk}.${start}.${end}`;
+	return `${shardGroup}${SHARD_GROUP_SEPARATOR}r.${hk}.${start}.${end}`;
 }
 
 /** The route context of a range partition (root or child) of the same shard group as `base`. */
@@ -274,7 +393,7 @@ export class PartitionIdHelper {
 			const root = (bytes[1] << 8) | bytes[2];
 			const depth = bytes[3];
 			const suffix = depth > 0 ? "." + bytes.subarray(4, 4 + depth).join(".") : "";
-			return `${shardGroup}.h.${root}${suffix}`;
+			return `${shardGroup}${SHARD_GROUP_SEPARATOR}h.${root}${suffix}`;
 		}
 		invariant(bytes[0] === PartitionIdHelper.SCHEMA_RANGE_V1, `fokos/topology: unsupported partition ID schema version: ${bytes[0]}`);
 		const decoded = PartitionIdHelper.decode(bytes);

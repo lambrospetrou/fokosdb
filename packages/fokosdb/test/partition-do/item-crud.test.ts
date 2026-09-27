@@ -16,7 +16,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 				rowsWritten: 0,
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^test\..+/),
+				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
@@ -128,7 +128,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
 			servedByActorId: expect.any(String),
-			servedByActorName: expect.stringMatching(/^test\..+/),
+			servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
 		});
 	});
 
@@ -172,7 +172,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 				rowsWritten: expect.any(Number),
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^test\..+/),
+				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
 			},
 		});
 	});
@@ -293,7 +293,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 				rowsWritten: 0,
 				databaseSize: expect.any(Number),
 				servedByActorId: expect.any(String),
-				servedByActorName: expect.stringMatching(/^test\..+/),
+				servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
 				servedByPartitionId: expect.any(String),
 				forwardCount: 0,
 				hashDepth: 0,
@@ -385,7 +385,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 			rowsWritten: expect.any(Number),
 			databaseSize: expect.any(Number),
 			servedByActorId: expect.any(String),
-			servedByActorName: expect.stringMatching(/^test\..+/),
+			servedByActorName: expect.stringMatching(/^fokos\.p\.test\..+~h\./),
 			servedByPartitionId: expect.any(String),
 		});
 	});
