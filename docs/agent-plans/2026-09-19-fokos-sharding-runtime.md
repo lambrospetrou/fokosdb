@@ -138,6 +138,7 @@ surface, and its data semantics.
 - One target step must pull and commit at most one page. One pass runs up to the value from
   `runtimeConfig().importPagesPerPass`. The default is 16 and the minimum is 1.
 - The serialized `servedBy` list of one envelope must stay at or below `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB).
+  **Changed on 2026-09-27:** the node that the cap always keeps (section 4.2.9) can cross the cap by itself.
 
 ## 3. Milestones
 
@@ -849,6 +850,12 @@ interface FokosShardingHooks<TPolicy> {
 	 * retry at the flat lock interval. The first point stops a range root from being created for a key
 	 * that cannot move yet; the second closes the window in which a lock appeared while the targets
 	 * were created. FokosDB returns `pendingLockCountForHashKey(hk) === 0` for a promotion. Synchronous.
+	 *
+	 * Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: FokosDB no longer implements this
+	 * hook. A promotion cuts over with the locks of its key. The hook stays for other hosts. The runtime
+	 * exports `fokos.sql.movedHashKeys()`, a SQL fragment that selects the hash keys of the promotions in
+	 * `cutover` or `completed`, so a host scan can exclude the rows it no longer owns without naming a
+	 * `fokos_` table.
 	 */
 	beforeCutover?(plan: FokosRepartitionPlan): boolean;
 
@@ -1071,6 +1078,11 @@ transaction id, not by key. Its `beforeForward` calls `cancelLocal(transactionId
 `repartitionUnblocked` on every node the cancel passes through, and its `local` handler is then empty.
 `beforeForward` runs before the remote groups start, so a child failure cannot leave the local row behind.
 
+> Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: `txCancel` has no `beforeForward`. Its
+> release runs in its `local` handler on the owned part of the request, which the runtime resolved in the same
+> synchronous block. A router keeps its pre-cutover lock rows until the completion transaction deletes them.
+> An empty `items` list is refused.
+
 For a `range` operation, the runtime computes the visits before it calls `walk`. The functions in the walk input
 record each local scope and forwarded envelope. The host must use only those functions to reach partitioned
 data. `fokosExecuteLocal` clips the request to the caller slice and calls only the descriptor's `local` handler.
@@ -1252,6 +1264,14 @@ at the head of the list also always survives the byte cap. A forwarding
 partition learns from `error.routing`, adds its RPC count, and rethrows the same error object. A partition
 without an identity attaches no routing data.
 
+**Changed on 2026-09-27:** the byte cap always keeps one node. The runtime first chooses that node: the raiser
+on an error, and otherwise the first node with the highest role. The count starts with the size of that node.
+Then the runtime adds the other nodes in insertion order, and drops a node that would cross the cap and every
+later one. The output keeps the insertion order. So a list is never empty when the partition collected a node,
+and it holds at most one node that crosses the cap. A range node with the largest keys crosses the cap by
+itself. When a sender forgets a target that refused a forward and resolves the request again, the target stops
+being the raiser. `docs/agent-plans/2026-09-27-range-self-hint-and-route-evidence-floor.md` gives the details.
+
 Every operation returns an envelope, including transaction operations. `TransactionCoordinatorDO` unwraps the
 envelope of `txPrepare`, `txCommit`, and `txCancel` where it calls `partitionStubByName`. `db.ts` unwraps every
 partition call with `FokosRouter.unwrap`. The unwrap removes `_rangeAncestors`. FokosDB builds `meta` from the
@@ -1370,6 +1390,8 @@ What changes against the shipped flow:
 - `repartitionUnblocked: true` is the shipped `onLockReleased`: one indexed check for a row that `beforeCutover`
   held back, then `markPromotionsDueNow` in one `transactionSync` and the fast path. A partition with no held
   row pays the check and nothing else. FokosDB returns it from `txCommit` and `txCancel` after a local success.
+  Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: FokosDB no longer signals it, because no
+  promotion waits on a lock. The signal stays in the runtime for other hosts.
 - A synchronous arbitration precheck rejects an ineligible queue attempt without an alarm write. For a possible
   new row, or an unfinished row that still needs work, the runtime moves the fallback alarm earlier before it
   opens the queue transaction. The transaction repeats arbitration and writes the decision. A failed fallback
@@ -1663,7 +1685,10 @@ The FokosDB host maps current mechanisms as follows:
   `attempt_all`.
 - The unconditional `cancelLocal(transactionId)` at the top of `txCancel` becomes its `beforeForward`, so a
   router releases its own pre-cutover lock rows before it forwards (section 4.2.6). Its `local` is empty.
-- `wakeLockBlockedPromotion` in `txCommit` and `txCancel` becomes the `repartitionUnblocked` signal.
+  Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the release runs in `local` on owned
+  rows only, and `txCancel` has no `beforeForward`.
+- `wakeLockBlockedPromotion` in `txCommit` and `txCancel` becomes the `repartitionUnblocked` signal. Superseded
+  by the same document: the two signals are removed.
 - The alarm after an accepted `prepareLocal` becomes a `stale_tx_recovery` job signal.
 - `routeSingleDestination` becomes the `single_owner` shape.
 - `walkRangeChildren` becomes the host `walk` callback of the `range` shape. It owns `QueryPageBudget` and the
@@ -1758,10 +1783,12 @@ not readable by the old code.
   remote groups are in flight finds the local lock already written on the node that owned the key at
   resolution time, and never on a node that resolved after the cutover.
 - A `beforeForward` test proves that `txCancel` on a router between cutover and completion deletes the router's
-  own pending rows and forwards to every child.
+  own pending rows and forwards to every child. Superseded by
+  `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the router keeps its rows until completion and forwards.
 - A `repartitionUnblocked` test proves that a promotion held by a lock cuts over on the pass right after the
   cancel, not after the flat lock interval. A companion test proves that a locked key gets no range root until
-  `beforeCutover` returns true.
+  `beforeCutover` returns true. Superseded by the same document: a lock does not hold a promotion, and the
+  tests prove the transfer of the lock instead.
 - Scheduler tests prove that a `scheduleJob` call during an async `runStep` survives the pass, and that a router
   with pending rows and a stale-recovery `deadline()` in the past re-arms no alarm for that job.
 - Repartition tests crash after queue and prove that the queue-time policy and data survive. They prove that

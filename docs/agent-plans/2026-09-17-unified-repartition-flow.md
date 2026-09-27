@@ -693,6 +693,12 @@ Before promotion initialization, the source must check that the key has no pendi
 target `pending`. The source retries this guard every 5 seconds. The cutover transaction must check the lock
 count again.
 
+> Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: a promotion cuts over with the locks of
+> its key. No lock check runs before initialization or at cutover. The pending stream copies the lock rows to
+> the range root, and the source keeps them as transfer copies until the target acknowledges. The source tells
+> a copy from an owned row by the state of the promotion row, through `owns()` and a SQL fragment the runtime
+> exports.
+
 A target in `initializing` means that an initialization call can be in flight or can have lost its reply. A due
 retry must repeat the same idempotent `fokosInit` call.
 
@@ -732,6 +738,11 @@ A guarded lock counts as a lock. A guarded row waits for `debugForceResolveTrans
 and the hash split behind it wait for the operator. The stale-transaction guard logs that row once when it
 quarantines it. This keeps the current behavior. The promotion must not skip a guarded row: a later forced
 commit would route the key to the range root, find no pending row, and lose the write.
+
+> Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the condition "the key has no lock" in the
+> row "Cut over a promotion" and the two paragraphs above no longer apply. A lock, guarded or not, moves with
+> its key, `guarded_at` included. A forced commit at the range root finds the copied row. A lock no longer
+> delays a promotion or the hash split behind it.
 
 A hash split row in any state must block a promotion on that source. A split source in `cutover` or
 `completed` is a router and owns no hash key.
@@ -928,6 +939,10 @@ metadata when the slice has no pending row.
 
 A promoted-key slice has no lock because promotion cutover requires a zero lock count. It still receives the
 deletion metadata.
+
+> Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: a promoted-key slice can have locks. The
+> stream copies them with their `guarded_at`, and the target inserts them as owned rows. The empty page with
+> deletion metadata stays for a slice with no lock.
 
 #### 4.7.4 Page bounds and cursor rules
 
@@ -1152,7 +1167,9 @@ The mechanisms hold these invariants:
 - A promoted-key read reaches the range tree. Overrides migrate first, and read-through follows them.
 - Each migration step is bounded and durable. One bounded page commits with its cursor.
 - A pre-split lock moves to its owner. The `pending_tx` stream completes before `imported`.
-- A promotion does not move a locked key. The source checks before init and during cutover.
+- A promotion does not move a locked key. The source checks before init and during cutover. Superseded by
+  `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: a promotion moves a locked key, and the source keeps a
+  transfer copy of each lock row until the target acknowledges.
 - A terminal promotion survives a hash split. The child receives its override and no item copy.
 - A decided transaction can always commit. Commit keeps `ignore_size_reject`.
 - Failed work keeps durable progress. Each job persists a guarded step and retry deadline.
@@ -1172,8 +1189,10 @@ The flow recovers as follows:
 - The source cannot accept an acknowledgement: the imported target continues to serve and retry.
 - A range split stops after partial initialization: its durable plan and target states remain.
 - A pull reaches the source before cutover: the target retries `repartition_not_cut_over`.
-- A promotion key has a lock: its target stays `pending`.
-- A lock appears during initialization: the promotion cutover guard fails.
+- A promotion key has a lock: its target stays `pending`. Superseded by
+  `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the target initializes and the lock moves with the key.
+- A lock appears during initialization: the promotion cutover guard fails. Superseded by the same document:
+  the cutover proceeds and the new lock row joins the transfer.
 - One selected target RPC fails: other calls finish, and only failed targets retry.
 - One repartition keeps failing: its later deadline lets another due row run.
 - An alarm job fails: it records another deadline before the alarm handler returns.
