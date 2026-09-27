@@ -151,8 +151,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	/** The mutable part of the last route context this partition received, from `__fokos/policy`. */
 	#stored?: FokosStoredPolicy<TPolicy>;
 	#routeCtx?: FokosRouteContext<TPolicy>;
-	/** The bounded ancestor boundaries of a range partition with its own appended last. Empty otherwise. */
-	#rangeAncestorsWithSelf: RangeAncestorInfo[] = [];
+	/** The bounded ancestor boundaries of a range partition, without its own slice. Empty otherwise. */
+	#rangeAncestors: RangeAncestorInfo[] = [];
 	#hashArena: HashTopology | null = null;
 	#bloom: PartialRangeTopology | null = null;
 	/** The plan of every visit `rangeVisits` returned, by the visit object, so `forwardRangeVisit` can fall back. */
@@ -1125,11 +1125,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#identity = identity;
 		this.#stored = stored;
 		this.#routeCtx = { schema: 2, ...identity.ref, topology: identity.topology, ...stored };
-		const range = identity.range;
-		this.#rangeAncestorsWithSelf =
-			range && range.ancestors.length > 0
-				? range.ancestors.concat({ depth: range.depth, startBoundary: range.start ?? NO_SORT_KEY, endBoundary: range.end ?? NO_SORT_KEY })
-				: [];
+		// The own slice is not in the list: a learner decodes it from the partition ID of the node.
+		this.#rangeAncestors = identity.range?.ancestors ?? [];
 	}
 
 	#selfNode(role: FokosServedRole): FokosRouteNode {
@@ -1141,7 +1138,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			hashDepth: identity.kind === "hash" ? depth : 0,
 			rangeDepth: identity.kind === "range" ? depth : 0,
 			role,
-			...(this.#rangeAncestorsWithSelf.length > 0 ? { _rangeAncestors: this.#rangeAncestorsWithSelf } : {}),
+			...(this.#rangeAncestors.length > 0 ? { _rangeAncestors: this.#rangeAncestors } : {}),
 		};
 	}
 
@@ -1475,11 +1472,16 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * Learns from the nodes of a child envelope for the hash keys of this request: the range
 	 * boundaries and the promotion of every range node, and the depth of the deepest hash node that
 	 * owns each key. The identity of a node is its scope, so a hash node owns a key when the key hashes
-	 * along its path, and a range node names its hash key itself.
+	 * along its path, and a range node names its hash key and its own slice itself.
+	 *
+	 * A slice is stored only when this partition can use it. A hash partition uses each slice below
+	 * the range root. A range partition at depth d uses only a slice strictly inside one of its
+	 * children, which is at depth d + 2 or deeper.
 	 */
 	#learn(nodes: readonly FokosRouteNode[], hashKeys: readonly KeyBytes[]): void {
 		const identity = this.identity();
 		const myDepth = identityDepth(identity);
+		const minRangeDepth = identity.kind === "hash" ? 1 : myDepth + 2;
 		const arena = identity.kind === "hash" ? this.#arena() : null;
 		let arenaChanged = false;
 		let bloomChanged = false;
@@ -1491,14 +1493,30 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		};
 		for (const node of nodes) {
 			if (isRangePartition(node.ref)) {
-				// Only the first part of the ID: the boundaries come from `_rangeAncestors`.
-				const hashKey = PartitionIdHelper.rangeHashKey(node.ref.partitionId);
+				let hashKey: KeyBytes;
+				if (node.rangeDepth >= minRangeDepth) {
+					const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(node.ref.partitionId));
+					invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/runtime.learn: a range node has a hash partition ID");
+					hashKey = decoded.hashKey;
+					this.#store.learnRangeBoundary(
+						hashKey,
+						decoded.startBoundary ?? NO_SORT_KEY,
+						decoded.endBoundary ?? NO_SORT_KEY,
+						node.rangeDepth,
+					);
+				} else {
+					// Only the first part of the ID, because the own slice of the node is not stored.
+					hashKey = PartitionIdHelper.rangeHashKey(node.ref.partitionId);
+				}
 				for (const ancestor of node._rangeAncestors ?? []) {
-					this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
+					if (ancestor.depth >= minRangeDepth) {
+						this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
+					}
 				}
 				if (identity.kind !== "hash") {
 					continue;
 				}
+				// Only hash partitions are relevant for the promotions of hash keys and hash splits.
 				const added = this.#bloomForLearning().learnPromotedKey(hashKey);
 				if (added === AddResult.Added) {
 					bloomChanged = true;

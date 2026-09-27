@@ -2,7 +2,7 @@
 
 **State:** Draft
 **Date:** 2026-09-26
-**Implementation:** Not implemented. Cancellation compatibility, recovery queries, and deployment choices remain open.
+**Implementation:** Not implemented.
 
 ## Table of contents
 
@@ -12,7 +12,7 @@
 - [4. Proposed solution](#4-proposed-solution)
   - [4.1 High-level overview](#41-high-level-overview)
   - [4.2 Technical details](#42-technical-details)
-  - [4.3 Open questions](#43-open-questions)
+  - [4.3 Decisions](#43-decisions)
 - [5. Alternative options](#5-alternative-options)
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
@@ -69,21 +69,28 @@ Three host paths must distinguish owned pending rows from transfer copies:
    not have copied those rows yet. An over-age unresolved payload can disappear instead of entering quarantine.
 2. `TransactionParticipant.commitLocal` compares the local request with every stored pending row for the
    transaction. A request for retained keys then conflicts with the copies of promoted keys.
-3. `debugForceResolveTransaction` currently discovers every locally stored pending row for the transaction.
-   It must exclude transfer copies. The operator addresses each current owner for emergency repair.
+3. `debugForceResolveTransaction` currently discovers every locally stored pending row for the transaction
+   and hands their keys to `dispatch`. The routing is safe, because `dispatch` resolves the owner of each key
+   again. The local mutation is not: the routed `txCommit` and `txCancel` must change owned rows only. The
+   handler must also report how many rows it resolved, because a call that finds no owned row answers today
+   with the same success as a real repair.
 
-After source cleanup, the old source has no moved keys to discover for emergency repair. Transparent repair
-through that old source is not a requirement of this change.
+After source cleanup, the old source has no moved keys to discover for emergency repair. Repair through that
+old source after its cleanup is not a requirement of this change.
 
 ## 2. Goals and requirements
 
 ### 2.1 In scope
 
 - A promotion must move a key with pending or quarantined transaction locks.
+- The cutover transaction of a promotion must record the promoted hash key as a transfer key, in one row,
+  whatever the number of pending rows under that key.
 - Local transaction validation and mutation must use locally owned pending rows.
 - Source recovery must preserve pending rows required by an unfinished transfer.
 - Promotion and split cancellation must preserve source transfer copies until acknowledgement permits cleanup.
 - Emergency repair must remain available on each complete current owner, with the existing request type.
+  Its response must say how many rows the partition resolved locally and how many keys it forwarded.
+- A `txCancel` request with no items must be refused.
 - The existing migration streams, import gate, routed operations, and coordinator recovery must remain in use.
 - Tests must cover transactions that span promoted keys and keys retained by the source.
 
@@ -96,8 +103,10 @@ through that old source is not a requirement of this change.
 - Removal of the mutual exclusion between a hash split and an unfinished promotion.
 - Removal of the Bloom fallback for an uninitialized or `awaiting_data` range root.
 - Automatic transaction-wide discovery of emergency-repair keys or current lock owners.
-- Emergency repair through the original source after its keys move.
+- Emergency repair through the original source after its cleanup removed the transfer copies.
 - New administrative APIs or records that prove a historical transaction outcome.
+- A rollback of the code on partitions that already hold a transfer key. The change ships to a new deployment
+  with no existing partitions.
 
 ### 2.3 Constraints
 
@@ -115,11 +124,22 @@ through that old source is not a requirement of this change.
 
 ## 3. Milestones
 
-The delivery milestones and deployment sequence remain open in section 4.3.3.
+Each milestone ends with `pnpm check` and `pnpm test` green. The promotion lock guard stays in place until
+milestone 4. Until then no production source holds a transfer copy, and the tests of the earlier milestones
+build that state by hand through the migration harness.
 
-The implementation has a required dependency order. Ownership-scoped participant operations and recovery must
-precede removal of the promotion lock guard. Emergency repair must respect ownership and work on complete targets.
-Section 4.2.12 defines the tests required before the guard is removed.
+1. **Transfer keys and owned-row scope.** Add the `transfer_hash_keys` table and the `onCutover` runtime hook
+   of section 4.2.8. Scope `commitLocal`, the cancel release, quarantine, guard removal, the stale selection,
+   and the recovery deadline to owned rows, as sections 4.2.5 and 4.2.6 define them. Refuse an empty cancel.
+   Tests: "Participant and routing tests" and "Recovery tests" of section 4.2.12.
+2. **Migration and cleanup.** Bound the pending-row deletion of promotion cleanup, delete the transfer key
+   last, and let the pending stream carry the rows of the promoted key. Tests: "Migration and coordinator
+   tests" and "Promotion cleanup tests" of section 4.2.12.
+3. **Emergency repair.** Route every row of the transaction, mutate owned rows only, and report the counts
+   of section 4.2.7. Tests: "Emergency-repair tests" of section 4.2.12.
+4. **Guard removal.** Remove the lock count from `beforeCutover`, remove the two `repartitionUnblocked`
+   signals, change the tests that hold a promotion with a lock, and add the "Superseded by" notes of
+   section 4.2.11 to the earlier documents.
 
 ## 4. Proposed solution
 
@@ -136,6 +156,10 @@ The design separates three responsibilities:
 | Authority | The current owner can resolve the pending operation, once its import is complete. |
 | Retention | The source keeps the pending payload until acknowledgement permits cleanup. |
 | Repair scope | The addressed owner obtains emergency-repair keys from its owned pending rows. |
+
+The cutover transaction of a promotion records the promoted hash key as a transfer key. Every local transaction
+path then reads its owned rows as the pending rows whose hash key is not a transfer key. One row marks the key,
+so the cutover transaction does not grow with the number of locks under it.
 
 After promotion, the source continues to resolve transactions for its retained keys. It excludes transfer copies
 from local commit validation and stale recovery. After a split, the source owns no application keys and resolves
@@ -157,8 +181,10 @@ The target can resolve a transaction before the source receives its acknowledgem
 source is then only a transfer copy. Its presence must not block another locally owned part of that transaction.
 
 Normal recovery continues through the coordinator. Quarantine remains a safeguard when decision evidence is
-missing. Emergency repair keeps the existing per-partition API. The operator calls each current lock owner,
-which reads its owned pending rows. This change adds no transaction-wide discovery protocol.
+missing. Emergency repair keeps the existing per-partition request. The operator calls a partition that holds
+rows of the transaction. That partition routes every row to its current owner, mutates only the rows it owns,
+and reports how many it resolved and how many keys it forwarded. This change adds no transaction-wide discovery
+protocol.
 
 ### 4.2 Technical details
 
@@ -167,8 +193,19 @@ which reads its owned pending rows. This change adds no transaction-wide discove
 An **owned pending row** belongs to a key for which `fokos.owns(key)` is true. An importing target owns its slice,
 but the import gate still prevents transaction resolution.
 
-A **transfer copy** is a source pending row whose key moved at cutover. Migration still needs that row until the
-required acknowledgement. The row can remain after the target resolves its own copy.
+A **transfer key** is a hash key that a promotion source has cut over and not yet cleaned. The source stores it
+in the host table `transfer_hash_keys (hk BLOB PRIMARY KEY)`. The table holds one row per promotion in flight,
+so it is normally empty or holds one row. A split source records no transfer key: it owns no key after cutover
+and resolves no transaction locally.
+
+A **transfer copy** is a source pending row whose hash key is a transfer key. Migration still needs that row
+until the required acknowledgement. The row can remain after the target resolves its own copy. The two
+definitions agree: a pending row for a transfer key can exist on the source only from before the cutover,
+because every later operation on that key resolves to the range root.
+
+The **owned-row predicate** is `hk NOT IN (SELECT hk FROM transfer_hash_keys)`. Every local transaction path
+of sections 4.2.5 to 4.2.7 selects, validates, mutates, and deletes pending rows through it. The probe is one
+seek into a table of at most a few rows. The host reads no `fokos_` table for the decision.
 
 Normal operations below include reads, writes, prepare, commit, cancel, and transactional reads. Normal lock
 conflicts and admission checks still apply.
@@ -212,8 +249,9 @@ normally. `R` is not yet an initialized target.
 prevent the proposed cutover. `R` remains `awaiting_data` and serves no application operation. The source refuses
 migration pulls before cutover. A direct ordinary read through `R` cannot bypass that restriction.
 
-**Stage 3 — Cutover recorded, import incomplete.** `S` routes normal operations for `K` to `R`. It retains item
-and pending-row copies for migration. It supplies migration pages and authorized ordinary read-through calls.
+**Stage 3 — Cutover recorded, import incomplete.** The cutover transaction inserted `K` into
+`transfer_hash_keys`. `S` routes normal operations for `K` to `R`. It retains item and pending-row copies for
+migration. It supplies migration pages and authorized ordinary read-through calls.
 It must not commit, cancel, quarantine, or recover `K` locally.
 
 `S` continues normal operations and stale recovery for `U`. Its local transaction checks exclude the transfer
@@ -232,7 +270,7 @@ pages and read-through calls for `K`. Requests for `K` still route to `R`. A los
 not prevent source cleanup or target service.
 
 **Stage 6 — Source cleanup complete.** The bounded batches of section 4.2.8 have removed both sets of copies for
-`K`. `S` removes the size estimate and keeps the route to the range tree. Cleanup leaves `U` and its locks
+`K`. `S` removes the size estimate and the transfer key, and keeps the route to the range tree. Cleanup leaves `U` and its locks
 untouched. An unresolved lock can remain at `R` after its source copy is gone.
 
 #### 4.2.3 A transaction across promoted and retained keys
@@ -323,19 +361,25 @@ until the cleanup condition in sections 4.2.2 and 4.2.4 holds.
 2. Validate the local request's key set.
 3. Select the pending rows to apply and delete.
 
-The local request must match the owned pending set when that set is nonempty. The method must preserve the
-existing mismatch error for a malformed request. If the owned pending set is empty, the method returns the
-existing idempotent success without treating transfer copies as unresolved local work.
+The owned pending set is the rows of the transaction that pass the owned-row predicate of section 4.2.1. The
+count, the key list, and the delete of the transaction gain that predicate and nothing else; no `owns()` call
+per row is needed. The local request must match the owned pending set when that set is nonempty. The method
+must preserve the existing mismatch error for a malformed request. If the owned pending set is empty, the
+method returns the existing idempotent success without treating transfer copies as unresolved local work.
 
 Validation, application, and deletion must remain atomic. Deletion must identify the transaction and its resolved
 local keys. Removing the mismatch check while keeping `deletePendingTx(transactionId)` would lose transfer copies.
 
-`txCancel.beforeForward` must stop deleting every stored pending row by transaction ID. A source must forward
-moved keys without deleting their copies. Cancellation resolves only the owned rows within its local scope.
-A pure split router performs no local cancellation.
+The release of `txCancel` moves from `beforeForward` into its `local` handler. The runtime hands that handler
+the owned part of the request, and the handler deletes the rows of the transaction whose keys are in that part
+and pass the owned-row predicate. A source therefore forwards moved keys without deleting their copies, and a
+pure split router, which has no owned part, performs no local cancellation. `txCancel` then has no
+`beforeForward`, and the note in `do-partition.ts` about a release that owner resolution could skip goes with it.
 
-An empty cancel must not erase transfer copies. Its current local-only compatibility contract needs a decision
-in section 4.3.1. Coordinator-driven cancellation continues to carry the transaction's routing keys.
+An empty `items` list is refused. The coordinator loads the keys of every participant from `tc_items` before
+it cancels, and that table is complete until the transaction completes, so no production caller sends an empty
+cancel. The `local` handler throws an invariant error for one, as `prepareLocal` does for a request without a
+coordinator reference, and the `CancelRequest` doc comment loses the sentence that allows the empty list.
 
 #### 4.2.6 Stale recovery and quarantine
 

@@ -39,6 +39,8 @@ const ROLE_RANK: Record<FokosServedRole, number> = { merged: 0, read_through: 1,
  */
 export class RouteCollector {
 	readonly #nodes = new Map<string, FokosRouteNode>();
+	/** The partition ID of the node that `addRaiser` put at the head of the list. */
+	#raiserId: string | undefined;
 	#forwardCount = 0;
 	#truncated = false;
 
@@ -62,16 +64,19 @@ export class RouteCollector {
 	/**
 	 * Lists `node` before every other, and keeps the stronger role when the list already holds this
 	 * partition. The error path uses it: a caller reads the partition that raised the error out of the
-	 * head of the list, and a node at the head always survives the byte cap. A fan-out that fails would
-	 * otherwise lead with a group that answered, because a remote node lands while the router awaits.
+	 * head of the list, and `build` always keeps the raiser. A fan-out that fails would otherwise lead
+	 * with a group that answered, because a remote node lands while the router awaits.
 	 */
 	addRaiser(node: FokosRouteNode): void {
+		this.#raiserId = node.ref.partitionId;
 		const held = this.#nodes.get(node.ref.partitionId);
-		const rest = [...this.#nodes].filter(([id]) => id !== node.ref.partitionId);
+		const rest = [...this.#nodes];
 		this.#nodes.clear();
 		this.#nodes.set(node.ref.partitionId, held && ROLE_RANK[held.role] > ROLE_RANK[node.role] ? held : node);
 		for (const [id, other] of rest) {
-			this.#nodes.set(id, other);
+			if (id !== node.ref.partitionId) {
+				this.#nodes.set(id, other);
+			}
 		}
 	}
 
@@ -81,6 +86,9 @@ export class RouteCollector {
 	 */
 	forget(partitionId: string): void {
 		this.#nodes.delete(partitionId);
+		if (this.#raiserId === partitionId) {
+			this.#raiserId = undefined;
+		}
 	}
 
 	/**
@@ -107,24 +115,45 @@ export class RouteCollector {
 	/**
 	 * The routing of this partition's response, with the byte cap applied.
 	 *
-	 * The cap drops nodes in insertion order. A future change can rank the list before it cuts, so that
-	 * the deepest owner and the executor survive a wide fan-out and the shallower routers go first: the
-	 * deep nodes are the ones a caller caches. Dropping a node costs one more hop on a later request,
-	 * and never a wrong count, because a caller aggregates its own per-partition metrics.
+	 * One node is always kept, even when it alone crosses the cap: the raiser on an error, else the
+	 * first node with the strongest role. So a response always names at least one partition. The cap
+	 * then drops the other nodes in insertion order, and the output keeps the insertion order. A future
+	 * change can rank the list before it cuts, so that the deepest owner and the executor survive a wide
+	 * fan-out and the shallower routers go first: the deep nodes are the ones a caller caches. Dropping a
+	 * node costs one more hop on a later request, and never a wrong count, because a caller aggregates
+	 * its own per-partition metrics.
 	 */
 	build(): FokosRouting {
+		const kept = this.#keptNode();
 		const servedBy: FokosRouteNode[] = [];
-		let bytes = 0;
-		let truncated = this.#truncated;
+		let bytes = kept ? routeNodeBytes(kept) : 0;
+		let full = false;
 		for (const node of this.#nodes.values()) {
-			bytes += routeNodeBytes(node);
-			if (bytes > ROUTE_EVIDENCE_MAX_BYTES) {
-				truncated = true;
-				break;
+			if (node === kept) {
+				servedBy.push(node);
+			} else if (!full) {
+				bytes += routeNodeBytes(node);
+				full = bytes > ROUTE_EVIDENCE_MAX_BYTES;
+				if (!full) {
+					servedBy.push(node);
+				}
 			}
-			servedBy.push(node);
 		}
-		return { servedBy, forwardCount: this.#forwardCount, servedByTruncated: truncated };
+		return { servedBy, forwardCount: this.#forwardCount, servedByTruncated: this.#truncated || full };
+	}
+
+	#keptNode(): FokosRouteNode | undefined {
+		const raiser = this.#raiserId === undefined ? undefined : this.#nodes.get(this.#raiserId);
+		if (raiser) {
+			return raiser;
+		}
+		let kept: FokosRouteNode | undefined;
+		for (const node of this.#nodes.values()) {
+			if (!kept || ROLE_RANK[node.role] > ROLE_RANK[kept.role]) {
+				kept = node;
+			}
+		}
+		return kept;
 	}
 }
 

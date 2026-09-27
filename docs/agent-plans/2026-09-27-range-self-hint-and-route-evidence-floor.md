@@ -354,7 +354,9 @@ A rollback returns to the current behavior. Learned rows stay valid hints.
     at depth 2 or deeper.
   - A new test sends a point read for a promoted key through its hash partition twice, with a depth-1 child as the
     owner. The second read has a `forwardCount` that is 1 lower than the first.
-  - A new test does the same for a depth-2 owner with `{ fromRoot: 0, fromLeaf: 0 }`.
+  - A new test does the same for a depth-2 owner with `{ fromRoot: 0, fromLeaf: 0 }`. The first read goes
+    through the range root and the depth-1 child, so it has a `forwardCount` of 3. The second read goes directly
+    to the owner, so it has a `forwardCount` of 1.
 - `src/sharding/envelope.test.ts`:
   - One node above the cap is kept, and `servedByTruncated` is false.
   - An `executed` node above the cap, after a `merged` node, is kept, and the `merged` node is dropped.

@@ -119,6 +119,54 @@ describe("RouteCollector", () => {
 		expect(routing.forwardCount).toBe(nodes);
 	});
 
+	describe("the node that the byte cap always keeps", () => {
+		/** A node that crosses `ROUTE_EVIDENCE_MAX_BYTES` by itself. */
+		const oversized = (name: string, role: FokosServedRole = "executed"): FokosRouteNode => {
+			const boundary = KeyCodec.encode("k".repeat(ROUTE_EVIDENCE_MAX_BYTES));
+			return { ...node(name, role), _rangeAncestors: [{ depth: 1, startBoundary: boundary, endBoundary: boundary }] };
+		};
+
+		it("keeps one node above the cap and does not mark the list as truncated", () => {
+			const big = oversized("big");
+			expect(routeNodeBytes(big)).toBeGreaterThan(ROUTE_EVIDENCE_MAX_BYTES);
+			const collector = new RouteCollector();
+			collector.add(big);
+			const routing = collector.build();
+			expect(routing.servedBy).toEqual([big]);
+			expect(routing.servedByTruncated).toBe(false);
+		});
+
+		it("keeps an executor above the cap and drops the merged router before it", () => {
+			const collector = new RouteCollector();
+			collector.add(node("router", "merged"));
+			collector.mergeForwarded(routingOf([oversized("leaf")]));
+			const routing = collector.build();
+			expect(routing.servedBy.map((n) => [n.ref.doName, n.role])).toEqual([["t.h.leaf", "executed"]]);
+			expect(routing.servedByTruncated).toBe(true);
+		});
+
+		it("keeps a raiser above the cap at the head and drops the nodes after it", () => {
+			const collector = new RouteCollector();
+			collector.mergeForwarded(routingOf([node("groupA"), node("groupB")]));
+			collector.addRaiser(oversized("self", "merged"));
+			const routing = collector.build();
+			expect(routing.servedBy.map((n) => n.ref.doName)).toEqual(["t.h.self"]);
+			expect(routing.servedByTruncated).toBe(true);
+		});
+
+		it("clears the raiser mark when it forgets the raiser", () => {
+			const collector = new RouteCollector();
+			collector.addRaiser(oversized("target", "merged"));
+			collector.forget(node("target").ref.partitionId);
+			// The same partition comes back without the mark: the executor is now the kept node.
+			collector.add(oversized("target", "merged"));
+			collector.add(oversized("self", "executed"));
+			const routing = collector.build();
+			expect(routing.servedBy.map((n) => n.ref.doName)).toEqual(["t.h.self"]);
+			expect(routing.servedByTruncated).toBe(true);
+		});
+	});
+
 	it("keeps the truncation flag of a child envelope", () => {
 		const collector = new RouteCollector();
 		collector.mergeForwarded({ ...routingOf([node("leaf")]), servedByTruncated: true });

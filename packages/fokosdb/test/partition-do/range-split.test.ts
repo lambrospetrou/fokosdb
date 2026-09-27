@@ -4,7 +4,14 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { executedBy, kb, rangeAncestorsOf } from "./helpers.js";
-import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition, makeTriggeredRangeRoot, rangeOf } from "./partition-harness.js";
+import {
+	PROMOTION_BIG_DATA,
+	PROMOTION_TEST_MAX_SIZE_MB,
+	type TestPartition,
+	makePartition,
+	makeTriggeredRangeRoot,
+	rangeOf,
+} from "./partition-harness.js";
 
 describe.concurrent("PartitionDO — range split", () => {
 	// The read-only tests walk the same settled N=4 tree, so it is built once. A test that needs
@@ -145,9 +152,8 @@ describe.concurrent("PartitionDO — range split", () => {
 				const g = await root.stub.apiGetItem(root.ctx, { hashKey: kb("alice"), sortKey: kb(`${keyPrefix}0000`) });
 				expect(g.value.found).toBe(true);
 				expect(executedBy(g).rangeDepth).toBe(2);
-				expect(rangeAncestorsOf(g)[0]).toEqual(expectAncestor(child.ctx));
-				// The last ancestor is the grandchild itself.
-				expect(rangeAncestorsOf(g)).toHaveLength(2);
+				// The only ancestor is the depth-1 parent. The own slice of the grandchild is in its partition ID.
+				expect(rangeAncestorsOf(g)).toEqual([expectAncestor(child.ctx)]);
 			}
 		}, 30_000);
 
@@ -167,6 +173,62 @@ describe.concurrent("PartitionDO — range split", () => {
 			expect(executedBy(g).rangeDepth).toBe(2);
 			expect(rangeAncestorsOf(g)).toEqual([]);
 		});
+	});
+
+	describe("learned range slices", () => {
+		/** The depths of the rows in `fokos_range_hierarchy` of `partition`. */
+		const learnedDepths = async (partition: TestPartition) =>
+			await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+				state.storage.sql
+					.exec<{ depth: number }>(`SELECT depth FROM fokos_range_hierarchy`)
+					.toArray()
+					.map((row) => row.depth),
+			);
+
+		it("a range root stores only the slices strictly inside one of its children", async () => {
+			const { root } = await makeTriggeredRangeRoot(2);
+			await root.awaitSplitCompleted();
+			const leftChild = (await root.children()).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+			const leftGrandchild = (await leftChild.splitRange("aa")).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+			// "a0000" sorts before each "aa…" key, so it lands in the leftmost grandchild.
+			await leftGrandchild.splitRange("a");
+
+			const g = await root.stub.apiGetItem(root.ctx, { hashKey: kb("alice"), sortKey: kb("a0000") });
+			expect(g.value.found).toBe(true);
+			expect(executedBy(g).rangeDepth).toBe(3);
+
+			const depths = await learnedDepths(root);
+			expect(depths).toContain(3);
+			expect(depths.every((depth) => depth >= 2)).toBe(true);
+		}, 30_000);
+
+		it("a hash partition jumps to a depth-1 owner of a promoted key on the second read", async () => {
+			const { root, sks, hashPartition } = await makeTriggeredRangeRoot(2);
+			await root.awaitSplitCompleted();
+
+			const first = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb(sks[0]) });
+			expect(first.found).toBe(true);
+			const second = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb(sks[0]) });
+			expect(second.found).toBe(true);
+			// The first read goes through the range root. The second goes directly to the depth-1 owner.
+			expect(first.meta.forwardCount).toBe(2);
+			expect(second.meta.forwardCount).toBe(1);
+		});
+
+		it("a hash partition jumps to a depth-2 owner when rangeAncestorsConfig={fromRoot:0,fromLeaf:0}", async () => {
+			const { root, hashPartition } = await makeTriggeredRangeRoot(2, { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 0 } });
+			await root.awaitSplitCompleted();
+			const leftChild = (await root.children()).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+			await leftChild.splitRange("aa");
+
+			const first = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb("aa0000") });
+			expect(first.found).toBe(true);
+			const second = await hashPartition.get({ hashKey: kb("alice"), sortKey: kb("aa0000") });
+			expect(second.found).toBe(true);
+			// The first read goes through the range root and the depth-1 child. The second goes directly to the owner.
+			expect(first.meta.forwardCount).toBe(3);
+			expect(second.meta.forwardCount).toBe(1);
+		}, 30_000);
 	});
 
 	describe("PartialRangeTopology", () => {
