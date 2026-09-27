@@ -438,7 +438,7 @@ export class TestPartition {
 
 /** The immutable range a range partition owns, decoded from its partition ID. */
 export function rangeOf(ctx: FokosDbRouteContext) {
-	const decoded = PartitionIdHelper.decode(Uint8Array.fromHex(ctx.partitionId));
+	const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(ctx.partitionId));
 	invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, `${ctx.doName}: not a range partition`);
 	return decoded;
 }

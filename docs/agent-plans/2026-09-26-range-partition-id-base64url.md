@@ -1,11 +1,12 @@
 # RFC — Compact range partition IDs with two base64url parts
 
-**State:** Draft  
+**State:** Implemented  
 **Date:** 2026-09-26  
 **Author:** Lambros Petrou
 
-**Status:** No code change exists yet. The two-part ID and direct DO-name construction are the core change.
-Boundary-prefix shortening is an extension, not part of the core change.
+**Status:** Implemented: the two-part ID, direct DO-name construction, and the first-part-only response learner.
+The Workers-runtime measurement of milestone 3 is not planned.
+Boundary-prefix shortening is an extension, not part of the core change, and is not implemented.
 
 ## Table of contents
 
@@ -184,7 +185,7 @@ The second encoding saves bytes on the wire, but the DO name and `_rangeAncestor
 
 The response learner decodes bytes that grow with `H`, not with `S + E`.
 A learned target still encodes its ID and DO name from its routing keys on the request path.
-TODO: Measure both paths in the Workers runtime against the current hex format.
+A measurement of both paths in the Workers runtime is not planned.
 
 This is a breaking ID change. This plan does not migrate identities that existing partitions store.
 A deployment with existing partition data needs a separate migration plan before it uses this format.
