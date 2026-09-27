@@ -1493,8 +1493,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		};
 		for (const node of nodes) {
 			if (isRangePartition(node.ref)) {
+				const shouldLearnNode = node.rangeDepth >= minRangeDepth;
+				// A range partition uses the hash key only to store a slice, so it skips the decode when it stores none.
+				if (identity.kind !== "hash" && !shouldLearnNode && !node._rangeAncestors?.some((a) => a.depth >= minRangeDepth)) {
+					continue;
+				}
 				let hashKey: KeyBytes;
-				if (node.rangeDepth >= minRangeDepth) {
+				if (shouldLearnNode) {
 					const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(node.ref.partitionId));
 					invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, "fokos/runtime.learn: a range node has a hash partition ID");
 					hashKey = decoded.hashKey;

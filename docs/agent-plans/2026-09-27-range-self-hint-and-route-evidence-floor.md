@@ -1,10 +1,10 @@
 # RFC — Learn the slice of every range node, and keep one route node under the byte cap
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-27
 **Author:** Lambros Petrou
 
-**Status:** No code change exists yet.
+**Status:** Implemented: M1, M2, and M3.
 
 ## Table of contents
 
