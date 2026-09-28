@@ -50,7 +50,8 @@ The current state has four problems:
   applications other than FokosDB. Its hosts need their own values for the settings that FokosDB leaves at the
   default.
 - **Duplicates.** The migration host of `PartitionDO` repeats the runtime page budgets. The status page budget is
-  defined twice. The retry backoff `{ baseDelayMs: 100, maxDelayMs: 2_000 }` is written seven times.
+  defined twice. The retry attempt counts are inline literals at four call sites, and the retry delays are the
+  defaults of `FokosShardingClient`, which no user can change.
 - **Coupled values without a check.** `MAX_PREPARING_HOLD_MS` derives from the stale threshold and the idempotency
   window. The client retry deadline for `partition_migrating` (15 s) must be longer than the runtime fallback alarm
   of the coordinator (5 s). `MAX_CLIENT_REQUEST_TOKEN_BYTES` must be at most `MAX_HASH_KEY_BYTES`. No code checks
@@ -118,7 +119,8 @@ Two facts of the platform limit the design:
 - A host reads `fokosConfig()` at each use. A subclass can therefore return a value that depends on the partition,
   for example from `this.fokos.identity()` or `this.fokos.policy()`, or from `this.env`.
 - The `config` callback and `fokosConfig()` must return valid values at any time, the construction of the host
-  included. The runtime can call the callback in its constructor.
+  included. The runtime can call the callback in its constructor. The host is responsible for values that follow the
+  lifecycle of a partition (section 4.2.1).
 - The runtime and the hosts must validate each value against its range, its platform ceiling, and its coupled
   values. A value that is not valid fails the construction, or fails the operation that reads it.
 - `FokosShardingRuntime` must not import FokosDB code. Its configuration type belongs to the runtime.
@@ -153,8 +155,8 @@ and `recoveryScanRows`. Remove `SplitConditions.maxItems`.
 
 ### M4 — Recovery budget of the coordinator
 
-Fix the defect in section 4.2.11. It is a separate milestone because it changes the retry flow of the
-`tx_recovery` job and its tests.
+Fix the defect in section 4.2.11. Add `recoverTransactionBudgetMs` to the `fokosConfig()` of T. It is a separate
+milestone because it changes the retry flow of the `tx_recovery` job and of `recoverTransaction`, and their tests.
 
 ### M5 — Client configuration
 
@@ -180,7 +182,7 @@ agree on the value.
 
 | Layer | Where a user sets it | Who reads it | Wire cost |
 | --- | --- | --- | --- |
-| Table | `PartitionContextCreator.create` options → `FokosDBPolicy` | C, P, T | Only the overrides |
+| Table | `PartitionContextCreator.create` options → `FokosDBPolicy` | C | Only the overrides |
 | Host | `fokosConfig()` on P or T | That host | None |
 | Runtime | `fokosRuntimeConfig()` on the host → the `config` callback | R | None |
 | Client | `FokosDBOptions` | C | None |
@@ -195,13 +197,15 @@ Caller Worker (C)                           Durable Object host (P or T)
 |   coordinatorRootsN, ...   |   RPC with   |                                             |
 | FokosDBPolicy              | -----------> | FokosShardingRuntime({ ctx, stub, hooks,    |
 |   limits (overrides only)  | route context|                        operations, config })|
-| resolveLimits() (cached)   |              | resolveLimits(this.fokos.policy()) (cached) |
+| resolveLimits() (cached)   |              |                                             |
 +----------------------------+              +---------------------------------------------+
 ```
 
-The table layer holds only the key size limits, because only the key sizes are both settable and checked by more
-than one party. A table without overrides sends no `limits` field. Each side builds the full limits from the
-overrides with one shared function, and caches the result.
+The table layer holds only the key size limits. They are a property of the table, so every client of the table must
+use the same values, and `PartitionContextCreator.create` is the one place where a table gets its options. Only the
+client checks the key sizes today (section 4.2.3). The limits stay in the policy, so that a later change can add a
+check in P with no change to the public API. A table without overrides sends no `limits` field. The client builds
+the full limits from the overrides with one shared function, and caches the result.
 
 The host and runtime layers hold every other setting. They cost nothing on the wire, so they also hold the DO-side
 platform budgets, which tests can make small.
@@ -260,9 +264,15 @@ contract. `fokosRuntimeConfig()` is the naming convention on the host side:
 - P and T follow the convention. A later helper base class for runtime hosts can wire the callback itself, as
   `ShardedDurableObject` in `examples/http-api/src/demo2/sharded-do.ts` wires the RPC delegation today. A subclass
   then only overrides `fokosRuntimeConfig()`.
-- The runtime can call the callback in its constructor. When an override reads a field of the host, the host must
-  give that field its value before it creates the runtime, for example with a field initializer or a value from
-  `env`.
+- The runtime can call the callback in its constructor. The host is responsible for how it derives each value, and
+  the value must follow the lifecycle of the partition:
+  - During the construction of the host, `this.fokos` can be unassigned, and a subclass field initializer has not
+    run yet. `this.env` is always set.
+  - `this.fokos.identity()` and `this.fokos.policy()` throw before the partition is initialized, for example on a
+    new partition before its first request.
+  - An override that reads the identity, the policy, or a field must first check that the value exists at that
+    point, for example with `this.fokos?.initialized()`. When the value does not exist, the override returns a
+    fallback value. The same rule applies to `fokosConfig()` (section 4.2.2).
 
 The runtime reads a value that sizes a structure once, when it first creates the structure. It reads every other
 value at each use.
@@ -302,6 +312,9 @@ class PartitionDO {
 - The host reads the method at each use, and does not cache the result. A subclass can therefore vary a value at
   runtime, and a test subclass keeps its control of one instance with no production hook for tests.
 - The method can read `this.env`, so a deployment can set values from `vars` with no subclass.
+- The constructor of `PartitionDO` reads `fokosConfig()` to arm the TTL sweep. An override that reads
+  `this.fokos.identity()` or `this.fokos.policy()` must check `this.fokos.initialized()`, and otherwise return a
+  fallback value (section 4.2.1).
 - The validation is a few number checks, so it runs at each read. If a profile shows a cost, the host can cache on
   the identity of the returned object.
 - `fokosNow()` stays a separate method, because it is a clock and not a setting.
@@ -310,7 +323,7 @@ The settings of `PartitionDO`:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `staleTransactionMs` | 5,000 ms | How long a prepared lock waits before the stale sweep asks its coordinator to resolve it. Shared default with T (section 4.2.6). |
+| `staleTransactionMs` | 5,000 ms | How long a prepared lock waits before the stale sweep asks its coordinator to resolve it. Shared default with T. It must be at least the default fan-out budget of T (section 4.2.6). |
 | `promotionFraction` | 0.25 | Section 4.2.7. |
 | `maxClockSkewMs` | 5,000 ms | The farthest into the future that a transaction timestamp can be when P accepts a prepare. It must be larger than the real clock skew between C, T and P. |
 | `ttlSweep` | See below | Today `fokosTtlConfig()`. |
@@ -325,7 +338,8 @@ The settings of `TransactionCoordinatorDO`:
 | Setting | Default | Notes |
 | --- | --- | --- |
 | `staleTransactionMs` | 5,000 ms | Today `STALE_THRESHOLD_MS`. It must be at least `fanoutRequestBudgetMs`. |
-| `fanoutRequestBudgetMs` | 5,000 ms | Today `fokosFanoutRequestBudgetMs()`. |
+| `fanoutRequestBudgetMs` | 5,000 ms | Today `fokosFanoutRequestBudgetMs()`. The default is the shared constant of section 4.2.6. |
+| `recoverTransactionBudgetMs` | 10,000 ms | The fan-out deadline of `recoverTransaction`, which the stale job of a participant calls (section 4.2.11). |
 | `participantRetry` | Section 4.2.5 | |
 | `alarmRecoveryBudgetMs` | 30,000 ms | Today `ALARM_RECOVERY_BUDGET_MS`. It must stay below the wall-clock limit of a DO alarm. |
 | `sweepBatchRows` | 1,000 | Today `SWEEP_BATCH_ROWS`. The rows that one step of the idempotency sweep and one step of the source cleanup read. |
@@ -341,8 +355,14 @@ The settings of `TransactionCoordinatorDO`:
 
 | Setting | Default | Checked by |
 | --- | --- | --- |
-| `maxHashKeyBytes` | 1,024 | C (`encodeHashKey`), T (the coordinator key of the token) |
+| `maxHashKeyBytes` | 1,024 | C (`encodeHashKey`) |
 | `maxSortKeyBytes` | 512 | C |
+
+Only the client checks the key sizes. P stores every key that a client sends, and T encodes the token with the
+default limits, because a token is at most `MAX_CLIENT_REQUEST_TOKEN_BYTES` (64). Every client of a table must
+therefore create the table with the same limits. A client with smaller limits cannot read or delete an item that a
+client with larger limits wrote: `encodeHashKey` and `encodeSortKey` reject the key before the RPC. A check in P is
+out of scope for this change.
 
 The limits are measured on the encoded key bytes. An increase is allowed. A decrease is not safe after items with
 larger keys exist, because the keys are stored in range boundaries, `doName` values, `partition_id` values, and
@@ -354,25 +374,27 @@ warning, once for each resolved policy. A large key has these effects:
 
 - **The size of a range partition identity.** A range partition has two names, and both contain three keys: the
   hash key, the start boundary, and the end boundary. A boundary is a sort key. `partition-id.ts` builds them:
-  - The `partitionId` is the hex form of 10 header bytes plus the three raw keys. Hex doubles each byte.
-  - The `doName` is `<shardGroup>.r.<hk>.<start>.<end>`. Each component keeps a safe ASCII byte as one character and
-    percent-encodes every other byte as three characters. A text key costs 1 character for each byte, and a binary
-    key costs 3.
+  - The `partitionId` is `01`, then two unpadded base64url parts. The first part holds 9 header bytes and the hash
+    key. The second part holds the two boundaries. Base64url costs 4 characters for each 3 bytes.
+  - The `doName` is `<shardGroup>~r.<hk>.<start>.<end>`. A text key keeps each character that is not in the escape
+    set, and writes each escaped byte as three characters (`%XX`). A text key costs about 1 character for each byte.
+    A binary key is `~b` and the unpadded base64url of its bytes, about 1.33 characters for each byte.
 
   | Key sizes (hash key, sort key) | Raw bytes | `partitionId` | `doName`, text keys | `doName`, binary keys |
   | --- | --- | --- | --- | --- |
-  | 1 KiB, 512 B (the defaults) | about 2 KiB | about 4 KiB | about 2 KiB | about 6 KiB |
-  | 2 KiB, 2 KiB | about 6 KiB | about 12 KiB | about 6 KiB | about 18 KiB |
+  | 1 KiB, 512 B (the defaults) | about 2 KiB | about 2.7 KiB | about 2 KiB | about 2.7 KiB |
+  | 2 KiB, 2 KiB | about 6 KiB | about 8 KiB | about 6 KiB | about 8 KiB |
 
   A Durable Object name has no length limit. The runtime truncates `ctx.id.name` to its first 1,024 bytes, so
   FokosDB reads `ctx.id.name` only for logs and error attributes, and never for identity or routing.
 - **The route context of each RPC.** The route context of a request to a range partition carries its `partitionId`
   and its `doName`, so each request grows with the keys.
-- **Route evidence.** `routeNodeBytes` counts 2 bytes for each character of `doName` and `partitionId`, and the bytes
-  of each ancestor boundary. Above `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB) the envelope truncates the list of nodes. The
-  request still succeeds, but the caller learns fewer boundaries, and later requests take more hops. With the default
-  limits, one node of a range partition whose keys are at the maximum already counts about 12 KiB (text keys) to
-  20 KiB (binary keys), which is above the cap.
+- **Route evidence.** `routeNodeBytes` counts 2 bytes for each character of `doName`, `partitionId` and `actorId`,
+  and the bytes of each ancestor boundary. Above `ROUTE_EVIDENCE_MAX_BYTES` (10 KiB) the envelope drops nodes. It
+  always keeps one node, so the response still names a partition, but the caller learns fewer boundaries, and later
+  requests take more hops. Take a range partition whose keys are at the maximum of the default limits. Its node
+  counts about 10 KiB (text keys) to 11 KiB (binary keys) before its ancestors. Each ancestor adds up to about
+  1 KiB. That one node is at or above the cap, so the envelope drops every other node.
 - **The item size.** The stored size of an item counts both keys against `MAX_ITEM_BYTES` (400 KiB), so a larger key
   leaves less room for data.
 - **Stored rows.** The learned range hierarchy holds up to `rangeHierarchyMaxRows` (10,000) rows, each with a hash
@@ -402,7 +424,8 @@ export function resolveLimits(overrides: FokosDBLimitOverrides | undefined): Fok
 ```
 
 1. It starts from the defaults of the package version that runs it.
-2. It applies the overrides and ignores the keys that it does not know. A newer client can send them to an older DO.
+2. It applies the overrides and ignores the keys that it does not know. A policy from a newer package version can
+   hold them.
 3. It checks each value against its ceiling and its coupled values. `maxHashKeyBytes` must be at least
    `MAX_CLIENT_REQUEST_TOKEN_BYTES` (64), because the token is a hash key of the coordinator.
 4. With no overrides, it returns the one frozen `DEFAULT_LIMITS` object and does no other work.
@@ -410,17 +433,12 @@ export function resolveLimits(overrides: FokosDBLimitOverrides | undefined): Fok
 The validation functions in `transaction-limits.ts` take the resolved limits as an argument. The constants stay as
 the exported defaults.
 
-**The cache.** No side resolves per request:
+**The cache.** `FokosDB` resolves once in its constructor, from the policy of its router. No DO resolves the limits.
 
-- `FokosDB` resolves once in its constructor, from the policy of its router.
-- A DO resolves from `this.fokos.policy()`. The runtime compares the incoming policy with `structurallyEqual` on each
-  request. While nothing changes, it keeps the same stored object. A `WeakMap<FokosDBPolicy, FokosDBLimits>` keyed on
-  the stored object therefore resolves once per policy change. A key on the incoming object does not work, because
-  each RPC delivers a new object.
-
-**Different defaults across versions.** A client and a DO on different package versions can resolve different
-defaults. This is acceptable. The client check is an early answer, and the DO check decides. A difference changes
-where a request fails, not what the DO stores.
+**Different defaults across versions.** Two clients on different package versions can resolve different defaults.
+The DO does not check the keys, so the client with the larger limits can write a key that the other client rejects.
+A table that must work across versions pins its limits as overrides. `PartitionContextCreator.create` keeps an
+override that is equal to the default for this reason.
 
 #### 4.2.4 Client configuration: `FokosDBOptions`
 
@@ -433,14 +451,31 @@ and `clientRequestToken` stay as they are.
 The client and the coordinator retry for different reasons. Each side has one policy, set in one place, and every
 retry on that side uses it.
 
+Every retry goes through `FokosShardingClient.send` with a `FokosRetryPolicy`: a `shouldRetry` rule, and optional
+`baseDelayMs` and `maxDelayMs` that default to 100 ms and 2,000 ms. A policy setting gives only the delays and the
+attempt counts to the call sites below. Each call site keeps its own `shouldRetry` rule.
+
+A policy setting must never become the `retry` option of a `FokosShardingClient`. Without that option, the client
+sends each request once. A default policy would retry the single-item writes. A write whose reply is lost can then
+apply twice, or fail the second time with a condition failure.
+
 - **Client.** A caller waits on each retry, so the policy is short.
 
   | Setting | Default | Used by |
   | --- | --- | --- |
-  | `retry.baseDelayMs` | 100 ms | Every client retry |
-  | `retry.maxDelayMs` | 2,000 ms | Every client retry |
-  | `retry.maxAttempts` | 5 | The two read phases of `transactGetItems` |
+  | `retry.baseDelayMs` | 100 ms | Every call site in this table |
+  | `retry.maxDelayMs` | 2,000 ms | Every call site in this table |
+  | `retry.maxAttempts` | 5 | `txReadForTransaction` in the two read phases of `transactGetItems` (every error), and `txReadSnapshot` on the single-partition fast path (runtime-retryable errors only) |
   | `partitionMigratingRetryDeadlineMs` | 15,000 ms | `transactWriteItems`, while its coordinator answers `partition_migrating`. Today `TX_COORDINATOR_MIGRATING_RETRY_MS`. |
+
+  `retry.baseDelayMs` must be less than `retry.maxDelayMs`, because `tryWhile` needs it.
+
+  The snapshot read changes behaviour. Today `READ_SNAPSHOT_RETRY` allows 3 attempts and a maximum delay of 3,000 ms.
+  With the defaults it allows 5 attempts and a maximum delay of 2,000 ms. A read applies nothing, so the extra
+  attempts are safe. A later change can give the snapshot read its own settings if a need appears.
+
+  The single-item operations (`getItem`, `putItem`, `updateItem`, `deleteItem`) and `queryItems` do not retry, as
+  today.
 
   `partitionMigratingRetryDeadlineMs` is a separate setting, because a coordinator split is a separate event: the
   client retries until a deadline, not for a number of attempts. The deadline must stay longer than
@@ -458,19 +493,28 @@ retry on that side uses it.
 
   Both prepare paths also stop at once on `partition_over_size`, because an over-size answer does not change inside
   one budget. The commit and cancel fan-outs (`runCommit`, `runCancel`) have no attempt count. They retry until a
-  deadline: `fanoutRequestBudgetMs` when a request drives them, and the remaining `alarmRecoveryBudgetMs` when the
-  `tx_recovery` job drives them (section 4.2.11).
+  deadline: `fanoutRequestBudgetMs` when a request drives them, `recoverTransactionBudgetMs` when `recoverTransaction`
+  drives them, and the remaining `alarmRecoveryBudgetMs` when the `tx_recovery` job drives them (section 4.2.11).
+  `participantRetry.baseDelayMs` must be less than `participantRetry.maxDelayMs`.
 
-Today the backoff `{ baseDelayMs: 100, maxDelayMs: 2_000 }` is written three times in `db.ts` and four times in
-`do-transaction-coordinator.ts`, and the attempt counts are inline literals.
+Today no call site sets a delay except `READ_SNAPSHOT_RETRY` (`maxDelayMs: 3_000`). The others use the defaults of
+`FokosShardingClient`. The attempt counts are inline literals: 5 in `READ_TRANSACTION_RETRY` and 3 in
+`READ_SNAPSHOT_RETRY` in `db.ts`, and `prepareRetry(3)` and `prepareRetry(5)` in `do-transaction-coordinator.ts`.
+`fanoutRetry` in T retries until a deadline.
 
 #### 4.2.6 The stale-transaction threshold
 
 `STALE_TX_MS` in P and `STALE_THRESHOLD_MS` in T are both 5 s, and both mean "a transaction that no request drives".
-One constant in `shared/` holds the default, and both hosts expose `staleTransactionMs` in `fokosConfig()`.
+One constant in `shared/` holds the default, and both hosts expose `staleTransactionMs` in `fokosConfig()`. A second
+constant in `shared/` holds the default fan-out budget of T (5 s, today `TX_FANOUT_REQUEST_BUDGET_MS`).
 
-T checks that its `staleTransactionMs` is at least its `fanoutRequestBudgetMs`. A smaller value makes the stale path
-drive a transaction that a request still drives.
+A stale threshold that is smaller than the fan-out budget makes the stale path drive a transaction that a request
+still drives. Each host checks the relation when it validates its configuration:
+
+- T checks that its `staleTransactionMs` is at least its `fanoutRequestBudgetMs`.
+- P cannot read the configuration of T. P checks that its `staleTransactionMs` is at least the shared default
+  fan-out budget. When a deployment raises `fanoutRequestBudgetMs` in T above the default, it must also raise
+  `staleTransactionMs` in P to at least the same value. The documentation of both settings (M6) states the relation.
 
 #### 4.2.7 The promotion fraction
 
@@ -489,8 +533,8 @@ to relieve a large key.
 - A change applies to the next size evaluation. It does not move back a key that is already promoted.
 
 The setting is in `PartitionDO.fokosConfig()` and not in the policy. `fokosConfig()` runs at each use, so a subclass
-can choose a value per table or per partition from `this.fokos.identity()` and `this.fokos.policy()`. It adds no
-bytes to the wire.
+can choose a value per table or per partition from `this.fokos.identity()` and `this.fokos.policy()`, with the
+fallback of section 4.2.1. It adds no bytes to the wire.
 
 #### 4.2.8 Constants
 
@@ -533,20 +577,31 @@ for a table with defaults. The DO stores the policy and compares it with `struct
 
 `recoverStaleTransactions` in `do-transaction-coordinator.ts` checks `ALARM_RECOVERY_BUDGET_MS` (30 s) only between
 two transactions. It drives each transaction with no request budget. The prepare paths stop after a fixed number of
-attempts (section 4.2.5), but `runCommit` and `runCancel` pass an infinite deadline to `retryable`, which then allows
-`MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` (100) attempts for each participant. Each attempt waits a backoff of up
-to 2 s. One participant that does not answer can hold one job step for minutes.
+attempts (section 4.2.5). `runCommit` and `runCancel` pass an infinite deadline to `retryable`. `retryable` then
+allows `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` (100) attempts for each participant. Each attempt waits a backoff
+of up to 2 s. One participant that fails each attempt can hold one job step for about 100 × 2 s, which is more than
+3 minutes.
 
 The fix:
 
 1. The job computes the time that remains of its budget: `recoveryStartedAt + alarmRecoveryBudgetMs - now`.
 2. The job passes that time as the `requestBudgetMs` argument of each call, and `runCommit` and `runCancel` use it
-   as their deadline. A request passes its fan-out budget in
-   the same argument today.
+   as their deadline. A request passes its fan-out budget in the same argument today.
 3. The participant retries stop at the end of the budget. The transaction stays non-terminal, and the next run of
    the job continues it after `staleTransactionMs`.
-4. `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` is removed. Before the removal, M4 must check the other paths that
-   call with no request budget.
+4. `recoverTransactionLocal`, the handler of `recoverTransaction`, is the only other path that drives a transaction
+   with no budget today. The stale job of a participant calls it and waits for the answer. It passes
+   `recoverTransactionBudgetMs` (10 s) as its budget. When the budget ends before the transaction is terminal, it
+   schedules the `tx_recovery` job, as it does today on an error.
+5. After steps 2 and 4, every caller of `drivePrepare`, `runPrepareRecovery`, `runCommit`, `runCancel` and
+   `driveTransaction` passes a budget. The budget argument becomes required, and
+   `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` and the path of `retryable` with no deadline are removed.
+
+**The deadline bounds the retries, not one attempt.** `fanoutRetry` checks the deadline after each failed attempt,
+before the next one. An RPC that is in progress is not stopped at the deadline. A wrapper with `Promise.race` can
+return early, but it does not cancel the request, so the participant can still apply it. This change adds no
+timeout for one attempt. A job step can therefore end later than its budget, by at most one backoff
+(`participantRetry.maxDelayMs`) and the duration of one RPC.
 
 #### 4.2.12 `PartitionContextCreator.create` defaults (done)
 
@@ -578,13 +633,23 @@ to their first use, so that the values follow the rule "read at each use":
 - Each milestone passes `pnpm test`.
 - The test subclasses `test/controlled-partition-do.ts` and `test/controlled-transaction-coordinator-do.ts` override
   `fokosStaleTransactionMs()` and `fokosFanoutRequestBudgetMs()` today. M3 moves them to `fokosConfig()`.
+- `test/partition-do/partition-harness.ts` imports `RANGE_PROMOTION_FRACTION` from `do-partition.ts` to size its
+  filler items. M3 makes the fraction a setting, so the harness reads the default from its new place.
+- `test/sharding-prototype/fokosdb-partition-host.ts` is a prototype host that never runs, but `pnpm check` type-checks
+  it. It is its own class, not a subclass of P. It defines local `FokosDb*` types, its own `fokosStaleTransactionMs()`
+  and its own `RANGE_PROMOTION_FRACTION`. M1 renames its local types to the `FokosDB*` spelling. Its method and its
+  constant are not overrides of P, so M3 does not change them.
 - The DO-side budgets are settings, so a test can make a page, a batch, or a budget small and reach a boundary with
   little data.
 - Each validation rule gets a unit test: a value out of range, a value above its ceiling, and each coupled relation.
 - `resolveLimits` gets unit tests for no overrides (the result is `DEFAULT_LIMITS`), unknown keys, the cache, and the
   warning for a key size limit above 2 KiB.
 - A test gives `buildPage` a small budget through `fokosRuntimeConfig()` and checks that a migration takes more pages.
-- M4 needs a test in which one participant does not answer, and the job step ends inside `alarmRecoveryBudgetMs`.
+- M4 needs a test in which each attempt to one participant fails, and the job step ends inside
+  `alarmRecoveryBudgetMs` plus one `participantRetry.maxDelayMs`. A second test does the same for
+  `recoverTransaction` and `recoverTransactionBudgetMs`.
+- The validation of P rejects a `staleTransactionMs` below the shared default fan-out budget. The validation of T
+  rejects a `staleTransactionMs` below its `fanoutRequestBudgetMs`.
 
 #### 4.2.15 Compatibility and rollout
 
@@ -616,7 +681,7 @@ them. It cannot work for a Durable Object class, because the Workers runtime cre
 ### 5.3 All the limits in the policy
 
 Rejected. The full nested object measures 616 bytes and almost triples the route context of 325 bytes. The client
-cannot see a DO method, so the table layer holds only the values that the client and the DOs must share.
+cannot see a DO method, so the table layer holds only the values that every client of the table must share.
 
 ### 5.4 A positional array on the wire
 
@@ -652,13 +717,18 @@ settings therefore have their own method, `fokosRuntimeConfig()`, and their own 
 The contract is simpler for a host when every read is valid. The host is responsible for values that are ready
 before it creates the runtime.
 
+**Can an override read the identity or the policy of the partition?**
+Yes, but the host is responsible for it. Before the partition is initialized, `identity()` and `policy()` throw, and
+during construction `this.fokos` can be unassigned. The override checks `this.fokos?.initialized()` and returns a
+fallback value when it is false (section 4.2.1).
+
 **Why does a host read `fokosConfig()` at each use?**
 A subclass can then change a value from the partition, from `env`, or from a test, with no restart. The read is a
 few number checks.
 
-**What happens when a client and a DO have different default limits?**
-The client check is an early answer, and the DO check decides. The request fails in a different place. The stored
-data does not change.
+**What happens when two clients have different default limits?**
+Only the client checks the key sizes. The client with the larger limits can write a key that the other client cannot
+read or delete. A table pins its limits as overrides to prevent this (section 4.2.3).
 
 **Why are the key sizes settable when the transaction limits are not?**
 Users can need longer keys in their applications. The transaction limits have platform ceilings, and there is no
@@ -679,6 +749,10 @@ References:
 - `docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` — the sharding runtime.
 - `docs/agent-plans/2026-09-09-bounded-preparing-hold.md` — `MAX_PREPARING_HOLD_MS`.
 - `docs/agent-plans/2026-08-30-item-ttl-expiration.md` — the TTL sweep.
+- `docs/agent-plans/2026-09-26-fokos-sharding-client.md` — `FokosShardingClient` and `FokosRetryPolicy`.
+- `docs/agent-plans/2026-09-26-range-partition-id-base64url.md` — the format of a range `partitionId`.
+- `docs/agent-plans/2026-09-27-range-do-name-text-encoding.md` — the format of a range `doName`.
+- `docs/agent-plans/2026-09-27-range-self-hint-and-route-evidence-floor.md` — the route evidence cap.
 - `examples/http-api/src/demo2/sharded-do.ts` — the RPC delegation of a runtime host.
 - [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
 - [Workers limits](https://developers.cloudflare.com/workers/platform/limits/)
@@ -712,7 +786,8 @@ The users: C, P, T and R (section 1.1).
 | `MAX_PREPARING_HOLD_MS` | min(25 s, window) | T | derived |
 | `TX_FANOUT_REQUEST_BUDGET_MS` | 5 s | T | `fokosFanoutRequestBudgetMs()` |
 | `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` | 100 | T | constant |
-| Participant backoff `{ baseDelayMs: 100, maxDelayMs: 2_000 }` | | T (4 sites) | inline |
+| Participant retry delays | 100 ms, 2,000 ms | T (3 sites) | defaults of `FokosShardingClient` |
+| Prepare attempts | 3, 5 | T | `prepareRetry(3)`, `prepareRetry(5)` |
 | `MAX_CLOCK_SKEW_MS` | 5 s | P | static field |
 | Stale-lock scan batch, recovery `LIMIT`, sweep `CHUNK_SIZE` | 10, 100, 100 | P, T | inline |
 
@@ -774,5 +849,6 @@ compiler, and P checks a compiled plan again with them in `expression/runtime.ts
 | Value | Default | Today |
 | --- | --- | --- |
 | `TX_COORDINATOR_MIGRATING_RETRY_MS` | 15 s | constant |
-| Retry backoff `{ baseDelayMs: 100, maxDelayMs: 2_000 }` | | inline, 3 sites |
-| Read-phase attempts of `transactGetItems` | 5 | inline |
+| Retry delays | 100 ms, 2,000 ms | defaults of `FokosShardingClient`, 2 sites |
+| `READ_TRANSACTION_RETRY` | 5 attempts | constant |
+| `READ_SNAPSHOT_RETRY` | 3 attempts, 3,000 ms maximum delay | constant |
