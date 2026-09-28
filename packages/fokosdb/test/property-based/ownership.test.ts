@@ -23,6 +23,7 @@ import {
 	type RepartitionSourceDeps,
 	type RouteKey,
 } from "../../src/sharding/index-server.js";
+import { DEFAULT_RUNTIME_CONFIG } from "../../src/sharding/runtime-config.js";
 import { kb } from "../partition-do/helpers.js";
 import { makeTriggeredRangeRoot } from "../partition-do/partition-harness.js";
 import type { CounterPartitionDO } from "../sharding/counter-host.js";
@@ -53,6 +54,7 @@ function assertOwnershipAgrees<TPolicy, Ops extends FokosOperationSpec>(
 		hooks: { evaluateSplit: notUsed, migration: { buildPage: notUsed, applyPage: notUsed, validatePage: notUsed } },
 		scheduleWork: notUsed,
 		logParams: notUsed,
+		config: () => DEFAULT_RUNTIME_CONFIG,
 	};
 	const source = new RepartitionSource(new FokosShardingStore(storage), deps);
 	expect(fokos.lifecycle().role).toBe("router");

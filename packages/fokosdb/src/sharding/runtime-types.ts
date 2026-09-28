@@ -12,6 +12,7 @@ import type { FokosSlice } from "./repartition-slice.js";
 import type { FokosImportState, MigrationHost, RouteKey } from "./repartition-types.js";
 import type { RepartitionKind, RepartitionState } from "./sharding-store.js";
 import type { SkInterval } from "./sk-interval.js";
+import type { FokosRuntimeConfigOverrides } from "./runtime-config.js";
 import type { ScanCursor } from "../shared/partition/partition-store.js";
 import type { RangeAncestorInfo } from "./types.js";
 
@@ -27,20 +28,15 @@ export type FokosRuntimeOptions<TPolicy> = {
 	 * The `this: void` annotation states that this callback does not use a receiver. TypeScript removes it from JavaScript output.
 	 */
 	stub(this: void, ctx: FokosRouteContext<TPolicy>, doName: string): DurableObjectStub;
-	caches?: {
-		/** The byte budget of the hash arena cache. Default: 1 MiB. */
-		hashArenaBytes?: number;
-		/** The row bound of the learned range hierarchy. Default: 10,000. */
-		rangeHierarchyMaxRows?: number;
-		/** The Bloom filter of promoted keys a hash partition learns. Default: 300,000 keys at 1%. */
-		promotionBloom?: { expectedKeys: number; falsePositiveRate: number };
-	};
-	scheduler?: {
-		/** How far ahead a pass arms its fallback before its first transition. Default: 5,000 ms. */
-		fallbackAlarmMs?: number;
-		/** The delay of the in-memory fast path that runs a pass without an alarm. Default: 50 ms. */
-		fastPathDelayMs?: number;
-	};
+	/**
+	 * The runtime settings that the host overrides. The runtime merges them with
+	 * `DEFAULT_RUNTIME_CONFIG`, validates the result, and throws on a value that is not valid. The
+	 * runtime calls this in its constructor and again at each use of a setting, so the callback must
+	 * return valid values at any time. During the construction of the host, the runtime field of the
+	 * host is not assigned yet, and the identity and the policy of a new partition do not exist before
+	 * its first request. Absent: every setting takes its default.
+	 */
+	config?(this: void): FokosRuntimeConfigOverrides;
 };
 
 // ─── the primitive API ───────────────────────────────────────────────────────
@@ -281,11 +277,6 @@ export type FokosJob = {
 	deadline?(): number | null;
 };
 
-export type FokosRuntimeConfigOverrides = {
-	/** How many import pages one pass applies. Default: 16. Minimum: 1. */
-	importPagesPerPass?: number;
-};
-
 /**
  * Every hook is synchronous. Four of them run inside a `transactionSync`, and an `await` there is a
  * defect. A hook returns its policy result and does not throw to express one: a thrown error is a
@@ -332,8 +323,6 @@ export interface FokosShardingHooks<TPolicy> {
 		lifecycle: FokosLifecycle;
 		policy: TPolicy;
 	}): "allow" | { reject: Error };
-	/** Live runtime configuration overrides. The runtime validates each returned value. */
-	runtimeConfig?(): FokosRuntimeConfigOverrides;
 	/** Host background jobs. They run after the built-in jobs, in registration order. */
 	jobs?: FokosJob[];
 }

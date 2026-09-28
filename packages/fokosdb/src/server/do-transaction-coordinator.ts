@@ -3,6 +3,7 @@ import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migra
 import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
+import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
 import type {
 	FokosExecuteLocalRequest,
@@ -16,7 +17,6 @@ import type {
 	FokosStartImportRequest,
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
-import { FOKOS_PAGE_BYTES, FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "./do-partition.js";
@@ -344,6 +344,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			stub: (routeCtx, doName) => txCoordinatorStubByName(env, routeCtx, doName),
 			hooks: this.hooks(),
 			operations: this.operations(),
+			config: () => this.fokosRuntimeConfig(),
 		});
 		void ctx.blockConcurrencyWhile(async () => {
 			this.#migrations.runAllSync();
@@ -465,7 +466,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				};
 			},
 			migration: {
-				buildPage: (cursor, _slice, belongsToTarget) => this.buildMigrationPage(cursor as string | null, belongsToTarget),
+				buildPage: (cursor, _slice, belongsToTarget, budget) => this.buildMigrationPage(cursor as string | null, belongsToTarget, budget),
 				applyPage: (page) => this.applyMigrationPage(page as MigratedTransaction[]),
 				validatePage: (_cursor, page) => {
 					invariant(Array.isArray(page), "fokos/tc: a migration page must be an array of transactions");
@@ -538,6 +539,17 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	//////////////////////////////
 	// User overridable methods.
 	//////////////////////////////
+
+	/**
+	 * Override to change the settings of the sharding runtime of this class. The runtime merges the
+	 * result with `DEFAULT_RUNTIME_CONFIG` and validates it. It calls this method in its own
+	 * constructor, before `this.fokos` is assigned, and again at each use of a setting. An override that
+	 * reads the identity or the policy of the coordinator must first check `this.fokos?.initialized()`,
+	 * and return a fallback value when it is false.
+	 */
+	protected fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
+		return {};
+	}
 
 	/**
 	 * The wall-clock budget a request-driven fan-out gets, read at each use so a subclass can vary
@@ -1371,19 +1383,20 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * One page of the transactions that a split target owns, with their rows in all four tables. The
-	 * cursor is the last `transaction_id` read. A page reads at most `FOKOS_PAGE_ROWS` ledger rows and
-	 * keeps its payload near `FOKOS_PAGE_BYTES`: it stops before the transaction that would cross that
+	 * cursor is the last `transaction_id` read. A page reads at most `budget.pageRows` ledger rows and
+	 * keeps its payload near `budget.pageBytes`: it stops before the transaction that would cross that
 	 * budget, and always holds at least one.
 	 */
 	private buildMigrationPage(
 		cursor: string | null,
 		belongsToTarget: (key: RouteKey) => boolean,
+		budget: FokosMigrationPageBudget,
 	): { page: MigratedTransaction[]; nextCursor: string | null } {
 		const rows = this.ctx.storage.sql.exec<TcStateRow>(
 			`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
              FROM tc_state WHERE transaction_id > ? ORDER BY transaction_id LIMIT ?`,
 			cursor ?? "",
-			FOKOS_PAGE_ROWS + 1,
+			budget.pageRows + 1,
 		);
 		const page: MigratedTransaction[] = [];
 		let bytes = 0;
@@ -1391,7 +1404,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		let last: string | null = null;
 		for (const row of rows) {
 			// The extra row only shows that the ledger continues after this page.
-			if (scanned === FOKOS_PAGE_ROWS) {
+			if (scanned === budget.pageRows) {
 				return { page, nextCursor: last };
 			}
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
@@ -1402,7 +1415,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					results: this.loadResultImages(row.transaction_id),
 				};
 				const txBytes = migratedTransactionBytes(tx);
-				if (page.length > 0 && bytes + txBytes > FOKOS_PAGE_BYTES) {
+				if (page.length > 0 && bytes + txBytes > budget.pageBytes) {
 					return { page, nextCursor: last };
 				}
 				page.push(tx);

@@ -42,6 +42,7 @@ import { parseCoordinatorRef, TransactionParticipant, type PromotionCandidate } 
 import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
+import type { FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
 import type {
 	FokosEnvelope,
 	FokosGroupPart,
@@ -254,7 +255,6 @@ const keyOf = (item: TransactionItemKey) => ({ hashKey: item.hashKey, sortKey: i
 
 export class PartitionDO extends DurableObject implements PartitionRpc {
 	private static readonly STALE_TX_MS = 5_000;
-	private static readonly IMPORT_PAGES_PER_PASS = 16;
 
 	/** The sharding runtime: identity, routing, repartitions, and the alarm. Every public method is one `dispatch`. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
@@ -283,6 +283,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
 			hooks: this.hooks(),
 			operations: this.operations(),
+			config: () => this.fokosRuntimeConfig(),
 		});
 		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
 		this.#ttl.arm(this.fokosTtlConfig().initialDelayMs);
@@ -441,6 +442,17 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			return await getColoInfo();
 		}
 		return { cfColo: "", cfLoc: "", cfFl: "" };
+	}
+
+	/**
+	 * Override to change the settings of the sharding runtime of this class. The runtime merges the
+	 * result with `DEFAULT_RUNTIME_CONFIG` and validates it. It calls this method in its own
+	 * constructor, before `this.fokos` is assigned, and again at each use of a setting. An override that
+	 * reads the identity or the policy of the partition must first check `this.fokos?.initialized()`,
+	 * and return a fallback value when it is false.
+	 */
+	protected fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
+		return {};
 	}
 
 	protected fokosTtlConfig(): TtlSweepConfig {
@@ -715,7 +727,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				}
 				return "allow";
 			},
-			runtimeConfig: () => ({ importPagesPerPass: PartitionDO.IMPORT_PAGES_PER_PASS }),
 			jobs: [
 				{
 					name: JOB_STALE_TX_RECOVERY,

@@ -18,7 +18,7 @@ import type {
 	TransactWriteOperationResultEncoded,
 } from "../shared/transaction-wire-types.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
-import { FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
+import type { FokosMigrationPageBudget } from "../sharding/runtime-config.js";
 import type { FokosEnvelope, FokosShardingHooks } from "../sharding/runtime-types.js";
 import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
 
@@ -70,6 +70,7 @@ type CoordinatorInternals = {
 	buildMigrationPage(
 		cursor: string | null,
 		belongsToTarget: (key: { hashKey: Uint8Array }) => boolean,
+		budget: FokosMigrationPageBudget,
 	): { page: Array<{ state: { transaction_id: string } }>; nextCursor: string | null };
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
@@ -1162,26 +1163,27 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 });
 
 describe("TransactionCoordinatorDO - migration pages", () => {
-	it("pages the ledger FOKOS_PAGE_ROWS transactions at a time, and keeps only the transactions the target owns", async () => {
+	it("pages the ledger by the row budget, and keeps only the transactions the target owns", async () => {
+		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
 		await withCoordinator((tc, state) => {
-			const ids = Array.from({ length: 2 * FOKOS_PAGE_ROWS + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			const ids = Array.from({ length: 2 * budget.pageRows + 5 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
 			for (const id of ids) {
 				insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
 			}
 
 			const all = () => true;
-			const first = tc.buildMigrationPage(null, all);
-			expect(first.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(0, FOKOS_PAGE_ROWS));
-			expect(first.nextCursor).toBe(ids[FOKOS_PAGE_ROWS - 1]);
-			const second = tc.buildMigrationPage(first.nextCursor, all);
-			expect(second.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(FOKOS_PAGE_ROWS, 2 * FOKOS_PAGE_ROWS));
-			const last = tc.buildMigrationPage(second.nextCursor, all);
-			expect(last.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(2 * FOKOS_PAGE_ROWS));
+			const first = tc.buildMigrationPage(null, all, budget);
+			expect(first.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(0, budget.pageRows));
+			expect(first.nextCursor).toBe(ids[budget.pageRows - 1]);
+			const second = tc.buildMigrationPage(first.nextCursor, all, budget);
+			expect(second.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(budget.pageRows, 2 * budget.pageRows));
+			const last = tc.buildMigrationPage(second.nextCursor, all, budget);
+			expect(last.page.map((tx) => tx.state.transaction_id)).toEqual(ids.slice(2 * budget.pageRows));
 			expect(last.nextCursor).toBeNull();
 
 			// A page that the target owns no row of still advances the cursor past the rows it read.
-			const none = tc.buildMigrationPage(null, () => false);
-			expect(none).toEqual({ page: [], nextCursor: ids[FOKOS_PAGE_ROWS - 1] });
+			const none = tc.buildMigrationPage(null, () => false, budget);
+			expect(none).toEqual({ page: [], nextCursor: ids[budget.pageRows - 1] });
 		});
 	});
 });

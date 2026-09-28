@@ -130,7 +130,7 @@ export class BloomFilter {
 	static create(options: { errorRate?: number; maxSizeBytes: number; initialCapacityN?: number }): BloomFilter {
 		const errorRate = options.errorRate ?? DEFAULT_ERROR_RATE;
 		const initialCapacityN = options.initialCapacityN ?? DEFAULT_INITIAL_CAPACITY;
-		const firstBytes = layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
+		const firstBytes = bloomInitialLayerBytes(errorRate, initialCapacityN);
 		invariant(
 			firstBytes <= options.maxSizeBytes,
 			() => `maxSizeBytes (${options.maxSizeBytes}) is too small for the initial layer (${firstBytes} bytes required)`,
@@ -214,6 +214,11 @@ export class BloomFilter {
  */
 function layerFpr(baseErrorRate: number, layerIndex: number): number {
 	return baseErrorRate * Math.pow(TIGHTENING_RATIO, layerIndex + 1);
+}
+
+/** The bytes of the first layer of a filter that `BloomFilter.create` makes with these options. */
+export function bloomInitialLayerBytes(errorRate: number, initialCapacityN: number): number {
+	return layerByteSize(computeLayerBitCount(0, errorRate, initialCapacityN));
 }
 
 /** Converts a bit count to the number of bytes needed to hold it. */

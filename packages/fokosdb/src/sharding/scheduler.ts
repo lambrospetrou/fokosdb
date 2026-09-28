@@ -14,10 +14,10 @@ import type { FokosShardingStore } from "./sharding-store.js";
 export type FokosSchedulerDeps = {
 	storage: DurableObjectStorage;
 	store: FokosShardingStore;
-	/** How far ahead a pass arms its fallback before its first transition. */
-	fallbackAlarmMs: number;
-	/** The delay of the in-memory fast path. */
-	fastPathDelayMs: number;
+	/** How far ahead a pass arms its fallback before its first transition. Read at each use. */
+	fallbackAlarmMs: () => number;
+	/** The delay of the in-memory fast path. Read at each use. */
+	fastPathDelayMs: () => number;
 	/** True after the destroy fence. A fenced pass runs nothing and arms nothing. */
 	isFenced: () => boolean;
 	/** Built-in jobs first, then host jobs. Read at the start of every pass, and again at its end. */
@@ -70,7 +70,7 @@ export class FokosScheduler {
 			this.runDueWork().catch((error: unknown) => {
 				console.error({ ...this.#deps.logParams(), message: "fokos/scheduler: the fast-path pass failed.", error: String(error) });
 			});
-		}, this.#deps.fastPathDelayMs);
+		}, this.#deps.fastPathDelayMs());
 	}
 
 	/** Stops the fast path. The alarm is the caller's to delete. */
@@ -138,7 +138,7 @@ export class FokosScheduler {
 		// Armed BEFORE the pass changes state or calls an RPC. A crash inside the pass then leaves an
 		// alarm that can read the new durable state. The end of the pass replaces it with the earliest
 		// real deadline.
-		await this.ensureAlarmAtMost(now + this.#deps.fallbackAlarmMs);
+		await this.ensureAlarmAtMost(now + this.#deps.fallbackAlarmMs());
 
 		for (const { job } of due) {
 			if (this.#deps.isFenced()) {
@@ -154,7 +154,7 @@ export class FokosScheduler {
 					error: String(error),
 					errorProps: error,
 				});
-				nextRunAt = Date.now() + this.#deps.fallbackAlarmMs;
+				nextRunAt = Date.now() + this.#deps.fallbackAlarmMs();
 			}
 			// Written right after the step, and from a fresh read: a request can call `scheduleJob` for
 			// another job while the step awaits, and a batch write at the end would put stale values over it.

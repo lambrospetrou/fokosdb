@@ -64,6 +64,7 @@ import type {
 	RouteKey,
 } from "./repartition-types.js";
 import type { FokosRepartitionPlan, FokosShardingHooks } from "./runtime-types.js";
+import type { FokosMigrationPageBudget, FokosRuntimeConfig } from "./runtime-config.js";
 import { jitterBackoff } from "durable-utils/retries";
 
 /**
@@ -71,28 +72,6 @@ import { jitterBackoff } from "durable-utils/retries";
  * calls at most six targets. A wider fan-out would queue behind that limit and hold the step open.
  */
 export const REPARTITION_RPC_CONCURRENCY = 6;
-
-/**
- * The page budgets of the overrides phase, and the values a host can adopt for its own pages: the
- * serialized bytes of one page, the rows it holds, and the source rows one scan reads to fill it.
- */
-export const FOKOS_PAGE_BYTES = 20 * 1024 * 1024;
-export const FOKOS_PAGE_ROWS = 1_000;
-export const FOKOS_SCAN_ROWS = 10_000;
-/** The same ceiling over an administration page, measured with the estimator below. */
-const STATUS_PAGE_BYTES = FOKOS_PAGE_BYTES;
-
-const SOURCE_RETRY_BASE_MS = 5_000;
-const SOURCE_RETRY_MAX_MS = 5 * 60_000;
-/** A lock-blocked promotion retries at a flat interval: only a commit or a cancel can change the answer. */
-const LOCK_RETRY_MS = 5_000;
-const CLEANUP_RETRY_MS = 5_000;
-const IMPORT_RETRY_BASE_MS = 10_000;
-const IMPORT_RETRY_MAX_MS = 5 * 60_000;
-/** The source still owns the slice, so the target waits a flat interval rather than backing off. */
-const NOT_CUT_OVER_RETRY_MS = 10_000;
-/** A protocol error no retry can fix. The state stays, the identifiers are logged, and the retry is slow. */
-const NON_RETRYABLE_RETRY_MS = 5 * 60_000;
 
 /** This partition's own route context, as the last request left it, and its immutable identity. */
 export type RepartitionIdentity = {
@@ -115,6 +94,8 @@ export type RepartitionCommonDeps = {
 	identity: () => RepartitionIdentity;
 	scheduleWork: () => void;
 	logParams: () => Record<string, unknown>;
+	/** The active runtime settings: the retry intervals and the page budgets. Read at each use. */
+	config: () => FokosRuntimeConfig;
 };
 
 export type RepartitionSourceDeps = RepartitionCommonDeps;
@@ -376,8 +357,9 @@ export class RepartitionSource {
 					}) ?? null;
 				if (!boundaries) {
 					// A size-triggered split can find fewer than N items in its interval, because each child
-					// needs one. Only a new write can change that, so the retry backs off to five minutes.
-					this.#deferSource(row, now, jitterBackoff(row.attempts, SOURCE_RETRY_BASE_MS, SOURCE_RETRY_MAX_MS));
+					// needs one. Only a new write can change that, so the retry backs off to `sourceRetryMaxMs`.
+					const { sourceRetryBaseMs, sourceRetryMaxMs } = this.deps.config();
+					this.#deferSource(row, now, jitterBackoff(row.attempts, sourceRetryBaseMs, sourceRetryMaxMs));
 					return "progressed";
 				}
 				const starts: (KeyBytes | null)[] = [rp.start, ...boundaries];
@@ -456,7 +438,7 @@ export class RepartitionSource {
 		// Consulted before the FIRST target exists, so a key that cannot move yet gets no range root. The
 		// targets stay `pending` and the plan waits at the flat interval, until a signal wakes it.
 		if (this.store.countRepartitionTargets(row.id).initialized === 0 && !this.#cutoverAllowed(row)) {
-			this.#deferTargets(row, now, LOCK_RETRY_MS);
+			this.#deferTargets(row, now, this.deps.config().lockRetryMs);
 			return "progressed";
 		}
 
@@ -502,7 +484,7 @@ export class RepartitionSource {
 					this.store.setTargetInitialization(row.id, target.partitionId, "initialized", 0, now);
 				} else {
 					const attempts = target.attempts + 1;
-					this.store.setTargetAttempt(row.id, target.partitionId, attempts, now + retryDelay(result.reason, attempts));
+					this.store.setTargetAttempt(row.id, target.partitionId, attempts, now + retryDelay(result.reason, attempts, this.deps.config()));
 				}
 				this.store.refreshRepartitionDue(row.id, now);
 			});
@@ -532,7 +514,7 @@ export class RepartitionSource {
 			// change while the targets are created, and moving ownership then would strand host state on
 			// the wrong partition.
 			if (!this.#cutoverAllowed(current)) {
-				this.store.setRepartitionAttempt(row.id, current.attempts, now + LOCK_RETRY_MS);
+				this.store.setRepartitionAttempt(row.id, current.attempts, now + this.deps.config().lockRetryMs);
 				return "progressed";
 			}
 
@@ -557,6 +539,7 @@ export class RepartitionSource {
 
 		// The retry moves forward before the calls, so a crash in the middle of the fan-out still leaves
 		// a deadline that is later than now and the pass cannot spin on the same targets.
+		const { sourceRetryBaseMs, sourceRetryMaxMs } = this.deps.config();
 		this.store.transactionSync(() => {
 			for (const target of due) {
 				const attempts = target.attempts + 1;
@@ -564,7 +547,7 @@ export class RepartitionSource {
 					row.id,
 					target.partitionId,
 					attempts,
-					now + jitterBackoff(attempts, SOURCE_RETRY_BASE_MS, SOURCE_RETRY_MAX_MS),
+					now + jitterBackoff(attempts, sourceRetryBaseMs, sourceRetryMaxMs),
 				);
 			}
 			this.store.refreshRepartitionDue(row.id, now);
@@ -611,7 +594,7 @@ export class RepartitionSource {
 				this.store.deletePlanChain(row.id);
 				this.store.setRepartitionState(row.id, "cleaned");
 			} else {
-				this.store.setRepartitionAttempt(row.id, current.attempts, now + CLEANUP_RETRY_MS);
+				this.store.setRepartitionAttempt(row.id, current.attempts, now + this.deps.config().cleanupRetryMs);
 			}
 			return "progressed";
 		});
@@ -714,7 +697,7 @@ export class RepartitionSource {
 	statusEntries(
 		cursor: FokosStatusCursor | null,
 		limit: number,
-		maxBytes = STATUS_PAGE_BYTES,
+		maxBytes = this.deps.config().statusPageBytes,
 	): { entries: FokosStatusEntry[]; nextCursor: FokosStatusCursor | null } {
 		const rows = this.store.queryRepartitionStatusPage(cursor, limit);
 		const entries: FokosStatusEntry[] = [];
@@ -848,7 +831,13 @@ export class RepartitionSource {
 			return this.#buildOverridesPage(row, slice, cursor.inner);
 		}
 
-		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice));
+		const config = this.deps.config();
+		const budget: FokosMigrationPageBudget = {
+			pageBytes: config.migrationPageBytes,
+			pageRows: config.migrationPageRows,
+			scanRows: config.migrationScanRows,
+		};
+		const { page, nextCursor } = this.deps.hooks.migration.buildPage(cursor.inner, slice, this.belongsToTarget(slice), budget);
 		return { phase: "host", page, nextCursor: nextCursor === null ? null : { phase: "host", inner: nextCursor } };
 	}
 
@@ -874,15 +863,16 @@ export class RepartitionSource {
 		}
 
 		const n = this.deps.identity().ctx.topology.hashSplitN;
+		const config = this.deps.config();
 		const { rows, nextCursor } = collectBatch<{ hashKey: KeyBytes }, PromotedKeyCursor>({
 			fetchPage: (c, pageSize) => this.store.queryTerminalRouteOverridesPage(c, pageSize),
 			advanceCursor: (r) => ({ hashKey: r.hashKey }),
 			include: (r) => sliceIncludesHashKey(slice, r.hashKey, n),
 			estimateBytes: (r) => r.hashKey.byteLength + 64,
-			budgetBytes: FOKOS_PAGE_BYTES,
-			maxItems: FOKOS_PAGE_ROWS,
-			maxScannedRows: FOKOS_SCAN_ROWS,
-			pageSize: FOKOS_PAGE_ROWS,
+			budgetBytes: config.migrationPageBytes,
+			maxItems: config.migrationPageRows,
+			maxScannedRows: config.migrationScanRows,
+			pageSize: config.migrationPageRows,
 			startCursor: inner,
 		});
 		return {
@@ -1107,7 +1097,7 @@ export class RepartitionTarget {
 		// initialized. A pull now would earn a `repartition_not_cut_over` and put this target behind a
 		// retry deadline for no reason. `fokosStartImport` starts the import, and the alarm starts it
 		// when that call never arrives.
-		await this.deps.ensureAlarmSet(now + IMPORT_RETRY_BASE_MS);
+		await this.deps.ensureAlarmSet(now + this.deps.config().importRetryBaseMs);
 	}
 
 	#assertInitMatches(existing: FokosImportRecord, req: FokosInitRequest): void {
@@ -1157,7 +1147,7 @@ export class RepartitionTarget {
 			}
 			this.#putImport({ ...current, attempts: 0, nextAttemptAt: now, updatedAt: now });
 		});
-		await this.deps.ensureAlarmSet(now + IMPORT_RETRY_BASE_MS);
+		await this.deps.ensureAlarmSet(now + this.deps.config().importRetryBaseMs);
 		this.deps.scheduleWork();
 	}
 
@@ -1209,7 +1199,8 @@ export class RepartitionTarget {
 
 	#deferImport(rec: FokosImportRecord, now: number, error: unknown): void {
 		const attempts = rec.attempts + 1;
-		const delay = retryDelay(error, attempts, IMPORT_RETRY_BASE_MS, IMPORT_RETRY_MAX_MS, NOT_CUT_OVER_RETRY_MS);
+		const config = this.deps.config();
+		const delay = retryDelay(error, attempts, config, config.importRetryBaseMs, config.importRetryMaxMs, config.notCutOverRetryMs);
 		this.store.transactionSync(() => {
 			const current = this.importRecord();
 			if (!current || current.state === "active") {
@@ -1231,7 +1222,14 @@ export class RepartitionTarget {
 	}
 }
 
-function retryDelay(error: unknown, attempts: number, base = SOURCE_RETRY_BASE_MS, max = SOURCE_RETRY_MAX_MS, flat?: number): number {
+function retryDelay(
+	error: unknown,
+	attempts: number,
+	config: FokosRuntimeConfig,
+	base = config.sourceRetryBaseMs,
+	max = config.sourceRetryMaxMs,
+	flat?: number,
+): number {
 	if (flat !== undefined && FokosError.isCode(error, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over)) {
 		return flat;
 	}
@@ -1241,7 +1239,7 @@ function retryDelay(error: unknown, attempts: number, base = SOURCE_RETRY_BASE_M
 		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_unknown) ||
 		FokosError.isCode(error, SHARDING_INTERNAL_CODES.repartition_target_unknown)
 	) {
-		return NON_RETRYABLE_RETRY_MS;
+		return config.nonRetryableRetryMs;
 	}
 	return jitterBackoff(attempts, base, max);
 }

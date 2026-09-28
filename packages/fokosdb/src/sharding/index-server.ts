@@ -32,11 +32,12 @@ export type {
 	FokosRangeVisit,
 	FokosRepartitionPlan,
 	FokosRequestPromotionResult,
-	FokosRuntimeConfigOverrides,
 	FokosRuntimeOptions,
 	FokosShardingHooks,
 	FokosSignals,
 } from "./runtime-types.js";
+export { DEFAULT_RUNTIME_CONFIG, resolveRuntimeConfig } from "./runtime-config.js";
+export type { FokosMigrationPageBudget, FokosRuntimeConfig, FokosRuntimeConfigOverrides } from "./runtime-config.js";
 export { ROUTE_EVIDENCE_MAX_BYTES, RouteCollector, attachRouting, routedError, routeNodeBytes } from "./envelope.js";
 export type { FokosRoutedError } from "./envelope.js";
 export { planRangeFrontier } from "./range-frontier.js";
@@ -54,7 +55,7 @@ export { selectRangeAncestors } from "./range-ancestors.js";
 
 // ─── Sharding store ───────────────────────────────────────────────────────────
 
-export { FOKOS_KV_KEYS, FokosShardingStore, RANGE_HIERARCHY_MAX_ROWS } from "./sharding-store.js";
+export { FOKOS_KV_KEYS, FokosShardingStore } from "./sharding-store.js";
 export type {
 	FokosShardingStoreOptions,
 	LearnedRangeSlice,
@@ -71,14 +72,7 @@ export type {
 
 // ─── Repartition flow ─────────────────────────────────────────────────────────
 
-export {
-	FOKOS_PAGE_BYTES,
-	FOKOS_PAGE_ROWS,
-	FOKOS_SCAN_ROWS,
-	REPARTITION_RPC_CONCURRENCY,
-	RepartitionSource,
-	RepartitionTarget,
-} from "./repartition-flow.js";
+export { REPARTITION_RPC_CONCURRENCY, RepartitionSource, RepartitionTarget } from "./repartition-flow.js";
 export type {
 	RepartitionCommonDeps,
 	RepartitionIdentity,

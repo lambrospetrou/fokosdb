@@ -28,11 +28,7 @@ import {
 } from "./partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
 import type { MigrationHost, RouteKey } from "../../sharding/repartition-types.js";
-
-/** The page budgets of one pull. The source owns them; the request carries no budget. */
-const PAGE_BYTES = 20 * 1024 * 1024;
-const PAGE_ROWS = 1_000;
-const SCAN_ROWS = 10_000;
+import type { FokosMigrationPageBudget } from "../../sharding/runtime-config.js";
 
 type BelongsToTarget = (key: RouteKey) => boolean;
 
@@ -56,16 +52,20 @@ export type FokosMigrationHostDeps = {
 export class FokosMigrationHost implements MigrationHost {
 	constructor(private readonly deps: FokosMigrationHostDeps) {}
 
-	/** `belongsToTarget` is the ownership function of the slice; the flow owns it and every row passes through it. */
+	/**
+	 * `belongsToTarget` is the ownership function of the slice; the flow owns it and every row passes
+	 * through it. `budget` holds the page budgets of the source. The request carries no budget.
+	 */
 	buildPage(
 		cursor: unknown,
 		_slice: FokosSlice,
 		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const from = asHostCursor(cursor);
 		return from.stream === "items"
-			? this.#buildItemsPage(from.cursor, belongsToTarget)
-			: this.#buildPendingTxPage(from.cursor, belongsToTarget);
+			? this.#buildItemsPage(from.cursor, belongsToTarget, budget)
+			: this.#buildPendingTxPage(from.cursor, belongsToTarget, budget);
 	}
 
 	/**
@@ -90,6 +90,7 @@ export class FokosMigrationHost implements MigrationHost {
 	#buildItemsPage(
 		cursor: ScanCursor | null,
 		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
@@ -97,10 +98,10 @@ export class FokosMigrationHost implements MigrationHost {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimateItemBytes,
-			budgetBytes: PAGE_BYTES,
-			maxItems: PAGE_ROWS,
-			maxScannedRows: SCAN_ROWS,
-			pageSize: PAGE_ROWS,
+			budgetBytes: budget.pageBytes,
+			maxItems: budget.pageRows,
+			maxScannedRows: budget.scanRows,
+			pageSize: budget.pageRows,
 			startCursor: cursor,
 		});
 		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
@@ -148,6 +149,7 @@ export class FokosMigrationHost implements MigrationHost {
 	#buildPendingTxPage(
 		cursor: PendingTransactionCursor | null,
 		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
@@ -155,10 +157,10 @@ export class FokosMigrationHost implements MigrationHost {
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimatePendingTxBytes,
-			budgetBytes: PAGE_BYTES,
-			maxItems: PAGE_ROWS,
-			maxScannedRows: SCAN_ROWS,
-			pageSize: PAGE_ROWS,
+			budgetBytes: budget.pageBytes,
+			maxItems: budget.pageRows,
+			maxScannedRows: budget.scanRows,
+			pageSize: budget.pageRows,
 			startCursor: cursor,
 		});
 		// Every page of this stream carries the deletion metadata, so a slice with no lock at all still

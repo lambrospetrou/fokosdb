@@ -24,6 +24,7 @@ import { FokosRouter } from "../../src/sharding/router.js";
 import { isRangePartition, type FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
+import { DEFAULT_RUNTIME_CONFIG } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import {
 	RepartitionSource,
@@ -245,6 +246,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				return () => {};
 			},
 			scheduleWork: () => scheduled.set(doName, (scheduled.get(doName) ?? 0) + 1),
+			config: () => DEFAULT_RUNTIME_CONFIG,
 			ensureAlarmSet: async (targetMs) => {
 				alarms.set(doName, [...(alarms.get(doName) ?? []), targetMs]);
 			},

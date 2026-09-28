@@ -2,6 +2,7 @@ import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
+import type { FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -523,6 +524,30 @@ describe("PartitionDO - splitting", () => {
 			}
 			// The split spreads the items over more than one child. A very skewed hash can make this flaky.
 			expect(foundIds.size).toBeGreaterThan(1);
+		});
+
+		it("builds each migration page inside the page budgets of fokosRuntimeConfig", { concurrent: false }, async ({ expect }) => {
+			// Splits one partition, reads each item back through it, and counts the pulls that its children made.
+			const split = async (overrides: FokosRuntimeConfigOverrides) => {
+				const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2, hashSplitConditions: { maxSizeMb: 1 } });
+				await partition.controlled.testRuntimeConfig(overrides);
+				const items = await partition.triggerHashSplit();
+				await partition.awaitSplitCompleted();
+				for (const item of items) {
+					expect(await partition.get({ hashKey: item.hashKey, sortKey: item.sortKey })).toMatchObject({
+						found: true,
+						item: { data: item.data },
+					});
+				}
+				return { pulls: (await partition.controlled.testPullStats()).calls, items: items.length };
+			};
+
+			const defaults = await split({});
+			const onePerPage = await split({ migrationPageRows: 1 });
+			// One row for each page: each item is a page of its own, and each of the two children also
+			// pulls at least one page of route overrides and one page of pending transactions.
+			expect(onePerPage.pulls).toBeGreaterThanOrEqual(onePerPage.items + 2 * 2);
+			expect(onePerPage.pulls).toBeGreaterThan(defaults.pulls);
 		});
 
 		it("arms TTL deletion after child migration completes", { concurrent: false }, async ({ expect }) => {

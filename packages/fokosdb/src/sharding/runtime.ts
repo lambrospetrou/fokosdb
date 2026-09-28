@@ -76,18 +76,10 @@ import type {
 	FokosSignals,
 } from "./runtime-types.js";
 import { FokosScheduler } from "./scheduler.js";
+import { PROMOTION_BLOOM_MAX_BYTES, resolveRuntimeConfig, type FokosRuntimeConfig } from "./runtime-config.js";
 import { FokosShardingStore, type LearnedRangeSlice, type RepartitionState } from "./sharding-store.js";
 import { cursorFallsInChild, rangeIntersects, type SkInterval } from "./sk-interval.js";
 import type { RangeAncestorInfo } from "./types.js";
-
-const DEFAULT_FALLBACK_ALARM_MS = 5_000;
-const DEFAULT_FAST_PATH_DELAY_MS = 50;
-const DEFAULT_IMPORT_PAGES_PER_PASS = 16;
-/** Both bounds of one `fokosStatus` page: the entry count, and the estimated serialized size. */
-const STATUS_PAGE_ENTRIES = 1_000;
-const STATUS_PAGE_BYTES = 20 * 1024 * 1024;
-/** A speculative or cached forward that misses resolves again; this bounds the retries of one call. */
-const MAX_FORWARD_RETRIES = 8;
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const NOOP_CALL: FokosLocalCall = { signal: () => {} };
@@ -142,9 +134,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	readonly #source: RepartitionSource;
 	readonly #target: RepartitionTarget;
 	readonly #scheduler: FokosScheduler;
-	readonly #fallbackAlarmMs: number;
-	readonly #hashArenaBytes: number | undefined;
-	readonly #bloomOptions: { expectedKeys: number; falsePositiveRate: number };
+	readonly #configOverrides: FokosRuntimeOptions<TPolicy>["config"];
 
 	/** The immutable identity, from `__fokos/identity`. Absent until the first request or `fokosInit`. */
 	#identity?: FokosPartitionIdentity;
@@ -164,10 +154,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#hooks = opts.hooks;
 		this.#ops = opts.operations as Record<string, AnyOperation>;
 		this.#validateOperations();
-		this.#fallbackAlarmMs = opts.scheduler?.fallbackAlarmMs ?? DEFAULT_FALLBACK_ALARM_MS;
-		this.#hashArenaBytes = opts.caches?.hashArenaBytes;
-		this.#bloomOptions = opts.caches?.promotionBloom ?? { expectedKeys: 300_000, falsePositiveRate: 0.01 };
-		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: opts.caches?.rangeHierarchyMaxRows });
+		this.#configOverrides = opts.config;
+		// A configuration that is not valid fails the construction.
+		const config = this.#config();
+		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: config.rangeHierarchyMaxRows });
 
 		const deps: RepartitionCommonDeps = {
 			getPeer: (ref) => this.#peer(ref),
@@ -175,6 +165,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			identity: () => ({ ctx: this.routeContext(), identity: this.identity() }),
 			scheduleWork: () => this.#scheduler.wake(),
 			logParams: () => this.#logParams(),
+			config: () => this.#config(),
 		};
 		this.#source = new RepartitionSource(this.#store, deps);
 		this.#target = new RepartitionTarget(this.#store, {
@@ -186,8 +177,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#scheduler = new FokosScheduler({
 			storage: opts.ctx.storage,
 			store: this.#store,
-			fallbackAlarmMs: this.#fallbackAlarmMs,
-			fastPathDelayMs: opts.scheduler?.fastPathDelayMs ?? DEFAULT_FAST_PATH_DELAY_MS,
+			fallbackAlarmMs: () => this.#config().fallbackAlarmMs,
+			fastPathDelayMs: () => this.#config().fastPathDelayMs,
 			isFenced: () => this.#store.isDestroying(),
 			jobs: () => [...this.#builtinJobs(), ...(this.#hooks.jobs ?? [])],
 			logParams: () => this.#logParams(),
@@ -235,7 +226,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				// The same gate the other shapes take, under the name of this operation: the request nudges
 				// the import on before it is refused.
 				this.#scheduler.wake();
-				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
+				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
 				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "partition split in progress, please retry later",
 					attributes: { operation: op },
@@ -271,7 +262,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 */
 	async #whileImporting(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
 		this.#scheduler.wake();
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
+		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
 		// `dispatch` gates a `local` operation with `whileMigrating: "throw"` before this point and runs
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");
@@ -393,7 +384,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return await this.#forwardTo(collector, resolution.target, op, req, [key.hashKey]);
 		} catch (e) {
 			const next = this.#fallbackAfterMiss(key, resolution, e, descriptor.readOnly === true);
-			if (!next || retries >= MAX_FORWARD_RETRIES) {
+			if (!next || retries >= this.#config().maxForwardRetries) {
 				throw e;
 			}
 			// Every error that starts a fallback comes before any handler ran on the target.
@@ -933,7 +924,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			// A promotion in flight gets its fallback alarm back and one pass now: a request that asks
 			// about it is the one signal a partition gets when an eviction lost its alarm.
 			if (override.state === "queued" || override.state === "planned" || override.state === "cutover") {
-				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
+				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
 				this.#scheduler.wake();
 			}
 			return { owner, queued: false, reason: "already_promoted", state: override.state };
@@ -950,7 +941,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		}
 		// The fallback alarm moves earlier BEFORE the queue transaction, so a crash between the two
 		// leaves an alarm that reads the new row. A failed alarm write creates no row.
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
+		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
 		const row = this.#source.queue({ kind: "key_promotion", hashKey, data });
 		if (!row) {
 			return { owner, queued: false, reason: "split_in_progress" };
@@ -979,7 +970,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (!this.#identity) {
 				return { initialized: false, destroying, ref: null, role: null, importState: null, entries: [], nextCursor: null };
 			}
-			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, STATUS_PAGE_ENTRIES, STATUS_PAGE_BYTES);
+			const config = this.#config();
+			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, config.statusPageEntries, config.statusPageBytes);
 			return {
 				initialized: true,
 				destroying,
@@ -1288,7 +1280,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return null;
 		}
 		const snapshot = this.#store.getHashArena();
-		const opts = this.#hashArenaBytes === undefined ? undefined : { budgetBytes: this.#hashArenaBytes };
+		const opts = { budgetBytes: this.#config().hashArenaBytes };
 		this.#hashArena = snapshot
 			? HashTopology.fromSnapshot(snapshot, opts)
 			: HashTopology.create(identity.topology.hashSplitN, identityDepth(identity), opts);
@@ -1344,7 +1336,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * resolves the hash tree again with the Bloom step off: on a router the target is the hash child,
 	 * on a leaf it is this partition and the local handler answers for the same visit. Every retry of a
 	 * cache miss goes through the same ladder, so a miss on a retry cannot skip a fallback.
-	 * `MAX_FORWARD_RETRIES` bounds the misses one call can absorb.
+	 * `maxForwardRetries` bounds the misses one call can absorb.
 	 */
 	async #forwardRangeVisit(
 		op: string,
@@ -1362,7 +1354,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			try {
 				return await this.#forwardTo(collector, target, op, req, [input.hashKey]);
 			} catch (e) {
-				if (attempt >= MAX_FORWARD_RETRIES) {
+				if (attempt >= this.#config().maxForwardRetries) {
 					throw e;
 				}
 
@@ -1482,6 +1474,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const identity = this.identity();
 		const myDepth = identityDepth(identity);
 		const minRangeDepth = identity.kind === "hash" ? 1 : myDepth + 2;
+		const refreshMs = this.#config().rangeHierarchyRefreshMs;
 		const arena = identity.kind === "hash" ? this.#arena() : null;
 		let arenaChanged = false;
 		let bloomChanged = false;
@@ -1508,6 +1501,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 						decoded.startBoundary ?? NO_SORT_KEY,
 						decoded.endBoundary ?? NO_SORT_KEY,
 						node.rangeDepth,
+						refreshMs,
 					);
 				} else {
 					// Only the first part of the ID, because the own slice of the node is not stored.
@@ -1515,7 +1509,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				}
 				for (const ancestor of node._rangeAncestors ?? []) {
 					if (ancestor.depth >= minRangeDepth) {
-						this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth);
+						this.#store.learnRangeBoundary(hashKey, ancestor.startBoundary, ancestor.endBoundary, ancestor.depth, refreshMs);
 					}
 				}
 				if (identity.kind !== "hash") {
@@ -1550,11 +1544,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	#bloomForLearning(): PartialRangeTopology {
-		this.#bloom ??= PartialRangeTopology.create({
-			errorRate: this.#bloomOptions.falsePositiveRate,
-			initialCapacityN: this.#bloomOptions.expectedKeys,
-			// The serialized filter is one KV value, which must stay below the 2 MB limit.
-			maxSizeBytes: 1.5 * 1024 * 1024,
+		if (this.#bloom) {
+			return this.#bloom;
+		}
+		const config = this.#config();
+		this.#bloom = PartialRangeTopology.create({
+			errorRate: config.promotionBloomFalsePositiveRate,
+			initialCapacityN: config.promotionBloomExpectedKeys,
+			maxSizeBytes: PROMOTION_BLOOM_MAX_BYTES,
 		});
 		return this.#bloom;
 	}
@@ -1671,7 +1668,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (!this.#source.canQueue({ kind })) {
 			return;
 		}
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#fallbackAlarmMs);
+		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
 		const row = this.#source.queue({ kind, data: decision.data });
 		if (!row) {
 			return;
@@ -1682,13 +1679,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	// ═══ jobs ═══════════════════════════════════════════════════════════════
 
-	#importPagesPerPass(): number {
-		const value = this.#hooks.runtimeConfig?.().importPagesPerPass ?? DEFAULT_IMPORT_PAGES_PER_PASS;
-		invariant(
-			Number.isInteger(value) && value >= 1,
-			() => `fokos/runtime: importPagesPerPass must be an integer of at least 1, got ${value}`,
-		);
-		return value;
+	/** The active settings: the host overrides over the defaults, validated. Read at each use. */
+	#config(): FokosRuntimeConfig {
+		return resolveRuntimeConfig(this.#configOverrides?.());
 	}
 
 	#builtinJobs(): FokosJob[] {
@@ -1703,7 +1696,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 					return rec && (rec.state === "awaiting_data" || rec.state === "importing") ? rec.nextAttemptAt : null;
 				},
 				runStep: async () => {
-					for (let i = 0; i < this.#importPagesPerPass(); i++) {
+					const pages = this.#config().importPagesPerPass;
+					for (let i = 0; i < pages; i++) {
 						if (this.#store.isDestroying()) {
 							break;
 						}

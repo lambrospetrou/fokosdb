@@ -7,6 +7,7 @@
  * without reading, which is what lets a later runtime package keep the flow unchanged while an
  * application defines its own streams.
  */
+import type { FokosMigrationPageBudget } from "./runtime-config.js";
 import type { KeyBytes } from "./key-codec.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { RangeAncestorInfo } from "./types.js";
@@ -172,9 +173,16 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * it. For a `hash_child` slice it returns false for a hash key with a terminal route override, because
  * a range tree owns that key; the child receives the override pointer and no data copy. For a `range`
  * slice it tests the hash key and `[start, end)`. For a `promoted_key` slice it tests the hash key only.
+ *
+ * `budget` holds the active page budgets of the runtime. The host keeps each page inside them.
  */
 export interface MigrationHost {
-	buildPage(cursor: unknown, slice: FokosSlice, belongsToTarget: (key: RouteKey) => boolean): { page: unknown; nextCursor: unknown };
+	buildPage(
+		cursor: unknown,
+		slice: FokosSlice,
+		belongsToTarget: (key: RouteKey) => boolean,
+		budget: FokosMigrationPageBudget,
+	): { page: unknown; nextCursor: unknown };
 	applyPage(page: unknown, slice: FokosSlice): void;
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void;
 }

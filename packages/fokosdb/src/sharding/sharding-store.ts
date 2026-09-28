@@ -14,6 +14,7 @@
  */
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
 import invariant from "../shared/invariant.js";
+import { DEFAULT_RUNTIME_CONFIG } from "./runtime-config.js";
 import { one, tryOne } from "../shared/sql-cursor.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import type { HashTopologySnapshot } from "./hash-topology.js";
@@ -136,19 +137,9 @@ export type PromotedKeyCursor = { hashKey: KeyBytes };
 export type LearnedRangeSlice = { depth: number; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null };
 
 export type FokosShardingStoreOptions = {
-	/** The row bound of `fokos_range_hierarchy`. Default: 10,000. */
+	/** The row bound of `fokos_range_hierarchy`. A row holds two boundary keys and one hash key. Default: `DEFAULT_RUNTIME_CONFIG`. */
 	rangeHierarchyMaxRows?: number;
 };
-
-/** The default row bound of the learned range hierarchy. A row holds two boundary keys and one hash key. */
-export const RANGE_HIERARCHY_MAX_ROWS = 10_000;
-
-/**
- * A learn refreshes `learned_at` only when the row is older than this. Every forwarded request learns
- * the boundaries of the partition that answered, so an unconditional refresh would be one write per
- * forward; this keeps a hot row at one seek and no write.
- */
-const RANGE_HIERARCHY_REFRESH_MS = 60_000;
 
 /**
  * A repartition row has a source step to run when this predicate holds, and the alarm and the due-row
@@ -391,7 +382,7 @@ export class FokosShardingStore {
 
 	constructor(storage: DurableObjectStorage, options: FokosShardingStoreOptions = {}) {
 		this.#storage = storage;
-		this.#rangeHierarchyMaxRows = options.rangeHierarchyMaxRows ?? RANGE_HIERARCHY_MAX_ROWS;
+		this.#rangeHierarchyMaxRows = options.rangeHierarchyMaxRows ?? DEFAULT_RUNTIME_CONFIG.rangeHierarchyMaxRows;
 		invariant(this.#rangeHierarchyMaxRows >= 1, "fokos/sharding-store: rangeHierarchyMaxRows must be at least 1");
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
@@ -929,14 +920,23 @@ export class FokosShardingStore {
 
 	/**
 	 * Learns one range boundary, or refreshes its eviction stamp when it is already known and older
-	 * than `RANGE_HIERARCHY_REFRESH_MS`. Every row is written under the real hash key it describes, so
+	 * than `refreshMs`. Every forwarded request learns the boundaries of the partition that answered, so
+	 * an unconditional refresh would be one write per forward; `refreshMs` keeps a hot row at one seek
+	 * and no write. Every row is written under the real hash key it describes, so
 	 * a hash partition can hold the boundaries of many promoted keys in one table.
 	 *
 	 * The table is bounded by `rangeHierarchyMaxRows`. A write that can have grown it evicts the rows
 	 * with the oldest `learned_at`, deepest first. A partition's own ancestors are in its identity, so
 	 * eviction cannot change its route evidence; a lost row costs one more hop on a later request.
 	 */
-	learnRangeBoundary(hk: KeyBytes, startBoundary: KeyBytes, endBoundary: KeyBytes, depth: number, now = Date.now()): void {
+	learnRangeBoundary(
+		hk: KeyBytes,
+		startBoundary: KeyBytes,
+		endBoundary: KeyBytes,
+		depth: number,
+		refreshMs: number,
+		now = Date.now(),
+	): void {
 		const res = this.#storage.sql.exec(
 			`INSERT INTO fokos_range_hierarchy (hk, sk_start_boundary, sk_end_boundary, depth, learned_at) VALUES (?1, ?2, ?3, ?4, ?5)
 			 ON CONFLICT (hk, sk_start_boundary, sk_end_boundary) DO UPDATE SET learned_at = excluded.learned_at
@@ -946,7 +946,7 @@ export class FokosShardingStore {
 			endBoundary,
 			depth,
 			now,
-			RANGE_HIERARCHY_REFRESH_MS,
+			refreshMs,
 		);
 		if (res.rowsWritten === 0) {
 			return;

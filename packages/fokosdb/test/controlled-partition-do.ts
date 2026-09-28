@@ -12,6 +12,7 @@
  */
 import { PartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
+import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
 import type { FokosInitRequest, FokosMigrationPage, FokosMigrationPullRequest } from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
@@ -70,6 +71,7 @@ export class ControlledPartitionDO extends PartitionDO {
 	#readGate: (Gate & { parked: boolean }) | null = null;
 	#prepareGate: (Gate & { parked: boolean }) | null = null;
 	#staleTransactionMs: number | null = null;
+	#runtimeConfig: FokosRuntimeConfigOverrides = {};
 
 	/**
 	 * Logs the call, and applies the rule of `op` when one exists. Else it returns the promise of
@@ -127,6 +129,11 @@ export class ControlledPartitionDO extends PartitionDO {
 
 	override fokosStaleTransactionMs(): number {
 		return this.#staleTransactionMs ?? super.fokosStaleTransactionMs();
+	}
+
+	protected override fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
+		// The runtime reads this in the constructor of PartitionDO, before the fields of this class exist.
+		return #runtimeConfig in this ? this.#runtimeConfig : super.fokosRuntimeConfig();
 	}
 
 	override async fokosMigrationPull(req: FokosMigrationPullRequest): Promise<FokosMigrationPage> {
@@ -230,6 +237,11 @@ export class ControlledPartitionDO extends PartitionDO {
 	async testReleasePrepare(): Promise<void> {
 		this.#prepareGate?.release();
 		this.#prepareGate = null;
+	}
+
+	/** Replaces the runtime setting overrides of this partition. `{}` restores the defaults. */
+	async testRuntimeConfig(overrides: FokosRuntimeConfigOverrides): Promise<void> {
+		this.#runtimeConfig = overrides;
 	}
 
 	/** Replaces the stale-transaction time of this partition. `null` restores the shipped value. */
