@@ -6,7 +6,6 @@ export type AppEnv = { Bindings: Env; Variables: { dbItemMeta?: object } };
 
 const SplitConditionsSchema = v.object({
 	maxSizeMb: v.optional(v.number()),
-	// maxItems: v.optional(v.number()),
 });
 
 export const PartitionOptionsSchema = v.optional(

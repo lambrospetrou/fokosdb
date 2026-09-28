@@ -82,6 +82,8 @@ export type TransactionParticipantDeps = {
 	store: PartitionStore;
 	/** Injectable wall clock (epoch milliseconds) for skew/staleness tests; defaults to Date.now. */
 	now?: () => number;
+	/** A prepare whose timestamp is more than this far ahead of the local clock is rejected (clock_skew). Read at each prepare. */
+	maxClockSkewMs: () => number;
 	/**
 	 * The transaction order timestamp of a single-shot transaction. Injectable so tests can pin it;
 	 * defaults to txOrderTimestampNow.
@@ -110,16 +112,15 @@ export type SingleShotResult = { response: SingleShotResponse; promotionCandidat
  * the PartitionStore.
  */
 export class TransactionParticipant {
-	/** Prepares arriving more than this far ahead of the local clock are rejected (clock_skew). */
-	static readonly MAX_CLOCK_SKEW_MS = 5_000;
-
 	#store: PartitionStore;
 	#now: () => number;
+	#maxClockSkewMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
+		this.#maxClockSkewMs = deps.maxClockSkewMs;
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
 	}
 
@@ -202,7 +203,7 @@ export class TransactionParticipant {
 
 		// The clock of this partition rejects the whole request, so every operation it owns reports it.
 		// The transaction order timestamp carries sub-millisecond digits, so the comparison is on physical milliseconds.
-		if (Math.floor(request.transactionTimestamp / TX_ORDER_TS_UNITS_PER_MS) > now + TransactionParticipant.MAX_CLOCK_SKEW_MS) {
+		if (Math.floor(request.transactionTimestamp / TX_ORDER_TS_UNITS_PER_MS) > now + this.#maxClockSkewMs()) {
 			return {
 				outcome: "rejected",
 				results: request.items.map((item) => ({

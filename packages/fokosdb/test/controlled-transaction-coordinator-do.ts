@@ -7,26 +7,27 @@
  * value.
  */
 import { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
+import type { TransactionCoordinatorDOConfigOverrides } from "../src/server/host-config.js";
 
 export class ControlledTransactionCoordinatorDO extends TransactionCoordinatorDO {
 	#initiateWriteCalls = 0;
-	#fanoutBudgetMs: number | null = null;
+	#config: TransactionCoordinatorDOConfigOverrides = {};
 
 	override async initiateWrite(...args: Parameters<TransactionCoordinatorDO["initiateWrite"]>) {
 		this.#initiateWriteCalls++;
 		return await super.initiateWrite(...args);
 	}
 
-	override fokosFanoutRequestBudgetMs(): number {
-		return this.#fanoutBudgetMs ?? super.fokosFanoutRequestBudgetMs();
+	protected override fokosConfig(): TransactionCoordinatorDOConfigOverrides {
+		return this.#config;
 	}
 
 	async testInitiateWriteCalls(): Promise<number> {
 		return this.#initiateWriteCalls;
 	}
 
-	/** Replaces the fan-out budget of this coordinator. `null` restores the shipped value. */
-	async testFanoutBudgetMs(ms: number | null): Promise<void> {
-		this.#fanoutBudgetMs = ms;
+	/** Replaces the setting overrides of this coordinator. `{}` restores the defaults. */
+	async testConfig(overrides: TransactionCoordinatorDOConfigOverrides): Promise<void> {
+		this.#config = overrides;
 	}
 }

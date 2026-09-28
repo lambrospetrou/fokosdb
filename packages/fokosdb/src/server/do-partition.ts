@@ -39,7 +39,8 @@ import {
 } from "../shared/partition/partition-store.js";
 import type { RepartitionState } from "../sharding/sharding-store.js";
 import { parseCoordinatorRef, TransactionParticipant, type PromotionCandidate } from "../shared/partition/transaction-participant.js";
-import { TtlExpiry, type TtlSweepConfig } from "../shared/partition/ttl-expiry.js";
+import { TtlExpiry } from "../shared/partition/ttl-expiry.js";
+import { resolvePartitionConfig, type PartitionDOConfig, type PartitionDOConfigOverrides } from "./host-config.js";
 import { FokosMigrationHost } from "../shared/partition/fokos-migration-host.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
@@ -81,6 +82,7 @@ import { createQueryPageCollector } from "../shared/query/query-collector.js";
 import { getColoInfo, type ColoInfo } from "../shared/cf-utils.js";
 import { partitionStubByName, txCoordinatorStubForParticipant } from "../shared/do-stubs.js";
 import {
+	ADMISSION_MARGIN,
 	applyImageCap,
 	conditionFailedReason,
 	decodeItemKeys,
@@ -245,8 +247,6 @@ export type PartitionRpc = FokosShardingRpc & {
 
 // ─────────────────────────────────────────────────────────────────────────────
 
-/** The fraction of `hashSplitConditions.maxSizeMb` that one key must reach to become a promotion candidate. */
-export const RANGE_PROMOTION_FRACTION = 0.25;
 /** The host job that asks the coordinator of each stale lock to resolve it. */
 const JOB_STALE_TX_RECOVERY = "stale_tx_recovery";
 
@@ -254,8 +254,6 @@ const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const keyOf = (item: TransactionItemKey) => ({ hashKey: item.hashKey, sortKey: item.sortKey });
 
 export class PartitionDO extends DurableObject implements PartitionRpc {
-	private static readonly STALE_TX_MS = 5_000;
-
 	/** The sharding runtime: identity, routing, repartitions, and the alarm. Every public method is one `dispatch`. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
 	#store: PartitionStore;
@@ -269,12 +267,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.#store = new PartitionStore(ctx.storage);
-		this.#participant = new TransactionParticipant({ store: this.#store, now: () => this.fokosNow() });
+		this.#participant = new TransactionParticipant({
+			store: this.#store,
+			now: () => this.fokosNow(),
+			maxClockSkewMs: () => this.config().maxClockSkewMs,
+		});
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
 			canSweep: () => this.canSweepLocally(),
 			logParams: () => this.logParams(),
-			config: () => this.fokosTtlConfig(),
+			config: () => this.config().ttlSweep,
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
@@ -286,7 +288,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			config: () => this.fokosRuntimeConfig(),
 		});
 		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
-		this.#ttl.arm(this.fokosTtlConfig().initialDelayMs);
+		this.#ttl.arm(this.config().ttlSweep.initialDelayMs);
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
 		// It swallows the errors, because telemetry must never affect the lifecycle of the DO.
@@ -343,7 +345,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 	/**
 	 * Promotes `hashKey` to its own range structure now, instead of waiting for the key to grow past
-	 * `hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION`. It only queues the work: the same
+	 * `hashSplitConditions.maxSizeMb * promotionFraction`. It only queues the work: the same
 	 * background pass performs the cutover, the migration and the acknowledgement. Idempotent: a key
 	 * that already has a promotion entry comes back with `queued: false`.
 	 */
@@ -418,12 +420,25 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	//////////////////////////////
 
 	/**
-	 * How long a prepared transaction may sit on this partition before the stale sweep asks its
-	 * coordinator to resolve it, and how far ahead the sweep's alarm is set. Read at each use, so a
-	 * subclass can vary it.
+	 * Override to change the settings of this class. The class merges the result with
+	 * `DEFAULT_PARTITION_CONFIG`, validates it, and reads it at each use. The constructor of this class
+	 * calls it, before `this.fokos` is assigned and before the fields of a subclass exist. An override
+	 * that reads the identity or the policy of the partition must first check
+	 * `this.fokos?.initialized()`, and return a fallback value when it is false.
 	 */
-	fokosStaleTransactionMs(): number {
-		return PartitionDO.STALE_TX_MS;
+	protected fokosConfig(): PartitionDOConfigOverrides {
+		return {};
+	}
+
+	/**
+	 * Override to change the settings of the sharding runtime of this class. The runtime merges the
+	 * result with `DEFAULT_RUNTIME_CONFIG` and validates it. It calls this method in its own
+	 * constructor, before `this.fokos` is assigned, and again at each use of a setting. An override that
+	 * reads the identity or the policy of the partition must first check `this.fokos?.initialized()`,
+	 * and return a fallback value when it is false.
+	 */
+	protected fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
+		return {};
 	}
 
 	/**
@@ -444,26 +459,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		return { cfColo: "", cfLoc: "", cfFl: "" };
 	}
 
-	/**
-	 * Override to change the settings of the sharding runtime of this class. The runtime merges the
-	 * result with `DEFAULT_RUNTIME_CONFIG` and validates it. It calls this method in its own
-	 * constructor, before `this.fokos` is assigned, and again at each use of a setting. An override that
-	 * reads the identity or the policy of the partition must first check `this.fokos?.initialized()`,
-	 * and return a fallback value when it is false.
-	 */
-	protected fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
-		return {};
-	}
-
-	protected fokosTtlConfig(): TtlSweepConfig {
-		return {
-			chunkSize: 100,
-			sleepMs: 1000,
-			maxRowsBeforeSleep: 10_000,
-			maxBytesBeforeSleep: 50 * 1024 * 1024,
-			maxRowsPerCycle: 100_000,
-			initialDelayMs: 500,
-		};
+	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
+	private __cachedConfig?: PartitionDOConfig;
+	private config(): PartitionDOConfig {
+		if (!this.__cachedConfig) {
+			this.__cachedConfig = resolvePartitionConfig(this.fokosConfig());
+		}
+		return this.__cachedConfig;
 	}
 
 	/**
@@ -537,7 +539,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					const response = this.#participant.prepareLocal(req);
 					// The lock is durable, so its recovery deadline must be too, even when the coordinator never returns.
 					if (response.outcome === "accepted") {
-						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.fokosNow() + this.fokosStaleTransactionMs() }] });
+						call.signal({ jobs: [{ name: JOB_STALE_TX_RECOVERY, runAt: this.fokosNow() + this.config().staleTransactionMs }] });
 					}
 					return response;
 				},
@@ -701,7 +703,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					return true;
 				}
 				const hashKey = promotedKeyOf(plan);
-				this.#store.deleteItemsBatchForHashKey(hashKey, 1000);
+				this.#store.deleteItemsBatchForHashKey(hashKey, this.config().promotedKeyCleanupRows);
 				this.#store.deletePendingTxForHashKey(hashKey);
 				if (this.#store.hasItemsForHashKey(hashKey)) {
 					return false;
@@ -722,7 +724,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				}
 				const identity = this.fokos.identity();
 				const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
-				if (maxSizeMb && this.#store.databaseSize > maxSizeMb * 1.1 * 1024 * 1024) {
+				if (maxSizeMb && this.#store.databaseSize > maxSizeMb * ADMISSION_MARGIN * 1024 * 1024) {
 					return { reject: errExceededDatabaseSize(op) };
 				}
 				return "allow";
@@ -733,7 +735,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					canRun: () => this.canSweepLocally(),
 					deadline: () => {
 						const createdAt = this.#store.earliestUnguardedPendingTxCreatedAt();
-						return createdAt === null ? null : createdAt + this.fokosStaleTransactionMs();
+						return createdAt === null ? null : createdAt + this.config().staleTransactionMs;
 					},
 					runStep: async () => {
 						await this.recoverStaleTransactions();
@@ -767,7 +769,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		if (candidates.length === 0 || this.fokos.identity().kind !== "hash") {
 			return [];
 		}
-		const threshold = (this.fokos.policy().hashSplitConditions.maxSizeMb ?? 0) * RANGE_PROMOTION_FRACTION * 1024 * 1024;
+		const threshold = (this.fokos.policy().hashSplitConditions.maxSizeMb ?? 0) * this.config().promotionFraction * 1024 * 1024;
 		if (threshold <= 0) {
 			return [];
 		}
@@ -1023,7 +1025,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * `dispatch`, because the keys of the lock can have moved to a child since the lock was written.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
-		const staleTxRows = this.#participant.listStaleTransactions(this.fokosStaleTransactionMs(), 10);
+		const { staleTransactionMs, staleLockScanRows } = this.config();
+		const staleTxRows = this.#participant.listStaleTransactions(staleTransactionMs, staleLockScanRows);
 		for (const row of staleTxRows) {
 			try {
 				const ctx = this.fokos.routeContext();

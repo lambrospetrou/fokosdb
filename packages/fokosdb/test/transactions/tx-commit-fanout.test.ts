@@ -1,7 +1,7 @@
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
-import { TX_FANOUT_REQUEST_BUDGET_MS } from "../../src/server/do-transaction-coordinator.js";
+import { DEFAULT_FANOUT_REQUEST_BUDGET_MS } from "../../src/shared/transaction-limits.js";
 import { controlledCoordinator, controlledPartition, keysAcrossPartitions, makeDB, txCalls, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -61,7 +61,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: `data-${key.hashKey}` }));
 		const token = `commit-pending-${crypto.randomUUID()}`;
 		const coordinator = controlledCoordinator(db);
-		await coordinator.testFanoutBudgetMs(SHORT_BUDGET_MS);
+		await coordinator.testConfig({ fanoutRequestBudgetMs: SHORT_BUDGET_MS });
 		const reachable = await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
 
 		const start = Date.now();
@@ -79,7 +79,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(Date.now() - start).toBeLessThan(SHORT_BUDGET_MS + 3_000);
 
 		// The replay has to finish its fan-out inside the budget, so give it the shipped one.
-		await coordinator.testFanoutBudgetMs(null);
+		await coordinator.testConfig({});
 		await reachable();
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
@@ -95,7 +95,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: `data-${key.hashKey}` }));
 		const token = `split-window-${crypto.randomUUID()}`;
 		const coordinator = controlledCoordinator(db);
-		await coordinator.testFanoutBudgetMs(SHORT_BUDGET_MS);
+		await coordinator.testConfig({ fanoutRequestBudgetMs: SHORT_BUDGET_MS });
 
 		// A partition that started a split forwards the commit to its children, and a child rejects
 		// commit while it still migrates. Hold that window open deterministically instead of racing
@@ -109,7 +109,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 
 		await childrenMigrated();
-		await coordinator.testFanoutBudgetMs(null);
+		await coordinator.testConfig({});
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
 		expect(replay.outcome).toBe("committed");
 		for (const key of keys) {
@@ -132,9 +132,9 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			},
 		];
 		const token = `cancel-locked-${crypto.randomUUID()}`;
-		await controlledCoordinator(db).testFanoutBudgetMs(SHORT_BUDGET_MS);
+		await controlledCoordinator(db).testConfig({ fanoutRequestBudgetMs: SHORT_BUDGET_MS });
 		const unreachableStub = controlledPartition(db, lockedKey);
-		await unreachableStub.testStaleTransactionMs(SHORT_BUDGET_MS);
+		await unreachableStub.testConfig({ staleTransactionMs: SHORT_BUDGET_MS, coordinatorFanoutBudgetMs: SHORT_BUDGET_MS });
 		const reachable = await makeUnreachable(db, lockedKey, "txCancel", "simulated participant outage");
 
 		const start = Date.now();
@@ -175,7 +175,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 	// The budget below is paid in wall-clock time, so this case cannot use the global bound: its floor is
 	// the shipped constant and its own assertion caps it at the constant plus 3 s. Deriving the timeout
 	// keeps it above that ceiling if the constant ever changes.
-	it("waits out the shipped fan-out budget, and stops there", { timeout: TX_FANOUT_REQUEST_BUDGET_MS * 4 + 10_000 }, async () => {
+	it("waits out the shipped fan-out budget, and stops there", { timeout: DEFAULT_FANOUT_REQUEST_BUDGET_MS * 4 + 10_000 }, async () => {
 		const db = makeDB({ controlled: true });
 		const keys = keysAcrossPartitions(db, 2, "shipped-budget");
 		const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "value" }));
@@ -190,8 +190,8 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
 		// The caller waited the budget out — the deadline is only reached by the clock running.
-		expect(elapsed).toBeGreaterThanOrEqual(TX_FANOUT_REQUEST_BUDGET_MS);
+		expect(elapsed).toBeGreaterThanOrEqual(DEFAULT_FANOUT_REQUEST_BUDGET_MS);
 		// And stopped there, plus at most the one backoff already in flight.
-		expect(elapsed).toBeLessThan(TX_FANOUT_REQUEST_BUDGET_MS + 3_000);
+		expect(elapsed).toBeLessThan(DEFAULT_FANOUT_REQUEST_BUDGET_MS + 3_000);
 	});
 });

@@ -131,7 +131,7 @@ export type CancelRequest = {
 	 *
 	 * An empty list is legal and means "release locally, do not fan out". Correctness does not depend
 	 * on this list: a lock is always released eventually by the node holding it, via the stale-tx
-	 * recovery alarm. The keys only make that happen in milliseconds instead of STALE_TX_MS, which
+	 * recovery alarm. The keys only make that happen in milliseconds instead of `staleTransactionMs`, which
 	 * matters because a held lock makes non-transactional writes to that key throw.
 	 */
 	items: TransactionItemKey[];

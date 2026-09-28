@@ -52,7 +52,7 @@ An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Arr
 - `rootTreesN` root partitions exist at startup, and a hash of the hash key selects one. A partition ID is opaque: read it only through `PartitionIdHelper`.
 - `FokosShardingClient` picks the root partition of a hash key on the caller side, sends the operation, and retries only by the retry policy of the caller. `walk` reads the tree and changes nothing; `destroy` fences and deletes every partition. Inside a DO the runtime resolves the owner of every key (`resolveOwner`, `owns`), plans the range frontier (`rangeVisits`), and forwards (`forward`, `forwardRangeVisit`). The host never makes a stub to a peer of its own class.
 - **Hash split** — a partition past `hashSplitConditions.maxSizeMb` queues a split, creates `hashSplitN` children, becomes a router, and the children import their share in the background. Its runtime states are `queued`, `planned`, `cutover` and `completed`; `status` reports them as `split_queued`, `split_started` and `split_completed`.
-- **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * RANGE_PROMOTION_FRACTION` moves into a range tree of its own, which then splits by sort key. A promotion candidate is signalled before a split, because an unfinished promotion blocks the split behind it.
+- **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * promotionFraction` (a setting of `PartitionDO.fokosConfig()`) moves into a range tree of its own, which then splits by sort key. A promotion candidate is signalled before a split, because an unfinished promotion blocks the split behind it.
 - **`splitN` must never change after initialization.** A change breaks routing and loses data.
 - A partition refuses a write above 1.1 times its cap, and only a write that applies can queue the split that brings it back under.
 
@@ -93,7 +93,7 @@ The runtime runs the two concurrent state machines: **import** (a target that st
 
 ### Background recovery (stale-TX job)
 
-Stale-transaction recovery is the host job `stale_tx_recovery` in `hooks().jobs`. Its `canRun` is `canSweepLocally()`, which is false on a router, on a target that is `awaiting_data` or `importing`, and behind the destroy fence, because none of these owns complete lock state. Its `deadline()` is the oldest unguarded lock plus `fokosStaleTransactionMs()`, so the alarm also covers a lock that a restart left behind. The TTL sweep uses the same guard, stays an in-memory timer that every RPC arms, and registers no job.
+Stale-transaction recovery is the host job `stale_tx_recovery` in `hooks().jobs`. Its `canRun` is `canSweepLocally()`, which is false on a router, on a target that is `awaiting_data` or `importing`, and behind the destroy fence, because none of these owns complete lock state. Its `deadline()` is the oldest unguarded lock plus `staleTransactionMs` of `fokosConfig()`, so the alarm also covers a lock that a restart left behind. The TTL sweep uses the same guard, stays an in-memory timer that every RPC arms, and registers no job.
 
 A `not_found` result cancels an owned lock that is no older than `IDEMPOTENCY_WINDOW_MS`. It quarantines an older owned lock: set `guarded_at`, log the lock-age guard error once, and wait for `debugForceResolveTransaction`. A guarded transaction must stay out of the stale scan and out of its alarm scheduling.
 

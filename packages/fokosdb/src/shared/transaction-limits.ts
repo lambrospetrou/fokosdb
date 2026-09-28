@@ -48,8 +48,25 @@ export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a 
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
-export const SWEEP_BATCH_ROWS = 1_000;
-export const ALARM_RECOVERY_BUDGET_MS = 30_000;
+
+/**
+ * The default time after which a transaction that no request drives is stale. A partition then asks
+ * the coordinator of each of its locks to finish the transaction, and a coordinator drives each of its
+ * own non-terminal transactions. Both hosts use this default.
+ */
+export const DEFAULT_STALE_TRANSACTION_MS = 5_000;
+
+/**
+ * The default time that a coordinator retries its participants while a request waits for the answer.
+ * A stale time below this lets the stale recovery drive a transaction that a request still drives.
+ */
+export const DEFAULT_FANOUT_REQUEST_BUDGET_MS = 5_000;
+
+/**
+ * A partition or a coordinator accepts writes up to this factor above its split size, so the
+ * requests that make it split can complete. Above that it refuses new writes until the split is done.
+ */
+export const ADMISSION_MARGIN = 1.1;
 
 /**
  * Transaction order timestamps are integers in microsecond-shaped units: one millisecond is this many units.

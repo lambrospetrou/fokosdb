@@ -13,6 +13,7 @@
 import { PartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
+import type { PartitionDOConfigOverrides } from "../src/server/host-config.js";
 import type { FokosInitRequest, FokosMigrationPage, FokosMigrationPullRequest } from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
@@ -70,7 +71,7 @@ export class ControlledPartitionDO extends PartitionDO {
 	#txRules: { [Op in TxOp]?: TxResponseRule<Op> } = {};
 	#readGate: (Gate & { parked: boolean }) | null = null;
 	#prepareGate: (Gate & { parked: boolean }) | null = null;
-	#staleTransactionMs: number | null = null;
+	#config: PartitionDOConfigOverrides = {};
 	#runtimeConfig: FokosRuntimeConfigOverrides = {};
 
 	/**
@@ -127,12 +128,12 @@ export class ControlledPartitionDO extends PartitionDO {
 		return this.#tx("txCancel", req, () => super.txCancel(ctx, req));
 	}
 
-	override fokosStaleTransactionMs(): number {
-		return this.#staleTransactionMs ?? super.fokosStaleTransactionMs();
+	// The constructor of PartitionDO reads both methods below, before the fields of this class exist.
+	protected override fokosConfig(): PartitionDOConfigOverrides {
+		return #config in this ? this.#config : super.fokosConfig();
 	}
 
 	protected override fokosRuntimeConfig(): FokosRuntimeConfigOverrides {
-		// The runtime reads this in the constructor of PartitionDO, before the fields of this class exist.
 		return #runtimeConfig in this ? this.#runtimeConfig : super.fokosRuntimeConfig();
 	}
 
@@ -244,8 +245,8 @@ export class ControlledPartitionDO extends PartitionDO {
 		this.#runtimeConfig = overrides;
 	}
 
-	/** Replaces the stale-transaction time of this partition. `null` restores the shipped value. */
-	async testStaleTransactionMs(ms: number | null): Promise<void> {
-		this.#staleTransactionMs = ms;
+	/** Replaces the setting overrides of this partition. `{}` restores the defaults. */
+	async testConfig(overrides: PartitionDOConfigOverrides): Promise<void> {
+		this.#config = overrides;
 	}
 }

@@ -98,7 +98,7 @@ export class TtlExpiry {
 		this.#running = true;
 		try {
 			const config = this.#config();
-			validateConfig(config);
+			validateTtlSweepConfig(config);
 
 			let deletedRows = 0;
 			let deletedBytes = 0;
@@ -145,7 +145,7 @@ export class TtlExpiry {
 	}
 }
 
-function validateConfig(config: TtlSweepConfig): void {
+export function validateTtlSweepConfig(config: TtlSweepConfig): void {
 	for (const name of ["chunkSize", "maxRowsBeforeSleep", "maxBytesBeforeSleep", "maxRowsPerCycle"] as const) {
 		invariant(Number.isInteger(config[name]) && config[name] > 0, `ttl-expiry: ${name} must be an integer greater than zero`);
 	}

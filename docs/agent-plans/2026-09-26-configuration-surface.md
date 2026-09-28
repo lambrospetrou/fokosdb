@@ -323,7 +323,8 @@ The settings of `PartitionDO`:
 
 | Setting | Default | Notes |
 | --- | --- | --- |
-| `staleTransactionMs` | 5,000 ms | How long a prepared lock waits before the stale sweep asks its coordinator to resolve it. Shared default with T. It must be at least the default fan-out budget of T (section 4.2.6). |
+| `staleTransactionMs` | 5,000 ms | How long a prepared lock waits before the stale sweep asks its coordinator to resolve it. Shared default with T. It must be at least `coordinatorFanoutBudgetMs` (section 4.2.6). |
+| `coordinatorFanoutBudgetMs` | 5,000 ms | The `fanoutRequestBudgetMs` of the coordinators of the table. P cannot read it, so the deployment sets the same value here. P uses it only to check `staleTransactionMs`. The default is the shared constant of section 4.2.6. |
 | `promotionFraction` | 0.25 | Section 4.2.7. |
 | `maxClockSkewMs` | 5,000 ms | The farthest into the future that a transaction timestamp can be when P accepts a prepare. It must be larger than the real clock skew between C, T and P. |
 | `ttlSweep` | See below | Today `fokosTtlConfig()`. |
@@ -512,9 +513,11 @@ A stale threshold that is smaller than the fan-out budget makes the stale path d
 still drives. Each host checks the relation when it validates its configuration:
 
 - T checks that its `staleTransactionMs` is at least its `fanoutRequestBudgetMs`.
-- P cannot read the configuration of T. P checks that its `staleTransactionMs` is at least the shared default
-  fan-out budget. When a deployment raises `fanoutRequestBudgetMs` in T above the default, it must also raise
-  `staleTransactionMs` in P to at least the same value. The documentation of both settings (M6) states the relation.
+- P cannot read the configuration of T. P has the setting `coordinatorFanoutBudgetMs`, with the shared default
+  fan-out budget as its default, and checks that its `staleTransactionMs` is at least that value. When a
+  deployment changes `fanoutRequestBudgetMs` in T, it sets `coordinatorFanoutBudgetMs` in P to the same value.
+  A deployment that lowers the budget in T can then also lower `staleTransactionMs` in P. P cannot check that
+  the two values agree. The documentation of the settings (M6) states the relation.
 
 #### 4.2.7 The promotion fraction
 
@@ -648,7 +651,7 @@ to their first use, so that the values follow the rule "read at each use":
 - M4 needs a test in which each attempt to one participant fails, and the job step ends inside
   `alarmRecoveryBudgetMs` plus one `participantRetry.maxDelayMs`. A second test does the same for
   `recoverTransaction` and `recoverTransactionBudgetMs`.
-- The validation of P rejects a `staleTransactionMs` below the shared default fan-out budget. The validation of T
+- The validation of P rejects a `staleTransactionMs` below its `coordinatorFanoutBudgetMs`. The validation of T
   rejects a `staleTransactionMs` below its `fanoutRequestBudgetMs`.
 
 #### 4.2.15 Compatibility and rollout

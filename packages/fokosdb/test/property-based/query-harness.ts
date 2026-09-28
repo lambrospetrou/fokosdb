@@ -233,7 +233,7 @@ export async function drainFromCursor(
 // `query-items-split.test.ts` queries the tree after it settles. `query-items-active-split.test.ts`
 // keeps writing to it, so a query runs while a leaf splits and its children still import.
 
-// A key moves into a range tree once it holds `hashSplitMaxSizeMb * RANGE_PROMOTION_FRACTION`
+// A key moves into a range tree once it holds `hashSplitMaxSizeMb * promotionFraction`
 // bytes, and a range partition splits once it holds `rangeSplitMaxSizeMb`. A range partition also
 // REFUSES a write above 1.1 times its own threshold, and only a write that applies can queue the
 // split that brings it back under. The seed therefore runs in two phases: it writes just past the

@@ -55,14 +55,20 @@ import { exists, one, tryOne } from "../shared/sql-cursor.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
 import {
-	ALARM_RECOVERY_BUDGET_MS,
+	ADMISSION_MARGIN,
 	applyImageCap,
 	decodeItemKeys,
 	encodeHashKey,
 	IDEMPOTENCY_WINDOW_MS,
 	txOrderTimestampNow,
-	SWEEP_BATCH_ROWS,
 } from "../shared/transaction-limits.js";
+import {
+	maxPreparingHoldMs,
+	resolveCoordinatorConfig,
+	type ParticipantRetryConfig,
+	type TransactionCoordinatorDOConfig,
+	type TransactionCoordinatorDOConfigOverrides,
+} from "./host-config.js";
 import { CompiledConditionPlan, CompiledUpdatePlan } from "../shared/expression/plan.js";
 import { parseJSONTrusted } from "../shared/tsutils.js";
 
@@ -191,15 +197,6 @@ function keyFromBlob(value: ArrayBuffer): KeyBytes {
 	return KeyCodec.asKeyBytes(new Uint8Array(value));
 }
 
-const STALE_THRESHOLD_MS = 5_000;
-const MAX_PREPARING_HOLD_MS = Math.min(5 * STALE_THRESHOLD_MS, IDEMPOTENCY_WINDOW_MS);
-/**
- * The maximum database size of one coordinator. It is half of the 10 GB storage limit of a Durable
- * Object. The coordinator uses this limit when the table has no size threshold, or when the size
- * threshold of the table is larger.
- */
-const MAX_TC_DATABASE_BYTES = 5 * 1024 * 1024 * 1024;
-
 /** The host job that drives the non-terminal transactions that no request drives. */
 const JOB_TX_RECOVERY = "tx_recovery";
 /** The host job that deletes the transactions whose idempotency window has passed. */
@@ -242,17 +239,6 @@ type MigratedTransaction = {
 	participants: TcParticipantRow[];
 	results: TcResultRow[];
 };
-
-/**
- * Wall-clock budget for a participant fan-out that a request waits on, commit and cancel alike.
- * Past this deadline the coordinator stops dispatching participant RPCs and leaves the unconfirmed
- * participant behind: a commit leaves the transaction in COMMITTING and the caller receives the
- * commit-pending error, a cancel leaves it in CANCELLING and the caller receives the cancelled
- * outcome it is already entitled to. The `tx_recovery` job then finishes the fan-out with the full retry
- * budget, because nothing waits on it. Without the budget, one unreachable participant would hold
- * the request, and the shard, for tens of seconds.
- */
-export const TX_FANOUT_REQUEST_BUDGET_MS = 5_000;
 
 const sqlMigrations: SQLSchemaMigration[] = [
 	{
@@ -440,9 +426,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		const sql = this.ctx.storage.sql;
 		// The split threshold. A missing or zero `maxSizeMb` gives only the size limit of the coordinator.
-		// The limit is divided by 1.1, so the 10% admission margin below stops at MAX_TC_DATABASE_BYTES.
+		// The limit is divided by the admission margin, so the admission below stops at `maxDatabaseBytes`.
 		const maxBytes = (policy: FokosDBPolicy) =>
-			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, MAX_TC_DATABASE_BYTES / 1.1);
+			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, this.config().maxDatabaseBytes / ADMISSION_MARGIN);
 		return {
 			// The coordinator splits above the hash split threshold of its table. It also splits above
 			// its own size limit, when that limit is smaller.
@@ -452,7 +438,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			// split complete. Above that it refuses a NEW transaction only: a replay reads the ledger and
 			// writes nothing, so it still gets its answer. The ledger read runs only above the threshold.
 			admit: ({ admissionTag, keys, policy }) => {
-				if (admissionTag !== "write" || sql.databaseSize <= maxBytes(policy) * 1.1) {
+				if (admissionTag !== "write" || sql.databaseSize <= maxBytes(policy) * ADMISSION_MARGIN) {
 					return "allow";
 				}
 				const token = KeyCodec.decode(keys[0].hashKey) as string;
@@ -552,11 +538,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * The wall-clock budget a request-driven fan-out gets, read at each use so a subclass can vary
-	 * it. See TX_FANOUT_REQUEST_BUDGET_MS for what the deadline means for the caller.
+	 * Override to change the settings of this class. The class merges the result with
+	 * `DEFAULT_COORDINATOR_CONFIG`, validates it, and reads it at each use. An override that reads the
+	 * identity or the policy of the coordinator must first check `this.fokos?.initialized()`, and return
+	 * a fallback value when it is false.
 	 */
-	fokosFanoutRequestBudgetMs(): number {
-		return TX_FANOUT_REQUEST_BUDGET_MS;
+	protected fokosConfig(): TransactionCoordinatorDOConfigOverrides {
+		return {};
 	}
 
 	/**
@@ -565,6 +553,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	fokosNow(): number {
 		return Date.now();
+	}
+
+	/** The active settings: the overrides of `fokosConfig()` over the defaults, validated. */
+	private config(): TransactionCoordinatorDOConfig {
+		return resolveCoordinatorConfig(this.fokosConfig());
 	}
 
 	//////////////////////////////
@@ -658,10 +651,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// Durable before the first prepare, so a coordinator that stops after this point still resumes the
 		// transaction. The handler can end with a thrown answer, which drops the signals of a local call,
 		// so these calls do not go through `call.signal`.
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + STALE_THRESHOLD_MS);
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow() + this.config().staleTransactionMs);
 		this.fokos.requestSplitEvaluation();
 
-		return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs(), {
+		return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs, {
 			transactionTs,
 			participants,
 		});
@@ -675,20 +668,20 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			case "CANCELLED":
 				return this.loadFinalResponse(transactionId, idempotencyToken, existingRow);
 			case "PREPARING": {
-				await this.runPrepareRecovery(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
+				await this.runPrepareRecovery(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "PREPARED":
 			case "COMMITTING": {
-				await this.runCommit(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
+				await this.runCommit(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "CANCELLING": {
-				await this.runCancel(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
+				await this.runCancel(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
 				return this.loadFinalResponse(transactionId, idempotencyToken);
 			}
 			case "CREATED":
-				return await this.drivePrepare(transactionId, idempotencyToken, this.fokosFanoutRequestBudgetMs());
+				return await this.drivePrepare(transactionId, idempotencyToken, this.config().fanoutRequestBudgetMs);
 		}
 	}
 
@@ -985,7 +978,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private fanoutRetry(deadlineMs: number): FokosRetryPolicy {
 		const rule = retryable(deadlineMs);
-		return { shouldRetry: (err, nextAttempt) => rule(err, nextAttempt) && this.fokosNow() <= deadlineMs };
+		const { baseDelayMs, maxDelayMs } = this.config().participantRetry;
+		return { shouldRetry: (err, nextAttempt) => rule(err, nextAttempt) && this.fokosNow() <= deadlineMs, baseDelayMs, maxDelayMs };
 	}
 
 	/** The reference that each participant stores in its lock, and calls back on recovery. */
@@ -1025,6 +1019,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
 		// Each participant stores this reference in its lock, and calls it back on recovery.
 		const coordinator = this.coordinatorRef(idempotencyToken);
+		const retry = this.config().participantRetry;
 
 		const prepareResults = await Promise.allSettled(
 			participants.map(async (p) => {
@@ -1037,7 +1032,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						// Backpressure is deterministic for the life of this transaction: the partition is over
 						// its cap, and a split will not land inside a retry budget of a few seconds. Retrying
 						// only adds latency before the same cancellation.
-						{ retry: prepareRetry(3) },
+						{ retry: prepareRetry(retry, retry.prepareMaxAttempts) },
 					)
 					.catch((err: unknown) => {
 						this.storePrepareError(transactionId, p.doName, err);
@@ -1075,7 +1070,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * `requestBudgetMs` bounds the fan-out when a request waits on it (see
-	 * TX_FANOUT_REQUEST_BUDGET_MS). Undefined — the `tx_recovery` job and the recovery paths — means no
+	 * `fanoutRequestBudgetMs`). Undefined — the `tx_recovery` job and the recovery paths — means no
 	 * deadline, so those keep the full retry budget.
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
@@ -1205,6 +1200,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const existingParticipants = this.loadParticipants(transactionId);
 
 		const nullParticipants = existingParticipants.filter((p) => p.prepare_outcome === null);
+		const retry = this.config().participantRetry;
 
 		await Promise.allSettled(
 			nullParticipants.map(async (p) => {
@@ -1217,7 +1213,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 						{ transactionId, coordinator, transactionTimestamp: stateRow.transaction_ts, items: partitionItems },
 						partitionItems,
 						// Same as the first prepare pass: an over-size partition will not clear by retrying.
-						{ retry: prepareRetry(5) },
+						{ retry: prepareRetry(retry, retry.prepareRecoveryMaxAttempts) },
 					)
 					.catch((err: unknown) => {
 						this.storePrepareError(transactionId, p.partition_do_name, err);
@@ -1234,7 +1230,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
-		const heldTooLong = this.fokosNow() - stateRow.created_at > MAX_PREPARING_HOLD_MS;
+		const heldTooLong = this.fokosNow() - stateRow.created_at > maxPreparingHoldMs(this.config());
 
 		if (allAccepted) {
 			this.markPrepared(transactionId, idempotencyToken);
@@ -1253,6 +1249,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private async recoverStaleTransactions(): Promise<number | null> {
 		const recoveryStartedAt = this.fokosNow();
+		const { staleTransactionMs, recoveryScanRows, alarmRecoveryBudgetMs } = this.config();
 		const rows = this.ctx.storage.sql
 			.exec<{
 				idempotency_token: string;
@@ -1262,14 +1259,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				`SELECT idempotency_token, transaction_id, state
                  FROM tc_state
                  WHERE state NOT IN ('COMMITTED', 'CANCELLED') AND created_at <= ?
-                 ORDER BY created_at, transaction_id LIMIT 100`,
-				recoveryStartedAt - STALE_THRESHOLD_MS,
+                 ORDER BY created_at, transaction_id LIMIT ?`,
+				recoveryStartedAt - staleTransactionMs,
+				recoveryScanRows,
 			)
 			.toArray();
 
 		// FIXME: drive these transactions concurrently with a bounded fan-out.
 		for (const row of rows) {
-			if (this.fokosNow() - recoveryStartedAt >= ALARM_RECOVERY_BUDGET_MS) {
+			if (this.fokosNow() - recoveryStartedAt >= alarmRecoveryBudgetMs) {
 				break;
 			}
 			try {
@@ -1287,7 +1285,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const hasNonTerminalRows = exists(
 			this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`),
 		);
-		return hasNonTerminalRows ? this.fokosNow() + STALE_THRESHOLD_MS : null;
+		return hasNonTerminalRows ? this.fokosNow() + this.config().staleTransactionMs : null;
 	}
 
 	/** Drives one non-terminal transaction from its stored state, with the full retry budget. */
@@ -1316,21 +1314,17 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private sweepExpiredTransactions(): number | null {
 		const cutoff = this.fokosNow() - IDEMPOTENCY_WINDOW_MS;
+		const { sweepBatchRows, sweepDeleteChunkRows } = this.config();
 		const expiredBatch = this.ctx.storage.sql
 			.exec<{
 				transaction_id: string;
-			}>(
-				`SELECT transaction_id FROM tc_state WHERE completed_at < ? ORDER BY completed_at, transaction_id LIMIT ?`,
-				cutoff,
-				SWEEP_BATCH_ROWS,
-			)
+			}>(`SELECT transaction_id FROM tc_state WHERE completed_at < ? ORDER BY completed_at, transaction_id LIMIT ?`, cutoff, sweepBatchRows)
 			.toArray();
 		if (expiredBatch.length > 0) {
 			const ids = expiredBatch.map((r) => r.transaction_id);
-			const CHUNK_SIZE = 100;
 			this.ctx.storage.transactionSync(() => {
-				for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
-					const chunk = ids.slice(i, i + CHUNK_SIZE);
+				for (let i = 0; i < ids.length; i += sweepDeleteChunkRows) {
+					const chunk = ids.slice(i, i + sweepDeleteChunkRows);
 					const placeholders = chunk.map(() => "?").join(",");
 					this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id IN (${placeholders})`, ...chunk);
 					this.ctx.storage.sql.exec(`DELETE FROM tc_state WHERE transaction_id IN (${placeholders})`, ...chunk);
@@ -1500,7 +1494,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/** One bounded step of the cleanup of a split source. Returns true when no ledger row is left. */
 	private deleteMigratedRowsStep(): boolean {
 		const sql = this.ctx.storage.sql;
-		const batch = `SELECT transaction_id FROM tc_state ORDER BY transaction_id LIMIT ${SWEEP_BATCH_ROWS}`;
+		const batch = `SELECT transaction_id FROM tc_state ORDER BY transaction_id LIMIT ${this.config().sweepBatchRows}`;
 		for (const table of ["tc_items", "tc_participants", "tc_results", "tc_state"]) {
 			sql.exec(`DELETE FROM ${table} WHERE transaction_id IN (${batch})`);
 		}
@@ -1602,9 +1596,11 @@ function retryable(deadlineMs: number): (err: unknown, nextAttempt: number) => b
 }
 
 /** The retry rule of a prepare: every error except `partition_over_size`, up to `maxAttempts` attempts. */
-function prepareRetry(maxAttempts: number): FokosRetryPolicy {
+function prepareRetry(retry: ParticipantRetryConfig, maxAttempts: number): FokosRetryPolicy {
 	return {
 		shouldRetry: (err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= maxAttempts,
+		baseDelayMs: retry.baseDelayMs,
+		maxDelayMs: retry.maxDelayMs,
 	};
 }
 

@@ -20,11 +20,6 @@ import invariant from "./invariant.js";
 export type SplitConditions = {
 	/** The size in megabytes that makes the partition split. */
 	maxSizeMb?: number;
-	/**
-	 * The number of items that makes the partition split.
-	 * FIXME: Nothing reads this value. Remove it, or make the split policy use it.
-	 */
-	maxItems?: number;
 };
 
 export type PartitionNamespaceKey = {
@@ -149,8 +144,5 @@ function validateSplitConditions(
 ): void {
 	if (conditions.maxSizeMb && conditions.maxSizeMb <= 0) {
 		throw invalid(`${name}.maxSizeMb`, conditions.maxSizeMb, `${name}.maxSizeMb must be greater than 0`);
-	}
-	if (conditions.maxItems && conditions.maxItems < 1) {
-		throw invalid(`${name}.maxItems`, conditions.maxItems, `${name}.maxItems must be at least 1`);
 	}
 }

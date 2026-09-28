@@ -1,6 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
+import { DEFAULT_PARTITION_CONFIG } from "../../server/host-config.js";
 import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
 import { PartitionStore } from "./partition-store.js";
 import { parseCoordinatorRef, TransactionParticipant } from "./transaction-participant.js";
@@ -39,6 +40,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 		const participant = new TransactionParticipant({
 			store,
 			now: () => clock.now,
+			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			txOrderTimestamp: () => clock.now * TX_ORDER_TS_UNITS_PER_MS,
 		});
 		await fn({ participant, store, clock });
@@ -553,7 +555,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("rejects every operation with clock_skew when the transaction timestamp is too far ahead of the injected clock", async () => {
 		await withParticipant(({ participant, clock }) => {
 			const skewed = prepareReq({
-				transactionTimestamp: (clock.now + TransactionParticipant.MAX_CLOCK_SKEW_MS + 1) * TX_ORDER_TS_UNITS_PER_MS,
+				transactionTimestamp: (clock.now + DEFAULT_PARTITION_CONFIG.maxClockSkewMs + 1) * TX_ORDER_TS_UNITS_PER_MS,
 				items: [
 					{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" },
 					{ hashKey: kb("hk2"), sortKey: kb("sk2"), operation: "delete" },
@@ -574,7 +576,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			// Exactly at the skew bound is allowed.
 			const atBound = prepareReq({
-				transactionTimestamp: (clock.now + TransactionParticipant.MAX_CLOCK_SKEW_MS) * TX_ORDER_TS_UNITS_PER_MS,
+				transactionTimestamp: (clock.now + DEFAULT_PARTITION_CONFIG.maxClockSkewMs) * TX_ORDER_TS_UNITS_PER_MS,
 				items: [{ hashKey: kb("hk"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v", kind: "text" }],
 			});
 			expect(participant.prepareLocal(atBound)).toEqual({ outcome: "accepted" });

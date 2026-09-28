@@ -8,7 +8,8 @@ import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILAB
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import { FokosRouter } from "../sharding/router.js";
-import { ALARM_RECOVERY_BUDGET_MS, IDEMPOTENCY_WINDOW_MS, SWEEP_BATCH_ROWS } from "../shared/transaction-limits.js";
+import { IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
+import { DEFAULT_COORDINATOR_CONFIG } from "./host-config.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
 	InitiateWriteRequest,
@@ -328,7 +329,7 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 });
 
 describe("TransactionCoordinatorDO - bounded transaction storage", () => {
-	it.each([{ maxItems: 20 }, { maxSizeMb: 10_000 }])(
+	it.each([{}, { maxSizeMb: 10_000 }])(
 		"splits and refuses new transactions before the storage limit with hashSplitConditions %j",
 		async (hashSplitConditions) => {
 			await withCoordinator(async (tc, state, ctx) => {
@@ -859,7 +860,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 	it("deletes one batch and runs again at once while expired rows remain", async () => {
 		await withCoordinator(async (tc, state) => {
 			vi.spyOn(tc, "fokosNow").mockReturnValue(BASE_TIME);
-			for (let i = 0; i < SWEEP_BATCH_ROWS + 3; i++) {
+			for (let i = 0; i < DEFAULT_COORDINATOR_CONFIG.sweepBatchRows + 3; i++) {
 				insertState(state, {
 					token: `expired-${i}`,
 					transactionId: `tx-expired-${i}`,
@@ -979,7 +980,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 				completedAt: BASE_TIME - IDEMPOTENCY_WINDOW_MS - 1,
 			});
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockImplementation(async () => {
-				now += ALARM_RECOVERY_BUDGET_MS;
+				now += DEFAULT_COORDINATOR_CONFIG.alarmRecoveryBudgetMs;
 			});
 
 			await runJobs(tc);

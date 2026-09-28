@@ -134,7 +134,7 @@ describe("PartitionContextCreator.create option errors", () => {
 		["tableName", { tableName: "fokos.mine" }, "fokos.mine"],
 		["tableName", { tableName: "" }, ""],
 		["shardGroup", { tableName: "a~b" }, "fokos.p.a~b"],
-		["hashSplitConditions.maxItems", { hashSplitConditions: { maxSizeMb: 100, maxItems: -1 } }, -1],
+		["hashSplitConditions.maxSizeMb", { hashSplitConditions: { maxSizeMb: -1 } }, -1],
 		["rangeAncestors.fromLeaf", { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 11 } }, 11],
 	])("reports an invalid %s as partition_context_options_invalid", (option, overrides, value) => {
 		expect(() => PartitionContextCreator.create(makeOpts(overrides))).toThrow(

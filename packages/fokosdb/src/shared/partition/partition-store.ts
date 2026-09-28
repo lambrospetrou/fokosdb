@@ -772,7 +772,7 @@ export class PartitionStore {
 		// (transaction-participant.ts), so a lower value here would let an already-superseded
 		// transaction commit over newer data. The two writers disagree on whose clock they read: a
 		// non-transactional put stamps this partition's clock, while a committed transaction stamps
-		// its coordinator's, which prepare accepts up to MAX_CLOCK_SKEW_MS ahead. MAX is what
+		// its coordinator's, which prepare accepts up to `maxClockSkewMs` ahead. MAX is what
 		// reconciles them.
 		//
 		// MAX also cannot drift ahead of the wall clock: it only ever keeps the larger of two values

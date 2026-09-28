@@ -4,7 +4,8 @@ import { expect, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.js";
 import type { ControlledPartitionDO } from "../controlled-partition-do.js";
-import { RANGE_PROMOTION_FRACTION, type GetItemRpcRequest, type PutItemRpcRequest } from "../../src/server/do-partition.js";
+import type { GetItemRpcRequest, PutItemRpcRequest } from "../../src/server/do-partition.js";
+import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
@@ -48,7 +49,7 @@ const MAX_RANGE_FILLER_WRITES = 200;
 function fillerChunk(maxSizeMb: number): string {
 	const chunkBytes = Math.min(
 		MAX_ITEM_BYTES - 4096,
-		Math.floor(RANGE_PROMOTION_FRACTION * maxSizeMb * 1024 * 1024 * FILLER_CHUNK_FRACTION),
+		Math.floor(DEFAULT_PARTITION_CONFIG.promotionFraction * maxSizeMb * 1024 * 1024 * FILLER_CHUNK_FRACTION),
 	);
 	invariant(chunkBytes > 0, "split threshold is too small for filler items");
 	expect(chunkBytes, "filler chunk exceeds MAX_ITEM_BYTES; lower maxSizeMb or FILLER_CHUNK_FRACTION").toBeLessThanOrEqual(MAX_ITEM_BYTES);
