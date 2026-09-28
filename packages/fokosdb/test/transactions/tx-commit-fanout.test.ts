@@ -1,10 +1,11 @@
-import { runDurableObjectAlarm } from "cloudflare:test";
+import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import type { FokosDB } from "../../src/client/db.js";
 import { DEFAULT_FANOUT_REQUEST_BUDGET_MS } from "../../src/shared/transaction-limits.js";
 import { controlledCoordinator, controlledPartition, keysAcrossPartitions, makeDB, txCalls, writeOutcome } from "./tx-helpers.js";
 import { FokosError, TRANSACTION_PENDING_CODES } from "../../src/shared/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
+import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 
 /**
  * The commit fan-out carries keys only, and the `committed` answer waits for every participant: a
@@ -75,7 +76,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_undecided)).toBe(false);
 		// Within the request budget plus at most one in-flight attempt — the deadline is checked
 		// after each backoff, so a sleep already running when it passes still finishes. Never the
-		// alarm's full retry budget (10 attempts, 13 s of backoff ceiling).
+		// longer budget of the recovery job.
 		expect(Date.now() - start).toBeLessThan(SHORT_BUDGET_MS + 3_000);
 
 		// The replay has to finish its fan-out inside the budget, so give it the shipped one.
@@ -193,5 +194,84 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		expect(elapsed).toBeGreaterThanOrEqual(DEFAULT_FANOUT_REQUEST_BUDGET_MS);
 		// And stopped there, plus at most the one backoff already in flight.
 		expect(elapsed).toBeLessThan(DEFAULT_FANOUT_REQUEST_BUDGET_MS + 3_000);
+	});
+
+	describe("recovery budgets", () => {
+		// Small budgets and short retry waits, so a step that ignored its budget would take seconds: one
+		// participant that fails each attempt then costs many attempts of up to `maxDelayMs` each.
+		const RECOVERY_BUDGET_MS = 500;
+		const MAX_DELAY_MS = 100;
+		// One RPC, and the time that the runtime and the test need around the step.
+		const SLACK_MS = 1_000;
+
+		/** Leaves one transaction in COMMITTING, with a participant that fails each commit, and returns its IDs. */
+		async function commitPendingTransaction(prefix: string) {
+			const db = makeDB({ controlled: true });
+			const keys = keysAcrossPartitions(db, 2, prefix);
+			const items = keys.map((key) => ({ ...key, operation: "put" as const, data: "value" }));
+			const coordinator = controlledCoordinator(db);
+			await coordinator.testConfig({
+				fanoutRequestBudgetMs: SHORT_BUDGET_MS,
+				staleTransactionMs: SHORT_BUDGET_MS,
+				alarmRecoveryBudgetMs: RECOVERY_BUDGET_MS,
+				recoverTransactionBudgetMs: RECOVERY_BUDGET_MS,
+				participantRetry: { baseDelayMs: 10, maxDelayMs: MAX_DELAY_MS },
+			});
+			await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
+			const token = `${prefix}-${crypto.randomUUID()}`;
+			const err = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token })).then(
+				() => null,
+				(e: unknown) => e,
+			);
+			expect(FokosError.isCode(err, TRANSACTION_PENDING_CODES.transaction_commit_pending)).toBe(true);
+			const transactionId = await runInDurableObject(
+				coordinator,
+				(_instance: TransactionCoordinatorDO, state: DurableObjectState) =>
+					state.storage.sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM tc_state WHERE idempotency_token = ?`, token).one()
+						.transaction_id,
+			);
+			const commits = async () => (await txCalls(db, [keys[1]], "txCommit")).length;
+			const state = async () =>
+				await runInDurableObject(
+					coordinator,
+					(_instance: TransactionCoordinatorDO, s: DurableObjectState) =>
+						s.storage.sql.exec<{ state: string }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, transactionId).one().state,
+				);
+			return { coordinator, token, transactionId, commits, state };
+		}
+
+		it("ends one step of the tx_recovery job at alarmRecoveryBudgetMs when a participant never answers", async () => {
+			const { coordinator, commits, state } = await commitPendingTransaction("recovery-job-budget");
+			const before = await commits();
+
+			// The request above waited out its fan-out budget, so the transaction is already stale.
+			const elapsed = await runInDurableObject(coordinator, async (instance: TransactionCoordinatorDO) => {
+				const start = Date.now();
+				await (instance as unknown as { recoverStaleTransactions(): Promise<number | null> }).recoverStaleTransactions();
+				return Date.now() - start;
+			});
+
+			// The step drove the commit and retried until its budget ended, and then stopped.
+			expect(await commits()).toBeGreaterThan(before);
+			expect(elapsed).toBeGreaterThanOrEqual(RECOVERY_BUDGET_MS - SHORT_BUDGET_MS);
+			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS + MAX_DELAY_MS + SLACK_MS);
+			// The transaction stays non-terminal, so a later step continues it.
+			expect(await state()).toBe("COMMITTING");
+		});
+
+		it("ends recoverTransaction at recoverTransactionBudgetMs when a participant never answers", async () => {
+			const { coordinator, token, transactionId, commits, state } = await commitPendingTransaction("recover-transaction-budget");
+			const before = await commits();
+
+			const start = Date.now();
+			const result = await coordinator.recoverTransactionForParticipant({ transactionId, idempotencyToken: token });
+			const elapsed = Date.now() - start;
+
+			expect(result).toEqual({ state: "driving" });
+			expect(await commits()).toBeGreaterThan(before);
+			expect(elapsed).toBeGreaterThanOrEqual(RECOVERY_BUDGET_MS);
+			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS + MAX_DELAY_MS + SLACK_MS);
+			expect(await state()).toBe("COMMITTING");
+		});
 	});
 });

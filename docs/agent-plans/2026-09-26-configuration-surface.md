@@ -4,8 +4,8 @@
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
-**Status:** Not started, except one fix: `PartitionContextCreator.create` now defaults each option on its own and
-keeps the options object of the caller unchanged (section 4.2.12).
+**Status:** In progress. M1, M2 and M3 are done. `PartitionContextCreator.create` also defaults each option on its
+own and keeps the options object of the caller unchanged (section 4.2.12).
 
 ## Table of contents
 
@@ -132,13 +132,13 @@ Two facts of the platform limit the design:
 
 Each milestone is one change that a reviewer can approve on its own.
 
-### M1 — Rename the `FokosDb*` types
+### M1 — Rename the `FokosDb*` types (done)
 
 Rename `FokosDbPolicy`, `FokosDbRouteContext`, `FokosDbStubContext`, `FokosDbTableConfig`, `FokosDbHostCursor`,
 `FokosDbHostPage` and `FokosDbMigrationHost` to the `FokosDB*` spelling. Three of them are exported from
 `fokosdb/client`, so the public types change. Each new type also uses the `FokosDB` spelling.
 
-### M2 — Runtime configuration
+### M2 — Runtime configuration (done)
 
 Add `FokosRuntimeConfig` and the `config` constructor callback (section 4.2.1). Move the `caches` and `scheduler`
 options, `importPagesPerPass`, the repartition retry intervals, the page and status budgets, `maxForwardRetries` and
@@ -146,7 +146,7 @@ options, `importPagesPerPass`, the repartition retry intervals, the page and sta
 duplicate page and status constants. `MigrationHost.buildPage` gets the active page budgets as an argument. P and T
 implement `fokosRuntimeConfig()`.
 
-### M3 — Host configuration
+### M3 — Host configuration (done)
 
 Add `fokosConfig()` to P and T with the settings of section 4.2.2. Remove `fokosStaleTransactionMs()`,
 `fokosTtlConfig()` and `fokosFanoutRequestBudgetMs()`. Add the shared stale-transaction default, the shared

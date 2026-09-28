@@ -75,10 +75,10 @@ type CoordinatorInternals = {
 	): { page: Array<{ state: { transaction_id: string } }>; nextCursor: string | null };
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
-	drivePrepare(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<InitiateWriteResponseEncoded>;
-	runPrepareRecovery(transactionId: string, idempotencyToken: string, commitRequestBudgetMs?: number): Promise<void>;
-	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void>;
-	runCancel(transactionId: string, idempotencyToken: string): Promise<void>;
+	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
+	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
+	runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
 	stripPayload(transactionId: string): void;
 };
 
@@ -191,6 +191,9 @@ function tableNames(state: DurableObjectState): string[] {
  * Runs `fn` inside a root coordinator that owns every token. A first request gives the runtime its
  * identity, because each transition of the state machine tests that the coordinator owns the token.
  */
+/** The retry budget of a direct call to a drive method: the one that `recoverTransaction` uses. */
+const BUDGET_MS = DEFAULT_COORDINATOR_CONFIG.recoverTransactionBudgetMs;
+
 async function withCoordinator(
 	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDBRouteContext) => void | Promise<void>,
 ): Promise<void> {
@@ -494,7 +497,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			});
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			expect(
 				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
@@ -582,7 +585,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			const response = await tc.drivePrepare(TX_ID, TOKEN);
+			const response = await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
 
 			expect(response.outcome).toBe("cancelled");
 			if (response.outcome === "cancelled") {
@@ -636,7 +639,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			);
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
@@ -671,7 +674,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			insertParticipant(state, { name: "p2", prepare: "accepted" });
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
 			expect(response.outcome).toBe("cancelled");
@@ -691,7 +694,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			insertParticipant(state, { prepare: "rejected" });
 			vi.spyOn(tc, "runCancel").mockResolvedValue();
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			expect(
 				state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN).toArray()[0].state,
@@ -712,7 +715,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			seed(state, "COMMITTING");
 			insertParticipant(state, { prepare: "accepted", commit: "committed" });
 
-			await tc.runCommit(TX_ID, TOKEN);
+			await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{
@@ -735,7 +738,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			seed(state, "CANCELLING", results);
 			insertParticipant(state, { prepare: "rejected", cancel: "cancelled" });
 
-			await tc.runCancel(TX_ID, TOKEN);
+			await tc.runCancel(TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{
@@ -1005,7 +1008,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -1044,7 +1047,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			});
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -1063,7 +1066,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCommit } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const row = state.storage.sql
 				.exec<{ state: TCState; completed_at: number | null }>(`SELECT state, completed_at FROM tc_state WHERE transaction_id = ?`, TX_ID)
@@ -1110,7 +1113,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 					}) as unknown as DurableObjectStub<PartitionDO>,
 			);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			expect(txCancelP1).toHaveBeenCalledWith(
 				expect.anything(),
@@ -1142,7 +1145,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			const txCancel = vi.fn(async () => enveloped(undefined));
 			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare, txCancel } as unknown as DurableObjectStub<PartitionDO>);
 
-			await tc.runPrepareRecovery(TX_ID, TOKEN);
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			expect(countRows(state, "tc_state")).toBe(1);
 			const row = state.storage.sql

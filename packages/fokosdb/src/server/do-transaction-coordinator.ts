@@ -973,13 +973,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * The retry rule of a commit or a cancel fan-out. It also stops at the request budget on the clock
-	 * of this coordinator, so a participant past the budget stays unconfirmed for the `tx_recovery` job.
+	 * The retry rule of a commit or a cancel fan-out. It retries until the deadline, on the wall clock and
+	 * on the clock of this coordinator, and a participant past the deadline stays unconfirmed for the
+	 * `tx_recovery` job.
 	 */
 	private fanoutRetry(deadlineMs: number): FokosRetryPolicy {
-		const rule = retryable(deadlineMs);
 		const { baseDelayMs, maxDelayMs } = this.config().participantRetry;
-		return { shouldRetry: (err, nextAttempt) => rule(err, nextAttempt) && this.fokosNow() <= deadlineMs, baseDelayMs, maxDelayMs };
+		return { shouldRetry: () => this.fokosNow() <= deadlineMs, baseDelayMs, maxDelayMs };
 	}
 
 	/** The reference that each participant stores in its lock, and calls back on recovery. */
@@ -1009,7 +1009,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private async drivePrepare(
 		transactionId: string,
 		idempotencyToken: string,
-		requestBudgetMs?: number,
+		requestBudgetMs: number,
 		fanout?: PrepareFanout,
 	): Promise<InitiateWriteResponseEncoded> {
 		this.transition(idempotencyToken, () =>
@@ -1069,11 +1069,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * `requestBudgetMs` bounds the fan-out when a request waits on it (see
-	 * `fanoutRequestBudgetMs`). Undefined — the `tx_recovery` job and the recovery paths — means no
-	 * deadline, so those keep the full retry budget.
+	 * `requestBudgetMs` bounds the retries of the fan-out: `fanoutRequestBudgetMs` when a request waits
+	 * on it, `recoverTransactionBudgetMs` for `recoverTransaction`, and the rest of
+	 * `alarmRecoveryBudgetMs` for the `tx_recovery` job. A participant with no answer at the deadline
+	 * stays unconfirmed, and the transaction stays non-terminal for the `tx_recovery` job.
 	 */
-	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
+	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
 		this.transition(idempotencyToken, () =>
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
@@ -1086,7 +1087,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
-		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : this.fokosNow() + requestBudgetMs;
+		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
@@ -1134,12 +1135,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
-	private async runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
+	private async runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
 		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
-		const deadlineMs = requestBudgetMs === undefined ? Number.POSITIVE_INFINITY : this.fokosNow() + requestBudgetMs;
+		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
 		// Cancel any participant not yet committed and not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
@@ -1187,7 +1188,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		}
 	}
 
-	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs?: number): Promise<void> {
+	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
 		const stateRow = this.loadStateRow(transactionId);
 		if (!stateRow) {
 			return;
@@ -1225,7 +1226,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		const allParticipants = this.loadParticipants(transactionId);
 		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
-		// nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive with the full retry budget.
+		// nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive later.
 		// Only a real rejection or exceeding the hold deadline commits the transaction to cancelling;
 		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
 		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
@@ -1244,7 +1245,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * One step of the `tx_recovery` job: drives the non-terminal transactions older than the stale
-	 * threshold, oldest first, within the recovery budget. Returns when the job must run again: while a
+	 * threshold, oldest first, within `alarmRecoveryBudgetMs`. Returns when the job must run again: while a
 	 * non-terminal transaction remains, one stale threshold from now.
 	 */
 	private async recoverStaleTransactions(): Promise<number | null> {
@@ -1267,11 +1268,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 		// FIXME: drive these transactions concurrently with a bounded fan-out.
 		for (const row of rows) {
-			if (this.fokosNow() - recoveryStartedAt >= alarmRecoveryBudgetMs) {
+			// The time that remains of the budget of this step. It also bounds the participant retries of
+			// each transaction, so one participant with no answer cannot hold the step past the budget.
+			const remainingMs = recoveryStartedAt + alarmRecoveryBudgetMs - this.fokosNow();
+			if (remainingMs <= 0) {
 				break;
 			}
 			try {
-				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state);
+				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state, remainingMs);
 			} catch (e) {
 				console.error({
 					message: "fokos/tc: recovery failed",
@@ -1288,21 +1292,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return hasNonTerminalRows ? this.fokosNow() + this.config().staleTransactionMs : null;
 	}
 
-	/** Drives one non-terminal transaction from its stored state, with the full retry budget. */
-	private async driveTransaction(transactionId: string, idempotencyToken: string, state: TCState): Promise<void> {
+	/** Drives one non-terminal transaction from its stored state. `budgetMs` bounds the participant retries. */
+	private async driveTransaction(transactionId: string, idempotencyToken: string, state: TCState, budgetMs: number): Promise<void> {
 		switch (state) {
 			case "CREATED":
-				await this.drivePrepare(transactionId, idempotencyToken);
+				await this.drivePrepare(transactionId, idempotencyToken, budgetMs);
 				break;
 			case "PREPARING":
-				await this.runPrepareRecovery(transactionId, idempotencyToken);
+				await this.runPrepareRecovery(transactionId, idempotencyToken, budgetMs);
 				break;
 			case "PREPARED":
 			case "COMMITTING":
-				await this.runCommit(transactionId, idempotencyToken);
+				await this.runCommit(transactionId, idempotencyToken, budgetMs);
 				break;
 			case "CANCELLING":
-				await this.runCancel(transactionId, idempotencyToken);
+				await this.runCancel(transactionId, idempotencyToken, budgetMs);
 				break;
 		}
 	}
@@ -1361,13 +1365,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		}
 
 		try {
-			await this.driveTransaction(transactionId, row.idempotency_token, row.state);
+			await this.driveTransaction(transactionId, row.idempotency_token, row.state, this.config().recoverTransactionBudgetMs);
 		} catch (e) {
 			console.error({
 				message: "fokos/tc: recoverTransaction failed, scheduling recovery",
 				transactionId,
 				error: String(e),
 			});
+			await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
+			return { state: "driving" };
+		}
+		// The budget ended before every participant answered. The `tx_recovery` job continues the transaction.
+		const state = this.loadStateRow(transactionId)?.state;
+		if (state !== undefined && state !== "COMMITTED" && state !== "CANCELLED") {
 			await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
 		}
 		return { state: "driving" };
@@ -1578,21 +1588,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			)
 			.toArray();
 	}
-}
-
-/** The maximum number of attempts for one participant when the fan-out has no deadline. */
-const MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE = 100;
-
-/**
- * The retry rule of one participant in a fan-out. A request retries until its deadline, so it always
- * waits the full budget before it leaves a participant behind. The `tx_recovery` job and the recovery
- * paths have no deadline, so they stop after `MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE` attempts.
- */
-function retryable(deadlineMs: number): (err: unknown, nextAttempt: number) => boolean {
-	if (deadlineMs === Number.POSITIVE_INFINITY) {
-		return (_err, nextAttempt) => nextAttempt <= MAX_PARTICIPANT_ATTEMPTS_WITHOUT_DEADLINE;
-	}
-	return () => Date.now() <= deadlineMs;
 }
 
 /** The retry rule of a prepare: every error except `partition_over_size`, up to `maxAttempts` attempts. */
