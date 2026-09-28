@@ -105,7 +105,7 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { coordinatorShardGroup, type FokosDbPolicy } from "../shared/partition-context.js";
+import { coordinatorShardGroup, type FokosDBPolicy } from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
@@ -307,7 +307,7 @@ function validateTtlAt(ttlAt: number | undefined, where: string): void {
 
 export type FokosDBOptions = {
 	/** The router of the table: its topology, range config and policy. */
-	topology: FokosRouter<FokosDbPolicy>;
+	topology: FokosRouter<FokosDBPolicy>;
 
 	/**
 	 * The root coordinators of the table. Defaults to two per root partition, with a maximum of
@@ -336,9 +336,9 @@ function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): Ope
 export class FokosDB {
 	#options: Required<FokosDBOptions>;
 	/** The partitions of the table. */
-	#partitions: FokosShardingClient<FokosDbPolicy, PartitionOps>;
+	#partitions: FokosShardingClient<FokosDBPolicy, PartitionOps>;
 	/** The coordinator group of the table, `fokos.tc.<tableName>`. */
-	#coordinators: FokosShardingClient<FokosDbPolicy, CoordinatorOps>;
+	#coordinators: FokosShardingClient<FokosDBPolicy, CoordinatorOps>;
 
 	constructor(options: FokosDBOptions) {
 		const { topology, rangeConfig, policy } = options.topology;

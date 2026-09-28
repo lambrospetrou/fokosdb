@@ -18,7 +18,7 @@ import { runInDurableObject } from "cloudflare:test";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator, type FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import { PartitionContextCreator, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { isRangePartition, type FokosPartitionIdentity } from "../../src/sharding/route-context.js";
@@ -61,11 +61,11 @@ export type NodeEnv = {
 	/** The FokosDB data tables the migration host moves. */
 	store: PartitionStore;
 	storage: DurableObjectStorage;
-	ctx: FokosDbRouteContext;
+	ctx: FokosDBRouteContext;
 };
 
 export type Node = {
-	ctx: FokosDbRouteContext;
+	ctx: FokosDBRouteContext;
 	ref: FokosPartitionRef;
 	doName: string;
 	/** Runs `fn` inside this node, against its own real storage. */
@@ -76,11 +76,11 @@ export type Node = {
 
 export type Cluster = {
 	/** The root context of the one-root table every node of the cluster belongs to. */
-	base: FokosDbRouteContext;
+	base: FokosDBRouteContext;
 	/** The node for a context, created on first use so a target exists before it is initialized. */
-	node(ctx: FokosDbRouteContext): Node;
+	node(ctx: FokosDBRouteContext): Node;
 	hashNode(idxs: number[]): Node;
-	rangeNode(from: FokosDbRouteContext, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Node;
+	rangeNode(from: FokosDBRouteContext, hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null): Node;
 	/** Per-node counts of the side effects the flow asks its DO for. */
 	scheduled(doName: string): number;
 	alarms(doName: string): number[];
@@ -141,7 +141,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		nextPullPage: (doName, page) => cannedPages.set(doName, page),
 	};
 
-	function makeNode(ctx: FokosDbRouteContext): Node {
+	function makeNode(ctx: FokosDBRouteContext): Node {
 		// The DO name carries a per-cluster suffix so two clusters in one test file never share storage.
 		const stubName = `rf.${suffix}.${ctx.doName}`;
 
@@ -202,7 +202,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		doName: string,
 		sharding: FokosShardingStore,
 		store: PartitionStore,
-		ctx: FokosDbRouteContext,
+		ctx: FokosDBRouteContext,
 	): RepartitionSourceDeps & RepartitionTargetDeps {
 		const identity = (): FokosPartitionIdentity =>
 			sharding.getIdentity() ?? partitionIdentityFrom(ctx, isRangePartition(ctx) ? { depth: 0, ancestors: [] } : undefined);
@@ -237,7 +237,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			identity: () => ({ ctx, identity: identity() }),
 			hasIdentity: () => sharding.getIdentity() !== undefined,
 			applyTargetIdentity: (req: FokosInitRequest) => {
-				const target = req.target as FokosDbRouteContext;
+				const target = req.target as FokosDBRouteContext;
 				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
 				sharding.putIdentity(partitionIdentityFrom(target, range));
 				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy });

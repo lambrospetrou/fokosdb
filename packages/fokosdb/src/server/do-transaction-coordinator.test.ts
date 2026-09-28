@@ -20,7 +20,7 @@ import type {
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 import { FOKOS_PAGE_ROWS } from "../sharding/repartition-flow.js";
 import type { FokosEnvelope, FokosShardingHooks } from "../sharding/runtime-types.js";
-import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
+import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
 
 const kb = (s: string) => KeyCodec.encode(s);
 const ABSENT_SK = KeyCodec.encodeOptional(undefined);
@@ -56,10 +56,10 @@ afterEach(() => {
 // retry budgets. Direct calls keep the tests deterministic and isolate each storage transition.
 type CoordinatorInternals = {
 	/** The public RPC: it goes through the runtime, admission included. */
-	initiateWrite(ctx: FokosDbRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
+	initiateWrite(ctx: FokosDBRouteContext, request: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>>;
 	fokos: TransactionCoordinatorDO["fokos"];
 	fokosNow(): number;
-	hooks(): FokosShardingHooks<FokosDbPolicy>;
+	hooks(): FokosShardingHooks<FokosDBPolicy>;
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
 	recoverTransactionLocal(transactionId: string): Promise<unknown>;
 	/** The step of the `tx_recovery` job. */
@@ -190,7 +190,7 @@ function tableNames(state: DurableObjectState): string[] {
  * identity, because each transition of the state machine tests that the coordinator owns the token.
  */
 async function withCoordinator(
-	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDbRouteContext) => void | Promise<void>,
+	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDBRouteContext) => void | Promise<void>,
 ): Promise<void> {
 	const ctx = testCoordinatorContext();
 	const stub = testCoordinatorStubByName(ctx.doName);

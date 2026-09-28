@@ -63,7 +63,7 @@ import type * as Rpc from "./api.js";
  * hosts share it. Neither needs the topology of the other group: every cross-class call carries the full route
  * context of its target, and a lock row stores the coordinator's.
  */
-export type FokosDbPolicy = {
+export type FokosDBPolicy = {
 	ns: string;
 	nsTx: string;
 	locationHint?: DurableObjectLocationHint;
@@ -71,7 +71,7 @@ export type FokosDbPolicy = {
 	rangeSplitConditions: { maxSizeMb: number };
 };
 
-export type FokosDbRouteContext = FokosRouteContext<FokosDbPolicy>;
+export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 
 // ─── wire types that change ──────────────────────────────────────────────────
 
@@ -118,7 +118,7 @@ export type QueryRes = {
 export type PrepareReq = {
 	transactionId: string;
 	idempotencyToken: string;
-	coordinator: FokosRouteContext<FokosDbPolicy>;
+	coordinator: FokosRouteContext<FokosDBPolicy>;
 	transactionTimestamp: TransactionTimestamp;
 	items: TransactionItem[];
 };
@@ -144,7 +144,7 @@ export type PartitionOps = {
 
 /** The RPC surface of the class, derived from the spec. `db.ts` and the coordinator type their stubs with it. */
 export type PartitionRpc = FokosShardingRpc & {
-	[K in keyof PartitionOps]: (ctx: FokosDbRouteContext, req: PartitionOps[K]["req"]) => Promise<FokosEnvelope<PartitionOps[K]["res"]>>;
+	[K in keyof PartitionOps]: (ctx: FokosDBRouteContext, req: PartitionOps[K]["req"]) => Promise<FokosEnvelope<PartitionOps[K]["res"]>>;
 };
 
 // ─── constants the host owns ─────────────────────────────────────────────────
@@ -155,7 +155,7 @@ const JOB_STALE_TX = "stale_tx_recovery";
 
 // ─── the host ────────────────────────────────────────────────────────────────
 
-type Runtime = FokosShardingRuntime<FokosDbPolicy, PartitionOps>;
+type Runtime = FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
 
 export class PartitionDO extends DurableObject<Env> implements PartitionRpc {
 	readonly fokos: Runtime;
@@ -164,7 +164,7 @@ export class PartitionDO extends DurableObject<Env> implements PartitionRpc {
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.fokos = new FokosShardingRuntime<FokosDbPolicy, PartitionOps>({
+		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
 			ctx,
 			// Host code: it reads the binding and the location hint from its own policy.
 			stub: (routeCtx, doName) => todo(`partitionStubByName(${routeCtx.policy.ns}, ${doName})`),
@@ -175,20 +175,20 @@ export class PartitionDO extends DurableObject<Env> implements PartitionRpc {
 	}
 
 	// One line per public method. The name of the method is the name of the operation.
-	apiPutItem = (ctx: FokosDbRouteContext, req: PutItemRpcRequest) => this.fokos.dispatch("apiPutItem", ctx, req);
-	apiGetItem = (ctx: FokosDbRouteContext, req: GetItemRpcRequest) => this.fokos.dispatch("apiGetItem", ctx, req);
-	apiDeleteItem = (ctx: FokosDbRouteContext, req: DeleteItemRpcRequest) => this.fokos.dispatch("apiDeleteItem", ctx, req);
-	apiQueryItems = (ctx: FokosDbRouteContext, req: QueryReq) => this.fokos.dispatch("apiQueryItems", ctx, req);
-	txPrepare = (ctx: FokosDbRouteContext, req: PrepareReq) => this.fokos.dispatch("txPrepare", ctx, req);
-	txCommit = (ctx: FokosDbRouteContext, req: CommitRequest) => this.fokos.dispatch("txCommit", ctx, req);
-	txCancel = (ctx: FokosDbRouteContext, req: CancelRequest) => this.fokos.dispatch("txCancel", ctx, req);
-	txReadForTransaction = (ctx: FokosDbRouteContext, req: ReadForTransactionRequest) =>
+	apiPutItem = (ctx: FokosDBRouteContext, req: PutItemRpcRequest) => this.fokos.dispatch("apiPutItem", ctx, req);
+	apiGetItem = (ctx: FokosDBRouteContext, req: GetItemRpcRequest) => this.fokos.dispatch("apiGetItem", ctx, req);
+	apiDeleteItem = (ctx: FokosDBRouteContext, req: DeleteItemRpcRequest) => this.fokos.dispatch("apiDeleteItem", ctx, req);
+	apiQueryItems = (ctx: FokosDBRouteContext, req: QueryReq) => this.fokos.dispatch("apiQueryItems", ctx, req);
+	txPrepare = (ctx: FokosDBRouteContext, req: PrepareReq) => this.fokos.dispatch("txPrepare", ctx, req);
+	txCommit = (ctx: FokosDBRouteContext, req: CommitRequest) => this.fokos.dispatch("txCommit", ctx, req);
+	txCancel = (ctx: FokosDBRouteContext, req: CancelRequest) => this.fokos.dispatch("txCancel", ctx, req);
+	txReadForTransaction = (ctx: FokosDBRouteContext, req: ReadForTransactionRequest) =>
 		this.fokos.dispatch("txReadForTransaction", ctx, req);
-	txReadSnapshot = (ctx: FokosDbRouteContext, req: ReadSnapshotRequest) => this.fokos.dispatch("txReadSnapshot", ctx, req);
-	txExecuteSingleShot = (ctx: FokosDbRouteContext, req: SingleShotRequest) => this.fokos.dispatch("txExecuteSingleShot", ctx, req);
-	debugForceResolveTransaction = (ctx: FokosDbRouteContext, req: DebugForceResolveTransactionRequest) =>
+	txReadSnapshot = (ctx: FokosDBRouteContext, req: ReadSnapshotRequest) => this.fokos.dispatch("txReadSnapshot", ctx, req);
+	txExecuteSingleShot = (ctx: FokosDBRouteContext, req: SingleShotRequest) => this.fokos.dispatch("txExecuteSingleShot", ctx, req);
+	debugForceResolveTransaction = (ctx: FokosDBRouteContext, req: DebugForceResolveTransactionRequest) =>
 		this.fokos.dispatch("debugForceResolveTransaction", ctx, req);
-	debugForcePromoteKey = (ctx: FokosDbRouteContext, req: { hashKey: KeyBytes }) => this.fokos.dispatch("debugForcePromoteKey", ctx, req);
+	debugForcePromoteKey = (ctx: FokosDBRouteContext, req: { hashKey: KeyBytes }) => this.fokos.dispatch("debugForcePromoteKey", ctx, req);
 
 	fokosInit = (req: Rpc.FokosInitRequest) => this.fokos.fokosInit(req);
 	fokosStartImport = (req: Rpc.FokosStartImportRequest) => this.fokos.fokosStartImport(req);
@@ -212,7 +212,7 @@ const noSortKey = KeyCodec.encodeOptional(undefined);
 const keyOf = (item: TransactionItemKey): RouteKey => ({ hashKey: item.hashKey, sortKey: item.sortKey });
 
 /** Signals a write handler reports after its storage transaction committed. */
-function writeSignals(call: FokosLocalCall, candidates: PromotionCandidate[], policy: FokosDbPolicy): void {
+function writeSignals(call: FokosLocalCall, candidates: PromotionCandidate[], policy: FokosDBPolicy): void {
 	const cap = policy.hashSplitConditions.maxSizeMb * 1024 * 1024 * RANGE_PROMOTION_FRACTION;
 	call.signal({
 		evaluateSplit: true,
@@ -495,7 +495,7 @@ async function walkRange(
 
 // ─── hooks ───────────────────────────────────────────────────────────────────
 
-function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
+function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
 	const { fokos, store, participant } = host;
 	return {
 		evaluateSplit: ({ identity, policy }) => {
@@ -504,7 +504,7 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
 		},
 		computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
 			todo(`store.rangeBoundaries(${hashKey.length}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
-		migration: todo("FokosDbMigrationHost, unchanged"),
+		migration: todo("FokosDBMigrationHost, unchanged"),
 		// A promotion cannot move a locked key. A split never holds: every lock follows its key to the child.
 		beforeCutover: (plan) => plan.kind !== "key_promotion" || todo<number>("store.pendingLockCountForHashKey") === 0,
 		beforeComplete: (plan) => (plan.kind === "key_promotion" ? undefined : todo("onSplitCompleted")),
@@ -528,7 +528,7 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDbPolicy> {
 					// Each stale lock is resolved by its own coordinator, then applied through `dispatch`, because the
 					// keys of the lock can have moved to a child since the lock was written.
 					for (const row of participant.listStaleTransactions(host.fokosStaleTransactionMs(), 10)) {
-						const pending = todo<{ coordinator: FokosDbRouteContext; idempotencyToken: string }>(`pending row of ${row.transaction_id}`);
+						const pending = todo<{ coordinator: FokosDBRouteContext; idempotencyToken: string }>(`pending row of ${row.transaction_id}`);
 						// A stub to another class. The coordinator's runtime forwards when that coordinator has split.
 						const tc = todo<import("./fokosdb-coordinator-host.js").CoordinatorRpc>(
 							"txCoordinatorStub(env, ctx, pending.coordinator.doName)",

@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { executedBy, kb, rangeAncestorsOf } from "./helpers.js";
 import {
@@ -66,7 +66,7 @@ describe.concurrent("PartitionDO — range split", () => {
 		const raisedMaxSizeMb = splitTimeMaxSizeMb * 4;
 
 		// An operator raises the range split threshold; the new value travels with every request.
-		const updatedCtx: FokosDbRouteContext = {
+		const updatedCtx: FokosDBRouteContext = {
 			...root.ctx,
 			policy: { ...root.ctx.policy, rangeSplitConditions: { ...root.ctx.policy.rangeSplitConditions, maxSizeMb: raisedMaxSizeMb } },
 		};
@@ -131,7 +131,7 @@ describe.concurrent("PartitionDO — range split", () => {
 			// A depth-2 grandchild's expected ancestor is its depth-1 parent's own boundaries, decoded to
 			// wire form. Split both the leftmost child (start=null) and a non-leftmost one (start=KeyBytes)
 			// so both the null and the decode-from-KeyBytes startBoundary paths are exercised.
-			const expectAncestor = (childCtx: FokosDbRouteContext) => {
+			const expectAncestor = (childCtx: FokosDBRouteContext) => {
 				return {
 					depth: 1,
 					startBoundary: rangeOf(childCtx).startBoundary ?? KeyCodec.encodeOptional(undefined),

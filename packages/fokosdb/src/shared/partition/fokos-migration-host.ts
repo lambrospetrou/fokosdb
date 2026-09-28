@@ -37,11 +37,11 @@ const SCAN_ROWS = 10_000;
 type BelongsToTarget = (key: RouteKey) => boolean;
 
 /** Where the host has got to. The flow stores it verbatim and never reads inside it. */
-export type FokosDbHostCursor =
+export type FokosDBHostCursor =
 	| { stream: "items"; cursor: ScanCursor | null }
 	| { stream: "pending_tx"; cursor: PendingTransactionCursor | null };
 
-export type FokosDbHostPage =
+export type FokosDBHostPage =
 	| { stream: "items"; items: MigratedItem[] }
 	| {
 			stream: "pending_tx";
@@ -61,7 +61,7 @@ export class FokosMigrationHost implements MigrationHost {
 		cursor: unknown,
 		_slice: FokosSlice,
 		belongsToTarget: BelongsToTarget,
-	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
+	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const from = asHostCursor(cursor);
 		return from.stream === "items"
 			? this.#buildItemsPage(from.cursor, belongsToTarget)
@@ -73,7 +73,7 @@ export class FokosMigrationHost implements MigrationHost {
 	 * write it makes commits or rolls back with the cursor that page advanced.
 	 */
 	applyPage(page: unknown, _slice: FokosSlice): void {
-		const p = page as FokosDbHostPage;
+		const p = page as FokosDBHostPage;
 		if (p.stream === "items") {
 			this.#applyItems(p.items);
 			return;
@@ -90,7 +90,7 @@ export class FokosMigrationHost implements MigrationHost {
 	#buildItemsPage(
 		cursor: ScanCursor | null,
 		belongsToTarget: BelongsToTarget,
-	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
+	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
 			fetchPage: (c, pageSize) => store.queryItemsPage(c, pageSize),
@@ -105,7 +105,7 @@ export class FokosMigrationHost implements MigrationHost {
 		});
 		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
 		// keeps each page to a single stream.
-		const next: FokosDbHostCursor = nextCursor ? { stream: "items", cursor: nextCursor } : { stream: "pending_tx", cursor: null };
+		const next: FokosDBHostCursor = nextCursor ? { stream: "items", cursor: nextCursor } : { stream: "pending_tx", cursor: null };
 		return { page: { stream: "items", items: rows }, nextCursor: next };
 	}
 
@@ -148,7 +148,7 @@ export class FokosMigrationHost implements MigrationHost {
 	#buildPendingTxPage(
 		cursor: PendingTransactionCursor | null,
 		belongsToTarget: BelongsToTarget,
-	): { page: FokosDbHostPage; nextCursor: FokosDbHostCursor | null } {
+	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
 			fetchPage: (c, pageSize) => store.queryPendingTxPage(c, pageSize),
@@ -164,11 +164,11 @@ export class FokosMigrationHost implements MigrationHost {
 		// Every page of this stream carries the deletion metadata, so a slice with no lock at all still
 		// receives it in one empty page. A promoted key never has a lock — promotion cutover requires a
 		// zero lock count — and still needs the watermark.
-		const page: FokosDbHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
+		const page: FokosDBHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
 		return { page, nextCursor: nextCursor ? { stream: "pending_tx", cursor: nextCursor } : null };
 	}
 
-	#applyPendingTx(page: Extract<FokosDbHostPage, { stream: "pending_tx" }>): void {
+	#applyPendingTx(page: Extract<FokosDBHostPage, { stream: "pending_tx" }>): void {
 		const { store } = this.deps;
 		for (const row of page.pendingTransactions) {
 			store.insertPendingLock(row);
@@ -182,22 +182,22 @@ export class FokosMigrationHost implements MigrationHost {
  * The flow validates the phase; this validates the stream inside it, so a page can never apply
  * against a cursor from another stream.
  */
-function asHostCursor(cursor: unknown): FokosDbHostCursor {
+function asHostCursor(cursor: unknown): FokosDBHostCursor {
 	if (cursor === null || cursor === undefined) {
 		return { stream: "items", cursor: null };
 	}
-	const c = cursor as FokosDbHostCursor;
+	const c = cursor as FokosDBHostCursor;
 	invariant(c.stream === "items" || c.stream === "pending_tx", () => `fokos/migration-host: unknown stream ${String(c.stream)}`);
 	return c;
 }
 
 /** The stream order, so a page can be checked against the cursor that asked for it. */
-const STREAM_ORDER: Record<FokosDbHostCursor["stream"], number> = { items: 0, pending_tx: 1 };
+const STREAM_ORDER: Record<FokosDBHostCursor["stream"], number> = { items: 0, pending_tx: 1 };
 
 /** Throws when a page would move the host's own streams backwards. */
 export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, nextCursor: unknown): void {
 	const requested = asHostCursor(cursor);
-	const answered = (page as FokosDbHostPage).stream;
+	const answered = (page as FokosDBHostPage).stream;
 	invariant(
 		STREAM_ORDER[answered] === STREAM_ORDER[requested.stream],
 		() => `fokos/migration-host: asked for the ${requested.stream} stream and received ${answered}`,

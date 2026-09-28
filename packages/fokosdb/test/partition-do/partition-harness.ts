@@ -9,7 +9,7 @@ import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
 import { isHashPartition, isRangePartition } from "../../src/sharding/route-context.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	PartitionIdHelper,
@@ -33,8 +33,8 @@ import {
 } from "./helpers.js";
 
 type PartitionWriter = {
-	apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
-	status(ctx: FokosDbRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
+	apiPutItem(ctx: FokosDBRouteContext, req: PutItemRpcRequest): Promise<{ meta: { databaseSize: number } }>;
+	status(ctx: FokosDBRouteContext): Promise<{ splitStatus?: SplitStatusView }>;
 };
 
 // Each hash filler is below the promotion threshold (a quarter of the cap), and the write that
@@ -73,20 +73,20 @@ export function makePartition(opts?: PartitionOptions): TestPartition {
 }
 
 export class TestPartition {
-	readonly ctx: FokosDbRouteContext;
+	readonly ctx: FokosDBRouteContext;
 	/** The raw stub: every call answers an envelope. `runInDurableObject` needs it. */
 	readonly stub: DurableObjectStub<PartitionDO>;
 	/** The same stub with every envelope opened, as a test reads a response. */
 	readonly rpc: OpenedPartitionRpc;
 
-	private constructor(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>) {
+	private constructor(ctx: FokosDBRouteContext, stub?: DurableObjectStub<PartitionDO>) {
 		this.ctx = ctx;
 		this.stub = stub ?? testPartitionStub(ctx.doName, ctx.policy.ns);
 		this.rpc = openedRpc(this.stub);
 	}
 
 	/** Wraps a context that another partition (or a pure resolver) produced. */
-	static at(ctx: FokosDbRouteContext, stub?: DurableObjectStub<PartitionDO>): TestPartition {
+	static at(ctx: FokosDBRouteContext, stub?: DurableObjectStub<PartitionDO>): TestPartition {
 		return new TestPartition(ctx, stub);
 	}
 
@@ -437,7 +437,7 @@ export class TestPartition {
 }
 
 /** The immutable range a range partition owns, decoded from its partition ID. */
-export function rangeOf(ctx: FokosDbRouteContext) {
+export function rangeOf(ctx: FokosDBRouteContext) {
 	const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(ctx.partitionId));
 	invariant(decoded.schema === PartitionIdHelper.SCHEMA_RANGE_V1, `${ctx.doName}: not a range partition`);
 	return decoded;

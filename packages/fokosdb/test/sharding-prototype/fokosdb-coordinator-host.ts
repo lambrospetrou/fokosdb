@@ -27,11 +27,11 @@ import type {
 import { FokosShardingRuntime, todo } from "./api.js";
 import type { FokosEnvelope, FokosOperations, FokosRouteContext, FokosShardingHooks, FokosShardingRpc, RouteKey } from "./api.js";
 import type * as Rpc from "./api.js";
-import type { FokosDbPolicy, FokosDbRouteContext, PartitionRpc, PrepareReq } from "./fokosdb-partition-host.js";
+import type { FokosDBPolicy, FokosDBRouteContext, PartitionRpc, PrepareReq } from "./fokosdb-partition-host.js";
 
 // ─── wire types that change ──────────────────────────────────────────────────
 
-export type TcWriteOperation = Omit<TCWriteOperation, "partitionContext"> & { partitionContext: FokosDbRouteContext };
+export type TcWriteOperation = Omit<TCWriteOperation, "partitionContext"> & { partitionContext: FokosDBRouteContext };
 export type InitiateWriteReq = { clientRequestToken?: string; items: TcWriteOperation[] };
 export type RecoverTransactionReq = { transactionId: string; idempotencyToken: string };
 
@@ -42,7 +42,7 @@ export type CoordinatorOps = {
 
 export type CoordinatorRpc = FokosShardingRpc & {
 	[K in keyof CoordinatorOps]: (
-		ctx: FokosDbRouteContext,
+		ctx: FokosDBRouteContext,
 		req: CoordinatorOps[K]["req"],
 	) => Promise<FokosEnvelope<CoordinatorOps[K]["res"]>>;
 };
@@ -57,7 +57,7 @@ const JOB_SWEEP = "idempotency_sweep";
 const noSortKey = KeyCodec.encodeOptional(undefined);
 const tokenKey = (token: string): RouteKey => ({ hashKey: encodeHashKey(token), sortKey: noSortKey });
 
-type Runtime = FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>;
+type Runtime = FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 
 type TcStateRow = { transaction_id: string; idempotency_token: string; state: TCState; created_at: number; completed_at: number | null };
 
@@ -66,7 +66,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.fokos = new FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>({
+		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
 			stub: (routeCtx, doName) => todo(`txCoordinatorStubByName(${routeCtx.policy.nsTx}, ${doName})`),
 			// A coordinator needs no range tree and no Bloom cache. The hash arena is the only cache it learns.
@@ -76,8 +76,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		void ctx.blockConcurrencyWhile(async () => todo("tc_state, tc_items, tc_participants, tc_results migrations"));
 	}
 
-	initiateWrite = (ctx: FokosDbRouteContext, req: InitiateWriteReq) => this.fokos.dispatch("initiateWrite", ctx, req);
-	recoverTransaction = (ctx: FokosDbRouteContext, req: RecoverTransactionReq) => this.fokos.dispatch("recoverTransaction", ctx, req);
+	initiateWrite = (ctx: FokosDBRouteContext, req: InitiateWriteReq) => this.fokos.dispatch("initiateWrite", ctx, req);
+	recoverTransaction = (ctx: FokosDBRouteContext, req: RecoverTransactionReq) => this.fokos.dispatch("recoverTransaction", ctx, req);
 
 	fokosInit = (req: Rpc.FokosInitRequest) => this.fokos.fokosInit(req);
 	fokosStartImport = (req: Rpc.FokosStartImportRequest) => this.fokos.fokosStartImport(req);
@@ -97,7 +97,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/** A stub to a partition of another class. The host reads the binding from the participant's own policy. */
-	partition(ctx: FokosDbRouteContext): PartitionRpc {
+	partition(ctx: FokosDBRouteContext): PartitionRpc {
 		return todo(`partitionStubByName(${ctx.policy.ns}, ${ctx.doName})`);
 	}
 
@@ -116,7 +116,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	async drive(row: TcStateRow): Promise<InitiateWriteResponseEncoded> {
 		const token = row.idempotency_token;
-		const participants = todo<Array<{ context: FokosDbRouteContext; request: PrepareReq }>>("tc_participants and tc_items of the row");
+		const participants = todo<Array<{ context: FokosDBRouteContext; request: PrepareReq }>>("tc_participants and tc_items of the row");
 		switch (row.state) {
 			case "CREATED":
 			case "PREPARING": {
@@ -200,7 +200,7 @@ function coordinatorOperations(host: TransactionCoordinatorDO): FokosOperations<
 
 // ─── hooks ───────────────────────────────────────────────────────────────────
 
-function coordinatorHooks(host: TransactionCoordinatorDO): FokosShardingHooks<FokosDbPolicy> {
+function coordinatorHooks(host: TransactionCoordinatorDO): FokosShardingHooks<FokosDBPolicy> {
 	const { fokos } = host;
 	const active = () => {
 		const lc = fokos.lifecycle();
@@ -248,4 +248,4 @@ function coordinatorHooks(host: TransactionCoordinatorDO): FokosShardingHooks<Fo
 	};
 }
 
-export type CoordinatorRouteContext = FokosRouteContext<FokosDbPolicy>;
+export type CoordinatorRouteContext = FokosRouteContext<FokosDBPolicy>;

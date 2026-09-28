@@ -40,7 +40,7 @@ export type TransactionCoordinatorNamespaceKey = {
  * except `ns` and `nsTx`: a change to those selects another Durable Object namespace, which a
  * partition inside the old namespace cannot detect, so a shard group must keep them for life.
  */
-export type FokosDbPolicy = {
+export type FokosDBPolicy = {
 	ns: PartitionNamespaceKey;
 	nsTx: TransactionCoordinatorNamespaceKey;
 	/**
@@ -52,7 +52,7 @@ export type FokosDbPolicy = {
 	rangeSplitConditions: SplitConditions;
 };
 
-export type FokosDbRouteContext = FokosRouteContext<FokosDbPolicy>;
+export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
 
 /**
  * FokosDB names its own shard groups with this prefix, so a table name must not start with it. The
@@ -72,13 +72,13 @@ export function coordinatorShardGroup(topology: FokosTopology): string {
 }
 
 /** The part of a route context that selects a namespace and a stub: enough for a Worker with no partition in mind. */
-export type FokosDbStubContext = Pick<FokosDbRouteContext, "topology" | "policy">;
+export type FokosDBStubContext = Pick<FokosDBRouteContext, "topology" | "policy">;
 
 /** One table configuration: what `FokosRouter` is built from. */
-export type FokosDbTableConfig = {
+export type FokosDBTableConfig = {
 	topology: FokosTopology;
 	rangeConfig: FokosRangeConfig;
-	policy: FokosDbPolicy;
+	policy: FokosDBPolicy;
 };
 
 export class PartitionContextCreator {
@@ -94,7 +94,7 @@ export class PartitionContextCreator {
 		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
 		jurisdiction?: DurableObjectJurisdiction;
 		locationHint?: DurableObjectLocationHint;
-	}): FokosDbTableConfig {
+	}): FokosDBTableConfig {
 		// Each option defaults on its own, so a value the caller gives is never replaced. The caller's
 		// object stays unchanged.
 		const hashSplitConditions = opts.hashSplitConditions ?? { maxSizeMb: 100 };
@@ -131,7 +131,7 @@ export class PartitionContextCreator {
 		validateSplitConditions("hashSplitConditions", hashSplitConditions, invalid);
 		validateSplitConditions("rangeSplitConditions", rangeSplitConditions, invalid);
 
-		const policy: FokosDbPolicy = {
+		const policy: FokosDBPolicy = {
 			ns: opts.ns,
 			nsTx: opts.nsTx,
 			hashSplitConditions,

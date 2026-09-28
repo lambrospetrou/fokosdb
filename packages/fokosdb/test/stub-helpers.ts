@@ -5,7 +5,7 @@
 import { env } from "cloudflare:workers";
 import type { PartitionDO } from "../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
-import { PartitionContextCreator, type FokosDbRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import { PartitionContextCreator, type FokosDBRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
 import { FokosRouter } from "../src/sharding/router.js";
 import { COORDINATOR_REF_VERSION, type CoordinatorRef } from "../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO } from "./controlled-partition-do.js";
@@ -29,7 +29,7 @@ export function testCoordinatorStubByName(doName: string): DurableObjectStub<Tra
 }
 
 /** The route context of a root coordinator in a new coordinator group. */
-export function testCoordinatorContext(): FokosDbRouteContext {
+export function testCoordinatorContext(): FokosDBRouteContext {
 	const table = PartitionContextCreator.create({
 		ns: "PARTITION_DO",
 		nsTx: "TRANSACTION_COORDINATOR_DO",

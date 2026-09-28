@@ -5,7 +5,7 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorStubByName, testPartitionStub } from "../stub-helpers.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
@@ -24,7 +24,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 	function insertStalePendingLock(
 		state: DurableObjectState,
 		transactionId: string,
-		coordinator: FokosDbRouteContext,
+		coordinator: FokosDBRouteContext,
 		options?: { createdAt?: number; hashKey?: string; data?: string; guardedAt?: number | null; transactionTimestamp?: number },
 	): PartitionStore {
 		const createdAt = options?.createdAt ?? Date.now() - 10_000;
@@ -68,7 +68,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const recoverTransaction = mockCoordinatorRecovery();
 		const transactionId = crypto.randomUUID();
 		const coordinator = testCoordinatorContext();
-		const childPartitionContexts: FokosDbRouteContext[] = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((child) => ({
+		const childPartitionContexts: FokosDBRouteContext[] = PartitionIdHelper.calculateHashChildPartitionIds(ctx).map((child) => ({
 			...ctx,
 			doName: child.doName,
 			partitionId: child.partitionIdOpaque,
@@ -107,7 +107,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		const { ctx: parentCtx } = makeStub({ hashSplitN: 2 });
 		const child = PartitionIdHelper.calculateHashChildPartitionIds(parentCtx)[0];
 		const childId = env.PARTITION_DO.idFromName(child.doName);
-		const childCtx: FokosDbRouteContext = {
+		const childCtx: FokosDBRouteContext = {
 			...parentCtx,
 			doName: child.doName,
 			partitionId: child.partitionIdOpaque,

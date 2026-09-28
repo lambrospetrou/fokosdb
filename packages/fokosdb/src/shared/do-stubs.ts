@@ -12,12 +12,12 @@
  */
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
-import type { FokosDbStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
+import type { FokosDBStubContext, TransactionCoordinatorNamespaceKey } from "./partition-context.js";
 
 /**
  * The namespace the context names, with its jurisdiction applied, if any is provided.
  */
-export function partitionNamespace(env: Env, ctx: FokosDbStubContext): DurableObjectNamespace<PartitionDO> {
+export function partitionNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<PartitionDO> {
 	const ns: DurableObjectNamespace<PartitionDO> = env[ctx.policy.ns];
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
@@ -25,24 +25,24 @@ export function partitionNamespace(env: Env, ctx: FokosDbStubContext): DurableOb
 /**
  * The coordinator namespace the context names, with its jurisdiction applied.
  */
-export function txCoordinatorNamespace(env: Env, ctx: FokosDbStubContext): DurableObjectNamespace<TransactionCoordinatorDO> {
+export function txCoordinatorNamespace(env: Env, ctx: FokosDBStubContext): DurableObjectNamespace<TransactionCoordinatorDO> {
 	const ns: DurableObjectNamespace<TransactionCoordinatorDO> = env[ctx.policy.nsTx];
 	return ctx.topology.jurisdiction === undefined ? ns : ns.jurisdiction(ctx.topology.jurisdiction);
 }
 
-function stubOptions(ctx: FokosDbStubContext): DurableObjectNamespaceGetDurableObjectOptions | undefined {
+function stubOptions(ctx: FokosDBStubContext): DurableObjectNamespaceGetDurableObjectOptions | undefined {
 	return ctx.policy.locationHint === undefined ? undefined : { locationHint: ctx.policy.locationHint };
 }
 
-export function partitionStub(env: Env, ctx: FokosDbStubContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
+export function partitionStub(env: Env, ctx: FokosDBStubContext, id: DurableObjectId): DurableObjectStub<PartitionDO> {
 	return partitionNamespace(env, ctx).get(id, stubOptions(ctx));
 }
 
-export function partitionStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<PartitionDO> {
+export function partitionStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<PartitionDO> {
 	return partitionNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 
-export function txCoordinatorStubByName(env: Env, ctx: FokosDbStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
+export function txCoordinatorStubByName(env: Env, ctx: FokosDBStubContext, doName: string): DurableObjectStub<TransactionCoordinatorDO> {
 	return txCoordinatorNamespace(env, ctx).getByName(doName, stubOptions(ctx));
 }
 

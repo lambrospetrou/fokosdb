@@ -3,7 +3,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex, PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
@@ -98,7 +98,7 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.fokosinit-idempotent.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
+		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 
 		const req = {
@@ -126,7 +126,7 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub();
 		const childName = `test.fokosinit-conflict.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
+		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 		const source = refOf(parentCtx);
@@ -156,7 +156,7 @@ describe("PartitionDO - splitting", () => {
 		const { ctx: parentCtx } = makeStub({ hashSplitConditions: { maxSizeMb: 100 } });
 		const childName = `test.fokosinit-mutable.${crypto.randomUUID()}`;
 		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDbRouteContext = { ...parentCtx, doName: childName };
+		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
 		const childStub = testPartitionStub(childId);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 

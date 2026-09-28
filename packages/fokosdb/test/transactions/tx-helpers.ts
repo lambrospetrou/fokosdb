@@ -10,8 +10,8 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	coordinatorShardGroup,
-	type FokosDbPolicy,
-	type FokosDbRouteContext,
+	type FokosDBPolicy,
+	type FokosDBRouteContext,
 	PartitionContextCreator,
 } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
@@ -190,7 +190,7 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 }
 
 /** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>`. */
-export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDbPolicy> {
+export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
 	const { topology, coordinatorRootsN } = db.options();
 	return new FokosRouter(
 		{ ...topology.topology, shardGroup: coordinatorShardGroup(topology.topology), rootTreesN: coordinatorRootsN },
@@ -237,7 +237,7 @@ export async function holdPendingLock(
 export async function betweenPhases<T>(
 	db: FokosDB,
 	key: Key,
-	between: (instance: PartitionDO, state: DurableObjectState, pCtx: FokosDbRouteContext) => Promise<void>,
+	between: (instance: PartitionDO, state: DurableObjectState, pCtx: FokosDBRouteContext) => Promise<void>,
 	read: () => Promise<T>,
 ): Promise<T> {
 	const partition = controlledPartition(db, key);

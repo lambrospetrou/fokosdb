@@ -9,14 +9,14 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
 /** Every entry of every page, so a test reads the whole view the traversal would walk. */
-async function allStatusEntries(partition: TestPartition, rootContext?: FokosDbRouteContext) {
+async function allStatusEntries(partition: TestPartition, rootContext?: FokosDBRouteContext) {
 	const entries = [];
 	let cursor = null;
 	do {

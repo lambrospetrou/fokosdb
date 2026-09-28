@@ -7,7 +7,7 @@ import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js"
 import { FokosRouter, FokosShardingClient, todo } from "./api.js";
 import type { FokosPublicRoute, FokosPublicRouting, FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
 import type { CoordinatorRpc, InitiateWriteReq } from "./fokosdb-coordinator-host.js";
-import type { FokosDbPolicy, FokosDbRouteContext, LeafMetrics, PartitionRpc, QueryReq } from "./fokosdb-partition-host.js";
+import type { FokosDBPolicy, FokosDBRouteContext, LeafMetrics, PartitionRpc, QueryReq } from "./fokosdb-partition-host.js";
 
 export type FokosDBOptions = {
 	tableName: string;
@@ -15,7 +15,7 @@ export type FokosDBOptions = {
 	hashSplitN: number;
 	jurisdiction?: DurableObjectJurisdiction;
 	rangeConfig: FokosRangeConfig;
-	policy: FokosDbPolicy;
+	policy: FokosDBPolicy;
 	/** Root count of the coordinator pool. It grows by hash splits from there, so retries need no fixed pool size. */
 	coordinatorRootsN?: number;
 };
@@ -24,8 +24,8 @@ export type FokosDBOptions = {
 export type PublicMeta = OperationMetrics & PartitionInfo;
 
 export class FokosDB {
-	readonly partitions: FokosRouter<FokosDbPolicy>;
-	readonly coordinators: FokosRouter<FokosDbPolicy>;
+	readonly partitions: FokosRouter<FokosDBPolicy>;
+	readonly coordinators: FokosRouter<FokosDBPolicy>;
 
 	constructor(opts: FokosDBOptions) {
 		const topology: FokosTopology = {
@@ -44,10 +44,10 @@ export class FokosDB {
 		this.coordinators = new FokosRouter(tcTopology, opts.rangeConfig, opts.policy);
 	}
 
-	partitionStub(ctx: FokosDbRouteContext): PartitionRpc {
+	partitionStub(ctx: FokosDBRouteContext): PartitionRpc {
 		return todo(`partitionStubByName(${ctx.policy.ns}, ${ctx.doName})`);
 	}
-	coordinatorStub(ctx: FokosDbRouteContext): CoordinatorRpc {
+	coordinatorStub(ctx: FokosDBRouteContext): CoordinatorRpc {
 		return todo(`txCoordinatorStubByName(${ctx.policy.nsTx}, ${ctx.doName})`);
 	}
 

@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
@@ -405,7 +405,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 		/** Groups probe keys by the child DO that serves them, asking the split root who answered. */
 		async function keysByServingChild(
 			stub: DurableObjectStub<PartitionDO>,
-			ctx: FokosDbRouteContext,
+			ctx: FokosDBRouteContext,
 			count: number,
 		): Promise<Map<string, string[]>> {
 			const rpc = openedRpc(stub);

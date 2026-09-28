@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migrations";
-import type { FokosDbPolicy, FokosDbRouteContext, FokosDbTableConfig } from "../shared/partition-context.js";
+import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../shared/partition-context.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosEnvelope, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
@@ -106,7 +106,7 @@ type TcParticipantRow = {
 /** One participant of the prepare fan-out: the partition and the items of the transaction it owns. */
 type PrepareParticipant = {
 	doName: string;
-	context: FokosDbRouteContext;
+	context: FokosDBRouteContext;
 	items: TransactionItem[];
 };
 
@@ -230,7 +230,7 @@ export type CoordinatorOps = {
 /** The RPC surface of the class. */
 type CoordinatorRpc = FokosShardingRpc & {
 	[K in keyof CoordinatorOps]: (
-		ctx: FokosDbRouteContext,
+		ctx: FokosDBRouteContext,
 		req: CoordinatorOps[K]["req"],
 	) => Promise<FokosEnvelope<CoordinatorOps[K]["res"]>>;
 };
@@ -329,7 +329,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
 export class TransactionCoordinatorDO extends DurableObject<Env> implements CoordinatorRpc {
 	/** The sharding runtime: identity, routing, splits, and the alarm. The pool grows by hash splits. */
-	readonly fokos: FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>;
+	readonly fokos: FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 	#migrations: SQLSchemaMigrations;
 
 	constructor(ctx: DurableObjectState, env: Env) {
@@ -339,7 +339,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			doStorage: ctx.storage,
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
-		this.fokos = new FokosShardingRuntime<FokosDbPolicy, CoordinatorOps>({
+		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({
 			ctx,
 			stub: (routeCtx, doName) => txCoordinatorStubByName(env, routeCtx, doName),
 			hooks: this.hooks(),
@@ -352,12 +352,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
 
-	initiateWrite(ctx: FokosDbRouteContext, req: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>> {
+	initiateWrite(ctx: FokosDBRouteContext, req: InitiateWriteRequest): Promise<FokosEnvelope<InitiateWriteResponseEncoded>> {
 		return this.fokos.dispatch("initiateWrite", ctx, req);
 	}
 
 	/** The routed operation. A coordinator that has split forwards the call to the child that owns the token. */
-	recoverTransaction(ctx: FokosDbRouteContext, req: RecoverTransactionRequest): Promise<FokosEnvelope<RecoverTransactionResult>> {
+	recoverTransaction(ctx: FokosDBRouteContext, req: RecoverTransactionRequest): Promise<FokosEnvelope<RecoverTransactionResult>> {
 		return this.fokos.dispatch("recoverTransaction", ctx, req);
 	}
 
@@ -436,11 +436,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	// ═══ hooks ═══════════════════════════════════════════════════════════════
 
-	private hooks(): FokosShardingHooks<FokosDbPolicy> {
+	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		const sql = this.ctx.storage.sql;
 		// The split threshold. A missing or zero `maxSizeMb` gives only the size limit of the coordinator.
 		// The limit is divided by 1.1, so the 10% admission margin below stops at MAX_TC_DATABASE_BYTES.
-		const maxBytes = (policy: FokosDbPolicy) =>
+		const maxBytes = (policy: FokosDBPolicy) =>
 			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, MAX_TC_DATABASE_BYTES / 1.1);
 		return {
 			// The coordinator splits above the hash split threshold of its table. It also splits above
@@ -956,10 +956,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/** The client of the partitions of the table that `ctx` names. The client is cheap to make. */
-	private partitionClient(ctx: FokosDbTableConfig): FokosShardingClient<FokosDbPolicy, PartitionOps> {
+	private partitionClient(ctx: FokosDBTableConfig): FokosShardingClient<FokosDBPolicy, PartitionOps> {
 		// TODO: Consider caching the client for repeated use to avoid creating a new instance each time.
 		// TODO: The client should exploit cache of topology hierarchy to leapfrog partitions.
-		return new FokosShardingClient<FokosDbPolicy, PartitionOps>({
+		return new FokosShardingClient<FokosDBPolicy, PartitionOps>({
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
 			policy: ctx.policy,
@@ -1616,8 +1616,8 @@ function migratedTransactionBytes(tx: MigratedTransaction): number {
 	return bytes;
 }
 
-function deserializePartitionContext(json: string): FokosDbRouteContext {
-	return JSON.parse(json) as FokosDbRouteContext;
+function deserializePartitionContext(json: string): FokosDBRouteContext {
+	return JSON.parse(json) as FokosDBRouteContext;
 }
 
 function groupByPartition<T extends Pick<TcItemRow, "partition_do_name">>(items: T[]): Map<string, T[]> {

@@ -11,7 +11,7 @@
  * holds, counts, answers, or fails one call, or replaces one tuning value.
  */
 import { PartitionDO } from "../src/server/do-partition.js";
-import type { FokosDbRouteContext } from "../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosInitRequest, FokosMigrationPage, FokosMigrationPullRequest } from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
@@ -87,11 +87,11 @@ export class ControlledPartitionDO extends PartitionDO {
 		return "error" in rule ? Promise.reject(new Error(rule.error)) : Promise.resolve(rule.value);
 	}
 
-	override txReadSnapshot(ctx: FokosDbRouteContext, req: TxRequest<"txReadSnapshot">) {
+	override txReadSnapshot(ctx: FokosDBRouteContext, req: TxRequest<"txReadSnapshot">) {
 		return this.#tx("txReadSnapshot", req, () => super.txReadSnapshot(ctx, req));
 	}
 
-	override txReadForTransaction(ctx: FokosDbRouteContext, req: TxRequest<"txReadForTransaction">) {
+	override txReadForTransaction(ctx: FokosDBRouteContext, req: TxRequest<"txReadForTransaction">) {
 		return this.#tx("txReadForTransaction", req, async () => {
 			const response = await super.txReadForTransaction(ctx, req);
 			const readGate = this.#readGate;
@@ -103,11 +103,11 @@ export class ControlledPartitionDO extends PartitionDO {
 		});
 	}
 
-	override txExecuteSingleShot(ctx: FokosDbRouteContext, req: TxRequest<"txExecuteSingleShot">) {
+	override txExecuteSingleShot(ctx: FokosDBRouteContext, req: TxRequest<"txExecuteSingleShot">) {
 		return this.#tx("txExecuteSingleShot", req, () => super.txExecuteSingleShot(ctx, req));
 	}
 
-	override async txPrepare(ctx: FokosDbRouteContext, req: Parameters<PartitionDO["txPrepare"]>[1]) {
+	override async txPrepare(ctx: FokosDBRouteContext, req: Parameters<PartitionDO["txPrepare"]>[1]) {
 		const response = await super.txPrepare(ctx, req);
 		const prepareGate = this.#prepareGate;
 		if (prepareGate && !prepareGate.parked) {
@@ -117,11 +117,11 @@ export class ControlledPartitionDO extends PartitionDO {
 		return response;
 	}
 
-	override txCommit(ctx: FokosDbRouteContext, req: TxRequest<"txCommit">) {
+	override txCommit(ctx: FokosDBRouteContext, req: TxRequest<"txCommit">) {
 		return this.#tx("txCommit", req, () => super.txCommit(ctx, req));
 	}
 
-	override txCancel(ctx: FokosDbRouteContext, req: TxRequest<"txCancel">) {
+	override txCancel(ctx: FokosDBRouteContext, req: TxRequest<"txCancel">) {
 		return this.#tx("txCancel", req, () => super.txCancel(ctx, req));
 	}
 

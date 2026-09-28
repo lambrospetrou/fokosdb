@@ -24,7 +24,7 @@ import type {
 	TransactionReadItem,
 } from "../shared/transaction-wire-types.js";
 import type { FokosPartitionIdentity, FokosPartitionRef } from "../sharding/route-context.js";
-import type { FokosDbPolicy, FokosDbRouteContext } from "../shared/partition-context.js";
+import type { FokosDBPolicy, FokosDBRouteContext } from "../shared/partition-context.js";
 import { identityDepth } from "../sharding/partition-id.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import type { SplitType } from "../sharding/types.js";
@@ -202,13 +202,13 @@ export type SplitStatusView =
 			status: "split_started" | "split_completed";
 			splitType: SplitType;
 			/** Built from THIS partition's current context, never from a snapshot taken at split time. */
-			childPartitionContexts: FokosDbRouteContext[];
+			childPartitionContexts: FokosDBRouteContext[];
 			migratedChildDoNames: string[];
 	  };
 
 export type PartitionStatusView = {
 	depth: number;
-	partitionContext: FokosDbRouteContext;
+	partitionContext: FokosDBRouteContext;
 	identityStored: FokosPartitionIdentity;
 	splitStatus: SplitStatusView | undefined;
 	migrationStatus: "migration_initialized" | "migration_migrating" | "migration_completed" | undefined;
@@ -239,7 +239,7 @@ export type PartitionOps = {
 
 /** The RPC surface of the class. `db.ts` and the coordinator type their stubs with it. */
 export type PartitionRpc = FokosShardingRpc & {
-	[K in keyof PartitionOps]: (ctx: FokosDbRouteContext, req: PartitionOps[K]["req"]) => Promise<FokosEnvelope<PartitionOps[K]["res"]>>;
+	[K in keyof PartitionOps]: (ctx: FokosDBRouteContext, req: PartitionOps[K]["req"]) => Promise<FokosEnvelope<PartitionOps[K]["res"]>>;
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -257,7 +257,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	private static readonly IMPORT_PAGES_PER_PASS = 16;
 
 	/** The sharding runtime: identity, routing, repartitions, and the alarm. Every public method is one `dispatch`. */
-	readonly fokos: FokosShardingRuntime<FokosDbPolicy, PartitionOps>;
+	readonly fokos: FokosShardingRuntime<FokosDBPolicy, PartitionOps>;
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#ttl: TtlExpiry;
@@ -277,7 +277,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			config: () => this.fokosTtlConfig(),
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
-		this.fokos = new FokosShardingRuntime<FokosDbPolicy, PartitionOps>({
+		this.fokos = new FokosShardingRuntime<FokosDBPolicy, PartitionOps>({
 			ctx,
 			// Host code: it reads the binding and the location hint from the policy and applies the jurisdiction.
 			stub: (routeCtx, doName) => partitionStubByName(env, routeCtx, doName),
@@ -300,22 +300,22 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	// ═══ the RPC surface: one dispatch per method ════════════════════════════
 
-	async apiPutItem(ctx: FokosDbRouteContext, req: PutItemRpcRequest) {
+	async apiPutItem(ctx: FokosDBRouteContext, req: PutItemRpcRequest) {
 		return await this.#api("apiPutItem", ctx, req);
 	}
-	async apiGetItem(ctx: FokosDbRouteContext, req: GetItemRpcRequest) {
+	async apiGetItem(ctx: FokosDBRouteContext, req: GetItemRpcRequest) {
 		return await this.#api("apiGetItem", ctx, req);
 	}
-	async apiDeleteItem(ctx: FokosDbRouteContext, req: DeleteItemRpcRequest) {
+	async apiDeleteItem(ctx: FokosDBRouteContext, req: DeleteItemRpcRequest) {
 		return await this.#api("apiDeleteItem", ctx, req);
 	}
-	async apiQueryItems(ctx: FokosDbRouteContext, req: QueryItemsRpcRequest) {
+	async apiQueryItems(ctx: FokosDBRouteContext, req: QueryItemsRpcRequest) {
 		return await this.#api("apiQueryItems", ctx, req);
 	}
-	async txPrepare(ctx: FokosDbRouteContext, req: PrepareRequest) {
+	async txPrepare(ctx: FokosDBRouteContext, req: PrepareRequest) {
 		return await this.#api("txPrepare", ctx, req);
 	}
-	async txCommit(ctx: FokosDbRouteContext, req: CommitRequest) {
+	async txCommit(ctx: FokosDBRouteContext, req: CommitRequest) {
 		return await this.#api("txCommit", ctx, req);
 	}
 	/**
@@ -323,21 +323,21 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * The release is by transaction id, so every hop clears itself before it forwards; the keys only
 	 * decide where else the cancel goes.
 	 */
-	async txCancel(ctx: FokosDbRouteContext, req: CancelRequest) {
+	async txCancel(ctx: FokosDBRouteContext, req: CancelRequest) {
 		return await this.#api("txCancel", ctx, req);
 	}
-	async txReadForTransaction(ctx: FokosDbRouteContext, req: ReadForTransactionRequest) {
+	async txReadForTransaction(ctx: FokosDBRouteContext, req: ReadForTransactionRequest) {
 		return await this.#api("txReadForTransaction", ctx, req);
 	}
 	/** The single-partition fast path for `transactGetItems`: one round trip, no coordinator, nothing persisted. */
-	async txReadSnapshot(ctx: FokosDbRouteContext, req: ReadSnapshotRequest) {
+	async txReadSnapshot(ctx: FokosDBRouteContext, req: ReadSnapshotRequest) {
 		return await this.#api("txReadSnapshot", ctx, req);
 	}
 	/** The single-partition fast path for `transactWriteItems`: one storage transaction applies the whole set. */
-	async txExecuteSingleShot(ctx: FokosDbRouteContext, req: SingleShotRequest) {
+	async txExecuteSingleShot(ctx: FokosDBRouteContext, req: SingleShotRequest) {
 		return await this.#api("txExecuteSingleShot", ctx, req);
 	}
-	async debugForceResolveTransaction(ctx: FokosDbRouteContext, req: DebugForceResolveTransactionRequest) {
+	async debugForceResolveTransaction(ctx: FokosDBRouteContext, req: DebugForceResolveTransactionRequest) {
 		return await this.#api("debugForceResolveTransaction", ctx, req);
 	}
 	/**
@@ -346,11 +346,11 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * background pass performs the cutover, the migration and the acknowledgement. Idempotent: a key
 	 * that already has a promotion entry comes back with `queued: false`.
 	 */
-	async debugForcePromoteKey(ctx: FokosDbRouteContext, req: DebugForcePromoteKeyRequest) {
+	async debugForcePromoteKey(ctx: FokosDBRouteContext, req: DebugForcePromoteKeyRequest) {
 		return await this.#api("debugForcePromoteKey", ctx, req);
 	}
 	/** INTERNAL ONLY FOR TESTING. */
-	async status(ctx: FokosDbRouteContext) {
+	async status(ctx: FokosDBRouteContext) {
 		return await this.#api("status", ctx, null);
 	}
 
@@ -405,7 +405,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * partition arms nothing: `fokosPrepareDestroy` disarms the sweep, and a request that arrives
 	 * between the fence and `fokosDestroy` must not start the timer again.
 	 */
-	#api<K extends keyof PartitionOps>(op: K, ctx: FokosDbRouteContext, req: PartitionOps[K]["req"]) {
+	#api<K extends keyof PartitionOps>(op: K, ctx: FokosDBRouteContext, req: PartitionOps[K]["req"]) {
 		if (!this.fokos.isFenced()) {
 			this.#ttl.arm();
 		}
@@ -663,7 +663,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	// ═══ hooks ═══════════════════════════════════════════════════════════════
 
-	private hooks(): FokosShardingHooks<FokosDbPolicy> {
+	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
 			evaluateSplit: ({ identity, policy }) => {
 				const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;

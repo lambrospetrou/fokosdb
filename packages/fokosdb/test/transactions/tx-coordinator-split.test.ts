@@ -8,7 +8,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
-import type { FokosDbRouteContext } from "../../src/shared/partition-context.js";
+import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -37,7 +37,7 @@ function tokenKey(token: string) {
 }
 
 /** Queues a hash split of the coordinator. The coordinator must already hold its identity. */
-async function queueCoordinatorSplit(coordinator: FokosDbRouteContext): Promise<void> {
+async function queueCoordinatorSplit(coordinator: FokosDBRouteContext): Promise<void> {
 	await runInDurableObject(coordinatorStub(coordinator.doName), async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 		const size = vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
 		try {
@@ -49,7 +49,7 @@ async function queueCoordinatorSplit(coordinator: FokosDbRouteContext): Promise<
 	});
 }
 
-async function roleOf(coordinator: FokosDbRouteContext): Promise<string> {
+async function roleOf(coordinator: FokosDBRouteContext): Promise<string> {
 	return await runInDurableObject(
 		coordinatorStub(coordinator.doName),
 		(instance: TransactionCoordinatorDO) => instance.fokos.lifecycle().role,
@@ -60,7 +60,7 @@ async function roleOf(coordinator: FokosDbRouteContext): Promise<string> {
  * Waits until the split of `coordinator` is complete and every child has finished its import. Returns
  * the child that owns `token`.
  */
-async function awaitSplitSettled(coordinator: FokosDbRouteContext, token: string): Promise<FokosPartitionRef> {
+async function awaitSplitSettled(coordinator: FokosDBRouteContext, token: string): Promise<FokosPartitionRef> {
 	const stub = coordinatorStub(coordinator.doName);
 	let owner: FokosPartitionRef | null = null;
 	await vi.waitFor(
