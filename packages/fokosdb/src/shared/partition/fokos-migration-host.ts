@@ -47,6 +47,8 @@ export type FokosDBHostPage =
 
 export type FokosMigrationHostDeps = {
 	store: PartitionStore;
+	/** The log fields of this partition, with its `doName` and `partitionId`, as `TtlExpiry` takes them. */
+	logParams: () => Record<string, unknown>;
 };
 
 export class FokosMigrationHost implements MigrationHost {
@@ -163,9 +165,8 @@ export class FokosMigrationHost implements MigrationHost {
 			pageSize: budget.pageRows,
 			startCursor: cursor,
 		});
-		// Every page of this stream carries the deletion metadata, so a slice with no lock at all still
-		// receives it in one empty page. A promoted key never has a lock — promotion cutover requires a
-		// zero lock count — and still needs the watermark.
+		// Each page of this stream carries the deletion metadata, so a slice with no lock receives it in
+		// one empty page. A promoted key carries the locks that it holds at cutover.
 		const page: FokosDBHostPage = { stream: "pending_tx", pendingTransactions: rows, deletionMetadata: store.getDeletionMetadata() };
 		return { page, nextCursor: nextCursor ? { stream: "pending_tx", cursor: nextCursor } : null };
 	}
@@ -176,6 +177,65 @@ export class FokosMigrationHost implements MigrationHost {
 			store.insertPendingLock(row);
 		}
 		store.mergeDeletionMetadata(page.deletionMetadata);
+		this.#logQuarantinedLocks(page.pendingTransactions);
+	}
+
+	/**
+	 * Logs each quarantined lock that this page brings. The stale scan skips a guarded row, and the
+	 * guard writes its line only on the partition where the quarantine starts. This line gives the
+	 * operator the partition that owns the lock now. The stream pages in `(hk, sk, transaction_id)`
+	 * order, so a transaction that spans pages gets one line for each page.
+	 *
+	 * The log must not fail the page: a throw rolls the page back on each retry and stops the import.
+	 * Thus the method reads the coordinator reference with no validation, and logs text that it cannot
+	 * read as it is.
+	 */
+	#logQuarantinedLocks(rows: readonly PendingTransactionRow[]): void {
+		try {
+			const byTransaction = new Map<string, PendingTransactionRow[]>();
+			for (const row of rows) {
+				if (row.guarded_at === null) {
+					continue;
+				}
+				const group = byTransaction.get(row.transaction_id);
+				if (group) {
+					group.push(row);
+				} else {
+					byTransaction.set(row.transaction_id, [row]);
+				}
+			}
+			if (byTransaction.size === 0) {
+				return;
+			}
+			const logParams = this.deps.logParams();
+			for (const [transactionId, group] of byTransaction) {
+				console.error({
+					...logParams,
+					message: "fokos/partition: imported a quarantined lock",
+					transactionId,
+					...coordinatorFieldsForLog(group[0].coordinator_json),
+					keys: group.map((row) => KeyCodec.pairForLog(row.hk, row.sk)),
+					lockCreatedAt: Math.min(...group.map((row) => row.created_at)),
+					guardedAt: Math.min(...group.map((row) => row.guarded_at ?? Number.POSITIVE_INFINITY)),
+				});
+			}
+		} catch (error) {
+			try {
+				console.error({ message: "fokos/partition: failed to log an imported quarantined lock", error: String(error) });
+			} catch {
+				// The log sink failed. The page must apply all the same.
+			}
+		}
+	}
+}
+
+/** The coordinator of a lock, for a log line only. It validates nothing, and keeps JSON that it cannot read as raw text. */
+function coordinatorFieldsForLog(json: string): { coordinatorDoName: unknown; idempotencyToken: unknown } | { coordinatorRef: string } {
+	try {
+		const ref = JSON.parse(json) as { doName?: unknown; idempotencyToken?: unknown };
+		return { coordinatorDoName: ref.doName, idempotencyToken: ref.idempotencyToken };
+	} catch {
+		return { coordinatorRef: json };
 	}
 }
 

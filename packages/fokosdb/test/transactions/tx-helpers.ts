@@ -64,23 +64,35 @@ export async function writeOutcome(write: Promise<TransactWriteItemsResult>): Pr
 	}
 }
 
+/** The total wait of `writeOutcomeWithClockRetry`. It must stay well below the test timeout of 5 s. */
+const CLOCK_RETRY_BUDGET_MS = 3_000;
+
 /**
  * Sends a transaction write, and sends it again after a cancel with `timestamp_conflict`.
  *
  * On the two-phase path, the coordinator stamps the transaction with its own clock. A partition
  * refuses a stamp that is not above the stamp of the item, or above the last delete of the partition.
  * A write of the same test, or of another test on a shared table, can have a stamp in the same
- * millisecond, and the clock can go back in local workerd/miniflare.
+ * millisecond, and the clock can go back in local workerd/miniflare. Under the load of the full
+ * suite, the clock of one Durable Object can be more than one second behind the clock of another.
  * A cancelled transaction applies nothing, thus a new attempt is safe.
  * A cancel for any other reason returns at once.
+ *
+ * The wait between attempts doubles from 2 ms to at most 250 ms, and the waits stop after
+ * `CLOCK_RETRY_BUDGET_MS` in total. The helper adds up its own waits and does not read the clock,
+ * because the clock is what can go back.
  *
  * A request with a `clientRequestToken` is refused: a replay of that token returns the same cancel.
  */
 export async function writeOutcomeWithClockRetry(db: FokosDB, request: TransactWriteItemsOptions): Promise<WriteOutcome> {
 	expect(request.clientRequestToken, "a replay of a token returns the same cancel").toBeUndefined();
 	let outcome = await writeOutcome(db.transactWriteItems(request));
-	for (let attempt = 1; attempt < 5 && isTimestampConflict(outcome); attempt++) {
-		await new Promise((resolve) => setTimeout(resolve, 2));
+	let waitMs = 2;
+	let waitedMs = 0;
+	while (waitedMs < CLOCK_RETRY_BUDGET_MS && isTimestampConflict(outcome)) {
+		await new Promise((resolve) => setTimeout(resolve, waitMs));
+		waitedMs += waitMs;
+		waitMs = Math.min(waitMs * 2, 250);
 		outcome = await writeOutcome(db.transactWriteItems(request));
 	}
 	return outcome;

@@ -99,7 +99,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			// Idempotent re-prepare: accepted again, no duplicate locks.
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(2);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(2);
 		});
 	});
 
@@ -118,7 +118,7 @@ describe("TransactionParticipant - prepare", () => {
 					conflictingTransactionId: first.transactionId,
 				}),
 			});
-			expect(store.pendingTxCountFor(second.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(second.transactionId).length).toBe(0);
 		});
 	});
 
@@ -142,7 +142,7 @@ describe("TransactionParticipant - prepare", () => {
 				outcome: "rejected",
 				results: aRejection({ code: "condition_failed", hashKey: "hk", sortKey: "sk" }),
 			});
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 		});
 	});
 
@@ -192,7 +192,7 @@ describe("TransactionParticipant - prepare", () => {
 			// The answer stays under the cap, and the dropped images changed no outcome code.
 			expect(sentBytes).toBeLessThanOrEqual(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX);
 			expect(res.results.every((r) => r.outcome === "rejected")).toBe(true);
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 		});
 	});
 
@@ -241,7 +241,7 @@ describe("TransactionParticipant - prepare", () => {
 
 			const request = prepareReq({ items: [{ hashKey: kb("fresh"), sortKey: sk, operation: "update", update: plan, ttlAt: 555 }] });
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(1);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(1);
 			// Nothing is written before commit.
 			expect(store.getItem(kb("fresh"), sk).row).toBeUndefined();
 
@@ -279,7 +279,7 @@ describe("TransactionParticipant - prepare", () => {
 				results: aRejection({ code: "condition_failed", hashKey: "guarded" }),
 			});
 			expect(store.getItem(kb("guarded"), sk).row).toBeUndefined();
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 		});
 	});
 
@@ -299,7 +299,7 @@ describe("TransactionParticipant - prepare", () => {
 				results: aRejection({ code: "update_value_is_bytes", hashKey: KeyCodec.decode(binaryKey) }),
 			});
 			// The rejection took no lock and wrote nothing.
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 			expect(store.getItem(binaryKey, sk).row?.v).toBe(1);
 
 			// The single-shot path answers with the same reason.
@@ -443,7 +443,7 @@ describe("TransactionParticipant - prepare", () => {
 				],
 			});
 			expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
-			participant.cancelLocal(check.transactionId);
+			participant.cancelLocal(check.transactionId, check.items);
 
 			// A content mutation at the same timestamp orders below the committed read, so it fails.
 			const put = prepareReq({
@@ -605,7 +605,7 @@ describe("TransactionParticipant - prepare", () => {
 				outcome: "rejected",
 				results: aRejection({ code: "timestamp_conflict", hashKey: "conflicting" }),
 			});
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 			expect(store.pendingLockFor(kb("fine"), KeyCodec.encodeOptional(undefined))).toBeUndefined();
 		});
 	});
@@ -671,7 +671,7 @@ describe("TransactionParticipant - commit", () => {
 			});
 
 			// All locks for the transaction are gone.
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 
 			// A commit retry finds no locks and applies nothing a second time: every timestamp and
 			// the delete revision stay exactly where the first commit left them.
@@ -691,6 +691,45 @@ describe("TransactionParticipant - commit", () => {
 			expect(store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.put);
 			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toEqual(afterCommit.check);
 			expect(store.getDeletionMetadata()).toEqual(afterCommit.metadata);
+		});
+	});
+
+	it("keeps the copies of a moved key, and asks the owner one time for each hash key", async () => {
+		await withParticipant(({ participant, store }) => {
+			const request = prepareReq({
+				items: [
+					{ hashKey: kb("owned"), sortKey: kb("sk"), operation: "put", data: "v1", kind: "text" },
+					...["a", "b", "c"].map((sk) => ({
+						hashKey: kb("moved"),
+						sortKey: kb(sk),
+						operation: "put" as const,
+						data: "v1",
+						kind: "text" as const,
+					})),
+				],
+			});
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+
+			// A promotion moved the key "moved" away, so its rows here are copies.
+			const asked: string[] = [];
+			const source = new TransactionParticipant({
+				store,
+				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
+				owns: (key) => {
+					asked.push(KeyCodec.pairForLog(key.hashKey, key.sortKey));
+					return KeyCodec.compare(key.hashKey, kb("moved")) !== 0;
+				},
+			});
+			const commit = {
+				transactionId: request.transactionId,
+				transactionTimestamp: request.transactionTimestamp,
+				items: [{ hashKey: kb("owned"), sortKey: kb("sk") }],
+			};
+			expect(source.commitLocal(commit).response).toEqual({ outcome: "committed" });
+
+			expect(asked).toHaveLength(1);
+			expect(store.getItem(kb("owned"), kb("sk")).row).toMatchObject({ data: "v1" });
+			expect(store.listPendingTxKeys(request.transactionId).map((row) => KeyCodec.decode(row.sk))).toEqual(["a", "b", "c"]);
 		});
 	});
 
@@ -831,8 +870,8 @@ describe("TransactionParticipant - cancel", () => {
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
-			participant.cancelLocal(request.transactionId);
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			participant.cancelLocal(request.transactionId, request.items);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 
 			const retry = prepareReq({
 				items: [{ hashKey: kb("a"), sortKey: KeyCodec.encodeOptional(undefined), operation: "put", data: "v2", kind: "text" }],
@@ -852,9 +891,9 @@ describe("TransactionParticipant - cancel", () => {
 			const request = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
-			participant.cancelLocal(request.transactionId);
+			participant.cancelLocal(request.transactionId, request.items);
 
-			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
+			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 			const item = store.getItem(kb("user"), sk);
 			expect(item.row?.v).toBe(1);
 			expect(JSON.parse(item.row?.data as string)).toEqual({ score: 10 });
@@ -970,24 +1009,24 @@ describe("TransactionParticipant - readForTransaction", () => {
 			});
 			expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(false);
-			participant.cancelLocal(check.transactionId);
+			participant.cancelLocal(check.transactionId, check.items);
 
 			// Every content mutation counts as a pending write.
 			const put = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "put", data: "v2", kind: "text" }] });
 			expect(participant.prepareLocal(put)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(put.transactionId);
+			participant.cancelLocal(put.transactionId, put.items);
 
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
 			const update = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "update", update: updatePlan }] });
 			expect(participant.prepareLocal(update)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(update.transactionId);
+			participant.cancelLocal(update.transactionId, update.items);
 
 			const del = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "delete" }] });
 			expect(participant.prepareLocal(del)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(del.transactionId);
+			participant.cancelLocal(del.transactionId, del.items);
 
 			// An operation value the code does not know counts as a pending write, not a read.
 			store.insertPendingLock({

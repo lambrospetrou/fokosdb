@@ -1,8 +1,9 @@
 # RFC — A promotion cuts over with the locks of its key
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-29
-**Status:** Not implemented.
+**Status:** Milestones 1 to 4 are implemented. Section 4.3.1 is decided and implemented with option 1. The
+comments on the two stale queries record the measured cost.
 
 ## Table of contents
 
@@ -142,8 +143,9 @@ state by hand through the migration harness.
    each call, and remove `clearPendingTxGuard` (section 4.2.7). Tests: "Emergency repair" in section 4.2.13.
 4. **Guard removal.** Remove the lock count from `beforeCutover`, and make the runtime changes of section 4.2.11.
    Change the tests that hold a promotion with a lock. Run the transfer tests of milestones 1 and 2 again through
-   a real cutover: a prepare lands during target initialization, the source cuts over, the target imports the
-   lock, and the target commits it.
+   a real cutover: a prepare locks the key, the source cuts over, the target imports the lock, and the target
+   commits it. A lock that arrives during target initialization takes the same prepare path, so the repartition
+   flow test covers it without a real partition.
 
 ## 4. Proposed solution
 
@@ -407,10 +409,10 @@ deadline is the oldest owned row or null.
 Both queries walk `pending_transactions_created_at` from its start and skip the excluded rows. With `n` transfer
 copies older than the oldest owned row, one query reads `n` index entries and probes the subquery index `n` times.
 `n` is the number of locks under keys in `cutover`, not the number of transfer keys, and payload bytes do not
-change it. The scheduler reads the `deadline()` of every runnable job up to three times per pass, on a pass of
-any job. So while copies exist, the deadline query pays this cost up to three times per pass. The stale selection
-pays it once per pass of the stale job. The cost ends when the completion transaction deletes the copies. Section
-4.3.1 holds the open question about the repeated reads.
+change it. The scheduler reads the `deadline()` of every runnable job one time before the steps of a pass and one
+time after them, on a pass of any job (section 4.3.1). So while copies exist, the deadline query pays this cost up
+to two times per pass. The stale selection pays it once per pass of the stale job. The cost ends when the
+completion transaction deletes the copies.
 
 **Log of an imported quarantine.** The stale scan skips a guarded row, and the guard logs only when a lock enters
 quarantine. So a target writes nothing about a guarded row it imports, unless the import logs it. When
@@ -728,7 +730,8 @@ Use the current Workers test infrastructure. No production test hook.
 
 **Migration and coordinator**
 
-- Prepare before cutover and during target initialization. The lock reaches the target.
+- Prepare before cutover through a real partition, and write a lock during target initialization in the
+  repartition flow test. The lock reaches the target.
 - Commit on each side of the cutover. The item applies once and has the correct final version.
 - Cancel before, during, and after the pending stream. No owned lock survives a successful cancel.
 - Hold one split child in import while another serves. The source keeps its split copies until every child
@@ -784,9 +787,14 @@ Use the current Workers test infrastructure. No production test hook.
 
 #### 4.3.1 One deadline read per pass
 
-The scheduler reads the `deadline()` of every runnable job up to three times per pass (section 4.2.6). While
-transfer copies exist, each read of the stale-job deadline steps past every copy older than the oldest owned row.
-This change keeps the repeated reads. The options are:
+**Decision:** option 1. The scheduler builds the list of deadlines one time before the steps of a pass, and takes
+the due jobs and the earliest deadline from that list. It reads the deadlines again after the steps. The measured
+cost of the deadline query with 10,000 transfer copies is 20,003 rows read, so one pass reads up to 40,006 rows
+for it, and not 60,009.
+
+The scheduler read the `deadline()` of every runnable job up to three times per pass (section 4.2.6): two reads
+before the steps gave the same answer. While transfer copies exist, each read of the stale-job deadline steps
+past every copy older than the oldest owned row. The options were:
 
 1. The scheduler reads each deadline once at the start of a pass and once after the steps. A step can change a
    deadline, so the read after the steps stays. This changes the scheduler for every host.
@@ -794,7 +802,8 @@ This change keeps the repeated reads. The options are:
    it. This changes only the FokosDB job, and adds one more place that must track every write path.
 3. Keep the reads and accept the cost that the measurement of section 4.2.13 gives.
 
-The answer changes the scheduler or the stale job, not the transfer rules.
+The answer changes the scheduler or the stale job, not the transfer rules. Option 2 can follow when a real
+promotion shows that the two remaining reads cost too much.
 
 ## 5. Alternative options
 

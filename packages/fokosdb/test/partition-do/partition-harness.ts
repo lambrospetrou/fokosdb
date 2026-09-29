@@ -21,7 +21,8 @@ import {
 	resolveRangePartitionContext,
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
-import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
+import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
+import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { SplitStatusView } from "../../src/server/do-partition.js";
 import { MAX_ITEM_BYTES, validateItemKeys } from "../../src/shared/transaction-limits.js";
 import {
@@ -497,6 +498,53 @@ async function driveUntil(nodes: () => Promise<TestPartition[]>, check: () => Pr
 /** Drives each partition in `drive` until `check` passes. */
 export async function drainUntil(drive: TestPartition[], check: () => Promise<boolean>, label: string): Promise<void> {
 	await driveUntil(async () => drive, check, label);
+}
+
+/**
+ * Stops the stale job of each partition in `holders` from cancelling a test lock. The coordinator of a
+ * test prepare holds no record of the transaction. When a lock is older than `staleTransactionMs`, the
+ * stale job asks the coordinator, and the answer `not_found` cancels the lock. Under load, a repartition
+ * can take longer than that limit. An import keeps the creation time of the lock, thus each partition
+ * that will hold the lock needs the long limit. The limit applies only to these instances. Each
+ * partition must be in the `CONTROLLED_NS` namespace.
+ */
+export async function keepTestLocks(...holders: TestPartition[]): Promise<void> {
+	for (const holder of holders) {
+		await holder.controlled.testConfig({ staleTransactionMs: 10 * 60_000 });
+	}
+}
+
+/**
+ * Gives each hash partition in `partitions` a promotion Bloom filter that holds only one key at its
+ * false positive rate. After the partition learns one promoted key, many other hash keys are false
+ * positives of the filter, and `findKey` finds them in a small number of tries. The partition reads
+ * the setting when it creates its filter, thus call this before it learns its first promotion. The
+ * setting applies only to these instances, and a stored filter keeps its size after a restart. Each
+ * partition must be in the `CONTROLLED_NS` namespace.
+ */
+export async function useSmallBloom(...partitions: TestPartition[]): Promise<void> {
+	for (const partition of partitions) {
+		await partition.controlled.testRuntimeConfig({ promotionBloomExpectedKeys: 1 });
+	}
+}
+
+/** The promotion Bloom filter that `partition` stored. Fails when the partition has none. */
+export async function storedBloom(partition: TestPartition): Promise<PartialRangeTopology> {
+	const snapshot = await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+		new FokosShardingStore(state.storage).getPromotionBloom(),
+	);
+	invariant(snapshot, `${partition.doName}: no promotion Bloom filter; the partition learns one from a read of a promoted key`);
+	return PartialRangeTopology.fromSnapshot(snapshot);
+}
+
+/** The first hash key `${prefix}-${i}` for which `accept` is true. */
+export function findKey(prefix: string, accept: (hashKey: string) => boolean): string {
+	for (let i = 0; i < 100_000; i++) {
+		if (accept(`${prefix}-${i}`)) {
+			return `${prefix}-${i}`;
+		}
+	}
+	throw new Error(`no hash key with the prefix ${prefix} passed the check`);
 }
 
 /** True when each node of the split tree completed its split and its migration. */

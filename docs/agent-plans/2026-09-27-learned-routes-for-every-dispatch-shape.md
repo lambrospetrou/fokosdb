@@ -407,11 +407,15 @@ A skipped partition holds no lock row that only its own release can delete:
   imports them before it serves. `beforeComplete` calls `deleteAllPendingTx` when the split completes. A router
   runs no stale-transaction job, because `canSweepLocally()` is false.
 - The partition that promoted a key has no lock on that key at cutover. `beforeCutover` refuses the cutover
-  while a lock exists.
+  while a lock exists. Superseded: a promotion cuts over with the locks of its key. The source keeps the
+  copies until the completion transaction deletes them, and no release on the source changes a copy.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.8 for changes.
 
 The comment on `txCancel.beforeForward` in `src/server/do-partition.ts` says "Every hop releases by transaction
 id". Milestone 4 changes it: each partition that the cancel reaches releases by transaction ID, and a skipped
-router keeps its rows until its split completes.
+router keeps its rows until its split completes. Superseded: `txCancel` has no `beforeForward`. Its `local`
+handler releases the owned keys of the request only, so a router releases nothing, and a skipped router is
+the same as a router that the cancel reaches. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.5 for changes.
 
 `docs/ideas/2026-09-26-promotion-moves-its-locks.md` proposes that a promotion moves its locks, and that
 `txCancel` releases in its `local` handler. The source then keeps transfer copies until the target acknowledges.

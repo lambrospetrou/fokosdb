@@ -89,10 +89,10 @@ export type FokosRuntimeConfig = Readonly<{
 	importRetryBaseMs: number;
 	importRetryMaxMs: number;
 	/**
-	 * When the `beforeCutover` hook of the host tells a source to wait, the source asks the hook again
-	 * after this time. For example, a host can keep a key in place while a transaction holds a lock on it.
+	 * When the `beforeCutover` hook of the host holds a repartition, the source asks the hook again
+	 * after this time.
 	 */
-	lockRetryMs: number;
+	cutoverHoldRetryMs: number;
 	/** After a split is complete, the source deletes the data that moved, in steps. This is the time between two steps. */
 	cleanupRetryMs: number;
 	/**
@@ -142,7 +142,7 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	sourceRetryMaxMs: 5 * 60_000,
 	importRetryBaseMs: 10_000,
 	importRetryMaxMs: 5 * 60_000,
-	lockRetryMs: 5_000,
+	cutoverHoldRetryMs: 5_000,
 	cleanupRetryMs: 5_000,
 	notCutOverRetryMs: 10_000,
 	nonRetryableRetryMs: 5 * 60_000,
@@ -170,7 +170,7 @@ const MINIMUMS: { [K in keyof FokosRuntimeConfig]?: number } = {
 	sourceRetryMaxMs: 1,
 	importRetryBaseMs: 1,
 	importRetryMaxMs: 1,
-	lockRetryMs: 1,
+	cutoverHoldRetryMs: 1,
 	cleanupRetryMs: 1,
 	notCutOverRetryMs: 1,
 	nonRetryableRetryMs: 1,

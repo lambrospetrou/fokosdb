@@ -564,8 +564,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * the keys of one owner over two sub-requests.
 	 *
 	 * Why. The owner of a key must receive all its keys of this request in one sub-request: `txCommit`
-	 * compares its keys with every lock row of the transaction, and throws `commit_keyset_mismatch` when
-	 * the two sets differ. A Bloom hit is a guess for one hash key H, and it sends the entries of H to
+	 * compares its keys with the lock rows of the transaction that it owns, and throws
+	 * `commit_keyset_mismatch` when the two sets differ. A Bloom hit is a guess for one hash key H, and it sends the entries of H to
 	 * a range partition of H. When the guess is wrong, the range partition refuses, and the entries of
 	 * H fall back to the exact target of H: the partition that owns H without the filter. When another
 	 * hash key also goes to that exact target, the owner then receives two sub-requests.
@@ -956,6 +956,18 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			destroying: this.#store.isDestroying(),
 		};
 	}
+
+	/**
+	 * SQL text that the host puts into its own statements. A host scan that holds no key cannot call
+	 * `owns()` for each row, and the host must not name a table of the runtime. Thus the runtime
+	 * gives the text.
+	 *
+	 * `movedHashKeys()` selects one column, `hash_key`: the keys whose promotion from this partition
+	 * is in `cutover`. A host excludes the rows of these keys with `hk NOT IN (<fragment>)`.
+	 */
+	readonly sql = {
+		movedHashKeys: (): string => this.#store.movedHashKeysSql(),
+	};
 
 	/**
 	 * True when this partition owns the key now. It reads the topology and the route overrides only,
@@ -1886,9 +1898,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				}
 				for (const candidate of s.promotionCandidates ?? []) {
 					await this.#requestPromotion(candidate.hashKey, candidate.data);
-				}
-				if (s.repartitionUnblocked && this.#source.onRepartitionUnblocked()) {
-					this.#scheduler.wake();
 				}
 				for (const job of s.jobs ?? []) {
 					await this.#scheduler.scheduleJob(job.name, job.runAt);

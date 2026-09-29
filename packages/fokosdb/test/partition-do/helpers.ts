@@ -3,6 +3,7 @@
  * split-status narrowing, and log capture. Split, migration, and promotion drivers live in
  * `partition-harness.ts`.
  */
+import { runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";
@@ -12,6 +13,7 @@ import { createTableConfig, type FokosTableIdentity, type FokosTableOptions } fr
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
+import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js";
 import type { FokosEnvelope, FokosPublicRouting } from "../../src/sharding/runtime-types.js";
@@ -92,6 +94,15 @@ export function openedRpc(stub: DurableObjectStub<PartitionDO>): OpenedPartition
  */
 export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): TransactionItem[] {
 	return items.map((item, i) => ({ ...item, opIndex: i }));
+}
+
+/** The keys of the lock rows of one transaction on one partition, as `"<hash>/<sort>"`, in storage order. */
+export async function lockKeys(stub: DurableObjectStub<PartitionDO>, transactionId: string): Promise<string[]> {
+	return await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) =>
+		new PartitionStore(state.storage)
+			.listPendingTxItems(transactionId)
+			.map((row) => `${new TextDecoder().decode(row.hk)}/${new TextDecoder().decode(row.sk)}`),
+	);
 }
 
 export type SplitStartedOrCompleted = Extract<SplitStatusView, { status: "split_started" | "split_completed" }>;

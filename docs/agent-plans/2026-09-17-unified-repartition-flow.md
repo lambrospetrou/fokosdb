@@ -667,7 +667,8 @@ The source transitions are:
 - `init_start`: At most six targets are due. Set `pending` targets to `initializing` before the RPCs.
 - `init_done`: A `fokosInit` call succeeds. Set its target to `initialized` and reset retry fields.
 - `cutover`: Every target is `initialized`. For a promotion, recheck the lock count. Set the state and
-  `cutover_at`. Delete the plan.
+  `cutover_at`. Delete the plan. Superseded: no lock check runs at cutover, and the locks of the key move
+  with it. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.8 for changes.
 - `start_import`: At most six targets are due. Advance retries before calls. Mark each success as `start_notified`.
 - `ack`: A member target acknowledges. Mark it. Set `completed` and `completed_at` after the final acknowledgement.
 - `cleanup`: A repartition is `completed`. Run one bounded cleanup step for its kind and set `cleaned`
@@ -1114,7 +1115,9 @@ in its own transaction.
 
 The source uses these retry delays:
 
-- A lock-blocked promotion: 5 seconds with no backoff.
+- A lock-blocked promotion: 5 seconds with no backoff. Superseded: no lock holds a promotion. The flat
+  interval is now `cutoverHoldRetryMs`, and it applies to any hold of the `beforeCutover` hook. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`
+  section 4.2.11 for changes.
 - A range plan with no boundaries: exponential from 5 seconds to 5 minutes.
 - A target initialization or start failure: exponential from 5 seconds to 5 minutes.
 - An incomplete cleanup: 5 seconds.

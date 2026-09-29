@@ -983,6 +983,10 @@ type FokosOperationBase<Req, Res> = {
 	 * release by transaction id. It must not write partitioned data by key: owner resolution has not
 	 * placed the request yet. Its result is discarded and it cannot change `value`. It can signal: a
 	 * router has no local success, and this is its only channel.
+	 *
+	 * Superseded: FokosDB releases a lock in the `local` handler of `txCancel`, on owned rows only, and
+	 * no FokosDB operation has a `beforeForward`. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`
+	 * section 4.2.5 for changes.
 	 */
 	beforeForward?(req: Req, call: FokosLocalCall): void;
 	/**
@@ -1002,6 +1006,9 @@ type FokosSignals = {
 	 * A condition that `beforeCutover` tests has changed, for example a lock was released. The runtime
 	 * marks every repartition row that `beforeCutover` held back as due now and runs the fast path.
 	 * Without it the held row waits out the flat lock interval.
+	 *
+	 * Superseded: the runtime no longer has this signal. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`
+	 * section 4.2.11 for changes.
 	 */
 	repartitionUnblocked?: boolean;
 	/** Host jobs that must run by a deadline because of this result. */
@@ -1402,7 +1409,7 @@ What changes against the shipped flow:
   held back, then `markPromotionsDueNow` in one `transactionSync` and the fast path. A partition with no held
   row pays the check and nothing else. FokosDB returns it from `txCommit` and `txCancel` after a local success.
   Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: FokosDB no longer signals it, because no
-  promotion waits on a lock. The signal stays in the runtime for other hosts.
+  promotion waits on a lock. The runtime also removes the signal, because no host sends it.
   UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.11 for changes.
 - A synchronous arbitration precheck rejects an ineligible queue attempt without an alarm write. For a possible
   new row, or an unfinished row that still needs work, the runtime moves the fallback alarm earlier before it
@@ -1713,7 +1720,9 @@ The FokosDB host maps current mechanisms as follows:
   reads `keyEstBytes` from its upsert result and `txCommit` reads `promotionCandidates` from `commitLocal`;
   neither value is in the response, which is why the signal comes from inside the handler.
 - The flow's `lockCountForKey` becomes `beforeCutover` with `pendingLockCountForHashKey(hk) === 0`, consulted
-  before the first target initialization and at cutover, as the flow consults it today.
+  before the first target initialization and at cutover, as the flow consults it today. Superseded: FokosDB
+  does not implement `beforeCutover`, and `pendingLockCountForHashKey` is removed. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`
+  section 4.2.11 for changes.
 - The flow's `cleanupStep` becomes `cleanupSourceStep` for `key_promotion`. Splits keep their rows.
 - The flow's `onSplitCompleted` becomes `beforeComplete` for hash and range splits.
 - `computeRangeSplitBoundaries` becomes `computeRangeBoundaries`.

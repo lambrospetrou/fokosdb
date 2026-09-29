@@ -6,12 +6,26 @@
  * no Durable Object of its own beyond storage: the peer adapter in the harness lands each control
  * call on the receiving half directly.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
-import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node, type NodeEnv } from "./repartition-harness.js";
+import {
+	kb,
+	keySizeEstimate,
+	lockCount,
+	lockRow,
+	makeCluster,
+	putItem,
+	putLock,
+	storedBytes,
+	T0,
+	type Node,
+	type NodeEnv,
+} from "./repartition-harness.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
+import { TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
+import { MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
 /**
@@ -229,7 +243,7 @@ describe("Repartition — initialization and cutover", () => {
 		});
 	});
 
-	it("holds a lock-blocked promotion at its target, and moves on once the lock goes", async () => {
+	it("cuts a locked key over with no hold, and keeps the lock as a copy", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
@@ -240,42 +254,43 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
 		await root.enter(async ({ source, sharding }) => {
+			// The lock no longer decides when the key moves: the target is created at the first pass.
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			const targetRow = sharding.listRepartitionTargets("r1", "key_promotion")[0];
-			// The target is never created while a lock is held, and the retry is flat: only a commit or a
-			// cancel can change the answer, so backing off would only slow the promotion down.
-			expect(targetRow.initialization).toBe("pending");
-			expect(targetRow.nextAttemptAt).toBe(T0 + 5_000);
-			expect(targetRow.attempts).toBe(0);
-		});
-
-		await root.enter(async ({ source, store, sharding }) => {
-			store.deletePendingTx("tx-1");
-			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.listRepartitionTargets("r1", "key_promotion")[0].initialization).toBe("initialized");
 		});
-	});
 
-	it("checks the lock count again at cutover, so a lock that appears during init defers it", async () => {
-		const c = makeCluster();
-		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
-			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") }, T0);
-		});
-		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
-		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
-
-		await root.enter(async ({ source, store, sharding }) => {
-			// The lock arrives after the range root exists but before routing moved.
-			putLock(store, "alice", "s1");
+		await root.enter(async ({ source, store, sharding, storage }) => {
+			// A lock that arrives between initialization and cutover also holds nothing back.
+			putLock(store, "alice", "s2", "tx-late");
+			expect(store.earliestUnguardedPendingTxCreatedAt()).toBe(1);
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			expect(sharding.getRepartition("r1")!.state).toBe("planned");
-			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
-
-			store.deletePendingTx("tx-1");
-			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
+			// Both rows stay as copies for the import of the target. From the cutover, the fragment names
+			// the key, so the stale scans of the source skip the copies.
+			expect(lockCount(store, "alice")).toBe(2);
+			expect(movedHashKeys(storage, sharding)).toEqual(["alice"]);
+			expect(store.earliestUnguardedPendingTxCreatedAt()).toBeNull();
+			expect(store.listStalePendingTx(T0, 10)).toEqual([]);
+		});
+
+		// The range root imports the lock that arrived during its initialization, and commits it.
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
+		await drainImport(rangeRoot);
+		await rangeRoot.enter(({ store }) => {
+			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
+			const participant = new TransactionParticipant({ store, maxClockSkewMs: () => 0 });
+			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 2, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
+			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
+			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1")]);
+		});
+
+		// The completion transaction deletes the copies, and the fragment stops naming the key.
+		await sendAck(rangeRoot);
+		await root.enter(({ store, sharding, storage }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			expect(lockCount(store, "alice")).toBe(0);
+			expect(movedHashKeys(storage, sharding)).toEqual([]);
 		});
 	});
 
@@ -396,7 +411,7 @@ describe("Repartition — the migration protocol", () => {
 
 		// The acknowledgements complete the source, which then drops its now-redundant lock copies.
 		for (const child of [childA, childB]) {
-			await child.enter(async ({ target }) => void (await target.sendAck()));
+			await sendAck(child);
 		}
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
 		await root.enter(({ store, sharding }) => {
@@ -650,7 +665,7 @@ describe("Repartition — promotions", () => {
 		await rangeRoot.enter(({ store }) => {
 			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
 		});
-		await rangeRoot.enter(async ({ target }) => void (await target.sendAck()));
+		await sendAck(rangeRoot);
 
 		await root.enter(({ source, store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
@@ -666,6 +681,173 @@ describe("Repartition — promotions", () => {
 			// Only the promoted key went back; every other key this partition owns stayed.
 			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 		});
+	});
+
+	it("carries the locks of the promoted key, and deletes the source copies at completion only", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			for (const sk of ["s1", "s2", "s3"]) {
+				putItem(store, "alice", sk);
+			}
+			putItem(store, "bob", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		// Rows as the source keeps them after the cutover: one transaction with MAX_ITEMS_PER_TX keys
+		// under the moved key, one quarantined transaction, and one lock of a key that stays here.
+		const wide = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => lockRow("alice", `m${String(i).padStart(3, "0")}`, "tx-a"));
+		const guarded = { ...lockRow("alice", "s2", "tx-g"), guarded_at: 77 };
+		await root.enter(({ store }) => {
+			for (const row of [...wide, guarded]) {
+				store.insertPendingLock(row);
+			}
+			putLock(store, "bob", "s1", "tx-b");
+		});
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		await drainImport(rangeRoot);
+		await rangeRoot.enter(({ store }) => {
+			// The payload, the coordinator reference, the timestamps, and the quarantine came across.
+			expect(store.queryPendingTxPage(null, 1_000)).toEqual([...wide, guarded]);
+		});
+		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1));
+
+		const ack = { repartitionId: "r1", target: rangeRoot.ref };
+		await sendAck(rangeRoot);
+		await root.enter(({ store, sharding }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			// The completion transaction deletes all copies of the key at one time, so no call can
+			// send on only a part of one transaction. The lock of the other key stays.
+			expect(lockCount(store, "alice")).toBe(0);
+			expect(lockCount(store, "bob")).toBe(1);
+		});
+
+		// A repeat of the last acknowledgement deletes nothing more and changes no state.
+		await root.peer.fokosMigrationAck(ack);
+		await root.enter(({ store, sharding }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			expect(lockCount(store, "bob")).toBe(1);
+		});
+
+		// The item cleanup takes more than one step. Each step deletes items only.
+		await root.enter(({ source, store, sharding }) => {
+			expect(source.sourceCleanupStep(T0)).toBe("progressed");
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			expect(lockCount(store, "bob")).toBe(1);
+			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
+			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
+			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
+			expect(lockCount(store, "bob")).toBe(1);
+		});
+		// The target keeps its locks.
+		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 1_000)).toHaveLength(MAX_ITEMS_PER_TX + 1));
+	});
+
+	it("names each quarantined lock it imports", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		await root.enter(({ store }) => {
+			store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 });
+			store.insertPendingLock({ ...lockRow("alice", "s2", "tx-g"), guarded_at: 88 });
+			putLock(store, "alice", "s3", "tx-open");
+			store.insertPendingLock({ ...lockRow("alice", "s4", "tx-bad"), coordinator_json: "not-json", guarded_at: 99 });
+		});
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		const lines = await captureErrorLines(async () => await drainImport(rangeRoot));
+
+		const quarantines = lines.filter((line) => line.message === "fokos/partition: imported a quarantined lock");
+		// One line for each transaction, not for each row. The line names the partition that holds the
+		// lock now, and a coordinator reference that it cannot read stays raw text.
+		expect(quarantines).toEqual([
+			expect.objectContaining({
+				transactionId: "tx-g",
+				coordinatorDoName: "tc-1",
+				lockCreatedAt: 1,
+				guardedAt: 77,
+				doName: rangeRoot.doName,
+				keys: [KeyCodec.pairForLog(kb("alice"), kb("s1")), KeyCodec.pairForLog(kb("alice"), kb("s2"))],
+			}),
+			expect.objectContaining({ transactionId: "tx-bad", coordinatorRef: "not-json", doName: rangeRoot.doName }),
+		]);
+		// The open lock came across with the guarded ones.
+		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(4));
+	});
+
+	it("writes one line for each page of a quarantined transaction that spans pages", async () => {
+		const c = makeCluster({ runtimeConfig: { migrationPageRows: 1 } });
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		await root.enter(({ store }) => {
+			store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 });
+			store.insertPendingLock({ ...lockRow("alice", "s2", "tx-g"), guarded_at: 77 });
+		});
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		const lines = await captureErrorLines(async () => await drainImport(rangeRoot));
+
+		const quarantines = lines.filter((line) => line.message === "fokos/partition: imported a quarantined lock");
+		expect(quarantines.map((line) => line.keys)).toEqual([
+			[KeyCodec.pairForLog(kb("alice"), kb("s1"))],
+			[KeyCodec.pairForLog(kb("alice"), kb("s2"))],
+		]);
+	});
+
+	it("names each quarantined lock that a hash child imports, with the name of the child", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		const key = keyForChild(1, c.base.topology.hashSplitN, "q");
+		await root.enter(({ source, store }) => {
+			putItem(store, key, "s1");
+			store.insertPendingLock({ ...lockRow(key, "s1", "tx-g"), guarded_at: 77 });
+			source.queue({ kind: "hash_split" });
+		});
+		await cutOver(root);
+
+		const child = await targetNode(c, root, 1);
+		const lines = await captureErrorLines(async () => await drainImport(child));
+
+		expect(lines.filter((line) => line.message === "fokos/partition: imported a quarantined lock")).toEqual([
+			expect.objectContaining({
+				transactionId: "tx-g",
+				guardedAt: 77,
+				doName: child.doName,
+				keys: [KeyCodec.pairForLog(kb(key), kb("s1"))],
+			}),
+		]);
+	});
+
+	it("imports a page of locks even when the log of its quarantines throws", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		await root.enter(({ store }) => store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 }));
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		// A log that throws would roll the page back on every retry and stop the import for good.
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {
+			throw new Error("log sink is down");
+		});
+		try {
+			await drainImport(rangeRoot);
+		} finally {
+			logged.mockRestore();
+		}
+		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(1));
 	});
 
 	it("hands a finished promotion to the hash child that inherits the key, with no item copy", async () => {
@@ -842,7 +1024,13 @@ function activeRepartitionId(sharding: FokosShardingStore): string | undefined {
  */
 async function drainImport(node: Node): Promise<void> {
 	for (let i = 0; i < 40; i++) {
-		const outcome = await node.enter(async ({ target }) => await target.importOnePage());
+		const outcome = await node.enter(async ({ target }) => {
+			// Under load, the clock of one entry can be behind the clock of an earlier entry. A step that
+			// applies a page sets `nextAttemptAt` to the clock of that step. Thus the next step uses a
+			// time that is not before it, and does not stop as "not due yet".
+			const now = Math.max(Date.now(), target.importRecord()?.nextAttemptAt ?? 0);
+			return await target.importOnePage(now);
+		});
 		if (outcome === "stopped") {
 			throw new Error(`${node.doName}: the import stopped before it completed`);
 		}
@@ -854,6 +1042,34 @@ async function drainImport(node: Node): Promise<void> {
 	if (state !== "imported" && state !== "active") {
 		throw new Error(`${node.doName}: the import did not complete; state is ${state ?? "absent"}`);
 	}
+}
+
+/** Sends the acknowledgement of a target that has imported, at a time that is not before its last step. */
+async function sendAck(node: Node): Promise<void> {
+	await node.enter(async ({ target }) => {
+		const now = Math.max(Date.now(), target.importRecord()?.nextAttemptAt ?? 0);
+		expect(await target.sendAck(now)).toBe("progressed");
+	});
+}
+
+/** The `console.error` lines that `fn` writes. The lines do not reach the console. */
+async function captureErrorLines(fn: () => Promise<void>): Promise<Record<string, unknown>[]> {
+	const lines: Record<string, unknown>[] = [];
+	const logged = vi.spyOn(console, "error").mockImplementation((line: unknown) => void lines.push(line as Record<string, unknown>));
+	try {
+		await fn();
+	} finally {
+		logged.mockRestore();
+	}
+	return lines;
+}
+
+/** The hash keys that the moved-key fragment of the runtime names now, as text. */
+function movedHashKeys(storage: DurableObjectStorage, sharding: FokosShardingStore): string[] {
+	return storage.sql
+		.exec<{ hash_key: ArrayBuffer }>(sharding.movedHashKeysSql())
+		.toArray()
+		.map((row) => new TextDecoder().decode(row.hash_key));
 }
 
 /** The first target of this source's split, as a node. */

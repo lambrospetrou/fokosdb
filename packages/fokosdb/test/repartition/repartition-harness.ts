@@ -27,9 +27,9 @@ import {
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
-import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { PartitionStore, type PendingTransactionRow } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
-import { DEFAULT_RUNTIME_CONFIG } from "../../src/sharding/runtime-config.js";
+import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
 import {
 	RepartitionSource,
@@ -101,6 +101,8 @@ export type ClusterOptions = {
 	rangeSplitN?: number;
 	/** Fixes the table name, so two clusters can be built over one topology. */
 	tableName?: string;
+	/** Runtime settings over the defaults, for example a smaller migration page. */
+	runtimeConfig?: FokosRuntimeConfigOverrides;
 };
 
 export function makeCluster(opts: ClusterOptions = {}): Cluster {
@@ -117,6 +119,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 		rangeSplitConditions: { maxSizeMb: 500 },
 	});
 	const base = new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy).allRoots()[0];
+	const runtimeConfig = resolveRuntimeConfig(opts.runtimeConfig);
 
 	const nodes = new Map<string, Node>();
 	const scheduled = new Map<string, number>();
@@ -161,7 +164,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			await runInDurableObject(testPartitionStub(stubName), async (_i: PartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
-				const store = new PartitionStore(storage);
+				const store = new PartitionStore(storage, () => sharding.movedHashKeysSql());
 				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
@@ -220,13 +223,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
 			hooks: {
 				evaluateSplit: () => false,
-				migration: new FokosMigrationHost({ store }),
+				migration: new FokosMigrationHost({ store, logParams: () => ({ doName, partitionId: ctx.partitionId }) }),
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
-				beforeCutover: (plan) => plan.kind !== "key_promotion" || store.pendingLockCountForHashKey(promotedKeyOf(plan)) === 0,
 				beforeComplete: (plan) => {
-					if (plan.kind !== "key_promotion") {
-						store.deleteAllPendingTx();
+					if (plan.kind === "key_promotion") {
+						store.deletePendingTxForHashKey(promotedKeyOf(plan));
+						return;
 					}
+					store.deleteAllPendingTx();
 				},
 				cleanupSourceStep: (plan) => {
 					if (plan.kind !== "key_promotion") {
@@ -234,7 +238,6 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					}
 					const hashKey = promotedKeyOf(plan);
 					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
-					store.deletePendingTxForHashKey(hashKey);
 					if (store.hasItemsForHashKey(hashKey)) {
 						return false;
 					}
@@ -253,7 +256,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				return () => {};
 			},
 			scheduleWork: () => scheduled.set(doName, (scheduled.get(doName) ?? 0) + 1),
-			config: () => DEFAULT_RUNTIME_CONFIG,
+			config: () => runtimeConfig,
 			ensureAlarmSet: async (targetMs) => {
 				alarms.set(doName, [...(alarms.get(doName) ?? []), targetMs]);
 			},
@@ -279,9 +282,14 @@ export function putItem(store: PartitionStore, hk: string, sk: string, data = `d
 	store.upsertItem({ hk: kb(hk), sk: kb(sk), data, kind: "text", ttlAt: null, txOrderTs: 1 });
 }
 
-/** Writes one pending lock, which is what blocks a promotion and what a split target must inherit. */
+/** Writes one pending lock. The lock moves with its key to the target that owns the key. */
 export function putLock(store: PartitionStore, hk: string, sk: string, transactionId = "tx-1"): void {
-	store.insertPendingLock({
+	store.insertPendingLock(lockRow(hk, sk, transactionId));
+}
+
+/** One unguarded lock row, for a test that writes it itself or compares an imported copy with it. */
+export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTransactionRow {
+	return {
 		hk: kb(hk),
 		sk: kb(sk),
 		transaction_id: transactionId,
@@ -294,7 +302,12 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 		coordinator_json: '{"doName":"tc-1"}',
 		created_at: 1,
 		guarded_at: null,
-	});
+	};
+}
+
+/** The number of lock rows under one hash key in a node's store. */
+export function lockCount(store: PartitionStore, hk: string): number {
+	return store.queryPendingTxPage(null, 1_000_000).filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
 }
 
 /** The running size estimate of one hash key, which the import maintains page by page. */

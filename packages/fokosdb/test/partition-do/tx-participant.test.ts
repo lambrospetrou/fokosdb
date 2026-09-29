@@ -1,6 +1,8 @@
 import { runInDurableObject } from "cloudflare:test";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
+import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
+import * as doStubs from "../../src/shared/do-stubs.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -303,32 +305,43 @@ describe("PartitionDO — two-phase commit queues splits", () => {
 		const transactionId = crypto.randomUUID();
 		const transactionTimestamp = Date.now();
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
-		const items = withOpIndex([
-			{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
-		]);
-		expect(
-			await rpc.txPrepare(ctx, {
-				transactionId,
-				transactionTimestamp,
-				coordinator: testCoordinatorRef(),
-				items,
-			}),
-		).toEqual({ outcome: "accepted" });
+		// The coordinator of this test holds no record of the transaction. Under load, the split can
+		// take longer than `staleTransactionMs`. The stale job then asks the coordinator, and the answer
+		// `not_found` cancels the lock before the commit below. The coordinator answers `driving`: it
+		// holds the transaction and completes it, so the stale job keeps the lock.
+		const coordinator = vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+			recoverTransactionForParticipant: async () => ({ state: "driving" as const }),
+		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
+		try {
+			const items = withOpIndex([
+				{ hashKey: kb("split-ttl-put"), sortKey: kb("sk"), operation: "put" as const, data: "value", kind: "text" as const, ttlAt },
+			]);
+			expect(
+				await rpc.txPrepare(ctx, {
+					transactionId,
+					transactionTimestamp,
+					coordinator: testCoordinatorRef(),
+					items,
+				}),
+			).toEqual({ outcome: "accepted" });
 
-		await partition.splitHash();
-		expect(
-			await rpc.txCommit(ctx, {
-				transactionId,
-				transactionTimestamp,
-				// Keys only: the split parent routes them to the children, which apply from their own
-				// pending_transactions rows.
-				items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })),
-			}),
-		).toEqual({ outcome: "committed" });
-		expect(await rpc.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
-			found: true,
-			item: { data: "value", ttlAt },
-		});
+			await partition.splitHash();
+			expect(
+				await rpc.txCommit(ctx, {
+					transactionId,
+					transactionTimestamp,
+					// Keys only: the split parent routes them to the children, which apply from their own
+					// pending_transactions rows.
+					items: items.map(({ hashKey, sortKey }) => ({ hashKey, sortKey })),
+				}),
+			).toEqual({ outcome: "committed" });
+			expect(await rpc.apiGetItem(ctx, { hashKey: items[0].hashKey, sortKey: items[0].sortKey })).toMatchObject({
+				found: true,
+				item: { data: "value", ttlAt },
+			});
+		} finally {
+			coordinator.mockRestore();
+		}
 	});
 
 	it("queues a split once committed transactions push the partition over the threshold", async () => {

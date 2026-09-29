@@ -10,8 +10,8 @@ const PACKAGE_DIR = join(import.meta.dirname, "../packages/fokosdb");
 // Files that still have a prototype spy. Each entry is work to do: move the spy to a test control on a
 // test-only subclass, then remove the entry. The check fails when an entry has no spy.
 const PROTOTYPE_SPY_EXCEPTIONS = {
-	"test/partition-do/promotion.test.ts":
-		"PartialRangeTopology is private to the runtime, thus no subclass can reach it. The spy is in a sequential top-level describe.",
+	//"test/partition-do/promotion.test.ts":
+	//	"PartialRangeTopology is private to the runtime, thus no subclass can reach it. The spy is in a sequential top-level describe.",
 };
 
 const TIMER_MARKER = "guard: allow-timer";

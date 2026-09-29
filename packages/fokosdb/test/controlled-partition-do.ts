@@ -14,7 +14,12 @@ import { PartitionDO } from "../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../src/shared/partition-context.js";
 import type { FokosRuntimeConfigOverrides } from "../src/sharding/runtime-config.js";
 import type { PartitionDOConfigOverrides } from "../src/server/host-config.js";
-import type { FokosInitRequest, FokosMigrationPage, FokosMigrationPullRequest } from "../src/sharding/repartition-types.js";
+import type {
+	FokosInitRequest,
+	FokosMigrationAckRequest,
+	FokosMigrationPage,
+	FokosMigrationPullRequest,
+} from "../src/sharding/repartition-types.js";
 
 export type MigrationStream = "overrides" | "items" | "pending_tx";
 
@@ -61,6 +66,7 @@ export class ControlledPartitionDO extends PartitionDO {
 	#pullStats: PullStats = { calls: 0, heldTargets: [] };
 	#initGate: Gate | null = null;
 	#initCalls = 0;
+	#refuseAcks = false;
 	#txCalls: { [Op in TxOp]: TxRequest<Op>[] } = {
 		txReadSnapshot: [],
 		txReadForTransaction: [],
@@ -155,6 +161,13 @@ export class ControlledPartitionDO extends PartitionDO {
 		return page ?? (await super.fokosMigrationPull(req));
 	}
 
+	override async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {
+		if (this.#refuseAcks) {
+			throw new Error("the test refuses the acknowledgement");
+		}
+		return await super.fokosMigrationAck(req);
+	}
+
 	override async fokosInit(req: FokosInitRequest): Promise<void> {
 		await super.fokosInit(req);
 		this.#initCalls++;
@@ -176,6 +189,14 @@ export class ControlledPartitionDO extends PartitionDO {
 
 	async testPullStats(): Promise<PullStats> {
 		return this.#pullStats;
+	}
+
+	/**
+	 * Refuses each acknowledgement that a target sends to this source while `refuse` is true. A
+	 * target then stays imported, and the repartition stays in `cutover`.
+	 */
+	async testRefuseAcks(refuse: boolean): Promise<void> {
+		this.#refuseAcks = refuse;
 	}
 
 	/** Holds each `fokosInit` on this partition after it applies, until `testReleaseInit`. */

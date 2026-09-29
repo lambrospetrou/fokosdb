@@ -189,6 +189,9 @@ export type StalePendingTx = Pick<PendingTransactionRow, "transaction_id" | "coo
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
+/** One key of a lock row, as the transaction paths hold it. */
+export type PendingTxKey = { hashKey: KeyBytes; sortKey: KeyBytes };
+
 export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
@@ -488,10 +491,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//
 		// pending_transactions_transaction_id exists because `transaction_id` is the THIRD primary key
 		// column and so cannot be seeked on its own. Every whole-transaction operation filters by it —
-		// pendingTxCountFor, listPendingTxKeys, listPendingTxItems, deletePendingTx. Also, deletePendingTx
-		// and listPendingTxKeys run on every commit and abort, so without this index the cost of
-		// committing ONE transaction is O(all pending rows in the partition). Measured over 20k pending
-		// rows: 147 page reads drop to 3, and listPendingTxItems drops from 2859 to 8.
+		// listPendingTxKeys and listPendingTxItems. Also, listPendingTxKeys runs on every commit, so
+		// without this index the cost of committing ONE transaction is O(all pending rows in the
+		// partition). Measured over 20k pending rows: 147 page reads drop to 3, and listPendingTxItems
+		// drops from 2859 to 8. A per-key statement —
+		// guardPendingTx, deletePendingTxKeys — seeks the primary key instead.
 		//
 		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid table. A rowid table
 		// appends only the rowid to an index entry, so a key of `transaction_id` alone would send
@@ -542,16 +546,33 @@ const sqlMigrations: SQLSchemaMigration[] = [
 // The store
 // ---------------------------------------------------------------------------
 
+/** The moved-key fragment of a store that no sharding runtime answers for: an empty set of keys. */
+const NO_MOVED_HASH_KEYS = `SELECT NULL WHERE 0`;
+
 export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
+	#movedHashKeys: () => string;
 
-	constructor(storage: DurableObjectStorage) {
+	/**
+	 * `movedHashKeys` returns the SQL fragment of the hash keys that this partition promoted away and
+	 * that have copies here. The stale scans exclude the rows of these keys, because the range root
+	 * owns them now. The copies stay until the completion of the promotion deletes them. The store
+	 * calls the callback when it runs a statement, because the host creates the store before the
+	 * runtime that answers it. A store with no runtime holds no promotion, so the default names no key.
+	 */
+	constructor(storage: DurableObjectStorage, movedHashKeys: () => string = () => NO_MOVED_HASH_KEYS) {
 		this.#storage = storage;
+		this.#movedHashKeys = movedHashKeys;
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
 		});
+	}
+
+	/** `hk NOT IN (...)`: the rows of the keys that this partition owns, without the copies of a moved key. */
+	#ownedRows(): string {
+		return `hk NOT IN (${this.#movedHashKeys()})`;
 	}
 
 	runMigrations(): void {
@@ -863,9 +884,9 @@ export class PartitionStore {
 	 * Deletes one bounded chunk of expired, unlocked items and updates all deletion bookkeeping in the
 	 * same storage transaction. The victim scan uses only metadata columns and never reads item data.
 	 *
-	 * The sweep tests no ownership per row. An expired row of a key that a promotion is moving is
-	 * either still owned here, or a copy that the promotion cleanup reclaims in any case, so deleting
-	 * it early changes nothing.
+	 * The sweep does not test the owner of each row. An expired row of a key that a promotion moves is
+	 * an owned row or a copy. The promotion cleanup deletes a copy in all cases, so an early delete
+	 * changes no result. A lock row, owned or a copy, keeps its item.
 	 */
 	deleteExpiredItems(nowSeconds: number, limit: number): { deletedRows: number; deletedBytes: number } {
 		return this.transactionSync(() => {
@@ -1435,12 +1456,6 @@ export class PartitionStore {
 		};
 	}
 
-	pendingTxCountFor(transactionId: string): number {
-		return one(
-			this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) as n FROM pending_transactions WHERE transaction_id = ?`, transactionId),
-		).n;
-	}
-
 	/** Does this partition hold any pending lock? */
 	hasAnyPendingTx(): boolean {
 		return this.#storage.sql.exec(`SELECT 1 FROM pending_transactions LIMIT 1`).toArray().length > 0;
@@ -1452,16 +1467,26 @@ export class PartitionStore {
 	 *
 	 * The query walks `pending_transactions_created_at` from its start and stops at the first unguarded
 	 * row, so it costs one seek in the common case where the oldest lock is not guarded.
+	 *
+	 * It skips the copies of a moved key, because this partition cannot recover them. Without that
+	 * clause the oldest copy keeps the deadline in the past for the whole import. The scheduler then
+	 * sets the alarm in the past, and the pass repeats until the copies go.
+	 *
+	 * The clause has a cost while copies exist. The query steps past each copy that is older than the
+	 * oldest owned row, and SQLite counts one read for the index entry and one read for the probe of
+	 * the subquery. Measured with 10,000 such copies and one owned row behind them: 20,003 rows read.
+	 * The scheduler reads this deadline one time before the steps of a pass and one time after them,
+	 * so one pass can read 40,006 rows here. The cost stops when the completion transaction deletes the copies. With no promotion
+	 * in `cutover`, the query reads 2 rows, as before the clause.
 	 */
 	earliestUnguardedPendingTxCreatedAt(): number | null {
 		const rows = this.#storage.sql
-			.exec<{ created_at: number }>(`SELECT created_at FROM pending_transactions WHERE guarded_at IS NULL ORDER BY created_at LIMIT 1`)
+			.exec<{ created_at: number }>(
+				`SELECT created_at FROM pending_transactions
+				  WHERE guarded_at IS NULL AND ${this.#ownedRows()} ORDER BY created_at LIMIT 1`,
+			)
 			.toArray();
 		return rows[0]?.created_at ?? null;
-	}
-
-	pendingLockCountForHashKey(hk: KeyBytes): number {
-		return one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions WHERE hk = ?`, hk)).n;
 	}
 
 	listPendingTxKeys(transactionId: string): { hk: KeyBytes; sk: KeyBytes }[] {
@@ -1556,37 +1581,70 @@ export class PartitionStore {
 	 * `GROUP BY transaction_id ... HAVING MIN(created_at) < ?` walks the `transaction_id` index, which
 	 * cannot use `created_at` at all: 10,000 rows read in the same case, and the whole table in the
 	 * common case where few rows are stale.
+	 *
+	 * The scan skips the copies of a moved key, because their new owner recovers them. The clause
+	 * applies to each row, so the scan still selects a transaction that has one owned row and one
+	 * copy. The cost is the same as on `earliestUnguardedPendingTxCreatedAt`: two rows read for each
+	 * copy that the scan steps past. Measured with 10,000 such copies and one owned stale row: 20,003
+	 * rows read, one time in each pass of the stale job.
 	 */
 	listStalePendingTx(staleBeforeTs: number, limit: number): StalePendingTx[] {
 		return this.#storage.sql
 			.exec<StalePendingTx>(
 				`SELECT DISTINCT transaction_id, coordinator_json
-                     FROM pending_transactions WHERE created_at < ? AND guarded_at IS NULL LIMIT ?`,
+                     FROM pending_transactions
+                     WHERE created_at < ? AND guarded_at IS NULL AND ${this.#ownedRows()} LIMIT ?`,
 				staleBeforeTs,
 				limit,
 			)
 			.toArray();
 	}
 
-	guardPendingTx(transactionId: string, guardedAt: number): boolean {
-		return (
-			this.#storage.sql.exec(
-				`UPDATE pending_transactions SET guarded_at = ? WHERE transaction_id = ? AND guarded_at IS NULL`,
+	/**
+	 * Quarantines the rows of one transaction under `keys`, and answers whether it changed a row. The
+	 * caller owns these keys. A copy of a key that a promotion moved away keeps its guard state, and
+	 * the migration carries that state to the new owner, which makes the decision.
+	 *
+	 * The method runs one statement per key, by the primary key. A transaction can hold up to
+	 * MAX_ITEMS_PER_TX (100) keys here, and one statement binds at most 100 parameters.
+	 */
+	guardPendingTx(transactionId: string, guardedAt: number, keys: readonly PendingTxKey[]): boolean {
+		let written = 0;
+		for (const key of keys) {
+			written += this.#storage.sql.exec(
+				`UPDATE pending_transactions SET guarded_at = ?
+				  WHERE hk = ? AND sk = ? AND transaction_id = ? AND guarded_at IS NULL`,
 				guardedAt,
+				key.hashKey,
+				key.sortKey,
 				transactionId,
-			).rowsWritten > 0
-		);
+			).rowsWritten;
+		}
+		return written > 0;
 	}
 
-	clearPendingTxGuard(transactionId: string): void {
-		this.#storage.sql.exec(`UPDATE pending_transactions SET guarded_at = NULL WHERE transaction_id = ?`, transactionId);
+	/**
+	 * Releases the locks of one transaction under `keys`, one statement per key for the reason on
+	 * guardPendingTx.
+	 *
+	 * Do not delete by transaction id alone. That delete also removes the copies of a key that a
+	 * promotion moved away, and the source must keep them until the new owner acknowledges its import.
+	 */
+	deletePendingTxKeys(transactionId: string, keys: readonly PendingTxKey[]): void {
+		for (const key of keys) {
+			this.#storage.sql.exec(
+				`DELETE FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ?`,
+				key.hashKey,
+				key.sortKey,
+				transactionId,
+			);
+		}
 	}
 
-	deletePendingTx(transactionId: string): void {
-		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, transactionId);
-	}
-
-	/** Promotion GC: a fully-promoted key can have no live locks here anymore. */
+	/**
+	 * Promotion completion: the target holds every lock of the key, so the copies here are not
+	 * necessary. One statement deletes them all, so a transaction never keeps only a part of its copies.
+	 */
 	deletePendingTxForHashKey(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hk);
 	}

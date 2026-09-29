@@ -52,7 +52,7 @@ An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Arr
 - `rootTreesN` root partitions exist at startup, and a hash of the hash key selects one. A partition ID is opaque: read it only through `PartitionIdHelper`.
 - `FokosShardingClient` picks the root partition of a hash key on the caller side, sends the operation, and retries only by the retry policy of the caller. `walk` reads the tree and changes nothing; `destroy` fences and deletes every partition. Inside a DO the runtime resolves the owner of every key (`resolveOwner`, `owns`), plans the range frontier (`rangeVisits`), and forwards (`forward`, `forwardRangeVisit`). The host never makes a stub to a peer of its own class.
 - **Hash split** — a partition past `hashSplitConditions.maxSizeMb` queues a split, creates `hashSplitN` children, becomes a router, and the children import their share in the background. Its runtime states are `queued`, `planned`, `cutover` and `completed`; `status` reports them as `split_queued`, `split_started` and `split_completed`.
-- **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * promotionFraction` (a setting of `PartitionDO.fokosConfig()`) moves into a range tree of its own, which then splits by sort key. A promotion candidate is signalled before a split, because an unfinished promotion blocks the split behind it.
+- **Promotion** — one hash key past `hashSplitConditions.maxSizeMb * promotionFraction` (a setting of `PartitionDO.fokosConfig()`) moves into a range tree of its own, which then splits by sort key. A promotion candidate is signalled before a split, because an unfinished promotion blocks the split behind it. A lock on the key does not hold the promotion: the lock moves with the key.
 - **`hashSplitN` and `rootTreesN` must never change after initialization.** A change breaks routing and loses data. `rangeSplitN` can change: it applies only to the range splits that start after the change.
 - A partition refuses a write above 1.1 times its cap, and only a write that applies can queue the split that brings it back under.
 
@@ -98,7 +98,9 @@ Stale-transaction recovery is the host job `stale_tx_recovery` in `hooks().jobs`
 
 A `not_found` result cancels an owned lock that is no older than `IDEMPOTENCY_WINDOW_MS`. It quarantines an older owned lock: set `guarded_at`, log the lock-age guard error once, and wait for `debugForceResolveTransaction`. A guarded transaction must stay out of the stale scan and out of its alarm scheduling.
 
-Apply a terminal outcome through `this.fokos.dispatch("txCommit" | "txCancel", this.fokos.routeContext(), ...)`, never through inline SQL and never by calling the participant directly. `dispatch` resolves the owner of every key again, so a key that moved to a child since the lock was written is applied there. `debugForceResolveTransaction` follows the same rule.
+Apply a terminal outcome through `this.fokos.dispatch("txCommit" | "txCancel", this.fokos.routeContext(), ...)`, never through inline SQL and never by calling the participant directly. Recovery reads the rows and their owners again after the coordinator call, and applies the outcome to the rows that this partition owns now. `debugForceResolveTransaction` sends every row it holds through `dispatch`, so the current owner of each key applies the outcome, and it changes only the owned rows here.
+
+A promotion moves the locks of its key: the `pending_tx` stream copies them to the range root, and the source keeps the copies until the completion transaction deletes them. A split router keeps its copies in the same way. No local decision applies to a copy. `commitLocal`, the cancel release, and the quarantine change owned rows only, one statement per key. The two stale queries exclude the copies with `fokos.sql.movedHashKeys()`. Never release the locks of a transaction by its transaction id alone: that delete also removes the copies.
 
 ## Testing
 

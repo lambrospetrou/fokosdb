@@ -125,11 +125,11 @@ export type CommitResponse = { outcome: "committed" };
 export type CancelRequest = {
 	transactionId: TransactionId;
 	/**
-	 * The keys this transaction locked, used ONLY to route the cancel to the partitions that can hold
-	 * a lock — the release itself is by transaction id, so every node the cancel passes through is
-	 * cleared whether or not it owns one of these keys.
+	 * The keys this transaction locked. They route the cancel to the partitions that can hold a lock,
+	 * and each of those partitions releases the rows of the keys it owns: a node that owns none of
+	 * these keys holds only the copies of a key that moved, and their new owner releases those.
 	 *
-	 * An empty list is legal and means "release locally, do not fan out". Correctness does not depend
+	 * An empty list is legal and means "release nothing, do not fan out". Correctness does not depend
 	 * on this list: a lock is always released eventually by the node holding it, via the stale-tx
 	 * recovery alarm. The keys only make that happen in milliseconds instead of `staleTransactionMs`, which
 	 * matters because a held lock makes non-transactional writes to that key throw.
@@ -144,7 +144,12 @@ export type DebugForceResolveTransactionRequest = {
 	outcome: "commit" | "cancel";
 };
 
-export type DebugForceResolveTransactionResponse = CommitResponse | CancelResponse;
+export type DebugForceResolveTransactionResponse = (CommitResponse | CancelResponse) & {
+	/** Pending rows of this transaction that this partition owned and resolved in this call. */
+	resolvedLocally: number;
+	/** Keys of this transaction that this partition sent to their current owners. Not the rows those owners resolved. */
+	forwarded: number;
+};
 
 // ─── PartitionDO — ReadForTransaction ─────────────────────────────────────────
 

@@ -171,6 +171,10 @@ function fromSqlKey(value: ArrayBuffer | Uint8Array): KeyBytes {
 const REPARTITION_SELECT = `SELECT r.id, r.seq, r.kind, r.state, r.queued_at, r.cutover_at, r.completed_at,
 	r.attempts, r.next_attempt_at, r.hash_key FROM fokos_repartitions r`;
 
+/** The fragment that `movedHashKeysSql` returns. The text does not change, so a host statement keeps one text. */
+const MOVED_HASH_KEYS_SQL = `SELECT hash_key FROM fokos_repartitions
+	WHERE kind = 'key_promotion' AND state = 'cutover' AND hash_key IS NOT NULL`;
+
 const TARGET_SELECT = `SELECT repartition_id, target_index, initialization, start_notified, acknowledged, attempts, next_attempt_at,
 	slice_child_idx, partition_id, do_name, slice_hash_key, slice_start, slice_end FROM fokos_repartition_targets`;
 
@@ -553,6 +557,23 @@ export class FokosShardingStore {
 		return row && toRepartitionRow(row);
 	}
 
+	/**
+	 * The text of a `SELECT` of one column, `hash_key`: the hash keys whose promotion from this
+	 * partition is in `cutover`. A host puts the text into its own statement as
+	 * `hk NOT IN (<fragment>)`, so the host code names no `fokos_` table.
+	 *
+	 * A key is in the result for the full time of its transfer. The cutover gives the authority over
+	 * the key to the range root, and the transaction that writes `completed` deletes the copies of
+	 * the key.
+	 *
+	 * `hash_key` can be NULL. One NULL in the result of a `NOT IN` subquery makes the predicate NULL
+	 * for each row, so the fragment excludes NULL itself. The text binds no parameter, so the host
+	 * statement keeps one text and the statement cache holds it.
+	 */
+	movedHashKeysSql(): string {
+		return MOVED_HASH_KEYS_SQL;
+	}
+
 	/** True while any key promotion has not reached `completed`. It blocks a hash split. */
 	hasUnfinishedPromotion(): boolean {
 		return (
@@ -595,26 +616,6 @@ export class FokosShardingStore {
 			        ?2)
 			  WHERE id = ?1`,
 			id,
-			now,
-		);
-	}
-
-	/**
-	 * Makes every unfinished promotion due now, with every target of one that still needs a call.
-	 *
-	 * A promotion that cannot move a locked key parks itself 5 seconds out. The release of that lock is
-	 * the event it waits for, so the caller brings the deadline forward. The retry interval must not
-	 * decide how long the key stays where it is.
-	 */
-	markPromotionsDueNow(now: number): void {
-		this.#storage.sql.exec(
-			`UPDATE fokos_repartitions SET next_attempt_at = ?1 WHERE kind = 'key_promotion' AND state IN ('queued', 'planned')`,
-			now,
-		);
-		this.#storage.sql.exec(
-			`UPDATE fokos_repartition_targets SET next_attempt_at = ?1
-			  WHERE initialization != 'initialized'
-			    AND repartition_id IN (SELECT id FROM fokos_repartitions WHERE kind = 'key_promotion' AND state IN ('queued', 'planned'))`,
 			now,
 		);
 	}

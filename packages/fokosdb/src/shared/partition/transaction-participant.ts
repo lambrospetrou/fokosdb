@@ -60,6 +60,26 @@ export function parseCoordinatorRef(json: string, transactionId: string): Coordi
 	return ref as CoordinatorRef;
 }
 
+/**
+ * Wraps `owns` so that it runs one time for each hash key of the rows it tests. On a partition that
+ * holds lock rows of a hash key, all sort keys of that hash key have the same owner: a promotion and a
+ * hash split move a full hash key, and a range split moves all keys of the source.
+ */
+export function ownsByHashKey(
+	owns: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean,
+): (row: { hk: KeyBytes; sk: KeyBytes }) => boolean {
+	const answers = new Map<bigint, boolean>();
+	return (row) => {
+		const id = KeyCodec.mapKey(row.hk);
+		let owned = answers.get(id);
+		if (owned === undefined) {
+			owned = owns({ hashKey: row.hk, sortKey: row.sk });
+			answers.set(id, owned);
+		}
+		return owned;
+	};
+}
+
 // A pending check cannot change the item, so a transactional read may serialize on either side of it.
 // Allowlist the read-only operations: an operation the code does not know counts as a pending write.
 const READ_ONLY_PENDING_OPERATIONS: ReadonlySet<string> = new Set(["check"]);
@@ -89,6 +109,12 @@ export type TransactionParticipantDeps = {
 	 * defaults to txOrderTimestampNow.
 	 */
 	txOrderTimestamp?: () => TransactionTimestamp;
+	/**
+	 * True when this partition owns the key now. A lock row of a key that a promotion moved away is a
+	 * copy. The new owner resolves it, and no local decision applies to it. A participant with no
+	 * routing holds no copy, so the default answers true.
+	 */
+	owns?: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 };
 
 /**
@@ -116,12 +142,14 @@ export class TransactionParticipant {
 	#now: () => number;
 	#maxClockSkewMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
+	#owns: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
 		this.#maxClockSkewMs = deps.maxClockSkewMs;
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
+		this.#owns = deps.owns ?? (() => true);
 	}
 
 	/**
@@ -343,27 +371,41 @@ export class TransactionParticipant {
 		});
 	}
 
+	/**
+	 * Applies the part of a commit that this partition owns. Each decision uses the owned rows of the
+	 * transaction: whether local work remains, whether the request matches, and which rows to apply
+	 * and release. A row of a key that a promotion moved away is a copy. The new owner resolves it,
+	 * and the completion of the promotion deletes it here.
+	 */
 	commitLocal(request: CommitRequest): CommitLocalResult {
-		const pendingCount = this.#store.pendingTxCountFor(request.transactionId);
-
-		if (pendingCount === 0) {
-			return { response: { outcome: "committed" }, promotionCandidates: [] };
-		}
-
 		const promotionCandidates: PromotionCandidate[] = [];
 
 		this.#store.transactionSync(() => {
-			const pendingRows = this.#store.listPendingTxKeys(request.transactionId);
-			const pendingKeySet = new Set(pendingRows.map((r) => KeyCodec.pairKey(r.hk, r.sk)));
 			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
-			if (pendingKeySet.size !== requestKeySet.size) {
+			// Each key of the request is owned: the runtime resolved it to this partition in this
+			// synchronous block. A row outside the request is owned only when `owns()` says so. On the
+			// usual path no row is outside the request, and the method does not call `owns()`.
+			const ownsRow = ownsByHashKey(this.#owns);
+			const ownedKeySet = new Set<ReturnType<typeof KeyCodec.pairKey>>();
+			for (const row of this.#store.listPendingTxKeys(request.transactionId)) {
+				const key = KeyCodec.pairKey(row.hk, row.sk);
+				if (requestKeySet.has(key) || ownsRow(row)) {
+					ownedKeySet.add(key);
+				}
+			}
+			// No owned row remains: the rows are gone, or only copies remain. This partition has no
+			// local work, and the answer is the idempotent success.
+			if (ownedKeySet.size === 0) {
+				return;
+			}
+			if (ownedKeySet.size !== requestKeySet.size) {
 				throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 					message: "pending_transactions and the commit request hold a different number of items",
-					attributes: { transactionId: request.transactionId, pendingItems: pendingKeySet.size, requestItems: requestKeySet.size },
+					attributes: { transactionId: request.transactionId, pendingItems: ownedKeySet.size, requestItems: requestKeySet.size },
 				});
 			}
 			for (const key of requestKeySet) {
-				if (!pendingKeySet.has(key)) {
+				if (!ownedKeySet.has(key)) {
 					throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 						message: "a commit request item is not found in pending_transactions",
 						attributes: { transactionId: request.transactionId, key: String(key) },
@@ -372,7 +414,9 @@ export class TransactionParticipant {
 			}
 
 			this.#applyCommitItems(request.transactionId, request.transactionTimestamp, request.items, promotionCandidates);
-			this.#store.deletePendingTx(request.transactionId);
+			// The owned set and the request have the same keys here. The release deletes these keys one
+			// by one, and keeps the copies of a moved key.
+			this.#store.deletePendingTxKeys(request.transactionId, request.items);
 		});
 
 		return { response: { outcome: "committed" }, promotionCandidates };
@@ -533,8 +577,14 @@ export class TransactionParticipant {
 		return { response, promotionCandidates };
 	}
 
-	cancelLocal(transactionId: string): void {
-		this.#store.deletePendingTx(transactionId);
+	/**
+	 * Releases the locks of a cancelled transaction under `ownedKeys`. The caller owns these keys, so
+	 * the method keeps the copies of a key that this partition moved away. With no key, it releases
+	 * nothing: a router and a promotion source send the moved keys on, and the partition that imports
+	 * the copies releases its own rows.
+	 */
+	cancelLocal(transactionId: string, ownedKeys: readonly TransactionItemKey[]): void {
+		this.#store.deletePendingTxKeys(transactionId, ownedKeys);
 	}
 
 	/**

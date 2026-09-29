@@ -298,7 +298,6 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			local: (req, call) => {
 				const { response, promotionCandidates } = participant.commitLocal(req);
 				writeSignals(call, promotionCandidates, fokos.policy());
-				call.signal({ repartitionUnblocked: true });
 				return response;
 			},
 			merge: () => ({ outcome: "committed" }),
@@ -310,12 +309,11 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			failurePolicy: "attempt_all",
 			items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 			subRequest: (req, items) => ({ ...req, items: items as TransactionItemKey[] }),
-			// Every hop releases by transaction id, owner or router, before the remote groups start.
-			beforeForward: (req, call) => {
-				participant.cancelLocal(req.transactionId);
-				call.signal({ repartitionUnblocked: true });
+			// Each hop releases the rows of the keys it owns, which the runtime hands this handler.
+			local: (req) => {
+				participant.cancelLocal(req.transactionId, req.items);
+				return { outcome: "cancelled" };
 			},
-			local: () => ({ outcome: "cancelled" }),
 			merge: () => ({ outcome: "cancelled" }),
 		},
 		txReadForTransaction: {
@@ -356,11 +354,14 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 			},
 		},
 		// A `local` operation that re-enters `dispatch`: the commit or cancel routes to the current owner of each key.
+		// A row of a key that moved is a copy, so it routes the outcome and never writes here. The
+		// quarantine stays as it is: the rows that remain after the call belong to another owner.
 		debugForceResolveTransaction: {
 			shape: "local",
 			local: async (req) => {
 				const pendingRows = store.listPendingTxItems(req.transactionId);
 				const items = pendingRows.map((p) => ({ hashKey: p.hk, sortKey: p.sk }));
+				const resolvedLocally = items.filter((key) => fokos.owns(key)).length;
 				const ctx = fokos.routeContext();
 				const response =
 					req.outcome === "commit"
@@ -370,8 +371,7 @@ function partitionOperations(host: PartitionDO): FokosOperations<PartitionOps> {
 								items,
 							})
 						: await fokos.dispatch("txCancel", ctx, { transactionId: req.transactionId, items });
-				store.clearPendingTxGuard(req.transactionId);
-				return response.value;
+				return { ...response.value, resolvedLocally, forwarded: items.length - resolvedLocally };
 			},
 		},
 		debugForcePromoteKey: {
@@ -505,10 +505,10 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
 		computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
 			todo(`store.rangeBoundaries(${hashKey.length}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
 		migration: todo("FokosDBMigrationHost, unchanged"),
-		// A promotion cannot move a locked key. A split never holds: every lock follows its key to the child.
-		beforeCutover: (plan) => plan.kind !== "key_promotion" || todo<number>("store.pendingLockCountForHashKey") === 0,
-		beforeComplete: (plan) => (plan.kind === "key_promotion" ? undefined : todo("onSplitCompleted")),
-		cleanupSourceStep: (plan) => (plan.kind === "key_promotion" ? todo<boolean>("delete promoted rows, one bounded step") : true),
+		// No `beforeCutover`: a lock moves with its key, so nothing here holds a cutover back.
+		beforeComplete: (plan) =>
+			plan.kind === "key_promotion" ? todo("store.deletePendingTxForHashKey, every copy of the key") : todo("onSplitCompleted"),
+		cleanupSourceStep: (plan) => (plan.kind === "key_promotion" ? todo<boolean>("delete promoted items, one bounded step") : true),
 		admit: ({ admissionTag, policy }) => {
 			if (admissionTag !== "write") {
 				return "allow";

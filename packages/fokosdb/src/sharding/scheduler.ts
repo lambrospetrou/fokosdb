@@ -123,13 +123,14 @@ export class FokosScheduler {
 			return;
 		}
 		const now = Date.now();
-		const runnable = this.#runnable();
-		const due = this.#deadlines(runnable).filter(({ at }) => at <= now);
-
-		const earliest = this.#earliest(runnable);
+		// One read of the deadlines before the steps. A deadline can cost a storage query, so the pass
+		// reads them again only after the steps, which can change them.
+		const deadlines = this.#deadlines(this.#runnable());
+		const earliest = earliestOf(deadlines);
 		if (earliest === null) {
 			return;
 		}
+		const due = deadlines.filter(({ at }) => at <= now);
 		if (due.length === 0) {
 			await this.ensureAlarmAtMost(earliest);
 			return;
@@ -183,7 +184,7 @@ export class FokosScheduler {
 		//
 		// `canRun` is asked again, and never read from the list this pass started with: a step can make
 		// another job runnable, and a job left out here loses its deadline and the alarm with it.
-		const next = this.#earliest(this.#runnable());
+		const next = earliestOf(this.#deadlines(this.#runnable()));
 		if (next === null) {
 			await this.#deps.storage.deleteAlarm();
 			return;
@@ -213,15 +214,16 @@ export class FokosScheduler {
 		}
 		return out;
 	}
+}
 
-	#earliest(runnable: readonly FokosJob[]): number | null {
-		// FIXME: Index the jobs in a smarter way to avoid scanning all deadlines every time.
-		let earliest: number | null = null;
-		for (const { at } of this.#deadlines(runnable)) {
-			if (earliest === null || at < earliest) {
-				earliest = at;
-			}
+/** The earliest of `deadlines`, or null when there is none. */
+function earliestOf(deadlines: readonly { at: number }[]): number | null {
+	// FIXME: Index the jobs in a smarter way to avoid scanning all deadlines every time.
+	let earliest: number | null = null;
+	for (const { at } of deadlines) {
+		if (earliest === null || at < earliest) {
+			earliest = at;
 		}
-		return earliest;
 	}
+	return earliest;
 }
