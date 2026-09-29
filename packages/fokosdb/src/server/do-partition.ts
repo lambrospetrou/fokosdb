@@ -573,8 +573,11 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				failurePolicy: "attempt_all",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 				subRequest: (req, items) => ({ ...req, items: items as TransactionItemKey[] }),
-				// Every hop releases by transaction id, owner or router, before the remote groups start, so
-				// a router between cutover and completion clears its own pre-cutover lock rows.
+				// Each partition that the cancel reaches releases by transaction id, owner or router, before
+				// the remote groups start. A cached jump can skip a router. A skipped router between cutover
+				// and completion keeps its pre-cutover lock rows until its split completes and
+				// `beforeComplete` deletes them. The partition that promoted a key holds no lock on that key,
+				// because `beforeCutover` refuses the cutover while a lock exists.
 				// FIXME: owner resolution runs before this hook, so a request that fails it never releases
 				// the local locks. Every call today carries the keys of the transaction and they resolve.
 				// If a cancel ever fans out to children without those keys, run this release before the

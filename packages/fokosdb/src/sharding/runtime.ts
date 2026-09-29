@@ -108,14 +108,39 @@ type Resolution =
 	  }
 	| { kind: "out_of_range" };
 
+type RemoteResolution = Extract<Resolution, { kind: "remote" }>;
+type OwnedResolution = Exclude<Resolution, { kind: "out_of_range" }>;
+
+/** The caches a resolution reads. The hash arena has no switch: each resolution reads it. */
 type ResolveOptions = {
-	/** Consult the promotion Bloom cache. Point and range shapes do; group and single-owner shapes do not. */
+	/** Read the promotion Bloom cache. Each dispatch shape does on its first attempt. */
 	bloom: boolean;
-	/** Jump to the deepest learned range slice. Off for a fan-out, which enters a range tree at its root. */
+	/** Jump to the deepest learned range slice. Each dispatch shape does. */
 	learnedRange: boolean;
 };
 
+/** The durable facts and the hash arena only: `owns()` and the forward of a promotion request. */
 const EXACT: ResolveOptions = { bloom: false, learnedRange: false };
+/** The first attempt of each dispatch shape, and `resolveOwner`. */
+const HINTED: ResolveOptions = { bloom: true, learnedRange: true };
+/**
+ * Each retry of a group or single-owner request. The hash arena and the learned range slices give the
+ * same target to two keys of one owner, so one owner gets its keys in one sub-request. A Bloom hit
+ * answers for one hash key only, and it can send the keys of one owner to two targets.
+ */
+const HINTED_NO_BLOOM: ResolveOptions = { bloom: false, learnedRange: true };
+
+/** One item of a `group` request with its route key. */
+type GroupEntry = { key: RouteKey; item: unknown };
+/** The items of a `group` request that resolved to one remote target. They share one resolution. */
+type RemoteGroup = { resolution: RemoteResolution; entries: GroupEntry[] };
+type GroupParts = Array<FokosGroupPart<unknown, unknown>>;
+/** The entries of a `group` request by target, as `#groupByOwner` builds them. `remote` is keyed by partition ID. */
+type Groups = { local: GroupEntry[]; remote: Map<string, RemoteGroup> };
+/** The entries of one hash key that have a Bloom hit, each with its own resolution. */
+type BloomHashKey = { hashKey: KeyBytes; entries: Array<{ entry: GroupEntry; resolution: RemoteResolution }> };
+/** Where the keys of a `single_owner` request go. `spans` is the set that is local and remote, or on two remote targets. */
+type SingleOwnerResolution = { kind: "local" } | { kind: "remote"; resolution: RemoteResolution } | { kind: "spans_many" };
 
 type AnyOperation = FokosOperation<unknown, unknown>;
 
@@ -270,7 +295,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		invariant(record, "fokos/runtime: importing without an import record");
 		if (descriptor.whileMigrating === "throw") {
 			// `importState` tells a sender that followed its Bloom filter here that this partition has no
-			// page yet. That sender resolves the key again without the filter (see `#fallbackAfterMiss`).
+			// page yet. That sender resolves the key again without the filter (see `#missLadder`).
 			throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 				message: "partition split in progress, please retry later",
 				attributes: { operation: op, importState: record.state },
@@ -329,7 +354,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector: RouteCollector,
 	): Promise<FokosEnvelope<unknown>> {
 		const key = descriptor.key(req);
-		const resolution = this.#resolve(key, { bloom: true, learnedRange: true });
+		const resolution = this.#resolve(key, HINTED);
 		if (resolution.kind === "out_of_range") {
 			throw misrouted(op, "key outside this partition");
 		}
@@ -376,19 +401,20 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		descriptor: Extract<AnyOperation, { shape: "point" }>,
 		req: unknown,
 		key: RouteKey,
-		resolution: Extract<Resolution, { kind: "remote" }>,
+		resolution: RemoteResolution,
 		collector: RouteCollector,
 		retries: number,
 	): Promise<unknown> {
 		try {
 			return await this.#forwardTo(collector, resolution.target, op, req, [key.hashKey]);
 		} catch (e) {
-			const next = this.#fallbackAfterMiss(key, resolution, e, descriptor.readOnly === true);
-			if (!next || retries >= this.#config().maxForwardRetries) {
+			const opts = this.#missLadder([key], resolution, e, descriptor.readOnly === true, "point");
+			if (!opts || retries >= this.#config().maxForwardRetries) {
 				throw e;
 			}
 			// Every error that starts a fallback comes before any handler ran on the target.
 			collector.forget(resolution.target.partitionId);
+			const next = this.#resolve(key, opts);
 			if (next.kind === "out_of_range") {
 				throw misrouted(op, "key outside this partition");
 			}
@@ -403,21 +429,32 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * The resolution to try after a forward failed, or null when the failure is not a cache miss. It
-	 * forgets the hint that caused the miss, so the next resolution cannot repeat it.
+	 * The options to resolve the keys of a failed forward again with, or null when the failure is not
+	 * a cache miss. It forgets the hint that caused the miss, so the next resolution cannot repeat it.
+	 * The keys share the target of `resolution`, thus they share its hint, and one forget covers all
+	 * of them. A point retry can use the Bloom step again. A group or single-owner retry turns the
+	 * Bloom step off and keeps the learned range slices.
 	 */
-	#fallbackAfterMiss(key: RouteKey, resolution: Extract<Resolution, { kind: "remote" }>, e: unknown, readOnly: boolean): Resolution | null {
+	#missLadder(
+		keys: readonly RouteKey[],
+		resolution: RemoteResolution,
+		e: unknown,
+		readOnly: boolean,
+		shape: "point" | "group" | "single_owner",
+	): ResolveOptions | null {
+		const retry = (point: ResolveOptions) => (shape === "point" ? point : HINTED_NO_BLOOM);
+		const hashKey = keys[0].hashKey;
 		const notInitialized = FokosError.isCode(e, SHARDING_ROUTING_CODES.range_partition_not_initialized);
 		const notCutOver = FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over);
 		const awaitingData = isAwaitingData(e);
 		if (resolution.learned && notInitialized) {
-			this.#store.deleteLearnedRangeSlice(key.hashKey, resolution.learned.startBoundary, resolution.learned.endBoundary);
-			return this.#resolve(key, { bloom: resolution.via === "bloom", learnedRange: true });
+			this.#store.deleteLearnedRangeSlice(hashKey, resolution.learned.startBoundary, resolution.learned.endBoundary);
+			return retry({ bloom: resolution.via === "bloom", learnedRange: true });
 		}
 		// A Bloom hit can name the range root of a key whose promotion has not cut over. The exact
 		// resolution reads the route overrides, so it names the partition that owns the key now.
 		if (resolution.via === "bloom" && (notInitialized || awaitingData || (readOnly && notCutOver))) {
-			return this.#resolve(key, { bloom: false, learnedRange: true });
+			return retry({ bloom: false, learnedRange: true });
 		}
 		if (
 			resolution.via === "hash" &&
@@ -425,10 +462,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			FokosError.isCode(e, SHARDING_ROUTING_CODES.hash_partition_not_initialized)
 		) {
 			const arena = this.#arena();
-			if (arena?.invalidate(key.hashKey, resolution.relDepth!)) {
+			if (arena?.invalidate(hashKey, resolution.relDepth!)) {
 				this.#store.putHashArena(arena.toSnapshot());
 			}
-			return this.#resolve(key, { bloom: true, learnedRange: true });
+			return retry(HINTED);
 		}
 		return null;
 	}
@@ -449,29 +486,11 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 
-		const local: Array<{ key: RouteKey; item: unknown }> = [];
-		const remote = new Map<string, { target: FokosPartitionRef; items: unknown[]; keys: KeyBytes[] }>();
-		for (const entry of items) {
-			const resolution = this.#resolve(entry.key, EXACT);
-			if (resolution.kind === "out_of_range") {
-				throw misrouted(op, "item outside this partition");
-			}
-			if (resolution.kind === "local") {
-				local.push(entry);
-				continue;
-			}
-			const group = remote.get(resolution.target.partitionId);
-			if (group) {
-				group.items.push(entry.item);
-				group.keys.push(entry.key.hashKey);
-			} else {
-				remote.set(resolution.target.partitionId, { target: resolution.target, items: [entry.item], keys: [entry.key.hashKey] });
-			}
-		}
+		const { local, remote } = this.#groupByOwner(op, items, HINTED);
 
 		// Admission, `beforeForward`, the local work, and the start of every remote call run in the same
-		// synchronous block as the resolution above: an outbound RPC yields only at the await below, so
-		// a cutover cannot interleave between the ownership decision and the write.
+		// synchronous block as the resolution above: an outbound RPC yields only at the first await of
+		// `#runGroups`, so a cutover cannot interleave between the ownership decision and the write.
 		if (local.length > 0) {
 			this.#admit(
 				op,
@@ -480,6 +499,142 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			);
 		}
 		const signals: FokosSignals[] = this.#beforeForward(descriptor, req);
+		const { parts, localFailure, remoteFailures } = await this.#runGroups(op, descriptor, req, local, remote, collector, 0, signals);
+		// The local part is the more specific answer, and every remote group has been attempted by now.
+		if (localFailure) {
+			throw localFailure.error;
+		}
+		if (remoteFailures.length > 0) {
+			throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_fanout_failed, {
+				message: "a remote group of the operation failed",
+				cause: remoteFailures[0],
+				attributes: {
+					operation: op,
+					failureCount: remoteFailures.length,
+					groupCount: remote.length,
+					// `cause` is a non-enumerable own property, so it does not cross an RPC hop. The
+					// caller still needs the failure it stands for, and `attributes` does cross.
+					...causeAttributes(remoteFailures[0]),
+				},
+			});
+		}
+		return envelope(descriptor.merge(parts), collector.build());
+	}
+
+	/**
+	 * Resolves each entry of a `group` request, and groups the remote entries by their target. When an
+	 * entry has a Bloom hit, the speculation guard runs before the entries are grouped.
+	 */
+	#groupByOwner(op: string, entries: readonly GroupEntry[], opts: ResolveOptions): { local: GroupEntry[]; remote: RemoteGroup[] } {
+		const groups: Groups = { local: [], remote: new Map() };
+		// The entries with a Bloom hit wait for the guard, by hash key. `KeyCodec.mapKey` is a hash and
+		// not an identity, so a bucket holds each hash key of one hash value.
+		let bloomHits: Map<bigint, BloomHashKey[]> | undefined;
+		for (const entry of entries) {
+			const resolution = this.#resolve(entry.key, opts);
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, "item outside this partition");
+			}
+			if (!isBloomHit(resolution)) {
+				addToGroups(groups, entry, resolution);
+				continue;
+			}
+			bloomHits ??= new Map();
+			const id = KeyCodec.mapKey(entry.key.hashKey);
+			let bucket = bloomHits.get(id);
+			if (bucket === undefined) {
+				bucket = [];
+				bloomHits.set(id, bucket);
+			}
+			let hit = bucket.find((b) => KeyCodec.compare(b.hashKey, entry.key.hashKey) === 0);
+			if (hit === undefined) {
+				hit = { hashKey: entry.key.hashKey, entries: [] };
+				bucket.push(hit);
+			}
+			hit.entries.push({ entry, resolution });
+		}
+		if (bloomHits) {
+			this.#guardBloomHits(bloomHits, groups);
+		}
+		return { local: groups.local, remote: [...groups.remote.values()] };
+	}
+
+	/**
+	 * The speculation guard of a `group` request. It keeps a Bloom hit only when the hit cannot split
+	 * the keys of one owner over two sub-requests.
+	 *
+	 * Why. The owner of a key must receive all its keys of this request in one sub-request: `txCommit`
+	 * compares its keys with every lock row of the transaction, and throws `commit_keyset_mismatch` when
+	 * the two sets differ. A Bloom hit is a guess for one hash key H, and it sends the entries of H to
+	 * a range partition of H. When the guess is wrong, the range partition refuses, and the entries of
+	 * H fall back to the exact target of H: the partition that owns H without the filter. When another
+	 * hash key also goes to that exact target, the owner then receives two sub-requests.
+	 *
+	 * How. The input is `groups`, the entries without a Bloom hit, and `bloomHits`, the entries of each
+	 * hash key H with a Bloom hit.
+	 * 1. For each H, find its exact target with `#hashTopologyOwner`. H has no cut-over route override
+	 *    here, because a Bloom hit comes after the override check. So the exact target is the topology
+	 *    owner, `local` or a hash descendant, and the guard reads no route override again.
+	 * 2. Count the Bloom hash keys at each exact target.
+	 * 3. The exact target of H is shared when another Bloom hash key has the same exact target, or when
+	 *    `groups` already has an entry there. An entry of `groups` belongs to another hash key, because
+	 *    the filter answers for the whole hash key, so each entry of H has a Bloom hit.
+	 * 4. When the target is shared, each entry of H goes to the exact target, and the owner gets all its
+	 *    keys in one sub-request. Otherwise each entry of H keeps its Bloom resolution. A later fallback
+	 *    then reaches a partition that gets no other key of this request from this partition.
+	 *
+	 * The guard compares the exact target of H only with the targets that `groups` already holds. The
+	 * resolution of an entry without a Bloom hit is exact, or it names a range partition of its own
+	 * hash key. A range partition of another hash key is never the exact target of H.
+	 *
+	 * Example. This hash leaf owns `alice` and `carol`. A commit has the keys (alice, a) and
+	 * (carol, b). The filter gives a false positive for `alice`.
+	 * - Without the guard, (alice, a) goes to the range root of `alice`, which does not exist, and
+	 *   (carol, b) runs here. The fallback then runs (alice, a) here in a second call. The first call
+	 *   has {b}, the lock rows have {a, b}, and the commit throws `commit_keyset_mismatch`.
+	 * - With the guard, the exact target of `alice` is `local`, and `groups.local` holds (carol, b). The
+	 *   target is shared, so (alice, a) runs here with (carol, b) in one call.
+	 * - When the commit has only `alice` keys, no other hash key shares `local`. The Bloom hit stays,
+	 *   and a true positive saves the forwards to the range owner.
+	 */
+	#guardBloomHits(bloomHits: Map<bigint, BloomHashKey[]>, groups: Groups): void {
+		const router = this.#source.routerRole();
+		const owners: Array<{ hit: BloomHashKey; owner: OwnedResolution; id: string }> = [];
+		const hashKeysAt = new Map<string, number>();
+		for (const bucket of bloomHits.values()) {
+			for (const hit of bucket) {
+				const owner = this.#hashTopologyOwner(hit.hashKey, router);
+				const id = owner.kind === "local" ? "local" : owner.target.partitionId;
+				owners.push({ hit, owner, id });
+				hashKeysAt.set(id, (hashKeysAt.get(id) ?? 0) + 1);
+			}
+		}
+		for (const { hit, owner, id } of owners) {
+			// An earlier hash key of this loop adds entries at `id` only when two Bloom hash keys share
+			// `id`, and then the count already says that the target is shared.
+			const shared = hashKeysAt.get(id)! > 1 || (id === "local" ? groups.local.length > 0 : groups.remote.has(id));
+			for (const { entry, resolution } of hit.entries) {
+				addToGroups(groups, entry, shared ? owner : resolution);
+			}
+		}
+	}
+
+	/**
+	 * Runs the local part of a `group` operation and starts each remote group, in the synchronous
+	 * block of the caller, then settles them by the failure policy. The caller admitted the local
+	 * entries. `signals` holds the signals of the caller, which apply with the local part. A
+	 * `fail_fast` failure throws at once. An `attempt_all` failure comes back after each group settled.
+	 */
+	async #runGroups(
+		op: string,
+		descriptor: Extract<AnyOperation, { shape: "group" }>,
+		req: unknown,
+		local: GroupEntry[],
+		remote: RemoteGroup[],
+		collector: RouteCollector,
+		retries: number,
+		signals: FokosSignals[],
+	): Promise<{ parts: GroupParts; localFailure?: { error: unknown }; remoteFailures: unknown[] }> {
 		const attemptAll = descriptor.failurePolicy === "attempt_all";
 		let localCall: { request: unknown; value: unknown; signals: FokosSignals[] } | undefined;
 		// An `attempt_all` group runs every group before it reports a failure, and that includes the
@@ -502,16 +657,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				localFailure = { error };
 			}
 		}
-		const remoteCalls = [...remote.values()].map((group) => {
-			const request = descriptor.subRequest(req, group.items);
-			const promise = this.#forwardTo(collector, group.target, op, request, group.keys);
+		const remoteCalls = remote.map((group) => {
+			const promise = this.#forwardGroup(op, descriptor, req, group, collector, retries);
 			// A rejection that lands while the signals below run must not count as unhandled; it is
 			// awaited right after.
 			promise.catch(() => {});
-			return { target: group.target, request, promise };
+			return promise;
 		});
 
-		const parts: Array<FokosGroupPart<unknown, unknown>> = [];
 		if (localCall) {
 			try {
 				localCall.value = await localCall.value;
@@ -531,40 +684,81 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (remoteCalls.length > 0) {
 			collector.add(this.#selfNode("merged"));
 		}
-		if (descriptor.failurePolicy === "fail_fast") {
-			const results = await Promise.all(remoteCalls.map((c) => c.promise));
-			results.forEach((result, i) => parts.push({ target: remoteCalls[i].target, request: remoteCalls[i].request, result }));
-		} else {
-			const settled = await Promise.allSettled(remoteCalls.map((c) => c.promise));
-			const failures = settled.filter((r): r is PromiseRejectedResult => r.status === "rejected");
-			// The local part is the more specific answer, and every remote group has been attempted by now.
-			if (localFailure) {
-				throw localFailure.error;
-			}
-			if (failures.length > 0) {
-				throw new FokosInternalError(SHARDING_INTERNAL_CODES.partition_fanout_failed, {
-					message: "a remote group of the operation failed",
-					cause: failures[0].reason,
-					attributes: {
-						operation: op,
-						failureCount: failures.length,
-						groupCount: remoteCalls.length,
-						// `cause` is a non-enumerable own property, so it does not cross an RPC hop. The
-						// caller still needs the failure it stands for, and `attributes` does cross.
-						...causeAttributes(failures[0].reason),
-					},
-				});
-			}
-			settled.forEach((result, i) => {
+		const parts: GroupParts = [];
+		const remoteFailures: unknown[] = [];
+		if (attemptAll) {
+			for (const result of await Promise.allSettled(remoteCalls)) {
 				if (result.status === "fulfilled") {
-					parts.push({ target: remoteCalls[i].target, request: remoteCalls[i].request, result: result.value });
+					parts.push(...result.value);
+				} else {
+					remoteFailures.push(result.reason);
 				}
-			});
+			}
+		} else {
+			parts.push(...(await Promise.all(remoteCalls)).flat());
 		}
 		if (localCall) {
 			parts.push({ target: "local", request: localCall.request, result: localCall.value });
 		}
-		return envelope(descriptor.merge(parts), collector.build());
+		return { parts, localFailure, remoteFailures };
+	}
+
+	/**
+	 * Forwards one remote group of a `group` operation, and falls back after a cache miss: it forgets
+	 * the hint, resolves the entries of the group again, and runs them where they resolve now. The
+	 * answer holds one part for each forward that answered and one for a local run.
+	 *
+	 * A router below the target can apply one part before another part fails, so the fallback can send
+	 * a key again to an owner that applied it. Each `group` operation is safe to repeat for each key.
+	 */
+	async #forwardGroup(
+		op: string,
+		descriptor: Extract<AnyOperation, { shape: "group" }>,
+		req: unknown,
+		group: RemoteGroup,
+		collector: RouteCollector,
+		retries: number,
+	): Promise<GroupParts> {
+		const { target } = group.resolution;
+		const request = descriptor.subRequest(
+			req,
+			group.entries.map((entry) => entry.item),
+		);
+		const keys = group.entries.map((entry) => entry.key);
+		try {
+			const result = await this.#forwardTo(
+				collector,
+				target,
+				op,
+				request,
+				keys.map((key) => key.hashKey),
+			);
+			return [{ target, request, result }];
+		} catch (e) {
+			const opts = this.#missLadder(keys, group.resolution, e, descriptor.readOnly === true, "group");
+			if (!opts || retries >= this.#config().maxForwardRetries) {
+				throw e;
+			}
+			collector.forget(target.partitionId);
+			// The resolution, the admission, the local run, and the start of each remote group run in one
+			// synchronous block, as in `#dispatchGroup`.
+			const { local, remote } = this.#groupByOwner(op, group.entries, opts);
+			if (local.length > 0) {
+				this.#admit(
+					op,
+					descriptor,
+					local.map((entry) => entry.key),
+				);
+			}
+			const { parts, localFailure, remoteFailures } = await this.#runGroups(op, descriptor, req, local, remote, collector, retries + 1, []);
+			if (localFailure) {
+				throw localFailure.error;
+			}
+			if (remoteFailures.length > 0) {
+				throw remoteFailures[0];
+			}
+			return parts;
+		}
 	}
 
 	async #dispatchSingleOwner(
@@ -574,23 +768,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		collector: RouteCollector,
 	): Promise<FokosEnvelope<unknown>> {
 		const keys = descriptor.items(req).map((item) => item.key);
-		let localCount = 0;
-		let remote: FokosPartitionRef | null = null;
-		let spansPartitions = false;
-		for (const key of keys) {
-			const resolution = this.#resolve(key, EXACT);
-			if (resolution.kind === "out_of_range") {
-				throw misrouted(op, "item outside this partition");
-			}
-			if (resolution.kind === "local") {
-				localCount++;
-			} else if (remote === null) {
-				remote = resolution.target;
-			} else if (remote.partitionId !== resolution.target.partitionId) {
-				spansPartitions = true;
-			}
-		}
-		if (remote === null) {
+		const owner = this.#singleOwner(op, keys, HINTED);
+		if (owner.kind === "local") {
 			this.#admit(op, descriptor, keys);
 			const before = this.#beforeForward(descriptor, req);
 			const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
@@ -598,22 +777,92 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			return envelope(value, collector.build());
 		}
 		const before = this.#beforeForward(descriptor, req);
-		if (spansPartitions || localCount > 0) {
+		if (owner.kind === "spans_many") {
 			// A value and not an error: on a split shard group this is the ordinary answer for such a
 			// set, and it carries no side effects at any depth of a forwarding chain.
 			await this.#applySignals(before);
 			return envelope(descriptor.notApplicable, collector.build());
 		}
-		const forwarded = this.#forwardTo(
-			collector,
-			remote,
-			op,
-			req,
-			keys.map((key) => key.hashKey),
-		);
+		const forwarded = this.#forwardSingleOwner(op, descriptor, req, keys, owner.resolution, collector, 0);
 		forwarded.catch(() => {});
 		await this.#applySignals(before);
 		return envelope(await forwarded, collector.build());
+	}
+
+	/**
+	 * Where the keys of a single-owner request go. A Bloom hit answers for one hash key, so it can make
+	 * the keys of one owner look like the keys of two partitions. Such a set resolves again with the
+	 * Bloom step off before the answer is `spans_many`.
+	 */
+	#singleOwner(op: string, keys: readonly RouteKey[], opts: ResolveOptions): SingleOwnerResolution {
+		let localCount = 0;
+		let remote: RemoteResolution | null = null;
+		let spansPartitions = false;
+		let bloomHit = false;
+		for (const key of keys) {
+			const resolution = this.#resolve(key, opts);
+			if (resolution.kind === "out_of_range") {
+				throw misrouted(op, "item outside this partition");
+			}
+			bloomHit ||= isBloomHit(resolution);
+			if (resolution.kind === "local") {
+				localCount++;
+			} else if (remote === null) {
+				remote = resolution;
+			} else if (remote.target.partitionId !== resolution.target.partitionId) {
+				spansPartitions = true;
+			}
+		}
+		if (remote === null) {
+			return { kind: "local" };
+		}
+		if (spansPartitions || localCount > 0) {
+			return bloomHit ? this.#singleOwner(op, keys, HINTED_NO_BLOOM) : { kind: "spans_many" };
+		}
+		return { kind: "remote", resolution: remote };
+	}
+
+	/**
+	 * Forwards a single-owner request and falls back after a cache miss, as `#forwardPoint` does. After
+	 * the fallback the keys can be local, on one remote target, or on more than one partition.
+	 */
+	async #forwardSingleOwner(
+		op: string,
+		descriptor: Extract<AnyOperation, { shape: "single_owner" }>,
+		req: unknown,
+		keys: readonly RouteKey[],
+		resolution: RemoteResolution,
+		collector: RouteCollector,
+		retries: number,
+	): Promise<unknown> {
+		try {
+			return await this.#forwardTo(
+				collector,
+				resolution.target,
+				op,
+				req,
+				keys.map((key) => key.hashKey),
+			);
+		} catch (e) {
+			const opts = this.#missLadder(keys, resolution, e, descriptor.readOnly === true, "single_owner");
+			if (!opts || retries >= this.#config().maxForwardRetries) {
+				throw e;
+			}
+			// A single-owner request never fans out, and every error that starts a fallback comes from a
+			// check before the handler, so no handler ran on the chain.
+			collector.forget(resolution.target.partitionId);
+			const owner = this.#singleOwner(op, keys, opts);
+			if (owner.kind === "spans_many") {
+				return descriptor.notApplicable;
+			}
+			if (owner.kind === "local") {
+				this.#admit(op, descriptor, [...keys]);
+				const { value, signals } = await this.#runLocalScope(descriptor, req, collector);
+				await this.#applySignals(signals);
+				return value;
+			}
+			return await this.#forwardSingleOwner(op, descriptor, req, keys, owner.resolution, collector, retries + 1);
+		}
 	}
 
 	async #dispatchRange(
@@ -718,7 +967,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/** The point-routing answer, caches included. A speculative remote owner is a hint, not a fact. */
 	resolveOwner(key: RouteKey): FokosOwner {
-		const resolution = this.#resolve(key, { bloom: true, learnedRange: true });
+		const resolution = this.#resolve(key, HINTED);
 		return resolution.kind === "remote" ? { kind: "remote", target: resolution.target, speculative: resolution.speculative } : resolution;
 	}
 
@@ -1206,18 +1455,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (opts.bloom && this.#bloom?.maybePromoted(key.hashKey)) {
 				return this.#rangeOwner(key.hashKey, key.sortKey, "bloom", true, opts.learnedRange);
 			}
-			if (!this.#source.routerRole()) {
-				return { kind: "local" };
-			}
-			const relDepth = Math.max(1, this.#arena()?.findLeaf(key.hashKey) ?? 0);
-			return {
-				kind: "remote",
-				target: this.#hashDescendant(key.hashKey, relDepth),
-				speculative: false,
-				via: "hash",
-				relDepth,
-				learned: null,
-			};
+			return this.#hashTopologyOwner(key.hashKey, this.#source.routerRole());
 		}
 
 		if (!this.#source.routerRole()) {
@@ -1233,6 +1471,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return { kind: "remote", target, speculative: false, via: "range", learned: jump };
 	}
 
+	/**
+	 * The owner of a hash key that has no cut-over route override on this hash partition: local on an
+	 * owner, else the hash descendant that the hash arena names. `router` is `routerRole()`, which
+	 * reads SQLite, so a caller that asks for many keys reads it once.
+	 */
+	#hashTopologyOwner(hashKey: KeyBytes, router: boolean): OwnedResolution {
+		if (!router) {
+			return { kind: "local" };
+		}
+		const relDepth = Math.max(1, this.#arena()?.findLeaf(hashKey) ?? 0);
+		return { kind: "remote", target: this.#hashDescendant(hashKey, relDepth), speculative: false, via: "hash", relDepth, learned: null };
+	}
+
 	/** The range partition that serves a promoted key: the deepest learned slice that contains the sort key, or the root. */
 	#rangeOwner(
 		hashKey: KeyBytes,
@@ -1240,7 +1491,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		via: "override" | "bloom",
 		speculative: boolean,
 		learnedRange: boolean,
-	): Extract<Resolution, { kind: "remote" }> {
+	): RemoteResolution {
 		const routeCtx = this.routeContext();
 		const learned = learnedRange ? this.#store.findDeepestKnownRangeSlice(hashKey, sortKey) : null;
 		const jump = learned && (learned.startBoundary !== null || learned.endBoundary !== null) ? learned : null;
@@ -1882,6 +2133,23 @@ function intervalInside(interval: SkInterval, start: KeyBytes | null, end: KeyBy
  */
 function isAwaitingData(e: unknown): boolean {
 	return FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating) && e.attributes.importState === "awaiting_data";
+}
+
+function isBloomHit(resolution: Resolution): resolution is RemoteResolution {
+	return resolution.kind === "remote" && resolution.via === "bloom";
+}
+
+function addToGroups(groups: Groups, entry: GroupEntry, resolution: OwnedResolution): void {
+	if (resolution.kind === "local") {
+		groups.local.push(entry);
+		return;
+	}
+	const group = groups.remote.get(resolution.target.partitionId);
+	if (group) {
+		group.entries.push(entry);
+	} else {
+		groups.remote.set(resolution.target.partitionId, { resolution, entries: [entry] });
+	}
 }
 
 /** Never transient: the key reached a partition that can neither own nor route it. */

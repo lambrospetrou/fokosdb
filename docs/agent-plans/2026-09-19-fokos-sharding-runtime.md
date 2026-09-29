@@ -256,9 +256,10 @@ and differ from, or add to, the text of section 4.2:
 - `whileMigrating: "read_source"` is valid for the `point` and `range` shapes only; the constructor throws
   `sharding_operation_invalid` for a `group` or `single_owner` descriptor that declares it. FokosDB needs it for
   `apiGetItem` and `apiQueryItems` only.
-- The `group` and `single_owner` shapes resolve exactly: no Bloom step, and a promoted key enters its range tree
-  at the root and never at a learned slice, so a fan-out has no cache-miss fallback. `owns()` uses the same exact
-  resolution. `point` and `range` use both caches and own the fallbacks of section 4.2.8.
+- Each dispatch shape uses both caches and has a fallback after a cache miss. The `group` shape keeps a Bloom hit
+  only when no key of another hash key has the same exact target, and each `group` or `single_owner` retry turns
+  the Bloom step off. `docs/agent-plans/2026-09-27-learned-routes-for-every-dispatch-shape.md` gives the rules.
+  `owns()` resolves exactly.
 - `FokosLifecycle.activeRepartition` is the split row while it is not terminal, else the oldest promotion in
   `queued`, `planned`, or `cutover`.
 - A repartition row with no plan head, which only a direct write outside `queue` can produce, takes the live
@@ -1162,7 +1163,10 @@ Resolution order on a hash partition:
 2. **Route override.** When `fokos_route_overrides` has the hash key and its repartition is `cutover` or later,
    the owner is the range root, or a deeper range slice from the range hierarchy cache. This is authoritative.
 3. **Promotion Bloom cache.** When the filter reports a probable promotion by a descendant, the owner is the
-   range root, `speculative: true`. Point and range shapes use this step. Group and single-owner shapes skip it.
+   range root, or a deeper range slice from the range hierarchy cache, `speculative: true`. Each dispatch shape
+   uses this step on its first attempt. A `group` request drops a Bloom hit for a hash key when a key of another
+   hash key has the same exact target. A `single_owner` request resolves again without this step when a Bloom hit
+   puts its keys on more than one partition.
 4. **Topology.** When this partition is a router, pick the child by the hash function at this depth, then apply
    the hash arena cache to jump deeper. Otherwise the owner is local.
 
@@ -1173,11 +1177,13 @@ Resolution order on a range partition:
 2. When this partition is a router, pick the child whose interval contains the sort key, then apply the range
    hierarchy cache to jump deeper. Otherwise the owner is local.
 
-A speculative range forward that fails with `range_partition_not_initialized` or
-`repartition_not_cut_over` resolves again with the Bloom step disabled. The `repartition_not_cut_over` fallback
-applies to reads only; a write throws it unchanged. A cached hash jump that receives
-`hash_partition_not_initialized` invalidates that hash-arena hint and retries from the nearest known ancestor.
-A non-cached call propagates the error.
+A speculative range forward that fails with `range_partition_not_initialized`, `repartition_not_cut_over`, or
+`partition_migrating` with `importState: "awaiting_data"` resolves again with the Bloom step disabled. The
+`repartition_not_cut_over` fallback applies to reads only; a write throws it unchanged. A cached hash jump that
+receives `hash_partition_not_initialized` invalidates that hash-arena hint and retries from the nearest known
+ancestor. A learned range slice that receives `range_partition_not_initialized` is deleted, and the key resolves
+again. Each dispatch shape uses these fallbacks. A `group` or `single_owner` retry keeps the Bloom step disabled
+for the rest of its fallback chain. A non-cached call propagates the error.
 
 `out_of_range` throws `partition_misrouted`. It is a routing defect, not backpressure.
 

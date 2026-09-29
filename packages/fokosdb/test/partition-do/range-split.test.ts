@@ -3,7 +3,8 @@ import { beforeAll, describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { executedBy, kb, rangeAncestorsOf } from "./helpers.js";
+import { testCoordinatorRef } from "../stub-helpers.js";
+import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
 	PROMOTION_TEST_MAX_SIZE_MB,
@@ -214,6 +215,43 @@ describe.concurrent("PartitionDO — range split", () => {
 			expect(first.meta.forwardCount).toBe(2);
 			expect(second.meta.forwardCount).toBe(1);
 		});
+
+		it("a transaction through the partition that holds the route override jumps to the depth-2 owner", async () => {
+			const { root, hashPartition } = await makeTriggeredRangeRoot(2);
+			await root.awaitSplitCompleted();
+			const leftChild = (await root.children()).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+			const owner = (await leftChild.splitRange("aa")).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+
+			// One read goes through the range root and the depth-1 child, and it teaches the hash partition
+			// the slice of the owner.
+			const read = await hashPartition.stub.apiGetItem(hashPartition.ctx, { hashKey: kb("alice"), sortKey: kb("aa0000") });
+			expect(read.routing.forwardCount).toBe(3);
+			expect(executedBy(read).ref.doName).toBe(owner.doName);
+
+			// "a0" sorts before each "aa…" key, so the owner of "aa0000" owns it too.
+			const key = { hashKey: kb("alice"), sortKey: kb("a0") };
+			const transactionId = crypto.randomUUID();
+			const transactionTimestamp = Date.now();
+			const prepare = await hashPartition.stub.txPrepare(hashPartition.ctx, {
+				transactionId,
+				transactionTimestamp,
+				coordinator: testCoordinatorRef(),
+				items: withOpIndex([{ ...key, operation: "put", data: "v", kind: "text" }]),
+			});
+			expect(prepare.value.outcome).toBe("accepted");
+			expect(prepare.routing.forwardCount).toBe(1);
+			expect(executedBy(prepare).ref.doName).toBe(owner.doName);
+
+			const commit = await hashPartition.stub.txCommit(hashPartition.ctx, { transactionId, transactionTimestamp, items: [key] });
+			expect(commit.value.outcome).toBe("committed");
+			expect(commit.routing.forwardCount).toBe(1);
+			expect(executedBy(commit).ref.doName).toBe(owner.doName);
+
+			const snapshot = await hashPartition.stub.txReadSnapshot(hashPartition.ctx, { items: [key] });
+			expect(snapshot.value).toMatchObject({ outcome: "committed", items: [{ found: true, data: "v" }] });
+			expect(snapshot.routing.forwardCount).toBe(1);
+			expect(executedBy(snapshot).ref.doName).toBe(owner.doName);
+		}, 30_000);
 
 		it("a hash partition jumps to a depth-2 owner when rangeAncestorsConfig={fromRoot:0,fromLeaf:0}", async () => {
 			const { root, hashPartition } = await makeTriggeredRangeRoot(2, { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 0 } });

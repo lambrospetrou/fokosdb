@@ -4,17 +4,22 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { PartialRangeTopology } from "../../src/sharding/partial-range-topology.js";
 import { FokosError } from "../../src/shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
+import { HashTopology } from "../../src/sharding/hash-topology.js";
+import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { hashChildIndex, resolveDescendantHashPartitionContext } from "../../src/sharding/partition-id.js";
+import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
 import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
 	PROMOTION_TEST_MAX_SIZE_MB,
-	type TestPartition,
+	TestPartition,
 	assertSplitTreeComplete,
 	CONTROLLED_NS,
 	drainUntil,
 	makePartition,
+	rangeOf,
 } from "./partition-harness.js";
 
 describe.concurrent("PartitionDO — promotion detection and queuing", () => {
@@ -418,5 +423,275 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 			"the retried commit to commit",
 		);
 		await partition.awaitPromoted("hot");
+	}, 30_000);
+});
+
+/**
+ * The partition behind a context with the hash split cap raised to 100 MB. After a hash split, a child
+ * is still above a 1 MB cap in SQLite pages, and it would split again during a test. The operator
+ * raises the cap, and every later call carries the new policy: a call with the old context stores the
+ * old cap again.
+ */
+function raised(p: TestPartition): TestPartition {
+	return TestPartition.at({
+		...p.ctx,
+		policy: { ...p.ctx.policy, hashSplitConditions: { ...p.ctx.policy.hashSplitConditions, maxSizeMb: 100 } },
+	});
+}
+
+/** Splits the hash root once, then raises the cap on the root and on each child. Every later call uses the answer. */
+async function splitHashOnce(opts: Parameters<typeof makePartition>[0]): Promise<TestPartition> {
+	const split = makePartition({ hashSplitN: 2, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB }, ...opts });
+	await split.splitHash();
+	const partition = raised(split);
+	for (const child of await partition.children()) {
+		await raised(child).status();
+	}
+	return partition;
+}
+
+describe("PartitionDO — a transaction through a hash jump to a partition that does not exist", () => {
+	it("falls back from the jump, keeps Bloom off, and sends the keys of one owner in one call", async () => {
+		const hashSplitN = 2;
+		const partition = await splitHashOnce({ ns: CONTROLLED_NS, hashSplitN });
+
+		// The root holds a Bloom filter only after it learns a promotion. The spy below has no effect without one.
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("bob") });
+		await raised(await partition.childOwning("bob")).awaitPromoted("bob");
+		await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
+
+		// Two hash keys with the same child index at depths 0 and 1: one hash leaf owns both, and a
+		// depth-2 hint for one of them names the same grandchild for the other.
+		const path = (key: string) => [0, 1].map((depth) => hashChildIndex(kb(key), depth, hashSplitN));
+		const h1 = "tx-path-0";
+		let h2 = "";
+		for (let i = 1; h2 === ""; i++) {
+			if (path(`tx-path-${i}`).join() === path(h1).join()) {
+				h2 = `tx-path-${i}`;
+			}
+		}
+		const owner = await partition.childOwning(h1);
+		const missing = TestPartition.at(resolveDescendantHashPartitionContext(partition.ctx, path(h1)));
+
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = Date.now();
+		const prepare = await partition.rpc.txPrepare(partition.ctx, {
+			transactionId,
+			transactionTimestamp,
+			coordinator: testCoordinatorRef(),
+			items: withOpIndex([
+				{ hashKey: kb(h1), sortKey: kb("a"), operation: "put", data: "v1", kind: "text" },
+				{ hashKey: kb(h2), sortKey: kb("b"), operation: "put", data: "v2", kind: "text" },
+			]),
+		});
+		expect(prepare.outcome).toBe("accepted");
+		const keys = [
+			{ hashKey: kb(h1), sortKey: kb("a") },
+			{ hashKey: kb(h2), sortKey: kb("b") },
+		];
+
+		// The root learns a hint to a grandchild that no split created. Then the root restarts, so the
+		// next instance reads the hint from storage. A stub of an aborted object stays broken, thus the
+		// answer is the root behind a new stub.
+		const plantMissingGrandchild = async (): Promise<TestPartition> => {
+			const root = TestPartition.at(partition.ctx);
+			await runInDurableObject(root.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+				const arena = HashTopology.create(hashSplitN, 0);
+				arena.updateFromHint(kb(h1), 2);
+				new FokosShardingStore(state.storage).putHashArena(arena.toSnapshot());
+			});
+			await runInDurableObject(root.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+				state.abort("reload the hash arena");
+			}).catch(() => {});
+			return TestPartition.at(partition.ctx);
+		};
+
+		// This spy is on a prototype, thus the rules of the spy in "serves a read and a write at the source
+		// when a Bloom false positive names a range root before its cutover" apply: keep this `describe`
+		// sequential and at the top level.
+		const maybePromotedSpy = vi
+			.spyOn(PartialRangeTopology.prototype, "maybePromoted")
+			.mockImplementation((hashKey) => KeyCodec.compare(hashKey, kb(h1)) === 0);
+		try {
+			const root = await plantMissingGrandchild();
+			expect(await root.rpc.txCommit(root.ctx, { transactionId, transactionTimestamp, items: keys })).toMatchObject({
+				outcome: "committed",
+			});
+
+			const restarted = await plantMissingGrandchild();
+			expect(await restarted.rpc.txReadSnapshot(restarted.ctx, { items: keys })).toMatchObject({
+				outcome: "committed",
+				items: [
+					{ found: true, data: "v1" },
+					{ found: true, data: "v2" },
+				],
+			});
+		} finally {
+			maybePromotedSpy.mockRestore();
+		}
+
+		// The root tried the grandchild first, and then sent both keys to their owner in one call. The order
+		// of the items in a sub-request is not part of the contract.
+		expect(await missing.controlled.testTxCalls("txCommit")).toHaveLength(1);
+		expect(await missing.controlled.testTxCalls("txReadSnapshot")).toHaveLength(1);
+		const commits = await owner.controlled.testTxCalls("txCommit");
+		expect(commits).toHaveLength(1);
+		expect(commits[0].items.map((item) => [KeyCodec.decode(item.hashKey), KeyCodec.decode(item.sortKey)])).toEqual(
+			expect.arrayContaining([
+				[h1, "a"],
+				[h2, "b"],
+			]),
+		);
+		expect(commits[0].items).toHaveLength(2);
+		expect(await owner.controlled.testTxCalls("txReadSnapshot")).toHaveLength(1);
+		expect(await owner.localItemCount(h1)).toBe(1);
+		expect(await owner.localItemCount(h2)).toBe(1);
+		// No split below the root runs during the test or after it.
+		expect((await raised(owner).status()).splitStatus).toBeUndefined();
+	}, 30_000);
+});
+
+// Two tests spy on a prototype, thus the rules of the spy in "serves a read and a write at the source
+// when a Bloom false positive names a range root before its cutover" apply: keep this `describe`
+// sequential and at the top level.
+describe("PartitionDO — the Bloom step of the transaction shapes", () => {
+	/** A Bloom filter at `partition`: it promotes `bob` and reads it once. The spies below have no effect without one. */
+	const learnOnePromotion = async (partition: TestPartition) => {
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("bob") });
+		await partition.awaitPromoted("bob");
+		await partition.get({ hashKey: kb("bob"), sortKey: kb("sk1") });
+	};
+	const spyBloomFor = (...hashKeys: string[]) =>
+		vi
+			.spyOn(PartialRangeTopology.prototype, "maybePromoted")
+			.mockImplementation((key) => hashKeys.some((hashKey) => KeyCodec.compare(key, kb(hashKey)) === 0));
+
+	it("jumps from the hash root to the range owner of a promoted key in one forward", async () => {
+		const partition = await splitHashOnce({ rangeSplitN: 2, rangeSplitConditions: { maxSizeMb: 1 } });
+		// A depth-1 hash leaf promotes `alice`, and the range tree of `alice` grows to depth 2.
+		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
+		const rangeRoot = await raised(await partition.childOwning("alice")).awaitPromoted("alice");
+		await rangeRoot.triggerRangeSplit((i) => `sk${String(i).padStart(3, "0")}`);
+		await rangeRoot.awaitSplitCompleted();
+		const leftChild = (await rangeRoot.children()).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+		const owner = (await leftChild.splitRange("aa")).find((c) => rangeOf(c.ctx).startBoundary === null)!;
+
+		// One read goes through the hash leaf, the range root, and the depth-1 range child. The hash root
+		// learns the promotion of `alice` and the slice of the owner.
+		const read = await partition.stub.apiGetItem(partition.ctx, { hashKey: kb("alice"), sortKey: kb("aa0000") });
+		expect(read.routing.forwardCount).toBe(4);
+		expect(executedBy(read).ref.doName).toBe(owner.doName);
+
+		// "a0" sorts before each "aa…" key, so the owner of "aa0000" owns it too.
+		const key = { hashKey: kb("alice"), sortKey: kb("a0") };
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = Date.now();
+		const prepare = await partition.stub.txPrepare(partition.ctx, {
+			transactionId,
+			transactionTimestamp,
+			coordinator: testCoordinatorRef(),
+			items: withOpIndex([{ ...key, operation: "put", data: "v", kind: "text" }]),
+		});
+		expect(prepare.value.outcome).toBe("accepted");
+		expect(prepare.routing.forwardCount).toBe(1);
+		expect(executedBy(prepare).ref.doName).toBe(owner.doName);
+
+		const commit = await partition.stub.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: [key] });
+		expect(commit.value.outcome).toBe("committed");
+		expect(commit.routing.forwardCount).toBe(1);
+		expect(executedBy(commit).ref.doName).toBe(owner.doName);
+
+		const snapshot = await partition.stub.txReadSnapshot(partition.ctx, { items: [key] });
+		expect(snapshot.value).toMatchObject({ outcome: "committed", items: [{ found: true, data: "v" }] });
+		expect(snapshot.routing.forwardCount).toBe(1);
+		expect(executedBy(snapshot).ref.doName).toBe(owner.doName);
+	}, 30_000);
+
+	it("drops a Bloom hit that would split the keys of one owner, for a group and for a single owner", async () => {
+		const partition = makePartition();
+		await learnOnePromotion(partition);
+
+		// The partition owns `alice` and `carol`. A Bloom false positive names the range root of its hash
+		// key, which does not exist. Without the guard, the commit sends `alice` and `carol` in two calls
+		// to the same partition, and it fails with `commit_keyset_mismatch`. In the first case the other
+		// hash key is local. In the second case both hash keys have a Bloom hit and one exact target.
+		for (const [i, bloomHits] of [["alice"], ["alice", "carol"]].entries()) {
+			const keys = [
+				{ hashKey: kb("alice"), sortKey: kb(`a${i}`) },
+				{ hashKey: kb("carol"), sortKey: kb(`b${i}`) },
+			];
+			const transactionId = crypto.randomUUID();
+			const transactionTimestamp = Date.now();
+			const maybePromotedSpy = spyBloomFor(...bloomHits);
+			try {
+				const prepare = await partition.rpc.txPrepare(partition.ctx, {
+					transactionId,
+					transactionTimestamp,
+					coordinator: testCoordinatorRef(),
+					items: withOpIndex(keys.map((key) => ({ ...key, operation: "put" as const, data: "v", kind: "text" as const }))),
+				});
+				expect(prepare.outcome).toBe("accepted");
+				expect(await partition.rpc.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: keys })).toMatchObject({
+					outcome: "committed",
+				});
+
+				// A single owner holds both keys, thus the request runs here and does not answer `not_applicable`.
+				const shot = await partition.rpc.txExecuteSingleShot(partition.ctx, {
+					items: withOpIndex(keys.map((key) => ({ ...key, operation: "put" as const, data: "v2", kind: "text" as const }))),
+				});
+				expect(shot.outcome).toBe("committed");
+			} finally {
+				maybePromotedSpy.mockRestore();
+			}
+			for (const key of keys) {
+				expect(await partition.get(key)).toMatchObject({ found: true, item: { data: "v2" } });
+			}
+		}
+		expect(await partition.localItemCount("alice")).toBe(2);
+		expect(await partition.localItemCount("carol")).toBe(2);
+	}, 30_000);
+
+	it("prepares and commits at the hash leaf when a Bloom hit names a range root before its cutover", async () => {
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		await learnOnePromotion(partition);
+		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "v", kind: "text" });
+
+		const rangeRoot = partition.rangeRoot("alice");
+		await rangeRoot.controlled.testHoldInit();
+		const maybePromotedSpy = spyBloomFor("alice");
+		const key = { hashKey: kb("alice"), sortKey: kb("sk2") };
+		try {
+			// The range root has its identity and no page yet, because the source cuts over only after
+			// `fokosInit` answers.
+			await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
+			await vi.waitFor(async () => expect(await rangeRoot.controlled.testInitCalls()).toBeGreaterThan(0), { timeout: 5000, interval: 10 });
+
+			// The range root answers `partition_migrating` with `awaiting_data`, and the source runs each
+			// request itself.
+			const transactionId = crypto.randomUUID();
+			const transactionTimestamp = Date.now();
+			const prepare = await partition.stub.txPrepare(partition.ctx, {
+				transactionId,
+				transactionTimestamp,
+				coordinator: testCoordinatorRef(),
+				items: withOpIndex([{ ...key, operation: "put", data: "v2", kind: "text" }]),
+			});
+			expect(prepare.value.outcome).toBe("accepted");
+			expect(prepare.routing.forwardCount).toBe(1);
+			expect(executedBy(prepare).ref.doName).toBe(partition.doName);
+
+			const commit = await partition.stub.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: [key] });
+			expect(commit.value.outcome).toBe("committed");
+			expect(commit.routing.forwardCount).toBe(1);
+			expect(executedBy(commit).ref.doName).toBe(partition.doName);
+			expect(await partition.localItemCount("alice")).toBe(2);
+		} finally {
+			await rangeRoot.controlled.testReleaseInit();
+			maybePromotedSpy.mockRestore();
+		}
+
+		// The import after the cutover brings the committed item to the range tree.
+		await partition.awaitPromoted("alice");
+		expect(await partition.get(key)).toMatchObject({ found: true, item: { data: "v2" } });
 	}, 30_000);
 });

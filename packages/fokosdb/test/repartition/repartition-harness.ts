@@ -19,7 +19,12 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
-import { isRangePartition, partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
+import {
+	isRangePartition,
+	partitionIdentityFrom,
+	PartitionIdHelper,
+	resolveRangePartitionContext,
+} from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";

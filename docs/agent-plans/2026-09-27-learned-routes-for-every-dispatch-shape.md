@@ -1,10 +1,11 @@
 # RFC — Every dispatch shape uses the learned routes inside the partitions
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-27
 **Author:** Lambros Petrou
 
-**Status:** Not implemented.
+**Status:** M1, M2, M3, and M4 are built. Sections 1 and 4 describe the code before this spec as "today". The cost
+of one `findDeepestKnownRangeSlice` query in section 4.2.10 is not measured yet.
 
 ## Table of contents
 
@@ -17,6 +18,8 @@
 - [5. Alternative options](#5-alternative-options)
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
+- [8. Appendix](#8-appendix)
+  - [8.1 The call tree of a group dispatch](#81-the-call-tree-of-a-group-dispatch)
 
 ## 1. Overview and context
 
@@ -191,12 +194,13 @@ the keys again without the Bloom step before it answers `not_applicable`.
 
 #### 4.2.1 Resolution modes
 
-`src/sharding/runtime.ts` keeps two constants:
+`src/sharding/runtime.ts` keeps three constants:
 
-- `EXACT`, which is `{ bloom: false, learnedRange: false }`. Its users are `owns()`, `fokosRequestPromotion`, and
-  the speculation guard.
+- `EXACT`, which is `{ bloom: false, learnedRange: false }`. Its users are `owns()` and `fokosRequestPromotion`.
 - `HINTED` (new), which is `{ bloom: true, learnedRange: true }`. Its users are `#dispatchPoint`,
   `#dispatchGroup`, `#dispatchSingleOwner`, and `resolveOwner`.
+- `HINTED_NO_BLOOM` (new), which is `{ bloom: false, learnedRange: true }`. Its users are each `group` and
+  `single_owner` retry, and the single-owner rule of section 4.2.5.
 
 `EXACT` still uses the hash arena. Section 4.2.2 shows why the arena keeps the one-call-per-owner rule. The miss
 ladder of section 4.2.6 turns Bloom off for each `group` and `single_owner` retry. It keeps learned slices on from
@@ -234,16 +238,25 @@ reaches one.
 
 #### 4.2.3 The speculation guard of a group
 
-After `#dispatchGroup` resolves each item with `HINTED`, it runs the guard when at least one item has
-`via: "bloom"`:
+`#dispatchGroup` resolves each item with `HINTED` in one loop. It groups each item without a Bloom hit by
+target, and it keeps the items with `via: "bloom"` aside, by hash key. When at least one item has a Bloom hit, it
+runs the guard:
 
-1. For each item, resolve the key with `EXACT`. The exact target is a partition ID, or `local`.
-2. For each hash key `H` whose items have `via: "bloom"`: when an item of another hash key has the same exact
-   target as `H`, resolve each item of `H` again with `{ bloom: false, learnedRange: true }`.
-3. Group the items by target, as now.
+1. For each hash key `H` with a Bloom hit, find the exact target of `H`: `local`, or the hash descendant that the
+   hash arena names.
+2. When another hash key has an item at the exact target of `H`, send each item of `H` to that exact target.
+   Otherwise, keep the Bloom resolution of each item of `H`.
 
-Step 1 runs only when a Bloom hit exists. It reads the topology, the arena in memory, and one route override row
-for each key.
+The guard needs no exact resolution of the other items, for three reasons:
+
+- The resolution of an item without a Bloom hit is exact, or it names a range partition of its own hash key. A
+  range partition of another hash key is never the exact target of `H`.
+- The Bloom filter answers for the hash key, so each item of `H` has a Bloom hit.
+- `H` has no cut-over route override here, so its exact target is its topology owner. This is also the answer of
+  `{ bloom: false, learnedRange: true }` for `H`.
+
+The guard runs only when a Bloom hit exists. It reads `routerRole()` once, and it walks the arena in memory once
+for each hash key with a Bloom hit. It reads no route override row.
 
 **Why the guard is enough.** A Bloom group of `H` can fall back only to the exact target of `H`. The guard makes
 sure that no other hash key has that target. So the fallback sends the keys of `H` to a partition that receives
@@ -421,8 +434,8 @@ UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` sections 
   promoted hash key adds one `findDeepestKnownRangeSlice` query. The query uses the primary key of
   `fokos_range_hierarchy`, `(hk, sk_start_boundary, sk_end_boundary)`. `TODO: measure` the cost of one query. A
   transaction has at most `MAX_ITEMS_PER_TX` (100) items.
-- **Bloom hit.** The guard adds one exact resolution for each item. That is the arena walk in memory and one
-  route override read.
+- **Bloom hit.** The guard adds one `routerRole()` read, and one arena walk in memory for each hash key with a
+  Bloom hit.
 - **Saved forwards.** Each skipped forward is one RPC between Durable Objects, which costs one network round
   trip. The example of section 1.2 goes from 4 forwards to 1, for each of `txPrepare` and `txCommit`.
 - **Miss.** A Bloom false positive costs one extra forward, as on the point shape. The filter keeps the false
@@ -439,12 +452,12 @@ returns to the current behavior. The learned rows stay valid hints.
 
 Tests run in the Workers runtime through `@cloudflare/vitest-plugin`.
 
-- **Milestone 1, arena fallback.** In `test/partition-do/tx-participant.test.ts` or `test/transactions/`, use a
-  test-only cache setup to make a hash router name a descendant that does not exist. Prepare two keys of one owner,
+- **Milestone 1, arena fallback.** In `test/partition-do/promotion.test.ts`, use a test-only cache setup to make a hash router name a descendant that does not exist. Prepare two keys of one owner,
   then commit through the router. Make Bloom answer `true` for only one key. The miss retry must keep Bloom off and
   send both keys to their owner in one call. Do not add a production hook. If no test-only setup can make this miss,
   report the arena fallback and Bloom-off retry as untested before milestone 1 ships. Run this test again in
-  milestone 3.
+  milestone 3. The test needs a spy on a prototype, and `tools/check-test-machinery.js` permits such a spy only in
+  `promotion.test.ts`.
 - **Milestone 2, learned slices.** In `test/partition-do/promotion.test.ts` or `range-split.test.ts`: build the
   shape of section 1.2 with `TestPartition` (`splitHash`, `makeRangeRoot`, `triggerRangeSplit`). Warm the caches
   with one read. Then `txPrepare` and `txCommit` for `(H, sk)` through the partition with the override have a
@@ -456,6 +469,7 @@ Tests run in the Workers runtime through `@cloudflare/vitest-plugin`.
   before its cutover" does. Keep the `describe` sequential and at the top level, for the reason in that test.
   Then prepare and commit a transaction on `(H1, a)` and `(H2, b)`, where one hash leaf owns both keys. The commit
   succeeds, and the hash leaf applies both items. Without the guard, this test fails with `commit_keyset_mismatch`.
+  Do it again with a spy that returns `true` for `H1` and `H2`, so that two Bloom hash keys have one exact target.
 - **Milestone 3, before the cutover.** Hold `fokosInit` of the range root of `H` with `testHoldInit`, as the
   existing test does. Make the Bloom filter answer `true` for `H`. A transaction on `H` prepares and commits at the
   hash leaf.
@@ -523,3 +537,96 @@ No. It runs only when at least one key has a Bloom hit.
 - `packages/fokosdb/src/server/do-partition.ts`
 - `packages/fokosdb/src/shared/partition/transaction-participant.ts`
 - `packages/fokosdb/test/partition-do/promotion.test.ts`
+
+## 8. Appendix
+
+### 8.1 The call tree of a group dispatch
+
+The tree shows one `txCommit` request that enters a hash router. `txCommit` is a `group`
+operation with `failurePolicy: "attempt_all"`. Each function is in `src/sharding/runtime.ts`, except the two
+functions that name `do-partition.ts`.
+
+```text
+PartitionDO.txCommit                          (do-partition.ts)
+└─ #api                                       (do-partition.ts: arms the TTL sweep)
+   └─ fokos.dispatch
+      └─ #guard                               (turns an error into a routed error)
+         ├─ #ensureIdentity                   (checks the route context, stores a new policy)
+         ├─ new RouteCollector
+         └─ #dispatch
+            ├─ [importing] #whileImporting    → throws partition_migrating (whileMigrating: "throw")
+            └─ #dispatchGroup
+               ├─ descriptor.items(req)       (the host gives one entry for each key)
+               ├─ [no items] #admit → #beforeForward → #runLocal → #applySignals → return
+               │
+               ├─ #groupByOwner(HINTED)       ── the synchronous block starts here ──
+               │  ├─ #resolve (for each key)
+               │  │  ├─ #ownsByTopology       → out_of_range → partition_misrouted
+               │  │  ├─ route override        → #rangeOwner (via "override", learned slice or range root)
+               │  │  ├─ [bloom on] Bloom hit  → #rangeOwner (via "bloom", learned slice or range root)
+               │  │  ├─ not a router          → local
+               │  │  └─ router                → #arena().findLeaf → #hashDescendant (via "hash")
+               │  │  (one loop: an entry without a Bloom hit → addToGroups; a Bloom hit → set aside by hash key)
+               │  └─ [a Bloom hit] #guardBloomHits
+               │     ├─ #hashTopologyOwner (for each Bloom hash key H) → the exact target of H
+               │     └─ the exact target of H also gets another hash key → the entries of H go there
+               │
+               ├─ #admit (the local keys)
+               ├─ #beforeForward              (txCancel: cancelLocal on each partition that the cancel reaches)
+               │
+               └─ #runGroups(retries = 0)
+                  ├─ the local part:
+                  │  ├─ #localCall
+                  │  ├─ descriptor.subRequest
+                  │  ├─ collector.add(#selfNode("executed"))
+                  │  └─ #runLocal             → the host handler (synchronous)
+                  ├─ for each remote group (started, not awaited):
+                  │  └─ #forwardGroup         ── the synchronous block stops at the first await ──
+                  │     ├─ descriptor.subRequest
+                  │     ├─ #forwardTo
+                  │     │  ├─ collector.countForward
+                  │     │  ├─ stub[op](targetCtx, req)   → the next partition runs this tree again
+                  │     │  ├─ success: #learn → collector.mergeForwarded
+                  │     │  └─ error:   #learn → mergeForwarded → addRaiser → throw again
+                  │     └─ on an error, the group ladder:
+                  │        ├─ #missLadder(keys, resolution, e, readOnly, "group")
+                  │        │  ├─ learned slice + range_partition_not_initialized → deleteLearnedRangeSlice
+                  │        │  ├─ via "bloom" + not initialized or awaiting_data  → forget nothing
+                  │        │  ├─ via "hash", relDepth > 1 + hash_partition_not_initialized
+                  │        │  │     → #arena().invalidate → putHashArena
+                  │        │  └─ any other case → null → throw again
+                  │        ├─ [null, or retries ≥ maxForwardRetries] → throw again
+                  │        ├─ collector.forget(target)
+                  │        ├─ #groupByOwner(HINTED_NO_BLOOM)   (the entries of this group only, no guard)
+                  │        ├─ #admit (the keys that are local now)
+                  │        └─ #runGroups(retries + 1, [])   ← the same tree again
+                  │           └─ throws its first failure (the local one first), or returns its parts
+                  ├─ await the local value → keep its signals
+                  ├─ #applySignals(beforeForward + local)
+                  ├─ collector.add(#selfNode("merged"))   (only when a remote group exists)
+                  └─ settle the remote groups
+                     ├─ attempt_all: Promise.allSettled → parts and remoteFailures
+                     └─ fail_fast:   Promise.all → the first rejection throws
+               │
+               ├─ a local failure   → throw the local error
+               ├─ a remote failure  → throw partition_fanout_failed (cause: the first failure)
+               └─ envelope(descriptor.merge(parts), collector.build())
+```
+
+How to read the tree:
+
+- **The synchronous block.** The block starts at the first `#resolve` and stops at the first `await` in
+  `#forwardGroup`. It contains the resolution, `#admit`, `#beforeForward`, the local handler, and the start of each
+  remote RPC. No step yields inside the block, so a cutover cannot come between the owner decision and the write.
+- **The fallback chain.** A fallback in `#forwardGroup` calls `#groupByOwner`, `#admit`, and `#runGroups` again,
+  with `retries + 1`. One fallback chain is one path down this recursion. `maxForwardRetries` bounds each chain
+  (section 4.2.4).
+- **The failure path.** Inside a fallback, `#forwardGroup` throws the first failure without a change. Only
+  `#dispatchGroup` wraps a remote failure as `partition_fanout_failed`. So each partition hop wraps an
+  `attempt_all` failure one time.
+- **The next partition.** Each `stub[op]` call in `#forwardTo` starts the tree again on the target, with a new
+  `RouteCollector`. The routing of the target comes back through `mergeForwarded`.
+
+The single-owner dispatch has the same first steps. `#singleOwner(HINTED)` resolves the keys. When a Bloom hit puts
+them on more than one partition, it resolves them again with `HINTED_NO_BLOOM` (section 4.2.5). `#forwardSingleOwner`
+then forwards the whole request, and its fallback asks `#missLadder` with the shape `"single_owner"`.
