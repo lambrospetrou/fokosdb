@@ -12,7 +12,7 @@ import {
 	coordinatorShardGroup,
 	type FokosDBPolicy,
 	type FokosDBRouteContext,
-	PartitionContextCreator,
+	createTableConfig,
 } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow, type FokosDBLimitOverrides } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
@@ -115,24 +115,32 @@ export type MakeDBOptions = {
 /** A client over its own table, so no two tests share partitions. */
 export function makeDB(opts?: MakeDBOptions) {
 	const { maxSizeMb, rootTreesN, tableName, controlled, limits, ...dbOptions } = opts ?? {};
-	const base = PartitionContextCreator.create({
-		ns: controlled ? "CONTROLLED_PARTITION_DO" : "PARTITION_DO",
-		nsTx: controlled ? "CONTROLLED_TRANSACTION_COORDINATOR_DO" : "TRANSACTION_COORDINATOR_DO",
-		tableName: tableName ?? `txtest.${crypto.randomUUID()}`,
-		rootTreesN: rootTreesN ?? 100,
-		hashSplitN: 2,
+	const { coordinatorRootsN, ...clientOptions } = dbOptions;
+	return new FokosDB({
+		table: {
+			name: tableName ?? `txtest.${crypto.randomUUID()}`,
+			ns: controlled ? "CONTROLLED_PARTITION_DO" : "PARTITION_DO",
+			nsTx: controlled ? "CONTROLLED_TRANSACTION_COORDINATOR_DO" : "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: rootTreesN ?? 100,
+			hashSplitN: 2,
+			coordinatorRootsN: coordinatorRootsN ?? (controlled ? 1 : undefined),
+		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: maxSizeMb ?? 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
 		limits,
+		...clientOptions,
 	});
-	const topology = new FokosRouter(base.topology, base.rangeConfig, base.policy);
-	return new FokosDB({ topology, ...(controlled ? { coordinatorRootsN: 1 } : {}), ...dbOptions });
+}
+
+/** The router of the partitions of a table, built from the options of the client as FokosDB builds it. */
+export function partitionRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
+	const { topology, rangeConfig, policy } = createTableConfig(db.options());
+	return new FokosRouter(topology, rangeConfig, policy);
 }
 
 export function partitionNameOf(db: FokosDB, key: { hashKey: string; sortKey?: string }): string {
-	const topology = db.options().topology;
-	return topology.rootContext(KeyCodec.encode(key.hashKey)).doName;
+	return partitionRouter(db).rootContext(KeyCodec.encode(key.hashKey)).doName;
 }
 
 export function countDistinctPartitions(db: FokosDB, keys: Array<{ hashKey: string; sortKey?: string }>): number {
@@ -171,16 +179,14 @@ export function keysInOnePartition(db: FokosDB, count: number, prefix: string): 
 
 /** The stub and route context of the partition that owns `key`, in the namespace of the table. */
 export function owningPartition(db: FokosDB, key: Key) {
-	const { topology } = db.options();
-	const pCtx = topology.rootContext(KeyCodec.encode(key.hashKey));
-	const stub = testPartitionStub(pCtx.doName, topology.policy.ns);
+	const pCtx = partitionRouter(db).rootContext(KeyCodec.encode(key.hashKey));
+	const stub = testPartitionStub(pCtx.doName, pCtx.policy.ns);
 	return { stub, rpc: openedRpc(stub), pCtx };
 }
 
 /** The test controls of the partition that owns `key`. The table must be `controlled`. */
 export function controlledPartition(db: FokosDB, key: Key): DurableObjectStub<ControlledPartitionDO> {
-	const { topology } = db.options();
-	expect(topology.policy.ns, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
+	expect(db.options().table.ns, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_PARTITION_DO");
 	return env.CONTROLLED_PARTITION_DO.getByName(partitionNameOf(db, key));
 }
 
@@ -196,18 +202,15 @@ export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op)
 
 /** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>`. */
 export function coordinatorRouter(db: FokosDB): FokosRouter<FokosDBPolicy> {
-	const { topology, coordinatorRootsN } = db.options();
-	return new FokosRouter(
-		{ ...topology.topology, shardGroup: coordinatorShardGroup(topology.topology), rootTreesN: coordinatorRootsN },
-		topology.rangeConfig,
-		topology.policy,
-	);
+	const { coordinatorRootsN } = db.options().table;
+	const { topology, rangeConfig, policy } = createTableConfig(db.options());
+	return new FokosRouter({ ...topology, shardGroup: coordinatorShardGroup(topology), rootTreesN: coordinatorRootsN }, rangeConfig, policy);
 }
 
 /** The test controls of the one root coordinator of a `controlled` table. */
 export function controlledCoordinator(db: FokosDB): DurableObjectStub<ControlledTransactionCoordinatorDO> {
-	const { topology, coordinatorRootsN } = db.options();
-	expect(topology.policy.nsTx, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
+	const { nsTx, coordinatorRootsN } = db.options().table;
+	expect(nsTx, "a test control needs a table made with { controlled: true }").toBe("CONTROLLED_TRANSACTION_COORDINATOR_DO");
 	expect(coordinatorRootsN, "the coordinator test controls need a pool of one root coordinator").toBe(1);
 	return env.CONTROLLED_TRANSACTION_COORDINATOR_DO.getByName(coordinatorRouter(db).allRoots()[0].doName);
 }

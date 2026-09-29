@@ -30,42 +30,75 @@ If you want the manually published version on NPM:
 npm install fokosdb@dev
 ```
 
-## Two subpath imports
+## Subpath imports
 
-The package publishes exactly two entry points. There is no bare `fokosdb` import.
+The package publishes four entry points. There is no bare `fokosdb` import. To use FokosDB, you need
+only `fokosdb/client` and `fokosdb/server`.
 
-| Import           | What it gives you                                                          | Where it runs              |
-| ---------------- | -------------------------------------------------------------------------- | -------------------------- |
-| `fokosdb/client` | `FokosDB`, `PartitionTopologyRouterImpl`, `PartitionContextCreator`, types | Your Worker's request path |
-| `fokosdb/server` | `PartitionDO`, `TransactionCoordinatorDO`                                  | The Durable Objects        |
+| Import                    | What it gives you                                                 | Where it runs              |
+| ------------------------- | ----------------------------------------------------------------- | -------------------------- |
+| `fokosdb/client`          | `FokosDB`, its option and error types                             | Your Worker's request path |
+| `fokosdb/server`          | `PartitionDO`, `TransactionCoordinatorDO`                         | The Durable Objects        |
+| `fokosdb/sharding/client` | `FokosShardingClient`, routing types and errors                   | Your Worker's request path |
+| `fokosdb/sharding/server` | `FokosShardingRuntime`, for your own sharded Durable Object class | Your Durable Objects       |
 
-Both entries run inside `workerd`. "Client" means the Worker-side caller that routes requests to the
+Every entry runs inside `workerd`. "Client" means the Worker-side caller that routes requests to the
 partitions — not a browser. Only `fokosdb/server` carries the Durable Object implementations, so a
 Worker that talks to an already-deployed FokosDB deployment can import `fokosdb/client` alone.
 
 ```ts
-import { FokosDB, PartitionContextCreator, PartitionTopologyRouterImpl } from "fokosdb/client";
-
-const partitionContext = PartitionContextCreator.create({
-	tableName: "my-table",
-	ns: "PARTITION_DO",
-	nsTx: "TRANSACTION_COORDINATOR_DO",
-	rootTreesN: 10,
-	hashSplitN: 4,
-	hashSplitConditions: { maxSizeMb: 1000 },
-});
+import { FokosDB } from "fokosdb/client";
 
 const db = new FokosDB({
-	topology: new PartitionTopologyRouterImpl(partitionContext),
+	// The identity of the table. Never change these values after the table has data.
+	table: {
+		name: "my-table",
+		ns: "PARTITION_DO",
+		nsTx: "TRANSACTION_COORDINATOR_DO",
+		rootTreesN: 10,
+		hashSplitN: 4,
+	},
+	// These options can change between deploys.
+	hashSplitConditions: { maxSizeMb: 1000 },
 });
 
 await db.putItem({ hashKey: "user#1", sortKey: "profile", data: "hello" });
 const result = await db.getItem({ hashKey: "user#1", sortKey: "profile" });
 ```
 
+`FokosDB` gets the Durable Object bindings from the `env` of `cloudflare:workers`, so you can create
+the client one time at module scope or for each request.
+
+### The identity of a table
+
+The options in `table` select the Durable Objects of the table. Every client of the table must give
+the same values, and the values must never change after the table has data.
+
+| Option              | Required | What it selects                                                                         |
+| ------------------- | -------- | --------------------------------------------------------------------------------------- |
+| `name`              | Yes      | The names of the Durable Objects. It must not start with `fokos.`.                      |
+| `ns`                | Yes      | The binding of the `PartitionDO` namespace.                                             |
+| `nsTx`              | Yes      | The binding of the `TransactionCoordinatorDO` namespace.                                |
+| `rootTreesN`        | Yes      | The number of root partitions, from 1 to 65,000.                                        |
+| `hashSplitN`        | Yes      | The number of children of each hash split, from 2 to 255.                               |
+| `coordinatorRootsN` | No       | The number of root transaction coordinators. Default: `2 * rootTreesN`, at most 65,000. |
+| `jurisdiction`      | No       | The jurisdiction of every Durable Object of the table. See the section below.           |
+
+> [!WARNING]
+> If you change `name`, `ns`, `nsTx` or `jurisdiction`, the client connects to other, empty Durable
+> Objects, and the library cannot detect it. If you change `rootTreesN`, `hashSplitN` or
+> `coordinatorRootsN`, the existing partitions or coordinators reject each request with
+> `partition_context_mismatch`.
+> In both cases the data stays in the old Durable Objects.
+
+All other options are outside `table` and can change: `rangeSplitN`, `hashSplitConditions`,
+`rangeSplitConditions`, `rangeAncestorsConfig`, `locationHint`, `limits`, `singlePartitionFastPath`,
+`retry` and `partitionMigratingRetryDeadlineMs`. A change to `rangeSplitN` applies only to the range
+splits that start after it. Never decrease a key size limit in `limits` after items with larger keys exist.
+
 ### Jurisdictions and identity hazard
 
-A table can specify `jurisdiction: "eu" | "fedramp" | "us"` in `PartitionContextCreator.create`.
+A table can specify `jurisdiction: "eu" | "fedramp" | "us"` in the `table` option of `FokosDB`.
 The jurisdiction restricts all partition and transaction coordinator objects of the table to that geographic or regulatory area.
 
 - https://developers.cloudflare.com/durable-objects/reference/data-location/#supported-locations
@@ -114,15 +147,17 @@ Subclassing `PartitionDO` works, and a subclass needs its own binding, its own e
 
 ## Package layout
 
-`src/` splits three ways. `client/` and `server/` are the two build entries; `shared/` holds
-everything both sides use and is not published on its own — tsdown compiles it into whichever entry
-reaches it, so a consumer never sees it.
+`src/` splits four ways. `client/` and `server/` are the FokosDB build entries. `sharding/` is the
+sharding library, which uses no FokosDB module, and has the two sharding entries. `shared/` holds
+everything both FokosDB sides use and is not published on its own — tsdown compiles it into whichever
+entry reaches it, so a consumer never sees it.
 
 ```
 src/
-  client/   FokosDB and the routing surface
-  server/   the Durable Object classes
-  shared/   key codec, expressions, partition topology, transaction types, …
+  client/     FokosDB and its public types
+  server/     the Durable Object classes
+  sharding/   the sharding library: index-client.ts and index-server.ts
+  shared/     key codec, expressions, partition topology, transaction types, …
 ```
 
 `xxhash-wasm`, `durable-utils` and `cloudflare:workers` stay external in the build. Resolving

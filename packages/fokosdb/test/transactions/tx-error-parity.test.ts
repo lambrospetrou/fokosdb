@@ -5,7 +5,7 @@ import { FokosError } from "../../src/shared/errors.js";
 import { FokosTransactionCancelledError } from "../../src/shared/errors-operations.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
-import { keysInOnePartition, makeDB, type Key } from "./tx-helpers.js";
+import { keysInOnePartition, makeDB, partitionRouter, type Key } from "./tx-helpers.js";
 
 /**
  * A transaction raises the same exception, category, and code for one failure on the single-partition
@@ -103,7 +103,7 @@ describe.each(PATHS)("transactGetItems on %s", (_path, pathOptions) => {
 async function lockItem(db: ReturnType<typeof makeDB>, key: Key): Promise<() => Promise<void>> {
 	const hashKey = KeyCodec.encode(key.hashKey);
 	const sortKey = KeyCodec.encode(key.sortKey);
-	const partitionContext = db.options().topology.rootContext(hashKey);
+	const partitionContext = partitionRouter(db).rootContext(hashKey);
 	const rpc = openedRpc(testPartitionStub(partitionContext.doName));
 	const transactionId = crypto.randomUUID().replaceAll("-", "");
 	await rpc.txPrepare(partitionContext, {

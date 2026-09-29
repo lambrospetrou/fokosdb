@@ -3,7 +3,7 @@
  * every call, so a test proves which binding a helper resolved and whether `jurisdiction()` ran.
  */
 import { describe, expect, it, vi } from "vitest";
-import { PartitionContextCreator } from "./partition-context.js";
+import { createTableConfig } from "./partition-context.js";
 import {
 	partitionNamespace,
 	partitionStub,
@@ -29,14 +29,9 @@ function makeEnv(jurisdiction?: DurableObjectJurisdiction, locationHint?: Durabl
 	partitionNs.jurisdiction.mockReturnValue(partitionSub);
 	coordinatorNs.jurisdiction.mockReturnValue(coordinatorSub);
 	const env = { PARTITION_DO: partitionNs, TRANSACTION_COORDINATOR_DO: coordinatorNs } as unknown as Env;
-	const ctx = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: "do-stubs-test",
-		rootTreesN: 1,
-		hashSplitN: 2,
+	const ctx = createTableConfig({
+		table: { name: "do-stubs-test", ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 1, hashSplitN: 2, jurisdiction },
 		hashSplitConditions: { maxSizeMb: 100 },
-		...(jurisdiction === undefined ? {} : { jurisdiction }),
 		...(locationHint === undefined ? {} : { locationHint }),
 	});
 	return { env, ctx, partitionNs, coordinatorNs, partitionSub, coordinatorSub };

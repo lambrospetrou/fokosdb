@@ -8,7 +8,7 @@ import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
 import type { ConditionExpression } from "../../src/shared/expression/types.js";
-import { PartitionContextCreator } from "../../src/shared/partition-context.js";
+import { createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { PartitionDO, PartitionOps, SplitStatusView } from "../../src/server/do-partition.js";
@@ -95,19 +95,26 @@ export function withOpIndex(items: Omit<TransactionItem, "opIndex">[]): Transact
 }
 
 export type SplitStartedOrCompleted = Extract<SplitStatusView, { status: "split_started" | "split_completed" }>;
-export type PartitionOptions = Partial<Parameters<typeof PartitionContextCreator.create>[0]>;
+/** The options of a test table. The fields of `table` are flat, next to the other options. */
+export type PartitionOptions = Partial<
+	Omit<FokosTableIdentity, "name" | "coordinatorRootsN"> & Omit<FokosTableOptions, "table"> & { tableName: string }
+>;
 
 export function makeStub(opts?: PartitionOptions) {
-	const base = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: `test.${crypto.randomUUID()}`,
-		rootTreesN: 1,
-		hashSplitN: 2,
+	const { tableName, ns, nsTx, rootTreesN, hashSplitN, jurisdiction, ...rest } = opts ?? {};
+	const base = createTableConfig({
+		table: {
+			name: tableName ?? `test.${crypto.randomUUID()}`,
+			ns: ns ?? "PARTITION_DO",
+			nsTx: nsTx ?? "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: rootTreesN ?? 1,
+			hashSplitN: hashSplitN ?? 2,
+			jurisdiction,
+		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
-		...opts,
+		...rest,
 	});
 	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy).rootContext(kb("dummyHashKey"));
 	const stub = testPartitionStub(ctx.doName, ctx.policy.ns);

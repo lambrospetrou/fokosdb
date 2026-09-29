@@ -25,7 +25,6 @@ import {
 } from "../shared/types.js";
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import { FOKOS_HASH_PARTITIONS_MAX } from "../sharding/route-context.js";
-import type { FokosRouter } from "../sharding/router.js";
 import { FokosShardingClient, dropCallCost, type FokosRetryPolicy } from "../sharding/client.js";
 import type { PartitionOps } from "../server/do-partition.js";
 import type { CoordinatorOps } from "../server/do-transaction-coordinator.js";
@@ -107,7 +106,14 @@ import {
 	compileUpdateExpression,
 } from "../shared/expression/compiler.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
-import { coordinatorShardGroup, type FokosDBPolicy } from "../shared/partition-context.js";
+import {
+	coordinatorShardGroup,
+	createTableConfig,
+	type FokosDBPolicy,
+	type FokosDBTableConfig,
+	type FokosTableIdentity,
+	type FokosTableOptions,
+} from "../shared/partition-context.js";
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
@@ -320,18 +326,11 @@ function validateTtlAt(ttlAt: number | undefined, where: string): void {
 	}
 }
 
-export type FokosDBOptions = {
-	/** The router of the table: its topology, range config and policy. */
-	topology: FokosRouter<FokosDBPolicy>;
-
-	/**
-	 * The root coordinators of the table. Defaults to two per root partition, with a maximum of
-	 * `FOKOS_HASH_PARTITIONS_MAX`. Each root splits by hash when it grows larger than `hashSplitConditions.maxSizeMb` of
-	 * the table, or larger than the size limit of a coordinator. Thus the pool grows automatically.
-	 * The value must not change for a table that exists, as `rootTreesN` must not.
-	 */
-	coordinatorRootsN?: number;
-
+/**
+ * The options of a FokosDB client. `table` holds the identity of the table, and every client of the
+ * table must give the same values. The other options can change between deploys.
+ */
+export type FokosDBOptions = FokosTableOptions & {
 	/**
 	 * Runs a transaction whose items are all owned by ONE partition against that partition directly,
 	 * in a single round trip, instead of through a transaction coordinator. Defaults to true.
@@ -356,6 +355,17 @@ export type FokosDBOptions = {
 	 * it. The client cannot read that setting. Default: 15,000 ms.
 	 */
 	partitionMigratingRetryDeadlineMs?: number;
+};
+
+/** `FokosDBOptions` with the defaults of the client applied. */
+export type FokosDBResolvedOptions = Omit<
+	FokosDBOptions,
+	"table" | "singlePartitionFastPath" | "retry" | "partitionMigratingRetryDeadlineMs"
+> & {
+	table: FokosTableIdentity & { readonly coordinatorRootsN: number };
+	singlePartitionFastPath: boolean;
+	retry: Required<FokosDBRetryOptions>;
+	partitionMigratingRetryDeadlineMs: number;
 };
 
 function validateRetryOptions(retry: Required<FokosDBRetryOptions>, partitionMigratingRetryDeadlineMs: number): void {
@@ -388,7 +398,9 @@ function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): Ope
 }
 
 export class FokosDB {
-	#options: Required<Omit<FokosDBOptions, "retry">> & { retry: Required<FokosDBRetryOptions> };
+	#options: FokosDBResolvedOptions;
+	/** The route context parts of the table, which every coordinator request carries. */
+	#table: FokosDBTableConfig;
 	/** The key size limits of the table, resolved once from its policy. */
 	#limits: FokosDBLimits;
 	/** The partitions of the table. */
@@ -397,12 +409,16 @@ export class FokosDB {
 	#coordinators: FokosShardingClient<FokosDBPolicy, CoordinatorOps>;
 
 	constructor(options: FokosDBOptions) {
-		const { topology, rangeConfig, policy } = options.topology;
+		this.#table = createTableConfig(options);
+		const { topology, rangeConfig, policy } = this.#table;
 		// The default has the same maximum as the check below, so a large `rootTreesN` does not fail.
 		this.#options = {
 			...options,
-			coordinatorRootsN:
-				options.coordinatorRootsN ?? Math.min(TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN, FOKOS_HASH_PARTITIONS_MAX),
+			table: {
+				...options.table,
+				coordinatorRootsN:
+					options.table.coordinatorRootsN ?? Math.min(TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN, FOKOS_HASH_PARTITIONS_MAX),
+			},
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
 			// A client is made for each request, so the defaults are shared and not checked again.
 			retry:
@@ -419,7 +435,7 @@ export class FokosDB {
 			validateRetryOptions(this.#options.retry, this.#options.partitionMigratingRetryDeadlineMs);
 		}
 		this.#limits = resolveLimits(policy.limits);
-		const { coordinatorRootsN } = this.#options;
+		const { coordinatorRootsN } = this.#options.table;
 		if (!Number.isInteger(coordinatorRootsN) || coordinatorRootsN < 1 || coordinatorRootsN > FOKOS_HASH_PARTITIONS_MAX) {
 			throw new FokosValidationError(VALIDATION_CODES.num_tx_coordinators_invalid, {
 				message: `coordinatorRootsN must be an integer between 1 and ${FOKOS_HASH_PARTITIONS_MAX}`,
@@ -447,7 +463,8 @@ export class FokosDB {
 		});
 	}
 
-	options() {
+	/** The options of this client, with the defaults applied. */
+	options(): FokosDBResolvedOptions {
 		return { ...this.#options };
 	}
 
@@ -629,7 +646,7 @@ export class FokosDB {
 		// request carries the token, so a retry resumes the same transaction and never starts a second one.
 		const deadline = Date.now() + this.#options.partitionMigratingRetryDeadlineMs;
 		const { baseDelayMs, maxDelayMs } = this.#options.retry;
-		const { topology, rangeConfig, policy } = this.#options.topology;
+		const { topology, rangeConfig, policy } = this.#table;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
 		const { value: encoded } = await this.#coordinators.point(

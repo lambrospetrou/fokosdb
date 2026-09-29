@@ -39,8 +39,6 @@ import { FokosTransactionCancelledError } from "../../src/shared/errors-operatio
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { JsonComposite, JsonPrimitive, JsonValue } from "../../src/shared/json-types.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator } from "../../src/shared/partition-context.js";
-import { FokosRouter } from "../../src/sharding/router.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
@@ -80,17 +78,18 @@ export const textDecoder = new TextDecoder();
  * range tree passes a small `rangeSplitMaxSizeMb` as well.
  */
 export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number; rangeSplitMaxSizeMb?: number }): FokosDB {
-	const base = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: `test.pbt.${crypto.randomUUID()}`,
-		rootTreesN: 3,
-		hashSplitN: 2,
+	return new FokosDB({
+		table: {
+			name: `test.pbt.${crypto.randomUUID()}`,
+			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: 3,
+			hashSplitN: 2,
+		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: opts?.hashSplitMaxSizeMb ?? 500 },
 		rangeSplitConditions: { maxSizeMb: opts?.rangeSplitMaxSizeMb ?? 500 },
 	});
-	return new FokosDB({ topology: new FokosRouter(base.topology, base.rangeConfig, base.policy) });
 }
 
 // ─── The keys and the payloads ────────────────────────────────────────────────

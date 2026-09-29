@@ -1,6 +1,6 @@
 /**
  * The FokosDB half of the route context: the policy the two Durable Object classes read, and the
- * creator that validates a table configuration.
+ * function that validates the options of a table.
  *
  * The sharding code treats the policy as an opaque value. Everything FokosDB-specific that a request
  * must carry is here: the two namespace bindings, the location hint, and the split thresholds.
@@ -82,86 +82,133 @@ export type FokosDBTableConfig = {
 	policy: FokosDBPolicy;
 };
 
-export class PartitionContextCreator {
-	static create(opts: {
-		ns: PartitionNamespaceKey;
-		nsTx: TransactionCoordinatorNamespaceKey;
-		tableName: string;
-		rootTreesN: number;
-		hashSplitN: number;
-		hashSplitConditions: SplitConditions;
-		rangeSplitN?: number;
-		rangeSplitConditions?: SplitConditions;
-		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
-		jurisdiction?: DurableObjectJurisdiction;
-		locationHint?: DurableObjectLocationHint;
-		/**
-		 * The key size limits of the table. Every client of the table must use the same values. Never
-		 * decrease a key size limit after items with larger keys exist.
-		 */
-		limits?: FokosDBLimitOverrides;
-	}): FokosDBTableConfig {
-		// Each option defaults on its own, so a value the caller gives is never replaced. The caller's
-		// object stays unchanged.
-		const hashSplitConditions = opts.hashSplitConditions ?? { maxSizeMb: 100 };
-		const rangeSplitN = opts.rangeSplitN ?? 4;
-		const rangeSplitConditions = opts.rangeSplitConditions ?? { maxSizeMb: 500 };
-		const rangeAncestors = opts.rangeAncestorsConfig ?? { fromRoot: 0, fromLeaf: 3 };
-		const invalid = (option: string, value: unknown, message: string) =>
-			new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
+/**
+ * The identity of a table. FokosDB derives the Durable Object names of the table from these values,
+ * so they must never change after the table has data.
+ *
+ * A change to `name`, `ns`, `nsTx` or `jurisdiction` sends every request to other, empty Durable
+ * Objects. A change to `rootTreesN`, `hashSplitN` or `coordinatorRootsN` makes the existing partitions
+ * or coordinators reject each request with `partition_context_mismatch`. In each case the data of the
+ * table does not change, but the client can no longer reach it.
+ */
+export type FokosTableIdentity = {
+	/** The name of the table. It must not start with `"fokos."`. */
+	readonly name: string;
+	/** The binding of the `PartitionDO` namespace. */
+	readonly ns: PartitionNamespaceKey;
+	/** The binding of the `TransactionCoordinatorDO` namespace. */
+	readonly nsTx: TransactionCoordinatorNamespaceKey;
+	/** The number of root partitions, from 1 to 65,000. A hash of the hash key selects one. */
+	readonly rootTreesN: number;
+	/** The number of children of each hash split, from 2 to 255. */
+	readonly hashSplitN: number;
+	/**
+	 * The number of root transaction coordinators. Default: two per root partition, at most 65,000.
+	 * Each root splits by hash when it grows larger than `hashSplitConditions.maxSizeMb`.
+	 */
+	readonly coordinatorRootsN?: number;
+	/**
+	 * The Durable Object jurisdiction of every partition and coordinator of the table. Cloudflare gives
+	 * different object IDs in different jurisdictions.
+	 */
+	readonly jurisdiction?: DurableObjectJurisdiction;
+};
 
-		// No default: `hashSplitN` is part of the topology and must never change, so the caller states it.
-		if (!opts.hashSplitN) {
-			throw invalid("hashSplitN", opts.hashSplitN, "hashSplitN must be provided");
-		}
+/** The options of a table. Only the options in `table` are permanent; the others can change. */
+export type FokosTableOptions = {
+	/**
+	 * WARNING:: DO NOT EVER change the values of `table` after the table has data.
+	 *
+	 * The identity of the table. Never change these values after the table has data.
+	 **/
+	table: FokosTableIdentity;
 
-		if (typeof opts.tableName !== "string" || opts.tableName.length === 0) {
-			throw invalid("tableName", opts.tableName, "tableName must be a non-empty string");
-		}
-		if (opts.tableName.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
-			throw invalid("tableName", opts.tableName, `tableName must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
-		}
-		const topology: FokosTopology = {
-			shardGroup: `${PARTITION_SHARD_GROUP_PREFIX}${opts.tableName}`,
-			rootTreesN: opts.rootTreesN,
-			hashSplitN: opts.hashSplitN,
-			// A table that selects no jurisdiction stores a topology byte-identical to one built without
-			// the option, so an existing record and a new one compare equal.
-			...(opts.jurisdiction === undefined ? {} : { jurisdiction: opts.jurisdiction }),
-		};
-		validateTopology(topology);
+	/**
+	 * The location hint for the Durable Objects of this table. It is best-effort placement advice for
+	 * the first time each object spawns.
+	 */
+	locationHint?: DurableObjectLocationHint;
 
-		const rangeConfig: FokosRangeConfig = { rangeSplitN, rangeAncestors };
-		validateRangeConfig(rangeConfig);
+	/** Default: `{ maxSizeMb: 500 }`. */
+	hashSplitConditions?: SplitConditions;
+	/** The number of children of the next range split, from 2 to 255. It applies to later splits only. Default: 4. */
+	rangeSplitN?: number;
+	/** Default: `{ maxSizeMb: 500 }`. */
+	rangeSplitConditions?: SplitConditions;
+	/**
+	 * The ancestors that a new range child keeps, part of responses too for ancestors to learn about splits.
+	 * Default: `{ fromRoot: 0, fromLeaf: 3 }`.
+	 **/
+	rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number }; /**
+	 * The key size limits of the table. Every client of the table must use the same values. Never
+	 * decrease a key size limit after items with larger keys exist.
+	 */
+	limits?: FokosDBLimitOverrides;
+};
 
-		validateSplitConditions("hashSplitConditions", hashSplitConditions, invalid);
-		validateSplitConditions("rangeSplitConditions", rangeSplitConditions, invalid);
+/** Validates the options of a table, applies the defaults, and splits them into the parts of a route context. */
+export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
+	const { table } = opts;
+	// Each option defaults on its own, so a value the caller gives is never replaced. The caller's
+	// object stays unchanged.
+	const hashSplitConditions = opts.hashSplitConditions ?? { maxSizeMb: 500 };
+	const rangeSplitN = opts.rangeSplitN ?? 4;
+	const rangeSplitConditions = opts.rangeSplitConditions ?? { maxSizeMb: 500 };
+	const rangeAncestors = opts.rangeAncestorsConfig ?? { fromRoot: 0, fromLeaf: 3 };
+	const invalid = (option: string, value: unknown, message: string) =>
+		new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, { message, attributes: { option, value } });
 
-		// Only the known overrides travel. An override equal to the default stays, so a pinned value does
-		// not change when a later version changes the default.
-		const maxHashKeyBytes = opts.limits?.maxHashKeyBytes;
-		const maxSortKeyBytes = opts.limits?.maxSortKeyBytes;
-		let limits: FokosDBLimitOverrides | undefined;
-		if (maxHashKeyBytes !== undefined || maxSortKeyBytes !== undefined) {
-			limits = {
-				...(maxHashKeyBytes === undefined ? {} : { maxHashKeyBytes }),
-				...(maxSortKeyBytes === undefined ? {} : { maxSortKeyBytes }),
-			};
-		}
-		if (limits !== undefined) {
-			resolveLimits(limits);
-		}
-
-		const policy: FokosDBPolicy = {
-			ns: opts.ns,
-			nsTx: opts.nsTx,
-			hashSplitConditions,
-			rangeSplitConditions,
-			...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
-			...(limits === undefined ? {} : { limits }),
-		};
-		return { topology, rangeConfig, policy };
+	// No default: `hashSplitN` is part of the topology and must never change, so the caller states it.
+	if (!table.hashSplitN) {
+		throw invalid("table.hashSplitN", table.hashSplitN, "table.hashSplitN must be provided");
 	}
+
+	if (typeof table.name !== "string" || table.name.length === 0) {
+		throw invalid("table.name", table.name, "table.name must be a non-empty string");
+	}
+	if (table.name.startsWith(RESERVED_SHARD_GROUP_PREFIX)) {
+		throw invalid("table.name", table.name, `table.name must not start with "${RESERVED_SHARD_GROUP_PREFIX}"`);
+	}
+	const topology: FokosTopology = {
+		shardGroup: `${PARTITION_SHARD_GROUP_PREFIX}${table.name}`,
+		rootTreesN: table.rootTreesN,
+		hashSplitN: table.hashSplitN,
+		// A table that selects no jurisdiction stores a topology byte-identical to one built without
+		// the option, so an existing record and a new one compare equal.
+		...(table.jurisdiction === undefined ? {} : { jurisdiction: table.jurisdiction }),
+	};
+	validateTopology(topology);
+
+	const rangeConfig: FokosRangeConfig = { rangeSplitN, rangeAncestors };
+	validateRangeConfig(rangeConfig);
+
+	validateSplitConditions("hashSplitConditions", hashSplitConditions, invalid);
+	validateSplitConditions("rangeSplitConditions", rangeSplitConditions, invalid);
+
+	// Only the known overrides travel. An override equal to the default stays, so a pinned value does
+	// not change when a later version changes the default.
+	const maxHashKeyBytes = opts.limits?.maxHashKeyBytes;
+	const maxSortKeyBytes = opts.limits?.maxSortKeyBytes;
+	let limits: FokosDBLimitOverrides | undefined;
+	if (maxHashKeyBytes !== undefined || maxSortKeyBytes !== undefined) {
+		limits = {
+			...(maxHashKeyBytes === undefined ? {} : { maxHashKeyBytes }),
+			...(maxSortKeyBytes === undefined ? {} : { maxSortKeyBytes }),
+		};
+	}
+	if (limits !== undefined) {
+		resolveLimits(limits);
+	}
+
+	const policy: FokosDBPolicy = {
+		ns: table.ns,
+		nsTx: table.nsTx,
+		hashSplitConditions,
+		rangeSplitConditions,
+		...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
+		...(limits === undefined ? {} : { limits }),
+	};
+	return { topology, rangeConfig, policy };
 }
 
 function validateSplitConditions(

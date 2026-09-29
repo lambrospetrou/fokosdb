@@ -8,7 +8,7 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { describe, expect, it, vi } from "vitest";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
-import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
+import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
@@ -252,7 +252,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			await runInDurableObject(child, async (instance: TransactionCoordinatorDO) => {
 				const childCtx = instance.fokos.routeContext();
 				await expect(
-					instance.initiateWrite(childCtx, { clientRequestToken: token, table: db.options().topology, items: [] }),
+					instance.initiateWrite(childCtx, { clientRequestToken: token, table: createTableConfig(db.options()), items: [] }),
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 				await expect(
 					instance.recoverTransaction(childCtx, { transactionId: first.transactionId, idempotencyToken: token }),

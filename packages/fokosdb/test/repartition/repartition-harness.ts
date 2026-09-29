@@ -18,7 +18,7 @@ import { runInDurableObject } from "cloudflare:test";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { PartitionContextCreator, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
+import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import { isRangePartition, type FokosPartitionIdentity } from "../../src/sharding/route-context.js";
@@ -99,12 +99,14 @@ export type ClusterOptions = {
 };
 
 export function makeCluster(opts: ClusterOptions = {}): Cluster {
-	const cfg = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: opts.tableName ?? `repartition-${crypto.randomUUID()}`,
-		rootTreesN: 1,
-		hashSplitN: opts.hashSplitN ?? 2,
+	const cfg = createTableConfig({
+		table: {
+			name: opts.tableName ?? `repartition-${crypto.randomUUID()}`,
+			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: 1,
+			hashSplitN: opts.hashSplitN ?? 2,
+		},
 		rangeSplitN: opts.rangeSplitN ?? 2,
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },

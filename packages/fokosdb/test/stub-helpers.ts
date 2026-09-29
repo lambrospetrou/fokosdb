@@ -5,7 +5,7 @@
 import { env } from "cloudflare:workers";
 import type { PartitionDO } from "../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../src/server/do-transaction-coordinator.js";
-import { PartitionContextCreator, type FokosDBRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
+import { createTableConfig, type FokosDBRouteContext, type PartitionNamespaceKey } from "../src/shared/partition-context.js";
 import { FokosRouter } from "../src/sharding/router.js";
 import { COORDINATOR_REF_VERSION, type CoordinatorRef } from "../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO } from "./controlled-partition-do.js";
@@ -30,12 +30,8 @@ export function testCoordinatorStubByName(doName: string): DurableObjectStub<Tra
 
 /** The route context of a root coordinator in a new coordinator group. */
 export function testCoordinatorContext(): FokosDBRouteContext {
-	const table = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: `tc-test.${crypto.randomUUID()}`,
-		rootTreesN: 1,
-		hashSplitN: 2,
+	const table = createTableConfig({
+		table: { name: `tc-test.${crypto.randomUUID()}`, ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 1, hashSplitN: 2 },
 		hashSplitConditions: { maxSizeMb: 100 },
 	});
 	return new FokosRouter(table.topology, table.rangeConfig, table.policy).allRoots()[0];

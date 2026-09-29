@@ -1,19 +1,21 @@
 import { describe, expect, it } from "vitest";
-import { PartitionContextCreator } from "../shared/partition-context.js";
+import { createTableConfig } from "../shared/partition-context.js";
 import { FokosRouter } from "./router.js";
 import { KeyCodec } from "./key-codec.js";
 
 function makeRouter(rootTreesN: number, jurisdiction?: DurableObjectJurisdiction) {
-	const cfg = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: `router.${crypto.randomUUID()}`,
-		rootTreesN,
-		hashSplitN: 2,
+	const cfg = createTableConfig({
+		table: {
+			name: `router.${crypto.randomUUID()}`,
+			ns: "PARTITION_DO",
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			rootTreesN,
+			hashSplitN: 2,
+			jurisdiction,
+		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
-		...(jurisdiction === undefined ? {} : { jurisdiction }),
 	});
 	return new FokosRouter(cfg.topology, cfg.rangeConfig, cfg.policy);
 }

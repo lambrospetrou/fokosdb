@@ -1,24 +1,16 @@
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { PartitionContextCreator } from "../src/shared/partition-context.js";
-import { FokosRouter } from "../src/sharding/router.js";
 
 describe("fokosdb", async () => {
-	const testSplitOptions = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName: "fokos",
-		rootTreesN: 10,
-		hashSplitN: 2,
+	const testSplitOptions = {
+		table: { name: "fokos", ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 10, hashSplitN: 2 },
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 1 },
 		rangeSplitConditions: { maxSizeMb: 1 },
-	});
+	} as const;
 
 	it("should route to the right partition DO", async ({ expect }) => {
-		const db = new FokosDB({
-			topology: new FokosRouter(testSplitOptions.topology, testSplitOptions.rangeConfig, testSplitOptions.policy),
-		});
+		const db = new FokosDB(testSplitOptions);
 
 		await expect(
 			db.putItem({

@@ -12,8 +12,7 @@ import {
 	MAX_PARTITION_VISITS_PER_PAGE,
 	MAX_RESPONSE_BYTES_PER_PAGE,
 } from "../shared/query/page-budget.js";
-import { PartitionContextCreator, type PartitionNamespaceKey } from "../shared/partition-context.js";
-import { FokosRouter } from "../sharding/router.js";
+import type { PartitionNamespaceKey } from "../shared/partition-context.js";
 import { FokosShardingClient } from "../sharding/client.js";
 import type { FokosOperationSpec } from "../sharding/runtime-types.js";
 import { MAX_ITEM_BYTES, MAX_ITEMS_PER_TX } from "../shared/transaction-limits.js";
@@ -848,14 +847,14 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 
 	describe("FokosDB — transaction coordinator pool", () => {
 		it("derives two coordinator roots per root partition", () => {
-			expect(makeDBFor(ns, { rootTreesN: 1 }).options().coordinatorRootsN).toBe(2);
-			expect(makeDBFor(ns, { rootTreesN: 3 }).options().coordinatorRootsN).toBe(6);
-			expect(makeDBFor(ns, { rootTreesN: 32_501 }).options().coordinatorRootsN).toBe(65_000);
-			expect(makeDBFor(ns, { rootTreesN: 65_000 }).options().coordinatorRootsN).toBe(65_000);
+			expect(makeDBFor(ns, { rootTreesN: 1 }).options().table.coordinatorRootsN).toBe(2);
+			expect(makeDBFor(ns, { rootTreesN: 3 }).options().table.coordinatorRootsN).toBe(6);
+			expect(makeDBFor(ns, { rootTreesN: 32_501 }).options().table.coordinatorRootsN).toBe(65_000);
+			expect(makeDBFor(ns, { rootTreesN: 65_000 }).options().table.coordinatorRootsN).toBe(65_000);
 		});
 
 		it("uses and validates an explicit coordinatorRootsN value", () => {
-			expect(makeDBFor(ns, { rootTreesN: 3, coordinatorRootsN: 5 }).options().coordinatorRootsN).toBe(5);
+			expect(makeDBFor(ns, { rootTreesN: 3, coordinatorRootsN: 5 }).options().table.coordinatorRootsN).toBe(5);
 			for (const coordinatorRootsN of [0, -1, 1.5, 65001]) {
 				expect(() => makeDBFor(ns, { coordinatorRootsN })).toThrow(fokosErrorWith("num_tx_coordinators_invalid"));
 			}
@@ -872,12 +871,10 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 			});
 			try {
 				await expect(db.destroy()).resolves.toEqual({ ok: true });
-				const partitions = db.options().topology.topology.shardGroup;
-				expect(partitions).toMatch(/^fokos\.p\./);
-				const table = partitions.slice("fokos.p.".length);
+				const table = db.options().table.name;
 				expect(walked).toEqual([
 					{ shardGroup: `fokos.tc.${table}`, rootTreesN: 4 },
-					{ shardGroup: partitions, rootTreesN: 2 },
+					{ shardGroup: `fokos.p.${table}`, rootTreesN: 2 },
 				]);
 			} finally {
 				walk.mockRestore();
@@ -1310,19 +1307,18 @@ describe.each(["PARTITION_DO", "CUSTOM_PARTITION_DO"] as const)("FokosDB over %s
 // cross-sub-query fan-out and pagination, not the DO-level range-tree walk (covered in test/partition-do/query-items.test.ts).
 function makeDBFor(ns: PartitionNamespaceKey, options?: { rootTreesN?: number; coordinatorRootsN?: number }) {
 	const tableName = `test.${crypto.randomUUID()}`;
-	const base = PartitionContextCreator.create({
-		ns,
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName,
-		rootTreesN: options?.rootTreesN ?? 1,
-		hashSplitN: 2,
+	return new FokosDB({
+		table: {
+			name: tableName,
+			ns,
+			nsTx: "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: options?.rootTreesN ?? 1,
+			hashSplitN: 2,
+			coordinatorRootsN: options?.coordinatorRootsN,
+		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: 500 },
 		rangeSplitConditions: { maxSizeMb: 500 },
-	});
-	return new FokosDB({
-		topology: new FokosRouter(base.topology, base.rangeConfig, base.policy),
-		coordinatorRootsN: options?.coordinatorRootsN,
 	});
 }
 

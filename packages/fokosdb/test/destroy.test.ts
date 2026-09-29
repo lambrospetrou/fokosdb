@@ -1,31 +1,19 @@
 import { runDurableObjectAlarm } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { FokosDB } from "../src/client/db.js";
-import { PartitionContextCreator } from "../src/shared/partition-context.js";
-import { FokosRouter } from "../src/sharding/router.js";
 import { testPartitionStub } from "./stub-helpers.js";
 
 // 3 root partitions, each splits into 2 children.
 // maxSizeMb: 0.25 = 262 144 bytes. The empty schema already holds ~100 KB of pages, so a smaller cap
 // would put every partition over its limit before the first write. 4 × 50 KB items then split one.
-const PARTITION_OPTIONS = {
-	rootTreesN: 3,
-	hashSplitN: 2,
-	rangeSplitN: 2,
-	hashSplitConditions: { maxSizeMb: 0.25 },
-	// rangeSplitConditions not specified here → PartitionContextCreator defaults to { splitN: 4, maxSizeMb: 500 }.
-};
+// rangeSplitConditions is not given, so it defaults to { maxSizeMb: 500 }.
 const ITEM_DATA = "x".repeat(50 * 1024); // 50 KB
 
 function makeDB(tableName: string) {
-	const base = PartitionContextCreator.create({
-		ns: "PARTITION_DO",
-		nsTx: "TRANSACTION_COORDINATOR_DO",
-		tableName,
-		...PARTITION_OPTIONS,
-	});
 	return new FokosDB({
-		topology: new FokosRouter(base.topology, base.rangeConfig, base.policy),
+		table: { name: tableName, ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 3, hashSplitN: 2 },
+		rangeSplitN: 2,
+		hashSplitConditions: { maxSizeMb: 0.25 },
 	});
 }
 

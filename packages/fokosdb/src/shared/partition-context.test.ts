@@ -1,29 +1,35 @@
 import { describe, expect, it } from "vitest";
-import { coordinatorShardGroup, PartitionContextCreator } from "./partition-context.js";
+import { coordinatorShardGroup, createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "./partition-context.js";
 import { structurallyEqual } from "../sharding/route-context.js";
 import { FokosRouter } from "../sharding/router.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 
-function makeOpts(overrides?: Partial<Parameters<typeof PartitionContextCreator.create>[0]>) {
+type FlatOptions = Partial<Omit<FokosTableIdentity, "name"> & Omit<FokosTableOptions, "table"> & { tableName: string }>;
+
+function makeOpts(overrides?: FlatOptions): FokosTableOptions {
+	const { tableName, ns, nsTx, rootTreesN, hashSplitN, jurisdiction, ...rest } = overrides ?? {};
 	return {
-		ns: "PARTITION_DO" as const,
-		nsTx: "TRANSACTION_COORDINATOR_DO" as const,
-		tableName: "testdb",
-		rootTreesN: 1,
-		hashSplitN: 4,
+		table: {
+			name: tableName ?? "testdb",
+			ns: ns ?? "PARTITION_DO",
+			nsTx: nsTx ?? "TRANSACTION_COORDINATOR_DO",
+			rootTreesN: rootTreesN ?? 1,
+			hashSplitN: hashSplitN ?? 4,
+			...(jurisdiction === undefined ? {} : { jurisdiction }),
+		},
 		hashSplitConditions: { maxSizeMb: 100 },
-		...overrides,
+		...rest,
 	};
 }
 
-describe("PartitionContextCreator.create — rangeAncestorsConfig", () => {
+describe("createTableConfig — rangeAncestorsConfig", () => {
 	it("defaults to { fromRoot: 0, fromLeaf: 3 } when omitted", () => {
-		const cfg = PartitionContextCreator.create(makeOpts());
+		const cfg = createTableConfig(makeOpts());
 		expect(cfg.rangeConfig.rangeAncestors).toEqual({ fromRoot: 0, fromLeaf: 3 });
 	});
 
 	it("keeps an explicit rangeAncestorsConfig", () => {
-		const cfg = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig: { fromRoot: 1, fromLeaf: 3 } }));
+		const cfg = createTableConfig(makeOpts({ rangeAncestorsConfig: { fromRoot: 1, fromLeaf: 3 } }));
 		expect(cfg.rangeConfig.rangeAncestors).toEqual({ fromRoot: 1, fromLeaf: 3 });
 	});
 
@@ -33,21 +39,21 @@ describe("PartitionContextCreator.create — rangeAncestorsConfig", () => {
 		{ fromRoot: 2, fromLeaf: -1 },
 		{ fromRoot: 2, fromLeaf: 11 },
 	])("rejects out-of-bounds config %j", (rangeAncestorsConfig) => {
-		expect(() => PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig }))).toThrow();
+		expect(() => createTableConfig(makeOpts({ rangeAncestorsConfig }))).toThrow();
 	});
 
 	it.each([
 		{ fromRoot: 0, fromLeaf: 0 },
 		{ fromRoot: 10, fromLeaf: 10 },
 	])("accepts boundary values %j", (rangeAncestorsConfig) => {
-		const cfg = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig }));
+		const cfg = createTableConfig(makeOpts({ rangeAncestorsConfig }));
 		expect(cfg.rangeConfig.rangeAncestors).toEqual(rangeAncestorsConfig);
 	});
 });
 
-describe("PartitionContextCreator.create — the split of one table configuration", () => {
+describe("createTableConfig — the split of one table configuration", () => {
 	it("puts the immutable fields in the topology and the FokosDB fields in the policy", () => {
-		const cfg = PartitionContextCreator.create(makeOpts({ jurisdiction: "eu", locationHint: "weur" }));
+		const cfg = createTableConfig(makeOpts({ jurisdiction: "eu", locationHint: "weur" }));
 		expect(cfg.topology).toEqual({ shardGroup: "fokos.p.testdb", rootTreesN: 1, hashSplitN: 4, jurisdiction: "eu" });
 		expect(cfg.rangeConfig).toEqual({ rangeSplitN: 4, rangeAncestors: { fromRoot: 0, fromLeaf: 3 } });
 		expect(cfg.policy).toEqual({
@@ -60,15 +66,15 @@ describe("PartitionContextCreator.create — the split of one table configuratio
 	});
 
 	it("stores no jurisdiction and no location hint keys when neither is given", () => {
-		const cfg = PartitionContextCreator.create(makeOpts());
+		const cfg = createTableConfig(makeOpts());
 		expect("jurisdiction" in cfg.topology).toBe(false);
 		expect("locationHint" in cfg.policy).toBe(false);
 	});
 });
 
-describe("PartitionContextCreator.create — the shard groups of a table", () => {
+describe("createTableConfig — the shard groups of a table", () => {
 	it("names the partitions fokos.p.<tableName> and the coordinators fokos.tc.<tableName>", () => {
-		const cfg = PartitionContextCreator.create(makeOpts({ tableName: "orders" }));
+		const cfg = createTableConfig(makeOpts({ tableName: "orders" }));
 		expect(cfg.topology.shardGroup).toBe("fokos.p.orders");
 		expect(coordinatorShardGroup(cfg.topology)).toBe("fokos.tc.orders");
 		const hk = KeyCodec.encode("hk");
@@ -79,15 +85,15 @@ describe("PartitionContextCreator.create — the shard groups of a table", () =>
 	});
 });
 
-describe("PartitionContextCreator.create — defaults", () => {
+describe("createTableConfig — defaults", () => {
 	it("keeps a given rangeSplitN when rangeSplitConditions is omitted", () => {
-		const cfg = PartitionContextCreator.create(makeOpts({ rangeSplitN: 8 }));
+		const cfg = createTableConfig(makeOpts({ rangeSplitN: 8 }));
 		expect(cfg.rangeConfig.rangeSplitN).toBe(8);
 		expect(cfg.policy.rangeSplitConditions).toEqual({ maxSizeMb: 500 });
 	});
 
 	it("defaults rangeSplitN when only rangeSplitConditions is given", () => {
-		const cfg = PartitionContextCreator.create(makeOpts({ rangeSplitConditions: { maxSizeMb: 200 } }));
+		const cfg = createTableConfig(makeOpts({ rangeSplitConditions: { maxSizeMb: 200 } }));
 		expect(cfg.rangeConfig.rangeSplitN).toBe(4);
 		expect(cfg.policy.rangeSplitConditions).toEqual({ maxSizeMb: 200 });
 	});
@@ -95,25 +101,25 @@ describe("PartitionContextCreator.create — defaults", () => {
 	it("does not change the options object of the caller", () => {
 		const opts = makeOpts({ hashSplitN: 8 });
 		const before = structuredClone(opts);
-		PartitionContextCreator.create(opts);
+		createTableConfig(opts);
 		expect(opts).toEqual(before);
 	});
 });
 
 describe("structurallyEqual over the mutable parts", () => {
 	it("treats equal range configs as equal and different ones as unequal", () => {
-		const a = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig: { fromRoot: 2, fromLeaf: 2 } }));
-		const b = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig: { fromRoot: 2, fromLeaf: 2 } }));
-		const c = PartitionContextCreator.create(makeOpts({ rangeAncestorsConfig: { fromRoot: 1, fromLeaf: 2 } }));
+		const a = createTableConfig(makeOpts({ rangeAncestorsConfig: { fromRoot: 2, fromLeaf: 2 } }));
+		const b = createTableConfig(makeOpts({ rangeAncestorsConfig: { fromRoot: 2, fromLeaf: 2 } }));
+		const c = createTableConfig(makeOpts({ rangeAncestorsConfig: { fromRoot: 1, fromLeaf: 2 } }));
 		expect(structurallyEqual(a.rangeConfig, b.rangeConfig)).toBe(true);
 		expect(structurallyEqual(a.rangeConfig, c.rangeConfig)).toBe(false);
 	});
 
 	it("compares the location hint inside the policy", () => {
-		const weur = PartitionContextCreator.create(makeOpts({ locationHint: "weur" }));
-		const weur2 = PartitionContextCreator.create(makeOpts({ locationHint: "weur" }));
-		const eeur = PartitionContextCreator.create(makeOpts({ locationHint: "eeur" }));
-		const none = PartitionContextCreator.create(makeOpts());
+		const weur = createTableConfig(makeOpts({ locationHint: "weur" }));
+		const weur2 = createTableConfig(makeOpts({ locationHint: "weur" }));
+		const eeur = createTableConfig(makeOpts({ locationHint: "eeur" }));
+		const none = createTableConfig(makeOpts());
 		expect(structurallyEqual(weur.policy, weur2.policy)).toBe(true);
 		expect(structurallyEqual(weur.policy, eeur.policy)).toBe(false);
 		expect(structurallyEqual(weur.policy, none.policy)).toBe(false);
@@ -127,17 +133,17 @@ describe("structurallyEqual over the mutable parts", () => {
 	});
 });
 
-describe("PartitionContextCreator.create option errors", () => {
+describe("createTableConfig option errors", () => {
 	it.each([
 		["rootTreesN", { rootTreesN: 0 }, 0],
 		["hashSplitN", { hashSplitN: 1 }, 1],
-		["tableName", { tableName: "fokos.mine" }, "fokos.mine"],
-		["tableName", { tableName: "" }, ""],
+		["table.name", { tableName: "fokos.mine" }, "fokos.mine"],
+		["table.name", { tableName: "" }, ""],
 		["shardGroup", { tableName: "a~b" }, "fokos.p.a~b"],
 		["hashSplitConditions.maxSizeMb", { hashSplitConditions: { maxSizeMb: -1 } }, -1],
 		["rangeAncestors.fromLeaf", { rangeAncestorsConfig: { fromRoot: 0, fromLeaf: 11 } }, 11],
 	])("reports an invalid %s as partition_context_options_invalid", (option, overrides, value) => {
-		expect(() => PartitionContextCreator.create(makeOpts(overrides))).toThrow(
+		expect(() => createTableConfig(makeOpts(overrides))).toThrow(
 			expect.objectContaining({
 				_tag: "FokosValidationError",
 				code: "partition_context_options_invalid",
@@ -148,20 +154,20 @@ describe("PartitionContextCreator.create option errors", () => {
 	});
 });
 
-describe("PartitionContextCreator.create — limits", () => {
+describe("createTableConfig — limits", () => {
 	it("omits limits from the policy when the table overrides nothing", () => {
-		expect(PartitionContextCreator.create(makeOpts()).policy).not.toHaveProperty("limits");
-		expect(PartitionContextCreator.create(makeOpts({ limits: {} })).policy).not.toHaveProperty("limits");
-		expect(PartitionContextCreator.create(makeOpts({ limits: { maxHashKeyBytes: undefined } })).policy).not.toHaveProperty("limits");
+		expect(createTableConfig(makeOpts()).policy).not.toHaveProperty("limits");
+		expect(createTableConfig(makeOpts({ limits: {} })).policy).not.toHaveProperty("limits");
+		expect(createTableConfig(makeOpts({ limits: { maxHashKeyBytes: undefined } })).policy).not.toHaveProperty("limits");
 	});
 
 	it("keeps only the known overrides, and keeps an override that is equal to the default", () => {
-		const limits = { maxHashKeyBytes: 1_024, maxFutureBytes: 7 } as Parameters<typeof PartitionContextCreator.create>[0]["limits"];
-		expect(PartitionContextCreator.create(makeOpts({ limits })).policy.limits).toEqual({ maxHashKeyBytes: 1_024 });
+		const limits = { maxHashKeyBytes: 1_024, maxFutureBytes: 7 } as FokosTableOptions["limits"];
+		expect(createTableConfig(makeOpts({ limits })).policy.limits).toEqual({ maxHashKeyBytes: 1_024 });
 	});
 
 	it("refuses a limit that is not valid", () => {
-		expect(() => PartitionContextCreator.create(makeOpts({ limits: { maxSortKeyBytes: 0 } }))).toThrow(
+		expect(() => createTableConfig(makeOpts({ limits: { maxSortKeyBytes: 0 } }))).toThrow(
 			expect.objectContaining({ code: "partition_context_options_invalid", attributes: { option: "limits.maxSortKeyBytes", value: 0 } }),
 		);
 	});

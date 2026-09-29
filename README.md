@@ -20,15 +20,17 @@ This is a pnpm workspace.
 ```
 packages/
   fokosdb/            the published library
-    src/client/       FokosDB and the routing surface  -> fokosdb/client
+    src/client/       FokosDB and its public types     -> fokosdb/client
     src/server/       the Durable Object classes       -> fokosdb/server
     src/shared/       code both entries use, inlined into each at build time
+    src/sharding/     the sharding library, uses no FokosDB module -> fokosdb/sharding/client, fokosdb/sharding/server
 examples/
   http-api/           deployable Worker exposing tables over REST
 ```
 
-`fokosdb` publishes exactly two subpath exports, `fokosdb/client` and `fokosdb/server`. There is no
-bare `fokosdb` import. See [`packages/fokosdb/README.md`](./packages/fokosdb/README.md) for the API
+`fokosdb` publishes four subpath exports: `fokosdb/client` and `fokosdb/server` for FokosDB, and
+`fokosdb/sharding/client` and `fokosdb/sharding/server` for the sharding library. There is no bare
+`fokosdb` import. See [`packages/fokosdb/README.md`](./packages/fokosdb/README.md) for the API
 and for the Durable Object re-export that wrangler requires.
 
 ## Commands
