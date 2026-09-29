@@ -44,6 +44,44 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 		expect(PartitionIdHelper.rootIdx(bytes)).toBe(4097);
 	});
 
+	it("hashId gives the ID and the DO name of fromHashIdxs", () => {
+		const paths: [number, number[]][] = [
+			[0, []],
+			[1, []],
+			[15, []],
+			[16, []],
+			[255, []],
+			[256, []],
+			[4097, []],
+			[0xffff, []],
+			[3, [0]],
+			[3, [15, 16, 255]],
+			[64_999, [1, 2, 0, 3]],
+			[7, Array.from({ length: 255 }, (_, i) => i)],
+		];
+		for (const [rootIdx, childIdxs] of paths) {
+			const { opaque, doName } = PartitionIdHelper.fromHashIdxs(base, [rootIdx, ...childIdxs]).encode(true);
+			expect(PartitionIdHelper.hashId(base, rootIdx, childIdxs)).toEqual({ opaque, doName });
+		}
+		expect(PartitionIdHelper.hashId(base, 3)).toEqual(PartitionIdHelper.hashId(base, 3, []));
+	});
+
+	it("hashId rejects a root index, a child index or a depth out of range", () => {
+		for (const rootIdx of [0x10000, -1, 1.5]) {
+			expect(() => PartitionIdHelper.hashId(base, rootIdx)).toThrow(invariantFailure(/rootIdx must be a u16/));
+		}
+		for (const childIdx of [256, -1, 1.5]) {
+			expect(() => PartitionIdHelper.hashId(base, 0, [1, childIdx])).toThrow(invariantFailure(/a child index must be a u8/));
+		}
+		expect(() =>
+			PartitionIdHelper.hashId(
+				base,
+				0,
+				Array.from({ length: 256 }, () => 0),
+			),
+		).toThrow(invariantFailure(/the depth must be a u8/));
+	});
+
 	it("fromHashIdxs with child indexes sets depth and lastChildIdx", () => {
 		const { bytes, doName } = PartitionIdHelper.fromHashIdxs(base, [1, 2, 0]).encode(true);
 		expect(doName).toBe("iddb~h.1.2.0");
@@ -79,6 +117,45 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(false);
 		expect(() => new PartitionIdHelper(base, range.bytes).appendHashIdx(1).encode(false)).toThrow(
 			invariantFailure(/cannot append hash indexes/),
+		);
+	});
+
+	it("hashDescendantId gives the ID and the DO name of appendHashIdx", () => {
+		const parents = [[0], [7], [4097], [0xffff], [3, 0], [3, 15, 16, 255], [1, ...Array.from({ length: 253 }, (_, i) => i % 256)]];
+		const childPaths = [[], [0], [3], [255], [1, 2], [16, 15, 0]];
+		for (const parentIdxs of parents) {
+			const parent = PartitionIdHelper.fromHashIdxs(base, parentIdxs).encode(true);
+			const ref = { partitionId: parent.opaque, doName: parent.doName! };
+			for (const childIdxs of childPaths) {
+				if (parentIdxs.length - 1 + childIdxs.length > 0xff) {
+					continue;
+				}
+				const { opaque, doName } = new PartitionIdHelper(base, parent.bytes).appendHashIdx(childIdxs).encode(true);
+				expect(PartitionIdHelper.hashDescendantId(ref, childIdxs)).toEqual({ opaque, doName });
+			}
+		}
+	});
+
+	it("hashDescendantId rejects a parent that is not a hash ID, a child index or a depth out of range", () => {
+		const root = PartitionIdHelper.fromHashIdxs(base, [1]).encode(true);
+		const ref = { partitionId: root.opaque, doName: root.doName! };
+		const range = PartitionIdHelper.fromRangePartition(base, kb("k"), null, null).encode(true);
+		const notHash = [
+			{ partitionId: range.opaque, doName: range.doName! },
+			// The depth byte says 1, but the ID has no child index.
+			{ partitionId: "00000101", doName: "iddb~h.1" },
+			{ partitionId: "000001", doName: "iddb~h.1" },
+			{ partitionId: "000001000", doName: "iddb~h.1" },
+		];
+		for (const parent of notHash) {
+			expect(() => PartitionIdHelper.hashDescendantId(parent, [0])).toThrow(invariantFailure(/the parent must be a hash partition ID/));
+		}
+		for (const childIdx of [256, -1, 1.5]) {
+			expect(() => PartitionIdHelper.hashDescendantId(ref, [0, childIdx])).toThrow(invariantFailure(/a child index must be a u8/));
+		}
+		const deep = PartitionIdHelper.fromHashIdxs(base, [1, ...Array.from({ length: 255 }, () => 0)]).encode(true);
+		expect(() => PartitionIdHelper.hashDescendantId({ partitionId: deep.opaque, doName: deep.doName! }, [0])).toThrow(
+			invariantFailure(/the depth must be a u8/),
 		);
 	});
 
@@ -551,11 +628,10 @@ describe("the contexts derived from a route context", () => {
 	it("keep the topology, range config and policy of the source and change only the identity", () => {
 		const router = makeRouter();
 		const root: FokosRouteContext<{ tier: string }> = router.rootContext(kb("hk"));
-		const bytes = Uint8Array.fromHex(root.partitionId);
 
 		const built = [
 			...resolveHashChildPartitionContexts(root),
-			resolveDescendantHashPartitionContext(root, bytes, [1, 2]),
+			resolveDescendantHashPartitionContext(root, [1, 2]),
 			resolveRangePartitionContext(root, kb("hk"), null, null),
 		];
 
@@ -578,7 +654,7 @@ describe("the contexts derived from a route context", () => {
 describe("partitionIdentityFrom", () => {
 	it("decodes a hash identity with its root index and child path", () => {
 		const root = makeRouter().allRoots()[2];
-		const child = resolveDescendantHashPartitionContext(root, Uint8Array.fromHex(root.partitionId), [3, 1]);
+		const child = resolveDescendantHashPartitionContext(root, [3, 1]);
 
 		const identity = partitionIdentityFrom(child);
 		expect(identity).toEqual({
@@ -590,6 +666,13 @@ describe("partitionIdentityFrom", () => {
 		});
 		expect(identityDepth(identity)).toBe(2);
 		expect(identityDepth(partitionIdentityFrom(root))).toBe(0);
+	});
+
+	it("rejects a hash identity whose DO name does not match its partition ID", () => {
+		const root = makeRouter().allRoots()[2];
+		expect(() => partitionIdentityFrom({ ...root, doName: `${base}~h.3` })).toThrow(
+			invariantFailure(/the DO name does not match the partition ID/),
+		);
 	});
 
 	it("decodes a range identity and takes the depth and ancestors from fokosInit", () => {

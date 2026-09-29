@@ -1255,7 +1255,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		const identity = this.identity();
 		const depth = identityDepth(identity);
 		const idxs = Array.from({ length: relDepth }, (_, i) => hashChildIndex(hashKey, depth + i, identity.topology.hashSplitN));
-		return refOf(resolveDescendantHashPartitionContext(this.routeContext(), Uint8Array.fromHex(identity.ref.partitionId), idxs));
+		return refOf(resolveDescendantHashPartitionContext(this.routeContext(), idxs));
 	}
 
 	/** The direct range child whose interval contains `sortKey`. The children tile the whole interval, so one always does. */

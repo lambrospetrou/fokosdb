@@ -8,7 +8,6 @@ import {
 	type FokosTopology,
 } from "./route-context.js";
 import type { FokosEnvelope, FokosPublicRoute, FokosPublicRouting, FokosRouteNode, FokosRouting } from "./runtime-types.js";
-import { assertExists } from "../shared/tsutils.js";
 
 /**
  * The Worker-side router of one shard group. It hashes a hash key to a root partition and builds
@@ -42,8 +41,7 @@ export class FokosRouter<TPolicy> {
 		if (cached) {
 			return cached;
 		}
-		const { doName, opaque } = PartitionIdHelper.fromHashIdxs(this.topology.shardGroup, [idx]).encode(true);
-		assertExists(doName);
+		const { doName, opaque } = PartitionIdHelper.hashId(this.topology.shardGroup, idx);
 		const ctx: FokosRouteContext<TPolicy> = {
 			schema: 2,
 			partitionId: opaque,

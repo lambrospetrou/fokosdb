@@ -289,7 +289,7 @@ export class TestPartition {
 			const key = `${prefix}_${i}`;
 			const root = router.rootContext(kb(key));
 			const indices = Array.from({ length: depth }, (_, d) => hashChildIndex(kb(key), d, hashSplitN));
-			const owner = resolveDescendantHashPartitionContext(root, Uint8Array.fromHex(root.partitionId), indices);
+			const owner = resolveDescendantHashPartitionContext(root, indices);
 			if (owner.partitionId !== this.ctx.partitionId || hashChildIndex(kb(key), depth, hashSplitN) !== emitted % hashSplitN) {
 				continue;
 			}

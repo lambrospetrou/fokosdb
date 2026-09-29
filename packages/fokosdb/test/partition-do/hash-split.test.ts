@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
@@ -6,7 +5,7 @@ import type { FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-con
 import { testPartitionStub } from "../stub-helpers.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { hashChildIndex, PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { hashChildIndex, PartitionIdHelper, resolveHashChildPartitionContexts } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { compiledCondition, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
 import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
@@ -97,10 +96,9 @@ describe("PartitionDO - splitting", () => {
 
 	it("fokosInit is idempotent for identical options, and restores the fallback alarm", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
-		const childName = `test.fokosinit-idempotent.${crypto.randomUUID()}`;
-		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
-		const childStub = testPartitionStub(childId);
+		// The DO name and the partition ID of a target must match, so the target is the real child 0.
+		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
+		const childStub = testPartitionStub(childCtx.doName);
 
 		const req = {
 			repartitionId: "r1",
@@ -117,7 +115,7 @@ describe("PartitionDO - splitting", () => {
 		});
 
 		const status = await openedRpc(childStub).status(childCtx);
-		expect(status.partitionContext?.doName).toBe(childName);
+		expect(status.partitionContext?.doName).toBe(childCtx.doName);
 		expect(status.parentPartitionContext).toEqual(refOf(parentCtx));
 		expect(status.parentSplitType).toBe("hash");
 		expect(status.migrationStatus).toBe("migration_initialized");
@@ -125,10 +123,9 @@ describe("PartitionDO - splitting", () => {
 
 	it("fokosInit refuses a call that conflicts with the import the target already holds", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub();
-		const childName = `test.fokosinit-conflict.${crypto.randomUUID()}`;
-		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
-		const childStub = testPartitionStub(childId);
+		// The DO name and the partition ID of a target must match, so the target is the real child 0.
+		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
+		const childStub = testPartitionStub(childCtx.doName);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 		const source = refOf(parentCtx);
 
@@ -155,10 +152,9 @@ describe("PartitionDO - splitting", () => {
 
 	it("a matching fokosInit retry stores the latest policy of the target context", async ({ expect }) => {
 		const { ctx: parentCtx } = makeStub({ hashSplitConditions: { maxSizeMb: 100 } });
-		const childName = `test.fokosinit-mutable.${crypto.randomUUID()}`;
-		const childId = env.PARTITION_DO.idFromName(childName);
-		const childCtx: FokosDBRouteContext = { ...parentCtx, doName: childName };
-		const childStub = testPartitionStub(childId);
+		// The DO name and the partition ID of a target must match, so the target is the real child 0.
+		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
+		const childStub = testPartitionStub(childCtx.doName);
 		const slice = { kind: "hash_child" as const, childIndex: 0, depth: 1 };
 
 		await childStub.fokosInit({ repartitionId: "r1", source: refOf(parentCtx), target: childCtx, slice });

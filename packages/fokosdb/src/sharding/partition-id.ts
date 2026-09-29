@@ -1,9 +1,8 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
-import { SHARD_GROUP_SEPARATOR, type FokosPartitionIdentity, type FokosRouteContext } from "./route-context.js";
+import { SHARD_GROUP_SEPARATOR, type FokosPartitionIdentity, type FokosPartitionRef, type FokosRouteContext } from "./route-context.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
-import { assertExists } from "../shared/tsutils.js";
 import invariant from "../shared/invariant.js";
 
 /**
@@ -27,6 +26,13 @@ const PERCENT_HEX: string[] = [];
 for (let b = 0; b < 256; b++) {
 	PERCENT_HEX.push("%" + b.toString(16).padStart(2, "0").toUpperCase());
 }
+
+// The two lowercase hex digits of each byte, as `Uint8Array.prototype.toHex` gives them.
+const BYTE_HEX: string[] = [];
+for (let b = 0; b < 256; b++) {
+	BYTE_HEX.push(b.toString(16).padStart(2, "0"));
+}
+const NO_CHILD_IDXS: readonly number[] = Object.freeze([]);
 
 // The escape set of the text form, as fixed code point ranges. A change to this set, or to
 // `isEscapedCodeUnit`, changes DO names and makes the data of the partitions unreachable. Do not use
@@ -194,15 +200,10 @@ export function resolveHashChildPartitionContexts<P>(parent: FokosRouteContext<P
 	}));
 }
 
-/** The route context of a descendant hash partition: the owner's encoded ID plus the appended child indexes. */
-export function resolveDescendantHashPartitionContext<P>(
-	base: FokosRouteContext<P>,
-	partitionIdBytes: Uint8Array,
-	hashIdxs: number[],
-): FokosRouteContext<P> {
-	const { doName, opaque } = new PartitionIdHelper(base.topology.shardGroup, partitionIdBytes).appendHashIdx(hashIdxs).encode(true);
-	assertExists(doName);
-	return { ...base, doName, partitionId: opaque };
+/** The route context of the hash partition `hashIdxs` levels below the hash partition `parent`. */
+export function resolveDescendantHashPartitionContext<P>(parent: FokosRouteContext<P>, hashIdxs: readonly number[]): FokosRouteContext<P> {
+	const { doName, opaque } = PartitionIdHelper.hashDescendantId(parent, hashIdxs);
+	return { ...parent, doName, partitionId: opaque };
 }
 
 /**
@@ -217,6 +218,11 @@ export function partitionIdentityFrom(
 	const decoded = PartitionIdHelper.decode(bytes);
 	const ref = { partitionId: ctx.partitionId, doName: ctx.doName };
 	if (decoded.schema === PartitionIdHelper.SCHEMA_HASH_V1) {
+		// `hashDescendantId` builds the DO name of a descendant from the DO name of this partition.
+		invariant(
+			ctx.doName === PartitionIdHelper.doName(ctx.topology.shardGroup, bytes),
+			"fokos/topology.partitionIdentityFrom: the DO name does not match the partition ID",
+		);
 		return {
 			schema: 1,
 			ref,
@@ -435,6 +441,56 @@ export class PartitionIdHelper {
 		return new PartitionIdHelper(shardGroup, encodeRangeBytes(hashKey, startBoundary, endBoundary));
 	}
 
+	/**
+	 * The ID and the DO name of the hash partition at root `rootIdx` and then `childIdxs`, from the root
+	 * down. They are equal to the result of `fromHashIdxs(shardGroup, [rootIdx, ...childIdxs]).encode(true)`,
+	 * but this function makes only the two strings, because a Worker resolves a partition for each request.
+	 * The bytes of the ID are `[0, rootHi, rootLo, depth, ...childIdxs]`.
+	 */
+	static hashId(shardGroup: string, rootIdx: number, childIdxs: readonly number[] = NO_CHILD_IDXS): { doName: string; opaque: string } {
+		invariant(Number.isInteger(rootIdx) && rootIdx >= 0 && rootIdx <= 0xffff, "fokos/topology.hashId: rootIdx must be a u16");
+		invariant(childIdxs.length <= 0xff, "fokos/topology.hashId: the depth must be a u8");
+		let doName = `${shardGroup}${SHARD_GROUP_SEPARATOR}h.${rootIdx}`;
+		let opaque = PartitionIdHelper.SCHEMA_HASH_V1_STR + BYTE_HEX[rootIdx >> 8] + BYTE_HEX[rootIdx & 0xff] + BYTE_HEX[childIdxs.length];
+		for (const idx of childIdxs) {
+			invariant(Number.isInteger(idx) && idx >= 0 && idx <= 0xff, "fokos/topology.hashId: a child index must be a u8");
+			doName += "." + idx;
+			opaque += BYTE_HEX[idx];
+		}
+		return { doName, opaque };
+	}
+
+	/**
+	 * The ID and the DO name of the hash partition `childIdxs` levels below the hash partition `parent`.
+	 * They are equal to the result of `new PartitionIdHelper(shardGroup, parentBytes).appendHashIdx(childIdxs).encode(true)`,
+	 * but this function decodes nothing: it adds to the DO name of the parent, and it replaces the depth
+	 * byte of the parent ID and adds to it. Thus `parent.doName` must be the DO name of `parent.partitionId`,
+	 * as `partitionIdentityFrom` makes sure for the identity of a partition.
+	 */
+	static hashDescendantId(parent: FokosPartitionRef, childIdxs: readonly number[]): { doName: string; opaque: string } {
+		const parentId = parent.partitionId;
+		const parentDepth = (parentId.length - 8) / 2;
+		const depth = parentDepth + childIdxs.length;
+		// A hash ID is "00", the root index in 4 hex digits, the depth in 2, and 2 for each child index.
+		invariant(
+			parentId.startsWith(PartitionIdHelper.SCHEMA_HASH_V1_STR) &&
+				Number.isInteger(parentDepth) &&
+				parentDepth >= 0 &&
+				parentId.charCodeAt(6) === BYTE_HEX[parentDepth].charCodeAt(0) &&
+				parentId.charCodeAt(7) === BYTE_HEX[parentDepth].charCodeAt(1),
+			"fokos/topology.hashDescendantId: the parent must be a hash partition ID",
+		);
+		invariant(depth <= 0xff, "fokos/topology.hashDescendantId: the depth must be a u8");
+		let doName = parent.doName;
+		let opaque = parentId.slice(0, 6) + BYTE_HEX[depth] + parentId.slice(8);
+		for (const idx of childIdxs) {
+			invariant(Number.isInteger(idx) && idx >= 0 && idx <= 0xff, "fokos/topology.hashDescendantId: a child index must be a u8");
+			doName += "." + idx;
+			opaque += BYTE_HEX[idx];
+		}
+		return { doName, opaque };
+	}
+
 	static fromHashIdxs(shardGroup: string, hashIdxs: number[]): PartitionIdHelper {
 		invariant(hashIdxs.length >= 1, "fokos/topology.fromHashIdxs: hashIdxs must not be empty");
 		// hashIdxs[0] is the root index (u16), hashIdxs[1..] are sub-tree child indexes (u8 each).
@@ -474,21 +530,10 @@ export class PartitionIdHelper {
 		doName: string;
 		partitionIdOpaque: string;
 	}[] {
-		const parentBytes = Uint8Array.fromHex(parent.partitionId);
-		invariant(parentBytes[0] === PartitionIdHelper.SCHEMA_HASH_V1, `fokos/topology: expected hash schema, got: ${parentBytes[0]}`);
-		const { shardGroup, hashSplitN } = parent.topology;
-		const result = Array.from({ length: hashSplitN }, (_, i) => {
-			const { doName, opaque } = new PartitionIdHelper(shardGroup, parentBytes).appendHashIdx(i).encode(true);
-			return {
-				doName: doName!,
-				partitionIdOpaque: opaque,
-			};
+		return Array.from({ length: parent.topology.hashSplitN }, (_, i) => {
+			const { doName, opaque } = PartitionIdHelper.hashDescendantId(parent, [i]);
+			return { doName, partitionIdOpaque: opaque };
 		});
-		invariant(
-			result.length === hashSplitN,
-			`fokos/topology.calculateChildPartitionIds: expected ${hashSplitN} children, got ${result.length}`,
-		);
-		return result;
 	}
 
 	#bytes: Uint8Array | undefined;

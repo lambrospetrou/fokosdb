@@ -8,7 +8,7 @@ export default defineConfig({
 	// The package directory, so that the paths below do not depend on the directory that starts vitest.
 	root: resolve(import.meta.dirname, "../.."),
 	test: {
-		include: ["test/do-names-bench/*.workerd-bench.ts"],
+		include: ["test/*-bench/*.workerd-bench.ts"],
 		testTimeout: 300_000,
 	},
 	plugins: [
