@@ -1,6 +1,6 @@
 # RFC — One configuration surface for FokosDB and FokosShardingRuntime
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
