@@ -50,8 +50,8 @@ export type FokosRuntimeConfig = Readonly<{
 	/**
 	 * The maximum number of rows in the stored table of learned range partition boundaries. A partition
 	 * uses these boundaries to send a request directly to the deepest range partition it knows. When
-	 * the table is full, the rows that were seen last the longest time ago are deleted first. Read when
-	 * the runtime is created.
+	 * the table is full, the rows that were seen last the longest time ago are deleted first. Read at
+	 * each deletion, so a lower value takes effect at the next write to the table.
 	 */
 	rangeHierarchyMaxRows: number;
 	/**

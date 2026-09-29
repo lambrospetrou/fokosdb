@@ -156,8 +156,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		this.#validateOperations();
 		this.#configOverrides = opts.config;
 		// A configuration that is not valid fails the construction.
-		const config = this.#config();
-		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: config.rangeHierarchyMaxRows });
+		this.#config();
+		this.#store = new FokosShardingStore(opts.ctx.storage, { rangeHierarchyMaxRows: () => this.#config().rangeHierarchyMaxRows });
 
 		const deps: RepartitionCommonDeps = {
 			getPeer: (ref) => this.#peer(ref),

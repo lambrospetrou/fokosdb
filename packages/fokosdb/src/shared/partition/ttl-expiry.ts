@@ -12,8 +12,8 @@ export type TtlSweepConfig = {
 	maxBytesBeforeSleep: number;
 	/** Maximum rows deleted by one sweep cycle. */
 	maxRowsPerCycle: number;
-	/** Delay before the first sweep after a partition wakes. */
-	initialDelayMs: number;
+	/** The delay between the arming of the sweep timer and the start of the sweep. Read at each arming. */
+	ttlSweepDelayMs: number;
 };
 
 export type TtlExpiryOptions = {
@@ -57,7 +57,7 @@ export class TtlExpiry {
 		if (this.#timer !== null) {
 			return;
 		}
-		const delay = delayMs ?? 500;
+		const delay = delayMs ?? this.#config().ttlSweepDelayMs;
 		this.#timer = setTimeout(() => {
 			this.#timer = null;
 			void this.runCycle()
@@ -149,7 +149,7 @@ export function validateTtlSweepConfig(config: TtlSweepConfig): void {
 	for (const name of ["chunkSize", "maxRowsBeforeSleep", "maxBytesBeforeSleep", "maxRowsPerCycle"] as const) {
 		invariant(Number.isInteger(config[name]) && config[name] > 0, `ttl-expiry: ${name} must be an integer greater than zero`);
 	}
-	for (const name of ["sleepMs", "initialDelayMs"] as const) {
+	for (const name of ["sleepMs", "ttlSweepDelayMs"] as const) {
 		invariant(Number.isInteger(config[name]) && config[name] >= 0, `ttl-expiry: ${name} must be an integer greater than or equal to zero`);
 	}
 }

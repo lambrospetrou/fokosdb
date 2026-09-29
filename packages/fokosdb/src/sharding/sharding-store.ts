@@ -137,8 +137,11 @@ export type PromotedKeyCursor = { hashKey: KeyBytes };
 export type LearnedRangeSlice = { depth: number; startBoundary: KeyBytes | null; endBoundary: KeyBytes | null };
 
 export type FokosShardingStoreOptions = {
-	/** The row bound of `fokos_range_hierarchy`. A row holds two boundary keys and one hash key. Default: `DEFAULT_RUNTIME_CONFIG`. */
-	rangeHierarchyMaxRows?: number;
+	/**
+	 * The row bound of `fokos_range_hierarchy`. A row holds two boundary keys and one hash key. Read at
+	 * each eviction. Default: `DEFAULT_RUNTIME_CONFIG`.
+	 */
+	rangeHierarchyMaxRows?: () => number;
 };
 
 /**
@@ -378,12 +381,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
 export class FokosShardingStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
-	#rangeHierarchyMaxRows: number;
+	#rangeHierarchyMaxRows: () => number;
 
 	constructor(storage: DurableObjectStorage, options: FokosShardingStoreOptions = {}) {
 		this.#storage = storage;
-		this.#rangeHierarchyMaxRows = options.rangeHierarchyMaxRows ?? DEFAULT_RUNTIME_CONFIG.rangeHierarchyMaxRows;
-		invariant(this.#rangeHierarchyMaxRows >= 1, "fokos/sharding-store: rangeHierarchyMaxRows must be at least 1");
+		this.#rangeHierarchyMaxRows = options.rangeHierarchyMaxRows ?? (() => DEFAULT_RUNTIME_CONFIG.rangeHierarchyMaxRows);
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
@@ -953,8 +955,9 @@ export class FokosShardingStore {
 		}
 
 		// FIXME: Optimize this by using a more efficient eviction strategy rather than counting and deleting excess rows.
-		const excess =
-			one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n - this.#rangeHierarchyMaxRows;
+		const maxRows = this.#rangeHierarchyMaxRows();
+		invariant(maxRows >= 1, "fokos/sharding-store: rangeHierarchyMaxRows must be at least 1");
+		const excess = one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n - maxRows;
 		if (excess <= 0) {
 			return;
 		}

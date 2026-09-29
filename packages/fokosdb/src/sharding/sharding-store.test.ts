@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { KeyCodec } from "./key-codec.js";
+import { invariantFailure } from "../../test/errors-matchers.js";
 import { FOKOS_KV_KEYS, FokosShardingStore, type FokosShardingStoreOptions } from "./sharding-store.js";
 import { DEFAULT_RUNTIME_CONFIG } from "./runtime-config.js";
 
@@ -146,7 +147,30 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 				expect(store.countRangeHierarchyRows()).toBe(3);
 				expect(rows()).toEqual(["b", "c", "d"]);
 			},
-			{ rangeHierarchyMaxRows: 3 },
+			{ rangeHierarchyMaxRows: () => 3 },
+		);
+	});
+
+	it("reads the bound at each eviction, so a lower bound applies at the next write", async () => {
+		let maxRows = 5;
+		await withStore(
+			(store) => {
+				const hk = kb("h");
+				store.learnRangeBoundary(hk, kb("a"), kb("b"), 1, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, kb("b"), kb("c"), 1, REFRESH_MS, 2_000);
+				store.learnRangeBoundary(hk, kb("c"), kb("d"), 1, REFRESH_MS, 3_000);
+				expect(store.countRangeHierarchyRows()).toBe(3);
+
+				maxRows = 2;
+				store.learnRangeBoundary(hk, kb("d"), kb("e"), 1, REFRESH_MS, 4_000);
+				expect(store.countRangeHierarchyRows()).toBe(2);
+
+				maxRows = 0;
+				expect(() => store.learnRangeBoundary(hk, kb("e"), kb("f"), 1, REFRESH_MS, 5_000)).toThrow(
+					invariantFailure(/rangeHierarchyMaxRows must be at least 1/),
+				);
+			},
+			{ rangeHierarchyMaxRows: () => maxRows },
 		);
 	});
 });

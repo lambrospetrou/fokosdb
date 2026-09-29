@@ -25,7 +25,7 @@ function config(overrides: Partial<TtlSweepConfig> = {}): TtlSweepConfig {
 		maxRowsBeforeSleep: 100,
 		maxBytesBeforeSleep: 1_000_000,
 		maxRowsPerCycle: 10,
-		initialDelayMs: 100,
+		ttlSweepDelayMs: 100,
 		...overrides,
 	};
 }
@@ -192,6 +192,33 @@ describe("TtlExpiry", () => {
 		});
 	});
 
+	it("reads ttlSweepDelayMs at each arming when no delay is given", async () => {
+		await withStore(async (store) => {
+			let checks = 0;
+			let delayMs = 5;
+			const expiry = new TtlExpiry({
+				store,
+				canSweep: () => (++checks, true),
+				logParams: () => ({ partition: "test" }),
+				config: () => config({ ttlSweepDelayMs: delayMs }),
+				nowSec: () => NOW_SECONDS,
+				wait: async () => {},
+			});
+
+			expiry.arm();
+			await scheduler.wait(30);
+			expect(checks).toBe(1);
+
+			// A changed value applies at the next arming.
+			delayMs = 10_000;
+			expiry.arm();
+			await scheduler.wait(30);
+			expect(checks).toBe(1);
+			expect(expiry.armed).toBe(true);
+			expiry.disarm();
+		});
+	});
+
 	it("validates every config field before deletion", async () => {
 		await withStore(async (store) => {
 			putExpired(store, "kept", 1);
@@ -201,7 +228,7 @@ describe("TtlExpiry", () => {
 					invalid.push([name, value]);
 				}
 			}
-			for (const name of ["sleepMs", "initialDelayMs"] as const) {
+			for (const name of ["sleepMs", "ttlSweepDelayMs"] as const) {
 				for (const value of [-1, 0.5]) {
 					invalid.push([name, value]);
 				}

@@ -4,8 +4,8 @@
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
-**Status:** In progress. M1, M2, M3, M4 and M5 are done. M6 is skipped: the comments on the settings types document
-each setting. `PartitionContextCreator.create` also defaults each option on its own and keeps the options object of
+**Status:** Done. M1, M2, M3, M4, M5 and M7 are done. M6 is skipped: the comments on the settings types document each
+setting. `PartitionContextCreator.create` also defaults each option on its own and keeps the options object of
 the caller unchanged (section 4.2.12).
 
 ## Table of contents
@@ -169,7 +169,7 @@ overrides in `FokosDBPolicy.limits`, with `resolveLimits` and the warning above 
 Document every setting: its default, its ceiling, what it affects, and whether a change is safe for a table that
 exists.
 
-### M7 — Late reads
+### M7 — Late reads (done)
 
 Move the two configuration reads that happen at construction to their first use (section 4.2.13). This milestone
 is last because each change alters a flow and its tests.
@@ -333,7 +333,8 @@ The settings of `PartitionDO`:
 | Promoted-key cleanup batch | 1,000 | Inline literal today. |
 
 `ttlSweep` has the fields of `TtlSweepConfig`: `chunkSize` (100), `sleepMs` (1,000), `maxRowsBeforeSleep` (10,000),
-`maxBytesBeforeSleep` (50 MiB), `maxRowsPerCycle` (100,000), and `initialDelayMs` (500). M7 renames `initialDelayMs`.
+`maxBytesBeforeSleep` (50 MiB), `maxRowsPerCycle` (100,000), and `ttlSweepDelayMs` (500). M7 renamed it from
+`initialDelayMs`.
 
 The settings of `TransactionCoordinatorDO`:
 

@@ -288,7 +288,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			config: () => this.fokosRuntimeConfig(),
 		});
 		void ctx.blockConcurrencyWhile(async () => this.#store.runMigrations());
-		this.#ttl.arm(this.config().ttlSweep.initialDelayMs);
+		this.#ttl.arm(this.config().ttlSweep.ttlSweepDelayMs);
 
 		// Best-effort, non-blocking: record the colo this isolate lives in for telemetry.
 		// It swallows the errors, because telemetry must never affect the lifecycle of the DO.

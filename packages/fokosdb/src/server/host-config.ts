@@ -118,7 +118,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 		maxRowsBeforeSleep: 10_000,
 		maxBytesBeforeSleep: 50 * 1024 * 1024,
 		maxRowsPerCycle: 100_000,
-		initialDelayMs: 500,
+		ttlSweepDelayMs: 500,
 	},
 	staleLockScanRows: 10,
 	promotedKeyCleanupRows: 1_000,
