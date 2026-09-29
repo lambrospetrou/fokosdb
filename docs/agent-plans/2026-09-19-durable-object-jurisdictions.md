@@ -1,6 +1,6 @@
 # RFC — Durable Object jurisdictions and location hints for a table
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-19
 
 ## Table of contents

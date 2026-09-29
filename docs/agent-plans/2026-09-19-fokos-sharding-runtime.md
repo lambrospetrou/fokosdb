@@ -1,6 +1,6 @@
 # RFC — FokosShardingRuntime: extract the sharding layer of `PartitionDO` into a reusable runtime
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-19
 **Author:** Lambros Petrou
 
