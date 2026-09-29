@@ -3,6 +3,8 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import {
 	encodeRangeComponent,
 	identityDepth,
+	isHashPartition,
+	isRangePartition,
 	partitionIdentityFrom,
 	PartitionIdHelper,
 	resolveDescendantHashPartitionContext,
@@ -32,8 +34,8 @@ describe("PartitionIdHelper — hash codec round-trips", () => {
 		expect(doName).toBe("iddb~h.3");
 		expect(PartitionIdHelper.rootIdx(bytes)).toBe(3);
 		expect(PartitionIdHelper.depth(bytes)).toBe(0);
-		expect(PartitionIdHelper.isHashPartition(opaque)).toBe(true);
-		expect(PartitionIdHelper.isRangePartition(opaque)).toBe(false);
+		expect(isHashPartition({ partitionId: opaque })).toBe(true);
+		expect(isRangePartition({ partitionId: opaque })).toBe(false);
 		const decoded = PartitionIdHelper.decode(Uint8Array.fromHex(opaque));
 		expect(decoded).toEqual({ schema: 0, rootIdx: 3, depth: 0 });
 	});
@@ -188,7 +190,7 @@ describe("PartitionIdHelper — range codec round-trips", () => {
 			const startKb = start === null ? null : kb(start);
 			const endKb = end === null ? null : kb(end);
 			const { bytes, opaque } = PartitionIdHelper.fromRangePartition(base, kb("alice"), startKb, endKb).encode(false);
-			expect(PartitionIdHelper.isRangePartition(opaque)).toBe(true);
+			expect(isRangePartition({ partitionId: opaque })).toBe(true);
 			const decoded = PartitionIdHelper.decode(bytes);
 			expect(decoded).toEqual({ schema: 1, hashKey: kb("alice"), startBoundary: startKb, endBoundary: endKb });
 		}

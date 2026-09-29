@@ -1,6 +1,6 @@
 import type { PartitionNodeId } from "./types.js";
 import type { RangeAncestorInfo } from "./types.js";
-import { SHARD_GROUP_SEPARATOR, type FokosPartitionIdentity, type FokosPartitionRef, type FokosRouteContext } from "./route-context.js";
+import type { FokosPartitionIdentity, FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import { GOLDEN_RATIO as _GOLDEN_RATIO, hashChildIndex as _hashChildIndex, hashRootIndex as _hashRootIndex } from "./hash-primitives.js";
 import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import invariant from "../shared/invariant.js";
@@ -11,6 +11,12 @@ import invariant from "../shared/invariant.js";
  * computed and the mutable parts travel unchanged. Nothing here resolves a Durable Object ID or a
  * stub: `idFromName` recreates the deterministic ID wherever a stub is made.
  */
+
+/**
+ * The separator between the shard group and the rest of a DO name. A shard group must not contain
+ * it (`validateTopology`), so the first "~" of a name always ends the shard group.
+ */
+export const SHARD_GROUP_SEPARATOR = "~";
 
 // Reserved sentinel tokens for the unbounded edges of a range, used ONLY in DO names (never in
 // routing comparisons — there boundaries stay `KeyBytes | null` with null = unbounded). The component
@@ -346,6 +352,18 @@ export const GOLDEN_RATIO = _GOLDEN_RATIO;
 export const hashChildIndex = _hashChildIndex;
 export const hashRootIndex = _hashRootIndex;
 
+/**
+ * The first byte of a partition ID names its schema. Both wire formats start with the schema byte
+ * as two hex digits, so a check of the prefix is sufficient and decodes nothing.
+ */
+export function isHashPartition(ref: Pick<FokosPartitionRef, "partitionId">): boolean {
+	return ref.partitionId.startsWith(PartitionIdHelper.SCHEMA_HASH_V1_STR);
+}
+
+export function isRangePartition(ref: Pick<FokosPartitionRef, "partitionId">): boolean {
+	return ref.partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR);
+}
+
 export class PartitionIdHelper {
 	static readonly SCHEMA_HASH_V1 = 0x00 as const;
 	static readonly SCHEMA_HASH_V1_STR = "00" as const;
@@ -376,22 +394,6 @@ export class PartitionIdHelper {
 		const first = new Uint8Array(base64UrlByteLength(firstText.length));
 		decodeBase64UrlInto(firstText, first);
 		return readRangeFirst(first).hashKey;
-	}
-
-	static isHashPartition(partitionId: PartitionNodeId): boolean {
-		// PartitionID are hex-encoded bytes with a schema version byte prefix,
-		// so we can peek the first byte to determine the type without full decoding.
-		// This is important for efficient routing in the DOs.
-		// const bytes = Number.parseInt(partitionId.substring(0, 2), 16);
-		// return bytes === PartitionIdHelper.SCHEMA_HASH_V1;
-		return partitionId.startsWith(PartitionIdHelper.SCHEMA_HASH_V1_STR);
-	}
-
-	static isRangePartition(partitionId: PartitionNodeId): boolean {
-		// PartitionID are hex-encoded bytes with a schema version byte prefix,
-		// so we can peek the first byte to determine the type without full decoding.
-		// This is important for efficient routing in the DOs.
-		return partitionId.startsWith(PartitionIdHelper.SCHEMA_RANGE_V1_STR);
 	}
 
 	static doName(shardGroup: string, bytes: Uint8Array): string {

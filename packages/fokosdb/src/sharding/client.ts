@@ -3,8 +3,8 @@ import { isDestroyAbortError } from "../shared/cf-utils.js";
 import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import type { FokosImportState, FokosShardingRpc, FokosStatusCursor, RouteKey } from "./repartition-types.js";
+import { isRangePartition } from "./partition-id.js";
 import {
-	isRangePartition,
 	refOf,
 	type FokosPartitionRef,
 	type FokosRangeConfig,

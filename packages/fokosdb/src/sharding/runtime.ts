@@ -21,6 +21,7 @@ import { KeyCodec, type KeyBytes } from "./key-codec.js";
 import { PartialRangeTopology } from "./partial-range-topology.js";
 import {
 	identityDepth,
+	isRangePartition,
 	partitionIdentityFrom,
 	PartitionIdHelper,
 	resolveDescendantHashPartitionContext,
@@ -44,7 +45,6 @@ import type {
 	RouteKey,
 } from "./repartition-types.js";
 import {
-	isRangePartition,
 	refOf,
 	structurallyEqual,
 	topologiesEqual,

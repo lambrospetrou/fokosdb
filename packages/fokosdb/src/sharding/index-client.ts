@@ -30,8 +30,6 @@ export { GOLDEN_RATIO, GOLDEN_RATIO_BIGINT, hash32, hash64, hashChildIndex, hash
 // ─── Identity and context ─────────────────────────────────────────────────────
 
 export {
-	isHashPartition,
-	isRangePartition,
 	refOf,
 	structurallyEqual,
 	topologiesEqual,
@@ -51,6 +49,8 @@ export {
 	RANGE_MAX,
 	RANGE_MIN,
 	identityDepth,
+	isHashPartition,
+	isRangePartition,
 	partitionIdentityFrom,
 	resolveDescendantHashPartitionContext,
 	resolveHashChildPartitionContexts,

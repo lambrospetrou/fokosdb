@@ -10,12 +10,7 @@ import type { KeyBytes } from "./key-codec.js";
 import type { RangeAncestorInfo } from "./types.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
-
-/**
- * The separator between the shard group and the rest of a DO name. A shard group must not contain
- * it (`validateTopology`), so the first "~" of a name always ends the shard group.
- */
-export const SHARD_GROUP_SEPARATOR = "~";
+import { SHARD_GROUP_SEPARATOR } from "./partition-id.js";
 
 export type FokosTopology = {
 	shardGroup: string;
@@ -76,18 +71,6 @@ export type FokosPartitionIdentity = {
 
 /** The mutable part of the last route context a partition received, under `__fokos/policy`. */
 export type FokosStoredPolicy<TPolicy> = { rangeConfig: FokosRangeConfig; policy: TPolicy };
-
-/** The first byte of a partition ID names its schema; see `PartitionIdHelper`. */
-const HASH_SCHEMA_PREFIX = "00";
-const RANGE_SCHEMA_PREFIX = "01";
-
-export function isHashPartition(ref: FokosPartitionRef): boolean {
-	return ref.partitionId.startsWith(HASH_SCHEMA_PREFIX);
-}
-
-export function isRangePartition(ref: FokosPartitionRef): boolean {
-	return ref.partitionId.startsWith(RANGE_SCHEMA_PREFIX);
-}
 
 export function refOf(ctx: FokosPartitionRef): FokosPartitionRef {
 	return { partitionId: ctx.partitionId, doName: ctx.doName };

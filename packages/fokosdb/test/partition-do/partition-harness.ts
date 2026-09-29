@@ -9,12 +9,13 @@ import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import invariant from "../../src/shared/invariant.js";
 import { FokosError, UNAVAILABLE_CODES } from "../../src/shared/errors.js";
 import type { PromotedKeyStatus } from "../../src/shared/partition/partition-store.js";
-import { isHashPartition, isRangePartition } from "../../src/sharding/route-context.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
 	PartitionIdHelper,
 	hashChildIndex,
+	isHashPartition,
+	isRangePartition,
 	resolveHashChildPartitionContexts,
 	resolveDescendantHashPartitionContext,
 	resolveRangePartitionContext,

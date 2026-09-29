@@ -21,7 +21,7 @@
 import fc from "fast-check";
 import { describe, expect, it } from "vitest";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
-import { encodeRangeComponent, PartitionIdHelper } from "../../src/sharding/partition-id.js";
+import { encodeRangeComponent, isHashPartition, isRangePartition, PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { propertyRuns, textEncoder } from "./harness.js";
 
 const PROPERTY_RUNS = propertyRuns(2_000);
@@ -222,8 +222,8 @@ describe("partition IDs and DO names — properties", () => {
 			fc.property(arbPartition, (partition) => {
 				const { bytes, opaque } = encodePartition(partition);
 				expect(PartitionIdHelper.partitionIdToBytes(opaque)).toEqual(bytes);
-				expect(PartitionIdHelper.isHashPartition(opaque)).toBe(partition.kind === "h");
-				expect(PartitionIdHelper.isRangePartition(opaque)).toBe(partition.kind === "r");
+				expect(isHashPartition({ partitionId: opaque })).toBe(partition.kind === "h");
+				expect(isRangePartition({ partitionId: opaque })).toBe(partition.kind === "r");
 				const decoded = PartitionIdHelper.decode(PartitionIdHelper.partitionIdToBytes(opaque));
 				if (partition.kind === "h") {
 					expect(decoded).toEqual({ schema: 0, rootIdx: partition.root, depth: partition.path.length });
