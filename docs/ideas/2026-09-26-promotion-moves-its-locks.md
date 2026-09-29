@@ -1,8 +1,11 @@
 # RFC — A promotion cuts over with the locks of its key
 
-**State:** Draft
+**State:** Superseded
 **Date:** 2026-09-26
 **Implementation:** Not implemented.
+
+> Superseded by `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`, which is the spec to implement. Do not
+> implement from this document.
 
 ## Table of contents
 
@@ -76,8 +79,8 @@ Three host paths must distinguish owned pending rows from transfer copies:
    handler must also report how many rows it resolved, because a call that finds no owned row answers today
    with the same success as a real repair.
 
-After source cleanup, the old source has no moved keys to discover for emergency repair. Repair through that
-old source after its cleanup is not a requirement of this change.
+After promotion completion, the old source has no transfer copies left to discover for emergency repair. Repair
+through that old source after completion is not a requirement of this change.
 
 ## 2. Goals and requirements
 
@@ -88,11 +91,11 @@ old source after its cleanup is not a requirement of this change.
   fragment the runtime exports. No new table, hook, or per-row mark.
 - Local transaction validation and mutation must use locally owned pending rows.
 - Source recovery must preserve pending rows required by an unfinished transfer.
-- Promotion and split cancellation must preserve source transfer copies until acknowledgement permits cleanup.
+- Promotion and split cancellation must preserve source transfer copies until the last acknowledgement.
 - Emergency repair must remain available on each complete current owner, with the existing request type.
-  Its response must say how many rows the partition resolved locally, how many keys it forwarded, and which
-  partitions answered for the forwarded keys. Each call must write one log line with that result. A call that
-  fails must still record the rows that it resolved locally.
+  Its response must say how many rows the partition resolved locally and how many keys it forwarded. Each call
+  must write one log line with that result. A call that fails must still record the rows that it resolved
+  locally.
 - A target that imports a quarantined lock must log the lock with its own `doName`.
 - A `txCancel` request with an empty `items` list must stay legal and release no pending row.
 - The existing migration streams, import gate, routed operations, and coordinator recovery must remain in use.
@@ -107,7 +110,7 @@ old source after its cleanup is not a requirement of this change.
 - Removal of the mutual exclusion between a hash split and an unfinished promotion.
 - Removal of the Bloom fallback for an uninitialized or `awaiting_data` range root.
 - Automatic transaction-wide discovery of emergency-repair keys or current lock owners.
-- Emergency repair through the original source after its cleanup removed the transfer copies.
+- Emergency repair through the original source after its completion deleted the transfer copies.
 - New administrative APIs or records that prove a historical transaction outcome.
 - A rollback of the code on partitions that already cut over a locked key. The change ships to a new
   deployment with no existing partitions.
@@ -134,19 +137,23 @@ milestone 4. Until then no production source holds a transfer copy, and the test
 build that state by hand through the migration harness.
 
 1. **Transfer keys and owned-row scope.** Add the `movedHashKeys` SQL fragment to the runtime (section 4.2.1).
-   Scope `commitLocal`, the cancel release, quarantine, guard removal, the stale selection, and the recovery
-   deadline to owned rows, as sections 4.2.5 and 4.2.6 define them. Keep every owned-row statement within the
-   parameter limit of section 4.2.5. An empty cancel releases nothing. Tests:
-   "Participant and routing tests" and "Recovery tests" of section 4.2.12.
-2. **Migration and cleanup.** Bound the pending-row deletion of promotion cleanup and let the pending stream
-   carry the rows of the promoted key. Log each quarantined lock that a target imports (section 4.2.6). Tests:
-   "Migration and coordinator tests" and "Promotion cleanup tests" of section 4.2.12.
-3. **Emergency repair.** Route every row of the transaction, mutate owned rows only, report the counts and the
-   answering partitions of section 4.2.7, and log each call. Tests: "Emergency-repair tests" of section 4.2.12.
-4. **Guard removal.** Remove the lock count from `beforeCutover`, remove the two `repartitionUnblocked`
-   signals, change the tests that hold a promotion with a lock, and change the code comments that section
-   4.2.11 lists. Run the transfer tests of milestones 1 and 2 again through a real cutover: a prepare lands
-   during target initialization, the source cuts over, the target imports the lock, and the target commits it.
+   Scope `commitLocal`, the cancel release, quarantine, the stale selection, and the recovery deadline to owned
+   rows, as sections 4.2.5 and 4.2.6 define them. Keep every owned-row statement within the parameter limit of
+   section 4.2.5. An empty cancel releases nothing. Tests: "Participant and routing tests" and "Recovery tests"
+   of section 4.2.12.
+2. **Migration and cleanup.** Delete the pending copies of the promoted key in the completion transaction, and
+   remove the pending-row deletion from the cleanup step (section 4.2.8). Let the pending stream carry the rows
+   of the promoted key. Log each quarantined lock that a target imports (section 4.2.6). Tests: "Migration and
+   coordinator tests" and "Promotion cleanup tests" of section 4.2.12.
+3. **Emergency repair.** Route every row of the transaction, mutate owned rows only, report the two counts of
+   section 4.2.7, and log each call. Remove `clearPendingTxGuard`. Tests: "Emergency-repair tests" of section
+   4.2.12.
+4. **Guard removal.** Remove the lock count from `beforeCutover`. Remove the `repartitionUnblocked` signal
+   from the two host operations and from the runtime, together with `onRepartitionUnblocked` and
+   `markPromotionsDueNow`. Rename `lockRetryMs` to `cutoverHoldRetryMs` (section 4.2.11). Change the tests that
+   hold a promotion with a lock, and change the code comments that section 4.2.11 lists. Run the transfer tests
+   of milestones 1 and 2 again through a real cutover: a prepare lands during target initialization, the source
+   cuts over, the target imports the lock, and the target commits it.
 
 ## 4. Proposed solution
 
@@ -161,13 +168,14 @@ The design separates three responsibilities:
 | Responsibility | Meaning |
 | --- | --- |
 | Authority | The current owner can resolve the pending operation, once its import is complete. |
-| Retention | The source keeps the pending payload until acknowledgement permits cleanup. |
+| Retention | The source keeps the pending payload until the target acknowledges its import. |
 | Repair scope | The addressed partition routes every row it holds to its current owner and mutates only its owned rows. |
 
 The runtime already records every promotion with its hash key and its state. A hash key whose promotion is in
-`cutover` or `completed` is a transfer key, and the pending rows under it are transfer copies. A local path that
-holds the rows of one transaction asks `owns()` for the rows it cannot place. A scan that holds no transaction
-excludes the transfer keys with a SQL fragment the runtime exports. Nothing new is written at cutover.
+`cutover` is a transfer key, and the pending rows under it are transfer copies. The completion transaction
+deletes those copies. A local path that holds the rows of one transaction asks `owns()` for the rows it cannot
+place. A scan that holds no transaction excludes the transfer keys with a SQL fragment the runtime exports.
+Nothing new is written at cutover.
 
 After promotion, the source continues to resolve transactions for its retained keys. It excludes transfer copies
 from local commit validation and stale recovery. After a split, the source owns no application keys and resolves
@@ -182,7 +190,7 @@ Source retains transfer copy ---- import ----> Target holds complete key and loc
         |                                          |
         | no local transaction resolution          | normal operations and recovery
         |                                          | acknowledgement
-        +--------------- cleanup <-----------------+
+        +---------- delete copies <----------------+
 ```
 
 The target can resolve a transaction before the source receives its acknowledgement. A pending row left on the
@@ -201,19 +209,21 @@ protocol.
 An **owned pending row** belongs to a key for which `fokos.owns(key)` is true. An importing target owns its slice,
 but the import gate still prevents transaction resolution.
 
-A **transfer key** is a hash key whose promotion on this source is in `cutover` or `completed`. The runtime
-already stores that fact: `fokos_repartitions` carries `kind`, `state`, and `hash_key` for every promotion, and
-`idx_fokos_repartitions_due (state, next_attempt_at, seq)` finds the two states with one seek each. The key
-stops being a transfer key when the runtime writes `cleaned`, which happens in the transaction of the last
-cleanup step, after the host reported both copy sets empty. A split source has no transfer key: it owns no key
-after cutover and resolves no transaction locally. The number of transfer keys is not bounded by one: a
-`completed` promotion of a large key stays in that state for as many cleanup steps as its rows need, and forced
-promotions can put many keys there at once.
+A **transfer key** is a hash key whose promotion on this source is in `cutover`. The runtime already stores that
+fact: `fokos_repartitions` carries `kind`, `state`, and `hash_key` for every promotion, and
+`idx_fokos_repartitions_due (state, next_attempt_at, seq)` finds the state with one seek. The key stops being a
+transfer key when the runtime writes `completed`. The same transaction deletes every pending copy under the key
+(section 4.2.8), so no transfer copy exists outside `cutover`. The number of transfer keys is not bounded by
+one: forced promotions can put many keys in `cutover` at once.
+
+A split source has no transfer key. A hash split cannot queue while a promotion is unfinished, and a promotion
+cannot queue on a partition that has a split row. A promotion that completed before the split queued has no
+pending copy left. After cutover, a split source owns no key and resolves no transaction locally.
 
 A **transfer copy** is a source pending row whose hash key is a transfer key. Migration still needs that row
-until the required acknowledgement. The row can remain after the target resolves its own copy. The two
-definitions agree: a pending row for a transfer key can exist on the source only from before the cutover,
-because every later operation on that key resolves to the range root.
+until the target acknowledges. The row can remain after the target resolves its own copy. The two definitions
+agree: a pending row for a transfer key can exist on the source only from before the cutover, because every
+later operation on that key resolves to the range root.
 
 Two tools read that fact, one for each kind of caller:
 
@@ -227,7 +237,7 @@ Two tools read that fact, one for each kind of caller:
 
   ```sql
   SELECT hash_key FROM fokos_repartitions
-   WHERE kind = 'key_promotion' AND state IN ('cutover', 'completed') AND hash_key IS NOT NULL
+   WHERE kind = 'key_promotion' AND state = 'cutover' AND hash_key IS NOT NULL
   ```
 
   `hash_key` is a nullable column. When the result of a `NOT IN` subquery holds one NULL, the predicate is
@@ -239,11 +249,10 @@ Two tools read that fact, one for each kind of caller:
   subquery once per statement into an ephemeral index and probes it once per scanned row, so the cost does
   not depend on the number of pending rows and grows only with the number of transfer keys, once per statement.
   The fragment is the contract: the runtime can change its tables and keeps the text in step, and the host
-  never names a `fokos_` table. `PartitionStore` receives a callback that returns the fragment, either at
-  construction or as an argument of each method that needs it. The store calls the callback only when it runs
-  the statement. The constructor builds the store before the runtime, and the runtime needs the store for its
-  hooks, so the store cannot read the fragment at construction. The callback returns the same text on every
-  call, so the statement text stays constant.
+  never names a `fokos_` table. `PartitionStore` receives, at construction, a callback that returns the
+  fragment. The store calls the callback only when it runs a statement: the constructor builds the store
+  before the runtime, and the runtime needs the store for its hooks, so the fragment does not exist yet at
+  construction. The callback returns the same text on every call, so the statement text stays constant.
 
 Normal operations below include reads, writes, prepare, commit, cancel, and transactional reads. Normal lock
 conflicts and admission checks still apply.
@@ -277,8 +286,8 @@ still owns. `K` includes every sort key under that hash key.
 | 2. Before cutover | Own and serve. | Own and serve. | Await data. |
 | 3. Import incomplete | Forward; retain copies. | Own and serve. | Import; read through. |
 | 4. Imported, no ack | Forward; retain copies. | Own and serve. | Serve; recover; ack. |
-| 5. Ack recorded | Forward; queue cleanup. | Own and serve. | Serve and recover. |
-| 6. Cleaned | Forward; copies gone. | Own and serve. | Serve and recover. |
+| 5. Ack recorded | Forward; pending copies gone; clean items. | Own and serve. | Serve and recover. |
+| 6. Cleaned | Forward; item copies gone. | Own and serve. | Serve and recover. |
 
 **Stage 1 — Queued or planned, before initialization.** `S` owns both `K` and `U`. It takes and resolves locks
 normally. `R` is not yet an initialized target.
@@ -303,14 +312,15 @@ to `S`. It rejects writes, transactional reads, prepare, commit, cancel, and for
 its complete state. It can commit, cancel, or quarantine imported locks. It retries acknowledgement independently
 of transaction completion. `S` retains its transfer copies and excludes them from local transaction decisions.
 
-**Stage 5 — Acknowledgement recorded, promotion completed.** `S` schedules cleanup. It stops serving migration
-pages and read-through calls for `K`. Requests for `K` still route to `R`. A lost acknowledgement response does
-not prevent source cleanup or target service.
+**Stage 5 — Acknowledgement recorded, promotion completed.** The transaction that writes `completed` deletes
+every pending copy of `K`, so `K` stops being a transfer key. `S` schedules the item cleanup. It stops serving
+migration pages and read-through calls for `K`. Requests for `K` still route to `R`. A lost acknowledgement
+response does not prevent source cleanup or target service.
 
-**Stage 6 — Source cleanup complete.** The bounded batches of section 4.2.8 have removed both sets of copies for
-`K`. `S` removes the size estimate, the runtime writes `cleaned` in the same transaction, and `K` stops being a
-transfer key. `S` keeps the route to the range tree. Cleanup leaves `U` and its locks untouched. An unresolved
-lock can remain at `R` after its source copy is gone.
+**Stage 6 — Source cleanup complete.** The bounded item batches of section 4.2.8 have removed the item copies of
+`K`. `S` removes the size estimate, and the runtime writes `cleaned` in the same transaction. `S` keeps the route
+to the range tree. Cleanup leaves `U` and its locks untouched. An unresolved lock can remain at `R` after its
+source copy is gone.
 
 #### 4.2.3 A transaction across promoted and retained keys
 
@@ -333,7 +343,7 @@ Dispatch must divide commit or cancel by current ownership:
 | `U` | `S` validates and resolves its owned pending rows. |
 | `K`, import incomplete | `S` forwards. `R` refuses temporarily. The driver retries. |
 | `K`, import complete | `S` forwards. `R` resolves its owned pending rows. |
-| Source copy of `K` | Transaction resolution preserves it. Cleanup removes it after acknowledgement. |
+| Source copy of `K` | Transaction resolution preserves it. The completion transaction deletes it. |
 
 After local resolution of `U`, a retry can find only the transfer copy of `K` on `S`. This is an idempotent local
 success, not `commit_keyset_mismatch`.
@@ -389,10 +399,10 @@ In this table, an imported target includes both `imported` and `active`. An impo
 | Stale recovery | Owned rows only. | Do not run. | Do not run. | Run normally. |
 | Old `not_found` | Guard owned rows. | No local decision. | No decision. | Guard owned rows. |
 | Export locks | Promoted slice. | Each child slice. | Not applicable. | No further import. |
-| Delete copies | Cleanup after ack. | After every ack. | Not permitted. | Rows are owned. |
+| Delete copies | At completion. | At completion. | Not permitted. | Rows are owned. |
 
 A promotion source forwards the moved part of commit or cancel. Both source kinds preserve transfer copies
-until the cleanup condition in sections 4.2.2 and 4.2.4 holds.
+until the transaction that records the last acknowledgement deletes them (sections 4.2.2 and 4.2.4).
 
 `TransactionParticipant.commitLocal` must use the owned pending set for all three decisions:
 
@@ -428,16 +438,11 @@ locally" to "release nothing".
 
 **Statement shape.** One SQLite query on a Durable Object binds at most 100 parameters. A transaction can hold
 `MAX_ITEMS_PER_TX` (100) keys on one partition, and each key binds two parameters, so one statement cannot bind
-every owned key. The commit deletion, the cancel release, `guardPendingTx`, and `clearPendingTxGuard` must each
-use one of two shapes:
-
-1. One statement per key, by the primary key `(hk, sk, transaction_id)`, all inside one `transactionSync`.
-2. One statement with `transaction_id = ?` and `hk NOT IN (<movedHashKeys fragment>)`.
-
-Shape 2 selects exactly the owned rows on a partition that owns keys, because each of its pending rows is an
-owned row or a transfer copy. A split router owns no key, and each of its rows is a copy for a child that the
-fragment does not name. Each of the four statements therefore runs only when its path holds at least one owned
-key. With no owned key, the path changes no row.
+every owned key. The commit deletion, the cancel release, and `guardPendingTx` therefore run one statement per
+owned key, by the primary key `(hk, sk, transaction_id)`, all inside one `transactionSync`. Each path already
+holds its owned keys: the commit request, the cancel request, and the owned rows that the quarantine path
+selected. A path with no owned key changes no row. These statements do not use the `movedHashKeys` fragment,
+so a local mutation depends only on the ownership decision of `dispatch` or `owns()`.
 
 #### 4.2.6 Stale recovery and quarantine
 
@@ -461,18 +466,18 @@ For locally owned rows:
 - A failed coordinator call preserves the pending rows for retry.
 
 For transfer copies, these results authorize no local mutation. In particular, `not_found` must not delete a row
-because its key routes away. The migration cleanup path removes that copy after acknowledgement.
+because its key routes away. The completion transaction deletes that copy (section 4.2.8).
 
-Guard updates and guard removal must use the same owned-row scope: `guardPendingTx` and `clearPendingTxGuard`
-take the owned rows of the transaction in a statement shape of section 4.2.5, not the transaction id alone. A
-source must not change quarantine metadata on a transfer copy after cutover. An existing `guarded_at` value must
-survive migration. If an unguarded row moves, the complete target evaluates its age and coordinator result
-itself.
+`guardPendingTx` takes the owned rows of the transaction, with the statement shape of section 4.2.5, not the
+transaction id alone. A source must not change quarantine metadata on a transfer copy after cutover. An
+existing `guarded_at` value must survive migration. If an unguarded row moves, the complete target evaluates its
+age and coordinator result itself.
 
 **Log of an imported quarantine.** The stale scan skips a guarded row, and the guard logs only when a lock
 enters quarantine. A target therefore stays silent about a guarded row it imports, unless it logs the import.
 When the migration host applies a pending page, it writes one line for each transaction whose rows in that page
-carry `guarded_at`:
+carry `guarded_at`. The stream pages rows in `(hk, sk, transaction_id)` order, so the rows of one transaction can
+span pages, and that transaction then gets one line per page. Each line carries:
 
 - the message `"fokos/partition: imported a quarantined lock"`;
 - `transactionId`, `coordinatorDoName`, `idempotencyToken`, and the encoded keys of the rows of that transaction
@@ -500,7 +505,8 @@ Both queries walk `pending_transactions_created_at` from its start and skip the 
 `n` transfer copies older than the oldest owned row, one query steps past `n` index entries and probes the
 ephemeral index of the subquery once per entry. `n` is the number of locks that were in flight under the
 promoted keys at their cutovers, not the number of transfer keys: most transfer keys have no pending row. The
-cost does not depend on the payload bytes of the rows.
+cost does not depend on the payload bytes of the rows. It lasts only while the promotion is in `cutover`,
+because the completion transaction deletes the copies.
 
 The scheduler reads the `deadline()` of every runnable job up to three times in one pass: to find the due jobs,
 to find the earliest deadline, and again after the steps. It reads them on every pass of any job, not only on
@@ -523,7 +529,7 @@ Quarantine protects against missing decision evidence. The operator diagnoses th
 outcome. The repair RPC does not diagnose the transaction or reconstruct its decision.
 
 **Request, response, and scope.** Keep `DebugForceResolveTransactionRequest` unchanged. The response gives two
-counts and the partitions that answered for the forwarded keys:
+counts:
 
 ```ts
 type DebugForceResolveTransactionRequest = {
@@ -537,10 +543,6 @@ type DebugForceResolveTransactionResponse = {
   resolvedLocally: number;
   /** Keys of the transaction that this partition sent to their current owners. Not the rows those owners resolved. */
   forwarded: number;
-  /** The partitions that executed the forwarded keys. Call each one with the same request to read its own `resolvedLocally`. */
-  forwardedTo: { partitionId: string; doName: string }[];
-  /** True when the byte cap of the route evidence dropped a partition from `forwardedTo`. */
-  forwardedToTruncated: boolean;
 };
 ```
 
@@ -553,61 +555,57 @@ their current owner. The routed operations mutate owned rows only, as section 4.
 copy is a routing key here and never a local write. The caller supplies no item keys and cannot select an
 arbitrary subset of the rows.
 
-The handler derives the original transaction timestamp from an owned row when one exists, else from any row of
-the transaction. Selection and entry into the routed operation must have no intervening `await`. Guard removal
-runs after a routed operation that returned, and obeys the owned-row rule of section 4.2.6. The ordinary
-transaction paths continue to enforce ownership and the import gate: a forwarded key whose owner still imports
-fails the call with `partition_fanout_failed` after the local part applied, and the operator repeats the call
-later, which then finds no owned row and forwards again.
+The handler takes the original transaction timestamp from any row of the transaction: prepare writes one
+timestamp to every row of it. Selection and entry into the routed operation must have no intervening `await`.
+The ordinary transaction paths continue to enforce ownership and the import gate: a forwarded key whose owner
+still imports fails the call with `partition_fanout_failed` after the local part applied, and the operator
+repeats the call later, which then finds no owned row and forwards again.
 
-`resolvedLocally` is the number of rows the local part deleted. `forwarded` is the number of keys in the remote
-groups. `forwardedTo` lists the partitions that executed those keys. The handler takes the list from the routing
-of the routed call: every node with the role `executed`, except this partition. The route evidence has a byte
-cap, and `forwardedToTruncated` is true when the cap dropped a node.
+The handler no longer clears `guarded_at` after the routed operation, and `clearPendingTxGuard` goes. A routed
+operation that returned has deleted every owned row of the transaction on this partition. The rows that remain
+are transfer copies, and a source must not change their quarantine metadata (section 4.2.6).
 
-`forwarded` counts the keys sent, not the rows resolved. A current owner that holds no row of the transaction
-answers with success and changes nothing. The operator calls each partition in `forwardedTo` with the same
-request, and each one answers its own `resolvedLocally`. A call that finds no row answers zero counts and an
-empty `forwardedTo`.
+The handler computes both counts from the rows it selected, before it enters the routed operation.
+`resolvedLocally` is the number of selected rows for which `owns()` is true, and `forwarded` is the number of the
+other selected rows. The handler enters the routed operation in the same synchronous block, so the local part
+deletes exactly the rows that `resolvedLocally` counts. A successful call has applied the outcome on every
+owner. `forwarded` counts the keys sent, not the rows resolved: an owner that already resolved its rows answers
+with success and changes nothing.
 
 **Log.** Each call writes one line, so the operator has a record of each forced outcome:
 
 - After the routed call returns, the message is `"fokos/partition: forced resolution applied"`. The line carries
-  `transactionId`, `outcome`, `resolvedLocally`, `forwarded`, the `doName` of each partition in `forwardedTo`,
-  `forwardedToTruncated`, and the `doName` and `partitionId` of this partition.
+  `transactionId`, `outcome`, `resolvedLocally`, `forwarded`, and the `doName` and `partitionId` of this
+  partition.
 - When the routed call throws, the message is `"fokos/partition: forced resolution failed"`. The line carries
-  `transactionId`, `outcome`, `resolvedLocally`, the error code, the `causeCode` of a `partition_fanout_failed`,
-  and the `doName` and `partitionId` of this partition. The handler then throws the error again.
+  the same fields, the error code, and the `causeCode` of a `partition_fanout_failed`. The handler then throws
+  the error again.
 
-The local part can have applied before a failure, and the failure line records it:
-
-- When the error code is `partition_fanout_failed`, `resolvedLocally` is the number of owned rows that the
-  handler selected. The runtime throws that code only after the local part committed, because a failed local
-  part outranks a failed remote group.
-- For every other error code, `resolvedLocally` is zero. The local part threw, or the dispatch stopped before
-  the local part ran. The local part is atomic, so it applied no row.
-
-The handler selects the owned rows and enters the routed operation with no `await` between them. So the
-selected count is the number of rows that the local part deleted. When `causeCode` is `partition_migrating`, an
-owner still imports, and the operator repeats the call later.
+The local part can have applied before a failure. The runtime throws `partition_fanout_failed` only after the
+local part committed, because a failed local part outranks a failed remote group. So on that code the failure
+line keeps `resolvedLocally` as computed. On every other code the local part applied no row, and the line
+carries `resolvedLocally: 0`. When `causeCode` is `partition_migrating`, an owner still imports, and the operator
+repeats the call later.
 
 **Empty sets and retries.** If the partition holds no row of the transaction, the call applies no write and
-needs no original timestamp. A timestamp used to construct an empty internal request must not affect stored
-item state. With the outcome `cancel`, the internal request has an empty `items` list, which section 4.2.5 keeps
-legal and which releases no row. The response does not prove that the transaction existed or committed globally.
+answers two zero counts. With the outcome `cancel`, the internal request has an empty `items` list, which
+section 4.2.5 keeps legal and which releases no row. The response does not prove that the transaction existed
+or committed globally.
 
 A repeated repair call keeps the transaction ID and chosen outcome. It reads the remaining rows again. A lost
 response after local resolution therefore permits a retry that resolves nothing locally, forwards what remains,
 and applies no write twice. Two zero counts tell the operator that this partition holds nothing of the
-transaction and that the current owners must be addressed directly. The import log of section 4.2.6 names the
-partition that received each quarantined lock.
+transaction. The import log of section 4.2.6 names the partition that received each quarantined lock.
 
 | Stage | Emergency-repair behavior |
 | --- | --- |
 | Before cutover | Call the source. It resolves its owned rows and reports them in `resolvedLocally`. |
 | After cutover, import incomplete | The source resolves its owned rows and forwards the moved keys; the target refuses them and the call fails. Repeat later. |
-| After import | Call the source or the target. The source forwards the moved keys, counts them in `forwarded`, and names the target in `forwardedTo`. The target resolves its owned rows. |
-| After source cleanup | Call the current owner that the import log names. The old source holds no row and answers two zero counts. |
+| After import, before completion | Call the source or the target. The source forwards every transfer copy of the transaction and counts them in `forwarded`. The target resolves its owned rows. |
+| After completion | Call the current owner that the import log names. The old source holds no copy of the transaction and forwards nothing. It resolves its own owned rows of the transaction, if it holds any, and answers `forwarded: 0`. With no owned row, it answers two zero counts. |
+
+The completion transaction deletes every copy under the promoted key at once (section 4.2.8). So the source
+forwards every row of a transaction to the target, or no row. It never forwards part of one.
 
 A split source owns no key after cutover. An emergency call there forwards every row to the children, mutates
 nothing locally, and reports `resolvedLocally: 0`. A child that still imports refuses, and the call fails until
@@ -615,18 +613,8 @@ the child finishes. After the split completes, the router holds no row and answe
 then calls the children that the import log names. This RFC adds no automated inventory or transaction-wide
 recovery driver.
 
-**Coordinator and diagnostic records.** The coordinator is not a permanent key directory:
-
-| Coordinator point | Keys and result available internally |
-| --- | --- |
-| Before completion | `tc_items` retains keys. At `PREPARED`, it drops the write payload. |
-| At completion | `completeTransaction` deletes `tc_items` and `tc_participants`. |
-| After result expiry | The idempotency sweep deletes the terminal state and result records. |
-
-`recoverTransactionForParticipant` reports or drives an outcome. It does not return a recovery key list.
-The emergency tool gets keys from the pending rows of the addressed partition, not from this coordinator call.
-A quarantine log contains the keys observed by one participant. It remains diagnostic evidence, not proof of a
-complete transaction scope or historical outcome.
+The repair gets its keys from the pending rows of the addressed partition. The coordinator does not keep them:
+`completeTransaction` deletes `tc_items` and `tc_participants`.
 
 #### 4.2.8 Migration, acknowledgement, and cleanup
 
@@ -651,23 +639,37 @@ A target acknowledges only after its complete import is durable. The source reco
 before it deletes transfer copies. Acknowledgement failure changes cleanup progress, not the target's ability to
 serve its complete state.
 
-Promotion cleanup must bound both item deletion and pending-row deletion. Each step can delete one batch from
-each table for the promoted hash key. Each batch must use the existing item-cleanup limit of 1,000 rows.
-`deletePendingTxForHashKey` currently deletes every matching pending row. The promotion cleanup path must replace
-that unrestricted deletion with a bounded batch.
+The source deletes the two copy sets of a promoted key at different times:
 
-If either table still contains source copies for that key, `cleanupSourceStep` must report incomplete work.
-The repartition stays `completed` and retries through the existing cleanup schedule. An empty item set must not
-end cleanup while pending-row copies remain. Only after both sets are empty can cleanup remove the size estimate
-and allow the runtime to delete the plan and mark the repartition `cleaned`. The runtime writes `cleaned` in
-the transaction of that last step, so the key is a transfer key for as long as any copy remains and not one
-statement longer.
+1. **Pending copies, at completion.** `beforeComplete` runs in the transaction that records the last
+   acknowledgement and writes `completed`. For a promotion it calls `deletePendingTxForHashKey(K)`, as it calls
+   `deleteAllPendingTx()` for a split. `cleanupSourceStep` no longer deletes pending rows.
+2. **Item copies, in cleanup steps.** Each step deletes at most `promotedKeyCleanupRows` item copies, in `sk`
+   order, as it does today.
+
+The pending delete of step 1 has no batch bound. It deletes a subset of the rows that a split completion deletes
+in the same call, so it adds no new cost class. A bounded batch of pending copies would split the copies of one
+transaction across steps. A repair through the source between two steps would then forward part of the rows of
+that transaction, and the target would refuse the forced commit with `commit_keyset_mismatch`.
+
+**Invariant: the source holds every transfer copy of a transaction, or none.** Before the completion
+transaction, no path deletes a copy. Transaction operations do not change the copies, because the keys of the
+promoted key route to the target. The TTL sweep, stale recovery, and emergency repair do not change them either.
+The completion transaction deletes all of them, and it also ends the transfer key, because it writes
+`completed`.
+
+The target imported exactly the copies under the key. Its rows of one transaction then change only as a whole: a
+commit validates and deletes the full owned set, and a cancel receives every key. So a key set that the source
+forwards holds every row of the transaction at each owner, and the keyset check of section 4.2.5 passes.
+
+While item copies remain, `cleanupSourceStep` reports incomplete work. The repartition stays `completed` and
+retries through the existing cleanup schedule. Only after the item set is empty can cleanup remove the size
+estimate and allow the runtime to delete the plan and mark the repartition `cleaned`.
 
 Each step must remain idempotent and resume after a restart from the remaining stored rows. Batches must leave
 other hash keys untouched. They delete source copies only after acknowledgement, not the target's unresolved locks.
 
 Split completion remains unchanged: it deletes all source pending rows after every child acknowledges.
-The batching change above applies to promotion cleanup.
 
 The retention rule concerns pending rows. The existing TTL sweep can reclaim logically expired, unlocked item
 copies on a promotion source. It must not delete pending payloads or bypass a lock. An incomplete target and a
@@ -716,21 +718,22 @@ operations at the target until forced resolution.
 
 The wire protocol keeps its current migration calls and page budgets. Promotion now includes pending payloads
 in the existing stream. Transfer copies remain on the source until acknowledgement, even when cancellation has
-already reached another owner. This trades temporary storage retention for one consistent cleanup rule.
+already reached another owner. This trades temporary storage retention for one consistent retention rule.
 
 Local commit and cancel make no `owns()` call on the normal path: the keys of the request are owned by
-construction, and `owns()` runs only for a row outside the request. Shape 1 of section 4.2.5 replaces one
-deletion by transaction id with one primary-key deletion per owned key. Shape 2 keeps one statement. Quarantine
-and repair call `owns()` once per distinct hash key of one transaction. The stale scan and the deadline build
-the transfer-key set once per statement from the runtime's repartition index and probe it once per scanned row;
-on a partition with no promotion in flight that is one empty seek. While the copies exist, the deadline pays one
-extra index step per transfer copy older than the oldest owned row, up to three times per pass. The scan pays
-the same step once per pass of the stale job (section 4.2.6).
+construction, and `owns()` runs only for a row outside the request. Section 4.2.5 replaces one deletion by
+transaction id with one primary-key deletion per owned key. Quarantine and repair call `owns()` once per
+distinct hash key of one transaction. The stale scan and the deadline build the transfer-key set once per
+statement from the runtime's repartition index and probe it once per scanned row; on a partition with no
+promotion in flight that is one empty seek. While the copies exist, the deadline pays one extra index step per
+transfer copy older than the oldest owned row, up to three times per pass. The scan pays the same step once per
+pass of the stale job (section 4.2.6).
 
-After the target reaches `imported`, every lock it received is already older than the stale threshold, so its
-recovery job drains them ten transactions per pass with one coordinator call each. A key with thousands of
-pending rows at cutover therefore produces a burst of coordinator calls from the target. This is the same
-drain a partition performs today after a restart with many stale locks, and it is the intended behaviour.
+After the target reaches `imported`, many locks it received can already be older than the stale threshold, so
+its recovery job drains them ten transactions per pass with one coordinator call each. A lock that a prepare
+wrote during target initialization can still be younger than the threshold. A key with thousands of pending
+rows at cutover therefore produces a burst of coordinator calls from the target. This is the same drain a
+partition performs today after a restart with many stale locks, and it is the intended behaviour.
 
 #### 4.2.11 Compatibility and deployment
 
@@ -742,13 +745,23 @@ The change affects current internal contracts:
 - `txCancel` no longer clears pending rows at each forwarding hop. Its release runs in its `local` handler on
   owned rows only. An empty `items` list stays legal and releases no row.
 - Emergency repair routes every row it holds and mutates owned rows only. Its request type stays unchanged;
-  its response gains `resolvedLocally`, `forwarded`, `forwardedTo`, and `forwardedToTruncated`. Each call
-  writes one log line.
+  its response gains `resolvedLocally` and `forwarded`. Each call writes one log line. It no longer clears
+  `guarded_at`, and `PartitionStore.clearPendingTxGuard` goes.
+- A promotion deletes its pending copies in `beforeComplete`, not in `cleanupSourceStep`.
 - A target logs each quarantined lock that it imports (section 4.2.6).
-- `txCommit` and `txCancel` no longer signal `repartitionUnblocked`. No promotion waits on a lock, so the
-  signal has nothing to wake. The signal type stays in the runtime for other hosts.
+- The runtime loses the `repartitionUnblocked` signal. No promotion waits on a lock, so the signal has nothing
+  to wake, and no other host sends it. `FokosSignals.repartitionUnblocked`, its branch in `#applySignals`,
+  `RepartitionSource.onRepartitionUnblocked`, and `FokosShardingStore.markPromotionsDueNow` go.
+- `beforeCutover` stays in the runtime, and FokosDB no longer implements it. A plan that the hook holds waits
+  and asks again. No signal brings that retry forward.
+- The runtime setting `lockRetryMs` becomes `cutoverHoldRetryMs`, because it is the retry interval of any
+  `beforeCutover` refusal, not of a lock. Its default stays 5,000 milliseconds, its test value stays 1, and its
+  validation stays "an integer of at least 1". The rename changes `runtime-config.ts` (the type, its doc
+  comment, both defaults, and the validation), the two reads in `repartition-flow.ts`, and the case in
+  `runtime-config.test.ts`. The doc comment says: "When the `beforeCutover` hook of the host holds a
+  repartition, the source asks the hook again after this time."
 - The runtime exports the `fokos.sql.movedHashKeys()` fragment of section 4.2.1, the first of its SQL
-  fragments. `beforeCutover` stays for other hosts, and FokosDB no longer implements it.
+  fragments.
 - Promotion tests must no longer expect a lock to defer cutover.
 - Tests for split-router cancellation must expect retention until all children acknowledge.
 
@@ -769,25 +782,24 @@ The following code comments describe the old rule. The implementation changes ea
 - `packages/fokosdb/src/shared/transaction-wire-types.ts`: the `CancelRequest.items` doc comment, which says
   the release is by transaction id and that an empty list releases locally.
 - `packages/fokosdb/src/server/do-partition.ts`: the `beforeCutover` comment "A promotion cannot move a locked
-  key", the `txCommit` comment "A commit can release a lock a promotion waits for", and the `txCancel` doc
-  comment and its `beforeForward` note.
+  key", the `txCommit` comment "A commit can release a lock a promotion waits for", the `txCancel` doc
+  comment and its `beforeForward` note, and the `beforeComplete` comment "A promotion moved one key of many and
+  must not touch the rest", which now also names the pending copies of the promoted key.
 - `packages/fokosdb/src/shared/partition/partition-store.ts`: the `deletePendingTxForHashKey` comment "a
-  fully-promoted key can have no live locks here anymore".
-- `packages/fokosdb/src/sharding/sharding-store.ts`: the `markPromotionsDueNow` comment "A promotion that cannot
-  move a locked key parks itself 5 seconds out". The method stays for other hosts, and the comment names the
-  host condition in general terms.
-- `packages/fokosdb/src/sharding/repartition-flow.ts`: the `LOCK_RETRY_MS` comment "A lock-blocked promotion
-  retries at a flat interval: only a commit or a cancel can change the answer". The constant stays for other
-  hosts, and the comment names the host condition in general terms.
-- `packages/fokosdb/src/sharding/runtime-types.ts`: the `repartitionUnblocked` comment "for example a lock was
-  released", and the `beforeForward` comment "for example a lock release by transaction id". After this change
-  no host operation has a `beforeForward`, so both comments name the host work in general terms.
+  fully-promoted key can have no live locks here anymore". The method now runs at promotion completion
+  (section 4.2.8).
+- `packages/fokosdb/src/sharding/repartition-flow.ts`: the `#initializeTargets` comment "the plan waits at the
+  flat interval, until a signal wakes it". No signal wakes the plan any more, and the comment names
+  `cutoverHoldRetryMs`.
+- `packages/fokosdb/src/sharding/runtime-types.ts`: the `beforeForward` comment "for example a lock release by
+  transaction id". After this change no host operation has a `beforeForward`, so the comment names the host
+  work in general terms.
 
 The type-checked prototype `packages/fokosdb/test/sharding-prototype/fokosdb-partition-host.ts` states the old
 rule in code: the `repartitionUnblocked` signal of `txCommit`, the `beforeForward` release of `txCancel`, the
-lock count in `beforeCutover`, and the `debugForceResolveTransaction` handler. The implementation changes it
-with the host. `pnpm check` type-checks the file, so its forced-resolution handler must return the new response
-type.
+lock count in `beforeCutover`, and the `debugForceResolveTransaction` handler with its `clearPendingTxGuard`
+call. The implementation changes it with the host. `pnpm check` type-checks the file, so its forced-resolution
+handler must return the new response type.
 
 The change ships to a new deployment with no existing partitions, so no partition ever holds a transfer copy
 under the old code. A rollback of the code on a partition that holds one is out of scope (section 2.2): the old
@@ -804,22 +816,24 @@ Use the existing Workers test infrastructure. No production test hook is require
 - Hold target acknowledgement after import. Both owned parts must resolve without source cleanup.
 - Retry the source-local commit while only transfer copies remain. It must succeed without applying twice.
 - Preserve `commit_keyset_mismatch` for an incorrect owned key set.
-- Cancel through a promotion source and a split router. Transfer copies must remain until their cleanup condition.
+- Cancel through a promotion source and a split router. Transfer copies must remain until the last
+  acknowledgement.
 - Send a `txCancel` with an empty `items` list to a promotion source with transfer copies and to a split router
   before completion. Each answers `cancelled` and leaves every pending row in place.
 - Commit and cancel a transaction with `MAX_ITEMS_PER_TX` keys on one partition, and quarantine one on a
   promotion source. Every owned-row statement must stay within the parameter limit of section 4.2.5.
 - Cut over a promotion with a lock under the key. The `movedHashKeys` fragment must name the key as soon as the
   row is `cutover`, and a prepare that arrived during target initialization must count as a transfer copy.
-- Add a `key_promotion` row in `cutover` with a NULL `hash_key`. The owned-row statements and the two stale
-  queries must select the same rows as without that row.
+  The fragment must stop naming the key in the transaction that writes `completed`.
+- Add a `key_promotion` row in `cutover` with a NULL `hash_key`. The two stale queries must select the same rows
+  as without that row.
 
 **Recovery tests**
 
 - Cut over an over-age, unguarded `not_found` lock before its pending page is copied. Preserve its payload.
-- Copy a quarantined lock through a promotion and through a split. The target retains `guarded_at` and logs one
-  line per transaction with its own `doName`. A guarded row with an unreadable coordinator reference still
-  imports.
+- Copy a quarantined lock through a promotion and through a split. The target retains `guarded_at` and writes one
+  line per page for each transaction whose rows in that page are guarded, with its own `doName`. Include one
+  transaction whose rows span two pages. A guarded row with an unreadable coordinator reference still imports.
 - Recover a transaction with both owned rows and transfer copies. Change only the owned rows.
 - Recheck ownership after an awaited coordinator response.
 - Exclude transfer copies and guarded rows from recovery deadlines. They must not starve owned stale locks.
@@ -844,16 +858,18 @@ Use the existing Workers test infrastructure. No production test hook is require
 
 **Promotion cleanup tests**
 
-- Reclaim more than one batch of pending-row copies. Each step must respect the limit for both tables.
-- Leave pending-row copies after the item set becomes empty. Keep the plan and `completed` state until both drain.
-- Start cleanup with pending-row copies but no item copies. It must still drain every pending batch.
+- Complete a promotion with the pending copies of transactions with 1 to `MAX_ITEMS_PER_TX` keys under the
+  promoted key, and with pending rows of retained keys. The completion transaction deletes every copy under the
+  promoted key and no other row.
+- Repeat the last acknowledgement after completion. It deletes nothing more and changes no state.
+- Delete the item copies in more than one step. Each step deletes at most `promotedKeyCleanupRows` item copies,
+  and no step deletes a pending row.
 - Restart between batches and repeat cleanup. Preserve other keys and the target's unresolved locks.
-- Remove the size estimate and mark `cleaned` only after both source copy sets are empty. The fragment must
-  stop naming the key in the same transaction.
+- Remove the size estimate and mark `cleaned` only after the item copies are empty.
 
 **Emergency-repair tests**
 
-- Call the current range owner after promotion cleanup and each current child after split completion. Each
+- Call the current range owner after promotion completion and each current child after split completion. Each
   answers its own rows in `resolvedLocally` and `forwarded: 0`.
 - Force commit and cancel for transferred quarantined rows with the existing request type.
 - On a promotion source, resolve owned rows, forward the moved keys, and preserve the transfer copies of the
@@ -864,8 +880,9 @@ Use the existing Workers test infrastructure. No production test hook is require
 - Use the stored transaction timestamp when applying a forced commit.
 - Repeat repair after a lost response. A partition with no row must answer two zero counts and change no item.
 - Call an old source with transfer copies only, after the target imported. The target must resolve its rows,
-  and the copies on the source must stay. The response must carry `resolvedLocally: 0` and `forwarded: n`, and
-  `forwardedTo` must name the target. The source writes one `forced resolution applied` line.
+  and the copies on the source must stay. The response must carry `resolvedLocally: 0` and `forwarded: n`. The
+  copies on the source keep their `guarded_at`. The source writes one `forced resolution applied` line. After
+  completion, the same call on the source answers `forwarded: 0`.
 - Call an old source with transfer copies only, while the target imports. The call must fail, the copies must
   stay, and a later call must succeed. The failed call writes one `forced resolution failed` line with
   `causeCode` `partition_migrating` and `resolvedLocally: 0`.
@@ -902,8 +919,8 @@ Four ways to keep transfer copies out of the two scans were considered:
 - A host table with one row per transfer key, written by a new cutover hook. Rejected: it duplicates
   `fokos_repartitions`, which already holds the key and the state, and it adds a table, a migration, a hook,
   and an ordering rule for cleanup.
-- The list of transfer keys as bound parameters. Rejected for now: the list is not small over time, because a
-  `completed` promotion stays until its bounded cleanup drains, and bound parameters have a limit, so the host
+- The list of transfer keys as bound parameters. Rejected for now: the list is not bounded by one, because
+  forced promotions can put many keys in `cutover` at once, and bound parameters have a limit, so the host
   would need several statements per scan and a statement text that changes with the count.
 
 The decision is the `fokos.sql.movedHashKeys()` fragment of section 4.2.1: one `SELECT` over the runtime's own
@@ -930,7 +947,7 @@ owned row. This change does not remove the repeated reads. The options are:
 
 1. The scheduler reads each deadline once at the start of a pass and once after the steps. A step can change a
    deadline, so the read after the steps stays. This changes the scheduler for every host.
-2. The stale job keeps its deadline in memory. A prepare, a commit, a cancel, a guard change, and a cleanup step
+2. The stale job keeps its deadline in memory. A prepare, a commit, a cancel, a guard change, and a completion
    clear the value. This changes the FokosDB job only, and adds one more place that must track every write path.
 3. Keep the reads and accept the cost that the measurement of section 4.2.12 gives.
 
@@ -962,7 +979,7 @@ This design instead preserves copies until acknowledgement. Commit and cancel th
 ### 5.5 Add transaction-wide emergency recovery
 
 An explicit key list and automatic owner discovery could permit emergency repair through an old source after
-cleanup. That needs separate scope, completeness, and retry contracts. It is not required for correct lock
+completion. That needs separate scope, completeness, and retry contracts. It is not required for correct lock
 transfer. This RFC keeps the per-partition repair, which routes through the rows the partition still holds, and
 leaves that operator-tool expansion outside its scope.
 
@@ -970,8 +987,9 @@ leaves that operator-tool expansion outside its scope.
 
 The handler could select owned rows only and leave transfer copies out of the routed operation. A call on the
 old source would then resolve nothing for the moved key and could not tell the operator so. Routing the copies
-costs nothing extra, mutates nothing on the source, and reaches the target for as long as the copies exist.
-This design routes them and reports the counts.
+costs nothing extra, mutates nothing on the source, and reaches the target for as long as the copies of the
+transaction exist. The completion transaction deletes those copies together, so the source never forwards part
+of a transaction. This design routes them and reports the counts.
 
 ## 6. Frequently asked questions
 
@@ -986,8 +1004,8 @@ No. It means the target durably imported its slice. An unresolved lock can remai
 
 **Can a source delete only rows it owns?**
 
-Transaction resolution changes owned rows. Migration cleanup deletes non-owned transfer copies after acknowledgement.
-These are separate operations with separate authorization conditions.
+Transaction resolution changes owned rows. The completion transaction deletes non-owned transfer copies after the
+last acknowledgement. These are separate operations with separate authorization conditions.
 
 **Why do promotion and split sources differ?**
 
@@ -1010,18 +1028,18 @@ is not a permanent directory.
 No. Nonterminal coordinator records remain available for automatic recovery. Quarantine requires an over-age owned
 lock and `not_found`, not age alone. Emergency repair remains a safeguard for missing evidence or an unusable reference.
 
-**Can an old source repair moved locks after cleanup?**
+**Can an old source repair moved locks after completion?**
 
-No. After cleanup it holds no row for those keys and answers two zero counts. Before cleanup it can: its
-transfer copies route the repair to the target, `forwarded` reports how many keys went there, and `forwardedTo`
-names the target. Two zero counts tell the operator to address the current owners. The target logged each
-quarantined lock when it imported the lock, so that line names the partition to call.
+No. The completion transaction deletes every copy under the moved key, so after it the source holds no row of
+the transaction under that key and forwards nothing. Until then it can: its transfer copies route the repair to
+the target, and `forwarded` reports how many keys went there. The copies go all at once, so the source forwards
+every row of a transaction or none. `forwarded: 0` tells the operator to address the current owners. The
+target logged each quarantined lock when it imported the lock, so that line names the partition to call.
 
 **Does `forwarded` prove that the owners resolved the forwarded keys?**
 
-No. It counts the keys sent. An owner that holds no row of the transaction answers with success and changes
-nothing. The operator calls each partition in `forwardedTo` with the same request to read its own
-`resolvedLocally`.
+No. It counts the keys sent. A successful call has applied the outcome on every owner, but an owner that had
+already resolved its rows answers with the same success and changes nothing.
 
 **Why does the source write nothing at cutover to mark the copies?**
 

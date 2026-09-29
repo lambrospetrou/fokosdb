@@ -856,6 +856,9 @@ interface FokosShardingHooks<TPolicy> {
 	 * exports `fokos.sql.movedHashKeys()`, a SQL fragment that selects the hash keys of the promotions in
 	 * `cutover` or `completed`, so a host scan can exclude the rows it no longer owns without naming a
 	 * `fokos_` table.
+	 *
+	 * UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` sections 4.2.1 and 4.2.11 for
+	 * changes.
 	 */
 	beforeCutover?(plan: FokosRepartitionPlan): boolean;
 
@@ -1082,6 +1085,8 @@ transaction id, not by key. Its `beforeForward` calls `cancelLocal(transactionId
 > release runs in its `local` handler on the owned part of the request, which the runtime resolved in the same
 > synchronous block. A router keeps its pre-cutover lock rows until the completion transaction deletes them.
 > An empty `items` list is refused.
+>
+> UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.5 for changes.
 
 For a `range` operation, the runtime computes the visits before it calls `walk`. The functions in the walk input
 record each local scope and forwarded envelope. The host must use only those functions to reach partitioned
@@ -1392,6 +1397,7 @@ What changes against the shipped flow:
   row pays the check and nothing else. FokosDB returns it from `txCommit` and `txCancel` after a local success.
   Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: FokosDB no longer signals it, because no
   promotion waits on a lock. The signal stays in the runtime for other hosts.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.11 for changes.
 - A synchronous arbitration precheck rejects an ineligible queue attempt without an alarm write. For a possible
   new row, or an unfinished row that still needs work, the runtime moves the fallback alarm earlier before it
   opens the queue transaction. The transaction repeats arbitration and writes the decision. A failed fallback
@@ -1687,8 +1693,10 @@ The FokosDB host maps current mechanisms as follows:
   router releases its own pre-cutover lock rows before it forwards (section 4.2.6). Its `local` is empty.
   Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the release runs in `local` on owned
   rows only, and `txCancel` has no `beforeForward`.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.5 for changes.
 - `wakeLockBlockedPromotion` in `txCommit` and `txCancel` becomes the `repartitionUnblocked` signal. Superseded
   by the same document: the two signals are removed.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.11 for changes.
 - The alarm after an accepted `prepareLocal` becomes a `stale_tx_recovery` job signal.
 - `routeSingleDestination` becomes the `single_owner` shape.
 - `walkRangeChildren` becomes the host `walk` callback of the `range` shape. It owns `QueryPageBudget` and the
@@ -1785,10 +1793,12 @@ not readable by the old code.
 - A `beforeForward` test proves that `txCancel` on a router between cutover and completion deletes the router's
   own pending rows and forwards to every child. Superseded by
   `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the router keeps its rows until completion and forwards.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.13 for changes.
 - A `repartitionUnblocked` test proves that a promotion held by a lock cuts over on the pass right after the
   cancel, not after the flat lock interval. A companion test proves that a locked key gets no range root until
   `beforeCutover` returns true. Superseded by the same document: a lock does not hold a promotion, and the
   tests prove the transfer of the lock instead.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.13 for changes.
 - Scheduler tests prove that a `scheduleJob` call during an async `runStep` survives the pass, and that a router
   with pending rows and a stale-recovery `deadline()` in the past re-arms no alarm for that job.
 - Repartition tests crash after queue and prove that the queue-time policy and data survive. They prove that

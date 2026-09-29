@@ -698,6 +698,8 @@ count again.
 > the range root, and the source keeps them as transfer copies until the target acknowledges. The source tells
 > a copy from an owned row by the state of the promotion row, through `owns()` and a SQL fragment the runtime
 > exports.
+>
+> UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` sections 4.2.1 and 4.2.8 for changes.
 
 A target in `initializing` means that an initialization call can be in flight or can have lost its reply. A due
 retry must repeat the same idempotent `fokosInit` call.
@@ -743,6 +745,8 @@ commit would route the key to the range root, find no pending row, and lose the 
 > row "Cut over a promotion" and the two paragraphs above no longer apply. A lock, guarded or not, moves with
 > its key, `guarded_at` included. A forced commit at the range root finds the copied row. A lock no longer
 > delays a promotion or the hash split behind it.
+>
+> UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` sections 4.2.2 and 4.2.6 for changes.
 
 A hash split row in any state must block a promotion on that source. A split source in `cutover` or
 `completed` is a router and owns no hash key.
@@ -943,6 +947,8 @@ deletion metadata.
 > Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: a promoted-key slice can have locks. The
 > stream copies them with their `guarded_at`, and the target inserts them as owned rows. The empty page with
 > deletion metadata stays for a slice with no lock.
+>
+> UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.8 for changes.
 
 #### 4.7.4 Page bounds and cursor rules
 
@@ -1170,6 +1176,7 @@ The mechanisms hold these invariants:
 - A promotion does not move a locked key. The source checks before init and during cutover. Superseded by
   `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: a promotion moves a locked key, and the source keeps a
   transfer copy of each lock row until the target acknowledges.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.8 for changes.
 - A terminal promotion survives a hash split. The child receives its override and no item copy.
 - A decided transaction can always commit. Commit keeps `ignore_size_reject`.
 - Failed work keeps durable progress. Each job persists a guarded step and retry deadline.
@@ -1191,8 +1198,10 @@ The flow recovers as follows:
 - A pull reaches the source before cutover: the target retries `repartition_not_cut_over`.
 - A promotion key has a lock: its target stays `pending`. Superseded by
   `docs/ideas/2026-09-26-promotion-moves-its-locks.md`: the target initializes and the lock moves with the key.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.9 for changes.
 - A lock appears during initialization: the promotion cutover guard fails. Superseded by the same document:
   the cutover proceeds and the new lock row joins the transfer.
+  UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 4.2.9 for changes.
 - One selected target RPC fails: other calls finish, and only failed targets retry.
 - One repartition keeps failing: its later deadline lets another due row run.
 - An alarm job fails: it records another deadline before the alarm handler returns.

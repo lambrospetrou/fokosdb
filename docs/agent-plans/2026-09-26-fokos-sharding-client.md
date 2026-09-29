@@ -78,6 +78,7 @@ const { value, routing } = router.unwrap(envelope);          // 4. drops the int
    This case is rare. Section 4.2.10 lists every path that sends a request to a target before its first page, and
    shows that this is the only one now. The wait is long only because a promotion waits for the locks of its key.
    `docs/ideas/2026-09-26-promotion-moves-its-locks.md` records that cause.
+   UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` section 1.1 for changes.
 
 This document solves problems 2, 3, 6, and 7. It also adds the caller layer where a caller-side route cache
 connects later. That cache solves problems 1 and 4. Section 4.3.1 gives an optional solution to problem 5. The cache is separate work (section 4.3.1), and it depends on
@@ -874,7 +875,7 @@ without the filter, and its route overrides name the owner: the source before th
 transaction lock is on its key (`beforeCutover`). A split does not wait: it copies its locks to its children in the
 `pending_tx` stream, and that stream already copies the locks of a promoted key too.
 `docs/ideas/2026-09-26-promotion-moves-its-locks.md` records the change that removes the wait, and what to check
-first.
+first. UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` for changes.
 
 **Does the client change the public `meta` of `FokosDB`?** Only the count of `forwardCount`: a failed forward
 without routing now counts 1. `meta` comes from `FokosPublicRouting`, which the client returns as
@@ -889,7 +890,8 @@ References:
 - `docs/ideas/2026-09-20-query-entry-point-into-a-range-tree.md`
 - `docs/ideas/range-partition-id-hierarchy-encoding.md`
 - `docs/ideas/topology-propagation-via-piggyback.md`
-- `docs/ideas/2026-09-26-promotion-moves-its-locks.md`
+- `docs/ideas/2026-09-26-promotion-moves-its-locks.md` — UPDATE: see
+  `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` for changes.
 - `packages/fokosdb/src/sharding/router.ts`
 - `packages/fokosdb/src/sharding/runtime.ts`
 - `packages/fokosdb/src/sharding/repartition-flow.ts`

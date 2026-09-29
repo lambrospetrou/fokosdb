@@ -387,6 +387,7 @@ router keeps its rows until its split completes.
 `docs/ideas/2026-09-26-promotion-moves-its-locks.md` proposes that a promotion moves its locks, and that
 `txCancel` releases in its `local` handler. The source then keeps transfer copies until the target acknowledges.
 The source cleanup deletes the copies. A jump that skips the source does not change that design.
+UPDATE: see `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` sections 4.2.5 and 4.2.8 for changes.
 
 #### 4.2.9 What stays exact
 
@@ -496,7 +497,8 @@ No. It runs only when at least one key has a Bloom hit.
 - `docs/agent-plans/2026-09-26-fokos-sharding-client.md`
 - `docs/agent-plans/2026-09-27-range-self-hint-and-route-evidence-floor.md`
 - `docs/agent-plans/promoted-keys-bloom-filter-cache.md`
-- `docs/ideas/2026-09-26-promotion-moves-its-locks.md`
+- `docs/ideas/2026-09-26-promotion-moves-its-locks.md` — UPDATE: see
+  `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md` for changes.
 - `packages/fokosdb/src/sharding/runtime.ts`
 - `packages/fokosdb/src/sharding/hash-topology.ts`
 - `packages/fokosdb/src/sharding/sharding-store.ts`
