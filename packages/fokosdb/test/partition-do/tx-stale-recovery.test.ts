@@ -46,6 +46,14 @@ describe("PartitionDO — stale transaction recovery", () => {
 		return store;
 	}
 
+	/** Releases every remaining row of one transaction, to leave the partition without an alarm. */
+	function releasePendingLock(store: PartitionStore, transactionId: string): void {
+		store.deletePendingTxKeys(
+			transactionId,
+			store.listPendingTxKeys(transactionId).map((row) => ({ hashKey: row.hk, sortKey: row.sk })),
+		);
+	}
+
 	/**
 	 * Substitutes the coordinator stub with a fake that answers `not_found`.
 	 *
@@ -135,7 +143,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			expect(recoverTransaction).not.toHaveBeenCalled();
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
 			state.storage.kv.put<FokosImportRecord>(FOKOS_KV_KEYS.IMPORT, { ...record, state: "active" });
-			store.deletePendingTx(transactionId);
+			releasePendingLock(store, transactionId);
 			await state.storage.deleteAlarm();
 		});
 	});
@@ -220,7 +228,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
 			expect(store.listPendingTxItems(transactionId)[0].guarded_at).toBeNull();
-			store.deletePendingTx(transactionId);
+			releasePendingLock(store, transactionId);
 			await state.storage.deleteAlarm();
 		});
 
@@ -248,7 +256,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			);
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionId)).toBe(1);
-			store.deletePendingTx(transactionId);
+			releasePendingLock(store, transactionId);
 			await state.storage.deleteAlarm();
 		});
 
@@ -262,7 +270,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 		);
 	});
 
-	it("deletes a not_found lock directly when all its keys route away", async () => {
+	it("keeps a not_found lock whose keys all route away, and quarantines none of it", async () => {
 		const now = Date.now();
 		const { ctx, stub, rpc } = makeStub();
 		await rpc.status(ctx);
@@ -272,13 +280,16 @@ describe("PartitionDO — stale transaction recovery", () => {
 		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
 			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
-			// Every key of the lock now belongs to another partition.
+			// Every key of the lock now belongs to another partition, which holds the true lock. The
+			// rows here are copies, and the cleanup of the migration deletes them.
 			const owns = vi.spyOn(instance.fokos, "owns").mockReturnValue(false);
 			const cancel = vi.spyOn(instance, "txCancel");
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(owns).toHaveBeenCalled();
 			expect(cancel).not.toHaveBeenCalled();
-			expect(store.pendingTxCountFor(transactionId)).toBe(0);
+			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null });
+			releasePendingLock(store, transactionId);
+			await state.storage.deleteAlarm();
 		});
 	});
 
@@ -304,7 +315,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 			expect(store.pendingTxCountFor(transactionIds[10])).toBe(0);
 			for (const transactionId of transactionIds.slice(0, 10)) {
-				store.deletePendingTx(transactionId);
+				releasePendingLock(store, transactionId);
 			}
 			await state.storage.deleteAlarm();
 		});
@@ -336,6 +347,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		await expect(rpc.debugForceResolveTransaction(ctx, { transactionId, outcome })).resolves.toEqual({
 			outcome: outcome === "commit" ? "committed" : "cancelled",
+			resolvedLocally: 1,
+			forwarded: 0,
 		});
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			expect(new PartitionStore(state.storage).pendingTxCountFor(transactionId)).toBe(0);

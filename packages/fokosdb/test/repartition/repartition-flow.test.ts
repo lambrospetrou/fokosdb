@@ -6,11 +6,22 @@
  * no Durable Object of its own beyond storage: the peer adapter in the harness lands each control
  * call on the receiving half directly.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { hashChildIndex } from "../../src/sharding/hash-primitives.js";
-import { kb, keySizeEstimate, makeCluster, putItem, putLock, storedBytes, T0, type Node, type NodeEnv } from "./repartition-harness.js";
+import {
+	kb,
+	keySizeEstimate,
+	lockRow,
+	makeCluster,
+	putItem,
+	putLock,
+	storedBytes,
+	T0,
+	type Node,
+	type NodeEnv,
+} from "./repartition-harness.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
@@ -229,7 +240,7 @@ describe("Repartition — initialization and cutover", () => {
 		});
 	});
 
-	it("holds a lock-blocked promotion at its target, and moves on once the lock goes", async () => {
+	it("cuts a locked key over with no hold, and keeps the lock as a copy", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
@@ -240,42 +251,18 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
 		await root.enter(async ({ source, sharding }) => {
+			// The lock no longer decides when the key moves: the target is created at the first pass.
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			const targetRow = sharding.listRepartitionTargets("r1", "key_promotion")[0];
-			// The target is never created while a lock is held, and the retry is flat: only a commit or a
-			// cancel can change the answer, so backing off would only slow the promotion down.
-			expect(targetRow.initialization).toBe("pending");
-			expect(targetRow.nextAttemptAt).toBe(T0 + 5_000);
-			expect(targetRow.attempts).toBe(0);
-		});
-
-		await root.enter(async ({ source, store, sharding }) => {
-			store.deletePendingTx("tx-1");
-			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.listRepartitionTargets("r1", "key_promotion")[0].initialization).toBe("initialized");
 		});
-	});
-
-	it("checks the lock count again at cutover, so a lock that appears during init defers it", async () => {
-		const c = makeCluster();
-		const root = c.hashNode([0]);
-		await root.enter(({ source, store }) => {
-			putItem(store, "alice", "s1");
-			source.queue({ kind: "key_promotion", hashKey: kb("alice") }, T0);
-		});
-		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
-		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 
 		await root.enter(async ({ source, store, sharding }) => {
-			// The lock arrives after the range root exists but before routing moved.
-			putLock(store, "alice", "s1");
+			// A lock that arrives between initialization and cutover also holds nothing back.
+			putLock(store, "alice", "s2", "tx-late");
 			expect(await source.sourceStep(T0)).toBe("progressed");
-			expect(sharding.getRepartition("r1")!.state).toBe("planned");
-			expect(sharding.getRepartition("r1")!.nextAttemptAt).toBe(T0 + 5_000);
-
-			store.deletePendingTx("tx-1");
-			expect(await source.sourceStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
+			// Both rows stay as copies for the import of the target.
+			expect(store.pendingLockCountForHashKey(kb("alice"))).toBe(2);
 		});
 	});
 
@@ -666,6 +653,112 @@ describe("Repartition — promotions", () => {
 			// Only the promoted key went back; every other key this partition owns stayed.
 			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 		});
+	});
+
+	it("carries the locks of the promoted key, and deletes the source copies at completion only", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			putItem(store, "bob", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		// A lock the source took before cutover, and a guarded one, both still here: the source holds
+		// its copies until the target acknowledges, so a forced resolve finds a row on either side.
+		await root.enter(({ store }) => {
+			putLock(store, "alice", "s1", "tx-a");
+			store.insertPendingLock({ ...lockRow("alice", "s2", "tx-g"), guarded_at: 77 });
+			putLock(store, "bob", "s1", "tx-b");
+		});
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		await drainImport(rangeRoot);
+		await rangeRoot.enter(({ store }) => {
+			// The payload, the coordinator reference, the timestamps and the quarantine all came across.
+			expect(store.queryPendingTxPage(null, 10)).toEqual([
+				{ ...lockRow("alice", "s1", "tx-a"), hk: kb("alice"), sk: kb("s1") },
+				{ ...lockRow("alice", "s2", "tx-g"), hk: kb("alice"), sk: kb("s2"), guarded_at: 77 },
+			]);
+		});
+		await root.enter(({ store }) => {
+			expect(store.pendingLockCountForHashKey(kb("alice"))).toBe(2);
+		});
+
+		await rangeRoot.enter(async ({ target }) => void (await target.sendAck()));
+		await root.enter(({ source, store, sharding }) => {
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			// The completion transaction takes every copy of the key at once, so a transaction is never
+			// forwarded in part. Cleanup deletes items only, and the locks of another key stay.
+			expect(store.pendingLockCountForHashKey(kb("alice"))).toBe(0);
+			expect(source.sourceCleanupStep(T0)).toBe("progressed");
+			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
+			expect(store.pendingLockCountForHashKey(kb("bob"))).toBe(1);
+		});
+	});
+
+	it("names each quarantined lock it imports", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		await root.enter(({ store }) => {
+			store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 });
+			store.insertPendingLock({ ...lockRow("alice", "s2", "tx-g"), guarded_at: 88 });
+			putLock(store, "alice", "s3", "tx-open");
+		});
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		const lines: Record<string, unknown>[] = [];
+		const logged = vi.spyOn(console, "error").mockImplementation((line: unknown) => void lines.push(line as Record<string, unknown>));
+		try {
+			await drainImport(rangeRoot);
+		} finally {
+			logged.mockRestore();
+		}
+
+		const quarantines = lines.filter((line) => line.message === "fokos/partition: imported a quarantined lock");
+		// One line per transaction, not per row, and it names the partition that now holds the lock.
+		expect(quarantines).toHaveLength(1);
+		expect(quarantines[0]).toMatchObject({
+			transactionId: "tx-g",
+			coordinatorDoName: "tc-1",
+			lockCreatedAt: 1,
+			guardedAt: 77,
+			doName: rangeRoot.doName,
+			keys: [
+				{ hashKey: '"alice"', sortKey: '"s1"' },
+				{ hashKey: '"alice"', sortKey: '"s2"' },
+			],
+		});
+		// The open lock came across with the guarded ones.
+		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(3));
+	});
+
+	it("imports a page of locks even when the log of its quarantines throws", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, "alice", "s1");
+			source.queue({ kind: "key_promotion", hashKey: kb("alice") });
+		});
+		await cutOver(root);
+		await root.enter(({ store }) => store.insertPendingLock({ ...lockRow("alice", "s1", "tx-g"), guarded_at: 77 }));
+
+		const rangeRoot = c.rangeNode(root.ctx, kb("alice"), null, null);
+		// A log that throws would roll the page back on every retry and stop the import for good.
+		const logged = vi.spyOn(console, "error").mockImplementation(() => {
+			throw new Error("log sink is down");
+		});
+		try {
+			await drainImport(rangeRoot);
+		} finally {
+			logged.mockRestore();
+		}
+		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(1));
 	});
 
 	it("hands a finished promotion to the hash child that inherits the key, with no item copy", async () => {

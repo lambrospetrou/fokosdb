@@ -1156,7 +1156,7 @@ describe("PartitionStore - pending transactions", () => {
 			expect(store.pendingLockFor(kb("hk"), kb("s"))?.transaction_id).toBe("tx1");
 			expect(store.pendingLockFor(kb("hk"), kb("other"))).toBeUndefined();
 
-			store.deletePendingTx("tx1");
+			store.deletePendingTxKeys("tx1", [{ hashKey: kb("hk"), sortKey: kb("s") }]);
 			expect(store.pendingLockFor(kb("hk"), kb("s"))).toBeUndefined();
 			expect(store.hasAnyPendingTx()).toBe(false);
 		});
@@ -1198,15 +1198,17 @@ describe("PartitionStore - pending transactions", () => {
 	it("quarantines a transaction once and excludes it from the stale scan", async () => {
 		await withStore((store) => {
 			store.insertPendingLock(lockRow("a", "1", "tx-guarded"));
-			expect(store.guardPendingTx("tx-guarded", 2000)).toBe(true);
-			expect(store.guardPendingTx("tx-guarded", 3000)).toBe(false);
+			const guarded = [{ hashKey: kb("a"), sortKey: kb("1") }];
+			expect(store.guardPendingTx("tx-guarded", 2000, guarded)).toBe(true);
+			expect(store.guardPendingTx("tx-guarded", 3000, guarded)).toBe(false);
 			expect(store.listPendingTxItems("tx-guarded")[0].guarded_at).toBe(2000);
 			expect(store.hasAnyPendingTx()).toBe(true);
 			expect(store.earliestUnguardedPendingTxCreatedAt()).toBeNull();
 			expect(store.listStalePendingTx(5000, 10)).toEqual([]);
 
-			store.clearPendingTxGuard("tx-guarded");
-			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-guarded", coordinator_json: '{"doName":"tc-1"}' }]);
+			// Only a forced resolution ends a quarantine, and it deletes the rows.
+			store.deletePendingTxKeys("tx-guarded", guarded);
+			expect(store.hasAnyPendingTx()).toBe(false);
 		});
 	});
 
@@ -1216,7 +1218,7 @@ describe("PartitionStore - pending transactions", () => {
 				const transactionId = `tx-${i}`;
 				store.insertPendingLock(lockRow(`hk-${i}`, "1", transactionId));
 				if (i < 10) {
-					store.guardPendingTx(transactionId, 2000);
+					store.guardPendingTx(transactionId, 2000, [{ hashKey: kb(`hk-${i}`), sortKey: kb("1") }]);
 				}
 			}
 			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_json: '{"doName":"tc-1"}' }]);

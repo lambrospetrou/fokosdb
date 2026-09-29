@@ -89,8 +89,15 @@ import {
 	IDEMPOTENCY_WINDOW_MS,
 	txOrderTimestampNow,
 } from "../shared/transaction-limits.js";
-import { CONFLICT_CODES, FokosConflictError, FokosRoutingError, FokosUnavailableError, UNAVAILABLE_CODES } from "../shared/errors.js";
-import { SHARDING_ROUTING_CODES } from "../sharding/errors.js";
+import {
+	CONFLICT_CODES,
+	FokosConflictError,
+	FokosError,
+	FokosRoutingError,
+	FokosUnavailableError,
+	UNAVAILABLE_CODES,
+} from "../shared/errors.js";
+import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES } from "../sharding/errors.js";
 
 // ─── item RPC types ───────────────────────────────────────────────────────────
 
@@ -266,11 +273,14 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.#store = new PartitionStore(ctx.storage);
+		// The runtime exists after this store, and the callbacks run later, when a statement or a
+		// decision needs the answer.
+		this.#store = new PartitionStore(ctx.storage, () => this.fokos.sql.movedHashKeys());
 		this.#participant = new TransactionParticipant({
 			store: this.#store,
 			now: () => this.fokosNow(),
 			maxClockSkewMs: () => this.config().maxClockSkewMs,
+			owns: (key) => this.fokos.owns(key),
 		});
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
@@ -323,8 +333,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 	/**
 	 * Releases this transaction's locks in this partition and in the descendants that own `req.items`.
-	 * The release is by transaction id, so every hop clears itself before it forwards; the keys only
-	 * decide where else the cancel goes.
+	 * Each hop releases the rows of the keys it owns, so a router releases nothing and a source keeps
+	 * the copies of a key it moved away.
 	 */
 	async txCancel(ctx: FokosDBRouteContext, req: CancelRequest) {
 		return await this.#api("txCancel", ctx, req);
@@ -557,8 +567,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				subRequest: (req, items) => ({ ...req, items: items as TransactionItemKey[] }),
 				local: (req, call) => {
 					const { response, promotionCandidates } = this.#participant.commitLocal(req);
-					// A commit can release a lock a promotion waits for, and it grows the partition.
-					call.signal({ repartitionUnblocked: true });
 					this.signalGrowth(call, promotionCandidates);
 					return response;
 				},
@@ -573,17 +581,12 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				failurePolicy: "attempt_all",
 				items: (req) => req.items.map((item) => ({ key: keyOf(item), item })),
 				subRequest: (req, items) => ({ ...req, items: items as TransactionItemKey[] }),
-				// Every hop releases by transaction id, owner or router, before the remote groups start, so
-				// a router between cutover and completion clears its own pre-cutover lock rows.
-				// FIXME: owner resolution runs before this hook, so a request that fails it never releases
-				// the local locks. Every call today carries the keys of the transaction and they resolve.
-				// If a cancel ever fans out to children without those keys, run this release before the
-				// resolution.
-				beforeForward: (req, call) => {
-					this.#participant.cancelLocal(req.transactionId);
-					call.signal({ repartitionUnblocked: true });
+				// The release takes the owned part of the request, which the runtime hands this handler, so
+				// a router releases nothing and a source keeps the copies of the keys it forwards.
+				local: (req) => {
+					this.#participant.cancelLocal(req.transactionId, req.items);
+					return { outcome: "cancelled" };
 				},
-				local: () => ({ outcome: "cancelled" }),
 				merge: () => ({ outcome: "cancelled" }),
 			},
 			txReadForTransaction: {
@@ -631,23 +634,52 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				},
 			},
 			// Re-enters `dispatch`, so the commit or cancel of each key is applied on its current owner.
+			// A row of a key that moved is a copy: it routes the outcome to the new owner, and the
+			// routed operation writes here only for a key this partition still owns.
 			debugForceResolveTransaction: {
 				shape: "local",
 				whileMigrating: "throw",
 				local: async (req) => {
 					const pendingRows = this.#store.listPendingTxItems(req.transactionId);
 					const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
+					const resolvedLocally = items.filter((key) => this.fokos.owns(key)).length;
+					const counts = { resolvedLocally, forwarded: items.length - resolvedLocally };
 					const ctx = this.fokos.routeContext();
-					const response =
-						req.outcome === "commit"
-							? await this.fokos.dispatch("txCommit", ctx, {
-									transactionId: req.transactionId,
-									transactionTimestamp: pendingRows[0]?.transaction_ts ?? txOrderTimestampNow(),
-									items,
-								})
-							: await this.fokos.dispatch("txCancel", ctx, { transactionId: req.transactionId, items });
-					this.#store.clearPendingTxGuard(req.transactionId);
-					return response.value;
+					try {
+						const response =
+							req.outcome === "commit"
+								? await this.fokos.dispatch("txCommit", ctx, {
+										transactionId: req.transactionId,
+										// Prepare writes one timestamp to every row of the transaction.
+										transactionTimestamp: pendingRows[0]?.transaction_ts ?? txOrderTimestampNow(),
+										items,
+									})
+								: await this.fokos.dispatch("txCancel", ctx, { transactionId: req.transactionId, items });
+						console.info({
+							...this.logParams(),
+							...this.fokos.identity().ref,
+							message: "fokos/partition: forced resolution applied",
+							transactionId: req.transactionId,
+							outcome: req.outcome,
+							...counts,
+						});
+						return { ...response.value, ...counts };
+					} catch (e) {
+						// `partition_fanout_failed` comes after the local part committed, so the line keeps
+						// the local count. Every other code applied no row here.
+						const localApplied = FokosError.isCode(e, SHARDING_INTERNAL_CODES.partition_fanout_failed);
+						console.error({
+							...this.logParams(),
+							...this.fokos.identity().ref,
+							message: "fokos/partition: forced resolution failed",
+							transactionId: req.transactionId,
+							outcome: req.outcome,
+							resolvedLocally: localApplied ? counts.resolvedLocally : 0,
+							forwarded: counts.forwarded,
+							...(FokosError.is(e) ? { errorCode: e.code, causeCode: e.attributes.causeCode } : { error: String(e) }),
+						});
+						throw e;
+					}
 				},
 			},
 			debugForcePromoteKey: {
@@ -685,16 +717,20 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			},
 			computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
 				this.#store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
-			migration: new FokosMigrationHost({ store: this.#store }),
-			// A promotion cannot move a locked key. A guarded lock counts too: skipping it would route the
-			// key to the range root, and a later forced commit would find no pending row there.
-			beforeCutover: (plan) => plan.kind !== "key_promotion" || this.#store.pendingLockCountForHashKey(promotedKeyOf(plan)) === 0,
-			// Every target now holds the authoritative copy of its own locks, so the source's are
-			// redundant. A promotion moved one key of many and must not touch the rest.
+			migration: new FokosMigrationHost({
+				store: this.#store,
+				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
+			}),
+			// Every target now holds the authoritative copy of its own locks, so the copies here are
+			// redundant. This deletes them all at once, so a transaction is never forwarded in part: a
+			// promotion deletes the copies of its key only, and a split deletes every copy. A promotion
+			// moved one key of many and must not touch the rest.
 			beforeComplete: (plan) => {
-				if (plan.kind !== "key_promotion") {
-					this.#store.deleteAllPendingTx();
+				if (plan.kind === "key_promotion") {
+					this.#store.deletePendingTxForHashKey(promotedKeyOf(plan));
+					return;
 				}
+				this.#store.deleteAllPendingTx();
 			},
 			// A split keeps its item rows. Only a promotion has rows to give back: its key moved, and
 			// the rest of its keys stay here.
@@ -704,7 +740,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				}
 				const hashKey = promotedKeyOf(plan);
 				this.#store.deleteItemsBatchForHashKey(hashKey, this.config().promotedKeyCleanupRows);
-				this.#store.deletePendingTxForHashKey(hashKey);
 				if (this.#store.hasItemsForHashKey(hashKey)) {
 					return false;
 				}
@@ -1038,11 +1073,15 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					idempotencyToken,
 				});
 
+				// Ownership is read again after the await, because the promotion of a key can have cut
+				// over while the coordinator answered. Every row still routes, so the owner of a moved
+				// key applies the outcome there, but a local decision holds for the owned rows only.
 				const pendingRows = this.#store.listPendingTxItems(row.transaction_id);
 				if (pendingRows.length === 0) {
 					continue;
 				}
 				const items = pendingRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
+				const ownedRows = pendingRows.filter((pending) => this.fokos.owns({ hashKey: pending.hk, sortKey: pending.sk }));
 
 				if (result.state === "COMMITTED") {
 					await this.fokos.dispatch("txCommit", ctx, {
@@ -1053,23 +1092,25 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				} else if (result.state === "CANCELLED") {
 					await this.fokos.dispatch("txCancel", ctx, { transactionId: row.transaction_id, items });
 				} else if (result.state === "not_found") {
-					if (!items.some((item) => this.fokos.owns(item))) {
-						this.#store.deletePendingTx(row.transaction_id);
+					if (ownedRows.length === 0) {
+						// Every row is a copy of a key that moved. Its new owner decides, and the cleanup
+						// of the migration deletes the copy after the acknowledgement of that owner.
 						continue;
 					}
 
 					const now = this.fokosNow();
-					const lockCreatedAt = Math.min(...pendingRows.map((pending) => pending.created_at));
+					const lockCreatedAt = Math.min(...ownedRows.map((pending) => pending.created_at));
 					const lockAgeMs = now - lockCreatedAt;
 					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
-						if (this.#store.guardPendingTx(row.transaction_id, now)) {
+						const ownedKeys = ownedRows.map((pending) => ({ hashKey: pending.hk, sortKey: pending.sk }));
+						if (this.#store.guardPendingTx(row.transaction_id, now, ownedKeys)) {
 							console.error({
 								...this.logParams(),
 								message: "fokos/partition: lock-age guard: over-age lock with not_found",
 								transactionId: row.transaction_id,
 								coordinatorDoName,
 								idempotencyToken,
-								keys: pendingRows.map((pending) => ({
+								keys: ownedRows.map((pending) => ({
 									hashKey: pending.hk.toBase64({ alphabet: "base64url" }),
 									sortKey: pending.sk.toBase64({ alphabet: "base64url" }),
 								})),

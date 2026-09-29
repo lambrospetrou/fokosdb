@@ -436,9 +436,9 @@ export class RepartitionSource {
 	 */
 	async #initializeTargets(row: RepartitionRow, now: number): Promise<StepOutcome> {
 		// Consulted before the FIRST target exists, so a key that cannot move yet gets no range root. The
-		// targets stay `pending` and the plan waits at the flat interval, until a signal wakes it.
+		// targets stay `pending`, and the plan asks again after `cutoverHoldRetryMs`.
 		if (this.store.countRepartitionTargets(row.id).initialized === 0 && !this.#cutoverAllowed(row)) {
-			this.#deferTargets(row, now, this.deps.config().lockRetryMs);
+			this.#deferTargets(row, now, this.deps.config().cutoverHoldRetryMs);
 			return "progressed";
 		}
 
@@ -514,7 +514,7 @@ export class RepartitionSource {
 			// change while the targets are created, and moving ownership then would strand host state on
 			// the wrong partition.
 			if (!this.#cutoverAllowed(current)) {
-				this.store.setRepartitionAttempt(row.id, current.attempts, now + this.deps.config().lockRetryMs);
+				this.store.setRepartitionAttempt(row.id, current.attempts, now + this.deps.config().cutoverHoldRetryMs);
 				return "progressed";
 			}
 
@@ -598,21 +598,6 @@ export class RepartitionSource {
 			}
 			return "progressed";
 		});
-	}
-
-	/**
-	 * Tells the source that a condition `beforeCutover` tests has changed.
-	 *
-	 * A held promotion parks itself at a flat interval and asks again. Only the host knows which event
-	 * changes the answer, so it signals it. Without this call, a key that is ready to move waits out
-	 * an interval chosen for polling. Returns false when no promotion was waiting.
-	 */
-	onRepartitionUnblocked(now = Date.now()): boolean {
-		if (!this.store.hasUnfinishedPromotion()) {
-			return false;
-		}
-		this.store.transactionSync(() => this.store.markPromotionsDueNow(now));
-		return true;
 	}
 
 	/** The earliest durable deadline of any source work, or null when the source has none left. */

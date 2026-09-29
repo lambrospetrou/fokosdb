@@ -19,10 +19,15 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
 import { KeyCodec, type KeyBytes } from "../../src/sharding/key-codec.js";
 import { createTableConfig, type FokosDBRouteContext } from "../../src/shared/partition-context.js";
-import { isRangePartition, partitionIdentityFrom, PartitionIdHelper, resolveRangePartitionContext } from "../../src/sharding/partition-id.js";
+import {
+	isRangePartition,
+	partitionIdentityFrom,
+	PartitionIdHelper,
+	resolveRangePartitionContext,
+} from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
-import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { PartitionStore, type PendingTransactionRow } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { DEFAULT_RUNTIME_CONFIG } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
@@ -215,13 +220,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			getPeer: (ref) => cluster.node({ ...base, doName: ref.doName, partitionId: ref.partitionId }).peer,
 			hooks: {
 				evaluateSplit: () => false,
-				migration: new FokosMigrationHost({ store }),
+				migration: new FokosMigrationHost({ store, logParams: () => ({ doName, partitionId: ctx.partitionId }) }),
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
-				beforeCutover: (plan) => plan.kind !== "key_promotion" || store.pendingLockCountForHashKey(promotedKeyOf(plan)) === 0,
 				beforeComplete: (plan) => {
-					if (plan.kind !== "key_promotion") {
-						store.deleteAllPendingTx();
+					if (plan.kind === "key_promotion") {
+						store.deletePendingTxForHashKey(promotedKeyOf(plan));
+						return;
 					}
+					store.deleteAllPendingTx();
 				},
 				cleanupSourceStep: (plan) => {
 					if (plan.kind !== "key_promotion") {
@@ -229,7 +235,6 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 					}
 					const hashKey = promotedKeyOf(plan);
 					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
-					store.deletePendingTxForHashKey(hashKey);
 					if (store.hasItemsForHashKey(hashKey)) {
 						return false;
 					}
@@ -276,7 +281,12 @@ export function putItem(store: PartitionStore, hk: string, sk: string, data = `d
 
 /** Writes one pending lock, which is what blocks a promotion and what a split target must inherit. */
 export function putLock(store: PartitionStore, hk: string, sk: string, transactionId = "tx-1"): void {
-	store.insertPendingLock({
+	store.insertPendingLock(lockRow(hk, sk, transactionId));
+}
+
+/** One unguarded lock row, for a test that writes it itself or compares an imported copy with it. */
+export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTransactionRow {
+	return {
 		hk: kb(hk),
 		sk: kb(sk),
 		transaction_id: transactionId,
@@ -289,7 +299,7 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 		coordinator_json: '{"doName":"tc-1"}',
 		created_at: 1,
 		guarded_at: null,
-	});
+	};
 }
 
 /** The running size estimate of one hash key, which the import maintains page by page. */

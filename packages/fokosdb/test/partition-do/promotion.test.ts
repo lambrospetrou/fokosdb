@@ -6,7 +6,7 @@ import { FokosError } from "../../src/shared/errors.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_UNAVAILABLE_CODES } from "../../src/sharding/errors.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
-import { executedBy, kb, rangeAncestorsOf, withOpIndex } from "./helpers.js";
+import { executedBy, kb, lockKeys, rangeAncestorsOf, withOpIndex } from "./helpers.js";
 import {
 	PROMOTION_BIG_DATA,
 	PROMOTION_TEST_MAX_SIZE_MB,
@@ -39,68 +39,62 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 		// shouldSplit must return null while a key is in-flight, even though the database is over
 		// hashSplitConditions.maxSizeMb and a split would otherwise be warranted.
 		//
-		// Only 'queued' and 'promoting' block a split (hasInFlightPromotedKeys), so this pins alice at
-		// 'queued' with a transaction lock rather than waiting for a cutover that races the migration to
-		// 'promoted'. Landing on 'promoted' would leave nothing in flight and make the assertion pass for
-		// the wrong reason.
-		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
-
-		// Lock alice/sk1 so startPromotion defers the cutover and alice stays 'queued' throughout.
-		const txId = crypto.randomUUID();
-		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
-			transactionId: txId,
-			transactionTimestamp: Date.now(),
-			coordinator: testCoordinatorRef(),
-			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
-		});
-		expect(lockResult.outcome).toBe("accepted");
+		// Only 'queued' and 'promoting' block a split (hasInFlightPromotedKeys), so this holds the pages
+		// of the range root and pins alice at 'promoting'. Landing on 'promoted' would leave nothing in
+		// flight and make the assertion pass for the wrong reason.
+		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
+		const rangeRoot = partition.rangeRoot("alice");
+		await partition.controlled.testHoldPulls({ stream: "items", target: rangeRoot.doName });
 		try {
 			await partition.triggerPromotion("alice");
-			await partition.runAlarm();
-			await partition.awaitPromotedKeyStatus("alice", ["queued"]);
+			await partition.awaitPromotedKeyStatus("alice", ["promoting"]);
 
 			// Now make a split genuinely warranted. Every one of these writes runs checkSplits.
 			const databaseSize = await partition.growPastSplitThreshold();
 
 			// Both halves matter: no split queued, AND the preconditions that make that meaningful.
 			expect(databaseSize).toBeGreaterThan(PROMOTION_TEST_MAX_SIZE_MB * 1024 * 1024);
-			expect(await partition.promotedKeyStatus("alice")).toBe("queued");
+			expect(await partition.promotedKeyStatus("alice")).toBe("promoting");
 			expect((await partition.status()).splitStatus).toBeUndefined();
 		} finally {
-			await partition.rpc.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
-			await partition.awaitPromoted("alice");
+			await partition.controlled.testReleasePulls();
 		}
 	});
 });
 
 describe.concurrent("PartitionDO — promotion cutover deferral and routing", () => {
-	it("defers cutover to 'promoting' while the key has a pending transaction lock", async () => {
+	it("cuts a locked key over, and the range root commits the lock it imported", async () => {
 		const partition = makePartition({ hashSplitConditions: { maxSizeMb: PROMOTION_TEST_MAX_SIZE_MB } });
 
-		// Lock alice/sk1 with a prepare so the lock-free check in startPromotion defers.
+		// A prepare that lands before the cutover. The lock no longer holds the promotion back: it
+		// travels with its key, and the target resolves it.
 		const txId = crypto.randomUUID();
 		const lockResult = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId: txId,
 			transactionTimestamp: Date.now(),
 			coordinator: testCoordinatorRef(),
-			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "pending", kind: "text" }]),
+			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "from-the-lock", kind: "text" }]),
 		});
 		expect(lockResult.outcome).toBe("accepted");
-		try {
-			await partition.triggerPromotion("alice");
-			await partition.runAlarm();
 
-			// Detection queued alice but cutover was deferred — key must still be 'queued'.
-			await partition.awaitPromotedKeyStatus("alice", ["queued"]);
+		await partition.triggerPromotion("alice");
+		const rangeRoot = await partition.awaitPromoted("alice");
 
-			// A write to alice while 'queued' is still served locally.
-			const r = await partition.put({ hashKey: kb("alice"), sortKey: kb("sk2"), data: "still-local", kind: "text" as const });
-			expect(r.meta.forwardCount).toBe(0);
-		} finally {
-			// Release the lock; next background cycle should complete the cutover.
-			await partition.rpc.txCancel(partition.ctx, { transactionId: txId, items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }] });
-			await partition.awaitPromoted("alice");
-		}
+		// The migration carried the lock, and the completion transaction deleted the source copy.
+		expect(await lockKeys(rangeRoot.stub, txId)).toEqual(["alice/sk1"]);
+		expect(await lockKeys(partition.stub, txId)).toEqual([]);
+
+		// The commit routes to the owner the key has now, which holds the payload of the prepare.
+		await expect(
+			partition.rpc.txCommit(partition.ctx, {
+				transactionId: txId,
+				transactionTimestamp: Date.now(),
+				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
+			}),
+		).resolves.toEqual({ outcome: "committed" });
+		const read = await rangeRoot.get({ hashKey: kb("alice"), sortKey: kb("sk1") });
+		expect(read).toMatchObject({ found: true, item: { data: "from-the-lock" } });
+		expect(await lockKeys(rangeRoot.stub, txId)).toEqual([]);
 	});
 
 	it("forwards reads and writes to the range root after cutover ('promoting')", async () => {

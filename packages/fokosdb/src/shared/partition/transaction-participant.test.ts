@@ -443,7 +443,7 @@ describe("TransactionParticipant - prepare", () => {
 				],
 			});
 			expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
-			participant.cancelLocal(check.transactionId);
+			participant.cancelLocal(check.transactionId, check.items);
 
 			// A content mutation at the same timestamp orders below the committed read, so it fails.
 			const put = prepareReq({
@@ -831,7 +831,7 @@ describe("TransactionParticipant - cancel", () => {
 			});
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
-			participant.cancelLocal(request.transactionId);
+			participant.cancelLocal(request.transactionId, request.items);
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 
 			const retry = prepareReq({
@@ -852,7 +852,7 @@ describe("TransactionParticipant - cancel", () => {
 			const request = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
-			participant.cancelLocal(request.transactionId);
+			participant.cancelLocal(request.transactionId, request.items);
 
 			expect(store.pendingTxCountFor(request.transactionId)).toBe(0);
 			const item = store.getItem(kb("user"), sk);
@@ -970,24 +970,24 @@ describe("TransactionParticipant - readForTransaction", () => {
 			});
 			expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(false);
-			participant.cancelLocal(check.transactionId);
+			participant.cancelLocal(check.transactionId, check.items);
 
 			// Every content mutation counts as a pending write.
 			const put = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "put", data: "v2", kind: "text" }] });
 			expect(participant.prepareLocal(put)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(put.transactionId);
+			participant.cancelLocal(put.transactionId, put.items);
 
 			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
 			const update = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "update", update: updatePlan }] });
 			expect(participant.prepareLocal(update)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(update.transactionId);
+			participant.cancelLocal(update.transactionId, update.items);
 
 			const del = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "delete" }] });
 			expect(participant.prepareLocal(del)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);
-			participant.cancelLocal(del.transactionId);
+			participant.cancelLocal(del.transactionId, del.items);
 
 			// An operation value the code does not know counts as a pending write, not a read.
 			store.insertPendingLock({

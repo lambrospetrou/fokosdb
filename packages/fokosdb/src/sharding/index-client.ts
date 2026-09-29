@@ -29,13 +29,7 @@ export { GOLDEN_RATIO, GOLDEN_RATIO_BIGINT, hash32, hash64, hashChildIndex, hash
 
 // ─── Identity and context ─────────────────────────────────────────────────────
 
-export {
-	refOf,
-	structurallyEqual,
-	topologiesEqual,
-	validateRangeConfig,
-	validateTopology,
-} from "./route-context.js";
+export { refOf, structurallyEqual, topologiesEqual, validateRangeConfig, validateTopology } from "./route-context.js";
 export type {
 	FokosPartitionIdentity,
 	FokosPartitionRef,

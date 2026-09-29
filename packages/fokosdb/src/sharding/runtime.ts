@@ -709,6 +709,17 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
+	 * SQL the host splices into its own statements. A host scan that holds no key cannot ask `owns()`
+	 * per row, and the runtime's tables are not the host's to name, so the runtime exports the text.
+	 *
+	 * `movedHashKeys()` selects one column, `hash_key`: the keys whose promotion from this partition
+	 * has cut over and not completed yet. A host excludes their rows with `hk NOT IN (<fragment>)`.
+	 */
+	readonly sql = {
+		movedHashKeys: (): string => this.#store.movedHashKeysSql(),
+	};
+
+	/**
 	 * True when this partition owns the key now. It reads the topology and the route overrides only,
 	 * never a cache, so a Bloom false positive cannot make a host sweep skip a key it owns.
 	 */
@@ -1635,9 +1646,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 				}
 				for (const candidate of s.promotionCandidates ?? []) {
 					await this.#requestPromotion(candidate.hashKey, candidate.data);
-				}
-				if (s.repartitionUnblocked && this.#source.onRepartitionUnblocked()) {
-					this.#scheduler.wake();
 				}
 				for (const job of s.jobs ?? []) {
 					await this.#scheduler.scheduleJob(job.name, job.runAt);

@@ -4,13 +4,7 @@ import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
 import type { FokosImportState, FokosShardingRpc, FokosStatusCursor, RouteKey } from "./repartition-types.js";
 import { isRangePartition } from "./partition-id.js";
-import {
-	refOf,
-	type FokosPartitionRef,
-	type FokosRangeConfig,
-	type FokosRouteContext,
-	type FokosTopology,
-} from "./route-context.js";
+import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
 import { FokosRouter, publicRouting } from "./router.js";
 import type { FokosEnvelope, FokosOperationSpec, FokosPublicRouting, FokosRangeInput } from "./runtime-types.js";
 import type { RepartitionKind } from "./sharding-store.js";

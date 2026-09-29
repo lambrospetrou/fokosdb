@@ -189,6 +189,9 @@ export type StalePendingTx = Pick<PendingTransactionRow, "transaction_id" | "coo
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
+/** One key of a lock row, as the transaction paths hold it. */
+export type PendingTxKey = { hashKey: KeyBytes; sortKey: KeyBytes };
+
 export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
@@ -488,10 +491,11 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		//
 		// pending_transactions_transaction_id exists because `transaction_id` is the THIRD primary key
 		// column and so cannot be seeked on its own. Every whole-transaction operation filters by it —
-		// pendingTxCountFor, listPendingTxKeys, listPendingTxItems, deletePendingTx. Also, deletePendingTx
-		// and listPendingTxKeys run on every commit and abort, so without this index the cost of
-		// committing ONE transaction is O(all pending rows in the partition). Measured over 20k pending
-		// rows: 147 page reads drop to 3, and listPendingTxItems drops from 2859 to 8.
+		// pendingTxCountFor, listPendingTxKeys and listPendingTxItems. Also,
+		// listPendingTxKeys runs on every commit and abort, so without this index the cost of committing
+		// ONE transaction is O(all pending rows in the partition). Measured over 20k pending rows: 147
+		// page reads drop to 3, and listPendingTxItems drops from 2859 to 8. A per-key statement —
+		// guardPendingTx, deletePendingTxKeys — seeks the primary key instead.
 		//
 		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid table. A rowid table
 		// appends only the rowid to an index entry, so a key of `transaction_id` alone would send
@@ -542,16 +546,33 @@ const sqlMigrations: SQLSchemaMigration[] = [
 // The store
 // ---------------------------------------------------------------------------
 
+/** The moved-key fragment of a store that no sharding runtime answers for: an empty set of keys. */
+const NO_MOVED_HASH_KEYS = `SELECT NULL WHERE 0`;
+
 export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
+	#movedHashKeys: () => string;
 
-	constructor(storage: DurableObjectStorage) {
+	/**
+	 * `movedHashKeys` returns the SQL fragment of the hash keys this partition promoted away and has
+	 * not reclaimed yet. The pending-row statements exclude those rows: the range root owns them now,
+	 * and the copies here exist only until migration has delivered them. The store calls it when it
+	 * runs the statement, because the host builds the store before the runtime that answers it. A
+	 * store without a runtime holds no promotion, so its default names no key.
+	 */
+	constructor(storage: DurableObjectStorage, movedHashKeys: () => string = () => NO_MOVED_HASH_KEYS) {
 		this.#storage = storage;
+		this.#movedHashKeys = movedHashKeys;
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
 		});
+	}
+
+	/** `hk NOT IN (...)`: the rows of this partition's own keys, without the copies of a moved key. */
+	#ownedRows(): string {
+		return `hk NOT IN (${this.#movedHashKeys()})`;
 	}
 
 	runMigrations(): void {
@@ -1452,10 +1473,17 @@ export class PartitionStore {
 	 *
 	 * The query walks `pending_transactions_created_at` from its start and stops at the first unguarded
 	 * row, so it costs one seek in the common case where the oldest lock is not guarded.
+	 *
+	 * It skips the copies of a moved key, because this partition can no longer recover them. Without
+	 * that clause the oldest copy holds the deadline in the past for the whole import, the scheduler
+	 * arms the alarm in the past, and the pass repeats until the copies go.
 	 */
 	earliestUnguardedPendingTxCreatedAt(): number | null {
 		const rows = this.#storage.sql
-			.exec<{ created_at: number }>(`SELECT created_at FROM pending_transactions WHERE guarded_at IS NULL ORDER BY created_at LIMIT 1`)
+			.exec<{ created_at: number }>(
+				`SELECT created_at FROM pending_transactions
+				  WHERE guarded_at IS NULL AND ${this.#ownedRows()} ORDER BY created_at LIMIT 1`,
+			)
 			.toArray();
 		return rows[0]?.created_at ?? null;
 	}
@@ -1556,37 +1584,68 @@ export class PartitionStore {
 	 * `GROUP BY transaction_id ... HAVING MIN(created_at) < ?` walks the `transaction_id` index, which
 	 * cannot use `created_at` at all: 10,000 rows read in the same case, and the whole table in the
 	 * common case where few rows are stale.
+	 *
+	 * The scan skips the copies of a moved key: their owner recovers them. The clause holds per row,
+	 * so a transaction with one owned row and one copy is still selected, for its owned row.
 	 */
 	listStalePendingTx(staleBeforeTs: number, limit: number): StalePendingTx[] {
 		return this.#storage.sql
 			.exec<StalePendingTx>(
 				`SELECT DISTINCT transaction_id, coordinator_json
-                     FROM pending_transactions WHERE created_at < ? AND guarded_at IS NULL LIMIT ?`,
+                     FROM pending_transactions
+                     WHERE created_at < ? AND guarded_at IS NULL AND ${this.#ownedRows()} LIMIT ?`,
 				staleBeforeTs,
 				limit,
 			)
 			.toArray();
 	}
 
-	guardPendingTx(transactionId: string, guardedAt: number): boolean {
-		return (
-			this.#storage.sql.exec(
-				`UPDATE pending_transactions SET guarded_at = ? WHERE transaction_id = ? AND guarded_at IS NULL`,
+	/**
+	 * Quarantines the rows of one transaction under `keys`, and answers whether it changed one. The
+	 * caller owns those keys: a copy of a key that a promotion moved away keeps the guard state it
+	 * has, and migration carries that state to the new owner, whose decision it is.
+	 *
+	 * One statement per key, by the primary key, because a transaction holds up to MAX_ITEMS_PER_TX
+	 * (100) keys here and one statement binds at most 100 parameters.
+	 */
+	guardPendingTx(transactionId: string, guardedAt: number, keys: readonly PendingTxKey[]): boolean {
+		let written = 0;
+		for (const key of keys) {
+			written += this.#storage.sql.exec(
+				`UPDATE pending_transactions SET guarded_at = ?
+				  WHERE hk = ? AND sk = ? AND transaction_id = ? AND guarded_at IS NULL`,
 				guardedAt,
+				key.hashKey,
+				key.sortKey,
 				transactionId,
-			).rowsWritten > 0
-		);
+			).rowsWritten;
+		}
+		return written > 0;
 	}
 
-	clearPendingTxGuard(transactionId: string): void {
-		this.#storage.sql.exec(`UPDATE pending_transactions SET guarded_at = NULL WHERE transaction_id = ?`, transactionId);
+	/**
+	 * Releases the locks of one transaction under `keys`, one statement per key for the reason on
+	 * guardPendingTx.
+	 *
+	 * The caller owns those keys, so a delete by transaction id alone is wrong here: it also removes
+	 * the copies of a key that a promotion moved away, which the source keeps until the new owner has
+	 * imported them.
+	 */
+	deletePendingTxKeys(transactionId: string, keys: readonly PendingTxKey[]): void {
+		for (const key of keys) {
+			this.#storage.sql.exec(
+				`DELETE FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ?`,
+				key.hashKey,
+				key.sortKey,
+				transactionId,
+			);
+		}
 	}
 
-	deletePendingTx(transactionId: string): void {
-		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ?`, transactionId);
-	}
-
-	/** Promotion GC: a fully-promoted key can have no live locks here anymore. */
+	/**
+	 * Promotion completion: the target holds every lock of the key, so the copies here can go. One
+	 * statement, so a transaction never keeps part of its copies.
+	 */
 	deletePendingTxForHashKey(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hk);
 	}

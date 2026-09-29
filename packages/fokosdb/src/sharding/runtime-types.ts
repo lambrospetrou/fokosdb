@@ -140,11 +140,6 @@ export type FokosSignals = {
 	evaluateSplit?: boolean;
 	/** Keys that have grown past the host's own threshold. Each becomes a promotion request to its owner. */
 	promotionCandidates?: Array<{ hashKey: KeyBytes; data?: unknown }>;
-	/**
-	 * A condition that `beforeCutover` tests has changed, for example a lock was released. Every
-	 * repartition that the hook held back becomes due now, instead of at its flat retry interval.
-	 */
-	repartitionUnblocked?: boolean;
 	/** Host jobs that must run by a deadline because of this result. */
 	jobs?: Array<{ name: string; runAt: number }>;
 };
@@ -176,8 +171,8 @@ export type FokosOperationBase<Req, Res> = {
 	local(req: Req, call: FokosLocalCall): Res | Promise<Res>;
 	/**
 	 * Runs on every partition the request passes through, owner or router, after admission and before
-	 * the first remote call. For work that is keyed by something other than a route key, for example a
-	 * lock release by transaction id. It must not write partitioned data by key. Its result is discarded.
+	 * the first remote call. For host work that is keyed by something other than a route key. It must
+	 * not write partitioned data by key. Its result is discarded.
 	 */
 	beforeForward?(req: Req, call: FokosLocalCall): void;
 	/**

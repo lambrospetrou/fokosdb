@@ -32,7 +32,7 @@ describe("resolveRuntimeConfig", () => {
 		[{ hashArenaBytes: 1_019 }, /hashArenaBytes must be an integer of at least 1020/],
 		[{ rangeHierarchyMaxRows: 0 }, /rangeHierarchyMaxRows must be an integer of at least 1/],
 		[{ maxForwardRetries: -1 }, /maxForwardRetries must be an integer of at least 0/],
-		[{ lockRetryMs: 0 }, /lockRetryMs must be an integer of at least 1/],
+		[{ cutoverHoldRetryMs: 0 }, /cutoverHoldRetryMs must be an integer of at least 1/],
 		[{ migrationPageRows: 0 }, /migrationPageRows must be an integer of at least 1/],
 		[{ statusPageEntries: 0 }, /statusPageEntries must be an integer of at least 1/],
 	])("rejects a value below its range: %o", (overrides, detail) => {
