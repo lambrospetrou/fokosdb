@@ -105,8 +105,8 @@ result is correct, but the two-phase path adds at least one more round of RPCs.
 
 - The `group` and `single_owner` shapes resolve an owner with the Bloom filter and with the learned range slices,
   as the `point` shape does.
-- The `group` and `single_owner` shapes apply the same fallbacks after a cache miss as the `point` shape. This
-  includes the fallback for a cached hash jump.
+- The `group` and `single_owner` shapes handle the same cache-miss errors as the `point` shape, including a
+  cached hash jump. Their retries turn Bloom off and keep learned range slices after milestone 2.
 - In one dispatch of a `group` operation, each partition that runs the local handler receives the keys it owns in
   one sub-request.
 - A Bloom false positive does not make a `single_owner` operation answer `not_applicable` for keys of one owner.
@@ -130,6 +130,8 @@ result is correct, but the two-phase path adds at least one more round of RPCs.
 
 - A cache hint must never change a result. A missing, old, or false hint changes the latency only.
 - The one-call-per-owner rule of section 4.2.2 must hold for each `group` operation, with and without a miss.
+- A `group` operation must be safe under partial fan-out and repeated sub-requests for each key, even without
+  Bloom. Section 4.2.7 gives the proof for the current operations.
 - A fallback must start only after an error that proves no handler applied, or after an error on an operation
   that is idempotent for each key. Section 4.2.7 gives the proof for each operation.
 - `MAX_FORWARD_RETRIES` (8) must bound the fallbacks of one fallback chain. Section 4.2.4 defines the chain.
@@ -141,14 +143,15 @@ result is correct, but the two-phase path adds at least one more round of RPCs.
 Each milestone ships alone and leaves the system correct.
 
 1. **The miss ladder for a set of keys.** Move the decision of `#fallbackAfterMiss` into a form that takes one
-   resolution and a list of keys. Add the fallback to `#dispatchGroup` and `#dispatchSingleOwner`. Both shapes
-   still resolve with `EXACT`. This milestone closes gap 1 for the hash arena.
-2. **Learned range slices.** The two shapes resolve with `{ bloom: false, learnedRange: true }`. The learned slices
-   keep the one-call-per-owner rule without a guard (section 4.2.2). This milestone removes the forwards below a
-   partition that holds the route override.
-3. **The Bloom step.** The two shapes resolve with `{ bloom: true, learnedRange: true }`, with the speculation
-   guard of section 4.2.3 and the single-owner rule of section 4.2.5. This milestone removes the forwards above
-   the partition that holds the route override.
+   resolution, a list of keys, and the dispatch shape. Add the fallback to `#dispatchGroup` and
+   `#dispatchSingleOwner`. Both shapes resolve with `EXACT` on the first attempt and on each retry. This
+   milestone closes gap 1 for the hash arena.
+2. **Learned range slices.** The two shapes resolve with `{ bloom: false, learnedRange: true }` on the first
+   attempt and on retries. The learned slices keep the one-call-per-owner rule without a guard (section 4.2.2).
+   This milestone removes the forwards below a partition that holds the route override.
+3. **The Bloom step.** The two shapes first resolve with `{ bloom: true, learnedRange: true }`, with the speculation
+   guard of section 4.2.3 and the single-owner rule of section 4.2.5. A retry keeps learned slices but turns Bloom
+   off. This milestone removes the forwards above the partition that holds the route override.
 4. **Documents.** Update the resolution order in `docs/agent-plans/2026-09-19-fokos-sharding-runtime.md`, the
    `ResolveOptions` comments, the `txCancel` comment in `src/server/do-partition.ts` (section 4.2.8), and
    `AGENTS.md` where it describes the shapes.
@@ -163,9 +166,9 @@ Each dispatch shape resolves with all the caches. Two rules keep the transaction
    of one owner must resolve to the same target. The hash arena and the learned range slices keep this rule by
    their structure. A Bloom hit can break it. So a `group` operation uses a Bloom hit for a hash key only when no
    key of another hash key has the same exact target.
-2. **The same fallback on each shape.** When a forward fails because of a cache hint, the partition forgets the
-   hint, resolves the keys of that forward again, and sends them to the new targets. The point and range shapes do
-   this already.
+2. **A fallback after a miss.** When a forward fails because of a cache hint, the partition forgets the hint,
+   resolves the keys of that forward again, and sends them to the new targets. A group or single-owner retry does
+   not use Bloom. It can still use learned range slices. Point and range requests keep their current fallbacks.
 
 ```text
 hash root, txPrepare for (H, sk)                       today       after this spec
@@ -196,7 +199,8 @@ the keys again without the Bloom step before it answers `not_applicable`.
   `#dispatchGroup`, `#dispatchSingleOwner`, and `resolveOwner`.
 
 `EXACT` still uses the hash arena. Section 4.2.2 shows why the arena keeps the one-call-per-owner rule. The miss
-ladder of section 4.2.6 chooses other options for one retry, as it does now for the point shape.
+ladder of section 4.2.6 turns Bloom off for each `group` and `single_owner` retry. It keeps learned slices on from
+milestone 2 onward. The `point` shape keeps its current retry options.
 
 #### 4.2.2 The one-call-per-owner rule
 
@@ -268,8 +272,9 @@ the Bloom hit. The keys of `H` then go through `C`, and `C` applies its own cach
       target. So they share one resolution: the same `via`, the same learned slice, and the same `relDepth`. The
       ladder forgets the hint one time for the group.
    3. When the ladder gives no next options, or the group reached `MAX_FORWARD_RETRIES`, throw the error.
-   4. Otherwise, call `collector.forget` for the target. Then resolve each item of the group again with the next
-      options, and group the items by target.
+   4. Otherwise, call `collector.forget` for the target. Then resolve each item of the group again with Bloom off
+      and with the learned-slice setting of this milestone. Group the items by target. Do not turn Bloom back on
+      later in this fallback chain.
    5. When some items resolve to `local`, admit them and run the local handler for them. This runs in one
       synchronous block with step 4.4, as the local fallback of `#forwardPoint` does.
    6. Send each new remote group through this ladder, with the retry count plus 1.
@@ -309,8 +314,9 @@ after any failure.
 3. When each key is local, run the local handler, as now.
 4. When the keys are local and remote, or on two remote targets, answer `notApplicable`, as now.
 5. When each key resolves to one remote target, forward the request. On an error, ask the miss ladder for the next
-   options. Forget the hint, resolve each key again with those options, and go back to step 3. The local run of
-   step 3 then runs in one synchronous block with the new resolution.
+   options. Forget the hint, resolve each key again with Bloom off and with the learned-slice setting of this
+   milestone, and go back to step 3. Keep Bloom off for the rest of this fallback chain. The local run of step 3
+   then runs in one synchronous block with the new resolution.
 
 A single-owner operation never fans out. Each partition on the chain forwards the whole request to one target, or
 answers `notApplicable`, or runs the handler. Each error that starts a fallback comes from a check that runs
@@ -320,51 +326,61 @@ before the handler: the identity check, or the lifecycle gate. So a fallback nev
 #### 4.2.6 The miss ladder
 
 The ladder is the decision of `#fallbackAfterMiss`. It moves into a function that takes one resolution, the keys
-of the forward, the error, and `readOnly`. It returns the next options, or null.
+of the forward, the error, `readOnly`, and the dispatch shape. It returns the next options, or null. For `group`
+and `single_owner`, every retry uses `bloom: false`. It uses `learnedRange: false` in milestone 1 and
+`learnedRange: true` from milestone 2 onward. A later miss in the same chain never turns Bloom back on. The
+`point` shape keeps its current options.
 
 The ladder checks these cases in order:
 
 1. **A learned slice** and `range_partition_not_initialized`. Delete the slice with `deleteLearnedRangeSlice`.
-   The next options keep the Bloom step as before, with the learned slices on.
+   A point retry keeps the Bloom step as before. A group or single-owner retry turns it off. Learned slices stay
+   on, so the next resolution can jump to another known slice instead of the range root.
 2. **`via: "bloom"`** and `range_partition_not_initialized`, or `partition_migrating` with
    `importState: "awaiting_data"`. Forget nothing, because the filter cannot forget a key. The next options turn
    the Bloom step off, with the learned slices on.
 3. **`via: "bloom"` on a read-only operation** and `repartition_not_cut_over`. Forget nothing. The next options
    turn the Bloom step off, with the learned slices on.
 4. **`via: "hash"` with `relDepth > 1`** and `hash_partition_not_initialized`. Call `arena.invalidate` on the path
-   of the hash key. The next options are `HINTED`.
+   of the hash key. A point retry uses `HINTED`. A group or single-owner retry keeps Bloom off and uses the
+   learned-slice setting of its milestone.
 5. **Any other case.** Forget nothing, and return null. The error goes to the caller.
 
 A `group` or `single_owner` operation has `whileMigrating: "throw"`, so it never reads through its source. It
-cannot receive `repartition_not_cut_over`, and case 3 never applies to it.
+cannot receive `repartition_not_cut_over`, and case 3 never applies to it. On a hash partition without a cut-over
+override, Bloom is the only way to enter the range tree directly. A retry with Bloom off follows the hash tree
+until it reaches the override. That partition can still use its learned range slices to skip the range root.
 
 For a group, case 4 forgets the path of one key of the group. Each key of the group has the same path down
 to the target, so one call is enough.
 
-The error can come from a partition below the target. Example: the Bloom hit is true, the range root cut over and
-split, and a range child waits for its first page. The fallback then resolves the same range tree through the
-exact path, and the second error goes to the caller. `isAwaitingData` in `src/sharding/runtime.ts` describes this
-case for the point shape. It applies to the new shapes in the same way.
+A Bloom forward to a target in `awaiting_data` receives `partition_migrating` directly and retries without Bloom.
+The error can also come from a range child below the target. On a `fail_fast` group, the router propagates the
+child error, so the Bloom sender uses case 2. On an `attempt_all` group (`txCommit` or `txCancel`), the router wraps
+the child error as `partition_fanout_failed`. The sender does not use the miss ladder for that error. It reports
+the error to its caller. A coordinator keeps the transaction nonterminal and retries it. Section 4.2.7 covers
+any part that already applied.
 
 #### 4.2.7 Why a repeated sub-request is safe
 
 A point operation or a single-owner operation starts a fallback only after an error that proves no handler ran.
-A group operation is different. The target can fan out below itself, so some owners can apply their part before
-another owner returns the error. The fallback then sends the same keys again. Each group operation is idempotent
-for each key:
+A group operation is different. A router can send one group to several children, even without Bloom. Some owners
+can apply their part before another owner returns an error. A miss fallback or a caller retry can send those keys
+again. Each current group operation is idempotent for each key:
 
 | Operation | The second call at an owner that applied |
 | --- | --- |
 | `txPrepare` | The lock row has the same transaction ID, so the item answers `passed`. |
 | `txCommit` | The owner has no lock row for the transaction, so it answers `committed`. |
-| `txCancel` | The release is by transaction ID. No row means no change. |
+| `txCancel` | A second release finds no pending row and changes nothing. |
 | `txReadForTransaction` | A read changes nothing. |
 
 A repeated `txCommit` reaches each owner with the same keys as the first call, because of section 4.2.2. So an
 owner that did not apply still receives its whole key set in one sub-request.
 
-A new `group` operation must be idempotent for each key, or it must not use the Bloom step. This is a rule for
-the authors of new operations. The runtime cannot check it.
+A new `group` operation must be safe to repeat for each key after partial fan-out. Turning Bloom off does not
+remove this requirement: a split router can apply one part while another part fails. The runtime cannot check
+whether a host handler meets it.
 
 #### 4.2.8 The partitions that a jump skips
 
@@ -423,10 +439,12 @@ returns to the current behavior. The learned rows stay valid hints.
 
 Tests run in the Workers runtime through `@cloudflare/vitest-plugin`.
 
-- **Milestone 1, arena fallback.** In `test/partition-do/tx-participant.test.ts` or `test/transactions/`: a group
-  operation through a hash router whose arena names a hash descendant that does not exist. The operation succeeds
-  through the nearest known ancestor. `TODO: find a setup without a production hook.` When no such setup exists,
-  milestone 1 ships without this test.
+- **Milestone 1, arena fallback.** In `test/partition-do/tx-participant.test.ts` or `test/transactions/`, use a
+  test-only cache setup to make a hash router name a descendant that does not exist. Prepare two keys of one owner,
+  then commit through the router. Make Bloom answer `true` for only one key. The miss retry must keep Bloom off and
+  send both keys to their owner in one call. Do not add a production hook. If no test-only setup can make this miss,
+  report the arena fallback and Bloom-off retry as untested before milestone 1 ships. Run this test again in
+  milestone 3.
 - **Milestone 2, learned slices.** In `test/partition-do/promotion.test.ts` or `range-split.test.ts`: build the
   shape of section 1.2 with `TestPartition` (`splitHash`, `makeRangeRoot`, `triggerRangeSplit`). Warm the caches
   with one read. Then `txPrepare` and `txCommit` for `(H, sk)` through the partition with the override have a

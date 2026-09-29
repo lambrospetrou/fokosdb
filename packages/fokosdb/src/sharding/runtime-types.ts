@@ -193,6 +193,11 @@ export type FokosGroupPart<Req, Res> = { target: FokosPartitionRef | "local"; re
 export type FokosOperation<Req, Res> =
 	| (FokosOperationBase<Req, Res> & { shape: "point"; key(req: Req): RouteKey })
 	| (FokosOperationBase<Req, Res> & {
+			/**
+			 * A group can fan out to several owners. One owner can apply before another fails.
+			 * The runtime or caller can then retry a sub-request. Each key's local effect must
+			 * be safe to repeat, even when Bloom routing is off.
+			 */
 			shape: "group";
 			items(req: Req): Array<{ key: RouteKey; item: unknown }>;
 			subRequest(req: Req, items: unknown[]): Req;
