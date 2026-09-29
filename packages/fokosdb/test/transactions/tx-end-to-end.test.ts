@@ -6,7 +6,7 @@ import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression } from "../../src/shared/types.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { encodeHashKey } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
 import {
 	betweenPhases,
 	coordinatorRouter,
@@ -883,7 +883,7 @@ describe("transactions - end-to-end", () => {
 		const tableName = `tcpool.${crypto.randomUUID()}`;
 		const db2 = makeDB({ tableName, rootTreesN: 1, coordinatorRootsN: 2 });
 		const db3 = makeDB({ tableName, rootTreesN: 1, coordinatorRootsN: 3 });
-		const rootFor = (db: FokosDB, token: string) => coordinatorRouter(db).rootContext(encodeHashKey(token)).doName;
+		const rootFor = (db: FokosDB, token: string) => coordinatorRouter(db).rootContext(encodeHashKey(token, DEFAULT_LIMITS)).doName;
 		let token = "";
 		for (let i = 0; i < 100 && token === ""; i++) {
 			const candidate = `pool-token-${i}`;

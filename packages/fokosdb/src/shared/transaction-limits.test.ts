@@ -1,6 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
+	DEFAULT_LIMITS,
+	encodeHashKey,
+	encodeSortKey,
 	MAX_CLIENT_REQUEST_TOKEN_BYTES,
+	MAX_HASH_KEY_BYTES,
+	MAX_SORT_KEY_BYTES,
+	resolveLimits,
+	type FokosDBLimitOverrides,
 	MAX_ITEM_BYTES,
 	MAX_ITEMS_PER_TX,
 	MAX_PAYLOAD_BYTES_PER_TX,
@@ -15,7 +22,7 @@ import { KeyCodec } from "../sharding/key-codec.js";
 import { compileConditionExpression, compileUpdateExpression } from "./expression/compiler.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 
-const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops);
+const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops, DEFAULT_LIMITS);
 const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
 
 function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x"): TransactWriteOperationLike {
@@ -250,5 +257,48 @@ describe("validateTransactGetItemKeys", () => {
 
 	it("allows the same hashKey with different sortKeys", () => {
 		expect(() => validateTransactGetItemKeys([key("a", "s1"), key("a", "s2"), key("b")])).not.toThrow();
+	});
+});
+
+describe("resolveLimits", () => {
+	it("returns the frozen defaults when the table overrides nothing", () => {
+		expect(DEFAULT_LIMITS).toEqual({ maxHashKeyBytes: MAX_HASH_KEY_BYTES, maxSortKeyBytes: MAX_SORT_KEY_BYTES });
+		expect(Object.isFrozen(DEFAULT_LIMITS)).toBe(true);
+		expect(resolveLimits(undefined)).toBe(DEFAULT_LIMITS);
+		expect(resolveLimits({})).toBe(DEFAULT_LIMITS);
+	});
+
+	it("applies each override, and ignores a key that a newer version can send", () => {
+		const limits = resolveLimits({ maxSortKeyBytes: 1_024, maxFutureBytes: 7 } as FokosDBLimitOverrides);
+		expect(limits).toEqual({ maxHashKeyBytes: MAX_HASH_KEY_BYTES, maxSortKeyBytes: 1_024 });
+		expect(Object.isFrozen(limits)).toBe(true);
+	});
+
+	it("warns for a limit above 2 KiB, and not for a limit of exactly 2 KiB", () => {
+		const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+		resolveLimits({ maxHashKeyBytes: 2_048, maxSortKeyBytes: 2_048 });
+		expect(warn).not.toHaveBeenCalled();
+
+		resolveLimits({ maxHashKeyBytes: 4_096 });
+		expect(warn).toHaveBeenCalledTimes(1);
+		expect(warn.mock.calls[0][0]).toMatchObject({ limits: { maxHashKeyBytes: 4_096 } });
+	});
+
+	it.each<[FokosDBLimitOverrides, string]>([
+		[{ maxHashKeyBytes: MAX_CLIENT_REQUEST_TOKEN_BYTES - 1 }, "limits.maxHashKeyBytes"],
+		[{ maxHashKeyBytes: 1_500.5 }, "limits.maxHashKeyBytes"],
+		[{ maxSortKeyBytes: 0 }, "limits.maxSortKeyBytes"],
+	])("rejects %o as partition_context_options_invalid", (overrides, option) => {
+		expect(() => resolveLimits(overrides)).toThrow(fokosErrorWith("partition_context_options_invalid", { option }));
+	});
+
+	it("checks the key sizes against the limits it is given", () => {
+		const limits = resolveLimits({ maxHashKeyBytes: 2_000, maxSortKeyBytes: 1_000 });
+		const hashKey = "h".repeat(1_500);
+		const sortKey = "s".repeat(800);
+		expect(() => encodeHashKey(hashKey, DEFAULT_LIMITS)).toThrow(fokosErrorWith("hash_key_too_large", { limitBytes: MAX_HASH_KEY_BYTES }));
+		expect(() => encodeSortKey(sortKey, DEFAULT_LIMITS)).toThrow(fokosErrorWith("sort_key_too_large", { limitBytes: MAX_SORT_KEY_BYTES }));
+		expect(encodeHashKey(hashKey, limits).byteLength).toBeGreaterThan(MAX_HASH_KEY_BYTES);
+		expect(encodeSortKey(sortKey, limits).byteLength).toBeGreaterThan(MAX_SORT_KEY_BYTES);
 	});
 });

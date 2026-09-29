@@ -91,7 +91,8 @@ old source after its cleanup is not a requirement of this change.
 - Promotion and split cancellation must preserve source transfer copies until acknowledgement permits cleanup.
 - Emergency repair must remain available on each complete current owner, with the existing request type.
   Its response must say how many rows the partition resolved locally, how many keys it forwarded, and which
-  partitions answered for the forwarded keys. Each call must write one log line with that result.
+  partitions answered for the forwarded keys. Each call must write one log line with that result. A call that
+  fails must still record the rows that it resolved locally.
 - A target that imports a quarantined lock must log the lock with its own `doName`.
 - A `txCancel` request with an empty `items` list must stay legal and release no pending row.
 - The existing migration streams, import gate, routed operations, and coordinator recovery must remain in use.
@@ -225,8 +226,13 @@ Two tools read that fact, one for each kind of caller:
   with one column, `hash_key`, over the runtime's own tables:
 
   ```sql
-  SELECT hash_key FROM fokos_repartitions WHERE kind = 'key_promotion' AND state IN ('cutover', 'completed')
+  SELECT hash_key FROM fokos_repartitions
+   WHERE kind = 'key_promotion' AND state IN ('cutover', 'completed') AND hash_key IS NOT NULL
   ```
+
+  `hash_key` is a nullable column. When the result of a `NOT IN` subquery holds one NULL, the predicate is
+  NULL for every row, and the host statement selects no row. The fragment therefore excludes NULL itself, so
+  a host statement does not depend on an invariant in the write path of the runtime.
 
   The host splices it into its own statement as `hk NOT IN (<fragment>)`. The fragment binds no parameter,
   so the host statement keeps one constant text and the statement cache holds it. SQLite runs the uncorrelated
@@ -570,11 +576,20 @@ empty `forwardedTo`.
   `transactionId`, `outcome`, `resolvedLocally`, `forwarded`, the `doName` of each partition in `forwardedTo`,
   `forwardedToTruncated`, and the `doName` and `partitionId` of this partition.
 - When the routed call throws, the message is `"fokos/partition: forced resolution failed"`. The line carries
-  `transactionId`, `outcome`, the error code, the `causeCode` of a `partition_fanout_failed`, and the `doName`
-  and `partitionId` of this partition. The handler then throws the error again.
+  `transactionId`, `outcome`, `resolvedLocally`, the error code, the `causeCode` of a `partition_fanout_failed`,
+  and the `doName` and `partitionId` of this partition. The handler then throws the error again.
 
-The local part can have applied before a failure. When `causeCode` is `partition_migrating`, an owner still
-imports, and the operator repeats the call later.
+The local part can have applied before a failure, and the failure line records it:
+
+- When the error code is `partition_fanout_failed`, `resolvedLocally` is the number of owned rows that the
+  handler selected. The runtime throws that code only after the local part committed, because a failed local
+  part outranks a failed remote group.
+- For every other error code, `resolvedLocally` is zero. The local part threw, or the dispatch stopped before
+  the local part ran. The local part is atomic, so it applied no row.
+
+The handler selects the owned rows and enters the routed operation with no `await` between them. So the
+selected count is the number of rows that the local part deleted. When `causeCode` is `partition_migrating`, an
+owner still imports, and the operator repeats the call later.
 
 **Empty sets and retries.** If the partition holds no row of the transaction, the call applies no write and
 needs no original timestamp. A timestamp used to construct an empty internal request must not affect stored
@@ -739,10 +754,13 @@ The change affects current internal contracts:
 
 The coordinator states, public transaction outcomes, and normal commit routing remain unchanged.
 
-The two earlier RFCs carry a note "Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`" with the
-new rule at each statement of the old rule: `docs/agent-plans/2026-09-17-unified-repartition-flow.md` in
-sections 4.3, 4.4, 4.7.3, 4.10, and 4.11, and `docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` in
-sections 4.2.5, 4.2.6, 4.2.11, 4.2.18, and 4.2.20.
+The three earlier RFCs carry a note "Superseded by `docs/ideas/2026-09-26-promotion-moves-its-locks.md`" with
+the new rule at each statement of the old rule:
+
+- `docs/agent-plans/2026-09-17-unified-repartition-flow.md` in sections 4.3, 4.4, 4.7.3, 4.10, and 4.11.
+- `docs/agent-plans/2026-09-19-fokos-sharding-runtime.md` in sections 4.2.5, 4.2.6, 4.2.11, 4.2.18, and 4.2.20.
+- `docs/agent-plans/2026-09-26-fokos-sharding-client.md` in section 1.2 (problem 7) and section 6 ("Why can a
+  promotion wait for a long time before its cutover?").
 
 The following code comments describe the old rule. The implementation changes each one to the new rule:
 
@@ -758,6 +776,18 @@ The following code comments describe the old rule. The implementation changes ea
 - `packages/fokosdb/src/sharding/sharding-store.ts`: the `markPromotionsDueNow` comment "A promotion that cannot
   move a locked key parks itself 5 seconds out". The method stays for other hosts, and the comment names the
   host condition in general terms.
+- `packages/fokosdb/src/sharding/repartition-flow.ts`: the `LOCK_RETRY_MS` comment "A lock-blocked promotion
+  retries at a flat interval: only a commit or a cancel can change the answer". The constant stays for other
+  hosts, and the comment names the host condition in general terms.
+- `packages/fokosdb/src/sharding/runtime-types.ts`: the `repartitionUnblocked` comment "for example a lock was
+  released", and the `beforeForward` comment "for example a lock release by transaction id". After this change
+  no host operation has a `beforeForward`, so both comments name the host work in general terms.
+
+The type-checked prototype `packages/fokosdb/test/sharding-prototype/fokosdb-partition-host.ts` states the old
+rule in code: the `repartitionUnblocked` signal of `txCommit`, the `beforeForward` release of `txCancel`, the
+lock count in `beforeCutover`, and the `debugForceResolveTransaction` handler. The implementation changes it
+with the host. `pnpm check` type-checks the file, so its forced-resolution handler must return the new response
+type.
 
 The change ships to a new deployment with no existing partitions, so no partition ever holds a transfer copy
 under the old code. A rollback of the code on a partition that holds one is out of scope (section 2.2): the old
@@ -781,6 +811,8 @@ Use the existing Workers test infrastructure. No production test hook is require
   promotion source. Every owned-row statement must stay within the parameter limit of section 4.2.5.
 - Cut over a promotion with a lock under the key. The `movedHashKeys` fragment must name the key as soon as the
   row is `cutover`, and a prepare that arrived during target initialization must count as a transfer copy.
+- Add a `key_promotion` row in `cutover` with a NULL `hash_key`. The owned-row statements and the two stale
+  queries must select the same rows as without that row.
 
 **Recovery tests**
 
@@ -826,6 +858,9 @@ Use the existing Workers test infrastructure. No production test hook is require
 - Force commit and cancel for transferred quarantined rows with the existing request type.
 - On a promotion source, resolve owned rows, forward the moved keys, and preserve the transfer copies of the
   same transaction. The response counts both parts.
+- On a promotion source with owned rows and transfer copies of one transaction, force a commit while the target
+  imports. The call fails. Its `forced resolution failed` line carries `resolvedLocally` equal to the owned rows
+  that it committed. The repeated call after the import logs `resolvedLocally: 0`.
 - Use the stored transaction timestamp when applying a forced commit.
 - Repeat repair after a lost response. A partition with no row must answer two zero counts and change no item.
 - Call an old source with transfer copies only, after the target imported. The target must resolve its rows,
@@ -833,13 +868,17 @@ Use the existing Workers test infrastructure. No production test hook is require
   `forwardedTo` must name the target. The source writes one `forced resolution applied` line.
 - Call an old source with transfer copies only, while the target imports. The call must fail, the copies must
   stay, and a later call must succeed. The failed call writes one `forced resolution failed` line with
-  `causeCode` `partition_migrating`.
+  `causeCode` `partition_migrating` and `resolvedLocally: 0`.
 - Call a split router before completion. Every row must reach its child, and the router must mutate nothing.
 - Refuse emergency repair while the addressed target imports.
 
 The existing test "defers cutover to 'promoting' while the key has a pending transaction lock" must change.
 It must prove transfer instead of deferral. Repartition tests that use locks to hold promotion also need new
 control through the existing migration harness.
+
+The existing test "deletes a not_found lock directly when all its keys route away" in
+`test/partition-do/tx-stale-recovery.test.ts` must change in milestone 1. It tests the branch that section 1.2
+item 1 removes. It must prove that a `not_found` result deletes no transfer copy.
 
 ### 4.3 Decisions
 

@@ -16,6 +16,7 @@ import { validateRangeConfig, validateTopology } from "../sharding/route-context
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
+import { resolveLimits, type FokosDBLimitOverrides } from "./transaction-limits.js";
 
 export type SplitConditions = {
 	/** The size in megabytes that makes the partition split. */
@@ -45,6 +46,11 @@ export type FokosDBPolicy = {
 	locationHint?: DurableObjectLocationHint;
 	hashSplitConditions: SplitConditions;
 	rangeSplitConditions: SplitConditions;
+	/**
+	 * The key size limits that the table overrides. Absent when the table uses the defaults, so a table
+	 * with no overrides sends no extra bytes. Only the client reads it, through `resolveLimits`.
+	 */
+	limits?: FokosDBLimitOverrides;
 };
 
 export type FokosDBRouteContext = FokosRouteContext<FokosDBPolicy>;
@@ -89,6 +95,11 @@ export class PartitionContextCreator {
 		rangeAncestorsConfig?: { fromRoot: number; fromLeaf: number };
 		jurisdiction?: DurableObjectJurisdiction;
 		locationHint?: DurableObjectLocationHint;
+		/**
+		 * The key size limits of the table. Every client of the table must use the same values. Never
+		 * decrease a key size limit after items with larger keys exist.
+		 */
+		limits?: FokosDBLimitOverrides;
 	}): FokosDBTableConfig {
 		// Each option defaults on its own, so a value the caller gives is never replaced. The caller's
 		// object stays unchanged.
@@ -126,12 +137,28 @@ export class PartitionContextCreator {
 		validateSplitConditions("hashSplitConditions", hashSplitConditions, invalid);
 		validateSplitConditions("rangeSplitConditions", rangeSplitConditions, invalid);
 
+		// Only the known overrides travel. An override equal to the default stays, so a pinned value does
+		// not change when a later version changes the default.
+		const maxHashKeyBytes = opts.limits?.maxHashKeyBytes;
+		const maxSortKeyBytes = opts.limits?.maxSortKeyBytes;
+		let limits: FokosDBLimitOverrides | undefined;
+		if (maxHashKeyBytes !== undefined || maxSortKeyBytes !== undefined) {
+			limits = {
+				...(maxHashKeyBytes === undefined ? {} : { maxHashKeyBytes }),
+				...(maxSortKeyBytes === undefined ? {} : { maxSortKeyBytes }),
+			};
+		}
+		if (limits !== undefined) {
+			resolveLimits(limits);
+		}
+
 		const policy: FokosDBPolicy = {
 			ns: opts.ns,
 			nsTx: opts.nsTx,
 			hashSplitConditions,
 			rangeSplitConditions,
 			...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
+			...(limits === undefined ? {} : { limits }),
 		};
 		return { topology, rangeConfig, policy };
 	}

@@ -58,6 +58,7 @@ import {
 	ADMISSION_MARGIN,
 	applyImageCap,
 	decodeItemKeys,
+	DEFAULT_LIMITS,
 	encodeHashKey,
 	IDEMPOTENCY_WINDOW_MS,
 	txOrderTimestampNow,
@@ -210,9 +211,12 @@ const RECOVERY_DUE_KEY = "tc/recovery_due_at";
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 
-/** The route key of a coordinator. The idempotency token selects the coordinator that owns a transaction. */
+/**
+ * The route key of a coordinator. The idempotency token selects the coordinator that owns a transaction.
+ * A token is at most `MAX_CLIENT_REQUEST_TOKEN_BYTES`, so the default limits always hold it.
+ */
 function tokenKey(token: string): RouteKey {
-	return { hashKey: encodeHashKey(token), sortKey: NO_SORT_KEY };
+	return { hashKey: encodeHashKey(token, DEFAULT_LIMITS), sortKey: NO_SORT_KEY };
 }
 
 /**

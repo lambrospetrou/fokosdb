@@ -153,6 +153,8 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	statusPageBytes: 20 * 1024 * 1024,
 });
 
+const RUNTIME_CONFIG_KEYS = Object.keys(DEFAULT_RUNTIME_CONFIG) as (keyof FokosRuntimeConfig)[];
+
 /** The smallest valid value of each integer setting. */
 const MINIMUMS: { [K in keyof FokosRuntimeConfig]?: number } = {
 	fallbackAlarmMs: 1,
@@ -187,16 +189,16 @@ export function resolveRuntimeConfig(overrides: FokosRuntimeConfigOverrides | un
 	if (overrides === undefined) {
 		return DEFAULT_RUNTIME_CONFIG;
 	}
-	const config: Record<string, number> = { ...DEFAULT_RUNTIME_CONFIG };
-	let changed = false;
-	for (const key of Object.keys(DEFAULT_RUNTIME_CONFIG) as (keyof FokosRuntimeConfig)[]) {
+	// The runtime resolves at each use, so the copy happens only when a value is overridden.
+	let config: Record<string, number> | undefined;
+	for (const key of RUNTIME_CONFIG_KEYS) {
 		const value = overrides[key];
 		if (value !== undefined) {
+			config ??= { ...DEFAULT_RUNTIME_CONFIG };
 			config[key] = value;
-			changed = true;
 		}
 	}
-	if (!changed) {
+	if (config === undefined) {
 		return DEFAULT_RUNTIME_CONFIG;
 	}
 	const resolved = config as FokosRuntimeConfig;

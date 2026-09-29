@@ -24,9 +24,32 @@ import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
 
 // DynamoDB-style encoded-byte ceilings. Measured on KeyBytes (after UTF-8 encoding / 0xFF tagging).
-// DynamoDB uses 2KB for hashKey and 1KB for sortKey. These limits are stricter and can go up later.
+// DynamoDB uses 2KB for hashKey and 1KB for sortKey. These defaults are stricter, and a table can raise
+// them with `FokosDBPolicy.limits`.
 export const MAX_HASH_KEY_BYTES = 1024;
 export const MAX_SORT_KEY_BYTES = 512;
+
+/**
+ * The key size limits of a table, measured on the encoded key bytes. Only the client checks them, so
+ * every client of a table must use the same values.
+ */
+export type FokosDBLimits = Readonly<{
+	/** The largest hash key. Never decrease it after items with larger hash keys exist. */
+	maxHashKeyBytes: number;
+	/** The largest sort key. Never decrease it after items with larger sort keys exist. */
+	maxSortKeyBytes: number;
+}>;
+
+/** The limits that a table overrides. Only the overrides travel in the policy of the table. */
+export type FokosDBLimitOverrides = Partial<FokosDBLimits>;
+
+export const DEFAULT_LIMITS: FokosDBLimits = Object.freeze({ maxHashKeyBytes: MAX_HASH_KEY_BYTES, maxSortKeyBytes: MAX_SORT_KEY_BYTES });
+
+/**
+ * A key above this size makes each range partition name, each route context, and each route evidence
+ * node much larger. `resolveLimits` logs a warning for a limit above it.
+ */
+const LARGE_KEY_WARNING_BYTES = 2 * 1024;
 
 /**
  * Per-item ceiling, DynamoDB parity. Applies to EVERY write path — `putItem` and each operation in a
@@ -47,6 +70,46 @@ export const MAX_ITEMS_PER_TX = 100;
 export const MAX_PAYLOAD_BYTES_PER_TX = 4 * 1024 * 1024; // 4 MB, summed over a transaction
 export const MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX = 10 * 1024 * 1024; // 10 MiB
 export const MAX_CLIENT_REQUEST_TOKEN_BYTES = 64;
+
+/**
+ * The full limits of a table: the defaults of this package version, with the overrides applied. It
+ * ignores a key that it does not know, because a policy from a newer version can hold one. It throws
+ * on a value that is not valid, and logs a warning for a limit above 2 KiB.
+ */
+export function resolveLimits(overrides: FokosDBLimitOverrides | undefined): FokosDBLimits {
+	if (overrides === undefined) {
+		return DEFAULT_LIMITS;
+	}
+	const { maxHashKeyBytes, maxSortKeyBytes } = overrides;
+	// The token of a transaction is a hash key of its coordinator.
+	checkLimit("maxHashKeyBytes", maxHashKeyBytes, MAX_CLIENT_REQUEST_TOKEN_BYTES);
+	checkLimit("maxSortKeyBytes", maxSortKeyBytes, 1);
+	const resolved =
+		maxHashKeyBytes === undefined && maxSortKeyBytes === undefined
+			? DEFAULT_LIMITS
+			: Object.freeze({
+					maxHashKeyBytes: maxHashKeyBytes ?? DEFAULT_LIMITS.maxHashKeyBytes,
+					maxSortKeyBytes: maxSortKeyBytes ?? DEFAULT_LIMITS.maxSortKeyBytes,
+				});
+	if (resolved.maxHashKeyBytes > LARGE_KEY_WARNING_BYTES || resolved.maxSortKeyBytes > LARGE_KEY_WARNING_BYTES) {
+		console.warn({
+			message: `fokos/limits: a key size limit above ${LARGE_KEY_WARNING_BYTES} bytes makes range partition names, route contexts and route evidence larger.`,
+			limits: resolved,
+		});
+	}
+	return resolved;
+}
+
+/** Throws when an override is present and is not an integer of at least `min`. */
+function checkLimit(key: keyof FokosDBLimits, value: number | undefined, min: number): void {
+	if (value !== undefined && (!Number.isSafeInteger(value) || value < min)) {
+		throw new FokosValidationError(SHARDING_VALIDATION_CODES.partition_context_options_invalid, {
+			message: `limits.${key} must be an integer of at least ${min}`,
+			attributes: { option: `limits.${key}`, value },
+		});
+	}
+}
+
 export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 
 /**
@@ -198,27 +261,27 @@ export function validateItemKeys(hashKey: string | Uint8Array, sortKey?: string 
 }
 
 /** Encodes a hash key to canonical bytes, enforcing the size cap on the encoded form. */
-export function encodeHashKey(k: string | Uint8Array): KeyBytes {
+export function encodeHashKey(k: string | Uint8Array, limits: FokosDBLimits): KeyBytes {
 	const bytes = KeyCodec.encode(k);
-	if (bytes.byteLength > MAX_HASH_KEY_BYTES) {
+	if (bytes.byteLength > limits.maxHashKeyBytes) {
 		throw new FokosValidationError(VALIDATION_CODES.hash_key_too_large, {
-			message: `hashKey exceeds ${MAX_HASH_KEY_BYTES} bytes when encoded`,
-			attributes: { limitBytes: MAX_HASH_KEY_BYTES, bytes: bytes.byteLength },
+			message: `hashKey exceeds ${limits.maxHashKeyBytes} bytes when encoded`,
+			attributes: { limitBytes: limits.maxHashKeyBytes, bytes: bytes.byteLength },
 		});
 	}
 	return bytes;
 }
 
 /** Encodes a sort key to canonical bytes (absent ⇒ the empty sentinel), enforcing the size cap. */
-export function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
+export function encodeSortKey(k: string | Uint8Array | undefined, limits: FokosDBLimits): KeyBytes {
 	if (k === undefined) {
 		return KeyCodec.encodeOptional(undefined);
 	}
 	const bytes = KeyCodec.encode(k);
-	if (bytes.byteLength > MAX_SORT_KEY_BYTES) {
+	if (bytes.byteLength > limits.maxSortKeyBytes) {
 		throw new FokosValidationError(VALIDATION_CODES.sort_key_too_large, {
-			message: `sortKey exceeds ${MAX_SORT_KEY_BYTES} bytes when encoded`,
-			attributes: { limitBytes: MAX_SORT_KEY_BYTES, bytes: bytes.byteLength },
+			message: `sortKey exceeds ${limits.maxSortKeyBytes} bytes when encoded`,
+			attributes: { limitBytes: limits.maxSortKeyBytes, bytes: bytes.byteLength },
 		});
 	}
 	return bytes;
@@ -229,9 +292,9 @@ export function encodeSortKey(k: string | Uint8Array | undefined): KeyBytes {
  * and passing this to `normalizeSkInterval` checks every bound exactly once wherever that function
  * uses it (`between` and `range` each carry two).
  */
-export function encodeSortBound(k: string | Uint8Array): KeyBytes {
+export function encodeSortBound(k: string | Uint8Array, limits: FokosDBLimits): KeyBytes {
 	validateKeyContent("sortKey", k);
-	return encodeSortKey(k);
+	return encodeSortKey(k, limits);
 }
 
 /**
@@ -245,6 +308,7 @@ export function encodeSortBound(k: string | Uint8Array): KeyBytes {
  */
 export function validateTransactWriteOperations(
 	ops: readonly TransactWriteOperationLike[],
+	limits: FokosDBLimits,
 ): Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> {
 	if (ops.length === 0) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_empty, { message: "transactWriteItems requires at least 1 item" });
@@ -260,8 +324,8 @@ export function validateTransactWriteOperations(
 	let totalBytes = 0;
 	for (const [opIndex, op] of ops.entries()) {
 		validateItemKeys(op.hashKey, op.sortKey);
-		const hashKey = encodeHashKey(op.hashKey);
-		const sortKey = encodeSortKey(op.sortKey);
+		const hashKey = encodeHashKey(op.hashKey, limits);
+		const sortKey = encodeSortKey(op.sortKey, limits);
 		const invalidFields = (message: string) =>
 			new FokosValidationError(VALIDATION_CODES.transact_operation_fields_invalid, {
 				message,

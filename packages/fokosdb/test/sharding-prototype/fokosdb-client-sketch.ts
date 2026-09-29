@@ -2,7 +2,7 @@
  * PROTOTYPE. The `db.ts` side: two routers (partitions and coordinators), the envelope unwrap, and the public
  * `meta`. Only the paths that touch the sharding surface are written.
  */
-import { encodeHashKey } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
 import type { OperationMetrics, PartitionInfo } from "../../src/shared/types.js";
 import { FokosRouter, FokosShardingClient, todo } from "./api.js";
 import type { FokosPublicRoute, FokosPublicRouting, FokosRangeConfig, FokosTopology, KeyBytes } from "./api.js";
@@ -88,7 +88,7 @@ export class FokosDB {
 
 	/** The coordinator is chosen by the token, as before, and reached through its root. */
 	async transactWrite(req: InitiateWriteReq & { clientRequestToken: string }) {
-		const ctx = this.coordinators.rootContext(encodeHashKey(req.clientRequestToken));
+		const ctx = this.coordinators.rootContext(encodeHashKey(req.clientRequestToken, DEFAULT_LIMITS));
 		const { value } = this.coordinators.unwrap(await this.coordinatorStub(ctx).initiateWrite(ctx, req));
 		return value;
 	}

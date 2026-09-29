@@ -147,3 +147,22 @@ describe("PartitionContextCreator.create option errors", () => {
 		);
 	});
 });
+
+describe("PartitionContextCreator.create — limits", () => {
+	it("omits limits from the policy when the table overrides nothing", () => {
+		expect(PartitionContextCreator.create(makeOpts()).policy).not.toHaveProperty("limits");
+		expect(PartitionContextCreator.create(makeOpts({ limits: {} })).policy).not.toHaveProperty("limits");
+		expect(PartitionContextCreator.create(makeOpts({ limits: { maxHashKeyBytes: undefined } })).policy).not.toHaveProperty("limits");
+	});
+
+	it("keeps only the known overrides, and keeps an override that is equal to the default", () => {
+		const limits = { maxHashKeyBytes: 1_024, maxFutureBytes: 7 } as Parameters<typeof PartitionContextCreator.create>[0]["limits"];
+		expect(PartitionContextCreator.create(makeOpts({ limits })).policy.limits).toEqual({ maxHashKeyBytes: 1_024 });
+	});
+
+	it("refuses a limit that is not valid", () => {
+		expect(() => PartitionContextCreator.create(makeOpts({ limits: { maxSortKeyBytes: 0 } }))).toThrow(
+			expect.objectContaining({ code: "partition_context_options_invalid", attributes: { option: "limits.maxSortKeyBytes", value: 0 } }),
+		);
+	});
+});

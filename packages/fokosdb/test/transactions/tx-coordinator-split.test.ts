@@ -10,7 +10,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
-import { encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_LIMITS, encodeHashKey, txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import type { FokosPartitionRef } from "../../src/sharding/route-context.js";
@@ -33,7 +33,7 @@ function coordinatorStub(doName: string) {
 }
 
 function tokenKey(token: string) {
-	return { hashKey: encodeHashKey(token), sortKey: KeyCodec.encodeOptional(undefined) };
+	return { hashKey: encodeHashKey(token, DEFAULT_LIMITS), sortKey: KeyCodec.encodeOptional(undefined) };
 }
 
 /** Queues a hash split of the coordinator. The coordinator must already hold its identity. */

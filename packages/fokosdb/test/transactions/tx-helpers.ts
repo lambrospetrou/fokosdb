@@ -5,7 +5,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { env } from "cloudflare:workers";
 import { expect, vi } from "vitest";
-import { FokosDB } from "../../src/client/db.js";
+import { FokosDB, type FokosDBRetryOptions } from "../../src/client/db.js";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import {
@@ -14,7 +14,7 @@ import {
 	type FokosDBRouteContext,
 	PartitionContextCreator,
 } from "../../src/shared/partition-context.js";
-import { txOrderTimestampNow } from "../../src/shared/transaction-limits.js";
+import { txOrderTimestampNow, type FokosDBLimitOverrides } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
 import type { ControlledPartitionDO, TxOp, TxRequest } from "../controlled-partition-do.js";
 import type { ControlledTransactionCoordinatorDO } from "../controlled-transaction-coordinator-do.js";
@@ -106,11 +106,15 @@ export type MakeDBOptions = {
 	 * `controlledCoordinator` reaches.
 	 */
 	controlled?: boolean;
+	retry?: FokosDBRetryOptions;
+	partitionMigratingRetryDeadlineMs?: number;
+	/** The key size limits of the table. */
+	limits?: FokosDBLimitOverrides;
 };
 
 /** A client over its own table, so no two tests share partitions. */
 export function makeDB(opts?: MakeDBOptions) {
-	const { maxSizeMb, rootTreesN, tableName, controlled, ...dbOptions } = opts ?? {};
+	const { maxSizeMb, rootTreesN, tableName, controlled, limits, ...dbOptions } = opts ?? {};
 	const base = PartitionContextCreator.create({
 		ns: controlled ? "CONTROLLED_PARTITION_DO" : "PARTITION_DO",
 		nsTx: controlled ? "CONTROLLED_TRANSACTION_COORDINATOR_DO" : "TRANSACTION_COORDINATOR_DO",
@@ -120,6 +124,7 @@ export function makeDB(opts?: MakeDBOptions) {
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: maxSizeMb ?? 100 },
 		rangeSplitConditions: { maxSizeMb: 500 },
+		limits,
 	});
 	const topology = new FokosRouter(base.topology, base.rangeConfig, base.policy);
 	return new FokosDB({ topology, ...(controlled ? { coordinatorRootsN: 1 } : {}), ...dbOptions });

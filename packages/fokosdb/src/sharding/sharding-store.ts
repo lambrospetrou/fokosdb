@@ -271,7 +271,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// Column order in both rowid tables: SQLite reads a record from the start until it has every
 		// column the query needs, so the wide columns go LAST and a query that reads only the small ones
 		// never touches their overflow pages. The wide columns are the keys and the derived names: a hash
-		// key reaches MAX_HASH_KEY_BYTES, and a range partition_id and doName both encode the two
+		// key can be a kilobyte or more, and a range partition_id and doName both encode the two
 		// boundaries, so each can be kilobytes. The columns the hot paths read — the due-row scan, the
 		// alarm deadline, and the target counts — all sit before them. The order of a PRIMARY KEY or
 		// UNIQUE declaration is independent of it, so the indexes are unaffected.

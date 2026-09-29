@@ -16,7 +16,7 @@
  */
 import { DurableObject } from "cloudflare:workers";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
-import { encodeHashKey } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_LIMITS, encodeHashKey } from "../../src/shared/transaction-limits.js";
 import type {
 	InitiateWriteResponseEncoded,
 	PrepareResponse,
@@ -55,7 +55,7 @@ const JOB_RECOVERY = "tx_recovery";
 const JOB_SWEEP = "idempotency_sweep";
 
 const noSortKey = KeyCodec.encodeOptional(undefined);
-const tokenKey = (token: string): RouteKey => ({ hashKey: encodeHashKey(token), sortKey: noSortKey });
+const tokenKey = (token: string): RouteKey => ({ hashKey: encodeHashKey(token, DEFAULT_LIMITS), sortKey: noSortKey });
 
 type Runtime = FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 

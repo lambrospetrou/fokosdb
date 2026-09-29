@@ -60,6 +60,8 @@ import {
 	validateTransactWriteOperations,
 	validateClientRequestToken,
 	decodeItemKeys,
+	resolveLimits,
+	type FokosDBLimits,
 } from "../shared/transaction-limits.js";
 import {
 	CONFLICT_CODES,
@@ -109,21 +111,34 @@ import { coordinatorShardGroup, type FokosDBPolicy } from "../shared/partition-c
 
 const TX_COORDINATORS_PER_ROOT_TREE = 2;
 
-/**
- * How long `transactWriteItems` sends a write again while its coordinator answers `partition_migrating`.
- * It is longer than the 5-second fallback alarm of the runtime, so an import that a crash stopped can
- * finish inside it.
- */
-const TX_COORDINATOR_MIGRATING_RETRY_MS = 15_000;
+/** The retries of the client, for the calls that can send a request again. */
+export type FokosDBRetryOptions = {
+	/** The first retry waits a random time up to this value, and each later retry doubles it. Default: 100 ms. */
+	baseDelayMs?: number;
+	/** The longest random wait between two attempts. It must be larger than `baseDelayMs`. Default: 2,000 ms. */
+	maxDelayMs?: number;
+	/**
+	 * The attempts of each read of a read transaction, and of the single-partition read of
+	 * `transactGetItems`. A read applies nothing, so an attempt again is safe. Default: 5.
+	 */
+	maxAttempts?: number;
+};
+
+const DEFAULT_RETRY: Readonly<Required<FokosDBRetryOptions>> = Object.freeze({ baseDelayMs: 100, maxDelayMs: 2_000, maxAttempts: 5 });
+
+/** The retry policy of a read: `retryable` decides which errors send the read again, up to `maxAttempts`. */
+function readRetry(retry: Required<FokosDBRetryOptions>, retryable: (err: unknown) => boolean): FokosRetryPolicy {
+	const { baseDelayMs, maxDelayMs, maxAttempts } = retry;
+	return { shouldRetry: (err, nextAttempt) => retryable(err) && nextAttempt <= maxAttempts, baseDelayMs, maxDelayMs };
+}
 
 /** A read applies nothing, so each phase of a read transaction sends again after any error. */
-const READ_TRANSACTION_RETRY: FokosRetryPolicy = { shouldRetry: (_err, nextAttempt) => nextAttempt <= 5 };
-
+const TRANSACTION_READ_RETRY = readRetry(DEFAULT_RETRY, () => true);
 /** The snapshot read sends again only after a transient fault of the runtime. */
-const READ_SNAPSHOT_RETRY: FokosRetryPolicy = {
-	shouldRetry: (err, nextAttempt) => isRuntimeRetryableError(err) && nextAttempt <= 3,
-	maxDelayMs: 3_000,
-};
+const SNAPSHOT_READ_RETRY = readRetry(DEFAULT_RETRY, (err) => isRuntimeRetryableError(err));
+
+/** The default of `FokosDBOptions.partitionMigratingRetryDeadlineMs`. */
+const PARTITION_MIGRATING_RETRY_DEADLINE_MS = 15_000;
 
 // The single JS↔wire encode boundary for item data: a Uint8Array is opaque bytes,
 // a string is opaque text, and an object/array is JSON — stringified exactly once here
@@ -326,7 +341,46 @@ export type FokosDBOptions = {
 	 * coordinator.
 	 */
 	singlePartitionFastPath?: boolean;
+
+	/**
+	 * The retries of the client. The single-item operations and `queryItems` never send a request again,
+	 * because a write whose answer is lost could then apply twice.
+	 */
+	retry?: FokosDBRetryOptions;
+
+	/**
+	 * How long `transactWriteItems` (or other write operations) send a write again while its coordinator answers
+	 * `partition_migrating`, because the coordinator splits. The request carries the same token, so a
+	 * retry continues the same transaction. It must stay longer than the `fallbackAlarmMs` of the runtime
+	 * of the coordinators (default 5,000 ms), so that an import that a crash stopped can finish inside
+	 * it. The client cannot read that setting. Default: 15,000 ms.
+	 */
+	partitionMigratingRetryDeadlineMs?: number;
 };
+
+function validateRetryOptions(retry: Required<FokosDBRetryOptions>, partitionMigratingRetryDeadlineMs: number): void {
+	const invalid = (option: string, value: number, message: string) =>
+		new FokosValidationError(VALIDATION_CODES.fokosdb_options_invalid, { message, attributes: { option, value } });
+	if (!Number.isSafeInteger(retry.baseDelayMs) || retry.baseDelayMs < 1) {
+		throw invalid("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be an integer of at least 1");
+	}
+	if (!Number.isSafeInteger(retry.maxDelayMs) || retry.maxDelayMs < 1) {
+		throw invalid("retry.maxDelayMs", retry.maxDelayMs, "retry.maxDelayMs must be an integer of at least 1");
+	}
+	if (retry.baseDelayMs >= retry.maxDelayMs) {
+		throw invalid("retry.baseDelayMs", retry.baseDelayMs, "retry.baseDelayMs must be less than retry.maxDelayMs");
+	}
+	if (retry.maxAttempts !== undefined && (!Number.isSafeInteger(retry.maxAttempts) || retry.maxAttempts < 1)) {
+		throw invalid("retry.maxAttempts", retry.maxAttempts, "retry.maxAttempts must be an integer of at least 1");
+	}
+	if (!Number.isSafeInteger(partitionMigratingRetryDeadlineMs) || partitionMigratingRetryDeadlineMs < 1) {
+		throw invalid(
+			"partitionMigratingRetryDeadlineMs",
+			partitionMigratingRetryDeadlineMs,
+			"partitionMigratingRetryDeadlineMs must be an integer of at least 1",
+		);
+	}
+}
 
 /** The public meta of one result: the metrics of the work, and the partition that produced it. */
 function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): OperationMetrics & PartitionInfo {
@@ -334,7 +388,9 @@ function publicMeta(metrics: OperationMetrics, routing: FokosPublicRouting): Ope
 }
 
 export class FokosDB {
-	#options: Required<FokosDBOptions>;
+	#options: Required<Omit<FokosDBOptions, "retry">> & { retry: Required<FokosDBRetryOptions> };
+	/** The key size limits of the table, resolved once from its policy. */
+	#limits: FokosDBLimits;
 	/** The partitions of the table. */
 	#partitions: FokosShardingClient<FokosDBPolicy, PartitionOps>;
 	/** The coordinator group of the table, `fokos.tc.<tableName>`. */
@@ -348,7 +404,21 @@ export class FokosDB {
 			coordinatorRootsN:
 				options.coordinatorRootsN ?? Math.min(TX_COORDINATORS_PER_ROOT_TREE * topology.rootTreesN, FOKOS_HASH_PARTITIONS_MAX),
 			singlePartitionFastPath: options.singlePartitionFastPath ?? true,
+			// A client is made for each request, so the defaults are shared and not checked again.
+			retry:
+				options.retry === undefined
+					? DEFAULT_RETRY
+					: {
+							baseDelayMs: options.retry.baseDelayMs ?? DEFAULT_RETRY.baseDelayMs,
+							maxDelayMs: options.retry.maxDelayMs ?? DEFAULT_RETRY.maxDelayMs,
+							maxAttempts: options.retry.maxAttempts ?? DEFAULT_RETRY.maxAttempts,
+						},
+			partitionMigratingRetryDeadlineMs: options.partitionMigratingRetryDeadlineMs ?? PARTITION_MIGRATING_RETRY_DEADLINE_MS,
 		};
+		if (options.retry !== undefined || options.partitionMigratingRetryDeadlineMs !== undefined) {
+			validateRetryOptions(this.#options.retry, this.#options.partitionMigratingRetryDeadlineMs);
+		}
+		this.#limits = resolveLimits(policy.limits);
 		const { coordinatorRootsN } = this.#options;
 		if (!Number.isInteger(coordinatorRootsN) || coordinatorRootsN < 1 || coordinatorRootsN > FOKOS_HASH_PARTITIONS_MAX) {
 			throw new FokosValidationError(VALIDATION_CODES.num_tx_coordinators_invalid, {
@@ -425,8 +495,8 @@ export class FokosDB {
 		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
-		const hashKey = encodeHashKey(opts.hashKey);
-		const sortKey = encodeSortKey(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
+		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const encoded = encodeItemData(opts.data);
 		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
@@ -455,8 +525,8 @@ export class FokosDB {
 
 	async #getItem(opts: GetItemOptions): Promise<GetItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
-		const hashKey = encodeHashKey(opts.hashKey);
-		const sortKey = encodeSortKey(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
+		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		const projection =
 			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
 		const { value: res, routing } = await this.#partitions.point(
@@ -495,8 +565,8 @@ export class FokosDB {
 	async #deleteItem(opts: DeleteItemOptions): Promise<DeleteItemResult> {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
-		const hashKey = encodeHashKey(opts.hashKey);
-		const sortKey = encodeSortKey(opts.sortKey);
+		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
+		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
 		const { value: res, routing } = await this.#partitions.point(
 			"apiDeleteItem",
@@ -531,7 +601,7 @@ export class FokosDB {
 			return { ...item, ...encodeItemData(item.data), condition };
 		});
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
-		const keys = validateTransactWriteOperations(prepared);
+		const keys = validateTransactWriteOperations(prepared, this.#limits);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
 			return { ...item, opIndex: i, hashKey, sortKey };
@@ -557,15 +627,22 @@ export class FokosDB {
 		// A coordinator answers `partition_migrating` while it splits: its root forwards the request to
 		// the child that owns the token, and that child refuses it until its import is complete. The
 		// request carries the token, so a retry resumes the same transaction and never starts a second one.
-		const deadline = Date.now() + TX_COORDINATOR_MIGRATING_RETRY_MS;
+		const deadline = Date.now() + this.#options.partitionMigratingRetryDeadlineMs;
+		const { baseDelayMs, maxDelayMs } = this.#options.retry;
 		const { topology, rangeConfig, policy } = this.#options.topology;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
 		const { value: encoded } = await this.#coordinators.point(
 			"initiateWrite",
-			{ hashKey: encodeHashKey(idempotencyToken), sortKey: encodeSortKey(undefined) },
+			{ hashKey: encodeHashKey(idempotencyToken, this.#limits), sortKey: encodeSortKey(undefined, this.#limits) },
 			{ clientRequestToken: idempotencyToken, table: { topology, rangeConfig, policy }, items },
-			{ retry: { shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline } },
+			{
+				retry: {
+					shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
+					baseDelayMs,
+					maxDelayMs,
+				},
+			},
 		);
 		// The outcome is the driver's, not the caller's: a committed transaction is the only value this
 		// method returns, and a cancelled one raises instead.
@@ -639,8 +716,8 @@ export class FokosDB {
 		// compiled plan does, and only when the caller asked for one.
 		const items: TransactionReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
-			const hashKey = encodeHashKey(item.hashKey);
-			const sortKey = encodeSortKey(item.sortKey);
+			const hashKey = encodeHashKey(item.hashKey, this.#limits);
+			const sortKey = encodeSortKey(item.sortKey, this.#limits);
 			const projection =
 				item.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(item.projection!));
 			return { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) };
@@ -701,7 +778,7 @@ export class FokosDB {
 
 		// Every error, a transport failure included, is the caller's, exactly as on the two-phase path.
 		const { value: response } = await this.#partitions.send("txReadSnapshot", groups[0].ctx, { items }, items, {
-			retry: READ_SNAPSHOT_RETRY,
+			retry: this.#options.retry === DEFAULT_RETRY ? SNAPSHOT_READ_RETRY : readRetry(this.#options.retry, isRuntimeRetryableError),
 		});
 		// No single partition owns every key. Nothing was read, so the two-phase path runs instead.
 		if (response.outcome === "not_applicable") {
@@ -720,11 +797,10 @@ export class FokosDB {
 			const items = indexes.map((i) => requestedItems[i]);
 			return { ctx, items };
 		});
+		const retry = this.#options.retry === DEFAULT_RETRY ? TRANSACTION_READ_RETRY : readRetry(this.#options.retry, () => true);
 		const readPhase = () =>
 			Promise.allSettled(
-				groups.map(({ ctx, items }) =>
-					this.#partitions.send("txReadForTransaction", ctx, { transactionId, items }, items, { retry: READ_TRANSACTION_RETRY }),
-				),
+				groups.map(({ ctx, items }) => this.#partitions.send("txReadForTransaction", ctx, { transactionId, items }, items, { retry })),
 			);
 
 		// Phase 1
@@ -854,8 +930,8 @@ export class FokosDB {
 			// item keys, and `begins_with: ""` is a legitimate "everything" query.
 			validateItemKeys(q.hashKey);
 			return {
-				hashKey: encodeHashKey(q.hashKey),
-				interval: normalizeSkInterval(q.sortKeyCondition, encodeSortBound),
+				hashKey: encodeHashKey(q.hashKey, this.#limits),
+				interval: normalizeSkInterval(q.sortKeyCondition, (k) => encodeSortBound(k, this.#limits)),
 				direction,
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};

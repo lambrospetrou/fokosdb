@@ -208,6 +208,10 @@ export function maxPreparingHoldMs(config: TransactionCoordinatorDOConfig): numb
  * `defaults` does not have. It returns `defaults` itself when no value changes.
  */
 function merge<T extends Readonly<Record<string, unknown>>>(defaults: T, overrides: object): T {
+	// The hosts resolve at each use, and most return no overrides, so that path allocates nothing.
+	if (isEmpty(overrides)) {
+		return defaults;
+	}
 	const source = overrides as Record<string, unknown>;
 	const result: Record<string, unknown> = {};
 	let changed = false;
@@ -225,6 +229,13 @@ function merge<T extends Readonly<Record<string, unknown>>>(defaults: T, overrid
 		}
 	}
 	return changed ? deepFreeze(result as T) : defaults;
+}
+
+function isEmpty(value: object): boolean {
+	for (const _ in value) {
+		return false;
+	}
+	return true;
 }
 
 function deepFreeze<T extends object>(value: T): T {

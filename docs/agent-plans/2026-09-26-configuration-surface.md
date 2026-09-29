@@ -4,8 +4,9 @@
 **Date:** 2026-09-26
 **Author:** Lambros Petrou
 
-**Status:** In progress. M1, M2 and M3 are done. `PartitionContextCreator.create` also defaults each option on its
-own and keeps the options object of the caller unchanged (section 4.2.12).
+**Status:** In progress. M1, M2, M3, M4 and M5 are done. M6 is skipped: the comments on the settings types document
+each setting. `PartitionContextCreator.create` also defaults each option on its own and keeps the options object of
+the caller unchanged (section 4.2.12).
 
 ## Table of contents
 
@@ -153,17 +154,17 @@ Add `fokosConfig()` to P and T with the settings of section 4.2.2. Remove `fokos
 admission margin constant, the coordinator retry policy, and the coordinator batch settings `sweepDeleteChunkRows`
 and `recoveryScanRows`. Remove `SplitConditions.maxItems`.
 
-### M4 — Recovery budget of the coordinator
+### M4 — Recovery budget of the coordinator (done)
 
 Fix the defect in section 4.2.11. Add `recoverTransactionBudgetMs` to the `fokosConfig()` of T. It is a separate
 milestone because it changes the retry flow of the `tx_recovery` job and of `recoverTransaction`, and their tests.
 
-### M5 — Client configuration
+### M5 — Client configuration (done)
 
 Add `FokosDBOptions.retry` and `FokosDBOptions.partitionMigratingRetryDeadlineMs` (section 4.2.5). Add the key size
-overrides in `FokosDBPolicy.limits`, with `resolveLimits`, its cache, and the warning above 2 KiB (section 4.2.3).
+overrides in `FokosDBPolicy.limits`, with `resolveLimits` and the warning above 2 KiB (section 4.2.3).
 
-### M6 — Documentation
+### M6 — Documentation (skipped)
 
 Document every setting: its default, its ceiling, what it affects, and whether a change is safe for a table that
 exists.
@@ -371,7 +372,7 @@ route evidence. The doc comment of each field must say: never decrease a key siz
 exist.
 
 The key size limits have no hard ceiling. When an override is above 2 KiB (2,048 bytes), `resolveLimits` logs a
-warning, once for each resolved policy. A large key has these effects:
+warning each time it resolves such a limit. A large key has these effects:
 
 - **The size of a range partition identity.** A range partition has two names, and both contain three keys: the
   hash key, the start boundary, and the end boundary. A boundary is a sort key. `partition-id.ts` builds them:
@@ -434,7 +435,10 @@ export function resolveLimits(overrides: FokosDBLimitOverrides | undefined): Fok
 The validation functions in `transaction-limits.ts` take the resolved limits as an argument. The constants stay as
 the exported defaults.
 
-**The cache.** `FokosDB` resolves once in its constructor, from the policy of its router. No DO resolves the limits.
+**Where the limits resolve.** `FokosDB` resolves once in its constructor, from the policy of its router, and
+`PartitionContextCreator.create` resolves to validate the overrides. No DO resolves the limits. The resolve is two
+integer checks, so it has no cache. A cache keyed by value, which also limits the warning to one for each distinct
+pair of limits, is a separate performance change.
 
 **Different defaults across versions.** Two clients on different package versions can resolve different defaults.
 The DO does not check the keys, so the client with the larger limits can write a key that the other client rejects.
@@ -645,8 +649,8 @@ to their first use, so that the values follow the rule "read at each use":
 - The DO-side budgets are settings, so a test can make a page, a batch, or a budget small and reach a boundary with
   little data.
 - Each validation rule gets a unit test: a value out of range, a value above its ceiling, and each coupled relation.
-- `resolveLimits` gets unit tests for no overrides (the result is `DEFAULT_LIMITS`), unknown keys, the cache, and the
-  warning for a key size limit above 2 KiB.
+- `resolveLimits` gets unit tests for no overrides (the result is `DEFAULT_LIMITS`), unknown keys, and the warning for
+  a key size limit above 2 KiB.
 - A test gives `buildPage` a small budget through `fokosRuntimeConfig()` and checks that a migration takes more pages.
 - M4 needs a test in which each attempt to one participant fails, and the job step ends inside
   `alarmRecoveryBudgetMs` plus one `participantRetry.maxDelayMs`. A second test does the same for

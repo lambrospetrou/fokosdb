@@ -9,7 +9,7 @@
  * server implementation out of this bundle.
  */
 export { FokosDB } from "./db.js";
-export type { FokosDBOptions } from "./db.js";
+export type { FokosDBOptions, FokosDBRetryOptions } from "./db.js";
 export { FokosStd } from "./fokos-std.js";
 
 // ─── Item data and single-item operations ─────────────────────────────────────
@@ -94,6 +94,8 @@ export { compileConditionExpression, compileUpdateExpression } from "../shared/e
 
 export { PartitionContextCreator } from "../shared/partition-context.js";
 export type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig, SplitConditions } from "../shared/partition-context.js";
+export { DEFAULT_LIMITS } from "../shared/transaction-limits.js";
+export type { FokosDBLimitOverrides, FokosDBLimits } from "../shared/transaction-limits.js";
 
 export { FokosRouter } from "../sharding/router.js";
 export { FokosShardingClient } from "../sharding/client.js";
