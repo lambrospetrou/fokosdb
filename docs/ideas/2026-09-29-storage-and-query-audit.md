@@ -1,6 +1,7 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. The other findings are not decided or implemented.
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. Skipped: C3. The other findings are not decided or
+implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-09-30.
 
@@ -48,8 +49,45 @@ says how it was checked:
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | `routerRole()` reads the split row and all target rows, several times per request, per key | Medium | No |
 | R5 | Runtime | `learnRangeBoundary` counts the whole table on each insert and each refresh | Medium | Optional index |
-| C3 | FokosDB (TC) | Rows of up to 400 KB sit in WITHOUT ROWID tables (2–5x storage, as measured for `items`) | Medium | Yes |
+| C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
 | R7 | Runtime | The Bloom filter (~360 KB) is written whole each time the partition learns one promoted key | Medium | Optional |
+
+----
+
+The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. I checked the code: F1, F11 and F5 are still open. _slice is not used in fokos-migration-host.ts:63, collectBatch checks the byte budget only after it fetches the rows, and deletion_metadata has only one counter row.
+
+Priority 1: stuck imports (availability)
+
+1. F11: migration memory bound. One page fetch can hold about 390 MiB of payload, and the isolate limit is 128 MB. Each retry fails on the same batch. The target then never finishes its import, and its keys stay unavailable.
+2. F1: use the slice during migration. A promotion reads the whole source to move one key. So the time that a hot key is unavailable depends on the size of the source partition, not on the size of the key.
+   - Do F1 and F11 together. Both change #buildItemsPage and the store queries under it.
+   - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no override exists, and read the keys before data. They change the same code path.
+3. C5: page the rows of one coordinator transaction. One transaction in PREPARING state can go above the 32 MiB RPC limit and stop the import of the coordinator. The fix changes the internal migration cursor and the page format, so do it before the freeze.
+
+Priority 2: correctness under load (and cheapest now)
+
+4. F5: delete buckets. With one delete counter for the whole partition, about 98 % of multi-partition reads abort at 200 deletes per second. Transactional inserts also fail on deletes of other keys. The change adds one table, and the wire format does not change. It is cheapest to do now.
+
+Priority 3: schema decisions before the freeze
+
+You must decide these now, also when the answer is "no":
+
+5. X1 split_bucket: you can add it now or never.
+6. C3: skipped. The measured gain is small (see C3).
+7. R11: a policy version in the route context. This changes the wire format.
+8. R7 (paged Bloom filter), K3 and R9 are optional. Their value is lower.
+
+Priority 4: cost and background work (no schema change)
+
+9. F3: delete the item rows of split sources. At depth d you keep d+1 copies of the data. First measure the cost of a DELETE FROM items with no WHERE clause on Durable Objects.
+10. F13, F12 and F7.
+
+Priority 5: small request-path fixes
+
+11. R3, R4/K2, R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+
+My recommendation: start with F11 and F1 as one change, then C5, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
+
 
 ## 3. Sharding runtime
 
@@ -449,21 +487,45 @@ The finding was:
 
 - **What happens:** One transaction with N items and P participants does about 3N + 4P + 10 row writes. The extra
   writes are:
-  - `stripPayload` rewrites N `tc_items` rows at PREPARED (`:1002`) and at CANCELLING (`:939`), a few
-    milliseconds before `completeTransaction` deletes them.
+  - Done: `stripPayload` rewrote N `tc_items` rows at PREPARED and at CANCELLING, a few milliseconds before
+    `completeTransaction` deleted them. Now the request path does not call it. The `tx_recovery` claim calls it
+    for a PREPARED, COMMITTING or CANCELLING transaction, in the storage transaction of the claim, and it writes
+    no row when the payload is already removed. A transaction that does not complete therefore keeps its payload
+    only until its first claim, about `staleTransactionMs` after its creation. `buildMigrationPage` does not
+    carry the payload of a transaction in these states. No step after the prepare reads the payload: `runCommit`
+    and `runCancel` read only the keys.
   - `prepare_outcome = 'accepted'` and `commit_outcome = 'committed'` add 2P updates. Only the recovery path needs
     them, and a new prepare or commit is idempotent.
   - The move from PREPARED to COMMITTING is a separate write.
   - `partition_context_json` stores a full route context for each participant of each transaction, although one
     coordinator group serves one table.
 - **Fix:** Write these values only when the request path cannot finish. That gives about 2N + 2P + 8 writes.
+  The `stripPayload` part is done, so a transaction now does about 2N + 4P + 10 row writes.
 
-**C3 — wide rows in WITHOUT ROWID tables (Medium).** **Code.**
+**C3 — skipped: wide rows in WITHOUT ROWID tables (Low).** **Code + SQL replay.**
 
 - **What happens:** `tc_items.data` (≤ 400 KB), `tc_results.image_data`, the JSON columns of `tc_participants`,
-  and `tc_state.results_json` are all in WITHOUT ROWID tables. The migration comment of `items` measured 2.3–4.7x
-  storage for this layout. A coordinator splits on size, so the extra storage also makes it split early.
-- **Fix:** Use rowid tables with an explicit unique index, as `items` and `pending_transactions` already do.
+  and `tc_state.results_json` are all in WITHOUT ROWID tables.
+- **Measurement:** SQLite with 4 KiB pages, each table built as WITHOUT ROWID and as a rowid table with a UNIQUE
+  index:
+  - `tc_state`: WITHOUT ROWID uses 1.15–1.18x the storage of a rowid table. For transactions of about 50 ops
+    (`results_json` of about 1 KB), it uses 3.26x.
+  - Payload rows: 3.13x against 1.40x for 1,500-byte values. For values below 1 KB or above 3 KB, the difference
+    is 0–30 %.
+  - The large loss occurs only for rows of about 1–2.5 KB. Each such row goes above the ~1,002-byte inline limit
+    and gets a private overflow page that is mostly empty.
+- **Why the effect is small:**
+  - `completeTransaction` deletes the `tc_items` and `tc_participants` rows, and the first `tx_recovery` claim
+    removes the payload of a transaction that does not complete (C2). These rows exist only while the
+    transaction is in flight.
+  - Only `tc_state` (every transaction) and `tc_results` (only condition failures with `all_old`) stay for the
+    10-minute idempotency window. At 500 tx/s, `tc_state` holds about 300k rows: about 90 MB as WITHOUT ROWID
+    and 78 MB as rowid. This is far below the split threshold, so the layout does not make the coordinator
+    split early.
+  - In a rowid table, the partial indexes on `tc_state` hold the rowid and not `transaction_id`. The recovery
+    job and the idempotency sweep then need one more table read for each row, unless the indexes include
+    `transaction_id`.
+- **Decision:** Skipped. Convert only `tc_state` if its migration is edited for another reason, for example C2.
 
 **C4 — recovery drives one transaction at a time (Low).** **Code.** Recovery drives transactions one at a time
 (FIXME at `:1273`) in a step of up to `alarmRecoveryBudgetMs` (30 s). The split and import jobs of the coordinator
@@ -557,7 +619,6 @@ wait behind it (see X2).
 The SQL migrations can still be edited in place.
 
 - **Breaking:**
-  - C3: rowid tables in the coordinator.
   - X1: `split_bucket`, if it is wanted.
   - R11: a policy version in the route context.
   - R7: paged Bloom storage, if it is wanted.

@@ -3,6 +3,10 @@
 **State:** Implemented
 **Date:** 2026-09-19
 
+> **Update (2026-09-30).** The transition to `PREPARED` no longer removes the payload: the coordinator keeps it
+> until the transaction completes or until the first `tx_recovery` claim, so the coordinators must still be in
+> the jurisdiction of the partitions.
+
 ## Table of contents
 
 - [1. Overview and context](#1-overview-and-context)

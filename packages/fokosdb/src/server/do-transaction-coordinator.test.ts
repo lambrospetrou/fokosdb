@@ -75,7 +75,10 @@ type CoordinatorInternals = {
 		cursor: string | null,
 		belongsToTarget: (key: { hashKey: Uint8Array }) => boolean,
 		budget: FokosMigrationPageBudget,
-	): { page: Array<{ state: { transaction_id: string } }>; nextCursor: string | null };
+	): {
+		page: Array<{ state: { transaction_id: string }; items: Array<{ data: unknown; data_kind: unknown; conditions_json: unknown }> }>;
+		nextCursor: string | null;
+	};
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
 	markPrepared(transactionId: string, idempotencyToken: string): void;
@@ -572,7 +575,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("strips payload in the PREPARED transition but retains routing keys", async () => {
+	it("keeps the payload in the PREPARED transition", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
@@ -595,8 +598,8 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				}>(`SELECT hk, sk, operation, data, data_kind, conditions_json FROM tc_items WHERE transaction_id = ?`, TX_ID)
 				.toArray();
 			expect(items).toHaveLength(2);
-			expect(items.every((item) => item.data === null && item.data_kind === null && item.conditions_json === null)).toBe(true);
-			expect(items.map((item) => item.operation)).toEqual(["put", "delete"]);
+			expect(items[0]).toMatchObject({ operation: "put", data: "v", data_kind: 1, conditions_json: '{"op":"test"}' });
+			expect(items[1]).toMatchObject({ operation: "delete", conditions_json: '{"op":"test"}' });
 		});
 	});
 
@@ -825,7 +828,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("strips payload in the CANCELLING transition", async () => {
+	it("keeps the payload in the CANCELLING transition", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
@@ -842,11 +845,38 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					data: string | ArrayBuffer | null;
 					data_kind: number | null;
 					conditions_json: string | null;
-				}>(`SELECT data, data_kind, conditions_json FROM tc_items WHERE transaction_id = ?`, TX_ID)
+				}>(`SELECT data, data_kind, conditions_json FROM tc_items WHERE transaction_id = ? ORDER BY op_index`, TX_ID)
 				.toArray();
-			expect(payload.every((item) => item.data === null && item.data_kind === null && item.conditions_json === null)).toBe(true);
+			expect(payload[0]).toEqual({ data: "v", data_kind: 1, conditions_json: '{"op":"test"}' });
 		});
 	});
+
+	it.each(["PREPARED", "COMMITTING", "CANCELLING"] as const)(
+		"the recovery claim removes the payload of a %s transaction and keeps its keys",
+		async (tcState) => {
+			await withCoordinator(async (tc, state) => {
+				seed(state, tcState);
+				state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
+				const drive = vi.spyOn(tc, "driveTransaction").mockResolvedValue();
+
+				await tc.recoverStaleTransactions();
+
+				expect(drive).toHaveBeenCalledTimes(1);
+				const items = state.storage.sql
+					.exec<{
+						hk: ArrayBuffer;
+						operation: string;
+						data: string | ArrayBuffer | null;
+						data_kind: number | null;
+						conditions_json: string | null;
+					}>(`SELECT hk, operation, data, data_kind, conditions_json FROM tc_items WHERE transaction_id = ? ORDER BY op_index`, TX_ID)
+					.toArray();
+				expect(items.map((item) => item.operation)).toEqual(["put", "delete"]);
+				expect(items.map((item) => new Uint8Array(item.hk))).toEqual([new Uint8Array(kb("hk1")), new Uint8Array(kb("hk2"))]);
+				expect(items.every((item) => item.data === null && item.data_kind === null && item.conditions_json === null)).toBe(true);
+			});
+		},
+	);
 
 	it("sets completed_at, deletes per-transaction rows, and keeps the committed replay", async () => {
 		await withCoordinator(async (tc, state) => {
@@ -1396,6 +1426,31 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 			// A page that the target owns no row of still advances the cursor past the rows it read.
 			const none = tc.buildMigrationPage(null, () => false, budget);
 			expect(none).toEqual({ page: [], nextCursor: ids[budget.pageRows - 1] });
+		});
+	});
+
+	it.each([
+		["PREPARING", true],
+		["PREPARED", false],
+		["COMMITTING", false],
+		["CANCELLING", false],
+		["COMMITTED", false],
+		["CANCELLED", false],
+	] as const)("a %s transaction carries its payload in the page: %s", async (tcState, withPayload) => {
+		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
+		await withCoordinator((tc, state) => {
+			seed(state, tcState);
+			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
+
+			const { page } = tc.buildMigrationPage(null, () => true, budget);
+
+			expect(page).toHaveLength(1);
+			expect(page[0].items).toHaveLength(2);
+			expect(page[0].items[0]).toMatchObject(
+				withPayload
+					? { data: "v", data_kind: 1, conditions_json: '{"op":"test"}' }
+					: { data: null, data_kind: null, conditions_json: null },
+			);
 		});
 	});
 });

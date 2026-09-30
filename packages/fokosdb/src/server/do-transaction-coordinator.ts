@@ -793,9 +793,17 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		}
 	}
 
+	/**
+	 * Removes the payload that no step needs after PREPARED or CANCELLING. The request path does not
+	 * call it: a transaction that completes deletes its rows a few milliseconds later, and a strip
+	 * before that only adds one write for each item. The `tx_recovery` claim calls it, so a transaction
+	 * that does not complete keeps its payload only until its first claim. It writes no row when the
+	 * payload is already removed.
+	 */
 	private stripPayload(transactionId: string): void {
 		this.ctx.storage.sql.exec(
-			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL, update_json = NULL WHERE transaction_id = ?`,
+			`UPDATE tc_items SET data = NULL, data_kind = NULL, conditions_json = NULL, update_json = NULL
+			  WHERE transaction_id = ? AND (data IS NOT NULL OR data_kind IS NOT NULL OR conditions_json IS NOT NULL OR update_json IS NOT NULL)`,
 			transactionId,
 		);
 	}
@@ -964,7 +972,6 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				return;
 			}
 
-			this.stripPayload(transactionId);
 			for (const opIndex of cappedOutOpIndexes) {
 				this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ? AND op_index = ?`, transactionId, opIndex);
 			}
@@ -1019,17 +1026,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return { v: COORDINATOR_REF_VERSION, doName: this.fokos.routeContext().doName, idempotencyToken };
 	}
 
-	/** Moves PREPARING to PREPARED, the point of no return, and removes the payload that the prepare no longer needs. */
+	/** Moves PREPARING to PREPARED, the point of no return. */
 	private markPrepared(transactionId: string, idempotencyToken: string): void {
-		this.transition(idempotencyToken, () => {
-			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`,
-				transactionId,
-			);
-			if (transition.rowsWritten > 0) {
-				this.stripPayload(transactionId);
-			}
-		});
+		this.transition(idempotencyToken, () =>
+			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`, transactionId),
+		);
 	}
 
 	/**
@@ -1327,7 +1328,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * The transactions whose `next_recovery_at` is at or before `dueAt`, earliest first, at most `limit`
-	 * of them, each with its `next_recovery_at` moved forward in the same storage transaction. The step
+	 * of them, each with its `next_recovery_at` moved forward in the same storage transaction. The same
+	 * storage transaction removes the payload of a claimed transaction that is past its prepare. The step
 	 * passes its start time as `dueAt`, and a claim moves the time past it, so one step claims a
 	 * transaction at most one time.
 	 */
@@ -1352,6 +1354,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 					nextRecoveryAt(now, row.created_at, staleTransactionMs),
 					row.transaction_id,
 				);
+				if (isPastPrepare(row.state)) {
+					this.stripPayload(row.transaction_id);
+				}
 			}
 			return rows;
 		});
@@ -1484,7 +1489,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {
 				const tx: MigratedTransaction = {
 					state: row,
-					items: this.loadItems(row.transaction_id),
+					// A transaction past its prepare needs only the keys. Its payload can still be on disk
+					// before its first recovery claim, and the page does not carry it.
+					items: this.loadItems(row.transaction_id, !isPastPrepare(row.state)),
 					participants: this.loadParticipants(row.transaction_id),
 					results: this.loadResultImages(row.transaction_id),
 				};
@@ -1627,10 +1634,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		};
 	}
 
-	private loadItems(transactionId: string): TcItemRow[] {
+	/** With `withPayload` false, the payload columns are NULL, so the rows do not hold the payload in memory. */
+	private loadItems(transactionId: string, withPayload = true): TcItemRow[] {
+		const payload = withPayload
+			? "data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json"
+			: "NULL AS data, NULL AS data_kind, ttl_epoch_utc_seconds, NULL AS conditions_json, NULL AS update_json";
 		return this.ctx.storage.sql
 			.exec<TcItemRow>(
-				`SELECT transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds, conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure
+				`SELECT transaction_id, hk, sk, op_index, operation, ${payload}, partition_do_name, return_values_on_condition_check_failure
                  FROM tc_items WHERE transaction_id = ? ORDER BY op_index`,
 				transactionId,
 			)
@@ -1679,6 +1690,28 @@ function prepareRetry(retry: ParticipantRetryConfig, maxAttempts: number): Fokos
 /** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */
 function sweepDueAt(completedAt: number): number {
 	return completedAt + IDEMPOTENCY_WINDOW_MS + 1;
+}
+
+/**
+ * True for every state after the prepare, the terminal states included. No step of these states reads the
+ * payload. A terminal transaction has no `tc_items` rows, because the completion deletes them.
+ */
+function isPastPrepare(state: TCState): boolean {
+	switch (state) {
+		case "CREATED":
+		case "PREPARING":
+			return false;
+		case "PREPARED":
+		case "COMMITTING":
+		case "COMMITTED":
+		case "CANCELLING":
+		case "CANCELLED":
+			return true;
+		default: {
+			const _exhaustive: never = state;
+			return _exhaustive;
+		}
+	}
 }
 
 /** The size of one migrated transaction, near its serialized size: the payloads and the text columns. */
