@@ -181,7 +181,7 @@ A repartition cannot make a partition smaller than one item. The floor for each 
   - With a `promotionFraction` of 0.5, a one-key leaf at 1.15 times the cap can then have `est_bytes` of only 0.45
     times the cap.
 
-  A hash leaf reaches its floor only when it holds no item, and its size is lock rows or runtime tables.
+A hash leaf reaches its floor only when both `items` and `pending_transactions` are empty.
 
 A real deployment usually sets a cap far above the size of one item, so the floor is rare outside tests. It matters
 for one reason: the decision must not queue a repartition below the floor. A range split below the floor stays
@@ -220,8 +220,8 @@ background job is needed. A leaf that nobody writes to needs nothing, because it
 
 The host decides what to do, and it respects the floor:
 
-- A hash leaf with two or more keys splits.
-- A hash leaf with one key promotes that key.
+- A hash leaf checks `items`, or `pending_transactions` when `items` is empty.
+- With two or more hash keys in that table, it splits. With one, it promotes that key.
 - A range leaf splits when the planner can find its boundaries.
 - At the floor, the decision is `false`, and the host logs an error once per instance.
 
@@ -341,7 +341,8 @@ can apply this rule, because only the host can read its own rows.
 
 1. **Size.** Read the cap for the identity kind. When `sql.databaseSize` is at or below it, return `false`. This is
    one property read, and it is the whole cost for a partition under its cap.
-2. **Hash leaf.** Count the hash keys up to two, with two seeks of the `(hk, sk)` index:
+2. **Hash leaf.** Probe `items` for up to two hash keys. Run the second query only when the first returns a key.
+   Bind that key to the second query. Both queries seek the `(hk, sk)` index.
 
    ```sql
    SELECT hk FROM items ORDER BY hk LIMIT 1;       -- the first key
@@ -349,11 +350,27 @@ can apply this rule, because only the host can read its own rows.
    ```
 
    - Two or more keys: return `{}`.
-   - One key: return `{ promote: [thatKey] }`, whatever the size estimate of the key (section 2.4).
-   - No key: go to step 4.
+   - One key: return `{ promote: [thatKey] }`, whatever its size estimate (section 2.4).
+   - No key: probe `pending_transactions` in the same way, through its `(hk, sk, transaction_id)` index:
 
+     ```sql
+     SELECT hk FROM pending_transactions ORDER BY hk LIMIT 1;
+     SELECT 1 FROM pending_transactions WHERE hk > ? LIMIT 1;
+     ```
+
+     Run the second query only when the first returns a key, and bind that key to it.
+     With two or more pending hash keys, return `{}`. With one, return `{ promote: [thatKey] }`, whatever its size estimate.
+     When both tables are empty, go to step 4.
+
+   Pending payloads can move even when the key has no committed item. A quarantined lock moves with its key and keeps its guard.
+   The decision uses two index seeks when items exist, and at most three when `items` is empty.
+   It compares no key across tables. Each second query seeks past all rows of its first key.
    A `SELECT DISTINCT hk ... LIMIT 2` is not bounded: it reads every row of the first key before it finds the second
    key.
+
+   A mixed leaf can hold one committed key A and a pending-only key B. The decision promotes A first.
+   After A's cleanup empties `items`, a later refused write reaches the pending-table fallback for B.
+   Recovery can therefore need another repartition and wait for cleanup. Pending rows of B stay here until B moves or resolves.
 3. **Range leaf.** Call `this.#store.computeRangeSplitBoundaries(hashKey, start, end, rangeSplitN)` with the range
    of the identity and `rangeSplitN` from `this.fokos.routeContext().rangeConfig`. These are the same arguments that
    the planner passes. When the result is not `null`, return `{}`. The planner then finds the same boundaries,
@@ -469,18 +486,18 @@ A fall in size needs no trigger, because a partition under its cap needs no repa
 
 #### 4.2.8 Milestone 5: more than one large key
 
-Until milestone 5, a hash leaf with two or more keys splits on the refusal path, even when one key is large. This has
-two costs:
+Until milestone 5, a hash leaf splits when the selected table holds two or more hash keys, even when one is large.
+This has two costs:
 
 - **One extra copy.** The split copies the large key into a child, and the child then promotes it with a second
   copy. The write path still promotes first, through `signalGrowth`, so the extra copy happens only after a cap
   change or a skewed split.
-- **A key behind a stuck promotion.** A promotion that cannot finish, for example because of a quarantined lock,
-  blocks the hash split: `canQueue` refuses a hash split while a promotion is `queued`, `planned` or `cutover`. A
-  second large key on the same leaf then cannot move, because the refused writes carry no promotion signal. A
-  quarantined lock needs an operator in any case.
+- **A key behind a stuck promotion.** A promotion can stay unfinished when its target cannot import or acknowledge.
+  It blocks the hash split: `canQueue` refuses a hash split while a promotion is `queued`, `planned` or `cutover`.
+  A second large key on the same leaf then cannot move, because the refused writes carry no promotion signal.
+  A quarantined lock does not hold the promotion: it moves with its key.
 
-Milestone 5 removes both costs. Step 2 of section 4.2.4 changes for a leaf with two or more keys:
+Milestone 5 removes both costs. Step 2 of section 4.2.4 changes when the selected table holds two or more hash keys:
 
 1. Read the largest keys at or above the promotion threshold:
 
@@ -542,9 +559,31 @@ Each test uses real timers and the scheduled-alarm test APIs. None mocks a globa
 9. **Coordinator floor.** A coordinator holds one token, or none, above its cap. A refused transaction queues no
    split, and the floor error is logged once. The existing 1-byte test in `tx-paths.test.ts` covers the case with no
    token. Suite: `test/transactions/tx-coordinator-split.test.ts`.
-10. **Milestone 5: two large keys, one blocked.** A hash leaf holds two keys above the promotion threshold. The first
-    key holds a quarantined lock, so its promotion stays `planned`. A refused write promotes the second key. Suite:
-    the file of test 1.
+10. **Milestone 5: two large keys, one blocked.** Seed two keys under a generous hash cap, without automatic promotion.
+    Make the first key larger than the second. Lower the cap so both keys exceed the promotion threshold.
+    The file must exceed 1.1 times the cap. Hold item pulls from the first range root with
+    `testHoldPulls({ stream: "items", target: firstRangeRoot.doName })` on the controlled source.
+    Queue the first promotion through the existing `debugForcePromoteKey` RPC. Wait until `testPullStats` names the held target.
+    Assert that the first promotion remains in `cutover` and its target has not completed import.
+    Send a put for the second key. The source refuses it for size, then queues the second promotion.
+    Wait for the second promotion to complete while the first pull remains held. Assert that no hash split row exists.
+    Read the second key from its range root and check its data. Assert that the first promotion remains in `cutover`.
+    Release the pull hold in `finally`, then verify that the first promotion completes.
+    Use the existing `ControlledPartitionDO` controls. Add no production hook. Suite: the file of test 1.
+11. **Pending-only keys.** Prepare puts for two hash keys on an empty hash leaf.
+    Lower the cap so the file exceeds 1.1 times the cap. Select keys that route to different children.
+    Each key fits below its child's admission limit. A refused put queues a hash split.
+    The children import every pending payload. A later put for an unrelated key succeeds. Repeat with quarantined locks.
+    Suite: the file of test 1.
+12. **One pending-only key.** Prepare puts for one hash key, with no committed item. Lower the cap and send one put.
+    The put is refused and queues a promotion, not a hash split. The range root imports every pending payload and guard.
+    Suite: the file of test 1.
+13. **Pending-table fallback after cleanup.** Store items under one hash key A and prepare puts under a different key B.
+    Lower the cap. Keep A below the promotion threshold, and keep the file above the refusal limit after A's cleanup.
+    A refused put queues a promotion of A, not a hash split. Wait until A's cleanup empties `items`.
+    Verify that B's pending payloads remain. Another refused put queues B's promotion through the pending-table fallback.
+    Verify that B's range root imports every pending payload and guard. No hash split row exists.
+    Repeat with pending puts under A: one promotion moves both its items and pending payloads. Suite: the file of test 1.
 
 The property fixture in `test/property-based/query-harness.ts` then seeds in one phase. Both
 `query-items-split.test.ts` and `query-items-active-split.test.ts` use it. The active suite keeps writing to the
@@ -620,8 +659,9 @@ symptom is a refused write, and the first one starts the decision.
 promotion threshold reads the logical estimate. The file can be about 2.5 times the estimate (section 2.4). Without
 this rule, a one-key leaf above its cap can stay below the promotion threshold and refuse writes for ever.
 
-**Why does a leaf with two or more keys split before it promotes its large key?** It keeps the decision to two index
-seeks. The cost is one extra copy of the large key, only on the refusal path. Milestone 5 adds promotion first.
+**Why does a leaf split before it promotes its large key?** With two keys in the selected table, the decision queues a split.
+It uses two index seeks when items exist. When `items` is empty, the pending-table fallback needs at most three seeks.
+The cost is one extra copy of the large key, only on the refusal path. Milestone 5 adds promotion first.
 
 **Why does the range floor call the boundary scan, and not count the items?** The planner needs one item per child,
 and it also needs the bytes to fall into `rangeSplitN` parts. A count of `rangeSplitN` items is not enough: a leaf
