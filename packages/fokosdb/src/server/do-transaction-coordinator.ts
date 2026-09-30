@@ -203,12 +203,6 @@ const JOB_TX_RECOVERY = "tx_recovery";
 /** The host job that deletes the transactions whose idempotency window has passed. */
 const JOB_IDEMPOTENCY_SWEEP = "idempotency_sweep";
 
-/**
- * A host KV key: the time at which the `tx_recovery` job must run, because a migration page brought
- * non-terminal transactions that no request drives. The job step deletes it.
- */
-const RECOVERY_DUE_KEY = "__fokosdb/tc/recovery_due_at";
-
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 
 /**
@@ -494,15 +488,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				{
 					name: JOB_TX_RECOVERY,
 					canRun: () => this.canDriveLocally(),
-					// Only the imported transactions set a deadline. A request that creates a transaction
-					// schedules the job itself, and the step schedules its next run. A deadline read from the
-					// non-terminal rows would stay in the past while a participant is down, and the job would
-					// run again at once after each step.
-					deadline: () => this.ctx.storage.kv.get<number>(RECOVERY_DUE_KEY) ?? null,
-					runStep: async () => {
-						this.ctx.storage.kv.delete(RECOVERY_DUE_KEY);
-						return { nextRunAt: await this.recoverStaleTransactions() };
-					},
+					// No deadline: a request that creates a transaction schedules the job, a migration page with
+					// a non-terminal transaction schedules it, and the step schedules its next run. A deadline
+					// read from the non-terminal rows would stay in the past while a participant is down, and
+					// the job would run again at once after each step.
+					runStep: async () => ({ nextRunAt: await this.recoverStaleTransactions() }),
 				},
 				{
 					name: JOB_IDEMPOTENCY_SWEEP,
@@ -1468,8 +1458,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private applyMigrationPage(page: MigratedTransaction[]): void {
 		const sql = this.ctx.storage.sql;
-		if (page.some((tx) => tx.state.completed_at === null) && this.ctx.storage.kv.get(RECOVERY_DUE_KEY) === undefined) {
-			this.ctx.storage.kv.put(RECOVERY_DUE_KEY, this.fokosNow());
+		if (page.some((tx) => tx.state.completed_at === null)) {
+			this.fokos.scheduleJobSyncNoAlarm(JOB_TX_RECOVERY, this.fokosNow());
 		}
 		for (const { state, items, participants, results } of page) {
 			sql.exec(

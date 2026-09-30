@@ -414,10 +414,10 @@ made during the implementation and differ from, or add to, the text of sections 
 - `initiateWrite` calls `scheduleJob` and `requestSplitEvaluation` directly after the `CREATED` insert, and not
   through `call.signal`. The handler often ends with a thrown answer (`transaction_commit_pending`), and a thrown
   handler drops its signals.
-- The `tx_recovery` job has a `deadline()` only for transactions that a migration page brought: `applyPage`
-  writes the host KV key `__fokosdb/tc/recovery_due_at` when a page holds a non-terminal transaction, and the job step
-  deletes it. A request that creates a transaction schedules the job, and each step returns its next run while a
-  non-terminal transaction remains. A deadline read from the non-terminal rows would stay in the past while a
+- The `tx_recovery` job has no `deadline()`. `applyPage` calls `scheduleJobInTransaction` when a page holds a
+  non-terminal transaction, so the job time goes into `__fokos/jobs` in the transaction of the page. A request that
+  creates a transaction schedules the job, and each step returns its next run while a non-terminal transaction
+  remains. A deadline read from the non-terminal rows would stay in the past while a
   participant is down, and the job would run again at once after each step. `idempotency_sweep` has the
   `deadline()` of the spec.
 - The ownership test guards the state transitions of section 4.2.21 only. The writes of participant answers and

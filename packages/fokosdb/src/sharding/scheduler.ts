@@ -67,8 +67,13 @@ export class FokosScheduler {
 		}
 		this.#fastPath = setTimeout(() => {
 			this.#fastPath = null;
-			this.runDueWork().catch((error: unknown) => {
-				console.error({ ...this.#deps.logParams(), message: "fokos/scheduler: the fast-path pass failed.", error: String(error) });
+			void this.runDueWork().catch((error: unknown) => {
+				console.error({
+					...this.#deps.logParams(),
+					message: "fokos/scheduler: the fast-path pass failed.",
+					error: String(error),
+					errorProps: error,
+				});
 			});
 		}, this.#deps.fastPathDelayMs());
 	}
@@ -87,7 +92,22 @@ export class FokosScheduler {
 	 * runs at the same time cannot be lost.
 	 */
 	async scheduleJob(name: string, runAt: number): Promise<void> {
-		const moved = this.#deps.store.transactionSync(() => {
+		if (!this.scheduleJobSyncNoAlarm(name, runAt)) {
+			return;
+		}
+		await this.ensureAlarmAtMost(runAt);
+		if (runAt <= Date.now()) {
+			this.wake();
+		}
+	}
+
+	/**
+	 * Moves the next run of one job earlier, never later, and does not arm the alarm. Returns true when
+	 * it wrote the record. It is synchronous, so it can run inside the transaction of the caller. Call it
+	 * only from a job step: the end of the pass arms the alarm at the new deadline.
+	 */
+	scheduleJobSyncNoAlarm(name: string, runAt: number): boolean {
+		return this.#deps.store.transactionSync(() => {
 			const record = this.#deps.store.getJobs();
 			const current = record[name]?.nextRunAt;
 			if (current !== undefined && current <= runAt) {
@@ -97,13 +117,6 @@ export class FokosScheduler {
 			this.#deps.store.putJobs(record);
 			return true;
 		});
-		if (!moved) {
-			return;
-		}
-		await this.ensureAlarmAtMost(runAt);
-		if (runAt <= Date.now()) {
-			this.wake();
-		}
 	}
 
 	/** Sets the alarm to `at` when no alarm exists or the existing one is later. */

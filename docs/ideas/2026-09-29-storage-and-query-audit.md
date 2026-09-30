@@ -180,7 +180,6 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokos/cache/hash_arena` | runtime | ≤ 1 MB | when the tree it learns grows | once, at the first forward |
 | `__fokos/cache/promotion_bloom` | runtime | ~360 KB at the defaults | each new promoted key it learns (R7) | each start, whole |
 | `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
-| `__fokosdb/tc/recovery_due_at` | coordinator | a number | on a migration page with a transaction that is not finished | 2 times per pass (job deadline), and on each migration page |
 
 **K1 — a new naming scheme does not make a read faster (no change needed for speed).**
 
@@ -193,7 +192,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 - **Keep `__fokos/`.** It marks what only the runtime can touch, and a full delete of the runtime state can use it.
 - **Done: the host keys have the `__fokosdb/` prefix (clarity, not speed).** `PartitionStore` tracks its migrations
   under `__fokosdb/partition/schema_version`, and the coordinator under `__fokosdb/tc/schema_version`. The
-  coordinator key `tc/recovery_due_at` is now `__fokosdb/tc/recovery_due_at`. Each class has its own storage, so
+  coordinator key `tc/recovery_due_at` is removed (K5). Each class has its own storage, so
   the old default name `__sql_migrations_lastID` did not collide. A class-specific name keeps the key clear if a
   second host store ever shares one storage.
 
@@ -228,15 +227,13 @@ size of a value does not change the bill. The limit for a key and its value toge
 - `__fokos/schema_version` and the host schema-version key also stay apart, because two different owners run their own
   migrations.
 
-**K5 — `__fokosdb/tc/recovery_due_at` can go into `__fokos/jobs` (Low).** **Code.**
+**K5 — done: the coordinator stores its recovery time in `__fokos/jobs` (Low).** **Code.**
 
-- The key is a job deadline that the coordinator stores beside the runtime record of job deadlines. Each pass reads
-  it 2 times through `deadline()`.
-- The runtime already stores job times in `__fokos/jobs`. `applyPage` runs inside the transaction of the page, and
-  `scheduleJob` is async only because it also arms the alarm. The import step runs in a pass, and the end of the
-  pass arms the alarm at the earliest deadline, so a write to the record is enough.
-- **Fix:** Add a synchronous runtime call that writes one job time into `__fokos/jobs` inside the current
-  transaction, and use it in `applyMigrationPage`. The host key and its deadline reads go away.
+- The coordinator stored a job deadline in its own key, `tc/recovery_due_at`, and each pass read it 2 times through
+  `deadline()`.
+- Now `applyMigrationPage` calls `scheduleJobInTransaction`, which writes the `tx_recovery` time into
+  `__fokos/jobs` in the transaction of the page. It does not arm the alarm. Only a job step applies a page, and the
+  end of the pass arms the alarm at the new deadline. The `tx_recovery` job has no `deadline()` now.
 
 **K6 — `jobs` is read on the transaction path (Low).** **Code.**
 
@@ -551,7 +548,6 @@ The SQL migrations can still be edited in place.
   - R7: paged Bloom storage, if it is wanted.
   - R9: finished promotions as override rows only, if it is wanted.
   - K3: the plan head as a column of `fokos_repartitions`, if it is wanted.
-  - K5: remove `__fokosdb/tc/recovery_due_at`.
 - **Additive, but cheapest now:**
   - C1: the partial index on `tc_state`.
   - F5: the delete buckets.
