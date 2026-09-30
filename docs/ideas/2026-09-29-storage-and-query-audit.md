@@ -2,8 +2,7 @@
 
 **State:** Findings. Nothing is decided or implemented.
 **Date:** 2026-09-29
-**Updated:** 2026-09-30. The findings describe the code after commit `1b4d8e3` (a promotion moves the locks of its
-key), and they leave out what `docs/agent-plans/2026-09-27-over-size-split-trigger.md` fixes.
+**Updated:** 2026-09-30.
 
 ## Table of contents
 
@@ -28,18 +27,25 @@ says how it was checked:
 - **Plan:** confirmed with `EXPLAIN QUERY PLAN`.
 - **Code:** confirmed by following the code path.
 - **Code, not run:** follows from the code path, but a test must confirm it.
+- **Collector:** the production `collectBatch` ran with logical row sizes, without payload allocation.
+- **SQL replay:** the current statements ran against the matching schema in SQLite 3.45.1.
 
 ## 2. Summary
 
 | # | Layer | Finding | Severity | Schema change? |
 |---|---|---|---|---|
 | F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High | No |
+| F11 | FokosDB | Migration fetches payload arrays before the byte budget; a default fetch can hold about 390 MiB | High | No |
+| C5 | FokosDB (TC) | One PREPARING transaction can exceed the 32 MiB migration RPC limit and stop an import | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
 | X2 | Cross | The stale-lock job can run again every ~50 ms and blocks the split and import jobs | High | Yes, if fixed with F4 |
 | C1 | FokosDB (TC) | `tx_recovery` does a full scan and sort of `tc_state` every 5 s | High | Additive index |
 | F5 | FokosDB | One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
 | F4 | FokosDB | `pending_transactions` repeats per-transaction data on each key; `conditions_json` is never read; the stale queries step past lock copies | Medium | Yes |
+| F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
+| F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
+| F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | `routerRole()` reads the split row and all target rows, several times per request, per key | Medium | No |
 | R5 | Runtime | `learnRangeBoundary` counts the whole table on each insert and each refresh | Medium | Optional index |
 | C3 | FokosDB (TC) | Rows of up to 400 KB sit in WITHOUT ROWID tables (2–5x storage, as measured for `items`) | Medium | Yes |
@@ -340,15 +346,26 @@ size of a value does not change the bill. The limit for a key and its value toge
   - The keys are stored 3 times. With 1 KB hash keys, that is most of a small row.
 - **Why it exists:** Count queries and the range split scan read only the index. This is a real trade-off, not a
   defect, but confirm it before the freeze.
-- **Related:** The `key_size_estimates` write adds one write to each item write. That cost is fixed per request,
-  so it is acceptable.
+- **Related:** Each item size change updates `key_size_estimates` and its `key_size_estimates_by_bytes` index.
+  The index also stores the hash key, because the table is WITHOUT ROWID. Count both B-tree updates and the extra
+  key storage. `largestKeysAtLeast` uses a bounded covering seek, confirmed with `EXPLAIN QUERY PLAN` in SQLite
+  3.45.1. Empty keys retain both entries (F12).
 
-**F7 — the range split boundary scan blocks the DO (Medium).** **Code.**
+**F7 — the range split boundary scan blocks the request path and runs again during planning (Medium).** **Code.**
 
-- **What happens:** `computeRangeSplitBoundaries` (`shared/partition/partition-store.ts:981`) scans up to
-  (N−1)/N of the partition index in one synchronous `transactionSync` inside `#plan`. On a 1 GB range partition
-  with 10M small rows, that blocks every request for seconds.
-- **Fix:** Scan in chunks over several steps, and keep the running totals in the plan head. Or sample the index.
+- **What happens:** `planRangeSplit` (`shared/partition/partition-store.ts`) scans the covering partition index
+  inside a synchronous `transactionSync`. `splitDecision` (`server/do-partition.ts`) runs it before the runtime
+  queues the split. The planner calls it again through `computeRangeSplitBoundaries`
+  (`sharding/repartition-flow.ts`, `#plan`).
+- **Example:** With uniform rows, each scan visits about (N−1)/N of the index. At `rangeSplitN = 4`, the two scans
+  visit about 1.5 times the row count. A 1 GB range partition with 10M small rows therefore needs about 15M row
+  visits. Both scans block other requests. TODO: measure their duration at that size.
+- **Refusal cost:** The decision runs synchronously before an over-size write receives its refusal. More requests
+  can repeat the scan while the alarm write is pending, before the split row exists. At the floor, every refused
+  write repeats the decision. The implemented over-size RFC already bounds the floor cases; it does not remove
+  this request-path cost.
+- **Fix:** Scan in chunks over several background steps, and keep the running totals in the plan head. Or sample
+  the index. Reuse a completed decision scan only when the item state and split arguments still match.
 
 **F8 — commit reads each lock row 2 times (Low).** **Code.** `listPendingTxKeys` and `getPendingTxOp` for each
 key read the same rows. One query that returns the keys and the payload can replace both. The release is one
@@ -369,6 +386,51 @@ each cycle, but locks are few.
   (see F1 for its length).
 - **Fix (schema):** Make the index `(created_at, hk) WHERE guarded_at IS NULL`. The deadline query then reads only
   the index, and guarded rows cost nothing.
+
+**F11 — migration reads payload arrays before it applies the byte budget (High).** **Code + Collector.**
+
+- **What happens:** `collectBatch` (`sharding/batch-scan.ts`) fetches a complete array before it checks
+  `budgetBytes`. `#buildItemsPage` and `#buildPendingTxPage` (`shared/partition/fokos-migration-host.ts`) both use
+  this collector. Their store queries materialize every requested row, including `data`.
+- **Example:** The default `migrationPageRows` is 1,000, and `migrationPageBytes` is 20 MiB. With near-maximum
+  400 KiB items, one fetch can hold about 390 MiB of payload before the collector applies its byte budget.
+  [Workers limits](https://developers.cloudflare.com/workers/platform/limits/#memory) allow 128 MB per isolate.
+  The budget bounds the response, not the memory needed to build it.
+- **Read cost:** A collector check with logical row sizes of `400 * 1024 - 128` fetched 1,000 rows and returned 51.
+  The returned cursor resumes after row 51, so the next fetch reads most of the unused payloads again.
+- **Failure:** A split or promotion cuts over, then its source exceeds the memory limit while it builds a page.
+  Repeated attempts can fail on the same batch. The target cannot finish its import, so writes and transaction
+  steps on its keys remain unavailable. This failure was not run in Workers.
+- **Fix:** Stream rows through the byte budget before a payload array can grow beyond it. A slice-aware query
+  (F1) does not fix this memory bound. The item and lock streams both need the bound. No schema change is needed.
+
+**F12 — empty hash keys retain their size-estimate rows and index entries (Medium).** **Code + SQL replay.**
+
+- **What happens:** `deleteItem` and `deleteExpiredItems` (`shared/partition/partition-store.ts`) reduce
+  `key_size_estimates.est_bytes` to zero, but keep the row. Only promotion completion and cleanup call
+  `deleteKeySizeEstimate`. The `key_size_estimates_by_bytes` index also keeps an entry for each empty key.
+- **Example:** Create one item under each new hash key, then delete it or let its TTL expire. The estimate table
+  grows with all keys ever written, not with live keys. A replay of the create/delete statements in SQLite 3.45.1
+  retained 10,000 zero-byte estimate rows after 10,000 cycles.
+- **Failure:** A small live dataset accumulates estimate rows and duplicated keys in the index. This increases
+  storage and can trigger size-based repartition even when the live items fit below the cap.
+- **Fix:** Remove an estimate when its key has no committed item. Keep the removal in the same transaction as the
+  item deletion and estimate update. Pending-only keys already use the lock-table fallback in `splitDecision`.
+  No schema change is needed.
+
+**F13 — completion deletes all lock copies in one synchronous transaction (Medium).** **Code.**
+
+- **What happens:** `acceptAck` (`sharding/repartition-flow.ts`) runs `beforeComplete` inside the transaction of
+  the last acknowledgement. `PartitionDO` then calls `deletePendingTxForHashKey` for a promotion, or
+  `deleteAllPendingTx` for a split (`shared/partition/partition-store.ts`). Neither deletion has a batch limit.
+- **Example:** A source retains 1,000 transactions with 100 lock rows each. One split completion deletes all
+  100,000 rows and their index entries before the acknowledgement returns. The item cleanup job has a row budget,
+  but it does not bound this lock deletion.
+- **Failure:** Other requests wait for the synchronous deletion and its commit. The completion cost grows with
+  the whole copied lock set. TODO: measure the duration at the target transaction count and payload sizes.
+- **Fix direction:** Measure this path before selecting a cleanup method. If the work needs stages, start only
+  after the targets hold the locks. Preserve the per-transaction key-set rule: remove no partial copy that a
+  routed commit or forced resolution can mistake for the complete set. No schema change is required by the finding.
 
 ### 4.2 TransactionCoordinatorDO
 
@@ -407,6 +469,31 @@ each cycle, but locks are few.
 **C4 — recovery drives one transaction at a time (Low).** **Code.** Recovery drives transactions one at a time
 (FIXME at `:1273`) in a step of up to `alarmRecoveryBudgetMs` (30 s). The split and import jobs of the coordinator
 wait behind it (see X2).
+
+**C5 — one PREPARING transaction can exceed the migration RPC limit (High).** **Code, not run.**
+
+- **What happens:** `storePrepareAnswer` (`server/do-transaction-coordinator.ts`) stores every condition-failure
+  image that a participant returns. Each participant caps its own answer at 10 MiB. The coordinator applies the
+  combined cap only in `cancelTransactionInStore`, when it records `CANCELLING`. Before that transition, one
+  transaction can hold more images than the combined cap.
+- **Failure, step by step:**
+  1. A transaction sends 100 condition checks to ten participants, with `returnValuesOnConditionCheckFailure`
+     set to `all_old`. Each participant receives ten operations.
+  2. Nine participants each return ten failed-condition images of 390 KiB. The last participant remains pending.
+     Each returned answer holds about 3.8 MiB, below its 10 MiB cap. The stored images total about 34.3 MiB.
+  3. The coordinator splits while the transaction stays `PREPARING`. After cutover, the source cannot make its
+     transition to `CANCELLING`, and its recovery job cannot run locally.
+  4. `buildMigrationPage` loads the complete transaction, including all rows of `tc_results`. It includes the
+     first transaction even when `migratedTransactionBytes` exceeds the default 20 MiB page budget.
+  5. The images alone exceed the
+     [32 MiB RPC limit](https://developers.cloudflare.com/workers/runtime-apis/rpc/#limitations).
+     The response fails, and the child retries the same transaction. It cannot finish its import or resume the
+     transaction to apply the combined cap. Other tokens routed to that importing child also remain unavailable.
+- **Verification:** The byte calculation and first-transaction exception were checked outside Workers.
+  The split and failed RPC sequence needs a runtime test. Use byte images so string serialization is not a factor.
+- **Fix:** Page the rows within a transaction, with a cursor that identifies its table and row position. A complete
+  transaction cannot be the smallest migration unit. Apply the import gate until every row arrives. No SQL schema
+  change is needed, but the internal migration cursor and page format must change.
 
 ## 5. Issues that cross both layers
 
@@ -469,7 +556,8 @@ The SQL migrations can still be edited in place.
   - C1: the partial index on `tc_state`.
   - F5: the delete buckets.
   - R5: an index on `learned_at`, if it is wanted.
-- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F8, C2, C4, K6, and the scheduler part of X2.
+- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F8, F11, F12, F13, C2, C4, C5, K6, and the
+  scheduler part of X2. C5 needs an internal migration cursor and page-format change.
 
 ## 7. What was checked and is fine
 
@@ -479,5 +567,6 @@ The SQL migrations can still be edited in place.
 - The idempotency sweep of the coordinator (covering partial index on `completed_at`).
 - The token lookups of the coordinator.
 - Lock release: one `DELETE` by primary key for each owned key.
-- The cleanup batches of promotions and of the coordinator ledger.
+- The item cleanup batches of promotions and the cleanup batches of the coordinator ledger. Lock-copy deletion
+  at completion is separate (F13).
 - The hash arena snapshot: it writes only the used part, and only when the tree grows.
