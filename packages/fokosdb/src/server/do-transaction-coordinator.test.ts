@@ -8,6 +8,7 @@ import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILAB
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import { FokosRouter } from "../sharding/router.js";
+import { FOKOS_KV_KEYS } from "../sharding/sharding-store.js";
 import { IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
 import { DEFAULT_COORDINATOR_CONFIG } from "./host-config.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
@@ -75,6 +76,7 @@ type CoordinatorInternals = {
 	): { page: Array<{ state: { transaction_id: string } }>; nextCursor: string | null };
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
+	markPrepared(transactionId: string, idempotencyToken: string): void;
 	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
 	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
@@ -191,8 +193,8 @@ function tableNames(state: DurableObjectState): string[] {
  * Runs `fn` inside a root coordinator that owns every token. A first request gives the runtime its
  * identity, because each transition of the state machine tests that the coordinator owns the token.
  */
-/** The retry budget of a direct call to a drive method: the one that `recoverTransaction` uses. */
-const BUDGET_MS = DEFAULT_COORDINATOR_CONFIG.recoverTransactionBudgetMs;
+/** The retry budget of a direct call to a drive method: the one that a request uses. */
+const BUDGET_MS = DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs;
 
 async function withCoordinator(
 	fn: (tc: CoordinatorInternals, state: DurableObjectState, ctx: FokosDBRouteContext) => void | Promise<void>,
@@ -398,16 +400,34 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("still drives recovery and runs its recovery job above the database size guard", async () => {
+	it("still answers a recovery call and runs its recovery job above the database size guard", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
 
-			await tc.recoverTransactionLocal(TX_ID);
+			await expect(tc.recoverTransactionLocal(TX_ID)).resolves.toEqual({ state: "driving" });
 			await tc.recoverStaleTransactions();
 
-			expect(recover).toHaveBeenCalledTimes(2);
+			expect(recover).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	// Calls from many participants must not start one drive each. The call makes the job due, and the
+	// job drives the transaction.
+	it("answers a recovery call for an incomplete transaction at once, and makes the tx_recovery job due", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			const recover = vi.spyOn(tc, "runPrepareRecovery").mockResolvedValue();
+			const now = Date.now();
+			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+
+			await expect(tc.recoverTransactionLocal(TX_ID)).resolves.toEqual({ state: "driving" });
+
+			expect(recover).not.toHaveBeenCalled();
+			expect(state.storage.kv.get<Record<string, { nextRunAt: number }>>(FOKOS_KV_KEYS.JOBS)?.tx_recovery?.nextRunAt).toBeLessThanOrEqual(
+				now,
+			);
 		});
 	});
 
@@ -1107,6 +1127,76 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 
 			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
 			expect(row.state).toBe("PREPARED");
+		});
+	});
+
+	// Two drives of one transaction run at the same time. The other drive wrote its decision while this
+	// drive waited for a prepare answer. A fan-out that follows the losing decision breaks atomicity:
+	// a cancel releases a lock that the commit must apply, and the participant then answers the commit
+	// with the idempotent success.
+	describe("a drive whose decision lost to a concurrent drive", () => {
+		// The row is new, so the `tx_recovery` job of the coordinator does not drive it as a third drive.
+		function twoParticipants(state: DurableObjectState) {
+			seed(state, "PREPARING", undefined, Date.now());
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1" });
+			insertParticipant(state, { name: "p2" });
+		}
+
+		function mockPartitions(p2Prepare: () => Promise<unknown>) {
+			const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
+			const txCancel = vi.fn(async () => enveloped(undefined));
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				(_env, _ctx, name) =>
+					({
+						txPrepare: name === "p1" ? async () => enveloped({ outcome: "accepted" as const }) : p2Prepare,
+						txCommit,
+						txCancel,
+					}) as unknown as DurableObjectStub<PartitionDO>,
+			);
+			return { txCommit, txCancel };
+		}
+
+		// The coordinator is shared with other tests, and a background drive of their transactions can
+		// use these mocks. Only the calls for this transaction count.
+		const callsFor = (fn: ReturnType<typeof vi.fn>) =>
+			fn.mock.calls.filter((args) => (args[1] as { transactionId?: string } | undefined)?.transactionId === TX_ID);
+
+		const stateOf = (state: DurableObjectState) =>
+			state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).one().state;
+
+		it("sends no cancel when the other drive decided commit", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state);
+				const { txCommit, txCancel } = mockPartitions(async () => {
+					// The other drive received an accept from p2 and wrote the commit decision.
+					tc.markPrepared(TX_ID, TOKEN);
+					throw new Error("p2 unreachable from this drive");
+				});
+
+				await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("transaction_commit_pending"));
+
+				expect(callsFor(txCancel)).toEqual([]);
+				expect(callsFor(txCommit)).toEqual([]);
+				expect(stateOf(state)).toBe("PREPARED");
+			});
+		});
+
+		it("sends no commit when the other drive decided cancel", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state);
+				const { txCommit, txCancel } = mockPartitions(async () => {
+					// The other drive reached the hold limit and wrote the cancel decision.
+					tc.cancelTransactionInStore(TX_ID, TOKEN);
+					return enveloped({ outcome: "accepted" as const });
+				});
+
+				await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
+
+				expect(callsFor(txCommit)).toEqual([]);
+				expect(callsFor(txCancel)).toEqual([]);
+				expect(stateOf(state)).toBe("CANCELLING");
+			});
 		});
 	});
 

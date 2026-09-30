@@ -79,12 +79,6 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	 * budget, one participant that cannot be reached holds the request for a long time.
 	 */
 	fanoutRequestBudgetMs: number;
-	/**
-	 * How long the coordinator retries its participants when the stale job of a partition asks it to
-	 * finish a transaction. The partition waits for the answer. When the time ends and the transaction
-	 * is not complete, the coordinator leaves it to the `tx_recovery` job.
-	 */
-	recoverTransactionBudgetMs: number;
 	/** The retries of each call from the coordinator to a participant. */
 	participantRetry: ParticipantRetryConfig;
 	/**
@@ -127,7 +121,6 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFreeze({
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	fanoutRequestBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
-	recoverTransactionBudgetMs: 10_000,
 	participantRetry: { baseDelayMs: 100, maxDelayMs: 2_000, prepareMaxAttempts: 3, prepareRecoveryMaxAttempts: 5 },
 	alarmRecoveryBudgetMs: 30_000,
 	sweepBatchRows: 1_000,
@@ -168,7 +161,6 @@ export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConf
 		c.staleTransactionMs >= c.fanoutRequestBudgetMs,
 		() => `staleTransactionMs (${c.staleTransactionMs}) must be at least fanoutRequestBudgetMs (${c.fanoutRequestBudgetMs})`,
 	);
-	checkInteger(c, "recoverTransactionBudgetMs", 1);
 	const retry = c.participantRetry;
 	checkInteger(retry, "baseDelayMs", 1, "participantRetry.");
 	checkInteger(retry, "maxDelayMs", 1, "participantRetry.");

@@ -20,7 +20,7 @@ import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { unexpectedTransactionStateError } from "../errors-operations.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import type { PartitionStore, StalePendingTx } from "./partition-store.js";
+import type { PartitionStore, PendingTxInfo, StalePendingTx } from "./partition-store.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -80,11 +80,20 @@ export function ownsByHashKey(
 	};
 }
 
+/**
+ * The longest wait between two attempts to recover one stale transaction. A coordinator that answers
+ * `driving`, or that does not answer, leaves the lock in place, and the next attempt waits.
+ */
+const STALE_RECOVERY_MAX_DELAY_MS = 30_000;
+
 // A pending check cannot change the item, so a transactional read may serialize on either side of it.
 // Allowlist the read-only operations: an operation the code does not know counts as a pending write.
 const READ_ONLY_PENDING_OPERATIONS: ReadonlySet<string> = new Set(["check"]);
 
 type ItemStamp = { last_read_ts: number; last_write_ts: number };
+
+/** One lock row of a transaction, as commit reads it. */
+type PendingLock = ReturnType<PartitionStore["listPendingTxItems"]>[number];
 
 /**
  * The item timestamps of the row that a condition or an update probe read, or undefined when it
@@ -104,6 +113,8 @@ export type TransactionParticipantDeps = {
 	now?: () => number;
 	/** A prepare whose timestamp is more than this far ahead of the local clock is rejected (clock_skew). Read at each prepare. */
 	maxClockSkewMs: () => number;
+	/** How long a lock waits before the stale-transaction job asks its coordinator about it. Read at each use. */
+	staleTransactionMs: () => number;
 	/**
 	 * The transaction order timestamp of a single-shot transaction. Injectable so tests can pin it;
 	 * defaults to txOrderTimestampNow.
@@ -141,6 +152,7 @@ export class TransactionParticipant {
 	#store: PartitionStore;
 	#now: () => number;
 	#maxClockSkewMs: () => number;
+	#staleTransactionMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
 	#owns: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 
@@ -148,6 +160,7 @@ export class TransactionParticipant {
 		this.#store = deps.store;
 		this.#now = deps.now ?? (() => Date.now());
 		this.#maxClockSkewMs = deps.maxClockSkewMs;
+		this.#staleTransactionMs = deps.staleTransactionMs;
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
 		this.#owns = deps.owns ?? (() => true);
 	}
@@ -333,36 +346,29 @@ export class TransactionParticipant {
 			}
 
 			// All checks passed — lock every item.
+			const tx: PendingTxInfo = {
+				transaction_id: request.transactionId,
+				transaction_ts: request.transactionTimestamp,
+				coordinator_json: coordinatorJson,
+				created_at: now,
+				guarded_at: null,
+				next_recovery_at: now + this.#staleTransactionMs(),
+			};
 			for (const item of request.items) {
 				const sk = item.sortKey;
 				if (item.operation === "update") {
 					invariant(item.update, "fokos/partition.prepare: update item missing update plan");
-					this.#store.insertPendingUpdateLock({
-						hk: item.hashKey,
-						sk,
-						transaction_id: request.transactionId,
-						transaction_ts: request.transactionTimestamp,
-						created_at: this.#now(),
-						coordinator_json: coordinatorJson,
-						plan: item.update,
-						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
-						ttlAt: item.ttlAt,
-					});
+					this.#store.insertPendingUpdateLock({ hk: item.hashKey, sk, tx, plan: item.update, ttlAt: item.ttlAt });
 				} else {
 					this.#store.insertPendingLock({
+						...tx,
 						hk: item.hashKey,
 						sk,
-						transaction_id: request.transactionId,
-						transaction_ts: request.transactionTimestamp,
 						operation: item.operation,
 						data: item.data ?? null,
 						// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
 						kind: item.kind ?? null,
-						conditions_json: item.condition ? JSON.stringify(item.condition) : null,
 						ttl_epoch_utc_seconds: item.ttlAt ?? null,
-						coordinator_json: coordinatorJson,
-						created_at: this.#now(),
-						guarded_at: null,
 					});
 				}
 			}
@@ -386,26 +392,26 @@ export class TransactionParticipant {
 			// synchronous block. A row outside the request is owned only when `owns()` says so. On the
 			// usual path no row is outside the request, and the method does not call `owns()`.
 			const ownsRow = ownsByHashKey(this.#owns);
-			const ownedKeySet = new Set<ReturnType<typeof KeyCodec.pairKey>>();
-			for (const row of this.#store.listPendingTxKeys(request.transactionId)) {
+			const ownedRows = new Map<ReturnType<typeof KeyCodec.pairKey>, PendingLock>();
+			for (const row of this.#store.listPendingTxItems(request.transactionId)) {
 				const key = KeyCodec.pairKey(row.hk, row.sk);
 				if (requestKeySet.has(key) || ownsRow(row)) {
-					ownedKeySet.add(key);
+					ownedRows.set(key, row);
 				}
 			}
 			// No owned row remains: the rows are gone, or only copies remain. This partition has no
 			// local work, and the answer is the idempotent success.
-			if (ownedKeySet.size === 0) {
+			if (ownedRows.size === 0) {
 				return;
 			}
-			if (ownedKeySet.size !== requestKeySet.size) {
+			if (ownedRows.size !== requestKeySet.size) {
 				throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 					message: "pending_transactions and the commit request hold a different number of items",
-					attributes: { transactionId: request.transactionId, pendingItems: ownedKeySet.size, requestItems: requestKeySet.size },
+					attributes: { transactionId: request.transactionId, pendingItems: ownedRows.size, requestItems: requestKeySet.size },
 				});
 			}
 			for (const key of requestKeySet) {
-				if (!ownedKeySet.has(key)) {
+				if (!ownedRows.has(key)) {
 					throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 						message: "a commit request item is not found in pending_transactions",
 						attributes: { transactionId: request.transactionId, key: String(key) },
@@ -413,7 +419,7 @@ export class TransactionParticipant {
 				}
 			}
 
-			this.#applyCommitItems(request.transactionId, request.transactionTimestamp, request.items, promotionCandidates);
+			this.#applyCommitItems(request.items, ownedRows, request.transactionTimestamp, promotionCandidates);
 			// The owned set and the request have the same keys here. The release deletes these keys one
 			// by one, and keeps the copies of a moved key.
 			this.#store.deletePendingTxKeys(request.transactionId, request.items);
@@ -422,17 +428,17 @@ export class TransactionParticipant {
 		return { response: { outcome: "committed" }, promotionCandidates };
 	}
 
-	// Items are keys only: every per-item fact applied here (operation, data, kind, conditions) comes
-	// from the partition's own pending_transactions row that prepare wrote.
+	// Items are keys only: every per-item fact applied here (operation, data, kind) comes from the
+	// partition's own pending_transactions row that prepare wrote. The caller read these rows once.
 	#applyCommitItems(
-		transactionId: string,
-		transactionTimestamp: number,
 		items: TransactionItemKey[],
+		pendingRows: ReadonlyMap<ReturnType<typeof KeyCodec.pairKey>, PendingLock>,
+		transactionTimestamp: number,
 		promotionCandidates: PromotionCandidate[],
 	): void {
 		for (const item of items) {
 			const sk = item.sortKey;
-			const pendingRow = this.#store.getPendingTxOp(item.hashKey, sk, transactionId);
+			const pendingRow = pendingRows.get(KeyCodec.pairKey(item.hashKey, sk));
 
 			if (!pendingRow) {
 				continue;
@@ -656,8 +662,26 @@ export class TransactionParticipant {
 		return { items: results };
 	}
 
-	/** Transactions whose locks are older than `staleMs` — the DO drives recovery via the TC. */
-	listStaleTransactions(staleMs: number, limit: number): StalePendingTx[] {
-		return this.#store.listStalePendingTx(this.#now() - staleMs, limit);
+	/**
+	 * The stale transactions that are due, at most `limit` of them. It moves the next attempt of each
+	 * one forward in the same storage transaction, before the caller asks a coordinator. So a lock that
+	 * stays, because the coordinator answers `driving` or does not answer, does not keep the deadline
+	 * of the job in the past, and does not block the other transactions.
+	 *
+	 * The wait is half the age of the transaction, at least `staleTransactionMs` and at most
+	 * STALE_RECOVERY_MAX_DELAY_MS. A lock of 10 seconds waits 5 seconds, a lock of 40 seconds waits
+	 * 20 seconds, and a lock of 10 minutes waits 30 seconds.
+	 */
+	claimStaleTransactions(limit: number): StalePendingTx[] {
+		const now = this.#now();
+		const staleMs = this.#staleTransactionMs();
+		return this.#store.transactionSync(() => {
+			const rows = this.#store.listStalePendingTx(now, limit);
+			for (const row of rows) {
+				const delayMs = Math.max(staleMs, Math.min((now - row.created_at) / 2, STALE_RECOVERY_MAX_DELAY_MS));
+				this.#store.deferPendingTxRecovery(row.transaction_id, now + Math.ceil(delayMs));
+			}
+			return rows;
+		});
 	}
 }

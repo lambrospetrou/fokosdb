@@ -167,25 +167,31 @@ export type ItemLinkId = number & { readonly [ITEM_LINK_ID_BRAND]: true };
 /** A stored item as migration copies it: the item and its link id. Query results never carry the id. */
 export type MigratedItem = StoredItem & { item_id: ItemLinkId };
 
-export type PendingTransactionRow = {
-	hk: KeyBytes;
-	sk: KeyBytes;
+/** The facts of one transaction that are the same for each of its locks: one `pending_tx_info` row. */
+export type PendingTxInfo = {
 	transaction_id: string;
 	transaction_ts: number;
-	operation: string;
-	// data and its kind are absent together: null for delete/check ops, present for put.
-	data: string | Uint8Array | null;
-	kind: DataKind | null;
-	conditions_json: string | null;
-	ttl_epoch_utc_seconds: number | null;
 	/** The JSON `CoordinatorRef` of the coordinator that drives the transaction. */
 	coordinator_json: string;
 	created_at: number;
 	guarded_at: number | null;
+	/** The earliest time at which the stale-transaction job asks the coordinator about this transaction. */
+	next_recovery_at: number;
 };
 
-/** One stale transaction of the lock table, with what the recovery job needs to reach its coordinator. */
-export type StalePendingTx = Pick<PendingTransactionRow, "transaction_id" | "coordinator_json">;
+/** One lock and the facts of its transaction, as prepare writes them and as migration copies them. */
+export type PendingTxItem = PendingTxInfo & {
+	hk: KeyBytes;
+	sk: KeyBytes;
+	operation: string;
+	// data and its kind are absent together: null for delete/check ops, present for put.
+	data: string | Uint8Array | null;
+	kind: DataKind | null;
+	ttl_epoch_utc_seconds: number | null;
+};
+
+/** One stale transaction, with what the recovery job needs to reach its coordinator and to set its next attempt. */
+export type StalePendingTx = Pick<PendingTxInfo, "transaction_id" | "coordinator_json" | "created_at">;
 
 export type PendingTransactionCursor = { hk: KeyBytes; sk: KeyBytes; transaction_id: string };
 
@@ -311,9 +317,9 @@ export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
 	return bytes;
 }
 
-export function estimatePendingTxBytes(row: PendingTransactionRow): number {
+export function estimatePendingTxBytes(row: PendingTxItem): number {
 	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + 8 + dataSize + (row.conditions_json?.length ?? 0) * 2 + 64;
+	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + 8 + dataSize + row.coordinator_json.length * 2 + 64;
 }
 
 /**
@@ -486,6 +492,15 @@ const sqlMigrations: SQLSchemaMigration[] = [
 	{
 		idMonotonicInc: 2,
 		description: "Create transaction support tables",
+		// A transaction has one `pending_tx_info` row and one `pending_transactions` row for each key that it
+		// locks here. The facts that are the same for each key of the transaction are stored one time.
+		// A `pending_tx_info` row stays while a lock row of its transaction stays, copies of a moved key
+		// included, and the statement that deletes the last lock row also deletes it.
+		//
+		// `pending_tx_info_due` holds only the unguarded transactions. The stale-transaction job reads its
+		// deadline and its batch from this index, one entry for each transaction. Each attempt moves
+		// `next_recovery_at` forward, so a lock that stays does not keep the deadline in the past.
+		//
 		// pending_transactions is a rowid table on purpose. Do NOT add WITHOUT ROWID back: it has the
 		// same defect here as in `items`.
 		// WITHOUT ROWID stores rows in an index B-tree with a ~1002-byte inline payload limit on a 4 KiB
@@ -497,37 +512,38 @@ const sqlMigrations: SQLSchemaMigration[] = [
 		// from the primary key.
 		//
 		// pending_transactions_transaction_id exists because `transaction_id` is the THIRD primary key
-		// column and so cannot be seeked on its own. Every whole-transaction operation filters by it —
-		// listPendingTxKeys and listPendingTxItems. Also, listPendingTxKeys runs on every commit, so
-		// without this index the cost of committing ONE transaction is O(all pending rows in the
-		// partition). Measured over 20k pending rows: 147 page reads drop to 3, and listPendingTxItems
-		// drops from 2859 to 8. A per-key statement —
-		// guardPendingTx, deletePendingTxKeys — seeks the primary key instead.
+		// column and so cannot be seeked on its own. Every whole-transaction operation filters by it:
+		// listPendingTxItems, and the delete of the `pending_tx_info` row. listPendingTxItems runs on every
+		// commit, so without this index the cost of committing ONE transaction is O(all pending rows in
+		// the partition). A per-key statement, deletePendingTxKeys, seeks the primary key instead.
 		//
-		// Its key carries (hk, sk) EXPLICITLY, and that is what pays for the rowid table. A rowid table
-		// appends only the rowid to an index entry, so a key of `transaction_id` alone would send
-		// listPendingTxKeys — a commit-and-abort path — back to one table fetch per row, and SQLite would
-		// also stop choosing pending_transactions_created_at for listStalePendingTx and scan this index
-		// instead. The explicit (hk, sk) keeps both plans. (A WITHOUT ROWID table appends the whole
-		// primary key instead, which is what covered these queries for free before.)
+		// Its key carries (hk, sk) EXPLICITLY. A rowid table appends only the rowid to an index entry, so
+		// a key of `transaction_id` alone would make the existence test of the last lock row and the
+		// key list of a commit read the table.
 		sql: `
+            CREATE TABLE IF NOT EXISTS pending_tx_info (
+                transaction_id   TEXT    NOT NULL PRIMARY KEY,
+                transaction_ts   INTEGER NOT NULL,
+                created_at       INTEGER NOT NULL,
+                coordinator_json TEXT    NOT NULL,
+                guarded_at       INTEGER,
+                next_recovery_at INTEGER NOT NULL
+            ) STRICT;
+
+            CREATE INDEX IF NOT EXISTS pending_tx_info_due ON pending_tx_info (next_recovery_at) WHERE guarded_at IS NULL;
+
             CREATE TABLE IF NOT EXISTS pending_transactions (
                 hk                    BLOB    NOT NULL,
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 transaction_id        TEXT    NOT NULL,
-                transaction_ts        INTEGER NOT NULL,
-				created_at            INTEGER NOT NULL,
-				coordinator_json      TEXT    NOT NULL DEFAULT '',
                 operation             TEXT    NOT NULL,
                 data_kind             INTEGER, -- NULL for delete/check (no data); set for put
-                conditions_json       TEXT,
                 ttl_epoch_utc_seconds INTEGER,
-				guarded_at            INTEGER,
-				data                  ANY,
+                data                  ANY,
+
                 PRIMARY KEY (hk, sk, transaction_id)
             ) STRICT;
 
-            CREATE INDEX IF NOT EXISTS pending_transactions_created_at ON pending_transactions (created_at);
             CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id ON pending_transactions (transaction_id, hk, sk);
 
             CREATE TABLE IF NOT EXISTS deletion_metadata (
@@ -555,34 +571,17 @@ const sqlMigrations: SQLSchemaMigration[] = [
 // The store
 // ---------------------------------------------------------------------------
 
-/** The moved-key fragment of a store that no sharding runtime answers for: an empty set of keys. */
-const NO_MOVED_HASH_KEYS = `SELECT NULL WHERE 0`;
-
 export class PartitionStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
-	#movedHashKeys: () => string;
 
-	/**
-	 * `movedHashKeys` returns the SQL fragment of the hash keys that this partition promoted away and
-	 * that have copies here. The stale scans exclude the rows of these keys, because the range root
-	 * owns them now. The copies stay until the completion of the promotion deletes them. The store
-	 * calls the callback when it runs a statement, because the host creates the store before the
-	 * runtime that answers it. A store with no runtime holds no promotion, so the default names no key.
-	 */
-	constructor(storage: DurableObjectStorage, movedHashKeys: () => string = () => NO_MOVED_HASH_KEYS) {
+	constructor(storage: DurableObjectStorage) {
 		this.#storage = storage;
-		this.#movedHashKeys = movedHashKeys;
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
 			keyNameTrackingLastMigrationID: "__fokosdb/partition/sql_schema_version",
 		});
-	}
-
-	/** `hk NOT IN (...)`: the rows of the keys that this partition owns, without the copies of a moved key. */
-	#ownedRows(): string {
-		return `hk NOT IN (${this.#movedHashKeys()})`;
 	}
 
 	runMigrations(): void {
@@ -1321,27 +1320,44 @@ export class PartitionStore {
 		);
 	}
 
+	/**
+	 * Writes the `pending_tx_info` row of a transaction, or merges `tx` into the row that exists. A merge
+	 * keeps a guard and the earlier next attempt, and writes nothing when neither changes. Each
+	 * lock insert calls it, so a migration page that repeats the row of a transaction is safe.
+	 */
+	#upsertPendingTx(tx: PendingTxInfo): void {
+		this.#storage.sql.exec(
+			`INSERT INTO pending_tx_info (transaction_id, transaction_ts, created_at, coordinator_json, guarded_at, next_recovery_at)
+			 VALUES (?, ?, ?, ?, ?, ?)
+			 ON CONFLICT (transaction_id) DO UPDATE SET
+			   guarded_at = COALESCE(guarded_at, excluded.guarded_at),
+			   next_recovery_at = MIN(next_recovery_at, excluded.next_recovery_at)
+			 WHERE (guarded_at IS NULL AND excluded.guarded_at IS NOT NULL) OR excluded.next_recovery_at < next_recovery_at`,
+			tx.transaction_id,
+			tx.transaction_ts,
+			tx.created_at,
+			tx.coordinator_json,
+			tx.guarded_at,
+			tx.next_recovery_at,
+		);
+	}
+
 	/** Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. */
-	insertPendingLock(row: PendingTransactionRow): void {
+	insertPendingLock(row: PendingTxItem): void {
+		this.#upsertPendingTx(row);
 		this.#storage.sql.exec(
 			// pending_transactions is never queried by JSON path, so a put's json data is stored raw, as
 			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
 			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
-			`INSERT OR IGNORE INTO pending_transactions
-			   (hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_json, created_at, guarded_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, data, data_kind, ttl_epoch_utc_seconds)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
 			row.transaction_id,
-			row.transaction_ts,
 			row.operation,
 			row.data,
 			codeFromNullableKind(row.kind),
-			row.conditions_json,
 			row.ttl_epoch_utc_seconds,
-			row.coordinator_json,
-			row.created_at,
-			row.guarded_at,
 		);
 	}
 
@@ -1359,39 +1375,22 @@ export class PartitionStore {
 	 * text bakes the escapes into the blob, so `{"k":"he said \"hi\""}` grows by 4 bytes. Storing the
 	 * blob makes the bytes that `probeUpdate` measured at prepare the exact bytes commit writes.
 	 */
-	insertPendingUpdateLock(opts: {
-		hk: KeyBytes;
-		sk: KeyBytes;
-		transaction_id: string;
-		transaction_ts: number;
-		created_at: number;
-		coordinator_json: string;
-		plan: CompiledUpdatePlan;
-		conditions_json: string | null;
-		ttlAt?: number;
-	}): { rowsRead: number; rowsWritten: number } {
+	insertPendingUpdateLock(opts: { hk: KeyBytes; sk: KeyBytes; tx: PendingTxInfo; plan: CompiledUpdatePlan; ttlAt?: number }): {
+		rowsRead: number;
+		rowsWritten: number;
+	} {
 		validateUpdatePlan(opts.plan);
+		this.#upsertPendingTx(opts.tx);
 		const tail = new StatementTail(opts.plan);
-		const transactionIdParam = tail.param(opts.transaction_id);
-		const transactionTsParam = tail.param(opts.transaction_ts);
-		const createdAtParam = tail.param(opts.created_at);
-		const coordinatorParam = tail.param(opts.coordinator_json);
-		const conditionsParam = tail.param(opts.conditions_json);
+		const transactionIdParam = tail.param(opts.tx.transaction_id);
 		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
 		// here, so the statement carries the branch it needs instead of testing a flag at run time. The
 		// VALUE still binds — see StatementTail for why a per-call value must not be interpolated.
 		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
 
 		const res = this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO pending_transactions (
-				hk, sk, transaction_id, transaction_ts, created_at, coordinator_json,
-				operation, data_kind, conditions_json, ttl_epoch_utc_seconds, guarded_at, data
-			)
-			SELECT ?1, ?2, ${transactionIdParam}, ${transactionTsParam}, ${createdAtParam}, ${coordinatorParam},
-			       'update', ${JSON_KIND_CODE}, ${conditionsParam},
-			       ${ttlExpr},
-			       NULL,
-			       ${opts.plan.documentSql}
+			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, data_kind, ttl_epoch_utc_seconds, data)
+			SELECT ?1, ?2, ${transactionIdParam}, 'update', ${JSON_KIND_CODE}, ${ttlExpr}, ${opts.plan.documentSql}
 			FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
@@ -1485,33 +1484,24 @@ export class PartitionStore {
 	}
 
 	/**
-	 * When the oldest unguarded lock was written, or null when this partition holds none. The scheduler
-	 * asks once per background pass to arm stale-transaction recovery at the moment that lock turns stale.
+	 * The earliest next attempt of an unguarded transaction, or null when there is none. The scheduler
+	 * reads it as the deadline of the stale-transaction job. One seek of `pending_tx_info_due`.
 	 *
-	 * The query walks `pending_transactions_created_at` from its start and stops at the first unguarded
-	 * row, so it costs one seek in the common case where the oldest lock is not guarded.
-	 *
-	 * It skips the copies of a moved key, because this partition cannot recover them. Without that
-	 * clause the oldest copy keeps the deadline in the past for the whole import. The scheduler then
-	 * sets the alarm in the past, and the pass repeats until the copies go.
-	 *
-	 * The clause has a cost while copies exist. The query steps past each copy that is older than the
-	 * oldest owned row, and SQLite counts one read for the index entry and one read for the probe of
-	 * the subquery. Measured with 10,000 such copies and one owned row behind them: 20,003 rows read.
-	 * The scheduler reads this deadline one time before the steps of a pass and one time after them,
-	 * so one pass can read 40,006 rows here. The cost stops when the completion transaction deletes the copies. With no promotion
-	 * in `cutover`, the query reads 2 rows, as before the clause.
+	 * A transaction whose locks here are only copies of a moved key also counts. Its attempt finds no
+	 * owned row and moves the time forward, so it costs one attempt per interval and does not keep the
+	 * deadline in the past.
 	 */
-	earliestUnguardedPendingTxCreatedAt(): number | null {
-		const rows = this.#storage.sql
-			.exec<{ created_at: number }>(
-				`SELECT created_at FROM pending_transactions
-				  WHERE guarded_at IS NULL AND ${this.#ownedRows()} ORDER BY created_at LIMIT 1`,
-			)
-			.toArray();
-		return rows[0]?.created_at ?? null;
+	earliestPendingTxRecoveryAt(): number | null {
+		return (
+			tryOne(
+				this.#storage.sql.exec<{ next_recovery_at: number }>(
+					`SELECT next_recovery_at FROM pending_tx_info WHERE guarded_at IS NULL ORDER BY next_recovery_at LIMIT 1`,
+				),
+			)?.next_recovery_at ?? null
+		);
 	}
 
+	/** The keys that one transaction locks here. It reads only `pending_transactions_transaction_id`. */
 	listPendingTxKeys(transactionId: string): { hk: KeyBytes; sk: KeyBytes }[] {
 		return this.#storage.sql
 			.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`, transactionId)
@@ -1519,136 +1509,99 @@ export class PartitionStore {
 			.map((r) => ({ hk: fromSqlKey(r.hk), sk: fromSqlKey(r.sk) }));
 	}
 
-	getPendingTxOp(
-		hk: KeyBytes,
-		sk: KeyBytes,
-		transactionId: string,
-	): { operation: string; data: string | Uint8Array | null; kind: DataKind | null; ttl_epoch_utc_seconds: number | null } | undefined {
-		const row = tryOne(
-			this.#storage.sql.exec<{
-				operation: string;
-				data: string | ArrayBuffer | null;
-				data_kind: number | null;
-				ttl_epoch_utc_seconds: number | null;
-			}>(
-				`SELECT operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE hk = ? AND sk = ? AND transaction_id = ? LIMIT 1`,
-				hk,
-				sk,
+	/**
+	 * The locked items of one transaction, data converted, each with the facts of its transaction.
+	 * Commit, stale recovery and forced resolution read it. One seek of `pending_tx_info` and one range of
+	 * `pending_transactions_transaction_id`.
+	 */
+	listPendingTxItems(transactionId: string): Omit<PendingTxItem, "transaction_id" | "coordinator_json">[] {
+		const tx = tryOne(
+			this.#storage.sql.exec<{ transaction_ts: number; created_at: number; guarded_at: number | null; next_recovery_at: number }>(
+				`SELECT transaction_ts, created_at, guarded_at, next_recovery_at FROM pending_tx_info WHERE transaction_id = ?`,
 				transactionId,
 			),
 		);
-		return row
-			? {
-					operation: row.operation,
-					data: fromSqlData(row.data),
-					kind: kindFromNullableCode(row.data_kind),
-					ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
-				}
-			: undefined;
-	}
-
-	/** Stale-transaction recovery: the locked items of one transaction, data converted. */
-	listPendingTxItems(transactionId: string): {
-		hk: KeyBytes;
-		sk: KeyBytes;
-		transaction_ts: number;
-		operation: string;
-		data: string | Uint8Array | null;
-		kind: DataKind | null;
-		ttl_epoch_utc_seconds: number | null;
-		created_at: number;
-		guarded_at: number | null;
-	}[] {
-		return this.#storage.sql
-			.exec<{
-				hk: ArrayBuffer;
-				sk: ArrayBuffer;
-				transaction_ts: number;
-				operation: string;
-				data: string | ArrayBuffer | null;
-				data_kind: number | null;
-				ttl_epoch_utc_seconds: number | null;
-				created_at: number;
-				guarded_at: number | null;
-			}>(
-				`SELECT hk, sk, transaction_ts, operation, data, data_kind, ttl_epoch_utc_seconds, created_at, guarded_at
-				 FROM pending_transactions WHERE transaction_id = ?`,
-				transactionId,
-			)
-			.toArray()
-			.map(({ data_kind, ...row }) => ({
-				...row,
+		if (!tx) {
+			return [];
+		}
+		const cursor = this.#storage.sql.exec<{
+			hk: ArrayBuffer;
+			sk: ArrayBuffer;
+			operation: string;
+			data: string | ArrayBuffer | null;
+			data_kind: number | null;
+			ttl_epoch_utc_seconds: number | null;
+		}>(
+			`SELECT hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
+			transactionId,
+		);
+		const items: Omit<PendingTxItem, "transaction_id" | "coordinator_json">[] = [];
+		for (const row of cursor) {
+			items.push({
+				transaction_ts: tx.transaction_ts,
+				created_at: tx.created_at,
+				guarded_at: tx.guarded_at,
+				next_recovery_at: tx.next_recovery_at,
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
+				operation: row.operation,
 				data: fromSqlData(row.data),
-				kind: kindFromNullableCode(data_kind),
-			}));
+				kind: kindFromNullableCode(row.data_kind),
+				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
+			});
+		}
+		return items;
 	}
 
 	/**
-	 * Transactions whose locks are older than `staleBeforeTs`, at most `limit` of them.
-	 *
-	 * `DISTINCT` with a `LIMIT` is not the trap it looks like. SQLite streams it: each row is probed
-	 * against the temp B-tree, a new tuple is emitted immediately, and `LIMIT` stops the scan. The
-	 * B-tree therefore holds at most `limit` tuples, not every matching row. Measured over 20k pending
-	 * rows with only 50 stale: **10 rows read** for `limit = 10`.
-	 *
-	 * The residual cost is one transaction's width, not the table's: all rows of one prepare share a
-	 * `created_at`, so they sit together in the index, and the scan must cross whole transactions to
-	 * collect distinct ids. Worst case measured, 20 transactions of 1000 keys each, all stale:
-	 * 9,000 rows read for 10 results — `limit` x rows-per-transaction.
-	 *
-	 * Two alternatives were measured and are worse. Widening `pending_transactions_created_at` to
-	 * `(created_at, transaction_id, coordinator_json)` makes the plan covering but reads the same
-	 * 9,000 rows, and makes the index larger, because each entry copies `coordinator_json`. A
-	 * `GROUP BY transaction_id ... HAVING MIN(created_at) < ?` walks the `transaction_id` index, which
-	 * cannot use `created_at` at all: 10,000 rows read in the same case, and the whole table in the
-	 * common case where few rows are stale.
-	 *
-	 * The scan skips the copies of a moved key, because their new owner recovers them. The clause
-	 * applies to each row, so the scan still selects a transaction that has one owned row and one
-	 * copy. The cost is the same as on `earliestUnguardedPendingTxCreatedAt`: two rows read for each
-	 * copy that the scan steps past. Measured with 10,000 such copies and one owned stale row: 20,003
-	 * rows read, one time in each pass of the stale job.
+	 * The unguarded transactions whose next attempt is at or before `now`, earliest first, at most
+	 * `limit` of them. One range of `pending_tx_info_due`, one entry for each transaction. The caller moves
+	 * the next attempt of each one forward, so a transaction that stays does not block the others.
 	 */
-	listStalePendingTx(staleBeforeTs: number, limit: number): StalePendingTx[] {
+	listStalePendingTx(now: number, limit: number): StalePendingTx[] {
 		return this.#storage.sql
 			.exec<StalePendingTx>(
-				`SELECT DISTINCT transaction_id, coordinator_json
-                     FROM pending_transactions
-                     WHERE created_at < ? AND guarded_at IS NULL AND ${this.#ownedRows()} LIMIT ?`,
-				staleBeforeTs,
+				`SELECT transaction_id, coordinator_json, created_at FROM pending_tx_info
+				  WHERE guarded_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
+				now,
 				limit,
 			)
 			.toArray();
 	}
 
-	/**
-	 * Quarantines the rows of one transaction under `keys`, and answers whether it changed a row. The
-	 * caller owns these keys. A copy of a key that a promotion moved away keeps its guard state, and
-	 * the migration carries that state to the new owner, which makes the decision.
-	 *
-	 * The method runs one statement per key, by the primary key. A transaction can hold up to
-	 * MAX_ITEMS_PER_TX (100) keys here, and one statement binds at most 100 parameters.
-	 */
-	guardPendingTx(transactionId: string, guardedAt: number, keys: readonly PendingTxKey[]): boolean {
-		let written = 0;
-		for (const key of keys) {
-			written += this.#storage.sql.exec(
-				`UPDATE pending_transactions SET guarded_at = ?
-				  WHERE hk = ? AND sk = ? AND transaction_id = ? AND guarded_at IS NULL`,
-				guardedAt,
-				key.hashKey,
-				key.sortKey,
-				transactionId,
-			).rowsWritten;
-		}
-		return written > 0;
+	/** Sets the next attempt of one transaction. */
+	deferPendingTxRecovery(transactionId: string, nextRecoveryAt: number): void {
+		this.#storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = ? WHERE transaction_id = ?`, nextRecoveryAt, transactionId);
 	}
 
 	/**
-	 * Releases the locks of one transaction under `keys`, one statement per key for the reason on
-	 * guardPendingTx.
+	 * Quarantines one transaction, and answers whether it changed the row. The guard applies to each
+	 * lock of the transaction here, copies of a moved key included. The migration carries it to the
+	 * new owner of a moved key. This is correct because the cause of a guard, a coordinator that
+	 * answers `not_found` for a lock older than the idempotency window, is the same for each key.
+	 */
+	guardPendingTx(transactionId: string, guardedAt: number): boolean {
+		return (
+			this.#storage.sql.exec(
+				`UPDATE pending_tx_info SET guarded_at = ? WHERE transaction_id = ? AND guarded_at IS NULL`,
+				guardedAt,
+				transactionId,
+			).rowsWritten > 0
+		);
+	}
+
+	/** Deletes the `pending_tx_info` row of a transaction that has no lock row left. */
+	#deletePendingTxIfUnlocked(transactionId: string): void {
+		this.#storage.sql.exec(
+			`DELETE FROM pending_tx_info WHERE transaction_id = ?1
+			   AND NOT EXISTS (SELECT 1 FROM pending_transactions WHERE transaction_id = ?1)`,
+			transactionId,
+		);
+	}
+
+	/**
+	 * Releases the locks of one transaction under `keys`, one statement per key. A transaction can hold
+	 * up to MAX_ITEMS_PER_TX (100) keys here, and one statement binds at most 100 parameters.
 	 *
 	 * Do not delete by transaction id alone. That delete also removes the copies of a key that a
 	 * promotion moved away, and the source must keep them until the new owner acknowledges its import.
@@ -1662,6 +1615,7 @@ export class PartitionStore {
 				transactionId,
 			);
 		}
+		this.#deletePendingTxIfUnlocked(transactionId);
 	}
 
 	/**
@@ -1669,12 +1623,21 @@ export class PartitionStore {
 	 * necessary. One statement deletes them all, so a transaction never keeps only a part of its copies.
 	 */
 	deletePendingTxForHashKey(hk: KeyBytes): void {
-		this.#storage.sql.exec(`DELETE FROM pending_transactions WHERE hk = ?`, hk);
+		const transactionIds = new Set(
+			this.#storage.sql
+				.exec<{ transaction_id: string }>(`DELETE FROM pending_transactions WHERE hk = ? RETURNING transaction_id`, hk)
+				.toArray()
+				.map((row) => row.transaction_id),
+		);
+		for (const transactionId of transactionIds) {
+			this.#deletePendingTxIfUnlocked(transactionId);
+		}
 	}
 
 	/** Split completion: children own authoritative copies; the parent's locks are redundant. */
 	deleteAllPendingTx(): void {
 		this.#storage.sql.exec(`DELETE FROM pending_transactions`);
+		this.#storage.sql.exec(`DELETE FROM pending_tx_info`);
 	}
 
 	/**
@@ -1684,31 +1647,27 @@ export class PartitionStore {
 	 * equivalent nested `hk > ? OR (hk = ? AND (...))` form cannot seek, so each page rescans from the
 	 * start of the hash key. All three key columns are NOT NULL, which is what makes row values correct.
 	 */
-	queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTransactionRow[] {
-		type Row = {
+	queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTxItem[] {
+		type Row = Omit<PendingTxItem, "hk" | "sk" | "data" | "kind"> & {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
-			transaction_id: string;
-			transaction_ts: number;
-			operation: string;
 			data: string | ArrayBuffer | null;
 			data_kind: number | null;
-			conditions_json: string | null;
-			ttl_epoch_utc_seconds: number | null;
-			coordinator_json: string;
-			created_at: number;
-			guarded_at: number | null;
 		};
 
-		const cols = `hk, sk, transaction_id, transaction_ts, operation, data, data_kind, conditions_json, ttl_epoch_utc_seconds, coordinator_json, created_at, guarded_at`;
+		// Each row carries the `pending_tx_info` row of its transaction, so the target can write both from one
+		// page. A transaction whose locks span pages sends its row again, and the insert merges it.
+		const select = `SELECT p.hk, p.sk, p.transaction_id, p.operation, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
+		                       t.transaction_ts, t.coordinator_json, t.created_at, t.guarded_at, t.next_recovery_at
+		                  FROM pending_transactions p JOIN pending_tx_info t ON t.transaction_id = p.transaction_id`;
 		let sqlCursor: SqlStorageCursor<Row>;
 		if (!cursor) {
-			sqlCursor = this.#storage.sql.exec<Row>(`SELECT ${cols} FROM pending_transactions ORDER BY hk, sk, transaction_id LIMIT ?`, limit);
+			sqlCursor = this.#storage.sql.exec<Row>(`${select} ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`, limit);
 		} else {
 			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT ${cols} FROM pending_transactions
-				 WHERE (hk, sk, transaction_id) > (?, ?, ?)
-				 ORDER BY hk, sk, transaction_id LIMIT ?`,
+				`${select}
+				 WHERE (p.hk, p.sk, p.transaction_id) > (?, ?, ?)
+				 ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`,
 				cursor.hk,
 				cursor.sk,
 				cursor.transaction_id,
@@ -1716,7 +1675,7 @@ export class PartitionStore {
 			);
 		}
 
-		const rows: PendingTransactionRow[] = [];
+		const rows: PendingTxItem[] = [];
 		for (const { data_kind, ...row } of sqlCursor) {
 			rows.push({
 				...row,

@@ -15,7 +15,7 @@ import type { PartitionDO } from "../../src/server/do-partition.js";
 import { testCoordinatorContext, testCoordinatorRef } from "../stub-helpers.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
-import { IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
 import { captureConsoleError, kb, lockKeys, makeStub, withOpIndex } from "./helpers.js";
 import { CONTROLLED_NS, keepTestLocks, makePartition, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-harness.js";
 
@@ -44,12 +44,6 @@ function cutOverPromotion(state: DurableObjectState, hashKey: string | null): vo
 	}
 }
 
-/** A store over `state` that excludes the copies of a moved key, as the store of the partition does. */
-function storeWithMovedKeys(state: DurableObjectState): PartitionStore {
-	const sharding = new FokosShardingStore(state.storage);
-	return new PartitionStore(state.storage, () => sharding.movedHashKeysSql());
-}
-
 /** Writes the lock row a prepare left before the cutover of its key. */
 function insertLock(
 	state: DurableObjectState,
@@ -67,7 +61,6 @@ function insertLock(
 		operation: "put",
 		data: options?.data ?? "moved-value",
 		kind: "text",
-		conditions_json: null,
 		ttl_epoch_utc_seconds: null,
 		coordinator_json: JSON.stringify({
 			v: 1,
@@ -76,6 +69,7 @@ function insertLock(
 		}),
 		created_at: createdAt,
 		guarded_at: options?.guardedAt ?? null,
+		next_recovery_at: createdAt + DEFAULT_STALE_TRANSACTION_MS,
 	});
 	return store;
 }
@@ -292,26 +286,6 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 		return { ...partition, coordinator, coordinatorDoName };
 	}
 
-	it("selects the same stale rows when a promotion in cutover has no hash key", async () => {
-		const now = Date.now();
-		const { ctx, stub, rpc } = makeStub();
-		await rpc.status(ctx);
-		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
-			insertLock(state, "tx-copy", "alice", { createdAt: now - 20_000 });
-			insertLock(state, "tx-owned", "bob", { createdAt: now - 10_000 });
-			cutOverPromotion(state, "alice");
-			const store = storeWithMovedKeys(state);
-			const selected = () => ({ deadline: store.earliestUnguardedPendingTxCreatedAt(), stale: store.listStalePendingTx(now, 10) });
-
-			const before = selected();
-			expect(before).toEqual({ deadline: now - 10_000, stale: [expect.objectContaining({ transaction_id: "tx-owned" })] });
-			// One NULL in the result of a `NOT IN` subquery makes the predicate NULL for each row. The
-			// fragment excludes the NULL, so the two queries do not change.
-			cutOverPromotion(state, null);
-			expect(selected()).toEqual(before);
-		});
-	});
-
 	it("reads the owner again after the coordinator answers, and changes no row that moved", async () => {
 		const now = Date.now();
 		const { stub, coordinator, coordinatorDoName } = await partitionWithCoordinator();
@@ -360,7 +334,9 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 		});
 	});
 
-	it("quarantines the owned rows of a transaction and leaves its copies unguarded", async () => {
+	// The guard is a fact of the transaction, so it also covers the copy. The migration carries it to
+	// the new owner of the moved key.
+	it("quarantines a transaction with an owned row, and the guard covers its copies", async () => {
 		const now = Date.now();
 		const { stub, coordinator, coordinatorDoName } = await partitionWithCoordinator();
 		const consoleError = captureConsoleError();
@@ -376,8 +352,7 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 			expect(await coordinator().testRecoverCalls()).toBe(1);
 
 			const rows = store.listPendingTxItems(transactionId);
-			expect(rows.find((row) => new TextDecoder().decode(row.hk) === "bob")?.guarded_at).toBe(now);
-			expect(rows.find((row) => new TextDecoder().decode(row.hk) === "alice")?.guarded_at).toBeNull();
+			expect(rows.map((row) => row.guarded_at)).toEqual([now, now]);
 		});
 
 		const guardLogs = consoleError.withMessage(LOCK_AGE_GUARD_LOG).filter((log) => log.transactionId === transactionId);
@@ -400,8 +375,7 @@ async function quarantine(partition: TestPartition, guardedAt: number, ...transa
 	await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
 		for (const transactionId of transactionIds) {
-			const keys = store.listPendingTxKeys(transactionId).map((row) => ({ hashKey: row.hk, sortKey: row.sk }));
-			expect(store.guardPendingTx(transactionId, guardedAt, keys)).toBe(true);
+			expect(store.guardPendingTx(transactionId, guardedAt)).toBe(true);
 		}
 	});
 }

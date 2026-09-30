@@ -27,7 +27,7 @@ import {
 } from "../../src/sharding/partition-id.js";
 import { FokosRouter } from "../../src/sharding/router.js";
 import type { FokosPartitionIdentity } from "../../src/sharding/route-context.js";
-import { PartitionStore, type PendingTransactionRow } from "../../src/shared/partition/partition-store.js";
+import { PartitionStore, type PendingTxItem } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { resolveRuntimeConfig, type FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
 import { FokosMigrationHost } from "../../src/shared/partition/fokos-migration-host.js";
@@ -164,7 +164,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 			await runInDurableObject(testPartitionStub(stubName), async (_i: PartitionDO, state: DurableObjectState) => {
 				const storage = state.storage;
 				const sharding = new FokosShardingStore(storage);
-				const store = new PartitionStore(storage, () => sharding.movedHashKeysSql());
+				const store = new PartitionStore(storage);
 				sharding.runMigrations();
 				store.runMigrations();
 				// The stored identity is what the flow reads back, so a target has none until fokosInit. A
@@ -288,7 +288,7 @@ export function putLock(store: PartitionStore, hk: string, sk: string, transacti
 }
 
 /** One unguarded lock row, for a test that writes it itself or compares an imported copy with it. */
-export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTransactionRow {
+export function lockRow(hk: string, sk: string, transactionId = "tx-1"): PendingTxItem {
 	return {
 		hk: kb(hk),
 		sk: kb(sk),
@@ -297,11 +297,11 @@ export function lockRow(hk: string, sk: string, transactionId = "tx-1"): Pending
 		operation: "put",
 		data: "pending",
 		kind: "text",
-		conditions_json: null,
 		ttl_epoch_utc_seconds: null,
 		coordinator_json: '{"doName":"tc-1"}',
 		created_at: 1,
 		guarded_at: null,
+		next_recovery_at: 1,
 	};
 }
 

@@ -9,7 +9,7 @@
  * The streams run in order and each drains before the next starts:
  *
  *   1. `items`      — the committed rows of the slice.
- *   2. `pending_tx` — the locks of in-flight transactions over the slice, plus the deletion metadata.
+ *   2. `pending_tx_info` — the locks of in-flight transactions over the slice, plus the deletion metadata.
  *
  * The two never merge into one page: `items` holds committed state only, and a pending lock is a
  * separate row that commit or cancel resolves later.
@@ -23,7 +23,7 @@ import {
 	PartitionStore,
 	type MigratedItem,
 	type PendingTransactionCursor,
-	type PendingTransactionRow,
+	type PendingTxItem,
 	type ScanCursor,
 } from "./partition-store.js";
 import type { FokosSlice } from "../../sharding/repartition-slice.js";
@@ -41,7 +41,7 @@ export type FokosDBHostPage =
 	| { stream: "items"; items: MigratedItem[] }
 	| {
 			stream: "pending_tx";
-			pendingTransactions: PendingTransactionRow[];
+			pendingTransactions: PendingTxItem[];
 			deletionMetadata: { maxDeleteTxOrderTs: number; deleteRevision: number };
 	  };
 
@@ -154,7 +154,7 @@ export class FokosMigrationHost implements MigrationHost {
 		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
-		const { rows, nextCursor } = collectBatch<PendingTransactionRow, PendingTransactionCursor>({
+		const { rows, nextCursor } = collectBatch<PendingTxItem, PendingTransactionCursor>({
 			fetchPage: (c, pageSize) => store.queryPendingTxPage(c, pageSize),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
@@ -190,9 +190,9 @@ export class FokosMigrationHost implements MigrationHost {
 	 * Thus the method reads the coordinator reference with no validation, and logs text that it cannot
 	 * read as it is.
 	 */
-	#logQuarantinedLocks(rows: readonly PendingTransactionRow[]): void {
+	#logQuarantinedLocks(rows: readonly PendingTxItem[]): void {
 		try {
-			const byTransaction = new Map<string, PendingTransactionRow[]>();
+			const byTransaction = new Map<string, PendingTxItem[]>();
 			for (const row of rows) {
 				if (row.guarded_at === null) {
 					continue;

@@ -119,8 +119,11 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 		// holds the coordinator that can release it.
 		await runInDurableObject(parent.stub, (_i: PartitionDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO pending_transactions (hk, sk, transaction_id, transaction_ts, created_at, coordinator_json, operation)
-				 VALUES (?, ?, 'tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 'put')`,
+				`INSERT INTO pending_tx_info (transaction_id, transaction_ts, created_at, coordinator_json, next_recovery_at)
+				 VALUES ('tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 6000)`,
+			);
+			state.storage.sql.exec(
+				`INSERT INTO pending_transactions (hk, sk, transaction_id, operation) VALUES (?, ?, 'tx-stale', 'put')`,
 				kb(HELD_KEY),
 				kb("sk"),
 			);
@@ -136,7 +139,9 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 		const locks = await runInDurableObject(
 			child.stub,
 			(_i: PartitionDO, state: DurableObjectState) =>
-				state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_transactions`).toArray()[0].n,
+				state.storage.sql
+					.exec<{ n: number }>(`SELECT (SELECT COUNT(*) FROM pending_transactions) + (SELECT COUNT(*) FROM pending_tx_info) AS n`)
+					.toArray()[0].n,
 		);
 		expect(locks).toBe(0);
 	});

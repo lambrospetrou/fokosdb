@@ -214,7 +214,6 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 				fanoutRequestBudgetMs: SHORT_BUDGET_MS,
 				staleTransactionMs: SHORT_BUDGET_MS,
 				alarmRecoveryBudgetMs: RECOVERY_BUDGET_MS,
-				recoverTransactionBudgetMs: RECOVERY_BUDGET_MS,
 				participantRetry: { baseDelayMs: 10, maxDelayMs: MAX_DELAY_MS },
 			});
 			await makeUnreachable(db, keys[1], "txCommit", "simulated participant outage");
@@ -259,18 +258,16 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			expect(await state()).toBe("COMMITTING");
 		});
 
-		it("ends recoverTransaction at recoverTransactionBudgetMs when a participant never answers", async () => {
-			const { coordinator, token, transactionId, commits, state } = await commitPendingTransaction("recover-transaction-budget");
-			const before = await commits();
+		// The participant does not wait for the fan-out. The `tx_recovery` job drives the transaction.
+		it("answers recoverTransaction at once when a participant never answers", async () => {
+			const { coordinator, token, transactionId, state } = await commitPendingTransaction("recover-transaction-at-once");
 
 			const start = Date.now();
 			const result = await coordinator.recoverTransactionForParticipant({ transactionId, idempotencyToken: token });
 			const elapsed = Date.now() - start;
 
 			expect(result).toEqual({ state: "driving" });
-			expect(await commits()).toBeGreaterThan(before);
-			expect(elapsed).toBeGreaterThanOrEqual(RECOVERY_BUDGET_MS);
-			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS + MAX_DELAY_MS + SLACK_MS);
+			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS);
 			expect(await state()).toBe("COMMITTING");
 		});
 	});

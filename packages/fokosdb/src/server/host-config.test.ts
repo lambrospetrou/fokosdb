@@ -69,7 +69,6 @@ describe("resolveCoordinatorConfig", () => {
 		[{ participantRetry: { baseDelayMs: 2_000 } }, /participantRetry.baseDelayMs must be less than participantRetry.maxDelayMs/],
 		[{ participantRetry: { prepareMaxAttempts: 0 } }, /participantRetry.prepareMaxAttempts must be an integer of at least 1/],
 		[{ participantRetry: { prepareRecoveryMaxAttempts: 0 } }, /prepareRecoveryMaxAttempts must be an integer of at least 1/],
-		[{ recoverTransactionBudgetMs: 0 }, /recoverTransactionBudgetMs must be an integer of at least 1/],
 		[{ alarmRecoveryBudgetMs: 15 * 60_000 }, /alarmRecoveryBudgetMs must be less than 840000/],
 		[{ sweepBatchRows: 0 }, /sweepBatchRows must be an integer of at least 1/],
 		[{ sweepDeleteChunkRows: 101 }, /sweepDeleteChunkRows must be at most 100/],

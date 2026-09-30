@@ -231,11 +231,11 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				operation: "put",
 				data: "recovered",
 				kind: "text",
-				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
 				coordinator_json: JSON.stringify({ v: 1, doName: root.doName, idempotencyToken: token }),
 				created_at: Date.now() - 60_000,
 				guarded_at: null,
+				next_recovery_at: Date.now() - 55_000,
 			});
 			await state.storage.setAlarm(Date.now());
 		});

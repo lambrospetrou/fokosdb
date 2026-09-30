@@ -41,6 +41,7 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 			store,
 			now: () => clock.now,
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
+			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 			txOrderTimestamp: () => clock.now * TX_ORDER_TS_UNITS_PER_MS,
 		});
 		await fn({ participant, store, clock });
@@ -338,7 +339,7 @@ describe("TransactionParticipant - prepare", () => {
 			// The lock row holds the complete new document as JSONB, and inherits the pre-image TTL. It is
 			// the binary form, NOT JSON text, so commit binds exactly the bytes the probe measured at
 			// prepare: a JSONB-to-text-to-JSONB round trip is not size-stable.
-			const pending = store.getPendingTxOp(kb("user"), sk, request.transactionId);
+			const pending = store.listPendingTxItems(request.transactionId)[0];
 			expect(pending?.operation).toBe("update");
 			expect(pending?.kind).toBe("json");
 			expect(pending?.ttl_epoch_utc_seconds).toBe(555);
@@ -372,7 +373,7 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
-	it("persists the compiled condition plan and TTL after prepare accepts it", async () => {
+	it("persists the TTL and the facts of the transaction after prepare accepts it", async () => {
 		await withParticipant(({ participant, store }) => {
 			const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
 			const request = prepareReq({
@@ -381,8 +382,12 @@ describe("TransactionParticipant - prepare", () => {
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 			expect(store.queryPendingTxPage(null, 1)[0]).toMatchObject({
-				conditions_json: JSON.stringify(condition),
 				ttl_epoch_utc_seconds: 777,
+				transaction_ts: request.transactionTimestamp,
+				coordinator_json: JSON.stringify(request.coordinator),
+				created_at: BASE_NOW,
+				guarded_at: null,
+				next_recovery_at: BASE_NOW + DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 			});
 		});
 	});
@@ -715,6 +720,7 @@ describe("TransactionParticipant - commit", () => {
 			const source = new TransactionParticipant({
 				store,
 				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
+				staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 				owns: (key) => {
 					asked.push(KeyCodec.pairForLog(key.hashKey, key.sortKey));
 					return KeyCodec.compare(key.hashKey, kb("moved")) !== 0;
@@ -1037,11 +1043,11 @@ describe("TransactionParticipant - readForTransaction", () => {
 				operation: "frobnicate",
 				data: null,
 				kind: null,
-				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
 				coordinator_json: JSON.stringify(COORDINATOR),
 				created_at: BASE_NOW,
 				guarded_at: null,
+				next_recovery_at: BASE_NOW,
 			});
 			expect(hasPendingWrite()).toBe(true);
 		});
@@ -1071,7 +1077,7 @@ describe("parseCoordinatorRef", () => {
 });
 
 describe("TransactionParticipant - stale transactions", () => {
-	it("lists a transaction only once its locks age past the staleness bound (injected clock)", async () => {
+	it("claims a transaction only once its locks age past the staleness bound (injected clock)", async () => {
 		await withParticipant(({ participant, clock }) => {
 			const request = prepareReq({
 				items: [
@@ -1082,12 +1088,53 @@ describe("TransactionParticipant - stale transactions", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
 			// Locks were created at clock.now — not yet stale.
-			expect(participant.listStaleTransactions(5_000, 10)).toEqual([]);
+			expect(participant.claimStaleTransactions(10)).toEqual([]);
 
-			clock.now += 5_001;
-			expect(participant.listStaleTransactions(5_000, 10)).toEqual([
-				{ transaction_id: request.transactionId, coordinator_json: JSON.stringify(COORDINATOR) },
+			clock.now += DEFAULT_PARTITION_CONFIG.staleTransactionMs;
+			expect(participant.claimStaleTransactions(10)).toEqual([
+				{ transaction_id: request.transactionId, coordinator_json: JSON.stringify(COORDINATOR), created_at: BASE_NOW },
 			]);
+		});
+	});
+});
+
+describe("TransactionParticipant - claimStaleTransactions", () => {
+	// A coordinator that answers `driving` leaves the lock in place. The claim moves the transaction
+	// back before the call, so the next attempt waits and the other transactions come first.
+	it("claims the due transactions and moves each one back by half its age, within the limits", async () => {
+		await withParticipant(({ participant, store, clock }) => {
+			const staleMs = DEFAULT_PARTITION_CONFIG.staleTransactionMs;
+			const lock = (name: string, createdAt: number, nextRecoveryAt: number) =>
+				store.insertPendingLock({
+					hk: kb(name),
+					sk: kb("sk"),
+					transaction_id: name,
+					transaction_ts: createdAt * TX_ORDER_TS_UNITS_PER_MS,
+					operation: "put",
+					data: "v",
+					kind: "text",
+					ttl_epoch_utc_seconds: null,
+					coordinator_json: JSON.stringify(COORDINATOR),
+					created_at: createdAt,
+					guarded_at: null,
+					next_recovery_at: nextRecoveryAt,
+				});
+			for (const [name, ageMs] of Object.entries({ young: 6_000, old: 40_000, ancient: 20 * 60_000 })) {
+				lock(name, BASE_NOW - ageMs, BASE_NOW - ageMs + staleMs);
+			}
+			lock("fresh", BASE_NOW, BASE_NOW + 1);
+
+			const claimed = participant.claimStaleTransactions(10);
+			expect(claimed.map((row) => row.transaction_id)).toEqual(["ancient", "old", "young"]);
+			const nextAttempts = Object.fromEntries(
+				["young", "old", "ancient"].map((name) => [name, store.listPendingTxItems(name)[0].next_recovery_at - BASE_NOW]),
+			);
+			expect(nextAttempts).toEqual({ young: staleMs, old: 20_000, ancient: 30_000 });
+
+			// Nothing is due until the earliest next attempt.
+			expect(participant.claimStaleTransactions(10).map((row) => row.transaction_id)).toEqual([]);
+			clock.now = BASE_NOW + staleMs;
+			expect(participant.claimStaleTransactions(10).map((row) => row.transaction_id)).toEqual(["fresh", "young"]);
 		});
 	});
 });

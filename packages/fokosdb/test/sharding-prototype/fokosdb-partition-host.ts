@@ -527,7 +527,7 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
 				runStep: async () => {
 					// Each stale lock is resolved by its own coordinator, then applied through `dispatch`, because the
 					// keys of the lock can have moved to a child since the lock was written.
-					for (const row of participant.listStaleTransactions(host.fokosStaleTransactionMs(), 10)) {
+					for (const row of participant.claimStaleTransactions(10)) {
 						const pending = todo<{ coordinator: FokosDBRouteContext; idempotencyToken: string }>(`pending row of ${row.transaction_id}`);
 						// A stub to another class. The coordinator's runtime forwards when that coordinator has split.
 						const tc = todo<import("./fokosdb-coordinator-host.js").CoordinatorRpc>(

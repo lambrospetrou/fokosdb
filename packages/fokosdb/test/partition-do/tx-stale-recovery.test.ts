@@ -9,7 +9,7 @@ import { testCoordinatorContext, testCoordinatorStubByName, testPartitionStub } 
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
-import { IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
@@ -38,11 +38,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 			operation: "put",
 			data: options?.data ?? "value",
 			kind: "text",
-			conditions_json: null,
 			ttl_epoch_utc_seconds: null,
 			coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` }),
 			created_at: createdAt,
 			guarded_at: options?.guardedAt ?? null,
+			next_recovery_at: createdAt + DEFAULT_STALE_TRANSACTION_MS,
 		});
 		return store;
 	}
@@ -234,6 +234,70 @@ describe("PartitionDO — stale transaction recovery", () => {
 		);
 	});
 
+	// The coordinator keeps the transaction and drives it itself, so the lock stays. The job moves the
+	// next attempt forward before the call. Without that, the deadline stays in the past and the
+	// scheduler runs the job again after each pass, with one coordinator call each time.
+	it("asks a coordinator that answers driving one time, and arms the alarm at the next attempt", async () => {
+		const now = Date.now();
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		const recoverTransaction = vi.fn(async () => ({ state: "driving" as const }));
+		vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+			recoverTransactionForParticipant: recoverTransaction,
+		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
+		const transactionId = crypto.randomUUID();
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - 10_000 });
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			// The next pass, as the fast path of the scheduler runs it after a pass that ends with a due job.
+			await instance.fokos.runDueWork();
+
+			expect(recoverTransaction).toHaveBeenCalledTimes(1);
+			expect(store.listPendingTxItems(transactionId)[0].next_recovery_at).toBe(now + DEFAULT_STALE_TRANSACTION_MS);
+			expect(await state.storage.getAlarm()).toBe(now + DEFAULT_STALE_TRANSACTION_MS);
+			releasePendingLock(store, transactionId);
+			await state.storage.deleteAlarm();
+		});
+	});
+
+	it("stops starting coordinator calls when the budget of the step ends", async () => {
+		const now = Date.now();
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		const transactionIds = [crypto.randomUUID(), crypto.randomUUID()];
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const clock = vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			// The first call takes the whole budget of the step.
+			const recoverTransaction = vi.fn(async () => {
+				clock.mockReturnValue(now + 10_000);
+				return { state: "driving" as const };
+			});
+			vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+				recoverTransactionForParticipant: recoverTransaction,
+			} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
+			const store = new PartitionStore(state.storage);
+			for (const [index, transactionId] of transactionIds.entries()) {
+				insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+					createdAt: now - 10_000 - index,
+					hashKey: `budget-${index}`,
+				});
+			}
+
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+
+			expect(recoverTransaction).toHaveBeenCalledTimes(1);
+			// The claim moved both transactions forward, so the one that this step did not reach waits.
+			for (const transactionId of transactionIds) {
+				expect(store.listPendingTxItems(transactionId)[0].next_recovery_at).toBeGreaterThan(now);
+				releasePendingLock(store, transactionId);
+			}
+			await state.storage.deleteAlarm();
+		});
+	});
+
 	it("keeps a lock whose coordinator reference it cannot read, and logs why", async () => {
 		const now = Date.now();
 		const { ctx, stub, rpc } = makeStub();
@@ -247,7 +311,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - 10_000 });
 			// A reference that a later version of the code wrote.
 			state.storage.sql.exec(
-				`UPDATE pending_transactions SET coordinator_json = json_set(coordinator_json, '$.v', 2) WHERE transaction_id = ?`,
+				`UPDATE pending_tx_info SET coordinator_json = json_set(coordinator_json, '$.v', 2) WHERE transaction_id = ?`,
 				transactionId,
 			);
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
@@ -389,11 +453,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 				operation: "put",
 				data: "value",
 				kind: "text",
-				conditions_json: null,
 				ttl_epoch_utc_seconds: ttlAt,
 				coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `stale-${transactionId}` }),
 				created_at: transactionTimestamp,
 				guarded_at: null,
+				next_recovery_at: transactionTimestamp + DEFAULT_STALE_TRANSACTION_MS,
 			});
 			await state.storage.setAlarm(Date.now());
 		});

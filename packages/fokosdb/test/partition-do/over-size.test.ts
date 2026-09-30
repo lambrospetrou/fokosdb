@@ -93,8 +93,7 @@ async function prepare(partition: TestPartition, hashKey: string, sortKeys: stri
 async function quarantine(partition: TestPartition, transactionId: string, guardedAt: number): Promise<void> {
 	await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
 		const store = new PartitionStore(state.storage);
-		const keys = store.listPendingTxKeys(transactionId).map((row) => ({ hashKey: row.hk, sortKey: row.sk }));
-		expect(store.guardPendingTx(transactionId, guardedAt, keys)).toBe(true);
+		expect(store.guardPendingTx(transactionId, guardedAt)).toBe(true);
 	});
 }
 

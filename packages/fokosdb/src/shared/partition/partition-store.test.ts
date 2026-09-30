@@ -1012,11 +1012,11 @@ describe("PartitionStore - TTL deletion", () => {
 				operation: "put",
 				data: "pending",
 				kind: "text",
-				conditions_json: null,
 				ttl_epoch_utc_seconds: null,
 				coordinator_json: "{}",
 				created_at: 1,
 				guarded_at: null,
+				next_recovery_at: 1,
 			});
 
 			const first = store.deleteExpiredItems(100, 2);
@@ -1165,12 +1165,22 @@ describe("PartitionStore - pending transactions", () => {
 			operation: "put",
 			data: "d",
 			kind: "text" as const,
-			conditions_json: null,
 			ttl_epoch_utc_seconds: null,
 			coordinator_json: '{"doName":"tc-1"}',
 			created_at: 1000,
 			guarded_at: null,
+			next_recovery_at: 6000,
 		};
+	}
+
+	/** The `pending_tx_info` row of one transaction, or undefined when it does not exist. */
+	function pendingTxRow(state: DurableObjectState, transactionId: string) {
+		return state.storage.sql
+			.exec<{
+				guarded_at: number | null;
+				next_recovery_at: number;
+			}>(`SELECT guarded_at, next_recovery_at FROM pending_tx_info WHERE transaction_id = ?`, transactionId)
+			.toArray()[0];
 	}
 
 	it("insertPendingLock is idempotent and pendingLockFor finds the lock", async () => {
@@ -1192,7 +1202,6 @@ describe("PartitionStore - pending transactions", () => {
 			const row = { ...lockRow("hk", "s", "tx-ttl"), ttl_epoch_utc_seconds: 777 };
 			store.insertPendingLock(row);
 
-			expect(store.getPendingTxOp(row.hk, row.sk, row.transaction_id)?.ttl_epoch_utc_seconds).toBe(777);
 			expect(store.listPendingTxItems(row.transaction_id)[0].ttl_epoch_utc_seconds).toBe(777);
 			expect(store.queryPendingTxPage(null, 1)[0].ttl_epoch_utc_seconds).toBe(777);
 		});
@@ -1211,12 +1220,61 @@ describe("PartitionStore - pending transactions", () => {
 		});
 	});
 
-	it("listStalePendingTx returns only locks created before the threshold", async () => {
+	it("listStalePendingTx returns the due transactions, earliest next attempt first", async () => {
 		await withStore((store) => {
-			store.insertPendingLock({ ...lockRow("a", "1", "tx-old"), created_at: 1000 });
-			store.insertPendingLock({ ...lockRow("b", "1", "tx-new"), created_at: 5000 });
-			const stale = store.listStalePendingTx(2000, 10);
-			expect(stale).toEqual([{ transaction_id: "tx-old", coordinator_json: '{"doName":"tc-1"}' }]);
+			store.insertPendingLock({ ...lockRow("a", "1", "tx-later"), next_recovery_at: 3000 });
+			store.insertPendingLock({ ...lockRow("b", "1", "tx-earlier"), next_recovery_at: 2000 });
+			store.insertPendingLock({ ...lockRow("c", "1", "tx-new"), next_recovery_at: 9000 });
+			expect(store.earliestPendingTxRecoveryAt()).toBe(2000);
+			expect(store.listStalePendingTx(5000, 10).map((row) => row.transaction_id)).toEqual(["tx-earlier", "tx-later"]);
+			expect(store.listStalePendingTx(5000, 1)).toEqual([
+				{ transaction_id: "tx-earlier", coordinator_json: '{"doName":"tc-1"}', created_at: 1000 },
+			]);
+
+			// A transaction that the job tried moves behind the others.
+			store.deferPendingTxRecovery("tx-earlier", 4000);
+			expect(store.earliestPendingTxRecoveryAt()).toBe(3000);
+			expect(store.listStalePendingTx(5000, 10).map((row) => row.transaction_id)).toEqual(["tx-later", "tx-earlier"]);
+		});
+	});
+
+	it("keeps one pending_tx_info row while any lock of its transaction stays", async () => {
+		await withStore((store, state) => {
+			for (const [hk, sk] of [
+				["a", "1"],
+				["a", "2"],
+				["b", "1"],
+			]) {
+				store.insertPendingLock(lockRow(hk, sk, "tx1"));
+			}
+			store.insertPendingLock(lockRow("b", "2", "tx2"));
+			expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_tx_info`).one().n).toBe(2);
+
+			store.deletePendingTxKeys("tx1", [{ hashKey: kb("a"), sortKey: kb("1") }]);
+			expect(pendingTxRow(state, "tx1")).toBeDefined();
+			// A promotion completion deletes the copies of one hash key.
+			store.deletePendingTxForHashKey(kb("a"));
+			expect(pendingTxRow(state, "tx1")).toBeDefined();
+			store.deletePendingTxForHashKey(kb("b"));
+			expect(pendingTxRow(state, "tx1")).toBeUndefined();
+			expect(pendingTxRow(state, "tx2")).toBeUndefined();
+
+			store.insertPendingLock(lockRow("c", "1", "tx3"));
+			store.deleteAllPendingTx();
+			expect(pendingTxRow(state, "tx3")).toBeUndefined();
+			expect(store.hasAnyPendingTx()).toBe(false);
+		});
+	});
+
+	// A migration page repeats the transaction row for each lock row, and a transaction can span pages.
+	it("merges a repeated transaction row: it keeps a guard and the earlier next attempt", async () => {
+		await withStore((store, state) => {
+			store.insertPendingLock({ ...lockRow("a", "1", "tx1"), next_recovery_at: 5000 });
+			store.insertPendingLock({ ...lockRow("a", "2", "tx1"), next_recovery_at: 7000, guarded_at: 4000 });
+			expect(pendingTxRow(state, "tx1")).toEqual({ guarded_at: 4000, next_recovery_at: 5000 });
+			store.insertPendingLock({ ...lockRow("a", "3", "tx1"), next_recovery_at: 3000, guarded_at: null });
+			expect(pendingTxRow(state, "tx1")).toEqual({ guarded_at: 4000, next_recovery_at: 3000 });
+			expect(store.listPendingTxItems("tx1").map((row) => row.guarded_at)).toEqual([4000, 4000, 4000]);
 		});
 	});
 
@@ -1224,12 +1282,12 @@ describe("PartitionStore - pending transactions", () => {
 		await withStore((store) => {
 			store.insertPendingLock(lockRow("a", "1", "tx-guarded"));
 			const guarded = [{ hashKey: kb("a"), sortKey: kb("1") }];
-			expect(store.guardPendingTx("tx-guarded", 2000, guarded)).toBe(true);
-			expect(store.guardPendingTx("tx-guarded", 3000, guarded)).toBe(false);
+			expect(store.guardPendingTx("tx-guarded", 2000)).toBe(true);
+			expect(store.guardPendingTx("tx-guarded", 3000)).toBe(false);
 			expect(store.listPendingTxItems("tx-guarded")[0].guarded_at).toBe(2000);
 			expect(store.hasAnyPendingTx()).toBe(true);
-			expect(store.earliestUnguardedPendingTxCreatedAt()).toBeNull();
-			expect(store.listStalePendingTx(5000, 10)).toEqual([]);
+			expect(store.earliestPendingTxRecoveryAt()).toBeNull();
+			expect(store.listStalePendingTx(10_000, 10)).toEqual([]);
 
 			// Only a forced resolution ends a quarantine, and it deletes the rows.
 			store.deletePendingTxKeys("tx-guarded", guarded);
@@ -1243,10 +1301,12 @@ describe("PartitionStore - pending transactions", () => {
 				const transactionId = `tx-${i}`;
 				store.insertPendingLock(lockRow(`hk-${i}`, "1", transactionId));
 				if (i < 10) {
-					store.guardPendingTx(transactionId, 2000, [{ hashKey: kb(`hk-${i}`), sortKey: kb("1") }]);
+					store.guardPendingTx(transactionId, 2000);
 				}
 			}
-			expect(store.listStalePendingTx(5000, 10)).toEqual([{ transaction_id: "tx-10", coordinator_json: '{"doName":"tc-1"}' }]);
+			expect(store.listStalePendingTx(10_000, 10)).toEqual([
+				{ transaction_id: "tx-10", coordinator_json: '{"doName":"tc-1"}', created_at: 1000 },
+			]);
 		});
 	});
 
@@ -1262,7 +1322,7 @@ describe("PartitionStore - pending transactions", () => {
 		});
 	});
 
-	// transaction_id is the third primary key column, so these four queries can only seek through
+	// transaction_id is the third primary key column, so these queries can only seek through
 	// pending_transactions_transaction_id. Without it they scan the whole table on every commit and
 	// abort. The results stay correct either way, so only the query plan catches the regression.
 	it("whole-transaction queries seek on transaction_id", async () => {
@@ -1275,16 +1335,40 @@ describe("PartitionStore - pending transactions", () => {
 					.join(" | ");
 
 			for (const sql of [
-				`SELECT COUNT(*) AS n FROM pending_transactions WHERE transaction_id = ?`,
+				`SELECT 1 FROM pending_transactions WHERE transaction_id = ?`,
 				`SELECT hk, sk FROM pending_transactions WHERE transaction_id = ?`,
-				`SELECT hk, sk, transaction_ts, operation, data, data_kind FROM pending_transactions WHERE transaction_id = ?`,
-				`DELETE FROM pending_transactions WHERE transaction_id = ?`,
+				`SELECT hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
 			]) {
 				// "SEARCH … (transaction_id=?)" is the seek. Asserting only the index name would also
 				// pass for a full SCAN that happens to walk the same index.
 				expect(plan(sql), sql).toContain("SEARCH");
 				expect(plan(sql), sql).toContain("pending_transactions_transaction_id (transaction_id=?)");
 			}
+		});
+	});
+
+	// The stale-transaction job reads one index entry and one table row for each transaction, in the
+	// order of the index, and it reads no guarded transaction. The deadline stops at the first entry.
+	it("the stale scan and its deadline read the partial index of pending_tx_info", async () => {
+		await withStore((_store, state) => {
+			const plan = (sql: string, ...params: number[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			const deadline = plan(`SELECT next_recovery_at FROM pending_tx_info WHERE guarded_at IS NULL ORDER BY next_recovery_at LIMIT 1`);
+			expect(deadline).toContain("USING INDEX pending_tx_info_due");
+			expect(deadline).not.toContain("TEMP B-TREE");
+			const scan = plan(
+				`SELECT transaction_id, coordinator_json, created_at FROM pending_tx_info
+				  WHERE guarded_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
+				1,
+				10,
+			);
+			expect(scan).toContain("SEARCH pending_tx_info USING INDEX pending_tx_info_due (next_recovery_at<?)");
+			expect(scan).not.toContain("TEMP B-TREE");
 		});
 	});
 

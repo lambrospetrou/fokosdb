@@ -25,7 +25,7 @@ import {
 } from "./repartition-harness.js";
 import type { KeyBytes } from "../../src/sharding/key-codec.js";
 import { TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
-import { MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
+import { DEFAULT_STALE_TRANSACTION_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
 import type { FokosShardingStore, RepartitionKind } from "../../src/sharding/sharding-store.js";
 
 /**
@@ -259,18 +259,13 @@ describe("Repartition — initialization and cutover", () => {
 			expect(sharding.listRepartitionTargets("r1", "key_promotion")[0].initialization).toBe("initialized");
 		});
 
-		await root.enter(async ({ source, store, sharding, storage }) => {
+		await root.enter(async ({ source, store, sharding }) => {
 			// A lock that arrives between initialization and cutover also holds nothing back.
 			putLock(store, "alice", "s2", "tx-late");
-			expect(store.earliestUnguardedPendingTxCreatedAt()).toBe(1);
 			expect(await source.sourceStep(T0)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cutover");
-			// Both rows stay as copies for the import of the target. From the cutover, the fragment names
-			// the key, so the stale scans of the source skip the copies.
+			// Both rows stay as copies for the import of the target.
 			expect(lockCount(store, "alice")).toBe(2);
-			expect(movedHashKeys(storage, sharding)).toEqual(["alice"]);
-			expect(store.earliestUnguardedPendingTxCreatedAt()).toBeNull();
-			expect(store.listStalePendingTx(T0, 10)).toEqual([]);
 		});
 
 		// The range root imports the lock that arrived during its initialization, and commits it.
@@ -279,18 +274,21 @@ describe("Repartition — initialization and cutover", () => {
 		await drainImport(rangeRoot);
 		await rangeRoot.enter(({ store }) => {
 			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
-			const participant = new TransactionParticipant({ store, maxClockSkewMs: () => 0 });
+			const participant = new TransactionParticipant({
+				store,
+				maxClockSkewMs: () => 0,
+				staleTransactionMs: () => DEFAULT_STALE_TRANSACTION_MS,
+			});
 			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 2, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
 			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
 			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1")]);
 		});
 
-		// The completion transaction deletes the copies, and the fragment stops naming the key.
+		// The completion transaction deletes the copies.
 		await sendAck(rangeRoot);
-		await root.enter(({ store, sharding, storage }) => {
+		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
 			expect(lockCount(store, "alice")).toBe(0);
-			expect(movedHashKeys(storage, sharding)).toEqual([]);
 		});
 	});
 
@@ -1062,14 +1060,6 @@ async function captureErrorLines(fn: () => Promise<void>): Promise<Record<string
 		logged.mockRestore();
 	}
 	return lines;
-}
-
-/** The hash keys that the moved-key fragment of the runtime names now, as text. */
-function movedHashKeys(storage: DurableObjectStorage, sharding: FokosShardingStore): string[] {
-	return storage.sql
-		.exec<{ hash_key: ArrayBuffer }>(sharding.movedHashKeysSql())
-		.toArray()
-		.map((row) => new TextDecoder().decode(row.hash_key));
 }
 
 /** The first target of this source's split, as a node. */

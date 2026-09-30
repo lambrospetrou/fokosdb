@@ -1090,17 +1090,24 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * `requestBudgetMs` bounds the retries of the fan-out: `fanoutRequestBudgetMs` when a request waits
-	 * on it, `recoverTransactionBudgetMs` for `recoverTransaction`, and the rest of
-	 * `alarmRecoveryBudgetMs` for the `tx_recovery` job. A participant with no answer at the deadline
+	 * on it, and the rest of `alarmRecoveryBudgetMs` for the `tx_recovery` job. A participant with no answer at the deadline
 	 * stays unconfirmed, and the transaction stays non-terminal for the `tx_recovery` job.
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
-		this.transition(idempotencyToken, () =>
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
-				transactionId,
-			),
+		// More than one drive of a transaction can run at the same time: the request, a retry with the
+		// same token, the `tx_recovery` job, and a participant's recovery call. Each one sends commits
+		// only when the stored decision is commit. A drive whose own decision lost sends nothing.
+		const decisionWinner = this.transition(
+			idempotencyToken,
+			() =>
+				this.ctx.storage.sql.exec(
+					`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
+					transactionId,
+				).rowsWritten > 0,
 		);
+		if (!decisionWinner) {
+			return;
+		}
 
 		const stateRow = this.loadStateRow(transactionId)!;
 		// Keys only, as in runCancel: every participant applies the payload from its own
@@ -1156,6 +1163,12 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
 	private async runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
+		// Sends cancels only when the stored decision is cancel, to avoid racy runs breaking atomicity.
+		// A cancel after a commit decision makes a participant release a lock that the commit must apply,
+		// and the participant then answers that commit with the idempotent success.
+		if (this.loadStateRow(transactionId)?.state !== "CANCELLING") {
+			return;
+		}
 		// Keys only: cancel routes on them but never reads the payload, and this path runs on every
 		// contended transaction, so loading up to MAX_PAYLOAD_BYTES of item data would be pure waste.
 		// tc_items is written before any prepare RPC, so a NULL-outcome participant still gets its keys.
@@ -1368,38 +1381,26 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		).completed_at;
 	}
 
-	/** The local handler of `recoverTransaction`. */
+	/**
+	 * The local handler of `recoverTransaction`. It answers from the ledger and does not drive the
+	 * transaction. For a transaction that is not complete, it makes the `tx_recovery` job due now and
+	 * answers `driving`. The job sends the commit or the cancel to the participant, so the participant
+	 * does not need to wait for the fan-out.
+	 *
+	 * A drive here would run beside the other drives of the transaction, one for each call. The job
+	 * runs in the passes of the scheduler, one at a time, so calls from many participants give one drive.
+	 */
 	private async recoverTransactionLocal(transactionId: string): Promise<RecoverTransactionResult> {
-		const row = tryOne(
-			this.ctx.storage.sql.exec<{
-				idempotency_token: string;
-				state: TCState;
-			}>(`SELECT idempotency_token, state FROM tc_state WHERE transaction_id = ?`, transactionId),
-		);
-
-		if (!row) {
+		const state = tryOne(
+			this.ctx.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, transactionId),
+		)?.state;
+		if (state === undefined) {
 			return { state: "not_found" };
 		}
-		if (row.state === "COMMITTED" || row.state === "CANCELLED") {
-			return { state: row.state };
+		if (state === "COMMITTED" || state === "CANCELLED") {
+			return { state };
 		}
-
-		try {
-			await this.driveTransaction(transactionId, row.idempotency_token, row.state, this.config().recoverTransactionBudgetMs);
-		} catch (e) {
-			console.error({
-				message: "fokos/tc: recoverTransaction failed, scheduling recovery",
-				transactionId,
-				error: String(e),
-			});
-			await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
-			return { state: "driving" };
-		}
-		// The budget ended before every participant answered. The `tx_recovery` job continues the transaction.
-		const state = this.loadStateRow(transactionId)?.state;
-		if (state !== undefined && state !== "COMMITTED" && state !== "CANCELLED") {
-			await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
-		}
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
 		return { state: "driving" };
 	}
 

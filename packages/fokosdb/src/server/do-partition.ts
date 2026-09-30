@@ -263,6 +263,12 @@ export type PartitionRpc = FokosShardingRpc & {
 const JOB_STALE_TX_RECOVERY = "stale_tx_recovery";
 
 /**
+ * The longest time that one step of the stale-transaction job starts coordinator calls. The passes of
+ * the scheduler run one at a time, so a long step delays the import and repartition jobs.
+ */
+const STALE_RECOVERY_STEP_BUDGET_MS = 10_000;
+
+/**
  * The most keys that one split decision asks to promote. When this many keys all have promotions
  * that cannot finish, the next large key waits until one of them finishes.
  */
@@ -289,11 +295,12 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		super(ctx, env);
 		// The runtime is created after this store. The callbacks run only when a statement or a
 		// decision needs the answer.
-		this.#store = new PartitionStore(ctx.storage, () => this.fokos.sql.movedHashKeys());
+		this.#store = new PartitionStore(ctx.storage);
 		this.#participant = new TransactionParticipant({
 			store: this.#store,
 			now: () => this.fokosNow(),
 			maxClockSkewMs: () => this.config().maxClockSkewMs,
+			staleTransactionMs: () => this.config().staleTransactionMs,
 			owns: (key) => this.fokos.owns(key),
 		});
 		this.#ttl = new TtlExpiry({
@@ -804,10 +811,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				{
 					name: JOB_STALE_TX_RECOVERY,
 					canRun: () => this.canSweepLocally(),
-					deadline: () => {
-						const createdAt = this.#store.earliestUnguardedPendingTxCreatedAt();
-						return createdAt === null ? null : createdAt + this.config().staleTransactionMs;
-					},
+					deadline: () => this.#store.earliestPendingTxRecoveryAt(),
 					runStep: async () => {
 						await this.recoverStaleTransactions();
 						return { nextRunAt: null };
@@ -1140,9 +1144,19 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * key again in the same synchronous block as the write.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
-		const { staleTransactionMs, staleLockScanRows } = this.config();
-		const staleTxRows = this.#participant.listStaleTransactions(staleTransactionMs, staleLockScanRows);
+		const staleTxRows = this.#participant.claimStaleTransactions(this.config().staleLockScanRows);
+		const deadline = this.fokosNow() + STALE_RECOVERY_STEP_BUDGET_MS;
 		for (const row of staleTxRows) {
+			// The claim moved each transaction forward, so a transaction that this step does not reach
+			// waits for its next attempt.
+			if (this.fokosNow() >= deadline) {
+				break;
+			}
+			// A transaction whose rows here are all copies of a moved key belongs to the new owner, so
+			// this partition does not ask the coordinator about it.
+			if (this.#ownedRows(this.#store.listPendingTxKeys(row.transaction_id)).length === 0) {
+				continue;
+			}
 			try {
 				const ctx = this.fokos.routeContext();
 				// The coordinator that drove the prepare. It forwards the call to the child that now owns the token.
@@ -1176,7 +1190,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					const lockCreatedAt = Math.min(...ownedRows.map((pending) => pending.created_at));
 					const lockAgeMs = now - lockCreatedAt;
 					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
-						if (this.#store.guardPendingTx(row.transaction_id, now, items)) {
+						if (this.#store.guardPendingTx(row.transaction_id, now)) {
 							console.error({
 								...this.logParams(),
 								message: "fokos/partition: lock-age guard: over-age lock with not_found",

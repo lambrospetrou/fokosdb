@@ -958,18 +958,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * SQL text that the host puts into its own statements. A host scan that holds no key cannot call
-	 * `owns()` for each row, and the host must not name a table of the runtime. Thus the runtime
-	 * gives the text.
-	 *
-	 * `movedHashKeys()` selects one column, `hash_key`: the keys whose promotion from this partition
-	 * is in `cutover`. A host excludes the rows of these keys with `hk NOT IN (<fragment>)`.
-	 */
-	readonly sql = {
-		movedHashKeys: (): string => this.#store.movedHashKeysSql(),
-	};
-
-	/**
 	 * True when this partition owns the key now. It reads the topology and the route overrides only,
 	 * never a cache, so a Bloom false positive cannot make a host sweep skip a key it owns.
 	 */
