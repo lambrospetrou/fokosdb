@@ -284,11 +284,19 @@ export type FokosJob = {
  */
 export interface FokosShardingHooks<TPolicy> {
 	/**
-	 * Called after a local success that signals `evaluateSplit`, and by `requestSplitEvaluation`.
-	 * Returns `false`, or `{ data }` when the host wants this partition to split now. `data` is opaque
-	 * and travels in the plan.
+	 * Called after a local success that signals `evaluateSplit`, by `requestSplitEvaluation`, and when
+	 * admission refuses a request. Returns `false`, `{ data }` when the host wants this partition to
+	 * split now, or `{ promote, data }` when the host wants these hash keys promoted, largest first.
+	 * `promote` is never empty, and the runtime queues no split from that answer. `data` is opaque and
+	 * travels in the plan.
+	 *
+	 * Return `false` when no repartition can make this partition smaller. A host that returns a split
+	 * for a partition at its floor makes each child split again at its first refused write.
 	 */
-	evaluateSplit(input: { identity: FokosPartitionIdentity; policy: TPolicy }): false | { data?: unknown };
+	evaluateSplit(input: {
+		identity: FokosPartitionIdentity;
+		policy: TPolicy;
+	}): false | { data?: unknown } | { promote: KeyBytes[]; data?: unknown };
 	/**
 	 * Range partitions only. Returns `childCount - 1` strictly increasing boundaries inside (start, end),
 	 * or null when the host cannot produce valid boundaries yet.

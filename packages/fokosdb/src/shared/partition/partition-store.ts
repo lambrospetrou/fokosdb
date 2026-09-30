@@ -2,7 +2,7 @@ import { SQLSchemaMigration, SQLSchemaMigrations } from "durable-utils/sql-migra
 import { DATA_KINDS, type DataKind, type QuerySelect } from "../types.js";
 import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
-import { one, tryOne } from "../sql-cursor.js";
+import { exists, one, tryOne } from "../sql-cursor.js";
 import {
 	composeQueryStatement,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
@@ -223,6 +223,13 @@ export type QueryCandidateConsumer = (
 export type PromotedKeyStatus = "queued" | "promoting" | "promoted";
 
 export type SqlMetrics = { rowsRead: number; rowsWritten: number };
+
+/**
+ * The range split of one slice: its boundaries, or why it has none.
+ * - `fewer_items`: the slice holds fewer items than children.
+ * - `skewed_bytes`: the bytes are so skewed that the scan finds fewer boundaries than it needs.
+ */
+export type RangeSplitPlan = { boundaries: KeyBytes[] } | { floor: "fewer_items" | "skewed_bytes" };
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -985,8 +992,29 @@ export class PartitionStore {
 	}
 
 	/**
+	 * The first hash key of `table`, and whether another hash key follows it. Two seeks of the index
+	 * that leads with `hk`: `idx_items_scan`, or the primary key of `pending_transactions`. The second
+	 * seek starts past every row of the first key, so the cost does not depend on the row count.
+	 */
+	probeHashKeys(table: "items" | "pending_transactions"): { first: KeyBytes; more: boolean } | null {
+		const sql = this.#storage.sql;
+		const first = tryOne(sql.exec<{ hk: ArrayBuffer }>(`SELECT hk FROM ${table} ORDER BY hk LIMIT 1`));
+		if (!first) {
+			return null;
+		}
+		return { first: fromSqlKey(first.hk), more: exists(sql.exec(`SELECT 1 FROM ${table} WHERE hk > ? LIMIT 1`, first.hk)) };
+	}
+
+	/** `planRangeSplit` without the reason: the boundaries, or null. */
+	computeRangeSplitBoundaries(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): KeyBytes[] | null {
+		const plan = this.planRangeSplit(hashKey, start, end, N);
+		return "boundaries" in plan ? plan.boundaries : null;
+	}
+
+	/**
 	 * Computes N-1 strictly-increasing split boundaries (byte-quantiles) within [start, end) in one
-	 * transactionSync snapshot. Returns null if the slice cannot yield N non-empty children.
+	 * transactionSync snapshot. When the slice cannot yield N non-empty children, it returns the
+	 * reason instead: fewer than N items, or bytes so skewed that the scan finds fewer boundaries.
 	 *
 	 * Each boundary is shortened to the minimum prefix that still separates adjacent data keys (the
 	 * "shortest separator" of the predecessor and crossing key), keeping doNames and topology encoding
@@ -999,21 +1027,21 @@ export class PartitionStore {
 	 * pull sub-slices during migration, so est_bytes[hk] equals the slice's bytes. The start/end SQL
 	 * filter is retained as a defensive bound on the scan.
 	 */
-	computeRangeSplitBoundaries(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): KeyBytes[] | null {
+	planRangeSplit(hashKey: KeyBytes, start: KeyBytes | null, end: KeyBytes | null, N: number): RangeSplitPlan {
 		// Rather than a COUNT(*) pass plus N-1 OFFSET re-walks (~2.5·cnt row touches, all count-balanced),
 		// this reads the O(1) est_bytes total and does a single early-stopping streaming scan that emits a
 		// boundary each time the running est_row_bytes total crosses the next byte threshold, breaking after
 		// the (N-1)th boundary (~0.75·cnt at N=4). Byte-balance — not count-balance — is the right metric
 		// because the split is triggered by size; it also isolates a heavy row into its own child.
-		return this.#storage.transactionSync(() => {
+		return this.#storage.transactionSync((): RangeSplitPlan => {
 			const lower = start ?? KeyCodec.encodeOptional(undefined); // −∞ ⇒ sk >= x'' (the empty sentinel)
 
-			// Total bytes in O(1) from the maintained per-hk estimate. Nothing to split ⇒ null.
+			// Total bytes in O(1) from the maintained per-hk estimate. No bytes ⇒ no items to split.
 			const B =
 				tryOne(this.#storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates WHERE hk = ?`, hashKey))
 					?.est_bytes ?? 0;
 			if (B <= 0) {
-				return null;
+				return { floor: "fewer_items" };
 			}
 
 			// Cheap "≥ N items" guard, O(N) not O(cnt): each child needs ≥ 1 item, so probe with a bounded
@@ -1035,15 +1063,7 @@ export class PartitionStore {
 						),
 			);
 			if (guardRow.n < N) {
-				console.warn({
-					message: "fokos/partition-store.computeRangeSplitBoundaries: cannot split, fewer than N items",
-					hashKey: KeyCodec.keyForLog(hashKey),
-					start: start ? KeyCodec.keyForLog(start) : null,
-					end: end ? KeyCodec.keyForLog(end) : null,
-					N,
-					itemCount: guardRow?.n ?? 0,
-				});
-				return null;
+				return { floor: "fewer_items" };
 			}
 
 			// Single streaming scan, accumulating est_row_bytes and emitting a boundary at each byte threshold.
@@ -1087,10 +1107,10 @@ export class PartitionStore {
 
 			// Boundaries must be strictly above the lower bound and strictly increasing (distinct, non-empty
 			// children). On skewed data the scan may yield fewer than N-1 boundaries; treat any shortfall or
-			// validation failure as "cannot split yet" and return null (the split retries later). This
-			// is the safety net that makes estimate inaccuracy harmless.
+			// validation failure as "cannot split yet" (the split retries later). This is the safety net
+			// that makes estimate inaccuracy harmless.
 			if (boundaries.length !== N - 1) {
-				return null;
+				return { floor: "skewed_bytes" };
 			}
 			for (let i = 0; i < boundaries.length; i++) {
 				invariant(
@@ -1104,7 +1124,7 @@ export class PartitionStore {
 					);
 				}
 			}
-			return boundaries;
+			return { boundaries };
 		});
 	}
 

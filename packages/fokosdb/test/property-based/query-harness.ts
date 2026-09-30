@@ -234,12 +234,9 @@ export async function drainFromCursor(
 // keeps writing to it, so a query runs while a leaf splits and its children still import.
 
 // A key moves into a range tree once it holds `hashSplitMaxSizeMb * promotionFraction`
-// bytes, and a range partition splits once it holds `rangeSplitMaxSizeMb`. A range partition also
-// REFUSES a write above 1.1 times its own threshold, and only a write that applies can queue the
-// split that brings it back under. The seed therefore runs in two phases: it writes just past the
-// promotion threshold, waits for the range root to exist, and only then writes the rest. One phase
-// would hand the fresh range root every byte at once, far above the refusal point, and the tree
-// would never grow past its root.
+// bytes, and a range partition splits once it holds `rangeSplitMaxSizeMb`. The seed writes every
+// hot item in one pass, so the range root can receive more bytes than it accepts. A range root that
+// refuses a write for size queues its own split, and the retry of the write succeeds after the split.
 const TREE_HASH_SPLIT_MAX_SIZE_MB = 1;
 export const RANGE_SPLIT_MAX_SIZE_MB = 0.5;
 const PROMOTE_ITEMS = 72;
@@ -431,19 +428,22 @@ async function putHotRange(db: FokosDB, model: QueryModel, start: number, end: n
 	}
 }
 
+const treeTable = () => makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
+
 /** A new table whose hot key is just past the promotion threshold, so its range root exists. */
 async function promotedTable(): Promise<{ db: FokosDB; model: QueryModel }> {
-	const db = makeTestDB({ hashSplitMaxSizeMb: TREE_HASH_SPLIT_MAX_SIZE_MB, rangeSplitMaxSizeMb: RANGE_SPLIT_MAX_SIZE_MB });
+	const db = treeTable();
 	const model: QueryModel = new Map();
 	await putHotRange(db, model, 0, PROMOTE_ITEMS);
-	// The range root must exist before the rest of the payload arrives. Its name carries "~r.".
+	// The name of a range root carries "~r.".
 	await awaitLeaves(db, (leaves) => leaves.some((name) => name.includes("~r.")), "the hot key is promoted");
 	return { db, model };
 }
 
 export async function buildFixture(): Promise<Fixture> {
-	const { db, model } = await promotedTable();
-	await putHotRange(db, model, PROMOTE_ITEMS, HOT_ITEMS);
+	const db = treeTable();
+	const model: QueryModel = new Map();
+	await putHotRange(db, model, 0, HOT_ITEMS);
 	await Promise.all([
 		...BINARY_SORT_KEYS.map((sortKey) => putAndRecord(db, model, HOT_HASH_KEY, sortKey, hotData(sortKey))),
 		...COLD_SORT_KEYS.map((sortKey, index) => putAndRecord(db, model, COLD_HASH_KEY, sortKey, coldData(sortKey, index))),

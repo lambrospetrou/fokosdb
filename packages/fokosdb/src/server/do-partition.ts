@@ -272,6 +272,8 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	#store: PartitionStore;
 	#participant: TransactionParticipant;
 	#ttl: TtlExpiry;
+	/** True after the split floor was logged. Every refused write runs the decision, so it logs once. */
+	#splitFloorLogged = false;
 	// Best-effort telemetry: which Cloudflare colo this isolate runs in. Populated
 	// non-blocking from the constructor, so it may be undefined for the first few
 	// requests after the DO wakes. Never gate correctness on it.
@@ -717,9 +719,24 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	private hooks(): FokosShardingHooks<FokosDBPolicy> {
 		return {
-			evaluateSplit: ({ identity, policy }) => {
-				const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
-				return maxSizeMb && this.#store.databaseSize > maxSizeMb * 1024 * 1024 ? {} : false;
+			evaluateSplit: (input) => {
+				const decision = this.splitDecision(input.identity, input.policy);
+				if ("answer" in decision) {
+					this.#splitFloorLogged = false;
+					return decision.answer;
+				}
+				// The partition refuses every write until an operator raises the cap or deletes data.
+				if (!this.#splitFloorLogged) {
+					this.#splitFloorLogged = true;
+					console.error({
+						...input.identity.ref,
+						...this.logParams(),
+						message: "fokos/partition: over the split threshold, but no repartition can make this partition smaller",
+						reason: decision.floor,
+						maxSizeBytes: decision.maxSizeBytes,
+					});
+				}
+				return false;
 			},
 			computeRangeBoundaries: ({ hashKey, start, end, childCount }) =>
 				this.#store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
@@ -823,6 +840,41 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			}
 		}
 		return [...largest.values()].filter((c) => c.keyEstBytes >= threshold).map(({ hashKey }) => ({ hashKey }));
+	}
+
+	/**
+	 * The answer of `evaluateSplit`, or `floor` when this leaf is over its cap and no repartition can
+	 * make it smaller. Under the cap it reads the database size only.
+	 *
+	 * A hash leaf probes `items` for two hash keys, and `pending_transactions` when `items` is empty,
+	 * because a pending payload moves with its key. Two keys split. One key is promoted whatever its
+	 * size estimate: the cap reads the physical file, which can be much larger than the estimate. A
+	 * range leaf splits when the planner finds its boundaries, from the same arguments the planner
+	 * passes.
+	 */
+	private splitDecision(
+		identity: FokosPartitionIdentity,
+		policy: FokosDBPolicy,
+	):
+		| { answer: ReturnType<FokosShardingHooks<FokosDBPolicy>["evaluateSplit"]> }
+		| { floor: "no_hash_key" | "fewer_items" | "skewed_bytes"; maxSizeBytes: number } {
+		const maxSizeMb = (identity.kind === "hash" ? policy.hashSplitConditions : policy.rangeSplitConditions)?.maxSizeMb;
+		const maxSizeBytes = (maxSizeMb ?? 0) * 1024 * 1024;
+		if (!maxSizeMb || this.#store.databaseSize <= maxSizeBytes) {
+			return { answer: false };
+		}
+		if (identity.kind === "range") {
+			invariant(identity.range, `fokos/do-partition: range identity must have a range`);
+			const { hashKey, start, end } = identity.range;
+			const plan = this.#store.planRangeSplit(hashKey, start, end, this.fokos.routeContext().rangeConfig.rangeSplitN);
+			return "boundaries" in plan ? { answer: {} } : { floor: plan.floor, maxSizeBytes };
+		}
+		const keys = this.#store.probeHashKeys("items") ?? this.#store.probeHashKeys("pending_transactions");
+		if (!keys) {
+			return { floor: "no_hash_key", maxSizeBytes };
+		}
+		// We have enough items to split.
+		return { answer: keys.more ? {} : { promote: [keys.first] } };
 	}
 
 	// ═══ local handlers ══════════════════════════════════════════════════════

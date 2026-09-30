@@ -1864,6 +1864,10 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			policy: this.policy(),
 		});
 		if (decision !== "allow") {
+			// A write that applies is the other trigger of the split decision, and a partition over its
+			// admission limit applies none. The host hook runs before the throw, and the queue work runs
+			// after the caller has its answer.
+			this.requestSplitEvaluation();
 			throw decision.reject;
 		}
 	}
@@ -1914,13 +1918,31 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	async #evaluateSplit(): Promise<void> {
-		const identity = this.identity();
-		// A router has nothing to split: its targets own the keys.
-		if (this.#source.routerRole()) {
+		// A split row in any state blocks every repartition here, a router included. The check runs
+		// before the host decision, because on a range leaf that decision scans rows.
+		if (this.#store.getSplitRepartition() !== undefined) {
 			return;
 		}
+		const identity = this.identity();
 		const decision = this.#hooks.evaluateSplit({ identity, policy: this.policy() });
 		if (decision === false) {
+			return;
+		}
+		if ("promote" in decision) {
+			for (const hashKey of decision.promote) {
+				try {
+					await this.#requestPromotion(hashKey, decision.data);
+				} catch (error) {
+					// The other keys still get their try. The next decision tries this key again.
+					console.error({
+						...this.#logParams(),
+						message: "fokos/runtime: the promotion of a key that the split decision named failed.",
+						hashKey: KeyCodec.keyForLog(hashKey),
+						error: String(error),
+						errorProps: error,
+					});
+				}
+			}
 			return;
 		}
 		const kind = identity.kind === "hash" ? "hash_split" : "range_split";

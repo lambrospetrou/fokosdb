@@ -269,5 +269,8 @@ export class ControlledPartitionDO extends PartitionDO {
 	/** Replaces the setting overrides of this partition. `{}` restores the defaults. */
 	async testConfig(overrides: PartitionDOConfigOverrides): Promise<void> {
 		this.#config = overrides;
+		// `PartitionDO` caches its settings, and its constructor fills the cache before this class has
+		// its fields. The next read resolves the settings again, with these overrides.
+		(this as unknown as { __cachedConfig?: unknown }).__cachedConfig = undefined;
 	}
 }

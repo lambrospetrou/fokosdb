@@ -337,6 +337,10 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		async (hashSplitConditions) => {
 			await withCoordinator(async (tc, state, ctx) => {
 				const policy = { ...ctx.policy, hashSplitConditions };
+				// A split needs two tokens.
+				for (const token of ["tok-a", "tok-b"]) {
+					insertState(state, { token, transactionId: `tx-${token}`, state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
+				}
 				// One byte above the size limit of a coordinator. Each policy has no size threshold, or a
 				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
 				vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(5 * 1024 * 1024 * 1024 + 1);
@@ -344,10 +348,23 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				await expect(tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, table: ctx, items: [] })).rejects.toThrow(
 					fokosErrorWith("coordinator_over_size"),
 				);
-				expect(countRows(state, "tc_state")).toBe(0);
+				expect(countRows(state, "tc_state")).toBe(2);
 			});
 		},
 	);
+
+	it("does not split above the limit with fewer than two tokens, because a split moves whole tokens", async () => {
+		await withCoordinator(async (tc, state, ctx) => {
+			vi.spyOn(console, "error").mockImplementation(() => {});
+			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(Number.MAX_SAFE_INTEGER);
+			const evaluate = () => tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy: ctx.policy });
+			expect(evaluate()).toBe(false);
+			insertState(state, { token: "tok-a", transactionId: "tx-a", state: "COMMITTED", createdAt: Date.now(), completedAt: Date.now() });
+			expect(evaluate()).toBe(false);
+			insertState(state, { token: "tok-b", transactionId: "tx-b", state: "PREPARING", createdAt: Date.now() });
+			expect(evaluate()).toEqual({});
+		});
+	});
 
 	it("refuses a new transaction when the coordinator is above its database size guard", async () => {
 		await withCoordinator(async (tc, state, ctx) => {

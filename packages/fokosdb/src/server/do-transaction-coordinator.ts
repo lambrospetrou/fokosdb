@@ -321,6 +321,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/** The sharding runtime: identity, routing, splits, and the alarm. The pool grows by hash splits. */
 	readonly fokos: FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>;
 	#migrations: SQLSchemaMigrations;
+	/** True after the split floor was logged. Every refused transaction runs the decision, so it logs once. */
+	#splitFloorLogged = false;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
@@ -435,8 +437,31 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			Math.min((policy.hashSplitConditions.maxSizeMb || Infinity) * 1024 * 1024, this.config().maxDatabaseBytes / ADMISSION_MARGIN);
 		return {
 			// The coordinator splits above the hash split threshold of its table. It also splits above
-			// its own size limit, when that limit is smaller.
-			evaluateSplit: ({ policy }) => (sql.databaseSize > maxBytes(policy) ? {} : false),
+			// its own size limit, when that limit is smaller. A hash split moves whole tokens, so it
+			// cannot make a coordinator with one token or none smaller: that is the floor.
+			evaluateSplit: ({ identity, policy }) => {
+				const databaseSize = sql.databaseSize;
+				const maxSizeBytes = maxBytes(policy);
+				if (databaseSize <= maxSizeBytes) {
+					this.#splitFloorLogged = false;
+					return false;
+				}
+				if (this.hasAtLeastTwoTransactions()) {
+					this.#splitFloorLogged = false;
+					return {};
+				}
+				if (!this.#splitFloorLogged) {
+					this.#splitFloorLogged = true;
+					console.error({
+						message: "fokos/tc: over the split threshold, but a split cannot make this coordinator smaller",
+						...identity.ref,
+						reason: "fewer than two idempotency tokens",
+						databaseSize,
+						maxSizeBytes,
+					});
+				}
+				return false;
+			},
 
 			// A coordinator accepts up to 10% above its split threshold, so the requests that trigger the
 			// split complete. Above that it refuses a NEW transaction only: a replay reads the ledger and
@@ -1528,6 +1553,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/** One seek of the unique token index, and no row read: the admission hook needs only to know that a row exists. */
 	private hasStateRowForToken(idempotencyToken: string): boolean {
 		return exists(this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE idempotency_token = ? LIMIT 1`, idempotencyToken));
+	}
+
+	/** Two seeks of the unique token index. The second seeks past the first token. */
+	private hasAtLeastTwoTransactions(): boolean {
+		const sql = this.ctx.storage.sql;
+		const first = tryOne(
+			sql.exec<{ idempotency_token: string }>(`SELECT idempotency_token FROM tc_state ORDER BY idempotency_token LIMIT 1`),
+		);
+		return first !== undefined && exists(sql.exec(`SELECT 1 FROM tc_state WHERE idempotency_token > ? LIMIT 1`, first.idempotency_token));
 	}
 
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
