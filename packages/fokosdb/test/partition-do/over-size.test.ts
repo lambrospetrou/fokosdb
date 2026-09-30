@@ -207,6 +207,10 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 		const rangeRoot = partition.rangeRoot("large");
 		await partition.awaitPromotedKeyStatus("large", ["promoted"], { drive: [partition, rangeRoot] });
 		expect(await partition.localItemCount("large")).toBeGreaterThan(0);
+		// The completion deleted the estimate, so the decision does not name the key again.
+		await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) => {
+			expect(state.storage.sql.exec(`SELECT 1 FROM key_size_estimates WHERE hk = ?`, kb("large")).toArray()).toEqual([]);
+		});
 		const low = await lowHashCap(partition);
 
 		await expectRefused(low, small[0]);
@@ -226,6 +230,47 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 			expect(await low.get({ hashKey: kb(key), sortKey: kb("sk1") })).toMatchObject({ found: true });
 		}
 		expect(await low.get({ hashKey: kb("large"), sortKey: kb("sk39") })).toMatchObject({ found: true });
+	});
+});
+
+describe("PartitionDO - a hash leaf with more than one large key", () => {
+	it("promotes the second large key while the promotion of the first cannot finish", async () => {
+		const partition = makePartition({ ns: CONTROLLED_NS });
+		// Both keys stay below the promotion threshold of the large cap, so no write promotes them.
+		await putRows(partition, "first", 24, 16 * 1024);
+		await putRows(partition, "second", 12, 16 * 1024);
+		const low = await lowHashCap(partition);
+		const threshold = (low.ctx.policy.hashSplitConditions.maxSizeMb ?? 0) * MB * DEFAULT_PARTITION_CONFIG.promotionFraction;
+		const estimates = await runInDurableObject(partition.stub, (_instance: PartitionDO, state: DurableObjectState) =>
+			state.storage.sql.exec<{ est_bytes: number }>(`SELECT est_bytes FROM key_size_estimates ORDER BY est_bytes DESC`).toArray(),
+		);
+		expect(estimates.map((row) => row.est_bytes >= threshold)).toEqual([true, true]);
+
+		const firstRoot = low.rangeRoot("first");
+		await low.controlled.testHoldPulls({ stream: "items", target: firstRoot.doName });
+		try {
+			await low.rpc.debugForcePromoteKey(low.ctx, { hashKey: kb("first") });
+			await low.awaitPromotedKeyStatus("first", ["promoting"]);
+			await vi.waitFor(async () => expect((await low.controlled.testPullStats()).heldTargets).toContain(firstRoot.doName), {
+				timeout: 10_000,
+				interval: 10,
+			});
+			expect((await firstRoot.status()).migrationStatus).not.toBe("migration_completed");
+
+			await expectRefused(low, "second");
+			await awaitPromotionQueued(low, "second");
+			const secondRoot = await low.awaitPromoted("second");
+
+			expect((await low.status()).splitStatus).toBeUndefined();
+			expect(await secondRoot.get({ hashKey: kb("second"), sortKey: kb("sk11") })).toMatchObject({
+				found: true,
+				item: { data: "x".repeat(16 * 1024) },
+			});
+			expect(await low.promotedKeyStatus("first")).toBe("promoting");
+		} finally {
+			await low.controlled.testReleasePulls();
+		}
+		await low.awaitPromoted("first");
 	});
 });
 

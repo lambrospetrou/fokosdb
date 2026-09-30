@@ -262,6 +262,12 @@ export type PartitionRpc = FokosShardingRpc & {
 /** The host job that asks the coordinator of each stale lock to resolve it. */
 const JOB_STALE_TX_RECOVERY = "stale_tx_recovery";
 
+/**
+ * The most keys that one split decision asks to promote. When this many keys all have promotions
+ * that cannot finish, the next large key waits until one of them finishes.
+ */
+const PROMOTION_CANDIDATES_MAX = 5;
+
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 const keyOf = (item: TransactionItemKey) => ({ hashKey: item.hashKey, sortKey: item.sortKey });
 const rowKeyOf = (row: { hk: KeyBytes; sk: KeyBytes }) => ({ hashKey: row.hk, sortKey: row.sk });
@@ -748,9 +754,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			// removes them all, so no call can send on only a part of one transaction. A promotion
 			// deletes the copies of its key only, because the other keys stay here. A split deletes
 			// all copies.
+			//
+			// A promotion also deletes the size estimate of its key. Every new write of the key goes to
+			// the range tree, so nothing here reads the estimate again. Without the delete, the key stays
+			// in the promotion list of the split decision until the cleanup deletes its last row, and
+			// the split behind it waits. The cleanup keeps its own delete of the estimate as a guard.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					this.#store.deletePendingTxForHashKey(promotedKeyOf(plan));
+					const hashKey = promotedKeyOf(plan);
+					this.#store.deletePendingTxForHashKey(hashKey);
+					this.#store.deleteKeySizeEstimate(hashKey);
 					return;
 				}
 				this.#store.deleteAllPendingTx();
@@ -847,10 +860,11 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * make it smaller. Under the cap it reads the database size only.
 	 *
 	 * A hash leaf probes `items` for two hash keys, and `pending_transactions` when `items` is empty,
-	 * because a pending payload moves with its key. Two keys split. One key is promoted whatever its
-	 * size estimate: the cap reads the physical file, which can be much larger than the estimate. A
-	 * range leaf splits when the planner finds its boundaries, from the same arguments the planner
-	 * passes.
+	 * because a pending payload moves with its key. With two or more keys, the leaf promotes its keys
+	 * at or above the promotion threshold, up to `PROMOTION_CANDIDATES_MAX` and largest first, and
+	 * splits when it has none. One key is promoted whatever its size estimate: the cap reads the
+	 * physical file, which can be much larger than the estimate. A range leaf splits when the planner
+	 * finds its boundaries, from the same arguments the planner passes.
 	 */
 	private splitDecision(
 		identity: FokosPartitionIdentity,
@@ -873,8 +887,15 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		if (!keys) {
 			return { floor: "no_hash_key", maxSizeBytes };
 		}
+		if (!keys.more) {
+			return { answer: { promote: [keys.first] } };
+		}
+		// A split copies a large key into a child, and the child promotes it with a second copy. A
+		// promotion that cannot finish blocks the split, and a refused write signals no promotion.
+		// So the large keys are promoted first, and each promotion answers independently.
+		const large = this.#store.largestKeysAtLeast(maxSizeBytes * this.config().promotionFraction, PROMOTION_CANDIDATES_MAX);
 		// We have enough items to split.
-		return { answer: keys.more ? {} : { promote: [keys.first] } };
+		return { answer: large.length > 0 ? { promote: large } : {} };
 	}
 
 	// ═══ local handlers ══════════════════════════════════════════════════════

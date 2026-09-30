@@ -1,6 +1,6 @@
 # RFC — Queue the repartition of an over-size partition when it refuses a write
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-09-27
 **Author:** Lambros Petrou
 
@@ -202,7 +202,7 @@ Each milestone must leave the test suite green. Review each one before the next 
    `test/property-based/query-harness.ts` in one phase, and remove its two-phase comment. Record the run time of
    `query-items-split.test.ts` and `query-items-active-split.test.ts` before and after, for the milestone review.
 5. **More than one large key.** A hash leaf with two or more hash keys promotes its large keys before it splits, up
-   to 8 of them in one decision (section 4.2.8).
+   to 5 of them in one decision (section 4.2.8).
 
 ## 4. Proposed solution
 
@@ -515,7 +515,7 @@ Three more changes come with it:
 
 - **The index.** Add `CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);` to
   the migration that creates `key_size_estimates` in `partition-store.ts`. Edit the migration in place, because the
-  project is before its first release. With the index, the query is one seek that reads at most 8 rows. Without it,
+  project is before its first release. With the index, the query is one seek that reads at most 5 rows. Without it,
   the query reads one row per hash key. The cost is one index write for each update of `key_size_estimates`, and
   every item upsert makes one such update.
 - **A completed promotion leaves the list.** The `beforeComplete` hook of `PartitionDO` deletes the size estimate of
@@ -525,7 +525,7 @@ Three more changes come with it:
   split, and every refused write, for about 21 minutes. No other reader needs the estimate after `completed`: every
   new write of the key goes to the range tree. The cleanup keeps its own call of `deleteKeySizeEstimate` after the
   last row, as a guard.
-- **The limit of 5.** When the 5 largest keys all have promotions that cannot finish, a sixth key over the threshold
+- **The limit of 5.** When the 5 largest keys all have promotions that cannot finish, a ninth key over the threshold
   waits until one of them finishes.
 
 #### 4.2.9 Deployment and rollback

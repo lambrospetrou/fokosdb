@@ -435,6 +435,31 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	// Every refused write on a hash leaf with two or more keys runs this query. Without its index, the
+	// query reads one row for each hash key of the partition.
+	it("largestKeysAtLeast returns the large keys, largest first, from one seek of its index", async () => {
+		await withStore((store, state) => {
+			for (let i = 1; i <= 12; i++) {
+				store.addKeySizeEstimate(kb(`k${i}`), i * 100);
+			}
+			expect(store.largestKeysAtLeast(500, 8).map(keyLabel)).toEqual(["k12", "k11", "k10", "k9", "k8", "k7", "k6", "k5"]);
+			expect(store.largestKeysAtLeast(1_100, 8).map(keyLabel)).toEqual(["k12", "k11"]);
+			expect(store.largestKeysAtLeast(1_300, 8)).toEqual([]);
+
+			const plan = state.storage.sql
+				.exec<{ detail: string }>(
+					`EXPLAIN QUERY PLAN SELECT hk FROM key_size_estimates WHERE est_bytes >= ? ORDER BY est_bytes DESC LIMIT ?`,
+					500,
+					8,
+				)
+				.toArray()
+				.map((r) => r.detail)
+				.join(" | ");
+			expect(plan).toContain("key_size_estimates_by_bytes (est_bytes>?)");
+			expect(plan).not.toContain("TEMP B-TREE");
+		});
+	});
+
 	// The old-estimate lookup that upsertItem and deleteItem share. Without INDEXED BY, SQLite picks
 	// sqlite_autoindex_items_1 and fetches the table row for est_row_bytes — correct, but one row
 	// fetch per put and per delete. Both halves are asserted: that the hint still works, and that it

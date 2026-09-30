@@ -545,7 +545,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
             CREATE TABLE IF NOT EXISTS key_size_estimates (
                 hk        BLOB    NOT NULL PRIMARY KEY,
                 est_bytes INTEGER NOT NULL DEFAULT 0
-            ) WITHOUT ROWID, STRICT;`,
+            ) WITHOUT ROWID, STRICT;
+
+            CREATE INDEX IF NOT EXISTS key_size_estimates_by_bytes ON key_size_estimates (est_bytes);`,
 	},
 ];
 
@@ -1776,6 +1778,17 @@ export class PartitionStore {
 
 	deleteKeySizeEstimate(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hk);
+	}
+
+	/**
+	 * Up to `limit` hash keys whose estimate is at least `minBytes`, largest first. One seek of
+	 * `key_size_estimates_by_bytes`, which reads at most `limit` rows.
+	 */
+	largestKeysAtLeast(minBytes: number, limit: number): KeyBytes[] {
+		return this.#storage.sql
+			.exec<{ hk: ArrayBuffer }>(`SELECT hk FROM key_size_estimates WHERE est_bytes >= ? ORDER BY est_bytes DESC LIMIT ?`, minBytes, limit)
+			.toArray()
+			.map((row) => fromSqlKey(row.hk));
 	}
 
 	/**
