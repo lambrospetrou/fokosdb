@@ -2,8 +2,8 @@
 
 **State:** Findings. Nothing is decided or implemented.
 **Date:** 2026-09-29
-**Updated:** 2026-09-30, after commit `1b4d8e3` (a promotion moves the locks of its key). Section 8 lists what
-that commit changed. R2 and X3 no longer apply.
+**Updated:** 2026-09-30. The findings describe the code after commit `1b4d8e3` (a promotion moves the locks of its
+key), and they leave out what `docs/agent-plans/2026-09-27-over-size-split-trigger.md` fixes.
 
 ## Table of contents
 
@@ -14,7 +14,6 @@ that commit changed. R2 and X3 no longer apply.
 - [5. Issues that cross both layers](#5-issues-that-cross-both-layers)
 - [6. Schema changes to decide before the freeze](#6-schema-changes-to-decide-before-the-freeze)
 - [7. What was checked and is fine](#7-what-was-checked-and-is-fine)
-- [8. Changes after commit 1b4d8e3](#8-changes-after-commit-1b4d8e3)
 
 ## 1. Scope and method
 
@@ -34,10 +33,9 @@ says how it was checked:
 
 | # | Layer | Finding | Severity | Schema change? |
 |---|---|---|---|---|
-| F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High (higher after `1b4d8e3`) | No |
+| F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
 | X2 | Cross | The stale-lock job can run again every ~50 ms and blocks the split and import jobs | High | Yes, if fixed with F4 |
-| ~~R2~~ | Runtime | Removed by `1b4d8e3`: the `repartitionUnblocked` signal and `markPromotionsDueNow` are gone | — | — |
 | C1 | FokosDB (TC) | `tx_recovery` does a full scan and sort of `tc_state` every 5 s | High | Additive index |
 | F5 | FokosDB | One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
@@ -57,25 +55,9 @@ says how it was checked:
   `earliestRepartitionDeadline` and `firstActiveRepartition` on 20k rows. A query-plan test would lock the good
   plan in.
 - **`fokos_repartition_targets`**, **`fokos_route_overrides`**, **`fokos_range_hierarchy`**.
-- **KV keys:** `identity`, `policy`, `import`, `destroying`, `jobs`, `hash_arena` (≤ 1 MB), `promotion_bloom`
-  (≤ 1.5 MB, ~360 KB at the defaults), and the plan heads.
+- **KV keys:** see section 3.4.
 
 ### 3.2 Request path
-
-**R2 — each commit and cancel rewrites every waiting promotion (High).** **No longer applies:** commit `1b4d8e3`
-removed the `repartitionUnblocked` signal, `markPromotionsDueNow`, and the lock hold of `beforeCutover`. The text
-below describes the code before that commit. **Code.**
-
-- **What happens:** `txCommit` and `txCancel` always signal `repartitionUnblocked`
-  (`server/do-partition.ts:561`, `:587`). While any promotion is unfinished, `markPromotionsDueNow`
-  (`sharding/sharding-store.ts:609`) runs two UPDATEs. They rewrite every queued or planned promotion row and its
-  `idx_due` entry, and every target that is not initialized. Then a pass runs, and `#deferTargets` writes those
-  targets again when the key is still locked.
-- **Example:** Key K grows past the promotion size, so K is hot and almost always holds a lock. Each commit on the
-  partition writes about 2P + T rows (P = waiting promotions, T = their targets) and starts a pass.
-  `beforeCutover` sees a lock again and defers again. The promotion can also never cut over (see X3).
-- **Fix:** Signal the hash keys that the commit or cancel released. Update only the promotion of such a key (one
-  `routeOverrideFor` seek), and only when `next_attempt_at > now`.
 
 **R3 — router facts are read again for each key, including all targets (Medium).** **Code.**
 
@@ -83,10 +65,11 @@ below describes the code before that commit. **Code.**
   the split row and `listRepartitionTargets`: K rows with the wide `do_name` and `partition_id` columns.
 - **Where it runs:**
   - For each key in `#resolve` on a hash partition (`#hashTopologyOwner(key, routerRole())`).
-  - After each write, in `#evaluateSplit`.
   - In `lifecycle()`.
   - On a range router, `#rangeChildFor` calls `children()`, which is `routerRole()` + `splitTargets()`: two reads
     of 1 + K rows for each key.
+  - For each hash key in `owns()`: `commitLocal` calls it for each hash key of a lock copy, and stale recovery
+    calls it for each hash key of a stale transaction.
 - **Example:** A `txPrepare` of 100 keys reaches a range router with `rangeSplitN = 4`. It does about 1,000 row
   reads and 100 slice searches only to route.
 - **Fix, step 1:** Make `routerRole()` read only the split row.
@@ -151,7 +134,7 @@ below describes the code before that commit. **Code.**
 **R10 — the scheduler does more reads than it needs (Low).** **Code.**
 
 - **What happens:**
-  - Each pass reads the deadline of every job 2 times (3 times before `1b4d8e3`), and calls `canRun` 2 times.
+  - Each pass reads the deadline of every job 2 times, and calls `canRun` 2 times.
   - `canSweepLocally` and `canDriveLocally` call `lifecycle()`, which does 4 reads, one of them the R3 target read.
   - Each request on an importing target starts a pass.
 - **Fix:** Memoize `lifecycle()` for one pass.
@@ -169,6 +152,103 @@ below describes the code before that commit. **Code.**
   later hash split copies the rows again. Only the override is needed to route.
 - **Fix:** Store a finished promotion as the override row only, if the smaller schema is worth the change.
 
+### 3.4 KV keys
+
+**How KV storage works.** On a SQLite-backed Durable Object, `ctx.storage.kv` stores its data in a hidden SQLite
+table. A local `workerd` database shows this table as `_cf_KV (key TEXT PRIMARY KEY, value BLOB) WITHOUT ROWID`.
+The Durable Objects pricing page bills each `get`, `put`, `delete` and `list` as rows read or rows written. The
+size of a value does not change the bill. The limit for a key and its value together is 2 MB.
+
+**Inventory.** "Each start" means each time the object starts, in `blockConcurrencyWhile`.
+
+| Key | Owner | Value | Written | Read |
+|---|---|---|---|---|
+| `__fokos/schema_version` | runtime | a number | once per schema version | each start |
+| `__sql_migrations_lastID` | host (`PartitionDO`, coordinator) | a number | once per schema version | each start |
+| `__fokos/identity` | runtime | ~200 B; KBs for a range partition with large keys | once | each start |
+| `__fokos/policy` | runtime | ~225 B | when the request policy changes (R11) | each start |
+| `__fokos/destroying` | runtime | `true` | once, at the destroy fence | 2 times per `PartitionDO` request (`#api`, `#guard`), 1 time per coordinator request, and several times per pass |
+| `__fokos/import` | runtime | a few hundred B; up to ~3 KB with a cursor of large keys | each migration page, retry, start and acknowledgement | 1 time per request (`#dispatch`), 2 times per pass (two job deadlines), `lifecycle()`, and each log line (`#logParams`) |
+| `__fokos/jobs` | runtime | a small record | after a job step that changes it; `scheduleJob` when the new time is earlier | 2 times per pass, and in each `scheduleJob`: each accepted `txPrepare`, each coordinator `initiateWrite`, and each completed coordinator transaction |
+| `__fokos/cache/hash_arena` | runtime | ≤ 1 MB | when the tree it learns grows | once, at the first forward |
+| `__fokos/cache/promotion_bloom` | runtime | ~360 KB at the defaults | each new promoted key it learns (R7) | each start, whole |
+| `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
+| `tc/recovery_due_at` | coordinator | a number | on a migration page with a transaction that is not finished | 2 times per pass (job deadline), and on each migration page |
+
+**K1 — a new naming scheme does not make a read faster (no change needed for speed).**
+
+- Each `get` is one seek on the primary key of `_cf_KV`. The table holds about 5 to 10 keys, so the seek reads one
+  or two pages. A prefix, the order of the keys, and the length of a key have no measurable effect on this seek.
+- A prefix helps only `list({ prefix })`. No code calls `list()`.
+- The large values do not slow the small keys. A value above the inline limit of a WITHOUT ROWID page (~1 KB) keeps
+  a local part on the leaf page, and the rest goes to overflow pages. A `get` of another key never reads those
+  overflow pages.
+- **Keep `__fokos/`.** It marks what only the runtime can touch, and a full delete of the runtime state can use it.
+- **Rename the two host keys (clarity, not speed).** `__sql_migrations_lastID` is the default name of
+  `durable-utils`, and `tc/recovery_due_at` has its own style. Give the FokosDB hosts one prefix, for example
+  `__fokosdb/schema_version` (through `keyNameTrackingLastMigrationID`) and `__fokosdb/tc/recovery_due_at`, or
+  remove the second key (K5). A stored key name cannot change after the first release without a migration, so do
+  it now.
+
+**K2 — each `PartitionDO` request reads 3 KV keys before it does any work (Medium).** **Code.**
+
+- `#api` (`server/do-partition.ts:430`) calls `isFenced()`, and `#guard` reads `destroying` again. Then `#dispatch`
+  reads `import` through `isImporting()`. A coordinator request reads 2 keys. Each read is a SQLite seek and a V8
+  deserialization of the value.
+- After a target finishes its import, its record stays in `active` state for life. So every later request still
+  reads and deserializes it, only to learn "not importing".
+- **Fix:** This is R4. Only this runtime writes these two keys, so keep both in memory and update memory after each
+  commit. A combined key does not help: with the memory copy there is no read left to combine, and without it a
+  combined key still costs one seek and one deserialization per request.
+- **Smallest fix:** `#api` reads the fence once, and passes it on, so `#guard` does not read it again.
+
+**K3 — the plan head can be a column of its repartition row (Low, schema).** **Code.**
+
+- The plan head has the same life as its `fokos_repartitions` row. The queue transaction writes both, and the
+  transaction that writes `cleaned` deletes the head. `#hookPlan` reads the row, the targets and the head in each
+  hook call, so the head costs one more read each time.
+- The chain (`nextKey`) exists to allow a plan above one value. A KV value and a SQL row have the same 2 MB limit,
+  so the chain gives no extra room. `deletePlanChain` also does one `get` and one `delete` for each link.
+- **Fix:** Store the plan as a last column of `fokos_repartitions` (wide columns go last, as the migration comment
+  says). The row read then includes it, and the `cleaned` transaction sets it to NULL. This removes one KV key per
+  repartition, and the chain code.
+
+**K4 — `identity` and `policy` stay two keys (no change).**
+
+- Both are read only at each start, so one combined key saves one seek per start.
+- `identity` is immutable and can be KBs (range ancestors with large keys), and `policy` changes. A combined key
+  makes each policy change rewrite the identity.
+- `schema_version` and `__sql_migrations_lastID` also stay apart, because two different owners run their own
+  migrations.
+
+**K5 — `tc/recovery_due_at` can go into `__fokos/jobs` (Low).** **Code.**
+
+- The key is a job deadline that the coordinator stores beside the runtime record of job deadlines. Each pass reads
+  it 2 times through `deadline()`.
+- The runtime already stores job times in `__fokos/jobs`. `applyPage` runs inside the transaction of the page, and
+  `scheduleJob` is async only because it also arms the alarm. The import step runs in a pass, and the end of the
+  pass arms the alarm at the earliest deadline, so a write to the record is enough.
+- **Fix:** Add a synchronous runtime call that writes one job time into `__fokos/jobs` inside the current
+  transaction, and use it in `applyMigrationPage`. The host key and its deadline reads go away.
+
+**K6 — `jobs` is read on the transaction path (Low).** **Code.**
+
+- `scheduleJob` opens a transaction and reads the record on each accepted `txPrepare`, each coordinator
+  `initiateWrite`, and each completed coordinator transaction. It writes only when the new time is earlier, so the
+  write is rare. The read is on each call.
+- One record for all jobs is the right shape: the jobs are few, and the scheduler reads all of them together.
+- **Fix:** Only the scheduler of this instance writes the record, so keep a copy in memory, and read storage only
+  at the start.
+
+**K7 — the Bloom filter is read whole at each start (Low–Medium).** **Code.**
+
+- The constructor reads and deserializes the whole value (~360 KB at the defaults) inside `blockConcurrencyWhile`.
+  So the first request of each hash partition that ever learned a promoted key waits for it.
+- The paged storage of R7 also fixes this: a lookup tests k bits (k = 7 at 1 %), so it needs at most k pages of
+  4 KB, and the object can read a page when a lookup first needs it.
+- A lazy read of the whole value helps less. Each request on a hash partition asks the filter, so the first request
+  pays the same cost. Only control calls, for example `fokosStatus`, would skip it.
+
 ## 4. FokosDB
 
 ### 4.1 PartitionDO
@@ -182,6 +262,12 @@ below describes the code before that commit. **Code.**
   and most pages have no items. The source reads about 1 GB for one key.
 - **Example (range split):** In a range split with N children, each child reads from row 0 to the end of the table.
   The source reads the table N times.
+- **Why it matters for availability:** A promotion cuts over while its key holds locks. After cutover, the range
+  root is `awaiting_data` or `importing`. Each write and each transaction step on the key answers
+  `partition_migrating` until the import ends, and the root cannot sweep its stale locks (`canSweepLocally` is
+  false). A commit fan-out that waits longer than `fanoutRequestBudgetMs` (5 s) goes to `tx_recovery`. Because of
+  F1, the import of a 250 MB key from a 1 GB partition reads the full 1 GB. The time that the hot key is not
+  available follows the size of the source partition, not the size of the key.
 - **Fix:** Seek to `(slice.hashKey, slice.start)`, and end the stream when the scan goes past the slice. There is
   no schema change.
 
@@ -202,18 +288,29 @@ below describes the code before that commit. **Code.**
   - `conditions_json` is written for each lock, but only the migration copy reads it. It is dead.
   - `coordinator_json`, `created_at`, `transaction_ts` and `guarded_at` are the same for every key of one
     transaction, but each key stores them. Each key also adds an entry to the `created_at` index.
-  - `guardPendingTx` and `clearPendingTxGuard` update N rows.
+  - `guardPendingTx` runs one UPDATE for each owned key of the transaction.
   - `listStalePendingTx` must walk every row of a transaction. The documented worst case is 9,000 rows for 10
     results.
   - Guarded rows stay at the head of the `created_at` index. Each pass walks past them in
     `earliestUnguardedPendingTxCreatedAt`.
+  - While a promotion is in `cutover`, both stale queries also walk past the lock copies of the moved key (F10).
 - **Fix (schema):** Add a per-transaction table
   `pending_tx(transaction_id PK, coordinator_json, transaction_ts, created_at, guarded_at, next_recovery_at)`, with
   a partial index on `next_recovery_at WHERE guarded_at IS NULL`. The lock rows keep `(hk, sk, transaction_id,
   operation, data_kind, ttl, data)`. Drop `conditions_json`.
 - **Result:** Today a prepare of N keys does 4N B-tree writes. After the fix it does 3N + 2. The stale scan reads
   one row per transaction. A guard writes one row. `next_recovery_at` also gives the stale job a backoff (X2).
-- **Smallest fix:** Drop `conditions_json`, and make the `created_at` index partial `WHERE guarded_at IS NULL`.
+- **Rules that the lock copies add to the per-transaction table:**
+  - A transaction row must stay while any of its lock rows stay, including copies. Delete it together with the last
+    lock row, for example `DELETE FROM pending_tx WHERE transaction_id = ? AND NOT EXISTS (SELECT 1 FROM
+    pending_transactions WHERE transaction_id = ?)`. This is one seek on `pending_transactions_transaction_id`.
+  - A transaction row cannot tell owned rows from copies. A transaction with only copies must not keep the
+    deadline in the past, so each recovery attempt moves `next_recovery_at` forward, also when it finds no owned
+    row. This is the same backoff that fixes X2.
+  - The guard is per key today. With one `guarded_at` for each transaction, the migration can copy a guard that the
+    source set after cutover to the copies of the moved key. This is harmless: `not_found` from the coordinator is
+    true for every owner of the transaction, so the new owner sets the same guard at its next check.
+- **Smallest fix:** Drop `conditions_json`, and use the index of F10.
 
 **F5 — one partition-wide delete counter (High).** **Code.**
 
@@ -254,13 +351,24 @@ below describes the code before that commit. **Code.**
 - **Fix:** Scan in chunks over several steps, and keep the running totals in the plan head. Or sample the index.
 
 **F8 — commit reads each lock row 2 times (Low).** **Code.** `listPendingTxKeys` and `getPendingTxOp` for each
-key read the same rows (`1b4d8e3` removed the third read, `pendingTxCountFor`). One query that returns the keys and
-the payload can replace both. The release is now one `DELETE` by primary key for each key
-(`deletePendingTxKeys`). The rows written are the same as before, so this is acceptable.
+key read the same rows. One query that returns the keys and the payload can replace both. The release is one
+`DELETE` by primary key for each key (`deletePendingTxKeys`), which is one write for each item, so it is acceptable.
 
 **F9 — TTL sweep (Low).** **Code + Plan.** The plan is good: a covering index scan on `idx_items_ttl` and an
 anti-join on the PK of the locks. Expired rows that are locked stay at the head of the index and are read again
 each cycle, but locks are few.
+
+**F10 — the stale queries read 2 rows for each lock copy (Low–Medium).** **Code + Plan.**
+
+- **What happens:** While a promotion is in `cutover`, the source keeps its lock rows of the moved key as copies.
+  `earliestUnguardedPendingTxCreatedAt` and `listStalePendingTx` exclude them with
+  `hk NOT IN (<fokos.sql.movedHashKeys()>)`. The plans are good: the subquery reads `idx_fokos_repartitions_due` one
+  time for each statement. But `pending_transactions_created_at` holds only `created_at`, so each copy that the scan
+  steps past costs one index entry and one table row, for `guarded_at` and `hk`. The code comment measured 20,003
+  rows read for 10,000 copies, and a pass reads the deadline 2 times. This lasts for the whole promotion import
+  (see F1 for its length).
+- **Fix (schema):** Make the index `(created_at, hk) WHERE guarded_at IS NULL`. The deadline query then reads only
+  the index, and guarded rows cost nothing.
 
 ### 4.2 TransactionCoordinatorDO
 
@@ -325,12 +433,13 @@ wait behind it (see X2).
 
 - **Cause:** In the scheduler, `#deadlines` uses `min(scheduled, own)`. When the `deadline()` of a job stays in the
   past, the job runs again about 50 ms after each pass, and the step's `nextRunAt` has no effect.
-- **Where it happens:** The `stale_tx_recovery` deadline is "oldest unguarded lock + 5 s"
-  (`server/do-partition.ts:739`). The lock stays in these cases:
-  - The coordinator answers `driving`.
-  - The call fails fast. For example, the coordinator answers `COMMITTED`, and the `txCommit` dispatch reaches a
-    child that is still importing and gets `partition_migrating`.
+- **Where it happens:** The `stale_tx_recovery` deadline is "oldest unguarded owned lock + 5 s". The lock stays
+  in these cases:
+  - The coordinator answers `driving`, or a state that the job does not act on.
+  - The call to the coordinator fails fast. For example, the lock names a coordinator that split, and its child
+    still imports, so the forward answers `partition_migrating`.
   - In both cases the job runs about 20 times per second and sends up to `staleLockScanRows` (10) RPCs each time.
+    During a promotion import, each turn also reads about 60,000 rows for 10,000 lock copies (F10).
 - **Precedent:** The coordinator hit the same problem and worked around it with a KV key (comment at
   `server/do-transaction-coordinator.ts:471`).
 - **Second problem:** Passes run one at a time, and so do the jobs of one pass. One slow stale-lock step (10 locks
@@ -340,14 +449,6 @@ wait behind it (see X2).
   2. Let `nextRunAt` limit how often `deadline()` can make a job due.
   3. Bound the time of host jobs, or run them in a separate pass.
 - **First step:** Write a test that holds a lock whose coordinator answers `driving`, and count the job runs.
-
-**X3 — a hot key can block its own promotion (liveness).** **No longer applies:** after `1b4d8e3`, a lock does not
-hold a promotion. The lock moves with the key. The text below describes the code before that commit. **Code.**
-
-- **What happens:** `beforeCutover` needs zero locks on the key. The key that grows past the promotion size is the
-  hot key, so under steady transactions it can always hold a lock. R2 adds write load on each commit. The
-  partition can go past 1.1 times its cap and then stop accepting writes, which is the known over-size stop.
-- **Fix to consider:** A short admission hold on new prepares for a key while its promotion waits for cutover.
 
 ## 6. Schema changes to decide before the freeze
 
@@ -361,11 +462,14 @@ The SQL migrations can still be edited in place.
   - R11: a policy version in the route context.
   - R7: paged Bloom storage, if it is wanted.
   - R9: finished promotions as override rows only, if it is wanted.
+  - K1: one prefix for the host KV keys.
+  - K3: the plan head as a column of `fokos_repartitions`, if it is wanted.
+  - K5: remove `tc/recovery_due_at`.
 - **Additive, but cheapest now:**
   - C1: the partial index on `tc_state`.
   - F5: the delete buckets.
   - R5: an index on `learned_at`, if it is wanted.
-- **No schema change:** R3, R4, R6, R8, R10, F1, F3, F7, F8, C2, C4, and the scheduler part of X2.
+- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F8, C2, C4, K6, and the scheduler part of X2.
 
 ## 7. What was checked and is fine
 
@@ -374,81 +478,6 @@ The SQL migrations can still be edited in place.
 - The due, cleanup and deadline queries of `fokos_repartitions`, without statistics.
 - The idempotency sweep of the coordinator (covering partial index on `completed_at`).
 - The token lookups of the coordinator.
-- Lock release by transaction id (index `pending_transactions_transaction_id`).
+- Lock release: one `DELETE` by primary key for each owned key.
 - The cleanup batches of promotions and of the coordinator ledger.
 - The hash arena snapshot: it writes only the used part, and only when the tree grows.
-
-## 8. Changes after commit 1b4d8e3
-
-Commit `1b4d8e3` makes a promotion cut over while its key holds locks. The `pending_tx` stream copies the locks to
-the range root. The source keeps its rows of the key as copies until the completion transaction deletes them. Each
-local decision (commit, cancel, quarantine) now changes owned rows only, one statement per key. The two stale
-queries exclude the copies with `hk NOT IN (<fokos.sql.movedHashKeys()>)`.
-
-### 8.1 Findings that the commit removed
-
-- **R2:** The `repartitionUnblocked` signal and `markPromotionsDueNow` are gone. A commit or a cancel writes no
-  repartition row and starts no pass.
-- **X3:** PartitionDO has no `beforeCutover` hook now, so a lock cannot hold a promotion.
-- **One cause of the X2 loop:** Before the change, the oldest copy of a moved key would keep the stale-lock
-  deadline in the past for the whole import. The `NOT IN` clause removes this case.
-
-### 8.2 Findings that the commit made more important
-
-**F1 — the promotion import now decides how long a hot key is unavailable.** **Code.**
-
-- **What happens:** After cutover, the range root is `awaiting_data` or `importing`. Each write and each
-  transaction step on the key answers `partition_migrating` until the import ends. The root also cannot sweep its
-  stale locks during the import (`canSweepLocally` is false).
-- **Why F1 matters more now:** Before the change, a promotion waited for zero locks. Now it cuts over while
-  transactions are in flight, so these transactions wait for the whole import. A commit fan-out that waits longer
-  than `fanoutRequestBudgetMs` (5 s) goes to `tx_recovery`.
-- **Example:** A 1 GB hash partition promotes a 250 MB key. Because of F1, the import reads the full 1 GB and
-  sends about 500 mostly empty pages. The unavailable time follows the size of the source partition, not the size
-  of the key.
-- **Fix:** Unchanged. Seek to the slice, and stop the stream after it.
-
-**X2 — the stale-lock loop can still start.** **Code, not run.**
-
-- **What happens:** The deadline still reads "oldest unguarded owned lock + 5 s". A lock that stays after a
-  recovery step keeps the deadline in the past. Two cases remain:
-  - The coordinator answers `driving`, or answers a state that the job does not act on.
-  - The call to the coordinator fails fast. For example, the lock names a coordinator that split, and its child
-    still imports, so the forward answers `partition_migrating`.
-- **New cost in the loop:** While a promotion is in `cutover`, each deadline read and each stale scan steps past
-  the copies. The comment on `earliestUnguardedPendingTxCreatedAt` measured 20,003 rows read for 10,000 copies,
-  and a pass reads the deadline 2 times. If the loop runs during a promotion import, each loop turn reads about
-  60,000 rows.
-- **Fix:** Unchanged: a durable backoff for each job (see F4, `next_recovery_at`).
-
-### 8.3 New item
-
-**F10 — the stale queries read 2 rows for each copy (Low–Medium).** **Code + Plan.**
-
-- **What happens:** The plans are good: the `NOT IN` subquery reads `idx_fokos_repartitions_due` one time for each
-  statement. But `pending_transactions_created_at` holds only `created_at`. Thus each copy that the scan steps past
-  costs one index entry and one table row, for `guarded_at` and `hk`. This lasts for the whole promotion import
-  (see F1 for its length).
-- **Fix (schema):** Make the index `(created_at, hk) WHERE guarded_at IS NULL`. The deadline query then reads only
-  the index, and guarded rows cost nothing. This also covers the smallest fix of F4.
-
-### 8.4 Effect on the F4 fix
-
-The per-transaction table of F4 still works, with these rules:
-
-- A transaction row must stay while any of its lock rows stay, including copies. Delete it in the same statement
-  group as the last lock row, for example `DELETE FROM pending_tx WHERE transaction_id = ? AND NOT EXISTS (SELECT 1
-  FROM pending_transactions WHERE transaction_id = ?)`. This is one seek on `pending_transactions_transaction_id`.
-- A transaction row cannot tell owned rows from copies. A transaction with only copies must not keep the deadline
-  in the past. Each recovery attempt must therefore move `next_recovery_at` forward, also when it finds no owned
-  row. This is the same backoff that fixes X2.
-- The guard is now per key (`guardPendingTx` takes the owned keys). With one `guarded_at` for each transaction,
-  the migration would copy a guard that the source set after cutover to the copies of the moved key. This is
-  harmless: `not_found` from the coordinator is true for every owner of the transaction, so the new owner would
-  set the same guard at its next check.
-
-### 8.5 Findings that the commit did not change
-
-C1, C2, C3, C4 (the coordinator source did not change), F3, F5, F6, F7, R3 to R11, and X1. R3 is used more now:
-`owns()` runs for each hash key of a copy in `commitLocal`, and for each hash key in stale recovery. Each call
-reads the route override and the router role.
