@@ -1027,15 +1027,6 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		await this.#scheduler.scheduleJob(name, runAt);
 	}
 
-	/**
-	 * Moves the next run of a host job earlier, inside the transaction of the caller, and does not arm
-	 * the alarm. Call it only from a job step or from `migration.applyPage`: the end of the pass arms
-	 * the alarm at the new deadline.
-	 */
-	scheduleJobSyncNoAlarm(name: string, runAt: number): void {
-		this.#scheduler.scheduleJobSyncNoAlarm(name, runAt);
-	}
-
 	/** One background pass. `alarm(info)` calls this and nothing else. */
 	async runDueWork(): Promise<void> {
 		await this.#scheduler.runDueWork();

@@ -433,10 +433,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 
 		await runInDurableObject(tcStub, async (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, operations_hash)
-				 VALUES (?, ?, 'COMMITTED', ?, ?, ?)`,
+				`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, operations_hash)
+				 VALUES (?, ?, 'COMMITTED', ?, ?, ?, ?)`,
 				`stale-${transactionId}`,
 				transactionId,
+				transactionTimestamp,
 				transactionTimestamp,
 				transactionTimestamp,
 				"0000000000000000",

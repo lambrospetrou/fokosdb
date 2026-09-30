@@ -65,7 +65,9 @@ type CoordinatorInternals = {
 	initiateWriteLocal(request: InitiateWriteRequest): Promise<InitiateWriteResponseEncoded>;
 	recoverTransactionLocal(transactionId: string): Promise<unknown>;
 	/** The step of the `tx_recovery` job. */
-	recoverStaleTransactions(): Promise<number | null>;
+	recoverStaleTransactions(): Promise<void>;
+	driveTransaction(transactionId: string, idempotencyToken: string, state: TCState, budgetMs: number): Promise<void>;
+	earliestRecoveryAt(): number | null;
 	/** The step of the `idempotency_sweep` job. */
 	sweepExpiredTransactions(): number | null;
 	earliestCompletedAt(): number | null;
@@ -90,13 +92,14 @@ function seed(state: DurableObjectState, tcState: TCState, results?: TransactWri
 	state.storage.sql.exec(`DELETE FROM tc_items`);
 	const now = createdAt ?? Date.now() - 10_000;
 	state.storage.sql.exec(
-		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO tc_state (idempotency_token, transaction_id, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 		TOKEN,
 		TX_ID,
 		tcState,
 		now,
 		now,
+		now + DEFAULT_COORDINATOR_CONFIG.staleTransactionMs,
 		results === undefined ? null : JSON.stringify(results),
 		// loadFinalResponse never reads the fingerprint; any non-null value satisfies the column.
 		"0000000000000000",
@@ -137,14 +140,15 @@ function insertState(
 ): void {
 	state.storage.sql.exec(
 		`INSERT INTO tc_state
-			(idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+			(idempotency_token, transaction_id, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		options.token,
 		options.transactionId,
 		options.state,
 		options.createdAt,
 		options.createdAt,
 		options.completedAt ?? null,
+		options.completedAt == null ? options.createdAt + DEFAULT_COORDINATOR_CONFIG.staleTransactionMs : null,
 		options.results === undefined ? null : JSON.stringify(options.results),
 		options.operationsHash ?? "0000000000000000",
 	);
@@ -400,6 +404,78 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
+	// A transaction that a drive does not finish goes behind the others, so it cannot use each step.
+	it("drives the due transactions in next_recovery_at order and moves each one forward", async () => {
+		await withCoordinator(async (tc, state) => {
+			const now = Date.now();
+			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			state.storage.sql.exec(`DELETE FROM tc_state`);
+			for (const [transactionId, createdAt] of [
+				["tx-later", now - 40_000],
+				["tx-earlier", now - 60_000],
+				["tx-new", now],
+			] as const) {
+				insertState(state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt });
+			}
+			const drives: { transactionId: string; budgetMs: number }[] = [];
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (transactionId, _token, _state, budgetMs) => {
+				drives.push({ transactionId, budgetMs });
+			});
+
+			await tc.recoverStaleTransactions();
+
+			expect(drives).toEqual([
+				{ transactionId: "tx-earlier", budgetMs: DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs },
+				{ transactionId: "tx-later", budgetMs: DEFAULT_COORDINATOR_CONFIG.fanoutRequestBudgetMs },
+			]);
+			const nextRecoveryAt = (transactionId: string) =>
+				state.storage.sql
+					.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE transaction_id = ?`, transactionId)
+					.one().next_recovery_at;
+			// Half the age, at most 30 seconds.
+			expect(nextRecoveryAt("tx-earlier")).toBe(now + 30_000);
+			expect(nextRecoveryAt("tx-later")).toBe(now + 20_000);
+			expect(tc.earliestRecoveryAt()).toBe(now + DEFAULT_COORDINATOR_CONFIG.staleTransactionMs);
+
+			// Nothing is due now, so a second step drives nothing.
+			await tc.recoverStaleTransactions();
+			expect(drives).toHaveLength(2);
+
+			// A recovery call makes its own transaction due now, before the others.
+			await expect(tc.recoverTransactionLocal("tx-later")).resolves.toEqual({ state: "driving" });
+			expect(nextRecoveryAt("tx-later")).toBe(now);
+			await tc.recoverStaleTransactions();
+			expect(drives.map((drive) => drive.transactionId)).toEqual(["tx-earlier", "tx-later", "tx-later"]);
+		});
+	});
+
+	// The step moves forward only the transactions that it drives. The others keep their place.
+	it("keeps the place of a due transaction that the step does not reach before its budget ends", async () => {
+		await withCoordinator(async (tc, state) => {
+			const now = Date.now();
+			const clock = vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			state.storage.sql.exec(`DELETE FROM tc_state`);
+			insertState(state, { token: "token-first", transactionId: "tx-first", state: "COMMITTING", createdAt: now - 60_000 });
+			insertState(state, { token: "token-second", transactionId: "tx-second", state: "COMMITTING", createdAt: now - 50_000 });
+			const before = state.storage.sql
+				.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE transaction_id = 'tx-second'`)
+				.one().next_recovery_at;
+			// The first drive uses the whole budget of the step.
+			const drive = vi.spyOn(tc, "driveTransaction").mockImplementation(async () => {
+				clock.mockReturnValue(now + DEFAULT_COORDINATOR_CONFIG.alarmRecoveryBudgetMs);
+			});
+
+			await tc.recoverStaleTransactions();
+
+			expect(drive.mock.calls.map(([transactionId]) => transactionId)).toEqual(["tx-first"]);
+			expect(
+				state.storage.sql
+					.exec<{ next_recovery_at: number }>(`SELECT next_recovery_at FROM tc_state WHERE transaction_id = 'tx-second'`)
+					.one().next_recovery_at,
+			).toBe(before);
+		});
+	});
+
 	it("still answers a recovery call and runs its recovery job above the database size guard", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
@@ -439,6 +515,31 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				.exec<{ sql: string }>(`SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_tc_state_completed_at'`)
 				.toArray()[0];
 			expect(index.sql).toMatch(/WHERE completed_at IS NOT NULL/);
+		});
+	});
+
+	// The recovery job reads only the transactions that are not complete, in index order, with no sort.
+	// A full scan of tc_state would read the whole idempotency window at each step.
+	it("reads the due transactions and the recovery deadline from the partial recovery index", async () => {
+		await withCoordinator((_tc, state) => {
+			const plan = (sql: string, ...params: number[]) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+
+			const deadline = plan(`SELECT next_recovery_at FROM tc_state WHERE completed_at IS NULL ORDER BY next_recovery_at LIMIT 1`);
+			expect(deadline).toContain("USING INDEX idx_tc_state_recovery");
+			expect(deadline).not.toContain("TEMP B-TREE");
+			const due = plan(
+				`SELECT transaction_id, idempotency_token, created_at FROM tc_state
+				  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
+				1,
+				10,
+			);
+			expect(due).toContain("USING INDEX idx_tc_state_recovery (next_recovery_at<?)");
+			expect(due).not.toContain("TEMP B-TREE");
 		});
 	});
 

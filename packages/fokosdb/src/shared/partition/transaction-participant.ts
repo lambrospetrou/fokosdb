@@ -26,6 +26,7 @@ import {
 	conditionFailedReason,
 	decodeItemKeys,
 	MAX_ITEM_BYTES,
+	nextRecoveryAt,
 	txOrderTimestampNow,
 	TX_ORDER_TS_UNITS_PER_MS,
 } from "../transaction-limits.js";
@@ -79,12 +80,6 @@ export function ownsByHashKey(
 		return owned;
 	};
 }
-
-/**
- * The longest wait between two attempts to recover one stale transaction. A coordinator that answers
- * `driving`, or that does not answer, leaves the lock in place, and the next attempt waits.
- */
-const STALE_RECOVERY_MAX_DELAY_MS = 30_000;
 
 // A pending check cannot change the item, so a transactional read may serialize on either side of it.
 // Allowlist the read-only operations: an operation the code does not know counts as a pending write.
@@ -666,11 +661,7 @@ export class TransactionParticipant {
 	 * The stale transactions that are due, at most `limit` of them. It moves the next attempt of each
 	 * one forward in the same storage transaction, before the caller asks a coordinator. So a lock that
 	 * stays, because the coordinator answers `driving` or does not answer, does not keep the deadline
-	 * of the job in the past, and does not block the other transactions.
-	 *
-	 * The wait is half the age of the transaction, at least `staleTransactionMs` and at most
-	 * STALE_RECOVERY_MAX_DELAY_MS. A lock of 10 seconds waits 5 seconds, a lock of 40 seconds waits
-	 * 20 seconds, and a lock of 10 minutes waits 30 seconds.
+	 * of the job in the past, and does not block the other transactions. `nextRecoveryAt` gives the wait.
 	 */
 	claimStaleTransactions(limit: number): StalePendingTx[] {
 		const now = this.#now();
@@ -678,8 +669,7 @@ export class TransactionParticipant {
 		return this.#store.transactionSync(() => {
 			const rows = this.#store.listStalePendingTx(now, limit);
 			for (const row of rows) {
-				const delayMs = Math.max(staleMs, Math.min((now - row.created_at) / 2, STALE_RECOVERY_MAX_DELAY_MS));
-				this.#store.deferPendingTxRecovery(row.transaction_id, now + Math.ceil(delayMs));
+				this.#store.deferPendingTxRecovery(row.transaction_id, nextRecoveryAt(now, row.created_at, staleMs));
 			}
 			return rows;
 		});

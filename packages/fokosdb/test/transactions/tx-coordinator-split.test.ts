@@ -182,11 +182,12 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const transactionId = `tx-${crypto.randomUUID()}`;
 		await runInDurableObject(coordinatorStub(root.doName), (_instance: TransactionCoordinatorDO, state: DurableObjectState) => {
 			state.storage.sql.exec(
-				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, results_json, operations_hash)
-				 VALUES (?, ?, 'CANCELLING', 1, ?, '[]', '0000000000000000')`,
+				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, results_json, operations_hash)
+				 VALUES (?, ?, 'CANCELLING', 1, ?, ?, '[]', '0000000000000000')`,
 				transactionId,
 				token,
 				Date.now() - 60_000,
+				Date.now() - 55_000,
 			);
 		});
 

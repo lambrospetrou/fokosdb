@@ -201,8 +201,6 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		// participant that fails each attempt then costs many attempts of up to `maxDelayMs` each.
 		const RECOVERY_BUDGET_MS = 500;
 		const MAX_DELAY_MS = 100;
-		// One RPC, and the time that the runtime and the test need around the step.
-		const SLACK_MS = 1_000;
 
 		/** Leaves one transaction in COMMITTING, with a participant that fails each commit, and returns its IDs. */
 		async function commitPendingTransaction(prefix: string) {
@@ -239,21 +237,25 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 			return { coordinator, token, transactionId, commits, state };
 		}
 
-		it("ends one step of the tx_recovery job at alarmRecoveryBudgetMs when a participant never answers", async () => {
+		// One transaction with a participant that is down must not use the whole step: the other due
+		// transactions also get a drive.
+		it("gives one drive of the tx_recovery job at most fanoutRequestBudgetMs when a participant never answers", async () => {
 			const { coordinator, commits, state } = await commitPendingTransaction("recovery-job-budget");
 			const before = await commits();
 
-			// The request above waited out its fan-out budget, so the transaction is already stale.
-			const elapsed = await runInDurableObject(coordinator, async (instance: TransactionCoordinatorDO) => {
+			// A background step can already have taken the transaction and moved it forward, so the test
+			// makes it due again.
+			const elapsed = await runInDurableObject(coordinator, async (instance: TransactionCoordinatorDO, ctx: DurableObjectState) => {
+				ctx.storage.sql.exec(`UPDATE tc_state SET next_recovery_at = 0 WHERE completed_at IS NULL`);
 				const start = Date.now();
-				await (instance as unknown as { recoverStaleTransactions(): Promise<number | null> }).recoverStaleTransactions();
+				await (instance as unknown as { recoverStaleTransactions(): Promise<void> }).recoverStaleTransactions();
 				return Date.now() - start;
 			});
 
-			// The step drove the commit and retried until its budget ended, and then stopped.
+			// The drive retried the commit until the budget of one drive ended, and then stopped.
 			expect(await commits()).toBeGreaterThan(before);
-			expect(elapsed).toBeGreaterThanOrEqual(RECOVERY_BUDGET_MS - SHORT_BUDGET_MS);
-			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS + MAX_DELAY_MS + SLACK_MS);
+			expect(elapsed).toBeGreaterThanOrEqual(SHORT_BUDGET_MS - MAX_DELAY_MS);
+			expect(elapsed).toBeLessThan(RECOVERY_BUDGET_MS);
 			// The transaction stays non-terminal, so a later step continues it.
 			expect(await state()).toBe("COMMITTING");
 		});

@@ -120,6 +120,22 @@ export const IDEMPOTENCY_WINDOW_MS = 10 * 60 * 1000;
 export const DEFAULT_STALE_TRANSACTION_MS = 5_000;
 
 /**
+ * The longest wait between two recovery attempts of one transaction. An attempt that does not finish
+ * the transaction, because a participant or the coordinator does not answer, leaves it in place.
+ */
+export const STALE_RECOVERY_MAX_DELAY_MS = 30_000;
+
+/**
+ * The time of the next recovery attempt of a transaction that an attempt at `now` did not finish. The
+ * wait is half the age of the transaction, at least `staleMs` and at most STALE_RECOVERY_MAX_DELAY_MS.
+ * A transaction of 10 seconds waits 5 seconds, one of 40 seconds waits 20 seconds, and one of 10
+ * minutes waits 30 seconds. A partition and a coordinator both use this rule.
+ */
+export function nextRecoveryAt(now: number, createdAt: number, staleMs: number): number {
+	return now + Math.ceil(Math.max(staleMs, Math.min((now - createdAt) / 2, STALE_RECOVERY_MAX_DELAY_MS)));
+}
+
+/**
  * The default time that a coordinator retries its participants while a request waits for the answer.
  * A stale time below this lets the stale recovery drive a transaction that a request still drives.
  */

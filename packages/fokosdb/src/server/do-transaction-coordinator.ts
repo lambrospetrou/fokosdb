@@ -61,6 +61,7 @@ import {
 	DEFAULT_LIMITS,
 	encodeHashKey,
 	IDEMPOTENCY_WINDOW_MS,
+	nextRecoveryAt,
 	txOrderTimestampNow,
 } from "../shared/transaction-limits.js";
 import {
@@ -80,6 +81,8 @@ type TcStateRow = {
 	transaction_ts: number;
 	created_at: number;
 	completed_at: number | null;
+	/** The earliest time at which the `tx_recovery` job drives the transaction. NULL once it is complete. */
+	next_recovery_at: number | null;
 	/**
 	 * Per-operation outcome array (TransactWriteOperationResultEncoded[]), ordered by request opIndex.
 	 * Stores outcome codes, reasons (keys only), and itemOmitted markers.
@@ -250,6 +253,10 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 transaction_ts          INTEGER NOT NULL,
                 created_at              INTEGER NOT NULL,
                 completed_at            INTEGER,
+                -- The earliest time at which the tx_recovery job drives this transaction. NULL once the
+                -- transaction is complete. Each attempt moves it forward, so a transaction that stays
+                -- goes behind the others and does not use each step of the job.
+                next_recovery_at        INTEGER,
                 -- Positional TransactWriteOperationResultEncoded array. Item images are omitted
                 -- and stored in tc_results to prevent exceeding the 2 MB SQLite row limit.
                 results_json            TEXT,
@@ -262,6 +269,7 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
 			CREATE UNIQUE INDEX IF NOT EXISTS tc_state_idempotency_token ON tc_state (idempotency_token);
 			CREATE INDEX IF NOT EXISTS idx_tc_state_completed_at ON tc_state (completed_at) WHERE completed_at IS NOT NULL;
+			CREATE INDEX IF NOT EXISTS idx_tc_state_recovery ON tc_state (next_recovery_at) WHERE completed_at IS NULL;
 
             CREATE TABLE IF NOT EXISTS tc_participants (
                 transaction_id          TEXT    NOT NULL,
@@ -488,11 +496,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				{
 					name: JOB_TX_RECOVERY,
 					canRun: () => this.canDriveLocally(),
-					// No deadline: a request that creates a transaction schedules the job, a migration page with
-					// a non-terminal transaction schedules it, and the step schedules its next run. A deadline
-					// read from the non-terminal rows would stay in the past while a participant is down, and
-					// the job would run again at once after each step.
-					runStep: async () => ({ nextRunAt: await this.recoverStaleTransactions() }),
+					// The step moves `next_recovery_at` of each transaction that it takes forward, so the
+					// deadline does not stay in the past while a participant is down.
+					deadline: () => this.earliestRecoveryAt(),
+					runStep: async () => {
+						await this.recoverStaleTransactions();
+						return { nextRunAt: null };
+					},
 				},
 				{
 					name: JOB_IDEMPOTENCY_SWEEP,
@@ -629,14 +639,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			}
 		}
 
+		const createdAt = this.fokosNow();
 		this.transition(idempotencyToken, () => {
 			this.ctx.storage.sql.exec(
-				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, operations_hash)
-                 VALUES (?, ?, 'CREATED', ?, ?, ?)`,
+				`INSERT INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, next_recovery_at, operations_hash)
+                 VALUES (?, ?, 'CREATED', ?, ?, ?, ?)`,
 				transactionId,
 				idempotencyToken,
 				transactionTs,
-				this.fokosNow(),
+				createdAt,
+				createdAt + this.config().staleTransactionMs,
 				operationsHash,
 			);
 			for (const op of request.items) {
@@ -803,7 +815,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		let transitioned = false;
 		this.transition(idempotencyToken, () => {
 			const transition = this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = ?, completed_at = ? WHERE transaction_id = ? AND state = ?`,
+				`UPDATE tc_state SET state = ?, completed_at = ?, next_recovery_at = NULL WHERE transaction_id = ? AND state = ?`,
 				terminalState,
 				completedAt,
 				transactionId,
@@ -1277,38 +1289,31 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * One step of the `tx_recovery` job: drives the non-terminal transactions older than the stale
-	 * threshold, oldest first, within `alarmRecoveryBudgetMs`. Returns when the job must run again: while a
-	 * non-terminal transaction remains, one stale threshold from now.
+	 * One step of the `tx_recovery` job: drives the due transactions one at a time, earliest
+	 * `next_recovery_at` first, for at most `recoveryScanRows` transactions and `alarmRecoveryBudgetMs`.
+	 *
+	 * Each iteration claims one transaction and then drives it. The claim moves `next_recovery_at`
+	 * forward with `nextRecoveryAt`, so a transaction that the drive does not finish, for example
+	 * because a participant is down, goes behind the others. A transaction that the step does not reach
+	 * keeps its place. Each drive gets at most `fanoutRequestBudgetMs`, so one participant that does not
+	 * answer cannot use the whole step.
 	 */
-	private async recoverStaleTransactions(): Promise<number | null> {
-		const recoveryStartedAt = this.fokosNow();
-		const { staleTransactionMs, recoveryScanRows, alarmRecoveryBudgetMs } = this.config();
-		const rows = this.ctx.storage.sql
-			.exec<{
-				idempotency_token: string;
-				transaction_id: string;
-				state: TCState;
-			}>(
-				`SELECT idempotency_token, transaction_id, state
-                 FROM tc_state
-                 WHERE state NOT IN ('COMMITTED', 'CANCELLED') AND created_at <= ?
-                 ORDER BY created_at, transaction_id LIMIT ?`,
-				recoveryStartedAt - staleTransactionMs,
-				recoveryScanRows,
-			)
-			.toArray();
-
-		// FIXME: drive these transactions concurrently with a bounded fan-out.
-		for (const row of rows) {
-			// The time that remains of the budget of this step. It also bounds the participant retries of
-			// each transaction, so one participant with no answer cannot hold the step past the budget.
-			const remainingMs = recoveryStartedAt + alarmRecoveryBudgetMs - this.fokosNow();
+	private async recoverStaleTransactions(): Promise<void> {
+		const startedAt = this.fokosNow();
+		const { staleTransactionMs, recoveryScanRows, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } = this.config();
+		// FIXME: claim a batch of transactions in one storage transaction and drive them concurrently,
+		// with a bounded fan-out.
+		for (let driven = 0; driven < recoveryScanRows; driven++) {
+			const remainingMs = startedAt + alarmRecoveryBudgetMs - this.fokosNow();
 			if (remainingMs <= 0) {
-				break;
+				return;
+			}
+			const row = this.claimDueTransaction(startedAt, staleTransactionMs);
+			if (!row) {
+				return;
 			}
 			try {
-				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state, remainingMs);
+				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state, Math.min(fanoutRequestBudgetMs, remainingMs));
 			} catch (e) {
 				console.error({
 					message: "fokos/tc: recovery failed",
@@ -1318,11 +1323,46 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				});
 			}
 		}
+	}
 
-		const hasNonTerminalRows = exists(
-			this.ctx.storage.sql.exec(`SELECT 1 FROM tc_state WHERE state NOT IN ('COMMITTED', 'CANCELLED') LIMIT 1`),
+	/**
+	 * The transaction with the earliest `next_recovery_at` at or before `dueAt`, with its
+	 * `next_recovery_at` moved forward in the same storage transaction, or undefined when none is due.
+	 * The step passes its start time as `dueAt`, and a claim moves the time past it, so one step claims
+	 * a transaction at most one time.
+	 */
+	private claimDueTransaction(
+		dueAt: number,
+		staleTransactionMs: number,
+	): { transaction_id: string; idempotency_token: string; state: TCState } | undefined {
+		return this.ctx.storage.transactionSync(() => {
+			const row = tryOne(
+				this.ctx.storage.sql.exec<{ transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
+					`SELECT transaction_id, idempotency_token, state, created_at FROM tc_state
+					  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT 1`,
+					dueAt,
+				),
+			);
+			if (row) {
+				this.ctx.storage.sql.exec(
+					`UPDATE tc_state SET next_recovery_at = ? WHERE transaction_id = ?`,
+					nextRecoveryAt(this.fokosNow(), row.created_at, staleTransactionMs),
+					row.transaction_id,
+				);
+			}
+			return row;
+		});
+	}
+
+	/** The earliest `next_recovery_at` of a transaction that is not complete, or null. One seek of `idx_tc_state_recovery`. */
+	private earliestRecoveryAt(): number | null {
+		return (
+			tryOne(
+				this.ctx.storage.sql.exec<{ next_recovery_at: number }>(
+					`SELECT next_recovery_at FROM tc_state WHERE completed_at IS NULL ORDER BY next_recovery_at LIMIT 1`,
+				),
+			)?.next_recovery_at ?? null
 		);
-		return hasNonTerminalRows ? this.fokosNow() + this.config().staleTransactionMs : null;
 	}
 
 	/** Drives one non-terminal transaction from its stored state. `budgetMs` bounds the participant retries. */
@@ -1383,8 +1423,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * The local handler of `recoverTransaction`. It answers from the ledger and does not drive the
-	 * transaction. For a transaction that is not complete, it makes the `tx_recovery` job due now and
-	 * answers `driving`. The job sends the commit or the cancel to the participant, so the participant
+	 * transaction. For a transaction that is not complete, it sets `next_recovery_at` of the transaction
+	 * to now, makes the `tx_recovery` job due now, and answers `driving`. The job sends the commit or the cancel to the participant, so the participant
 	 * does not need to wait for the fan-out.
 	 *
 	 * A drive here would run beside the other drives of the transaction, one for each call. The job
@@ -1400,7 +1440,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		if (state === "COMMITTED" || state === "CANCELLED") {
 			return { state };
 		}
-		await this.fokos.scheduleJob(JOB_TX_RECOVERY, this.fokosNow());
+		const now = this.fokosNow();
+		this.ctx.storage.sql.exec(
+			`UPDATE tc_state SET next_recovery_at = MIN(next_recovery_at, ?) WHERE transaction_id = ? AND completed_at IS NULL`,
+			now,
+			transactionId,
+		);
+		await this.fokos.scheduleJob(JOB_TX_RECOVERY, now);
 		return { state: "driving" };
 	}
 
@@ -1418,7 +1464,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		budget: FokosMigrationPageBudget,
 	): { page: MigratedTransaction[]; nextCursor: string | null } {
 		const rows = this.ctx.storage.sql.exec<TcStateRow>(
-			`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
+			`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
              FROM tc_state WHERE transaction_id > ? ORDER BY transaction_id LIMIT ?`,
 			cursor ?? "",
 			budget.pageRows + 1,
@@ -1454,24 +1500,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * Writes the rows of one page. Idempotent: a page applied twice leaves the same rows. A
-	 * non-terminal transaction makes the `tx_recovery` job due, because no request of this coordinator
-	 * drives it.
+	 * non-terminal transaction keeps its `next_recovery_at`, which the `deadline()` of the `tx_recovery`
+	 * job reads, so the job drives it after the import.
 	 */
 	private applyMigrationPage(page: MigratedTransaction[]): void {
 		const sql = this.ctx.storage.sql;
-		if (page.some((tx) => tx.state.completed_at === null)) {
-			this.fokos.scheduleJobSyncNoAlarm(JOB_TX_RECOVERY, this.fokosNow());
-		}
 		for (const { state, items, participants, results } of page) {
 			sql.exec(
-				`INSERT OR REPLACE INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				`INSERT OR REPLACE INTO tc_state (transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				state.transaction_id,
 				state.idempotency_token,
 				state.state,
 				state.transaction_ts,
 				state.created_at,
 				state.completed_at,
+				state.next_recovery_at,
 				state.results_json,
 				state.operations_hash,
 			);
@@ -1535,7 +1579,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private loadStateRow(transactionId: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
                  FROM tc_state WHERE transaction_id = ?`,
 				transactionId,
 			),
@@ -1559,7 +1603,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	private loadStateRowByToken(idempotencyToken: string): TcStateRow | undefined {
 		return tryOne(
 			this.ctx.storage.sql.exec<TcStateRow>(
-				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, results_json, operations_hash
+				`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
                  FROM tc_state WHERE idempotency_token = ?`,
 				idempotencyToken,
 			),
