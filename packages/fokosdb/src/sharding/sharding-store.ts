@@ -42,7 +42,7 @@ export const FOKOS_KV_KEYS = {
 	/** The byte-bounded Bloom filter of promoted keys a hash partition has learned. */
 	PROMOTION_BLOOM: "__fokos/cache/promotion_bloom",
 	/** The last sharding schema migration that ran. */
-	SCHEMA_VERSION: "__fokos/schema_version",
+	SCHEMA_VERSION: "__fokos/sql_schema_version",
 	/** The head of the plan chain of one repartition, written at queue time and deleted by the final cleanup. */
 	planHead: (repartitionId: string) => `__fokos/repartition/${repartitionId}/plan/00000001`,
 } as const;

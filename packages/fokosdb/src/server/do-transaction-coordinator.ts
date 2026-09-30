@@ -207,7 +207,7 @@ const JOB_IDEMPOTENCY_SWEEP = "idempotency_sweep";
  * A host KV key: the time at which the `tx_recovery` job must run, because a migration page brought
  * non-terminal transactions that no request drives. The job step deletes it.
  */
-const RECOVERY_DUE_KEY = "tc/recovery_due_at";
+const RECOVERY_DUE_KEY = "__fokosdb/tc/recovery_due_at";
 
 const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
 
@@ -329,6 +329,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: ctx.storage,
+			keyNameTrackingLastMigrationID: "__fokosdb/tc/sql_schema_version",
 		});
 		// The runtime runs the sharding migrations in its own blockConcurrencyWhile, before the host's.
 		this.fokos = new FokosShardingRuntime<FokosDBPolicy, CoordinatorOps>({

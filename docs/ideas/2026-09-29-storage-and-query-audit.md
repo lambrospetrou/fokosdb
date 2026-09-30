@@ -170,7 +170,8 @@ size of a value does not change the bill. The limit for a key and its value toge
 | Key | Owner | Value | Written | Read |
 |---|---|---|---|---|
 | `__fokos/schema_version` | runtime | a number | once per schema version | each start |
-| `__sql_migrations_lastID` | host (`PartitionDO`, coordinator) | a number | once per schema version | each start |
+| `__fokosdb/partition/schema_version` | `PartitionDO` | a number | once per schema version | each start |
+| `__fokosdb/tc/schema_version` | coordinator | a number | once per schema version | each start |
 | `__fokos/identity` | runtime | ~200 B; KBs for a range partition with large keys | once | each start |
 | `__fokos/policy` | runtime | ~225 B | when the request policy changes (R11) | each start |
 | `__fokos/destroying` | runtime | `true` | once, at the destroy fence | 2 times per `PartitionDO` request (`#api`, `#guard`), 1 time per coordinator request, and several times per pass |
@@ -179,7 +180,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokos/cache/hash_arena` | runtime | ≤ 1 MB | when the tree it learns grows | once, at the first forward |
 | `__fokos/cache/promotion_bloom` | runtime | ~360 KB at the defaults | each new promoted key it learns (R7) | each start, whole |
 | `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
-| `tc/recovery_due_at` | coordinator | a number | on a migration page with a transaction that is not finished | 2 times per pass (job deadline), and on each migration page |
+| `__fokosdb/tc/recovery_due_at` | coordinator | a number | on a migration page with a transaction that is not finished | 2 times per pass (job deadline), and on each migration page |
 
 **K1 — a new naming scheme does not make a read faster (no change needed for speed).**
 
@@ -190,11 +191,11 @@ size of a value does not change the bill. The limit for a key and its value toge
   a local part on the leaf page, and the rest goes to overflow pages. A `get` of another key never reads those
   overflow pages.
 - **Keep `__fokos/`.** It marks what only the runtime can touch, and a full delete of the runtime state can use it.
-- **Rename the two host keys (clarity, not speed).** `__sql_migrations_lastID` is the default name of
-  `durable-utils`, and `tc/recovery_due_at` has its own style. Give the FokosDB hosts one prefix, for example
-  `__fokosdb/schema_version` (through `keyNameTrackingLastMigrationID`) and `__fokosdb/tc/recovery_due_at`, or
-  remove the second key (K5). A stored key name cannot change after the first release without a migration, so do
-  it now.
+- **Done: the host keys have the `__fokosdb/` prefix (clarity, not speed).** `PartitionStore` tracks its migrations
+  under `__fokosdb/partition/schema_version`, and the coordinator under `__fokosdb/tc/schema_version`. The
+  coordinator key `tc/recovery_due_at` is now `__fokosdb/tc/recovery_due_at`. Each class has its own storage, so
+  the old default name `__sql_migrations_lastID` did not collide. A class-specific name keeps the key clear if a
+  second host store ever shares one storage.
 
 **K2 — each `PartitionDO` request reads 3 KV keys before it does any work (Medium).** **Code.**
 
@@ -224,10 +225,10 @@ size of a value does not change the bill. The limit for a key and its value toge
 - Both are read only at each start, so one combined key saves one seek per start.
 - `identity` is immutable and can be KBs (range ancestors with large keys), and `policy` changes. A combined key
   makes each policy change rewrite the identity.
-- `schema_version` and `__sql_migrations_lastID` also stay apart, because two different owners run their own
+- `__fokos/schema_version` and the host schema-version key also stay apart, because two different owners run their own
   migrations.
 
-**K5 — `tc/recovery_due_at` can go into `__fokos/jobs` (Low).** **Code.**
+**K5 — `__fokosdb/tc/recovery_due_at` can go into `__fokos/jobs` (Low).** **Code.**
 
 - The key is a job deadline that the coordinator stores beside the runtime record of job deadlines. Each pass reads
   it 2 times through `deadline()`.
@@ -549,9 +550,8 @@ The SQL migrations can still be edited in place.
   - R11: a policy version in the route context.
   - R7: paged Bloom storage, if it is wanted.
   - R9: finished promotions as override rows only, if it is wanted.
-  - K1: one prefix for the host KV keys.
   - K3: the plan head as a column of `fokos_repartitions`, if it is wanted.
-  - K5: remove `tc/recovery_due_at`.
+  - K5: remove `__fokosdb/tc/recovery_due_at`.
 - **Additive, but cheapest now:**
   - C1: the partial index on `tc_state`.
   - F5: the delete buckets.

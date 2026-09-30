@@ -415,7 +415,7 @@ made during the implementation and differ from, or add to, the text of sections 
   through `call.signal`. The handler often ends with a thrown answer (`transaction_commit_pending`), and a thrown
   handler drops its signals.
 - The `tx_recovery` job has a `deadline()` only for transactions that a migration page brought: `applyPage`
-  writes the host KV key `tc/recovery_due_at` when a page holds a non-terminal transaction, and the job step
+  writes the host KV key `__fokosdb/tc/recovery_due_at` when a page holds a non-terminal transaction, and the job step
   deletes it. A request that creates a transaction schedules the job, and each step returns its next run while a
   non-terminal transaction remains. A deadline read from the non-terminal rows would stay in the past while a
   participant is down, and the job would run again at once after each step. `idempotency_sweep` has the

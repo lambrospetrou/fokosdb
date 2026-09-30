@@ -576,6 +576,7 @@ export class PartitionStore {
 		this.#migrations = new SQLSchemaMigrations({
 			migrations: sqlMigrations,
 			doStorage: storage,
+			keyNameTrackingLastMigrationID: "__fokosdb/partition/sql_schema_version",
 		});
 	}
 
