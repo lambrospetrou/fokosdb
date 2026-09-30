@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Nothing is decided or implemented.
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. The other findings are not decided or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-09-30.
 
@@ -38,11 +38,11 @@ says how it was checked:
 | F11 | FokosDB | Migration fetches payload arrays before the byte budget; a default fetch can hold about 390 MiB | High | No |
 | C5 | FokosDB (TC) | One PREPARING transaction can exceed the 32 MiB migration RPC limit and stop an import | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
-| X2 | Cross | The stale-lock job can run again every ~50 ms and blocks the split and import jobs | High | Yes, if fixed with F4 |
-| C1 | FokosDB (TC) | `tx_recovery` does a full scan and sort of `tc_state` every 5 s | High | Additive index |
+| X2 | Cross | Done. The stale-lock job could run again every ~50 ms, and a slow step blocked the split and import jobs | High | Done with F4 |
+| C1 | FokosDB (TC) | Done. `tx_recovery` did a full scan and sort of `tc_state` every 5 s | High | Additive index |
 | F5 | FokosDB | One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
-| F4 | FokosDB | `pending_transactions` repeats per-transaction data on each key; `conditions_json` is never read; the stale queries step past lock copies | Medium | Yes |
+| F4 | FokosDB | Done. `pending_transactions` repeated per-transaction data on each key; `conditions_json` was never read; the stale queries stepped past lock copies | Medium | Yes |
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
 | F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
@@ -181,7 +181,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokos/cache/promotion_bloom` | runtime | ~360 KB at the defaults | each new promoted key it learns (R7) | each start, whole |
 | `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
 
-**K1 — a new naming scheme does not make a read faster (no change needed for speed).**
+**K1 — done: the host keys have one prefix. A new naming scheme does not make a read faster (no change needed for speed).**
 
 - Each `get` is one seek on the primary key of `_cf_KV`. The table holds about 5 to 10 keys, so the seek reads one
   or two pages. A prefix, the order of the keys, and the length of a key have no measurable effect on this seek.
@@ -286,35 +286,30 @@ size of a value does not change the bill. The limit for a key and its value toge
   five months of storage; for 100-byte rows, about fifty months. Measure whether a `DELETE FROM items` with no
   `WHERE` clause is cheap on Durable Objects before choosing the method.
 
-**F4 — `pending_transactions` shape (Medium).** **Code + Plan.**
+**F4 — done: `pending_transactions` shape (Medium).** **Code + Plan.**
 
-- **Problems:**
-  - `conditions_json` is written for each lock, but only the migration copy reads it. It is dead.
+- **The problems were:**
+  - `conditions_json` was written for each lock, but only the migration copy read it.
   - `coordinator_json`, `created_at`, `transaction_ts` and `guarded_at` are the same for every key of one
-    transaction, but each key stores them. Each key also adds an entry to the `created_at` index.
-  - `guardPendingTx` runs one UPDATE for each owned key of the transaction.
-  - `listStalePendingTx` must walk every row of a transaction. The documented worst case is 9,000 rows for 10
-    results.
-  - Guarded rows stay at the head of the `created_at` index. Each pass walks past them in
-    `earliestUnguardedPendingTxCreatedAt`.
-  - While a promotion is in `cutover`, both stale queries also walk past the lock copies of the moved key (F10).
-- **Fix (schema):** Add a per-transaction table
-  `pending_tx(transaction_id PK, coordinator_json, transaction_ts, created_at, guarded_at, next_recovery_at)`, with
-  a partial index on `next_recovery_at WHERE guarded_at IS NULL`. The lock rows keep `(hk, sk, transaction_id,
-  operation, data_kind, ttl, data)`. Drop `conditions_json`.
-- **Result:** Today a prepare of N keys does 4N B-tree writes. After the fix it does 3N + 2. The stale scan reads
-  one row per transaction. A guard writes one row. `next_recovery_at` also gives the stale job a backoff (X2).
-- **Rules that the lock copies add to the per-transaction table:**
-  - A transaction row must stay while any of its lock rows stay, including copies. Delete it together with the last
-    lock row, for example `DELETE FROM pending_tx WHERE transaction_id = ? AND NOT EXISTS (SELECT 1 FROM
-    pending_transactions WHERE transaction_id = ?)`. This is one seek on `pending_transactions_transaction_id`.
-  - A transaction row cannot tell owned rows from copies. A transaction with only copies must not keep the
-    deadline in the past, so each recovery attempt moves `next_recovery_at` forward, also when it finds no owned
-    row. This is the same backoff that fixes X2.
-  - The guard is per key today. With one `guarded_at` for each transaction, the migration can copy a guard that the
-    source set after cutover to the copies of the moved key. This is harmless: `not_found` from the coordinator is
-    true for every owner of the transaction, so the new owner sets the same guard at its next check.
-- **Smallest fix:** Drop `conditions_json`, and use the index of F10.
+    transaction, but each key stored them, and each key added an entry to the `created_at` index.
+  - `guardPendingTx` ran one UPDATE for each owned key of the transaction.
+  - `listStalePendingTx` walked every row of a transaction: 9,000 rows for 10 results in the worst case.
+  - The stale queries walked past guarded rows and past the lock copies of a moved key (F10).
+- **What changed:**
+  - The table `pending_tx_info(transaction_id PK, transaction_ts, created_at, coordinator_json, guarded_at,
+    next_recovery_at)` holds the facts of each transaction. The partial index `pending_tx_info_due (next_recovery_at)
+    WHERE guarded_at IS NULL` gives the deadline and the batch of the stale job.
+  - The lock rows keep `(hk, sk, transaction_id, operation, data_kind, ttl_epoch_utc_seconds, data)`.
+    `conditions_json` and `pending_transactions_created_at` are removed.
+  - The statement that deletes the last lock row of a transaction also deletes its `pending_tx_info` row.
+  - The guard is per transaction. It covers the copies of a moved key, and the migration carries it to the new
+    owner.
+  - Each lock row of a migration page carries the `pending_tx_info` fields of its transaction. The target merges a
+    repeated row: it keeps a guard and the earlier `next_recovery_at`. The page format did not change.
+  - The stale step claims the due transactions and moves `next_recovery_at` forward before it calls the
+    coordinator (X2). A transaction with only copies gets no coordinator call.
+- **Result:** A prepare of N keys writes 3N + 3 B-tree entries, where it wrote 4N. The stale scan and the deadline
+  read one index entry and one table row for each transaction. A guard writes one row.
 
 **F5 — one partition-wide delete counter (High).** **Code.**
 
@@ -365,25 +360,22 @@ size of a value does not change the bill. The limit for a key and its value toge
 - **Fix:** Scan in chunks over several background steps, and keep the running totals in the plan head. Or sample
   the index. Reuse a completed decision scan only when the item state and split arguments still match.
 
-**F8 — commit reads each lock row 2 times (Low).** **Code.** `listPendingTxKeys` and `getPendingTxOp` for each
-key read the same rows. One query that returns the keys and the payload can replace both. The release is one
+**F8 — done: commit read each lock row 2 times (Low).** **Code.** `listPendingTxKeys` and `getPendingTxOp` for
+each key read the same rows. Now `commitLocal` reads the rows of the transaction one time with `listPendingTxItems`. The release is one
 `DELETE` by primary key for each key (`deletePendingTxKeys`), which is one write for each item, so it is acceptable.
 
 **F9 — TTL sweep (Low).** **Code + Plan.** The plan is good: a covering index scan on `idx_items_ttl` and an
 anti-join on the PK of the locks. Expired rows that are locked stay at the head of the index and are read again
 each cycle, but locks are few.
 
-**F10 — the stale queries read 2 rows for each lock copy (Low–Medium).** **Code + Plan.**
+**F10 — done: the stale queries read 2 rows for each lock copy (Low–Medium).** **Code + Plan.**
 
-- **What happens:** While a promotion is in `cutover`, the source keeps its lock rows of the moved key as copies.
-  `earliestUnguardedPendingTxCreatedAt` and `listStalePendingTx` exclude them with
-  `hk NOT IN (<fokos.sql.movedHashKeys()>)`. The plans are good: the subquery reads `idx_fokos_repartitions_due` one
-  time for each statement. But `pending_transactions_created_at` holds only `created_at`, so each copy that the scan
-  steps past costs one index entry and one table row, for `guarded_at` and `hk`. The code comment measured 20,003
-  rows read for 10,000 copies, and a pass reads the deadline 2 times. This lasts for the whole promotion import
-  (see F1 for its length).
-- **Fix (schema):** Make the index `(created_at, hk) WHERE guarded_at IS NULL`. The deadline query then reads only
-  the index, and guarded rows cost nothing.
+- **What happened:** While a promotion was in `cutover`, the stale queries excluded the lock copies of the moved key
+  with `hk NOT IN (<fokos.sql.movedHashKeys()>)`, and each copy that the scan stepped past cost one index entry
+  and one table row. The code comment measured 20,003 rows read for 10,000 copies.
+- **What changed:** The stale queries read `pending_tx_info_due`, one entry for each transaction, with no filter on
+  `hk`. The step reads the keys of a claimed transaction and skips it when no key is owned. The runtime call
+  `fokos.sql.movedHashKeys()` had no other user, so it is removed.
 
 **F11 — migration reads payload arrays before it applies the byte budget (High).** **Code + Collector.**
 
@@ -432,7 +424,16 @@ each cycle, but locks are few.
 
 ### 4.2 TransactionCoordinatorDO
 
-**C1 — `tx_recovery` does a full scan of `tc_state` (High).** **Plan:** `SCAN tc_state` + `TEMP B-TREE FOR ORDER BY`.
+**C1 — done: `tx_recovery` did a full scan of `tc_state` (High).** **Plan:** `SCAN tc_state` + `TEMP B-TREE FOR ORDER BY`.
+
+- **What changed:** `tc_state` has the column `next_recovery_at` and the partial index `idx_tc_state_recovery
+  (next_recovery_at) WHERE completed_at IS NULL`. The job reads its batch and its `deadline()` from this index,
+  and `hasNonTerminalRows` is removed. The job is also fair now: each iteration of the step claims one due
+  transaction, moves its `next_recovery_at` forward, and drives it. Each drive gets at most
+  `fanoutRequestBudgetMs`. Before this change, the oldest transaction with a participant that was down came first
+  in each step and used the whole budget of 30 s, and the newer transactions got no drive.
+
+The finding was:
 
 - **What happens:**
   - `tc_state` keeps every transaction for `IDEMPOTENCY_WINDOW_MS` (10 minutes).
@@ -514,7 +515,23 @@ wait behind it (see X2).
   partition stores 0. The cost is one hash for each write and one byte for each index entry, and each point and
   range query adds `split_bucket = ?`.
 
-**X2 — a job's own deadline can make it run without pause (High).** **Code, not run.**
+**X2 — done: a job's own deadline can make it run without pause (High).**
+
+- **Done:** The stale-lock job now has a durable backoff in `next_recovery_at` (F4). The test "asks a coordinator
+  that answers driving one time, and arms the alarm at the next attempt" failed before the change and passes
+  after it. No other job has a deadline that stays in the past, so the scheduler change (fix 2) is not
+  necessary.
+- **Done, second problem:** `recoverTransaction` no longer drives the transaction in the call. It makes the
+  `tx_recovery` job of the coordinator due and answers `driving`, so a call is one round trip. The setting
+  `recoverTransactionBudgetMs` is removed. One step of the stale-lock job starts coordinator calls for at most
+  10 s.
+- **Found on the way, done:** More than one drive of one transaction can run at the same time. `drivePrepare` and
+  `runPrepareRecovery` sent the fan-out of their own decision also when the decision of another drive had won. A
+  cancel after a commit decision released a lock, and the participant then answered the commit with the
+  idempotent success: the transaction was COMMITTED, but one participant did not apply its write. `runCommit` and
+  `runCancel` now send only when the stored state is their decision. Two tests make the other drive win during
+  a prepare call. Both tests failed before the change.
+
 
 - **Cause:** In the scheduler, `#deadlines` uses `min(scheduled, own)`. When the `deadline()` of a job stays in the
   past, the job runs again about 50 ms after each pass, and the step's `nextRunAt` has no effect.
@@ -540,8 +557,6 @@ wait behind it (see X2).
 The SQL migrations can still be edited in place.
 
 - **Breaking:**
-  - F4: the per-transaction lock table, the removal of `conditions_json`, and the partial index.
-  - F10: the index `(created_at, hk) WHERE guarded_at IS NULL` on `pending_transactions`.
   - C3: rowid tables in the coordinator.
   - X1: `split_bucket`, if it is wanted.
   - R11: a policy version in the route context.
@@ -549,11 +564,9 @@ The SQL migrations can still be edited in place.
   - R9: finished promotions as override rows only, if it is wanted.
   - K3: the plan head as a column of `fokos_repartitions`, if it is wanted.
 - **Additive, but cheapest now:**
-  - C1: the partial index on `tc_state`.
   - F5: the delete buckets.
   - R5: an index on `learned_at`, if it is wanted.
-- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F8, F11, F12, F13, C2, C4, C5, K6, and the
-  scheduler part of X2. C5 needs an internal migration cursor and page-format change.
+- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6. C5 needs an internal migration cursor and page-format change.
 
 ## 7. What was checked and is fine
 
