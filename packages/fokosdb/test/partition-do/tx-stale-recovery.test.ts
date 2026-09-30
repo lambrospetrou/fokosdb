@@ -289,9 +289,11 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
 
 			expect(recoverTransaction).toHaveBeenCalledTimes(1);
-			// The claim moved both transactions forward, so the one that this step did not reach waits.
+			// The step claimed the older transaction and moved it forward. The other one keeps its place.
+			const nextRecoveryAt = (transactionId: string) => store.listPendingTxItems(transactionId)[0].next_recovery_at;
+			expect(nextRecoveryAt(transactionIds[1])).toBeGreaterThan(now);
+			expect(nextRecoveryAt(transactionIds[0])).toBe(now - 10_000 + DEFAULT_STALE_TRANSACTION_MS);
 			for (const transactionId of transactionIds) {
-				expect(store.listPendingTxItems(transactionId)[0].next_recovery_at).toBeGreaterThan(now);
 				releasePendingLock(store, transactionId);
 			}
 			await state.storage.deleteAlarm();

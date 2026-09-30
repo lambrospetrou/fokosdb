@@ -1230,6 +1230,7 @@ describe("PartitionStore - pending transactions", () => {
 			expect(store.listStalePendingTx(5000, 1)).toEqual([
 				{ transaction_id: "tx-earlier", coordinator_json: '{"doName":"tc-1"}', created_at: 1000 },
 			]);
+			expect(store.listStalePendingTx(1000, 10)).toEqual([]);
 
 			// A transaction that the job tried moves behind the others.
 			store.deferPendingTxRecovery("tx-earlier", 4000);
@@ -1363,9 +1364,8 @@ describe("PartitionStore - pending transactions", () => {
 			expect(deadline).not.toContain("TEMP B-TREE");
 			const scan = plan(
 				`SELECT transaction_id, coordinator_json, created_at FROM pending_tx_info
-				  WHERE guarded_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
+				  WHERE guarded_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT 1`,
 				1,
-				10,
 			);
 			expect(scan).toContain("SEARCH pending_tx_info USING INDEX pending_tx_info_due (next_recovery_at<?)");
 			expect(scan).not.toContain("TEMP B-TREE");

@@ -1308,7 +1308,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			if (remainingMs <= 0) {
 				return;
 			}
-			const row = this.claimDueTransaction(startedAt, staleTransactionMs);
+			const [row] = this.claimDueTransactions(startedAt, 1, staleTransactionMs);
 			if (!row) {
 				return;
 			}
@@ -1326,31 +1326,34 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * The transaction with the earliest `next_recovery_at` at or before `dueAt`, with its
-	 * `next_recovery_at` moved forward in the same storage transaction, or undefined when none is due.
-	 * The step passes its start time as `dueAt`, and a claim moves the time past it, so one step claims
-	 * a transaction at most one time.
+	 * The transactions whose `next_recovery_at` is at or before `dueAt`, earliest first, at most `limit`
+	 * of them, each with its `next_recovery_at` moved forward in the same storage transaction. The step
+	 * passes its start time as `dueAt`, and a claim moves the time past it, so one step claims a
+	 * transaction at most one time.
 	 */
-	private claimDueTransaction(
+	private claimDueTransactions(
 		dueAt: number,
+		limit: number,
 		staleTransactionMs: number,
-	): { transaction_id: string; idempotency_token: string; state: TCState } | undefined {
+	): { transaction_id: string; idempotency_token: string; state: TCState }[] {
+		const now = this.fokosNow();
 		return this.ctx.storage.transactionSync(() => {
-			const row = tryOne(
-				this.ctx.storage.sql.exec<{ transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
+			const rows = this.ctx.storage.sql
+				.exec<{ transaction_id: string; idempotency_token: string; state: TCState; created_at: number }>(
 					`SELECT transaction_id, idempotency_token, state, created_at FROM tc_state
-					  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT 1`,
+					  WHERE completed_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
 					dueAt,
-				),
-			);
-			if (row) {
+					limit,
+				)
+				.toArray();
+			for (const row of rows) {
 				this.ctx.storage.sql.exec(
 					`UPDATE tc_state SET next_recovery_at = ? WHERE transaction_id = ?`,
-					nextRecoveryAt(this.fokosNow(), row.created_at, staleTransactionMs),
+					nextRecoveryAt(now, row.created_at, staleTransactionMs),
 					row.transaction_id,
 				);
 			}
-			return row;
+			return rows;
 		});
 	}
 

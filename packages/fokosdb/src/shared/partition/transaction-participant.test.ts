@@ -1088,10 +1088,10 @@ describe("TransactionParticipant - stale transactions", () => {
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
 			// Locks were created at clock.now — not yet stale.
-			expect(participant.claimStaleTransactions(10)).toEqual([]);
+			expect(participant.claimStaleTransactions(clock.now, 10)).toEqual([]);
 
 			clock.now += DEFAULT_PARTITION_CONFIG.staleTransactionMs;
-			expect(participant.claimStaleTransactions(10)).toEqual([
+			expect(participant.claimStaleTransactions(clock.now, 10)).toEqual([
 				{ transaction_id: request.transactionId, coordinator_json: JSON.stringify(COORDINATOR), created_at: BASE_NOW },
 			]);
 		});
@@ -1123,18 +1123,26 @@ describe("TransactionParticipant - claimStaleTransactions", () => {
 				lock(name, BASE_NOW - ageMs, BASE_NOW - ageMs + staleMs);
 			}
 			lock("fresh", BASE_NOW, BASE_NOW + 1);
+			// Claims one at a time until none is due at the start time, as one step of the job does.
+			const claimStep = () => {
+				const dueAt = clock.now;
+				const claimed: string[] = [];
+				for (let [row] = participant.claimStaleTransactions(dueAt, 1); row; [row] = participant.claimStaleTransactions(dueAt, 1)) {
+					claimed.push(row.transaction_id);
+				}
+				return claimed;
+			};
 
-			const claimed = participant.claimStaleTransactions(10);
-			expect(claimed.map((row) => row.transaction_id)).toEqual(["ancient", "old", "young"]);
+			expect(claimStep()).toEqual(["ancient", "old", "young"]);
 			const nextAttempts = Object.fromEntries(
 				["young", "old", "ancient"].map((name) => [name, store.listPendingTxItems(name)[0].next_recovery_at - BASE_NOW]),
 			);
 			expect(nextAttempts).toEqual({ young: staleMs, old: 20_000, ancient: 30_000 });
 
 			// Nothing is due until the earliest next attempt.
-			expect(participant.claimStaleTransactions(10).map((row) => row.transaction_id)).toEqual([]);
+			expect(claimStep()).toEqual([]);
 			clock.now = BASE_NOW + staleMs;
-			expect(participant.claimStaleTransactions(10).map((row) => row.transaction_id)).toEqual(["fresh", "young"]);
+			expect(claimStep()).toEqual(["fresh", "young"]);
 		});
 	});
 });

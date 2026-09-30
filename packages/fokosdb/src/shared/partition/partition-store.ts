@@ -1554,16 +1554,16 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The unguarded transactions whose next attempt is at or before `now`, earliest first, at most
-	 * `limit` of them. One range of `pending_tx_info_due`, one entry for each transaction. The caller moves
-	 * the next attempt of each one forward, so a transaction that stays does not block the others.
+	 * The unguarded transactions whose next attempt is at or before `dueAt`, earliest first, at most
+	 * `limit` of them. One range of `pending_tx_info_due`, one entry for each transaction. The caller
+	 * moves the next attempt of each one forward, so a transaction that stays does not block the others.
 	 */
-	listStalePendingTx(now: number, limit: number): StalePendingTx[] {
+	listStalePendingTx(dueAt: number, limit: number): StalePendingTx[] {
 		return this.#storage.sql
 			.exec<StalePendingTx>(
 				`SELECT transaction_id, coordinator_json, created_at FROM pending_tx_info
 				  WHERE guarded_at IS NULL AND next_recovery_at <= ? ORDER BY next_recovery_at LIMIT ?`,
-				now,
+				dueAt,
 				limit,
 			)
 			.toArray();

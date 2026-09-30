@@ -1144,13 +1144,20 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * key again in the same synchronous block as the write.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
-		const staleTxRows = this.#participant.claimStaleTransactions(this.config().staleLockScanRows);
-		const deadline = this.fokosNow() + STALE_RECOVERY_STEP_BUDGET_MS;
-		for (const row of staleTxRows) {
-			// The claim moved each transaction forward, so a transaction that this step does not reach
-			// waits for its next attempt.
+		const startedAt = this.fokosNow();
+		const deadline = startedAt + STALE_RECOVERY_STEP_BUDGET_MS;
+		// Each iteration claims one transaction and then asks its coordinator. A transaction that the
+		// step does not reach keeps its place.
+		const { staleLockScanRows } = this.config();
+		for (let claimed = 0; claimed < staleLockScanRows; claimed++) {
 			if (this.fokosNow() >= deadline) {
-				break;
+				return;
+			}
+			// FIXME: claim a batch of transactions in one storage transaction and drive them concurrently,
+			// with a bounded fan-out.
+			const [row] = this.#participant.claimStaleTransactions(startedAt, 1);
+			if (!row) {
+				return;
 			}
 			// A transaction whose rows here are all copies of a moved key belongs to the new owner, so
 			// this partition does not ask the coordinator about it.

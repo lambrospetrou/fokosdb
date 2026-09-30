@@ -658,16 +658,20 @@ export class TransactionParticipant {
 	}
 
 	/**
-	 * The stale transactions that are due, at most `limit` of them. It moves the next attempt of each
-	 * one forward in the same storage transaction, before the caller asks a coordinator. So a lock that
-	 * stays, because the coordinator answers `driving` or does not answer, does not keep the deadline
-	 * of the job in the past, and does not block the other transactions. `nextRecoveryAt` gives the wait.
+	 * The stale transactions whose next attempt is at or before `dueAt`, earliest first, at most `limit`
+	 * of them. It moves the next attempt of each one forward in the same storage transaction, before the
+	 * caller asks a coordinator. So a lock that stays, because the coordinator answers `driving` or does
+	 * not answer, does not keep the deadline of the job in the past, and does not block the other
+	 * transactions. `nextRecoveryAt` gives the wait.
+	 *
+	 * The job passes the start time of its step as `dueAt`, and a claim moves the time past it, so one
+	 * step claims a transaction at most one time.
 	 */
-	claimStaleTransactions(limit: number): StalePendingTx[] {
+	claimStaleTransactions(dueAt: number, limit: number): StalePendingTx[] {
 		const now = this.#now();
 		const staleMs = this.#staleTransactionMs();
 		return this.#store.transactionSync(() => {
-			const rows = this.#store.listStalePendingTx(now, limit);
+			const rows = this.#store.listStalePendingTx(dueAt, limit);
 			for (const row of rows) {
 				this.#store.deferPendingTxRecovery(row.transaction_id, nextRecoveryAt(now, row.created_at, staleMs));
 			}
