@@ -151,6 +151,53 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		);
 	});
 
+	it("evicts down to 90 % of the bound, so the next inserts do not evict", async () => {
+		await withStore(
+			(store, state) => {
+				const hk = kb("h");
+				const learn = (i: number) => store.learnRangeBoundary(hk, kb(`k${String(i).padStart(2, "0")}`), UNBOUNDED, 1, REFRESH_MS, i);
+				for (let i = 0; i < 20; i++) {
+					learn(i);
+				}
+				expect(store.countRangeHierarchyRows()).toBe(20);
+
+				learn(20);
+				expect(store.countRangeHierarchyRows()).toBe(18);
+				// The three oldest rows went.
+				const oldest = state.storage.sql
+					.exec<{ learned_at: number }>(`SELECT MIN(learned_at) AS learned_at FROM fokos_range_hierarchy`)
+					.one().learned_at;
+				expect(oldest).toBe(3);
+
+				learn(21);
+				learn(22);
+				expect(store.countRangeHierarchyRows()).toBe(20);
+				learn(23);
+				expect(store.countRangeHierarchyRows()).toBe(18);
+			},
+			{ rangeHierarchyMaxRows: () => 20 },
+		);
+	});
+
+	it("corrects the row count at eviction after rows were deleted", async () => {
+		await withStore(
+			(store) => {
+				const hk = kb("h");
+				store.learnRangeBoundary(hk, kb("a"), kb("b"), 1, REFRESH_MS, 1_000);
+				store.learnRangeBoundary(hk, kb("b"), kb("c"), 1, REFRESH_MS, 2_000);
+				store.learnRangeBoundary(hk, kb("c"), kb("d"), 1, REFRESH_MS, 3_000);
+				store.deleteLearnedRangeSlice(hk, kb("b"), kb("c"));
+				// Three rows fit the bound again, so this insert evicts nothing.
+				store.learnRangeBoundary(hk, kb("d"), kb("e"), 1, REFRESH_MS, 4_000);
+				expect(store.countRangeHierarchyRows()).toBe(3);
+				store.learnRangeBoundary(hk, kb("e"), kb("f"), 1, REFRESH_MS, 5_000);
+				expect(store.countRangeHierarchyRows()).toBe(3);
+				expect(store.findDeepestKnownRangeSlice(hk, kb("a"))).toBeNull();
+			},
+			{ rangeHierarchyMaxRows: () => 3 },
+		);
+	});
+
 	it("reads the bound at each eviction, so a lower bound applies at the next write", async () => {
 		let maxRows = 5;
 		await withStore(

@@ -139,7 +139,7 @@ export type LearnedRangeSlice = { depth: number; startBoundary: KeyBytes | null;
 export type FokosShardingStoreOptions = {
 	/**
 	 * The row bound of `fokos_range_hierarchy`. A row holds two boundary keys and one hash key. Read at
-	 * each eviction. Default: `DEFAULT_RUNTIME_CONFIG`.
+	 * each insert. Default: `DEFAULT_RUNTIME_CONFIG`.
 	 */
 	rangeHierarchyMaxRows?: () => number;
 };
@@ -386,6 +386,14 @@ const sqlMigrations: SQLSchemaMigration[] = [
  * costs the usual read.
  */
 const mayHaveRouteOverrides = new WeakMap<DurableObjectStorage, boolean>();
+
+/**
+ * For each storage, the number of rows in `fokos_range_hierarchy` as this isolate last saw it. It only
+ * decides when an eviction runs, and the eviction counts the rows exactly again. A write that rolls
+ * back can make it wrong, and the next eviction corrects it. It is kept for the storage and not for one
+ * store instance, so every instance on the same storage sees each insert.
+ */
+const rangeHierarchyRows = new WeakMap<DurableObjectStorage, number>();
 
 export class FokosShardingStore {
 	#storage: DurableObjectStorage;
@@ -932,13 +940,13 @@ export class FokosShardingStore {
 	/**
 	 * Learns one range boundary, or refreshes its eviction stamp when it is already known and older
 	 * than `refreshMs`. Every forwarded request learns the boundaries of the partition that answered, so
-	 * an unconditional refresh would be one write per forward; `refreshMs` keeps a hot row at one seek
+	 * an unconditional refresh would be one write per forward; `refreshMs` keeps a hot row at two seeks
 	 * and no write. Every row is written under the real hash key it describes, so
 	 * a hash partition can hold the boundaries of many promoted keys in one table.
 	 *
-	 * The table is bounded by `rangeHierarchyMaxRows`. A write that can have grown it evicts the rows
-	 * with the oldest `learned_at`, deepest first. A partition's own ancestors are in its identity, so
-	 * eviction cannot change its route evidence; a lost row costs one more hop on a later request.
+	 * The table is bounded by `rangeHierarchyMaxRows`.
+	 * A partition's own ancestors are in its identity, so eviction cannot change its route evidence;
+	 * a lost row costs one more hop on a later request.
 	 */
 	learnRangeBoundary(
 		hk: KeyBytes,
@@ -948,36 +956,55 @@ export class FokosShardingStore {
 		refreshMs: number,
 		now = Date.now(),
 	): void {
-		const res = this.#storage.sql.exec(
-			`INSERT INTO fokos_range_hierarchy (hk, sk_start_boundary, sk_end_boundary, depth, learned_at) VALUES (?1, ?2, ?3, ?4, ?5)
-			 ON CONFLICT (hk, sk_start_boundary, sk_end_boundary) DO UPDATE SET learned_at = excluded.learned_at
-			 WHERE learned_at < excluded.learned_at - ?6`,
-			hk,
-			startBoundary,
-			endBoundary,
-			depth,
-			now,
-			refreshMs,
-		);
-		if (res.rowsWritten === 0) {
+		const inserted =
+			this.#storage.sql.exec(
+				`INSERT INTO fokos_range_hierarchy (hk, sk_start_boundary, sk_end_boundary, depth, learned_at) VALUES (?1, ?2, ?3, ?4, ?5)
+				 ON CONFLICT (hk, sk_start_boundary, sk_end_boundary) DO NOTHING`,
+				hk,
+				startBoundary,
+				endBoundary,
+				depth,
+				now,
+			).rowsWritten > 0;
+		// Only an insert can grow the table, so a refresh does not count the rows.
+		if (!inserted) {
+			this.#storage.sql.exec(
+				`UPDATE fokos_range_hierarchy SET learned_at = ?4
+				  WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3 AND learned_at < ?4 - ?5`,
+				hk,
+				startBoundary,
+				endBoundary,
+				now,
+				refreshMs,
+			);
 			return;
 		}
 
-		// FIXME: Optimize this by using a more efficient eviction strategy rather than counting and deleting excess rows.
+		// An insert that takes the count above the bound evicts the rows with the
+		// oldest `learned_at`, deepest first, down to 90 % of the bound. One count and one sort of the table
+		// then serve the next tenth of the bound in inserts.
 		const maxRows = this.#rangeHierarchyMaxRows();
 		invariant(maxRows >= 1, "fokos/sharding-store: rangeHierarchyMaxRows must be at least 1");
-		const excess = one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n - maxRows;
-		if (excess <= 0) {
+		// The first insert of this isolate counts the rows, and the count includes the new row.
+		const knownInMem = rangeHierarchyRows.get(this.#storage);
+		const rows = knownInMem === undefined ? this.countRangeHierarchyRows() : knownInMem + 1;
+		if (rows <= maxRows) {
+			rangeHierarchyRows.set(this.#storage, rows);
 			return;
 		}
-		this.#storage.sql.exec(
-			`DELETE FROM fokos_range_hierarchy WHERE (hk, sk_start_boundary, sk_end_boundary) IN (
-			     SELECT hk, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy ORDER BY learned_at, depth DESC LIMIT ?1)`,
-			excess,
-		);
+		const exact = knownInMem === undefined ? rows : this.countRangeHierarchyRows();
+		const excess = exact - (maxRows - Math.floor(maxRows / 10));
+		if (excess > 0) {
+			this.#storage.sql.exec(
+				`DELETE FROM fokos_range_hierarchy WHERE (hk, sk_start_boundary, sk_end_boundary) IN (
+				     SELECT hk, sk_start_boundary, sk_end_boundary FROM fokos_range_hierarchy ORDER BY learned_at, depth DESC LIMIT ?1)`,
+				excess,
+			);
+		}
+		rangeHierarchyRows.set(this.#storage, exact - Math.max(excess, 0));
 	}
 
-	/** The number of learned rows. For tests and status views; the bound is enforced on every learn. */
+	/** The exact number of learned rows. It reads the whole table. */
 	countRangeHierarchyRows(): number {
 		return one(this.#storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM fokos_range_hierarchy`)).n;
 	}
@@ -1000,12 +1027,18 @@ export class FokosShardingStore {
 	/** Forgets one learned slice, after the partition it names answered that it does not exist. */
 	deleteLearnedRangeSlice(hk: KeyBytes, startBoundary: KeyBytes | null, endBoundary: KeyBytes | null): void {
 		const unbounded = KeyCodec.encodeOptional(undefined);
-		this.#storage.sql.exec(
-			`DELETE FROM fokos_range_hierarchy WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3`,
-			hk,
-			startBoundary ?? unbounded,
-			endBoundary ?? unbounded,
-		);
+		const deleted = this.#storage.sql
+			.exec(
+				`DELETE FROM fokos_range_hierarchy WHERE hk = ?1 AND sk_start_boundary = ?2 AND sk_end_boundary = ?3 RETURNING 1`,
+				hk,
+				startBoundary ?? unbounded,
+				endBoundary ?? unbounded,
+			)
+			.toArray().length;
+		const known = rangeHierarchyRows.get(this.#storage);
+		if (known !== undefined && deleted > 0) {
+			rangeHierarchyRows.set(this.#storage, known - deleted);
+		}
 	}
 
 	/**

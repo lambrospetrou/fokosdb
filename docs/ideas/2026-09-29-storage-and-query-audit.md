@@ -1,7 +1,8 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, X2 and R3. Partly done: R4 (the override flag) and X1 (fix
-2, when the partition has no override). Skipped: C3. The other findings are not decided or implemented.
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, X2, R3 and R5. Partly done: R4 (the override flag) and X1 (fix
+2, when the partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
+or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-01.
 
@@ -48,7 +49,7 @@ says how it was checked:
 | F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
-| R5 | Runtime | `learnRangeBoundary` counts the whole table on each insert and each refresh | Medium | Optional index |
+| R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
 | R7 | Runtime | The Bloom filter (~360 KB) is written whole each time the partition learns one promoted key | Medium | Optional |
 
@@ -75,7 +76,7 @@ You must decide these now, also when the answer is "no":
 5. X1 split_bucket: you can add it now or never.
 6. C3: skipped. The measured gain is small (see C3).
 7. R11: a policy version in the route context. This changes the wire format.
-8. R7 (paged Bloom filter), K3 and R9 are optional. Their value is lower.
+8. R7 (paged Bloom filter) and R9 are optional. Their value is lower. K3 is decided: no change.
 
 Priority 4: cost and background work (no schema change)
 
@@ -84,7 +85,7 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R4/K2 (the destroy fence and the import state), R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+11. R4/K2 (the destroy fence and the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
 My recommendation: start with F11 and F1 as one change, then C5, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
 
@@ -160,18 +161,29 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
   `hasRouteOverride` and `hasTerminalRouteOverride` return at once with no read. The flag is kept for the storage
   object, not for one store instance, so every store on the same storage sees an insert.
 
-**R5 — `learnRangeBoundary` counts the whole table (Medium).** **Code + Plan.**
+**R5 — done: `learnRangeBoundary` counted the whole table (Medium).** **Code + Plan.**
 
-- **What happens:**
-  - Any `rowsWritten > 0` runs `SELECT COUNT(*)` over `fokos_range_hierarchy` (`sharding/sharding-store.ts:957`,
-    marked FIXME). This includes the 60-second refresh of a known row, where the table does not grow.
-  - The eviction query scans and sorts the whole table, because `learned_at` has no index.
+- **What happened:**
+  - Any `rowsWritten > 0` ran `SELECT COUNT(*)` over `fokos_range_hierarchy`. This included the 60-second refresh
+    of a known row, where the table does not grow. SQLite stores no row count, so each count read the whole table,
+    and Durable Objects bill each row it reads.
+  - Above the bound, each insert scanned and sorted the whole table to evict only 1 row, because `learned_at` has
+    no index.
 - **Example:** A router serves traffic to 5,000 learned slices, so about 83 refreshes per second. Each refresh
-  counts 5–10k entries: about 0.5M row visits per second on a single-threaded DO.
-- **Fix:**
-  1. Count once at load, and keep the count in memory.
-  2. Split the statement into `INSERT … ON CONFLICT DO NOTHING` (on a write, add 1) and a conditional `UPDATE`.
-  3. Evict in batches, for example the oldest 10 % when the count goes above the maximum.
+  counted 5–10k entries: about 0.5M row visits per second on a single-threaded DO.
+- **What changed** (`sharding/sharding-store.ts`):
+  1. The upsert is split into `INSERT … ON CONFLICT DO NOTHING` and, when it inserts nothing, a conditional
+     `UPDATE` of `learned_at`. A refresh does not count the rows. A hot row costs two seeks and no write.
+  2. A module `WeakMap` keeps the row count for each storage. The first insert of an isolate counts the rows, and
+     each later insert adds 1. `deleteLearnedRangeSlice` subtracts the rows it deletes. The count only decides when
+     an eviction runs, and the eviction counts the rows exactly again. A write that rolls back can make the count
+     wrong, and the next eviction corrects it.
+  3. An eviction deletes the oldest rows, deepest first, down to 90 % of the bound (`maxRows - floor(maxRows /
+     10)`). One count and one sort then serve the next tenth of the bound in inserts. Below 10 rows the bound is
+     exact, as before.
+- **Not done, on purpose:** No index on `learned_at`. Each refresh would move its index entry, and the batch
+  eviction already makes the sort rare. A counter row was also not used: it costs one more billed read and write on
+  each insert, and the eviction counts exactly anyway.
 
 **R6 — `findDeepestKnownRangeSlice` reads all slices of the key (Low–Medium).** **Plan.**
 
@@ -276,7 +288,7 @@ size of a value does not change the bill. The limit for a key and its value toge
   combined key still costs one seek and one deserialization per request.
 - **Smallest fix:** `#api` reads the fence once, and passes it on, so `#guard` does not read it again.
 
-**K3 — the plan head can be a column of its repartition row (Low, schema).** **Code.**
+**K3 — decided, no change: the plan head can be a column of its repartition row (Low, schema).** **Code.**
 
 - The plan head has the same life as its `fokos_repartitions` row. The queue transaction writes both, and the
   transaction that writes `cleaned` deletes the head. `#hookPlan` reads the row, the targets and the head in each
@@ -286,6 +298,10 @@ size of a value does not change the bill. The limit for a key and its value toge
 - **Fix:** Store the plan as a last column of `fokos_repartitions` (wide columns go last, as the migration comment
   says). The row read then includes it, and the `cleaned` transaction sets it to NULL. This removes one KV key per
   repartition, and the chain code.
+- **Decision:** Do not do this. The KV value stores the plan as an object with structured clone, so the plan can
+  hold `Uint8Array` keys and other objects without an encoding step. A column needs an encoding for each value,
+  and a schema change for each new field it must query. The KV key keeps the plan format open for future changes.
+  The cost stays: one more read in each hook call, and the chain code.
 
 **K4 — `identity` and `policy` stay two keys (no change).**
 
@@ -399,14 +415,47 @@ size of a value does not change the bill. The limit for a key and its value toge
 - **Why a per-item counter is not enough:** A read that sees an item absent in both phases must still detect a
   create and a delete between the phases. Only a counter that is shared by more keys than one item can record it.
 
-**F6 — two indexes on (hk, sk) (decision to confirm).** **Code.**
+**F6 — decided, keep both: two indexes on (hk, sk) (Low).** **Code + SQL replay.**
 
 - **What happens:** `items` has `UNIQUE(hk, sk)` and also `idx_items_scan (hk, sk, est_row_bytes)`.
   - Each insert and each delete writes both indexes.
   - Each update that changes the size moves the `idx_items_scan` entry.
   - The keys are stored 3 times. With 1 KB hash keys, that is most of a small row.
-- **Why it exists:** Count queries and the range split scan read only the index. This is a real trade-off, not a
-  defect, but confirm it before the freeze.
+- **Why both exist:**
+  - The upsert uses `ON CONFLICT (hk, sk)`, so it needs a unique index on exactly `(hk, sk)`.
+  - The count queries, the size lookups and the range split boundary scan read only `idx_items_scan`.
+- **Why one index cannot do both:**
+  - A unique index is unique on all its columns. `UNIQUE (hk, sk, est_row_bytes)` accepts two rows with the same
+    `(hk, sk)` and different sizes.
+  - SQLite has no `INCLUDE` columns, so an index cannot be unique on `(hk, sk)` and also hold `est_row_bytes`.
+- **Measurement:** SQLite 3.45.1, 4 KiB pages, 50k rows with the real columns, random hash keys.
+  - The size of each B-tree in the current layout:
+
+    | Item size | `items` | `sqlite_autoindex_items_1` | `idx_items_scan` |
+    |---|---|---|---|
+    | 100 B | 7.3 MB | 2.1 MB | 2.1 MB |
+    | 1,500 B | 97.9 MB | 2.0 MB | 2.2 MB |
+
+  - The total size of the current layout and of a `WITHOUT ROWID` table with `PRIMARY KEY (hk, sk)` and
+    `idx_items_scan`:
+
+    | Item size | rowid (current) | WITHOUT ROWID |
+    |---|---|---|
+    | 100 B | 11.4 MB | 9.8 MB (0.86x) |
+    | 1,500 B | 102.1 MB | 225.6 MB (2.2x) |
+    | 10,000 B | 492.7 MB | 616.2 MB (1.25x) |
+
+- **Alternatives, and why they are rejected:**
+  - Remove `idx_items_scan`, and read `est_row_bytes` from the table. At 1,500 B items, a boundary scan then reads
+    the 97.9 MB table and not the 2.2 MB index, about 45 times more pages. The boundary scan already blocks the
+    request path (F7), so this makes F7 worse.
+  - Change `items` to `WITHOUT ROWID` with `PRIMARY KEY (hk, sk)`. This removes `sqlite_autoindex_items_1` and
+    keeps the uniqueness. It is smaller only for very small items, and 2.2x larger at 1,500 B items, for the
+    reason that C3 measured. It also removes `item_id`, which links an item to its rows in other tables, and new
+    rows no longer go to the end of the table B-tree.
+- **Decision:** Keep both indexes. The second index costs about 22 % of the storage at 100 B items and about 2 % at
+  1,500 B items, and one more index write for each insert and delete. Examine `WITHOUT ROWID` again only if small
+  items become the main workload, and then together with C3.
 - **Related:** Each item size change updates `key_size_estimates` and its `key_size_estimates_by_bytes` index.
   The index also stores the hash key, because the table is WITHOUT ROWID. Count both B-tree updates and the extra
   key storage. `largestKeysAtLeast` uses a bounded covering seek, confirmed with `EXPLAIN QUERY PLAN` in SQLite
@@ -654,10 +703,8 @@ The SQL migrations can still be edited in place.
   - R11: a policy version in the route context.
   - R7: paged Bloom storage, if it is wanted.
   - R9: finished promotions as override rows only, if it is wanted.
-  - K3: the plan head as a column of `fokos_repartitions`, if it is wanted.
 - **Additive, but cheapest now:**
   - F5: the delete buckets.
-  - R5: an index on `learned_at`, if it is wanted.
 - **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6. C5 needs an internal migration cursor and page-format change.
 
 ## 7. What was checked and is fine
