@@ -2,7 +2,7 @@
 
 **State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
-partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
+partition has no override). Decided, no change: F6 and K3. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-01.
@@ -77,7 +77,10 @@ You must decide these now, also when the answer is "no":
 5. X1 split_bucket: you can add it now or never.
 6. C3: skipped. The measured gain is small (see C3).
 7. R11: done. The route context carries a policy version.
-8. R7 (paged Bloom filter) and R9 are optional. Their value is lower. K3 is decided: no change.
+8. C2 keeps one route context for each participant, for transactions across tables. K3 is decided: no change. R9 is postponed, and it does
+   not depend on the freeze (see R9).
+9. R7 (paged Bloom filter) does not depend on the freeze. The filter is a cache, so its storage can change at any
+   time.
 
 Priority 4: cost and background work (no schema change)
 
@@ -218,6 +221,8 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
   it at most once per interval. A crash loses only hints, which cost one more hop.
 - **Fix with a schema change:** Store the bits as 4 KB pages in a table, and write only the ≤ k pages that changed
   (k = 7 at 1 %).
+- **No freeze date:** The filter is a cache. A later version can delete the old KV key and learn the promoted keys
+  again. Until it learns a key, a request to that key costs one more forward.
 - **Hash arena:** It uses the same pattern, but it is small and changes seldom (Low).
 
 **R11 — done: policy "last writer wins" could write on every request (Low–Medium).** **Code + test.**
@@ -267,12 +272,35 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
   cursor, and then sorts it. Rows are permanent, so a full walk costs O(rows² / page size).
 - **Fix:** Walk `fokos_repartitions` by `seq` with a LIMIT. Then read the targets of each row with an ordered seek.
 
-**R9 — inherited promotions store 3 rows and about 6 copies of the hash key (Low).** **Code.**
+**R9 — postponed: inherited promotions store 3 rows and about 6 copies of the hash key (Low).** **Code.**
 
 - **What happens:** `#applyOverrides` writes a repartition row, a target row and an override row for each key. The
   target row holds `slice_hash_key`, `do_name` and `partition_id`, and the last two also encode the hash key. Each
   later hash split copies the rows again. Only the override is needed to route.
-- **Fix:** Store a finished promotion as the override row only, if the smaller schema is worth the change.
+- **Cost:** With a 100 B hash key, one inherited key uses about 880 B and 8 B-tree entries. The override row alone
+  is about 110 B. Example: 10,000 promoted keys, each with 3 later hash splits on its path, use about 23 MB in
+  place of about 3 MB. Each inherited row is also one more entry on each `fokosStatus` page, so walk and destroy
+  read more (R8).
+- **What reads the inherited rows:**
+  - Routing and the override export of the next split need only "a finished override exists". No caller reads the
+    `repartitionId` that `routeOverrideFor` returns.
+  - `walk` and `destroy` do not need them. The partition that did the promotion keeps its own row for life, so the
+    walk reaches the range root through it. `destroy` is post-order, so that partition stays until the range root
+    is deleted.
+  - `PartitionDO.status().promotedKeys` needs them: a child lists the keys it inherited
+    (`read-through.test.ts` checks this).
+- **Fix:**
+  1. `fokos_route_overrides.repartition_id` can be NULL. NULL means "the promotion finished at an ancestor".
+  2. `#applyOverrides` writes only the override row.
+  3. `routeOverrideFor` uses a `LEFT JOIN` and answers `cleaned` for NULL. `hasTerminalRouteOverride` and
+     `queryTerminalRouteOverridesPage` add `o.repartition_id IS NULL OR …`.
+  4. For `status().promotedKeys`, either add a paged runtime read of the inherited overrides (the host reads no
+     `fokos_` table), or stop listing inherited keys in the status of a child.
+- **Why it does not depend on the freeze:** The `LEFT JOIN` reads the old and the new form, so no second code path
+  is needed. A later version can use the marker `''` in place of NULL, because no repartition has that id, and
+  then it needs no schema change. The NULL form needs a table rebuild, which is cheap for the small override table.
+- **Decision:** Postponed. The change saves storage only on partitions with many promoted keys, and it removes a
+  status feature or adds a runtime read. Do it when the storage or the status page cost becomes real.
 
 ### 3.4 KV keys
 
@@ -609,9 +637,25 @@ The finding was:
     them, and a new prepare or commit is idempotent.
   - The move from PREPARED to COMMITTING is a separate write.
   - `partition_context_json` stores a full route context for each participant of each transaction, although one
-    coordinator group serves one table.
+    coordinator group serves one table. This part is decided: keep it (see "Schema" below).
 - **Fix:** Write these values only when the request path cannot finish. That gives about 2N + 2P + 8 writes.
   The `stripPayload` part is done, so a transaction now does about 2N + 4P + 10 row writes.
+- **Schema, decided: keep one context for each participant.** The coordinator calls each participant, also in
+  recovery, with its stored route context: `policy.ns`, `topology.jurisdiction` and `doName` select the stub, and
+  the partition checks `partitionId`, `topology` and `policyVersion`. A later feature can add transactions across
+  tables. The participants of one transaction then have different topologies and policies, and one context for the
+  coordinator cannot reach all of them. A table config for each pair of transaction and table saves more bytes, but
+  adds a table, a join on the commit and recovery paths, and code to build the context again.
+  - **Measurement:** A root context of a table with default options is 385 bytes as JSON. `topology` (73),
+    `rangeConfig` (76), `policy` (147) and `policyVersion` (17) are about 80 % of it, and they are the same for each
+    participant of one table. Only the root index is different for each participant.
+  - **Possible later fix:** Do not store `schema` (10), `partitionId` (24) and `doName` (30). Build them again from
+    the `partition_do_name` column, which already holds the DO name. This saves about 17 % for each participant,
+    needs no new table, and works for transactions across tables.
+  - **Why it can wait:** A transaction has at most 100 participants, so about 38 KB at most, and
+    `completeTransaction` deletes the rows. The stored `policyVersion` also stops a late commit or recovery from
+    storing old options on a partition.
+  - The other parts of the fix change no schema.
 
 **C3 — skipped: wide rows in WITHOUT ROWID tables (Low).** **Code + SQL replay.**
 
@@ -741,12 +785,18 @@ wait behind it (see X2).
 The SQL migrations can still be edited in place.
 
 - **Breaking:**
-  - X1: `split_bucket`, if it is wanted.
+  - X1: `split_bucket`, if it is wanted. Now or never: a later change must rewrite each row and both key indexes
+    of every partition.
   - R11: done, a policy version in the route context.
-  - R7: paged Bloom storage, if it is wanted.
-  - R9: finished promotions as override rows only, if it is wanted.
 - **Additive, but cheapest now:**
-  - F5: the delete buckets.
+  - F5: the delete buckets. The migration page must also carry the buckets, so a later change must accept pages
+    of the old format during a deploy.
+- **Breaking, not tied to the freeze:**
+  - R7: paged Bloom storage. The filter is a cache, and a later version can learn it again.
+  - R9: postponed. Finished promotions as override rows only. A `LEFT JOIN` reads both forms, and the marker `''`
+    needs no schema change.
+- **Decided, no change:** C2 keeps `tc_participants.partition_context_json` for each participant. The fields
+  that repeat the DO name can go later, with no schema change.
 - **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6.
 
 ## 7. What was checked and is fine
