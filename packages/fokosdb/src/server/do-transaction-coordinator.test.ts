@@ -9,7 +9,7 @@ import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import { FokosRouter } from "../sharding/router.js";
 import { FOKOS_KV_KEYS } from "../sharding/sharding-store.js";
-import { IDEMPOTENCY_WINDOW_MS } from "../shared/transaction-limits.js";
+import { IDEMPOTENCY_WINDOW_MS, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX } from "../shared/transaction-limits.js";
 import { DEFAULT_COORDINATOR_CONFIG } from "./host-config.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
 import type {
@@ -81,6 +81,7 @@ type CoordinatorInternals = {
 	};
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
+	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void;
 	markPrepared(transactionId: string, idempotencyToken: string): void;
 	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
@@ -688,6 +689,41 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 					},
 				]);
 			}
+			expect(countRows(state, "tc_results")).toBe(1);
+		});
+	});
+
+	// Two drives can prepare the same participant. The answer of the slower drive can arrive after the
+	// other drive has stored CANCELLING and deleted the images that the cap dropped.
+	it("ignores a prepare answer that arrives after the cancel, and does not add an image again", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1" });
+			insertParticipant(state, { name: "p2" });
+			const rejection = (opIndex: number, hashKey: string, imageBytes: number): PrepareResponse => ({
+				outcome: "rejected",
+				results: [
+					{
+						opIndex,
+						outcome: "rejected",
+						reason: { code: "condition_failed", hashKey, item: { hashKey, data: `image-${opIndex}`, kind: "text", version: 1 } },
+						imageBytes,
+					},
+				],
+			});
+			// The first image fills the whole cap, so the cap drops the second image.
+			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX));
+			tc.storePrepareAnswer(TX_ID, "p2", rejection(1, "hk2", 6));
+			tc.cancelTransactionInStore(TX_ID, TOKEN);
+			const before = tc.loadFinalResponse(TX_ID, TOKEN);
+			const answersBefore = state.storage.sql.exec(`SELECT * FROM tc_participants ORDER BY partition_do_name`).toArray();
+			expect(countRows(state, "tc_results")).toBe(1);
+
+			tc.storePrepareAnswer(TX_ID, "p2", rejection(1, "hk2", 6));
+
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual(before);
+			expect(state.storage.sql.exec(`SELECT * FROM tc_participants ORDER BY partition_do_name`).toArray()).toEqual(answersBefore);
 			expect(countRows(state, "tc_results")).toBe(1);
 		});
 	});

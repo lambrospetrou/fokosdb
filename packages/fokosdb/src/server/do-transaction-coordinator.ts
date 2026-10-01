@@ -846,9 +846,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * prepare outcome they belong to. No part of an answer then lives only in memory, so a coordinator
 	 * evicted between a participant's answer and the transaction's decision still reads back every
 	 * outcome, reason, and image that participant reported.
+	 *
+	 * It writes only while the transaction is PREPARING. An answer can arrive after another drive has
+	 * decided the transaction. That decision has stored its results and deleted the images that the cap
+	 * dropped, so a late answer must not change the answers or add an image again.
 	 */
 	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void {
 		this.ctx.storage.transactionSync(() => {
+			if (this.loadStateRow(transactionId)?.state !== "PREPARING") {
+				return;
+			}
 			this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
 				answer.outcome,
