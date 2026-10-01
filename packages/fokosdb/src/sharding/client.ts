@@ -27,6 +27,8 @@ export type FokosShardingClientOptions<TPolicy> = {
 	topology: FokosTopology;
 	rangeConfig: FokosRangeConfig;
 	policy: TPolicy;
+	/** The version of `rangeConfig` and `policy`. See `FokosRouteContext.policyVersion`. Default: 0. */
+	policyVersion?: number;
 	/** The contract of `FokosRuntimeOptions.stub`. The stub must also have the `FokosShardingRpc` methods. */
 	stub(this: void, ctx: FokosRouteContext<TPolicy>, doName: string): DurableObjectStub;
 	/** Absent: the client sends each request once. */
@@ -86,7 +88,7 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 	#firstRoot: FokosRouteContext<TPolicy> | undefined;
 
 	constructor(opts: FokosShardingClientOptions<TPolicy>) {
-		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy);
+		this.#router = new FokosRouter(opts.topology, opts.rangeConfig, opts.policy, opts.policyVersion);
 		this.#stub = opts.stub;
 		this.#retry = opts.retry;
 	}

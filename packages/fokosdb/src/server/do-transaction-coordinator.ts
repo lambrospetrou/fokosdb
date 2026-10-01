@@ -1055,6 +1055,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			topology: ctx.topology,
 			rangeConfig: ctx.rangeConfig,
 			policy: ctx.policy,
+			policyVersion: ctx.policyVersion,
 			stub: (c, doName) => partitionStubByName(this.env, c, doName),
 		});
 	}

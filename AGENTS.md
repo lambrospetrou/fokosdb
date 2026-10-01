@@ -44,7 +44,7 @@ Every partition RPC answers a `FokosEnvelope<T>`: `value` is the result and `rou
 
 An item has a `hashKey`, an optional `sortKey` (default `""`), data as `Uint8Array | string`, a `version` that every write increments, and an optional TTL.
 
-**`PartitionContext` travels in every RPC.** Workers RPC cannot configure a DO at instantiation, so the topology configuration goes with each request and the DO compares it with the one it stored. Never read `env[ctx.ns]` outside `shared/do-stubs.ts`: use `partitionNamespace`, `txCoordinatorNamespace`, or the stub helpers, because each one applies the configured jurisdiction.
+**`PartitionContext` travels in every RPC.** Workers RPC cannot configure a DO at instantiation, so the topology configuration goes with each request and the DO compares it with the one it stored. The DO stores the mutable part (`rangeConfig` and `policy`) only from a request with the same or a higher `policyVersion`. Never read `env[ctx.ns]` outside `shared/do-stubs.ts`: use `partitionNamespace`, `txCoordinatorNamespace`, or the stub helpers, because each one applies the configured jurisdiction.
 
 ## Partitions
 

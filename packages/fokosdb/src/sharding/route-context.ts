@@ -42,10 +42,17 @@ export type FokosRouteContext<TPolicy> = {
 	doName: string;
 	/** Immutable topology of the shard group. Persisted at creation. A later mismatch is an error. */
 	topology: FokosTopology;
-	/** Read when a range split is planned. Mutable, last writer wins. */
+	/** Read when a range split is planned. Mutable, and `policyVersion` orders its changes. */
 	rangeConfig: FokosRangeConfig;
-	/** Host policy. Opaque to the sharding code. Persisted and replaced when a request carries a new value. */
+	/** Host policy. Opaque to the sharding code. Mutable, and `policyVersion` orders its changes. */
 	policy: TPolicy;
+	/**
+	 * The version of `rangeConfig` and `policy`, a non-negative integer. A partition stores the request
+	 * values when this version is higher than the stored one, and ignores them when it is lower. With an
+	 * equal version, the last writer wins. So two Worker versions that send different values during a
+	 * deploy do not replace the stored values on each request, if the newer one sends a higher version.
+	 */
+	policyVersion: number;
 };
 
 /** The immutable identity of one partition. A name alone is a value the caller chose. */
@@ -70,7 +77,7 @@ export type FokosPartitionIdentity = {
 };
 
 /** The mutable part of the last route context a partition received, under `__fokos/policy`. */
-export type FokosStoredPolicy<TPolicy> = { rangeConfig: FokosRangeConfig; policy: TPolicy };
+export type FokosStoredPolicy<TPolicy> = { rangeConfig: FokosRangeConfig; policy: TPolicy; policyVersion: number };
 
 export function refOf(ctx: FokosPartitionRef): FokosPartitionRef {
 	return { partitionId: ctx.partitionId, doName: ctx.doName };
@@ -111,6 +118,12 @@ export function validateRangeConfig(rangeConfig: FokosRangeConfig): void {
 	}
 	if (!Number.isInteger(fromLeaf) || fromLeaf < 0 || fromLeaf > 10) {
 		throw invalid("rangeAncestors.fromLeaf", fromLeaf, "rangeAncestors.fromLeaf must be between 0 and 10");
+	}
+}
+
+export function validatePolicyVersion(policyVersion: number): void {
+	if (!Number.isSafeInteger(policyVersion) || policyVersion < 0) {
+		throw invalid("policyVersion", policyVersion, "policyVersion must be a non-negative integer");
 	}
 }
 

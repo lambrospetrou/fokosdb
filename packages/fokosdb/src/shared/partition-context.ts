@@ -12,7 +12,7 @@
 import type { PartitionDO } from "../server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../server/do-transaction-coordinator.js";
 import type { FokosRangeConfig, FokosRouteContext, FokosTopology } from "../sharding/route-context.js";
-import { validateRangeConfig, validateTopology } from "../sharding/route-context.js";
+import { validatePolicyVersion, validateRangeConfig, validateTopology } from "../sharding/route-context.js";
 import { FokosValidationError } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
@@ -32,8 +32,9 @@ export type TransactionCoordinatorNamespaceKey = {
 }[keyof Env];
 
 /**
- * What FokosDB needs on every partition and coordinator, beside the topology. Last writer wins,
- * except `ns` and `nsTx`: a change to those selects another Durable Object namespace, which a
+ * What FokosDB needs on every partition and coordinator, beside the topology. A request with a
+ * higher `policyVersion` replaces it, and with an equal version the last writer wins. The exception is
+ * `ns` and `nsTx`: a change to those selects another Durable Object namespace, which a
  * partition inside the old namespace cannot detect, so a shard group must keep them for life.
  */
 export type FokosDBPolicy = {
@@ -80,6 +81,7 @@ export type FokosDBTableConfig = {
 	topology: FokosTopology;
 	rangeConfig: FokosRangeConfig;
 	policy: FokosDBPolicy;
+	policyVersion: number;
 };
 
 /**
@@ -144,6 +146,16 @@ export type FokosTableOptions = {
 	 * decrease a key size limit after items with larger keys exist.
 	 */
 	limits?: FokosDBLimitOverrides;
+	/**
+	 * The version of the options above, a non-negative integer. Default: 0.
+	 *
+	 * Each partition and coordinator stores the options of the requests it receives. It stores them
+	 * when the version is higher than the stored version, and ignores them when it is lower. With an
+	 * equal version, the last request wins. Increase the version each time you change these options,
+	 * so that requests from an older deploy do not replace them. To go back to earlier options, deploy
+	 * them with a higher version: a lower version has no effect on partitions that saw the higher one.
+	 */
+	policyVersion?: number;
 };
 
 /** Validates the options of a table, applies the defaults, and splits them into the parts of a route context. */
@@ -208,7 +220,9 @@ export function createTableConfig(opts: FokosTableOptions): FokosDBTableConfig {
 		...(opts.locationHint === undefined ? {} : { locationHint: opts.locationHint }),
 		...(limits === undefined ? {} : { limits }),
 	};
-	return { topology, rangeConfig, policy };
+	const policyVersion = opts.policyVersion ?? 0;
+	validatePolicyVersion(policyVersion);
+	return { topology, rangeConfig, policy, policyVersion };
 }
 
 function validateSplitConditions(

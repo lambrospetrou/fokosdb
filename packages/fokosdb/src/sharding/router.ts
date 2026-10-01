@@ -1,6 +1,7 @@
 import { PartitionIdHelper, hashRootIndex } from "./partition-id.js";
 import type { KeyBytes } from "./key-codec.js";
 import {
+	validatePolicyVersion,
 	validateRangeConfig,
 	validateTopology,
 	type FokosRangeConfig,
@@ -21,9 +22,11 @@ export class FokosRouter<TPolicy> {
 		readonly topology: FokosTopology,
 		readonly rangeConfig: FokosRangeConfig,
 		readonly policy: TPolicy,
+		readonly policyVersion: number = 0,
 	) {
 		validateTopology(topology);
 		validateRangeConfig(rangeConfig);
+		validatePolicyVersion(policyVersion);
 	}
 
 	/** The root partition that owns `hashKey`. Keys arrive already encoded. */
@@ -49,6 +52,7 @@ export class FokosRouter<TPolicy> {
 			topology: this.topology,
 			rangeConfig: this.rangeConfig,
 			policy: this.policy,
+			policyVersion: this.policyVersion,
 		};
 		this.#roots.set(idx, ctx);
 		return ctx;

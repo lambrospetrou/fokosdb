@@ -96,6 +96,33 @@ All other options are outside `table` and can change: `rangeSplitN`, `hashSplitC
 `retry` and `partitionMigratingRetryDeadlineMs`. A change to `rangeSplitN` applies only to the range
 splits that start after it. Never decrease a key size limit in `limits` after items with larger keys exist.
 
+### Change the table options during a deploy
+
+Each partition and coordinator stores `rangeSplitN`, `hashSplitConditions`, `rangeSplitConditions`,
+`rangeAncestorsConfig`, `locationHint` and `limits` from the requests it receives. `policyVersion`
+(default `0`) orders these changes:
+
+- A request with a higher `policyVersion` replaces the stored options.
+- A request with a lower `policyVersion` does not change them.
+- A request with an equal `policyVersion` replaces them when they are different. The last request wins.
+
+During a gradual deploy, two Worker versions can send requests at the same time. If they send
+different options with the same version, each partition replaces its options each time the version
+changes. To prevent this, increase `policyVersion` each time you change these options:
+
+```ts
+const db = new FokosDB({
+	table: { name: "my-table", ns: "PARTITION_DO", nsTx: "TRANSACTION_COORDINATOR_DO", rootTreesN: 10, hashSplitN: 4 },
+	hashSplitConditions: { maxSizeMb: 2000 },
+	policyVersion: 1,
+});
+```
+
+> [!WARNING]
+> To go back to earlier options, deploy them with a higher `policyVersion`. If you roll back to a
+> Worker version with a lower `policyVersion`, the partitions that received the higher version keep
+> its options.
+
 ### Jurisdictions and identity hazard
 
 A table can specify `jurisdiction: "eu" | "fedramp" | "us"` in the `table` option of `FokosDB`.

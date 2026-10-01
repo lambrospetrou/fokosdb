@@ -410,7 +410,7 @@ export class FokosDB {
 
 	constructor(options: FokosDBOptions) {
 		this.#table = createTableConfig(options);
-		const { topology, rangeConfig, policy } = this.#table;
+		const { topology, rangeConfig, policy, policyVersion } = this.#table;
 		// The default has the same maximum as the check below, so a large `rootTreesN` does not fail.
 		this.#options = {
 			...options,
@@ -449,6 +449,7 @@ export class FokosDB {
 			topology,
 			rangeConfig,
 			policy,
+			policyVersion,
 			stub: (ctx, doName) => partitionStubByName(env, ctx, doName),
 		});
 		this.#coordinators = new FokosShardingClient({
@@ -459,6 +460,7 @@ export class FokosDB {
 			},
 			rangeConfig,
 			policy,
+			policyVersion,
 			stub: (ctx, doName) => txCoordinatorStubByName(env, ctx, doName),
 		});
 	}
@@ -646,13 +648,12 @@ export class FokosDB {
 		// request carries the token, so a retry resumes the same transaction and never starts a second one.
 		const deadline = Date.now() + this.#options.partitionMigratingRetryDeadlineMs;
 		const { baseDelayMs, maxDelayMs } = this.#options.retry;
-		const { topology, rangeConfig, policy } = this.#table;
 		// The TC response carries no keys — nothing to decode at this boundary, unlike every other
 		// method here. See TransactWriteItemsResult.
 		const { value: encoded } = await this.#coordinators.point(
 			"initiateWrite",
 			{ hashKey: encodeHashKey(idempotencyToken, this.#limits), sortKey: encodeSortKey(undefined, this.#limits) },
-			{ clientRequestToken: idempotencyToken, table: { topology, rangeConfig, policy }, items },
+			{ clientRequestToken: idempotencyToken, table: this.#table, items },
 			{
 				retry: {
 					shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,

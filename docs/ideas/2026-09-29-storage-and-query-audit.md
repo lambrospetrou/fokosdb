@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
 partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
 or implemented.
@@ -76,7 +76,7 @@ You must decide these now, also when the answer is "no":
 
 5. X1 split_bucket: you can add it now or never.
 6. C3: skipped. The measured gain is small (see C3).
-7. R11: a policy version in the route context. This changes the wire format.
+7. R11: done. The route context carries a policy version.
 8. R7 (paged Bloom filter) and R9 are optional. Their value is lower. K3 is decided: no change.
 
 Priority 4: cost and background work (no schema change)
@@ -88,7 +88,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: start with F11 and F1 as one change, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
+My recommendation: start with F11 and F1 as one change, then F5. Before you edit the migrations in place, make the decision on X1.
 
 
 ## 3. Sharding runtime
@@ -220,14 +220,22 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
   (k = 7 at 1 %).
 - **Hash arena:** It uses the same pattern, but it is small and changes seldom (Low).
 
-**R11 — policy "last writer wins" can write on every request (Low–Medium).** **Code.**
+**R11 — done: policy "last writer wins" could write on every request (Low–Medium).** **Code + test.**
 
-- **What happens:** `#ensureIdentity` writes `__fokos/policy` each time the request policy is different from the
+- **What happened:** `#ensureIdentity` wrote `__fokos/policy` each time the request policy was different from the
   stored one.
 - **Example:** During a rolling deploy, two Worker versions with different table options send requests in turn.
-  Each request writes the KV key and changes the split thresholds back and forth, on every partition they reach.
-- **Fix:** Add a monotonic policy version to the route context, and store only a newer policy. This is a wire
-  change, so do it before the freeze.
+  Each request wrote the KV key and changed the split thresholds back and forth, on every partition they reached.
+- **What changed:**
+  - `FokosRouteContext` and `FokosStoredPolicy` have `policyVersion`, a non-negative integer. It covers
+    `rangeConfig` and `policy`. `FokosTableOptions.policyVersion` sets it, and the default is 0.
+  - `#ensureIdentity` ignores a request with a lower version, and the request runs with the stored values. A
+    higher version replaces the stored values. An equal version keeps "last writer wins", so a user who never sets
+    the version, or forgets to increase it, gets the earlier behavior.
+  - The coordinator stores the route context of each participant, with its version. A late commit or recovery
+    that sends an old context therefore does not replace a newer stored policy.
+- **Trap:** A rollback to a Worker version with a lower version has no effect on partitions that saw the higher
+  one. To go back to earlier options, deploy them with a higher version. The README states this.
 
 ### 3.3 Background path
 
@@ -281,7 +289,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokosdb/partition/schema_version` | `PartitionDO` | a number | once per schema version | each start |
 | `__fokosdb/tc/schema_version` | coordinator | a number | once per schema version | each start |
 | `__fokos/identity` | runtime | ~200 B; KBs for a range partition with large keys | once | each start |
-| `__fokos/policy` | runtime | ~225 B | when the request policy changes (R11) | each start |
+| `__fokos/policy` | runtime | ~225 B | when a request carries a higher `policyVersion`, or the same version and other values (R11) | each start |
 | `__fokos/destroying` | runtime | `true` | once, at the destroy fence | 2 times per `PartitionDO` request (`#api`, `#guard`), 1 time per coordinator request, and several times per pass |
 | `__fokos/import` | runtime | a few hundred B; up to ~3 KB with a cursor of large keys | each migration page, retry, start and acknowledgement | 1 time per request (`#dispatch`), 2 times per pass (two job deadlines), `lifecycle()`, and each log line (`#logParams`) |
 | `__fokos/jobs` | runtime | a small record | after a job step that changes it; `scheduleJob` when the new time is earlier | 2 times per pass, and in each `scheduleJob`: each accepted `txPrepare`, each coordinator `initiateWrite`, and each completed coordinator transaction |
@@ -734,7 +742,7 @@ The SQL migrations can still be edited in place.
 
 - **Breaking:**
   - X1: `split_bucket`, if it is wanted.
-  - R11: a policy version in the route context.
+  - R11: done, a policy version in the route context.
   - R7: paged Bloom storage, if it is wanted.
   - R9: finished promotions as override rows only, if it is wanted.
 - **Additive, but cheapest now:**

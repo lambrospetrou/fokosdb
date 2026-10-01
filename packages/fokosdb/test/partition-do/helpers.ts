@@ -127,7 +127,7 @@ export function makeStub(opts?: PartitionOptions) {
 		rangeSplitConditions: { maxSizeMb: 500 },
 		...rest,
 	});
-	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy).rootContext(kb("dummyHashKey"));
+	const ctx = new FokosRouter(base.topology, base.rangeConfig, base.policy, base.policyVersion).rootContext(kb("dummyHashKey"));
 	const stub = testPartitionStub(ctx.doName, ctx.policy.ns);
 	return { ctx, stub, rpc: openedRpc(stub) };
 }

@@ -329,7 +329,11 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 			// Only the rows written before the first prepare are under test.
 			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
 
-			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: { topology, rangeConfig: ctx.rangeConfig, policy }, items });
+			await tc.initiateWriteLocal({
+				clientRequestToken: TOKEN,
+				table: { topology, rangeConfig: ctx.rangeConfig, policy, policyVersion: ctx.policyVersion },
+				items,
+			});
 
 			const itemRows = state.storage.sql
 				.exec<{ op_index: number; partition_do_name: string }>(`SELECT op_index, partition_do_name FROM tc_items ORDER BY op_index`)

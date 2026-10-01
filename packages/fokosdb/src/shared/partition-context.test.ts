@@ -98,6 +98,19 @@ describe("createTableConfig — defaults", () => {
 		expect(cfg.policy.rangeSplitConditions).toEqual({ maxSizeMb: 200 });
 	});
 
+	it("defaults policyVersion to 0 and keeps a given value", () => {
+		expect(createTableConfig(makeOpts()).policyVersion).toBe(0);
+		expect(createTableConfig(makeOpts({ policyVersion: 7 })).policyVersion).toBe(7);
+	});
+
+	it("rejects a policyVersion that is negative or not an integer", () => {
+		for (const policyVersion of [-1, 1.5, Number.NaN]) {
+			expect(() => createTableConfig(makeOpts({ policyVersion }))).toThrow(
+				expect.objectContaining({ code: "partition_context_options_invalid" }),
+			);
+		}
+	});
+
 	it("does not change the options object of the caller", () => {
 		const opts = makeOpts({ hashSplitN: 8 });
 		const before = structuredClone(opts);

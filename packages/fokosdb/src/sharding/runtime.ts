@@ -48,6 +48,7 @@ import {
 	refOf,
 	structurallyEqual,
 	topologiesEqual,
+	validatePolicyVersion,
 	validateRangeConfig,
 	validateTopology,
 	type FokosPartitionIdentity,
@@ -1369,7 +1370,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * Validates the route context of a request against the stored identity, and stores a changed
-	 * policy. A root hash partition without an identity takes it from its first request. Every other
+	 * policy with the same or a higher `policyVersion`. A root hash partition without an identity takes it from its first request. Every other
 	 * partition is created by `fokosInit` only. Synchronous: `fokosPrepareDestroy` and `fokosInit` call
 	 * it inside the transaction that writes the fence, or the import record.
 	 *
@@ -1404,11 +1405,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			throw contextMismatch({ doName: routeCtx.doName, expected: identity.ref.doName });
 		}
 		const stored = this.#stored!;
-		if (structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) && structurallyEqual(stored.policy, routeCtx.policy)) {
+		// A lower version comes from an older client, for example during a deploy. The request then
+		// runs with the stored values.
+		if (routeCtx.policyVersion < stored.policyVersion) {
 			return NO_COMMIT;
 		}
-		validateRangeConfig(routeCtx.rangeConfig);
-		const next: FokosStoredPolicy<TPolicy> = { rangeConfig: routeCtx.rangeConfig, policy: routeCtx.policy };
+		if (
+			routeCtx.policyVersion === stored.policyVersion &&
+			structurallyEqual(stored.rangeConfig, routeCtx.rangeConfig) &&
+			structurallyEqual(stored.policy, routeCtx.policy)
+		) {
+			return NO_COMMIT;
+		}
+		const next = storedPolicyOf(routeCtx);
 		this.#store.transactionSync(() => this.#store.putPolicy(next));
 		return () => this.#setIdentity(identity, next);
 	}
@@ -1434,9 +1443,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	#writeIdentity(routeCtx: FokosRouteContext<TPolicy>, range?: { depth: number; ancestors: RangeAncestorInfo[] }): () => void {
 		validateTopology(routeCtx.topology);
-		validateRangeConfig(routeCtx.rangeConfig);
 		const identity = partitionIdentityFrom(routeCtx, range);
-		const stored: FokosStoredPolicy<TPolicy> = { rangeConfig: routeCtx.rangeConfig, policy: routeCtx.policy };
+		const stored = storedPolicyOf(routeCtx);
 		this.#store.transactionSync(() => {
 			this.#store.putIdentity(identity);
 			this.#store.putPolicy(stored);
@@ -2180,6 +2188,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			...(importSource ? { importSource: importSource.doName } : {}),
 		};
 	}
+}
+
+/** The mutable part of a route context, validated, as a partition stores it under `__fokos/policy`. */
+function storedPolicyOf<TPolicy>(routeCtx: FokosRouteContext<TPolicy>): FokosStoredPolicy<TPolicy> {
+	validateRangeConfig(routeCtx.rangeConfig);
+	validatePolicyVersion(routeCtx.policyVersion);
+	return { rangeConfig: routeCtx.rangeConfig, policy: routeCtx.policy, policyVersion: routeCtx.policyVersion };
 }
 
 function cutOver(state: RepartitionState): boolean {

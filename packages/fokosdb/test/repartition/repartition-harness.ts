@@ -251,7 +251,7 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				const target = req.target as FokosDBRouteContext;
 				const range = isRangePartition(target) ? { depth: req.rangeDepth ?? 0, ancestors: req.rangeAncestors ?? [] } : undefined;
 				sharding.putIdentity(partitionIdentityFrom(target, range));
-				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy });
+				sharding.putPolicy({ rangeConfig: target.rangeConfig, policy: target.policy, policyVersion: target.policyVersion });
 				// This harness keeps its identity in the store only, so it has no in-memory step to take.
 				return () => {};
 			},

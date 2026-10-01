@@ -627,7 +627,7 @@ describe("the shard group separator", () => {
 });
 
 describe("the contexts derived from a route context", () => {
-	it("keep the topology, range config and policy of the source and change only the identity", () => {
+	it("keep the topology, range config, policy and policy version of the source and change only the identity", () => {
 		const router = makeRouter();
 		const root: FokosRouteContext<{ tier: string }> = router.rootContext(kb("hk"));
 
@@ -643,7 +643,8 @@ describe("the contexts derived from a route context", () => {
 			expect(ctx.topology).toBe(root.topology);
 			expect(ctx.rangeConfig).toBe(root.rangeConfig);
 			expect(ctx.policy).toBe(root.policy);
-			expect(Object.keys(ctx).sort()).toEqual(["doName", "partitionId", "policy", "rangeConfig", "schema", "topology"]);
+			expect(ctx.policyVersion).toBe(root.policyVersion);
+			expect(Object.keys(ctx).sort()).toEqual(["doName", "partitionId", "policy", "policyVersion", "rangeConfig", "schema", "topology"]);
 		}
 		expect(built.slice(0, HASH_SPLIT_N).map((c) => c.doName)).toEqual(
 			Array.from({ length: HASH_SPLIT_N }, (_, i) => `${root.doName}.${i}`),
