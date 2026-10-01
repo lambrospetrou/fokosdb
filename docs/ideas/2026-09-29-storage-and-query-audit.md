@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, X2, R3 and R5. Partly done: R4 (the override flag) and X1 (fix
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag) and X1 (fix
 2, when the partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
@@ -38,7 +38,7 @@ says how it was checked:
 |---|---|---|---|---|
 | F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High | No |
 | F11 | FokosDB | Migration fetches payload arrays before the byte budget; a default fetch can hold about 390 MiB | High | No |
-| C5 | FokosDB (TC) | One PREPARING transaction can exceed the 32 MiB migration RPC limit and stop an import | High | No |
+| C5 | FokosDB (TC) | Done. One PREPARING transaction could exceed the 32 MiB migration RPC limit and stop an import | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
 | X2 | Cross | Done. The stale-lock job could run again every ~50 ms, and a slow step blocked the split and import jobs | High | Done with F4 |
 | C1 | FokosDB (TC) | Done. `tx_recovery` did a full scan and sort of `tc_state` every 5 s | High | Additive index |
@@ -63,7 +63,7 @@ Priority 1: stuck imports (availability)
 2. F1: use the slice during migration. A promotion reads the whole source to move one key. So the time that a hot key is unavailable depends on the size of the source partition, not on the size of the key.
    - Do F1 and F11 together. Both change #buildItemsPage and the store queries under it.
    - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no finished override exists (done when the partition has no override at all), and read the keys before data. They change the same code path.
-3. C5: page the rows of one coordinator transaction. One transaction in PREPARING state can go above the 32 MiB RPC limit and stop the import of the coordinator. The fix changes the internal migration cursor and the page format, so do it before the freeze.
+3. C5: done. The coordinator applies the combined image cap when it stores each prepare answer, so one transaction stays below the RPC limit.
 
 Priority 2: correctness under load (and cheapest now)
 
@@ -87,7 +87,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the destroy fence and the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: start with F11 and F1 as one change, then C5, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
+My recommendation: start with F11 and F1 as one change, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
 
 
 ## 3. Sharding runtime
@@ -610,12 +610,12 @@ The finding was:
 (FIXME at `:1273`) in a step of up to `alarmRecoveryBudgetMs` (30 s). The split and import jobs of the coordinator
 wait behind it (see X2).
 
-**C5 — one PREPARING transaction can exceed the migration RPC limit (High).** **Code, not run.**
+**C5 — done: one PREPARING transaction could exceed the migration RPC limit (High).** **Code + test.**
 
-- **What happens:** `storePrepareAnswer` (`server/do-transaction-coordinator.ts`) stores every condition-failure
-  image that a participant returns. Each participant caps its own answer at 10 MiB. The coordinator applies the
+- **What happened:** `storePrepareAnswer` (`server/do-transaction-coordinator.ts`) stored every condition-failure
+  image that a participant returned. Each participant caps its own answer at 10 MiB. The coordinator applied the
   combined cap only in `cancelTransactionInStore`, when it records `CANCELLING`. Before that transition, one
-  transaction can hold more images than the combined cap.
+  transaction could hold up to about 39 MiB of images (100 operations of 400 KiB).
 - **Failure, step by step:**
   1. A transaction sends 100 condition checks to ten participants, with `returnValuesOnConditionCheckFailure`
      set to `all_old`. Each participant receives ten operations.
@@ -627,13 +627,23 @@ wait behind it (see X2).
      first transaction even when `migratedTransactionBytes` exceeds the default 20 MiB page budget.
   5. The images alone exceed the
      [32 MiB RPC limit](https://developers.cloudflare.com/workers/runtime-apis/rpc/#limitations).
-     The response fails, and the child retries the same transaction. It cannot finish its import or resume the
-     transaction to apply the combined cap. Other tokens routed to that importing child also remain unavailable.
-- **Verification:** The byte calculation and first-transaction exception were checked outside Workers.
-  The split and failed RPC sequence needs a runtime test. Use byte images so string serialization is not a factor.
-- **Fix:** Page the rows within a transaction, with a cursor that identifies its table and row position. A complete
-  transaction cannot be the smallest migration unit. Apply the import gate until every row arrives. No SQL schema
-  change is needed, but the internal migration cursor and page format must change.
+     The response fails, and the child retries the same transaction. It cannot finish its import.
+- **What changed:**
+  - The first stored answer of a participant stays, and a later answer is ignored. After an accepted answer, the
+    participant holds its locks until the decision. After a rejection, the transaction can only be cancelled, and
+    the cancel releases a lock that a later prepare took. So the stored images of a transaction only grow until
+    the decision.
+  - `applyImageCap` keeps the images in `opIndex` order up to the cap. An image that is above the cap with the
+    stored answers therefore stays above it in the final merge. `storePrepareAnswer` runs the cap over the stored
+    answers each time an answer with images arrives. It deletes the images above the cap, and does not write them.
+  - The client response does not change, and `answer_json` does not change.
+- **Result:** A transaction stores at most 10 MiB of images. With the 4 MiB payload limit
+  (`MAX_PAYLOAD_BYTES_PER_TX`), one transaction is about 15 MiB or less with the default key limits. A page holds
+  at most `migrationPageBytes`, which is at most the RPC limit, or one transaction.
+- **Not done, on purpose:** Paging the rows of one transaction. It changes the internal migration cursor and the
+  page format, and the image bound removes the case that the limits allow. Only a table that sets very large key
+  limits can still make one transaction large: the keys are stored in `tc_items`, in the answers and in the
+  results.
 
 ## 5. Issues that cross both layers
 
@@ -705,7 +715,7 @@ The SQL migrations can still be edited in place.
   - R9: finished promotions as override rows only, if it is wanted.
 - **Additive, but cheapest now:**
   - F5: the delete buckets.
-- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6. C5 needs an internal migration cursor and page-format change.
+- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6.
 
 ## 7. What was checked and is fine
 

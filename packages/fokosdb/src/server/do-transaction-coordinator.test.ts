@@ -751,22 +751,101 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("deletes the images of an earlier answer when a new answer of the same participant replaces it", async () => {
+	// A cancel follows a stored rejection, and the cancel releases a lock that a later prepare took. A
+	// stored answer never changes, so the stored images of a transaction only grow until the decision.
+	it("keeps the first rejection when a later answer of the same participant arrives", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			insertParticipant(state, { name: "p1" });
 
 			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", 7));
-			expect(countRows(state, "tc_results")).toBe(1);
-			tc.storePrepareAnswer(TX_ID, "p1", {
-				outcome: "rejected",
-				results: [
-					{ opIndex: 0, outcome: "rejected", reason: { code: "pending_conflict", hashKey: "hk1", conflictingTransactionId: "tx-other" } },
-				],
-			});
+			tc.storePrepareAnswer(TX_ID, "p1", { outcome: "accepted" });
 
-			expect(countRows(state, "tc_results")).toBe(0);
+			expect(state.storage.sql.exec<{ prepare_outcome: string | null }>(`SELECT prepare_outcome FROM tc_participants`).one()).toEqual({
+				prepare_outcome: "rejected",
+			});
+			expect(countRows(state, "tc_results")).toBe(1);
 		});
+	});
+
+	// Nine participants each answer under their own cap, and together they go above the combined cap.
+	// A PREPARING transaction then held more images than the RPC limit of one migration page.
+	it("stores at most the combined image cap while the transaction is PREPARING", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(`DELETE FROM tc_items`);
+			const imageBytes = 390 * 1024;
+			const data = "x".repeat(imageBytes);
+			for (let p = 0; p < 9; p++) {
+				insertParticipant(state, { name: `p${p}` });
+				for (let i = p * 10; i < p * 10 + 10; i++) {
+					state.storage.sql.exec(
+						`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, ?, 'check', ?)`,
+						TX_ID,
+						kb(`hk${i}`),
+						ABSENT_SK,
+						i,
+						`p${p}`,
+					);
+				}
+			}
+			for (let p = 0; p < 9; p++) {
+				tc.storePrepareAnswer(TX_ID, `p${p}`, {
+					outcome: "rejected",
+					results: Array.from({ length: 10 }, (_, k) => {
+						const opIndex = p * 10 + k;
+						const hashKey = `hk${opIndex}`;
+						return {
+							opIndex,
+							outcome: "rejected" as const,
+							reason: { code: "condition_failed" as const, hashKey, item: { hashKey, data, kind: "text" as const, version: 1 } },
+							imageBytes,
+						};
+					}),
+				});
+			}
+
+			const storedBytes = state.storage.sql
+				.exec<{ n: number }>(`SELECT SUM(LENGTH(image_data)) AS n FROM tc_results WHERE transaction_id = ?`, TX_ID)
+				.one().n;
+			expect(storedBytes).toBe(Math.floor(MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX / imageBytes) * imageBytes);
+		});
+	});
+
+	// The cap keeps the images in opIndex order. An answer that arrives later can drop an image that an
+	// earlier answer stored, and the response is the same in each order of the answers.
+	it("gives the same images in the response in each order of the answers", async () => {
+		const answerInOrder = async (order: string[]) => {
+			let response: unknown;
+			await withCoordinator(async (tc, state) => {
+				seed(state, "PREPARING");
+				state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+				insertParticipant(state, { name: "p1" });
+				insertParticipant(state, { name: "p2" });
+				const answers: Record<string, PrepareResponse> = {
+					p1: rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX - 5),
+					p2: rejection(1, "hk2", 10),
+				};
+				for (const name of order) {
+					tc.storePrepareAnswer(TX_ID, name, answers[name]);
+				}
+				expect(countRows(state, "tc_results")).toBe(1);
+				tc.cancelTransactionInStore(TX_ID, TOKEN);
+				response = tc.loadFinalResponse(TX_ID, TOKEN);
+			});
+			return response;
+		};
+
+		const first = await answerInOrder(["p1", "p2"]);
+		expect(await answerInOrder(["p2", "p1"])).toEqual(first);
+		expect(first).toMatchObject({
+			outcome: "cancelled",
+			results: [
+				{ outcome: "rejected", reason: { code: "condition_failed", item: { data: "image-0" } } },
+				{ outcome: "rejected", reason: { code: "condition_failed", hashKey: "hk2" }, itemOmitted: "response_too_large" },
+			],
+		});
+		expect((first as { results: Array<{ reason: { item?: unknown } }> }).results[1].reason.item).toBeUndefined();
 	});
 
 	it("does not store a prepare error after the decision", async () => {

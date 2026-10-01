@@ -851,9 +851,17 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * decided the transaction. That decision has stored its results and deleted the images that the cap
 	 * dropped, so a late answer must not change the answers or add an image again.
 	 *
-	 * An accepted answer stays. A participant that accepted holds its locks until the decision, and it
-	 * answers each later prepare of the transaction with accepted. So a rejection that arrives after an
-	 * acceptance is an old answer.
+	 * The first answer of a participant stays. Each later answer is ignored:
+	 * - After an accepted answer, the participant holds its locks until the decision, and it answers each
+	 *   later prepare of the transaction with accepted.
+	 * - After a rejection, the transaction can only be cancelled, and the cancel releases a lock that a
+	 *   later prepare took.
+	 *
+	 * So the stored images of a transaction only grow until the decision. The combined image cap keeps
+	 * the images in opIndex order up to the cap, so an image that is above the cap now stays above it in
+	 * the merge of `cancelTransactionInStore`. This method deletes those images, and does not write them,
+	 * so a transaction never stores more than MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX of images. Without
+	 * this bound, one PREPARING transaction can be larger than the RPC limit of a migration page.
 	 */
 	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void {
 		this.ctx.storage.transactionSync(() => {
@@ -862,28 +870,25 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			}
 			const stored = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
-				  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NOT 'accepted'`,
+				  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
 				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
 				transactionId,
 				partitionDoName,
 			);
-			if (stored.rowsWritten === 0) {
+			if (stored.rowsWritten === 0 || answer.outcome !== "rejected") {
 				return;
 			}
-			// The images of an earlier answer of this participant belong to the answer that this one replaces.
-			this.ctx.storage.sql.exec(
-				`DELETE FROM tc_results WHERE transaction_id = ? AND op_index IN
-				   (SELECT op_index FROM tc_items WHERE transaction_id = ? AND partition_do_name = ?)`,
-				transactionId,
-				transactionId,
-				partitionDoName,
-			);
-			if (answer.outcome !== "rejected") {
+			// An answer with no image adds no bytes, so the cap drops no new image.
+			if (!answer.results.some((res) => res.outcome === "rejected" && res.imageBytes !== undefined)) {
 				return;
+			}
+			const aboveCap = this.imagesAboveCap(transactionId);
+			for (const opIndex of aboveCap) {
+				this.ctx.storage.sql.exec(`DELETE FROM tc_results WHERE transaction_id = ? AND op_index = ?`, transactionId, opIndex);
 			}
 			for (const res of answer.results) {
-				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item) {
+				if (res.outcome !== "rejected" || res.reason.code !== "condition_failed" || !res.reason.item || aboveCap.has(res.opIndex)) {
 					continue;
 				}
 				const img = res.reason.item;
@@ -901,6 +906,22 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				);
 			}
 		});
+	}
+
+	/** The operations whose image the combined cap drops, from the prepare answers that are stored now. */
+	private imagesAboveCap(transactionId: string): Set<number> {
+		const results: ParticipantOperationResultEncoded[] = [];
+		for (const { answer_json } of this.ctx.storage.sql.exec<{ answer_json: string }>(
+			`SELECT answer_json FROM tc_participants WHERE transaction_id = ? AND answer_json IS NOT NULL`,
+			transactionId,
+		)) {
+			const answer = parseTagged<PrepareResponse>(answer_json);
+			if (answer.outcome === "rejected") {
+				results.push(...answer.results);
+			}
+		}
+		applyImageCap(results);
+		return new Set(results.filter((r) => r.outcome === "rejected" && r.itemOmitted === "response_too_large").map((r) => r.opIndex));
 	}
 
 	/**
