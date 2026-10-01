@@ -47,6 +47,20 @@ describe("condition SQLite compiler", () => {
 		expect(JSON.parse(JSON.stringify(plan))).toEqual(plan);
 	});
 
+	it("compiles the constant conditions to SQL constants with no bindings or columns", () => {
+		for (const [condition, sql] of [
+			[{ op: "true" }, "(1)"],
+			[{ op: "false" }, "(0)"],
+		] as const) {
+			const plan = compileConditionExpression(condition);
+			expect(plan.sql).toBe(sql);
+			expect(plan.bindings).toEqual([]);
+			expect(plan.requiredColumns).toEqual([]);
+			expect(plan.dataDependencies).toEqual({ completeData: false, paths: [] });
+			expect(plan.identity).toBe(`{"op":"${condition.op}"}`);
+		}
+	});
+
 	it("keeps literal and path text out of generated SQL", () => {
 		const path = `$."x'); DROP TABLE items; --"`;
 		const literal = "value'); SELECT random(); --";

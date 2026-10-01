@@ -14,6 +14,7 @@ export type ExpressionReference =
 export type ExpressionValue = { val: JsonValue } | { b64: string } | ExpressionReference | { fn: string; args: readonly ExpressionValue[] };
 
 export type ConditionExpression =
+	| { op: "true" | "false" }
 	| {
 			op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte";
 			args: readonly [left: ExpressionValue, right: ExpressionValue];

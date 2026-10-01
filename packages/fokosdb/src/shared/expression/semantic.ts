@@ -189,6 +189,12 @@ function assertArity(args: readonly unknown[], minimum: number, maximum = minimu
 function analyzeCondition(expression: unknown, depth: number, context: AnalysisContext): void {
 	assertDepth(depth);
 	assertNode(expression, "invalid condition expression");
+	if (expression.op === "true" || expression.op === "false") {
+		// A constant has no operands, so it has no args field.
+		assertFields(expression, "op");
+		countOperation(context);
+		return;
+	}
 	assertFields(expression, "op", "args");
 	if (typeof expression.op !== "string") {
 		throw new ExpressionError("invalid_ast", "invalid condition operator");
