@@ -139,8 +139,19 @@ export class RepartitionSource {
 	 * its targets do, and serving a local copy would answer with data that has moved on.
 	 */
 	routerRole(): boolean {
-		const row = this.splitRepartition();
-		return row !== undefined && row.state !== "queued" && row.state !== "planned";
+		const row = this.store.getSplitRepartition();
+		if (!row) {
+			return false;
+		}
+		switch (row.state) {
+			case "queued":
+			case "planned":
+				return false;
+			case "cutover":
+			case "completed":
+			case "cleaned":
+				return true;
+		}
 	}
 
 	/** The split's targets in `target_index` order — the order range children tile their interval. */
