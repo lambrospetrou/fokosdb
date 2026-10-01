@@ -131,7 +131,7 @@ export class RepartitionSource {
 
 	/** The split this source queued, if it ever queued one. */
 	splitRepartition(): RepartitionRow | undefined {
-		return this.#split()?.row;
+		return this.store.getSplitRepartition();
 	}
 
 	/**
@@ -154,9 +154,16 @@ export class RepartitionSource {
 		}
 	}
 
-	/** The split's targets in `target_index` order — the order range children tile their interval. */
+	/**
+	 * The split's targets in `target_index` order — the order range children tile their interval.
+	 * Called on the hot path of every request in a range partition.
+	 **/
 	splitTargets(): RepartitionTargetRow[] {
-		return this.#split()?.targets ?? [];
+		const row = this.store.getSplitRepartition();
+		if (!row) {
+			return [];
+		}
+		return this.store.listRepartitionTargets(row.id, row.kind);
 	}
 
 	/**
@@ -171,21 +178,6 @@ export class RepartitionSource {
 	ownedByRangeTree(hashKey: KeyBytes): boolean {
 		const state = this.overrideFor(hashKey);
 		return state === "cutover" || state === "completed" || state === "cleaned";
-	}
-
-	/**
-	 * The split row and its targets, read from SQL on every call.
-	 *
-	 * Section 4.3 allows a cache here, and an earlier revision held one. The risk is larger than the
-	 * gain. The case worth a cache is ABSENCE, which every leaf hits on every request, and a stale
-	 * negative answer is the dangerous direction: a router that believes it is not a router serves its
-	 * own rows for keys its targets already own. `getSplitRepartition` costs one seek of a partial
-	 * index, which is what the KV read it replaced cost. Add a cache here only with a test that proves
-	 * eviction and staleness change nothing.
-	 */
-	#split(): { row: RepartitionRow; targets: RepartitionTargetRow[] } | null {
-		const row = this.store.getSplitRepartition();
-		return row ? { row, targets: this.store.listRepartitionTargets(row.id, row.kind) } : null;
 	}
 
 	/**

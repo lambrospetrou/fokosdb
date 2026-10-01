@@ -1,9 +1,9 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. Skipped: C3. The other findings are not decided or
-implemented.
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. Steps 1 and 2 of R3 are done. Skipped: C3. The other findings
+are not decided or implemented.
 **Date:** 2026-09-29
-**Updated:** 2026-09-30.
+**Updated:** 2026-10-01.
 
 ## Table of contents
 
@@ -47,7 +47,7 @@ says how it was checked:
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
 | F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
-| R3 | Runtime | `routerRole()` reads the split row and all target rows, several times per request, per key | Medium | No |
+| R3 | Runtime | Steps 1 and 2 done: the router facts are read once for each request, not for each key. `owns()` still reads them for each key | Medium | No |
 | R5 | Runtime | `learnRangeBoundary` counts the whole table on each insert and each refresh | Medium | Optional index |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
 | R7 | Runtime | The Bloom filter (~360 KB) is written whole each time the partition learns one promoted key | Medium | Optional |
@@ -84,7 +84,7 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R3, R4/K2, R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+11. R3 step 3, R4/K2, R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
 My recommendation: start with F11 and F1 as one change, then C5, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
 
@@ -103,23 +103,39 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
 
 ### 3.2 Request path
 
-**R3 — router facts are read again for each key, including all targets (Medium).** **Code.**
+**R3 — router facts are read again for each key (Medium).** **Code.**
 
-- **What happens:** `routerRole()` calls `#split()` (`sharding/repartition-flow.ts:141`, `:175`). That call reads
-  the split row and `listRepartitionTargets`: K rows with the wide `do_name` and `partition_id` columns.
-- **Where it runs:**
+- **What happened:** `routerRole()` called `#split()`, which read the split row and `listRepartitionTargets`: K
+  rows with the wide `do_name` and `partition_id` columns. A hash partition read 1 + K rows for each key only to
+  learn if it is a router.
+- **Step 1, done:** `routerRole()` reads only the split row, and does an exhaustive `switch` on its state.
+  `splitTargets()` reads the split row and its target rows. `#split()` is removed.
+- **Step 2, done:** `#routerView()` in `sharding/runtime.ts` reads `routerRole()` once, and on a range router
+  also the targets as `FokosChild` values. `#groupByOwner`, `#singleOwner` and the range branch of `#planRange`
+  read the view once, and pass it to each `#resolve` and to `#guardBloomHits`. These loops are synchronous, so no
+  other request can change the split row while they run, and one read gives the same answer as one read for each
+  key. A view is never kept across an `await`. A caller that resolves one key reads the view in `#resolve`.
+- **Result:** A `txPrepare` of 100 keys on a range router with `rangeSplitN = 4` reads 6 rows only to route,
+  where it read 700 after step 1 and about 1,500 before it. On a hash partition, it reads 1 row, where it read
+  100.
+- **What is left, step 3:** `owns()` takes one key, and reads the view for each call. `#ownedRows`
+  (`server/do-partition.ts`) and `TransactionParticipant` (`commitLocal`, stale recovery) call it once for each
+  hash key. The fix is a form of `owns()` that returns a checker bound to one view, for example
+  `ownerCheck(): (key) => boolean`, and a change to these two callers.
+- **Where the reads ran before step 2:**
   - For each key in `#resolve` on a hash partition (`#hashTopologyOwner(key, routerRole())`).
+  - For each key in `#resolve` on a range router (`#rangeChildFor`), and for each range request in `#planRange`.
   - In `lifecycle()`.
-  - On a range router, `#rangeChildFor` calls `children()`, which is `routerRole()` + `splitTargets()`: two reads
-    of 1 + K rows for each key.
-  - For each hash key in `owns()`: `commitLocal` calls it for each hash key of a lock copy, and stale recovery
-    calls it for each hash key of a stale transaction.
-- **Example:** A `txPrepare` of 100 keys reaches a range router with `rangeSplitN = 4`. It does about 1,000 row
-  reads and 100 slice searches only to route.
-- **Fix, step 1:** Make `routerRole()` read only the split row.
-- **Fix, step 2:** Keep the split row and its targets in memory when the state is `cutover` or later. At that
-  point the targets never change and the role never goes back. The "not a router" answer stays a read, so the
-  risk that the comment at `sharding/repartition-flow.ts:166` describes does not return.
+  - For each hash key in `owns()`.
+- **Not done: no cache in memory for now.** A cache of the split row and its targets from `cutover` onwards was
+  tried and removed. The set of targets and their slices does not change after cutover, but a target row also
+  holds fields that change after cutover (`acknowledged`, `startNotified`, `attempts`, `nextAttemptAt`). A cached
+  row returns old values for those fields to a caller that reads them. The state can also change in storage while
+  a cache in memory keeps the old answer.
+- **Possible later fix:** A cache with a time limit. It keeps the last result of the store read and reads storage
+  again after X ms, so the reads have a bound per interval and not per key. Before it is added, decide how long
+  an old answer can be correct. An old "not a router" answer is the dangerous direction: the partition then
+  serves its own rows for keys that its targets already own.
 
 **R4 — facts that seldom change are read on each request (Low–Medium).** **Code.**
 
@@ -179,7 +195,7 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
 
 - **What happens:**
   - Each pass reads the deadline of every job 2 times, and calls `canRun` 2 times.
-  - `canSweepLocally` and `canDriveLocally` call `lifecycle()`, which does 4 reads, one of them the R3 target read.
+  - `canSweepLocally` and `canDriveLocally` call `lifecycle()`, which does 4 reads.
   - Each request on an importing target starts a pass.
 - **Fix:** Memoize `lifecycle()` for one pass.
 

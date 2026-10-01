@@ -130,6 +130,19 @@ const HINTED: ResolveOptions = { bloom: true, learnedRange: true };
  */
 const HINTED_NO_BLOOM: ResolveOptions = { bloom: false, learnedRange: true };
 
+/**
+ * The router facts of this partition, read once for one synchronous pass over many keys. No other
+ * request runs until the pass yields, so one read gives the same answer as one read for each key. Do
+ * not keep a view across an `await`.
+ */
+type RouterView = {
+	router: boolean;
+	/** The direct range children. Empty on a hash partition, which routes with the hash arena. */
+	rangeChildren: FokosChild[];
+};
+
+const NOT_ROUTER: RouterView = { router: false, rangeChildren: [] };
+
 /** One item of a `group` request with its route key. */
 type GroupEntry = { key: RouteKey; item: unknown };
 /** The items of a `group` request that resolved to one remote target. They share one resolution. */
@@ -530,8 +543,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		// The entries with a Bloom hit wait for the guard, by hash key. `KeyCodec.mapKey` is a hash and
 		// not an identity, so a bucket holds each hash key of one hash value.
 		let bloomHits: Map<bigint, BloomHashKey[]> | undefined;
+		const view = this.#routerView();
 		for (const entry of entries) {
-			const resolution = this.#resolve(entry.key, opts);
+			const resolution = this.#resolve(entry.key, opts, view);
 			if (resolution.kind === "out_of_range") {
 				throw misrouted(op, "item outside this partition");
 			}
@@ -554,7 +568,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			hit.entries.push({ entry, resolution });
 		}
 		if (bloomHits) {
-			this.#guardBloomHits(bloomHits, groups);
+			this.#guardBloomHits(bloomHits, groups, view.router);
 		}
 		return { local: groups.local, remote: [...groups.remote.values()] };
 	}
@@ -597,8 +611,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	 * - When the commit has only `alice` keys, no other hash key shares `local`. The Bloom hit stays,
 	 *   and a true positive saves the forwards to the range owner.
 	 */
-	#guardBloomHits(bloomHits: Map<bigint, BloomHashKey[]>, groups: Groups): void {
-		const router = this.#source.routerRole();
+	#guardBloomHits(bloomHits: Map<bigint, BloomHashKey[]>, groups: Groups, router: boolean): void {
 		const owners: Array<{ hit: BloomHashKey; owner: OwnedResolution; id: string }> = [];
 		const hashKeysAt = new Map<string, number>();
 		for (const bucket of bloomHits.values()) {
@@ -799,8 +812,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		let remote: RemoteResolution | null = null;
 		let spansPartitions = false;
 		let bloomHit = false;
+		const view = this.#routerView();
 		for (const key of keys) {
-			const resolution = this.#resolve(key, opts);
+			const resolution = this.#resolve(key, opts, view);
 			if (resolution.kind === "out_of_range") {
 				throw misrouted(op, "item outside this partition");
 			}
@@ -976,11 +990,23 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (!this.#source.routerRole()) {
 			return [];
 		}
+		return this.#splitChildren();
+	}
+
+	#splitChildren(): FokosChild[] {
 		return this.#source.splitTargets().map((t) => ({
 			ref: { partitionId: t.partitionId, doName: t.doName },
 			start: t.slice.kind === "range" ? t.slice.start : null,
 			end: t.slice.kind === "range" ? t.slice.end : null,
 		}));
+	}
+
+	/** Reads the router facts once. A caller that resolves many keys in one synchronous pass passes the view to each `#resolve`. */
+	#routerView(): RouterView {
+		if (!this.#source.routerRole()) {
+			return NOT_ROUTER;
+		}
+		return { router: true, rangeChildren: this.identity().kind === "range" ? this.#splitChildren() : [] };
 	}
 
 	/** A disjoint, ordered cover of one range request. The host walks it with `forwardRangeVisit`. */
@@ -1441,7 +1467,8 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return hash.path.every((idx, depth) => hashChildIndex(hashKey, depth, hashSplitN) === idx);
 	}
 
-	#resolve(key: RouteKey, opts: ResolveOptions): Resolution {
+	/** `view` is read here when the caller does not give one. A hash key with a cut-over override does not need it. */
+	#resolve(key: RouteKey, opts: ResolveOptions, view?: RouterView): Resolution {
 		const identity = this.identity();
 		if (!this.#ownsByTopology(key)) {
 			return { kind: "out_of_range" };
@@ -1455,14 +1482,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (opts.bloom && this.#bloom?.maybePromoted(key.hashKey)) {
 				return this.#rangeOwner(key.hashKey, key.sortKey, "bloom", true, opts.learnedRange);
 			}
-			return this.#hashTopologyOwner(key.hashKey, this.#source.routerRole());
+			return this.#hashTopologyOwner(key.hashKey, (view ?? this.#routerView()).router);
 		}
 
-		if (!this.#source.routerRole()) {
+		const { router, rangeChildren } = view ?? this.#routerView();
+		if (!router) {
 			return { kind: "local" };
 		}
 		const range = identity.range!;
-		const child = this.#rangeChildFor(key.sortKey);
+		const child = this.#rangeChildFor(key.sortKey, rangeChildren);
 		const learned = opts.learnedRange ? this.#store.findDeepestKnownRangeSlice(range.hashKey, key.sortKey) : null;
 		const jump = learned && isStrictSubSlice(learned, child.start, child.end) ? learned : null;
 		const target = jump
@@ -1510,9 +1538,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/** The direct range child whose interval contains `sortKey`. The children tile the whole interval, so one always does. */
-	#rangeChildFor(sortKey: KeyBytes): FokosChild {
+	#rangeChildFor(sortKey: KeyBytes, children: readonly FokosChild[]): FokosChild {
 		let best: FokosChild | null = null;
-		for (const child of this.children()) {
+		for (const child of children) {
 			if (KeyCodec.compare(child.start ?? NO_SORT_KEY, sortKey) <= 0 && (best === null || startCmp(child.start, best.start) > 0)) {
 				best = child;
 			}
@@ -1564,8 +1592,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 		} else {
 			const range = identity.range!;
-			if (this.#source.routerRole()) {
-				bases = this.children().map((child) => ({ target: child.ref, start: child.start, end: child.end, speculative: false }));
+			const { router, rangeChildren } = this.#routerView();
+			if (router) {
+				bases = rangeChildren.map((child) => ({ target: child.ref, start: child.start, end: child.end, speculative: false }));
 				learned = this.#store.listLearnedRangeSlices(range.hashKey);
 			} else {
 				bases = [{ target: "local", start: range.start, end: range.end, speculative: false }];
