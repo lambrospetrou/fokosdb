@@ -344,10 +344,10 @@ describe("PartitionDO — stale transaction recovery", () => {
 			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt: now - IDEMPOTENCY_WINDOW_MS - 1 });
 			// Every key of the lock now belongs to another partition, which holds the true lock. The
 			// rows here are copies, and the cleanup of the migration deletes them.
-			const owns = vi.spyOn(instance.fokos, "owns").mockReturnValue(false);
+			const ownerCheck = vi.spyOn(instance.fokos, "ownerCheck").mockReturnValue(() => false);
 			const cancel = vi.spyOn(instance, "txCancel");
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
-			expect(owns).toHaveBeenCalled();
+			expect(ownerCheck).toHaveBeenCalled();
 			expect(cancel).not.toHaveBeenCalled();
 			expect(store.listPendingTxItems(transactionId)[0]).toMatchObject({ guarded_at: null });
 			releasePendingLock(store, transactionId);

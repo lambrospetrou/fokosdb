@@ -62,7 +62,7 @@ export function parseCoordinatorRef(json: string, transactionId: string): Coordi
 }
 
 /**
- * Wraps `owns` so that it runs one time for each hash key of the rows it tests. On a partition that
+ * Wraps an owner check so that it runs one time for each hash key of the rows it tests. On a partition that
  * holds lock rows of a hash key, all sort keys of that hash key have the same owner: a promotion and a
  * hash split move a full hash key, and a range split moves all keys of the source.
  */
@@ -116,11 +116,11 @@ export type TransactionParticipantDeps = {
 	 */
 	txOrderTimestamp?: () => TransactionTimestamp;
 	/**
-	 * True when this partition owns the key now. A lock row of a key that a promotion moved away is a
-	 * copy. The new owner resolves it, and no local decision applies to it. A participant with no
-	 * routing holds no copy, so the default answers true.
+	 * Returns a check that is true when this partition owns the key now. A lock row of a key that a
+	 * promotion moved away is a copy. The new owner resolves it, and no local decision applies to it.
+	 * The participant gets a new check for each synchronous block.
 	 */
-	owns?: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
+	ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 };
 
 /**
@@ -149,7 +149,7 @@ export class TransactionParticipant {
 	#maxClockSkewMs: () => number;
 	#staleTransactionMs: () => number;
 	#txOrderTimestamp: () => TransactionTimestamp;
-	#owns: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
+	#ownerCheck: () => (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean;
 
 	constructor(deps: TransactionParticipantDeps) {
 		this.#store = deps.store;
@@ -157,7 +157,7 @@ export class TransactionParticipant {
 		this.#maxClockSkewMs = deps.maxClockSkewMs;
 		this.#staleTransactionMs = deps.staleTransactionMs;
 		this.#txOrderTimestamp = deps.txOrderTimestamp ?? txOrderTimestampNow;
-		this.#owns = deps.owns ?? (() => true);
+		this.#ownerCheck = deps.ownerCheck;
 	}
 
 	/**
@@ -384,9 +384,9 @@ export class TransactionParticipant {
 		this.#store.transactionSync(() => {
 			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
 			// Each key of the request is owned: the runtime resolved it to this partition in this
-			// synchronous block. A row outside the request is owned only when `owns()` says so. On the
-			// usual path no row is outside the request, and the method does not call `owns()`.
-			const ownsRow = ownsByHashKey(this.#owns);
+			// synchronous block. A row outside the request is owned only when the owner check says so. On the
+			// usual path no row is outside the request, and the method does not call the owner check.
+			const ownsRow = ownsByHashKey(this.#ownerCheck());
 			const ownedRows = new Map<ReturnType<typeof KeyCodec.pairKey>, PendingLock>();
 			for (const row of this.#store.listPendingTxItems(request.transactionId)) {
 				const key = KeyCodec.pairKey(row.hk, row.sk);

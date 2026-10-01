@@ -301,7 +301,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			now: () => this.fokosNow(),
 			maxClockSkewMs: () => this.config().maxClockSkewMs,
 			staleTransactionMs: () => this.config().staleTransactionMs,
-			owns: (key) => this.fokos.owns(key),
+			ownerCheck: () => this.fokos.ownerCheck(),
 		});
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
@@ -1228,9 +1228,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		}
 	}
 
-	/** The rows of `rows` that this partition owns now, with one `owns()` call for each hash key. */
+	/** The rows of `rows` that this partition owns now, with one owner check for each hash key. */
 	#ownedRows<Row extends { hk: KeyBytes; sk: KeyBytes }>(rows: readonly Row[]): Row[] {
-		return rows.filter(ownsByHashKey((key) => this.fokos.owns(key)));
+		return rows.filter(ownsByHashKey(this.fokos.ownerCheck()));
 	}
 
 	private logParams() {

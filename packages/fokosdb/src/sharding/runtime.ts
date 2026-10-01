@@ -979,6 +979,19 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return this.#resolve(key, EXACT).kind === "local";
 	}
 
+	/**
+	 * `owns()` for many keys in one synchronous pass. It reads the router facts once. A router owns no
+	 * key, and a range partition that is not a router owns every key of its interval, so neither reads
+	 * storage for each key. A hash partition that is not a router reads the route override of each key.
+	 * Do not keep a checker across an `await`.
+	 */
+	ownerCheck(): (key: RouteKey) => boolean {
+		if (this.#source.routerRole()) {
+			return () => false;
+		}
+		return (key) => this.#resolve(key, EXACT, NOT_ROUTER).kind === "local";
+	}
+
 	/** The point-routing answer, caches included. A speculative remote owner is a hint, not a fact. */
 	resolveOwner(key: RouteKey): FokosOwner {
 		const resolution = this.#resolve(key, HINTED);

@@ -1,7 +1,7 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1 and X2. Steps 1 and 2 of R3 are done. Skipped: C3. The other findings
-are not decided or implemented.
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, X2 and R3. Partly done: R4 (the override flag) and X1 (fix
+2, when the partition has no override). Skipped: C3. The other findings are not decided or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-01.
 
@@ -47,7 +47,7 @@ says how it was checked:
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
 | F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
-| R3 | Runtime | Steps 1 and 2 done: the router facts are read once for each request, not for each key. `owns()` still reads them for each key | Medium | No |
+| R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | `learnRangeBoundary` counts the whole table on each insert and each refresh | Medium | Optional index |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
 | R7 | Runtime | The Bloom filter (~360 KB) is written whole each time the partition learns one promoted key | Medium | Optional |
@@ -61,7 +61,7 @@ Priority 1: stuck imports (availability)
 1. F11: migration memory bound. One page fetch can hold about 390 MiB of payload, and the isolate limit is 128 MB. Each retry fails on the same batch. The target then never finishes its import, and its keys stay unavailable.
 2. F1: use the slice during migration. A promotion reads the whole source to move one key. So the time that a hot key is unavailable depends on the size of the source partition, not on the size of the key.
    - Do F1 and F11 together. Both change #buildItemsPage and the store queries under it.
-   - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no override exists, and read the keys before data. They change the same code path.
+   - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no finished override exists (done when the partition has no override at all), and read the keys before data. They change the same code path.
 3. C5: page the rows of one coordinator transaction. One transaction in PREPARING state can go above the 32 MiB RPC limit and stop the import of the coordinator. The fix changes the internal migration cursor and the page format, so do it before the freeze.
 
 Priority 2: correctness under load (and cheapest now)
@@ -84,7 +84,7 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R3 step 3, R4/K2, R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+11. R4/K2 (the destroy fence and the import state), R5, R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
 My recommendation: start with F11 and F1 as one change, then C5, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
 
@@ -103,7 +103,7 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
 
 ### 3.2 Request path
 
-**R3 — router facts are read again for each key (Medium).** **Code.**
+**R3 — done: router facts are read again for each key (Medium).** **Code.**
 
 - **What happened:** `routerRole()` called `#split()`, which read the split row and `listRepartitionTargets`: K
   rows with the wide `do_name` and `partition_id` columns. A hash partition read 1 + K rows for each key only to
@@ -118,10 +118,17 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
 - **Result:** A `txPrepare` of 100 keys on a range router with `rangeSplitN = 4` reads 6 rows only to route,
   where it read 700 after step 1 and about 1,500 before it. On a hash partition, it reads 1 row, where it read
   100.
-- **What is left, step 3:** `owns()` takes one key, and reads the view for each call. `#ownedRows`
-  (`server/do-partition.ts`) and `TransactionParticipant` (`commitLocal`, stale recovery) call it once for each
-  hash key. The fix is a form of `owns()` that returns a checker bound to one view, for example
-  `ownerCheck(): (key) => boolean`, and a change to these two callers.
+- **Step 3, done:** `ownerCheck()` in `sharding/runtime.ts` reads `routerRole()` once, and returns a check for
+  many keys. A router owns no key, so the check answers false and reads nothing. A range partition that is not a
+  router owns every key of its interval, so the check reads nothing either. A hash partition that is not a router
+  reads the route override of each hash key, and the override flag of R4 skips that read when the partition has
+  no override. `#ownedRows` (`server/do-partition.ts`) and `TransactionParticipant.commitLocal` get a new check for
+  each synchronous block, and `ownsByHashKey` still calls it once for each hash key. The callers of the check:
+  - `commitLocal`, on each commit. It calls the check only for a lock row outside the request, so on the usual
+    path it does not call it.
+  - Stale recovery, once for each stale transaction, before and after the call to the coordinator.
+  - `debugForceResolveTransaction`.
+  - `owns()` stays for one key, for example the token check of the coordinator.
 - **Where the reads ran before step 2:**
   - For each key in `#resolve` on a hash partition (`#hashTopologyOwner(key, routerRole())`).
   - For each key in `#resolve` on a range router (`#rangeChildFor`), and for each range request in `#planRange`.
@@ -142,9 +149,16 @@ My recommendation: start with F11 and F1 as one change, then C5, then F5. Before
 - **What happens:**
   - `#guard` reads the KV key `destroying` on each RPC.
   - `#dispatch` reads the KV import record on each RPC.
-  - A hash partition runs the `routeOverrideFor` JOIN for each key of each request, also when it has no override.
+  - Done: a hash partition ran the `routeOverrideFor` JOIN for each key of each request, also when it had no
+    override.
 - **Fix:** Keep the destroy fence (it only goes to true) and the import state in memory. Only this runtime writes
-  them, so it can update memory after each commit. Keep an in-memory "has any override" flag to skip the JOIN.
+  them, so it can update memory after each commit.
+- **Done, the override flag:** `FokosShardingStore` keeps a flag for each storage that says if the partition may
+  hold a route override. The first lookup reads it with one `SELECT 1 … LIMIT 1`, and `insertRouteOverride` sets
+  it to true. No statement deletes an override, so the flag goes only from false to true. An insert that rolls
+  back leaves it true, which only costs the usual read. While the flag is false, `routeOverrideFor`,
+  `hasRouteOverride` and `hasTerminalRouteOverride` return at once with no read. The flag is kept for the storage
+  object, not for one store instance, so every store on the same storage sees an insert.
 
 **R5 — `learnRangeBoundary` counts the whole table (Medium).** **Code + Plan.**
 
@@ -579,13 +593,14 @@ wait behind it (see X2).
 - **What happens:**
   - Only a JS hash of `hk` at the partition depth gives the child index. `items` is ordered by `(hk, sk)`, so a
     child finds its rows only when the source reads every row, with `data`.
-  - `belongsToTarget` (`sharding/repartition-flow.ts:849`) runs `hasTerminalRouteOverride`, a JOIN, for each row.
-    It also does this in the coordinator, where no promotion can exist.
+  - `belongsToTarget` (`sharding/repartition-flow.ts`) runs `hasTerminalRouteOverride`, a JOIN, for each row.
+    The override flag of R4 skips the JOIN when the partition has no override, which includes the coordinator.
 - **Example:** A 1 GB partition has 10M rows and `hashSplitN = 4`. The source reads about 4 GB, and runs 40M hashes
   and 40M JOINs. It builds each page synchronously, with up to 10k scanned rows.
 - **Fix without a schema change:**
   1. Keep the answer for the last hash key. Rows arrive in `hk` order, so there is one hash and one lookup per key.
-  2. Skip the JOIN when the partition has no finished override.
+  2. Skip the JOIN when the partition has no finished override. Done for a partition with no override at all (R4).
+     A partition that holds an override that is not finished still runs the JOIN for each row.
   3. Read the keys from `idx_items_scan` first, and read `data` only for the rows that match.
 - **Fix with a schema change (now or never):** Add a column `split_bucket = hashChildIndex(hk, depth, hashSplitN)`,
   computed on insert, and put it first in both key indexes: `UNIQUE(split_bucket, hk, sk)`. Each child's rows are

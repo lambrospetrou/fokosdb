@@ -43,6 +43,8 @@ async function withParticipant(fn: (h: Harness) => void | Promise<void>): Promis
 			maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 			staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
 			txOrderTimestamp: () => clock.now * TX_ORDER_TS_UNITS_PER_MS,
+			// This store has no routing, so it holds no copy of a moved key.
+			ownerCheck: () => () => true,
 		});
 		await fn({ participant, store, clock });
 	});
@@ -721,7 +723,7 @@ describe("TransactionParticipant - commit", () => {
 				store,
 				maxClockSkewMs: () => DEFAULT_PARTITION_CONFIG.maxClockSkewMs,
 				staleTransactionMs: () => DEFAULT_PARTITION_CONFIG.staleTransactionMs,
-				owns: (key) => {
+				ownerCheck: () => (key) => {
 					asked.push(KeyCodec.pairForLog(key.hashKey, key.sortKey));
 					return KeyCodec.compare(key.hashKey, kb("moved")) !== 0;
 				},

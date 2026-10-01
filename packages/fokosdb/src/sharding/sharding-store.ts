@@ -378,6 +378,15 @@ const sqlMigrations: SQLSchemaMigration[] = [
 // The store
 // ---------------------------------------------------------------------------
 
+/**
+ * For each DurableObjectStorage, whether it may hold a route override. It is kept for the storage and not for one
+ * store instance, so every instance on the same storage sees an insert. The first lookup reads it.
+ * Only `insertRouteOverride` adds a row, and no statement deletes one, so after the first read only
+ * that method changes the answer. An insert that rolls back leaves the value true, and true only
+ * costs the usual read.
+ */
+const mayHaveRouteOverrides = new WeakMap<DurableObjectStorage, boolean>();
+
 export class FokosShardingStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
@@ -792,7 +801,18 @@ export class FokosShardingStore {
 
 	// ─── fokos_route_overrides ──────────────────────────────────────────────
 
+	/** False when this partition holds no route override, so a lookup of one hash key can skip its read. */
+	#anyRouteOverride(): boolean {
+		let maybeHasOverride = mayHaveRouteOverrides.get(this.#storage);
+		if (maybeHasOverride === undefined) {
+			maybeHasOverride = this.#storage.sql.exec(`SELECT 1 FROM fokos_route_overrides LIMIT 1`).toArray().length > 0;
+			mayHaveRouteOverrides.set(this.#storage, maybeHasOverride);
+		}
+		return maybeHasOverride;
+	}
+
 	insertRouteOverride(hashKey: KeyBytes, repartitionId: string): void {
+		mayHaveRouteOverrides.set(this.#storage, true);
 		this.#storage.sql.exec(`INSERT OR IGNORE INTO fokos_route_overrides (hash_key, repartition_id) VALUES (?, ?)`, hashKey, repartitionId);
 	}
 
@@ -801,6 +821,9 @@ export class FokosShardingStore {
 	 * got. One indexed join on the hot point-read path.
 	 */
 	routeOverrideFor(hashKey: KeyBytes): { repartitionId: string; state: RepartitionState } | undefined {
+		if (!this.#anyRouteOverride()) {
+			return undefined;
+		}
 		const row = tryOne(
 			this.#storage.sql.exec<{ repartition_id: string; state: RepartitionState }>(
 				`SELECT o.repartition_id, r.state FROM fokos_route_overrides o
@@ -813,6 +836,9 @@ export class FokosShardingStore {
 	}
 
 	hasRouteOverride(hashKey: KeyBytes): boolean {
+		if (!this.#anyRouteOverride()) {
+			return false;
+		}
 		return this.#storage.sql.exec(`SELECT 1 FROM fokos_route_overrides WHERE hash_key = ? LIMIT 1`, hashKey).toArray().length > 0;
 	}
 
@@ -821,6 +847,9 @@ export class FokosShardingStore {
 	 * exactly these to its children and excludes exactly their keys from the item stream.
 	 */
 	hasTerminalRouteOverride(hashKey: KeyBytes): boolean {
+		if (!this.#anyRouteOverride()) {
+			return false;
+		}
 		return (
 			this.#storage.sql
 				.exec(

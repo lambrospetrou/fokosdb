@@ -278,6 +278,8 @@ describe("Repartition — initialization and cutover", () => {
 				store,
 				maxClockSkewMs: () => 0,
 				staleTransactionMs: () => DEFAULT_STALE_TRANSACTION_MS,
+				// The range root owns every key of the promoted hash key.
+				ownerCheck: () => () => true,
 			});
 			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 2, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
 			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
