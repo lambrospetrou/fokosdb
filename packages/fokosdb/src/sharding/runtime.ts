@@ -264,8 +264,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			if (descriptor.whileMigrating === "throw" && this.#target.isImporting()) {
 				// The same gate the other shapes take, under the name of this operation: the request nudges
 				// the import on before it is refused.
-				this.#scheduler.wake();
-				await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
+				await this.#nudgeImport();
 				throw new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, {
 					message: "partition split in progress, please retry later",
 					attributes: { operation: op },
@@ -294,14 +293,26 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
+	 * Starts a pass soon when the import is due, and restores the fallback alarm. While the import waits
+	 * for a retry, a pass can do no import work: the pass that deferred the import armed the alarm at
+	 * the retry time, and the fallback covers a lost alarm. So a request in that time starts no pass.
+	 */
+	async #nudgeImport(): Promise<void> {
+		const now = Date.now();
+		if ((this.#target.importRecord()?.nextAttemptAt ?? now) <= now) {
+			this.#scheduler.wake();
+		}
+		await this.#scheduler.ensureAlarmAtMost(now + this.#config().fallbackAlarmMs);
+	}
+
+	/**
 	 * The lifecycle gate. An incomplete target holds only some of the rows of its slice, so a write
 	 * cannot apply and a read cannot be answered locally. The request also asks for one more import
 	 * step and restores the fallback alarm, so the partition makes progress even when no start
 	 * notification arrived.
 	 */
 	async #whileImporting(op: string, descriptor: AnyOperation, req: unknown, collector: RouteCollector): Promise<FokosEnvelope<unknown>> {
-		this.#scheduler.wake();
-		await this.#scheduler.ensureAlarmAtMost(Date.now() + this.#config().fallbackAlarmMs);
+		await this.#nudgeImport();
 		// `dispatch` gates a `local` operation with `whileMigrating: "throw"` before this point and runs
 		// every other `local` operation without the gate, so this gate never sees one.
 		invariant(descriptor.shape !== "local", "fokos/runtime: a local operation cannot reach the import gate");

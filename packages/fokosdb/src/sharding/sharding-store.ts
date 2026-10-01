@@ -395,6 +395,19 @@ const mayHaveRouteOverrides = new WeakMap<DurableObjectStorage, boolean>();
  */
 const rangeHierarchyRows = new WeakMap<DurableObjectStorage, number>();
 
+/**
+ * For each storage, the destroy fence as this isolate last read or wrote it. Each request and each pass
+ * reads the fence, and only `setDestroying` writes it. It is kept for the storage and not for one store
+ * instance, so every instance on the same storage sees the write.
+ *
+ * A fence that a rolled-back transaction wrote would stay true in memory, and the partition would then
+ * refuse every request. So `transactionSync` deletes the value when its function throws, and the next
+ * read goes to storage. A write outside a transaction that fails resets the object, and the value goes
+ * with it.
+ */
+type KvCopies = { destroying?: boolean };
+const kvCopies = new WeakMap<DurableObjectStorage, KvCopies>();
+
 export class FokosShardingStore {
 	#storage: DurableObjectStorage;
 	#migrations: SQLSchemaMigrations;
@@ -419,7 +432,12 @@ export class FokosShardingStore {
 	 * host's own writes join the same transaction when a hook runs inside it.
 	 */
 	transactionSync<T>(fn: () => T): T {
-		return this.#storage.transactionSync(fn);
+		try {
+			return this.#storage.transactionSync(fn);
+		} catch (error) {
+			kvCopies.delete(this.#storage);
+			throw error;
+		}
 	}
 
 	// ─── KV: identity and policy ────────────────────────────────────────────
@@ -470,10 +488,20 @@ export class FokosShardingStore {
 
 	/** True after `fokosPrepareDestroy` fences this partition. Every transition must then stop. */
 	isDestroying(): boolean {
-		return this.#storage.kv.get<boolean>(FOKOS_KV_KEYS.DESTROYING) === true;
+		let fenced = kvCopies.get(this.#storage)?.destroying;
+		if (fenced === undefined) {
+			fenced = this.#storage.kv.get<boolean>(FOKOS_KV_KEYS.DESTROYING) === true;
+			const copy = kvCopies.get(this.#storage) ?? {};
+			copy.destroying = fenced;
+			kvCopies.set(this.#storage, copy);
+		}
+		return fenced;
 	}
 
 	setDestroying(): void {
+		const copy = kvCopies.get(this.#storage) ?? {};
+		copy.destroying = true;
+		kvCopies.set(this.#storage, copy);
 		this.#storage.kv.put<boolean>(FOKOS_KV_KEYS.DESTROYING, true);
 	}
 

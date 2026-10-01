@@ -1,7 +1,8 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag), R10 (the
-lazy lifecycle) and X1 (fix 2, when the partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag and the
+destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
+partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-01.
@@ -85,7 +86,7 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R4/K2 (the destroy fence and the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
 My recommendation: start with F11 and F1 as one change, then F5. Before you edit the migrations in place, make the decisions on X1 and R11.
 
@@ -148,12 +149,25 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
 **R4 — facts that seldom change are read on each request (Low–Medium).** **Code.**
 
 - **What happens:**
-  - `#guard` reads the KV key `destroying` on each RPC.
+  - Done: `#guard` read the KV key `destroying` on each RPC.
   - `#dispatch` reads the KV import record on each RPC.
   - Done: a hash partition ran the `routeOverrideFor` JOIN for each key of each request, also when it had no
     override.
-- **Fix:** Keep the destroy fence (it only goes to true) and the import state in memory. Only this runtime writes
-  them, so it can update memory after each commit.
+- **Done, the destroy fence:** `FokosShardingStore` keeps the fence in memory for each storage. The first read reads
+  storage, and `setDestroying` sets the memory value. `transactionSync` deletes the value when its function throws:
+  a fence that a rolled-back transaction wrote would otherwise stay true, and the partition would refuse every
+  request. Only `fokosPrepareDestroy` writes the fence, and no host code can call it inside a host transaction.
+- **Not done, on purpose: the import record and the jobs record (K6).** A copy in memory of these keys can go out
+  of date in two cases that the store cannot detect:
+  - A host transaction (`ctx.storage.transactionSync`) that rolls back a runtime write inside it. The store sees only
+    its own `transactionSync`, and not the outer transaction. No runtime method that a host can call synchronously
+    writes these keys today, but a later method could.
+  - A host `storage.deleteAll()` without `ctx.abort()`.
+  - A SQLite trigger cannot detect these writes: workerd refuses every statement on `_cf_KV`, also
+    `CREATE TRIGGER` (`SQLITE_AUTH`). A trigger can also not call JavaScript to clear the memory copy.
+  - **Possible later fix:** a write marks the copy "not confirmed", and reads go to storage until a microtask reads
+    storage again. A `transactionSync` function cannot `await`, so the microtask runs after the outermost
+    transaction ends. First check how the async `storage.transaction()` behaves on a SQLite-backed object.
 - **Done, the override flag:** `FokosShardingStore` keeps a flag for each storage that says if the partition may
   hold a route override. The first lookup reads it with one `SELECT 1 … LIMIT 1`, and `insertRouteOverride` sets
   it to true. No statement deletes an override, so the flag goes only from false to true. An insert that rolls
@@ -220,26 +234,24 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
 **R10 — the scheduler does more reads than it needs (Low).** **Code.**
 
 - **What happens:**
-  - Each pass reads the deadline of every job 2 times, and calls `canRun` 2 times.
   - Done: `canSweepLocally` and `canDriveLocally` called `lifecycle()`, which did 4 reads, once for each job and
     each check.
   - The deadlines of `target_import` and `target_ack` each read the import record.
-  - Each request on an importing target starts a pass.
+  - Done: each request on an importing target started a pass, also while the import waited for a retry.
 - **Why the deadlines are read 2 times:** The read after the steps is necessary, because a step can change a
   deadline. When no job is due, the pass reads the deadlines one time.
 - **Done, the lazy lifecycle:**
   - Each field of a `lifecycle()` result reads its storage only when a caller first reads it, and the result keeps
-    the answer. A caller that reads 3 fields does 3 reads, and `firstActiveRepartition()` runs only for a caller
-    that reads `activeRepartition`.
+    the answer. `firstActiveRepartition()` runs only for a caller that reads `activeRepartition`.
   - `canRun(lifecycle)` gets one result. `#runnable()` makes a new result for each check, and gives it to all jobs.
     The check is synchronous. The check after the steps gets a new result, because a step can change the facts.
   - The runtime does not know the rules of the host jobs. Each host keeps its own condition.
-  - Result: the checks of one pass do at most 6 reads for any number of host jobs. Before, they did 16 on the
-    coordinator (2 host jobs) and 8 on a partition.
   - Do not keep a result across an `await`: a field read after the `await` can come from a different state than a
     field read before it.
-- **Not done:** The import record reads of the deadlines. R4 keeps the import state in memory, and that removes
-  them.
+- **Done, the request gate:** A request on an importing target starts a pass only when `nextAttemptAt` is due.
+  While the import waits for a retry, a pass can do no import work: the pass that deferred the import armed the
+  alarm at the retry time. The request still restores the fallback alarm, for a lost alarm.
+- **Not done:** the import record reads of the deadlines. They need the memory copy of the import record (R4).
 
 **R8 — each status page sorts the whole union (Low).** **Plan.**
 
@@ -294,15 +306,12 @@ size of a value does not change the bill. The limit for a key and its value toge
 
 **K2 — each `PartitionDO` request reads 3 KV keys before it does any work (Medium).** **Code.**
 
-- `#api` (`server/do-partition.ts:430`) calls `isFenced()`, and `#guard` reads `destroying` again. Then `#dispatch`
-  reads `import` through `isImporting()`. A coordinator request reads 2 keys. Each read is a SQLite seek and a V8
-  deserialization of the value.
+- `#api` (`server/do-partition.ts`) calls `isFenced()`, and `#guard` reads `destroying` again. Then `#dispatch`
+  reads `import` through `isImporting()`. A coordinator request reads 2 keys.
 - After a target finishes its import, its record stays in `active` state for life. So every later request still
   reads and deserializes it, only to learn "not importing".
-- **Fix:** This is R4. Only this runtime writes these two keys, so keep both in memory and update memory after each
-  commit. A combined key does not help: with the memory copy there is no read left to combine, and without it a
-  combined key still costs one seek and one deserialization per request.
-- **Smallest fix:** `#api` reads the fence once, and passes it on, so `#guard` does not read it again.
+- **Done, the fence:** the memory copy of R4 removes both fence reads.
+- **Not done:** the import read. See R4 for why the import record has no memory copy.
 
 **K3 — decided, no change: the plan head can be a column of its repartition row (Low, schema).** **Code.**
 
@@ -341,8 +350,7 @@ size of a value does not change the bill. The limit for a key and its value toge
   `initiateWrite`, and each completed coordinator transaction. It writes only when the new time is earlier, so the
   write is rare. The read is on each call.
 - One record for all jobs is the right shape: the jobs are few, and the scheduler reads all of them together.
-- **Fix:** Only the scheduler of this instance writes the record, so keep a copy in memory, and read storage only
-  at the start.
+- **Not done:** a copy in memory can go out of date when a host transaction rolls back a write. See R4.
 
 **K7 — the Bloom filter is read whole at each start (Low–Medium).** **Code.**
 

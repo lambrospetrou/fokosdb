@@ -266,4 +266,27 @@ describe("FokosShardingStore - KV records", () => {
 			expect(state.storage.kv.get(FOKOS_KV_KEYS.DESTROYING)).toBe(true);
 		});
 	});
+
+	it("gives every store on one storage the destroy fence of the last write", async () => {
+		await withStore((store, state) => {
+			const other = new FokosShardingStore(state.storage);
+			expect(other.isDestroying()).toBe(false);
+			store.setDestroying();
+			expect(other.isDestroying()).toBe(true);
+		});
+	});
+
+	it("reads the destroy fence from storage again after a transaction that rolls back", async () => {
+		await withStore((store) => {
+			expect(store.isDestroying()).toBe(false);
+			expect(() =>
+				store.transactionSync(() => {
+					store.setDestroying();
+					throw new Error("roll back");
+				}),
+			).toThrow("roll back");
+			// A fence that stayed true in memory would refuse every request of a partition that is not fenced.
+			expect(store.isDestroying()).toBe(false);
+		});
+	});
 });

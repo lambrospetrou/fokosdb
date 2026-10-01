@@ -2,7 +2,8 @@ import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, it, vi } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { FokosRuntimeConfigOverrides } from "../../src/sharding/runtime-config.js";
-import { testPartitionStub } from "../stub-helpers.js";
+import { testControlledPartitionStub, testPartitionStub } from "../stub-helpers.js";
+import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex, PartitionIdHelper, resolveHashChildPartitionContexts } from "../../src/sharding/partition-id.js";
@@ -119,6 +120,35 @@ describe("PartitionDO - splitting", () => {
 		expect(status.parentPartitionContext).toEqual(refOf(parentCtx));
 		expect(status.parentSplitType).toBe("hash");
 		expect(status.migrationStatus).toBe("migration_initialized");
+	});
+
+	it("starts the import from a request when the import is due", async ({ expect }) => {
+		const { ctx: parentCtx } = makeStub({ ns: CONTROLLED_NS });
+		const childCtx: FokosDBRouteContext = resolveHashChildPartitionContexts(parentCtx)[0];
+		const child = testControlledPartitionStub(childCtx.doName);
+		// Each retry and the fallback alarm wait 60 s, so no alarm fires in this test.
+		const minute = 60_000;
+		await child.testRuntimeConfig({
+			fallbackAlarmMs: minute,
+			importRetryBaseMs: minute,
+			importRetryMaxMs: minute,
+			notCutOverRetryMs: minute,
+			nonRetryableRetryMs: minute,
+		});
+		await child.fokosInit({
+			repartitionId: "r1",
+			source: refOf(parentCtx),
+			target: childCtx,
+			slice: { kind: "hash_child", childIndex: 0, depth: 1 },
+		});
+		const attempts = async () =>
+			await runInDurableObject(child, (_i: PartitionDO, state: DurableObjectState) => new FokosShardingStore(state.storage).getImport()!.attempts);
+
+		// The new import is due, so the request starts a pass. The pull fails because the source has not
+		// cut over, and the import waits for its retry.
+		const write = openedRpc(child).apiPutItem(childCtx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v", kind: "text" as const });
+		await expect(write).rejects.toThrow(fokosErrorWith("partition_migrating"));
+		await vi.waitFor(async () => expect(await attempts()).toBe(1), { timeout: 5_000, interval: 10 });
 	});
 
 	it("fokosInit refuses a call that conflicts with the import the target already holds", async ({ expect }) => {
