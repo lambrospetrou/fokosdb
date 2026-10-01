@@ -52,6 +52,7 @@ import type { FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js"
 import type {
 	FokosEnvelope,
 	FokosGroupPart,
+	FokosLifecycle,
 	FokosLocalCall,
 	FokosOperations,
 	FokosRangeVisit,
@@ -305,7 +306,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 		});
 		this.#ttl = new TtlExpiry({
 			store: this.#store,
-			canSweep: () => this.canSweepLocally(),
+			canSweep: () => this.canSweepLocally(this.fokos.lifecycle()),
 			logParams: () => this.logParams(),
 			config: () => this.config().ttlSweep,
 		});
@@ -508,12 +509,13 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	 * The identity check comes first and reads only memory. The TTL sweep runs from a timer, so it can
 	 * ask this before any request gave the partition an identity, and a partition without one can hold
 	 * no import and no repartition: reading storage to learn that is work the answer does not need.
+	 * `lifecycle` reads storage only for the fields that this check reads, so a partition without an
+	 * identity reads nothing.
 	 */
-	private canSweepLocally(): boolean {
+	private canSweepLocally(lifecycle: FokosLifecycle): boolean {
 		if (!this.fokos.initialized()) {
 			return false;
 		}
-		const lifecycle = this.fokos.lifecycle();
 		if (lifecycle.destroying || lifecycle.role === "router") {
 			return false;
 		}
@@ -810,7 +812,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			jobs: [
 				{
 					name: JOB_STALE_TX_RECOVERY,
-					canRun: () => this.canSweepLocally(),
+					canRun: (lifecycle) => this.canSweepLocally(lifecycle),
 					deadline: () => this.#store.earliestPendingTxRecoveryAt(),
 					runStep: async () => {
 						await this.recoverStaleTransactions();
@@ -1087,7 +1089,7 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	private async statusView(): Promise<PartitionStatusView> {
 		const identity = this.fokos.identity();
 		const routeContext = this.fokos.routeContext();
-		const lifecycle = this.fokos.lifecycle();
+		const importInfo = this.fokos.lifecycle().import;
 		const entries: FokosStatusEntry[] = [];
 		let cursor: FokosStatusCursor | null = null;
 		do {
@@ -1129,9 +1131,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			partitionContext: routeContext,
 			identityStored: identity,
 			splitStatus,
-			migrationStatus: derivedMigrationStatus(lifecycle.import?.state),
-			parentPartitionContext: lifecycle.import?.source,
-			parentSplitType: lifecycle.import ? (lifecycle.import.slice.kind === "hash_child" ? "hash" : "range") : undefined,
+			migrationStatus: derivedMigrationStatus(importInfo?.state),
+			parentPartitionContext: importInfo?.source,
+			parentSplitType: importInfo ? (importInfo.slice.kind === "hash_child" ? "hash" : "range") : undefined,
 			promotedKeys,
 		};
 	}

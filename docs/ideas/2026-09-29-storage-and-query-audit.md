@@ -1,7 +1,7 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag) and X1 (fix
-2, when the partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
+**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3 and R5. Partly done: R4 (the override flag), R10 (the
+lazy lifecycle) and X1 (fix 2, when the partition has no override). Decided, no change: F6 and K3. Skipped: C3. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-01.
@@ -221,9 +221,25 @@ My recommendation: start with F11 and F1 as one change, then F5. Before you edit
 
 - **What happens:**
   - Each pass reads the deadline of every job 2 times, and calls `canRun` 2 times.
-  - `canSweepLocally` and `canDriveLocally` call `lifecycle()`, which does 4 reads.
+  - Done: `canSweepLocally` and `canDriveLocally` called `lifecycle()`, which did 4 reads, once for each job and
+    each check.
+  - The deadlines of `target_import` and `target_ack` each read the import record.
   - Each request on an importing target starts a pass.
-- **Fix:** Memoize `lifecycle()` for one pass.
+- **Why the deadlines are read 2 times:** The read after the steps is necessary, because a step can change a
+  deadline. When no job is due, the pass reads the deadlines one time.
+- **Done, the lazy lifecycle:**
+  - Each field of a `lifecycle()` result reads its storage only when a caller first reads it, and the result keeps
+    the answer. A caller that reads 3 fields does 3 reads, and `firstActiveRepartition()` runs only for a caller
+    that reads `activeRepartition`.
+  - `canRun(lifecycle)` gets one result. `#runnable()` makes a new result for each check, and gives it to all jobs.
+    The check is synchronous. The check after the steps gets a new result, because a step can change the facts.
+  - The runtime does not know the rules of the host jobs. Each host keeps its own condition.
+  - Result: the checks of one pass do at most 6 reads for any number of host jobs. Before, they did 16 on the
+    coordinator (2 host jobs) and 8 on a partition.
+  - Do not keep a result across an `await`: a field read after the `await` can come from a different state than a
+    field read before it.
+- **Not done:** The import record reads of the deadlines. R4 keeps the import state in memory, and that removes
+  them.
 
 **R8 — each status page sorts the whole union (Low).** **Plan.**
 

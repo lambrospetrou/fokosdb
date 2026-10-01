@@ -4,7 +4,7 @@ import type { FokosDBPolicy, FokosDBRouteContext, FokosDBTableConfig } from "../
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosShardingRuntime } from "../sharding/runtime.js";
 import type { FokosMigrationPageBudget, FokosRuntimeConfigOverrides } from "../sharding/runtime-config.js";
-import type { FokosEnvelope, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
+import type { FokosEnvelope, FokosLifecycle, FokosOperations, FokosShardingHooks, RouteKey } from "../sharding/runtime-types.js";
 import type {
 	FokosExecuteLocalRequest,
 	FokosInitRequest,
@@ -495,7 +495,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			jobs: [
 				{
 					name: JOB_TX_RECOVERY,
-					canRun: () => this.canDriveLocally(),
+					canRun: (lifecycle) => this.canDriveLocally(lifecycle),
 					// The step moves `next_recovery_at` of each transaction that it takes forward, so the
 					// deadline does not stay in the past while a participant is down.
 					deadline: () => this.earliestRecoveryAt(),
@@ -506,7 +506,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				},
 				{
 					name: JOB_IDEMPOTENCY_SWEEP,
-					canRun: () => this.canDriveLocally(),
+					canRun: (lifecycle) => this.canDriveLocally(lifecycle),
 					deadline: () => {
 						const earliest = this.earliestCompletedAt();
 						return earliest === null ? null : sweepDueAt(earliest);
@@ -521,11 +521,10 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * True when this coordinator drives its own transactions. A router owns no token, a target that
 	 * still imports holds an incomplete ledger, and a fenced coordinator makes no transition.
 	 */
-	private canDriveLocally(): boolean {
+	private canDriveLocally(lifecycle: FokosLifecycle): boolean {
 		if (!this.fokos.initialized()) {
 			return false;
 		}
-		const lifecycle = this.fokos.lifecycle();
 		if (lifecycle.destroying || lifecycle.role === "router") {
 			return false;
 		}

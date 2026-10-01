@@ -218,6 +218,7 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			fallbackAlarmMs: () => this.#config().fallbackAlarmMs,
 			fastPathDelayMs: () => this.#config().fastPathDelayMs,
 			isFenced: () => this.#store.isDestroying(),
+			lifecycle: () => this.lifecycle(),
 			jobs: () => [...this.#builtinJobs(), ...(this.#hooks.jobs ?? [])],
 			logParams: () => this.#logParams(),
 		});
@@ -956,18 +957,50 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		return this.#store.isDestroying();
 	}
 
-	/** The mutable lifecycle facts, read from storage. Callers that can run cold check `initialized()` first. */
+	/**
+	 * The mutable lifecycle facts, read from storage. Each field reads its storage only when a caller
+	 * first reads it, and then keeps the answer for this result. So a check that reads 2 fields does 2
+	 * reads, and checks that share one result read each fact one time. Callers that can run cold check
+	 * `initialized()` first.
+	 *
+	 * Do not keep a result across an `await`: a field read after the `await` can come from a different
+	 * state than a field read before it.
+	 */
 	lifecycle(): FokosLifecycle {
-		const record = this.#target.importRecord();
-		const active = this.#store.firstActiveRepartition();
+		const source = this.#source;
+		const target = this.#target;
+		const store = this.#store;
+		// `undefined` means "not read yet". A read never gives `undefined`.
+		let role: FokosLifecycle["role"] | undefined;
+		let imported: FokosLifecycle["import"] | undefined;
+		let activeRepartition: FokosLifecycle["activeRepartition"] | undefined;
+		let destroying: boolean | undefined;
 		return {
-			role: this.#source.routerRole() ? "router" : "owner",
-			import: record ? { state: record.state, source: record.source, slice: record.slice } : null,
-			activeRepartition:
-				active && (active.state === "queued" || active.state === "planned" || active.state === "cutover")
-					? { id: active.id, kind: active.kind, state: active.state }
-					: null,
-			destroying: this.#store.isDestroying(),
+			get role() {
+				role ??= source.routerRole() ? "router" : "owner";
+				return role;
+			},
+			get import() {
+				if (imported === undefined) {
+					const record = target.importRecord();
+					imported = record ? { state: record.state, source: record.source, slice: record.slice } : null;
+				}
+				return imported;
+			},
+			get activeRepartition() {
+				if (activeRepartition === undefined) {
+					const active = store.firstActiveRepartition();
+					activeRepartition =
+						active && (active.state === "queued" || active.state === "planned" || active.state === "cutover")
+							? { id: active.id, kind: active.kind, state: active.state }
+							: null;
+				}
+				return activeRepartition;
+			},
+			get destroying() {
+				destroying ??= store.isDestroying();
+				return destroying;
+			},
 		};
 	}
 
@@ -1881,16 +1914,13 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		if (!this.#hooks.admit) {
 			return;
 		}
-		const rl = () => this.lifecycle();
 		const decision = this.#hooks.admit({
 			op,
 			admissionTag: descriptor.admissionTag,
 			keys,
-			// Read on demand: every dispatch admits, and `lifecycle()` reads the import record and queries
-			// the repartition rows to answer. A host that admits on its own size or tag alone never asks.
-			get lifecycle() {
-				return rl();
-			},
+			// Every dispatch admits. A `lifecycle()` result reads its storage only for the fields that the
+			// hook reads, so a host that admits on its own size or tag alone reads nothing.
+			lifecycle: this.lifecycle(),
 			policy: this.policy(),
 		});
 		if (decision !== "allow") {

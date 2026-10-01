@@ -4,9 +4,14 @@ import type { PartitionDO } from "../server/do-partition.js";
 import { testPartitionStub } from "../../test/stub-helpers.js";
 import { FokosScheduler } from "./scheduler.js";
 import { FokosShardingStore } from "./sharding-store.js";
-import type { FokosJob } from "./runtime-types.js";
+import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 
 const FALLBACK_MS = 60_000;
+
+/** A new lifecycle result of a root owner, one object for each call. */
+function ownerLifecycle(): FokosLifecycle {
+	return { role: "owner", import: null, activeRepartition: null, destroying: false };
+}
 
 /**
  * Runs `fn` with a scheduler over REAL Durable Object storage and one host job. The job counts the
@@ -35,6 +40,7 @@ async function withScheduler(
 			fallbackAlarmMs: () => FALLBACK_MS,
 			fastPathDelayMs: () => 0,
 			isFenced: () => false,
+			lifecycle: ownerLifecycle,
 			jobs: () => [counted],
 			logParams: () => ({}),
 		});
@@ -86,5 +92,73 @@ describe("FokosScheduler - deadline reads", () => {
 				expect(await state.storage.getAlarm()).toBe(at);
 			},
 		);
+	});
+});
+
+describe("FokosScheduler - lifecycle reads", () => {
+	it("gives all jobs one lifecycle result before the steps, and a new one after them", async () => {
+		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const store = new FokosShardingStore(state.storage);
+			store.runMigrations();
+			const made: FokosLifecycle[] = [];
+			const seen: Array<{ name: string; lifecycle: FokosLifecycle }> = [];
+			let pending = true;
+			const job = (name: string): FokosJob => ({
+				name,
+				canRun: (lifecycle) => {
+					seen.push({ name, lifecycle });
+					return true;
+				},
+				deadline: () => (pending ? Date.now() - 1 : null),
+				runStep: () => {
+					pending = false;
+					return { nextRunAt: null };
+				},
+			});
+			const jobs = [job("first"), job("second")];
+			const scheduler = new FokosScheduler({
+				storage: state.storage,
+				store,
+				fallbackAlarmMs: () => FALLBACK_MS,
+				fastPathDelayMs: () => 0,
+				isFenced: () => false,
+				lifecycle: () => {
+					const lifecycle = ownerLifecycle();
+					made.push(lifecycle);
+					return lifecycle;
+				},
+				jobs: () => jobs,
+				logParams: () => ({}),
+			});
+			try {
+				await scheduler.runDueWork();
+			} finally {
+				await state.storage.deleteAlarm();
+			}
+
+			// One result for the check before the steps, and a new one for the check after them, because a
+			// step can change the facts.
+			expect(made).toHaveLength(2);
+			expect(seen.map(({ name, lifecycle }) => [name, made.indexOf(lifecycle)])).toEqual([
+				["first", 0],
+				["second", 0],
+				["first", 1],
+				["second", 1],
+			]);
+		});
+	});
+
+	it("keeps each lifecycle field of one result at its first read, and a new result reads again", async () => {
+		const stub = testPartitionStub(`scheduler-test.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const before = instance.fokos.lifecycle();
+			expect(before.destroying).toBe(false);
+
+			new FokosShardingStore(state.storage).setDestroying();
+
+			expect(before.destroying).toBe(false);
+			expect(instance.fokos.lifecycle().destroying).toBe(true);
+		});
 	});
 });

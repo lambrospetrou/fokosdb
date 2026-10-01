@@ -8,7 +8,7 @@
  * it knows, and runs at most one pass at a time: a request or an alarm that arrives during a pass waits
  * for it and then gets one more pass.
  */
-import type { FokosJob } from "./runtime-types.js";
+import type { FokosJob, FokosLifecycle } from "./runtime-types.js";
 import type { FokosShardingStore } from "./sharding-store.js";
 
 export type FokosSchedulerDeps = {
@@ -20,6 +20,8 @@ export type FokosSchedulerDeps = {
 	fastPathDelayMs: () => number;
 	/** True after the destroy fence. A fenced pass runs nothing and arms nothing. */
 	isFenced: () => boolean;
+	/** A new lazy lifecycle result. The scheduler makes one for each check of `canRun`, and gives it to each job. */
+	lifecycle: () => FokosLifecycle;
 	/** Built-in jobs first, then host jobs. Read at the start of every pass, and again at its end. */
 	jobs: () => readonly FokosJob[];
 	logParams: () => Record<string, unknown>;
@@ -208,9 +210,14 @@ export class FokosScheduler {
 		}
 	}
 
-	/** The jobs that can run now, built-ins first. Asked again whenever the answer can have changed. */
+	/**
+	 * The jobs that can run now, built-ins first. Asked again whenever the answer can have changed.
+	 * All jobs get the same lifecycle result, so each fact is read at most one time for each call. The
+	 * filter is synchronous, so the facts cannot change while it runs.
+	 */
 	#runnable(): FokosJob[] {
-		return this.#deps.jobs().filter((job) => job.canRun());
+		const lifecycle = this.#deps.lifecycle();
+		return this.#deps.jobs().filter((job) => job.canRun(lifecycle));
 	}
 
 	/** The earliest durable deadline of each runnable job: its scheduled run, or its own durable work. */

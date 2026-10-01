@@ -41,6 +41,7 @@ export type FokosRuntimeOptions<TPolicy> = {
 
 // ─── the primitive API ───────────────────────────────────────────────────────
 
+/** Each field reads its storage when a caller first reads it. Do not keep a value across an `await`. */
 export type FokosLifecycle = {
 	/** A router forwards every key after a split cutover; an owner serves its keys locally. */
 	role: "owner" | "router";
@@ -269,8 +270,12 @@ export type FokosRepartitionPlan<TPolicy = unknown> = {
 
 export type FokosJob = {
 	name: string;
-	/** False skips the job in this pass, and keeps its `deadline()` out of the alarm. Synchronous. */
-	canRun(): boolean;
+	/**
+	 * False skips the job in this pass, and keeps its `deadline()` out of the alarm. Synchronous. All
+	 * jobs of one check get the same `lifecycle`, and it reads only the fields that a job reads. Do not
+	 * keep it after the call.
+	 */
+	canRun(lifecycle: FokosLifecycle): boolean;
 	/** One bounded, idempotent step. Can be async: it runs outside any transaction. */
 	runStep(): { nextRunAt: number | null } | Promise<{ nextRunAt: number | null }>;
 	/** The earliest time this job has durable work, read from the host's own storage, or null. Synchronous. */
