@@ -850,16 +850,32 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * It writes only while the transaction is PREPARING. An answer can arrive after another drive has
 	 * decided the transaction. That decision has stored its results and deleted the images that the cap
 	 * dropped, so a late answer must not change the answers or add an image again.
+	 *
+	 * An accepted answer stays. A participant that accepted holds its locks until the decision, and it
+	 * answers each later prepare of the transaction with accepted. So a rejection that arrives after an
+	 * acceptance is an old answer.
 	 */
 	private storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void {
 		this.ctx.storage.transactionSync(() => {
 			if (this.loadStateRow(transactionId)?.state !== "PREPARING") {
 				return;
 			}
-			this.ctx.storage.sql.exec(
-				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
+			const stored = this.ctx.storage.sql.exec(
+				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
+				  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NOT 'accepted'`,
 				answer.outcome,
 				answer.outcome === "rejected" ? stringifyTagged(stripImagesFromPrepareResponse(answer)) : null,
+				transactionId,
+				partitionDoName,
+			);
+			if (stored.rowsWritten === 0) {
+				return;
+			}
+			// The images of an earlier answer of this participant belong to the answer that this one replaces.
+			this.ctx.storage.sql.exec(
+				`DELETE FROM tc_results WHERE transaction_id = ? AND op_index IN
+				   (SELECT op_index FROM tc_items WHERE transaction_id = ? AND partition_do_name = ?)`,
+				transactionId,
 				transactionId,
 				partitionDoName,
 			);
@@ -890,14 +906,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	/**
 	 * Records why a participant's prepare threw after its retries, so the cancel reports the cause. A
 	 * participant that has answered keeps its answer, and recovery can still re-prepare one that has not.
+	 * It writes only while the transaction is PREPARING: after the decision, the stored results already
+	 * hold the cause.
 	 */
 	private storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void {
 		dropCallCost(err);
 		this.ctx.storage.sql.exec(
-			`UPDATE tc_participants SET error_json = ? WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
+			`UPDATE tc_participants SET error_json = ?
+			  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL
+			    AND EXISTS (SELECT 1 FROM tc_state WHERE transaction_id = ? AND state = 'PREPARING')`,
 			stringifyTagged(FokosError.toWire(err)),
 			transactionId,
 			partitionDoName,
+			transactionId,
 		);
 	}
 
@@ -1033,10 +1054,18 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		return { v: COORDINATOR_REF_VERSION, doName: this.fokos.routeContext().doName, idempotencyToken };
 	}
 
-	/** Moves PREPARING to PREPARED, the point of no return. */
+	/**
+	 * Moves PREPARING to PREPARED, the point of no return. The stored answers decide, not the answers
+	 * that the caller holds in memory: every participant must have a stored accepted answer.
+	 */
 	private markPrepared(transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () =>
-			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'`, transactionId),
+			this.ctx.storage.sql.exec(
+				`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'
+				   AND NOT EXISTS (SELECT 1 FROM tc_participants WHERE transaction_id = ? AND prepare_outcome IS NOT 'accepted')`,
+				transactionId,
+				transactionId,
+			),
 		);
 	}
 
@@ -1052,9 +1081,16 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		requestBudgetMs: number,
 		fanout?: PrepareFanout,
 	): Promise<InitiateWriteResponseEncoded> {
-		this.transition(idempotencyToken, () =>
-			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId),
-		);
+		const row = this.transition(idempotencyToken, () => {
+			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId);
+			return this.loadStateRow(transactionId);
+		});
+		// Another drive can start between the insert of the transaction and this call, for example a
+		// retry with the same token. When that drive has already decided, a prepare from this drive can
+		// lock keys after the cancel released them.
+		if (row?.state !== "PREPARING") {
+			return this.loadFinalResponse(transactionId, idempotencyToken, row);
+		}
 
 		const { transactionTs, participants } = fanout ?? this.loadPrepareFanout(transactionId);
 		// Each participant stores this reference in its lock, and calls it back on recovery.
@@ -1243,7 +1279,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	private async runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
 		const stateRow = this.loadStateRow(transactionId);
-		if (!stateRow) {
+		if (stateRow?.state !== "PREPARING") {
 			return;
 		}
 

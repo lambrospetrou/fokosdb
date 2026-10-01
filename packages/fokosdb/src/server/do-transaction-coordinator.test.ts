@@ -82,6 +82,7 @@ type CoordinatorInternals = {
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
 	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void;
+	storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void;
 	markPrepared(transactionId: string, idempotencyToken: string): void;
 	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
@@ -186,6 +187,21 @@ function insertImage(state: DurableObjectState, transactionId: string, opIndex: 
 		opIndex,
 		data,
 	);
+}
+
+/** A prepare answer that rejects one operation on its condition, with the image of the item. */
+function rejection(opIndex: number, hashKey: string, imageBytes: number): PrepareResponse {
+	return {
+		outcome: "rejected",
+		results: [
+			{
+				opIndex,
+				outcome: "rejected",
+				reason: { code: "condition_failed", hashKey, item: { hashKey, data: `image-${opIndex}`, kind: "text", version: 1 } },
+				imageBytes,
+			},
+		],
+	};
 }
 
 // Every table this DO owns — the tc_* tables plus the migrations bookkeeping. The `_cf_*` tables are
@@ -701,17 +717,6 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
 			insertParticipant(state, { name: "p1" });
 			insertParticipant(state, { name: "p2" });
-			const rejection = (opIndex: number, hashKey: string, imageBytes: number): PrepareResponse => ({
-				outcome: "rejected",
-				results: [
-					{
-						opIndex,
-						outcome: "rejected",
-						reason: { code: "condition_failed", hashKey, item: { hashKey, data: `image-${opIndex}`, kind: "text", version: 1 } },
-						imageBytes,
-					},
-				],
-			});
 			// The first image fills the whole cap, so the cap drops the second image.
 			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX));
 			tc.storePrepareAnswer(TX_ID, "p2", rejection(1, "hk2", 6));
@@ -725,6 +730,82 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toEqual(before);
 			expect(state.storage.sql.exec(`SELECT * FROM tc_participants ORDER BY partition_do_name`).toArray()).toEqual(answersBefore);
 			expect(countRows(state, "tc_results")).toBe(1);
+		});
+	});
+
+	// A participant that accepted holds its locks until the decision. A rejection from the same
+	// participant that arrives later is an old answer.
+	it("keeps an accepted answer when a rejection of the same participant arrives later", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { name: "p1" });
+
+			tc.storePrepareAnswer(TX_ID, "p1", { outcome: "accepted" });
+			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", 7));
+
+			const row = state.storage.sql
+				.exec<{ prepare_outcome: string | null; answer_json: string | null }>(`SELECT prepare_outcome, answer_json FROM tc_participants`)
+				.one();
+			expect(row).toEqual({ prepare_outcome: "accepted", answer_json: null });
+			expect(countRows(state, "tc_results")).toBe(0);
+		});
+	});
+
+	it("deletes the images of an earlier answer when a new answer of the same participant replaces it", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { name: "p1" });
+
+			tc.storePrepareAnswer(TX_ID, "p1", rejection(0, "hk1", 7));
+			expect(countRows(state, "tc_results")).toBe(1);
+			tc.storePrepareAnswer(TX_ID, "p1", {
+				outcome: "rejected",
+				results: [
+					{ opIndex: 0, outcome: "rejected", reason: { code: "pending_conflict", hashKey: "hk1", conflictingTransactionId: "tx-other" } },
+				],
+			});
+
+			expect(countRows(state, "tc_results")).toBe(0);
+		});
+	});
+
+	it("does not store a prepare error after the decision", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			insertParticipant(state, { name: "p1" });
+
+			tc.storePrepareError(TX_ID, "p1", new Error("late failure"));
+
+			expect(state.storage.sql.exec<{ error_json: string | null }>(`SELECT error_json FROM tc_participants`).one().error_json).toBeNull();
+		});
+	});
+
+	it("does not move to PREPARED while a participant has no stored accepted answer", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "PREPARING");
+			insertParticipant(state, { name: "p1", prepare: "accepted" });
+			insertParticipant(state, { name: "p2" });
+
+			tc.markPrepared(TX_ID, TOKEN);
+
+			expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("PREPARING");
+		});
+	});
+
+	// A request waits for the job schedule after it inserts the transaction. A retry with the same token
+	// can drive and decide the transaction in that time.
+	it("sends no prepare when another drive has already decided the transaction", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "CANCELLING", [{ outcome: "not_evaluated" }, { outcome: "not_evaluated" }]);
+			insertParticipant(state, { name: "p1" });
+			const txPrepare = vi.fn(async (_pCtx: unknown, _request: { transactionId: string }) => enveloped({ outcome: "accepted" as const }));
+			vi.spyOn(doStubs, "partitionStubByName").mockReturnValue({ txPrepare } as unknown as DurableObjectStub<PartitionDO>);
+
+			await expect(tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS)).resolves.toMatchObject({ outcome: "cancelled" });
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+
+			// The coordinator is shared with other tests, so only the calls for this transaction count.
+			expect(txPrepare.mock.calls.filter(([, request]) => request.transactionId === TX_ID)).toEqual([]);
 		});
 	});
 
@@ -1336,7 +1417,8 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			await withCoordinator(async (tc, state) => {
 				twoParticipants(state);
 				const { txCommit, txCancel } = mockPartitions(async () => {
-					// The other drive received an accept from p2 and wrote the commit decision.
+					// The other drive received an accept from both participants and wrote the commit decision.
+					state.storage.sql.exec(`UPDATE tc_participants SET prepare_outcome = 'accepted' WHERE transaction_id = ?`, TX_ID);
 					tc.markPrepared(TX_ID, TOKEN);
 					throw new Error("p2 unreachable from this drive");
 				});
