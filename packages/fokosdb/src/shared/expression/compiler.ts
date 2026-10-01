@@ -592,6 +592,10 @@ function compactPoolParameters(sqlList: string[], context: CompileContext): stri
 
 function compileCondition(condition: ConditionExpression, context: CompileContext): string {
 	switch (condition.op) {
+		case "true":
+			return "(1)";
+		case "false":
+			return "(0)";
 		case "eq":
 		case "ne":
 		case "lt":

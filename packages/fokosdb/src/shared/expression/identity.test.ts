@@ -15,6 +15,12 @@ describe("canonical expression identity", () => {
 		expect(canonicalConditionIdentity(reordered)).toBe(canonicalConditionIdentity(versionEqualsOne));
 	});
 
+	it("writes a constant without args", () => {
+		expect(canonicalConditionIdentity({ op: "true" })).toBe('{"op":"true"}');
+		expect(canonicalConditionIdentity({ op: "false" })).toBe('{"op":"false"}');
+		expect(canonicalConditionIdentity({ op: "not", args: [{ op: "true" }] })).toBe('{"op":"not","args":[{"op":"true"}]}');
+	});
+
 	it("preserves argument order", () => {
 		const reversed: ConditionExpression = { op: "eq", args: [{ val: 1 }, { ref: "v" }] };
 		expect(canonicalConditionIdentity(reversed)).not.toBe(canonicalConditionIdentity(versionEqualsOne));

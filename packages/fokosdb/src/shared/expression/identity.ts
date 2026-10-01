@@ -64,6 +64,10 @@ class IdentityWriter {
 	}
 
 	writeCondition(condition: ConditionExpression): void {
+		if (!("args" in condition)) {
+			this.#out += `{"op":"${condition.op}"}`;
+			return;
+		}
 		this.#out += `{"op":${JSON.stringify(condition.op)},"args":[`;
 		const nestedConditions = condition.op === "and" || condition.op === "or" || condition.op === "not";
 		for (let i = 0; i < condition.args.length; i++) {

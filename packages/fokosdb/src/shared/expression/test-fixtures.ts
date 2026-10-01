@@ -37,6 +37,10 @@ const textItem: ExpressionSemanticItem = { hashKey: "hk", v: 1, data: "text", ki
 const bytesItem: ExpressionSemanticItem = { hashKey: new Uint8Array([1]), v: 1, data: new Uint8Array([2]), kind: "bytes" };
 
 export const MISSING_NULL_SEMANTIC_FIXTURES = [
+	{ name: "true is true for a missing item", item: null, condition: { op: "true" }, expected: true },
+	{ name: "false is false for a missing item", item: null, condition: { op: "false" }, expected: false },
+	{ name: "true is true for an item", item: textItem, condition: { op: "true" }, expected: true },
+	{ name: "false is false for an item", item: textItem, condition: { op: "false" }, expected: false },
 	{
 		name: "exists is false for a missing item",
 		item: null,
@@ -163,6 +167,10 @@ export const PROJECTION_PRESENCE_FIXTURES = [
 ] as const satisfies readonly ProjectionPresenceFixture[];
 
 export const VALID_CONDITION_SHAPE_FIXTURES = [
+	{ name: "true", condition: { op: "true" } },
+	{ name: "false", condition: { op: "false" } },
+	{ name: "not true", condition: { op: "not", args: [{ op: "true" }] } },
+	{ name: "and with false", condition: { op: "and", args: [{ op: "false" }, { op: "exists", args: [{ ref: "v" }] }] } },
 	{ name: "eq", condition: { op: "eq", args: [{ ref: "v" }, { val: 1 }] } },
 	{ name: "ne", condition: { op: "ne", args: [{ ref: "v" }, { val: 1 }] } },
 	{ name: "lt", condition: { op: "lt", args: [{ ref: "v" }, { val: 1 }] } },
@@ -202,6 +210,11 @@ export const INVALID_CONDITION_SHAPE_FIXTURES = [
 	{ name: "null root", condition: null },
 	{ name: "unknown operator", condition: { op: "unknown", args: [] } },
 	{ name: "unknown condition field", condition: { op: "exists", args: [{ ref: "v" }], extra: true } },
+	{ name: "true with empty args", condition: { op: "true", args: [] } },
+	{ name: "false with empty args", condition: { op: "false", args: [] } },
+	{ name: "true with an argument", condition: { op: "true", args: [{ val: true }] } },
+	{ name: "false with an unknown field", condition: { op: "false", extra: true } },
+	{ name: "a Boolean op", condition: { op: true } },
 	{ name: "comparison with one argument", condition: { op: "eq", args: [{ ref: "v" }] } },
 	{ name: "comparison with three arguments", condition: { op: "eq", args: [{ ref: "v" }, { val: 1 }, { val: 2 }] } },
 	{ name: "between with two arguments", condition: { op: "between", args: [{ ref: "v" }, { val: 1 }] } },

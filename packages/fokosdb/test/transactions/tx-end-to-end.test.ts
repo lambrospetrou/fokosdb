@@ -21,6 +21,7 @@ import {
 } from "./tx-helpers.js";
 
 const passingConditions: readonly ConditionExpression[] = [
+	{ op: "true" },
 	{ op: "eq", args: [{ ref: "data", path: "$.score" }, { val: 5 }] },
 	{ op: "ne", args: [{ ref: "data", path: "$.score" }, { val: 6 }] },
 	{ op: "lt", args: [{ ref: "data", path: "$.score" }, { val: 6 }] },
@@ -79,6 +80,21 @@ describe("write conditions", () => {
 		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version: 1 } });
+	});
+
+	it("applies the constant conditions to present and missing items", async () => {
+		const db = sharedDb;
+		const present = { hashKey: `condition-constant-${crypto.randomUUID()}` };
+		const missing = { hashKey: `condition-constant-${crypto.randomUUID()}` };
+		await db.putItem({ ...present, data: "v1" });
+
+		await expect(db.putItem({ ...present, data: "v2", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
+		await expect(db.deleteItem({ ...present, condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
+		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
+		await expect(db.getItem(present)).resolves.toMatchObject({ found: true, item: { data: "v1", version: 1 } });
+		await expect(db.getItem(missing)).resolves.toMatchObject({ found: false });
+
+		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "true" } })).resolves.toMatchObject({ version: 1 });
 	});
 });
 
@@ -212,6 +228,29 @@ describe("transactions - end-to-end", () => {
 		// The non-existent item must still not exist.
 		const missing = await db.getItem({ hashKey: "atom-nonexistent" });
 		expect(missing.found).toBe(false);
+	});
+
+	it("a check with a constant condition commits on true and cancels on false", async () => {
+		const db = sharedDb;
+		const putKey = `constant-put-${crypto.randomUUID()}`;
+		const checkKey = `constant-check-${crypto.randomUUID()}`;
+		const check = (condition: ConditionExpression) => ({ hashKey: checkKey, operation: "check" as const, condition });
+
+		const cancelled = await writeOutcomeWithClockRetry(db, {
+			items: [{ hashKey: putKey, operation: "put" as const, data: "cancelled" }, check({ op: "false" })],
+		});
+		expect(cancelled.outcome).toBe("cancelled");
+		invariant(cancelled.outcome === "cancelled");
+		expect(cancelled.results.at(-1)).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
+		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: false });
+
+		vi.advanceTimersByTime(1);
+		const committed = await writeOutcomeWithClockRetry(db, {
+			items: [{ hashKey: putKey, operation: "put" as const, data: "committed" }, check({ op: "true" })],
+		});
+		expect(committed.outcome).toBe("committed");
+		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: true, item: { data: "committed" } });
+		await expect(db.getItem({ hashKey: checkKey })).resolves.toMatchObject({ found: false });
 	});
 
 	it("atomicity: condition failure across partitions — no partial writes", async () => {

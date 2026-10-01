@@ -134,8 +134,11 @@ can enable composite literals without a public AST change or a change to scalar 
 
 ### 3.2 Conditions
 
+Updated at 2026-10-01: The `true` and `false` conditions were added so that a caller can write a condition that always passes or always fails, and they have no `args` field because they have no operands.
+
 ```ts
 type ConditionExpression =
+  | { op: "true" | "false" }
   | {
       op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte";
       args: readonly [left: ExpressionValue, right: ExpressionValue];
@@ -166,7 +169,8 @@ type ConditionExpression =
 
 Rules:
 
-- Every condition node has only `op` and `args`.
+- Every condition node has only `op` and `args`. Exception: `true` and `false` have only `op`.
+- `true` always passes and `false` always fails, also when the item does not exist.
 - `and` and `or` need at least two conditions.
 - `not`, `exists`, and `not_exists` need one argument.
 - `between` uses `[value, lower, upper]` and includes both bounds.
