@@ -113,14 +113,41 @@ Valid child weights: [111, 5111, 111]
 Three non-empty children are possible. Equal byte balance is not possible because an item is indivisible.
 The existing test expects `null` for this case. That test preserves the defect instead of detecting it.
 
-This RFC changes the range-floor rule in `2026-09-27-over-size-split-trigger.md`.
+This RFC changes the range-floor rule and the range-leaf decision in `2026-09-27-over-size-split-trigger.md`.
 It also replaces the threshold loop specified in `range-split-boundary-byte-seek.md`.
 
-### 1.5 Why this change is needed now
+### 1.5 The split decision scans rows on the request path
+
+When admission rejects a write on a partition over its cap, the runtime asks the host for a split decision.
+`#admit` calls `requestSplitEvaluation`, and `#evaluateSplit` calls `PartitionDO.splitDecision`
+before its first `await` (`sharding/runtime.ts`).
+So the decision runs synchronously, and the rejected write gets its error only after the decision ends.
+
+For a range leaf, `splitDecision` calls `planRangeSplit`.
+The scan reads about `(N - 1) / N` of the rows of the slice inside one `transactionSync`.
+No other request on the partition runs during the scan.
+The decision uses only one fact from the result: whether boundaries exist.
+It does not use the boundaries.
+
+The same scan runs again in these cases:
+
+1. The planner calls `computeRangeBoundaries` in `#plan` (`sharding/repartition-flow.ts`) and scans again.
+2. While `#evaluateSplit` waits for `ensureAlarmAtMost`, the split row does not exist yet.
+   Each write that admission rejects in that time scans again.
+3. At the `skewed_bytes` floor, no split row is ever created. Each rejected write scans the complete slice again.
+
+For example, a range leaf has 10M small rows and `N = 4`.
+The decision and the planner read about 15M rows together. Each repeated rejection adds 7.5M more.
+
+The decision needs the scan only for the `skewed_bytes` floor.
+Section 1.4 shows that this floor is a planner defect. When the defect is fixed, the decision needs no scan.
+
+### 1.6 Why this change is needed now
 
 The item-limit rule and persisted size fields need separate meanings before production use.
 Future tables and indexes must permit changes to storage estimates without changes to item validity.
 The range planner must distinguish an impossible split from an imperfect byte balance.
+A write that admission rejects must get its error without a scan of the items.
 
 ## 2. Goals and requirements
 
@@ -132,6 +159,7 @@ The range planner must distinguish an impossible split from an imperfect byte ba
 - Account for key copies in the existing indexes, including the partial TTL index.
 - Permit coefficient changes without a rewrite of every item.
 - Correct boundary byte accounting and permit splits with dominant items.
+- Remove the boundary scan from the split decision of a range leaf. Only the planner scans.
 - Specify the compatibility changes, migration constraints, and required tests.
 
 ### 2.2 Out of scope
@@ -144,6 +172,7 @@ The range planner must distinguish an impossible split from an imperfect byte ba
 - Changes to routing names, key encoding, or ownership rules.
 - Changes to the public configuration surface for storage coefficients.
 - Replacement of the streaming scan with histograms, window functions, or whole-partition materialization.
+- A planner scan in chunks over several alarm steps. The planner scan stays one `transactionSync`.
 
 ### 2.3 Requirements
 
@@ -160,6 +189,8 @@ The range planner must distinguish an impossible split from an imperfect byte ba
 11. Size and count scans must remain index-only. They must not read item data for size accounting.
 12. The physical split trigger and admission guard must continue to use `sql.databaseSize`.
 13. No test can need a new production hook.
+14. The split decision of a range leaf must not scan the items of its slice.
+    It must use only the item-count check of the planner, and it must read at most `N` index entries or one summary row.
 
 ## 3. Timeline and milestones
 
@@ -180,6 +211,9 @@ A future supporting table adds byte totals or row counts only when its actual sh
 The range planner selects feasible boundaries near byte targets.
 It measures bytes at the actual boundary and reserves an item for each remaining child.
 A dominant item can produce an unequal split, but it does not prevent a valid split.
+
+The item count alone then tells if a range leaf can split.
+The split decision on the request path checks only the item count, and only the planner scans rows.
 
 ```text
 Stored representation
@@ -415,7 +449,48 @@ Update `RangeSplitPlan`, `PartitionDO.splitDecision`, and tests that use this fl
 The planner must preserve canonical byte order, strict boundary order, and the slice bounds.
 An accounting or ownership inconsistency is not evidence that valid items cannot be split.
 
-#### 4.2.9 Extension for supporting tables
+#### 4.2.9 Split decision without a boundary scan
+
+With the planner of section 4.2.8, `fewer_items` is the only range floor.
+So the planner returns boundaries exactly when `C >= N`, and the decision needs no boundaries.
+
+For a range leaf over its cap, `PartitionDO.splitDecision` must:
+
+1. Apply the same item-count check as step 1 of section 4.2.8, on the same owned slice and `N`.
+   The check reads one summary row, or at most `N` entries of the covering index.
+2. Answer a split when `C >= N`.
+3. Return the `fewer_items` floor when `C < N`.
+4. Not call `planRangeSplit` or `computeRangeSplitBoundaries`.
+
+The decision and the planner use one shared count check, so they cannot disagree on the same item state.
+The hash-leaf decision and the check of the database size against the cap do not change.
+
+Only `#plan` scans rows. It calls `computeRangeBoundaries` in the alarm, one time for each queued split.
+If deletes make `C < N` after the decision, the planner returns `null` and waits with backoff.
+This is the current behaviour of `#plan`.
+
+| Case                                          | Before                 | After                          |
+| --------------------------------------------- | ---------------------- | ------------------------------ |
+| A write that admission rejects                | One slice scan         | One count check                |
+| A rejection before the split row exists       | One more slice scan    | One count check                |
+| A rejection at the floor                      | One slice scan         | One count check                |
+| The planner                                   | One slice scan         | One slice scan                 |
+
+The in-memory cache of the floor result (section 4.3.1 of `2026-09-27-over-size-split-trigger.md`) is then not
+necessary. Do not implement it.
+
+**Order of delivery.** Deliver this change in the same milestone as the planner change of section 4.2.8,
+or after it. Never deliver it before.
+With the current planner, a slice with weights `[111, 5111, 111]` and `N = 3` passes the count check.
+The decision queues a split, and `#plan` returns `null` at each retry.
+Each retry scans the complete slice, up to every `sourceRetryMaxMs`, and the split never happens.
+
+**Cost that stays.** The planner scan still reads about `(N - 1) / N` of the rows of the slice in one
+`transactionSync`. No other request on the partition runs during the scan.
+TODO: Measure the duration of one planner scan for a range leaf with 10M rows in a Durable Object.
+If the scan is too long, a scan in chunks over several alarm steps is a separate change.
+
+#### 4.2.10 Extension for supporting tables
 
 A future table must add facts that describe its actual storage shape.
 
@@ -435,7 +510,7 @@ Do not create placeholder tables, a cost registry, or a generic plug-in framewor
 Temporary transaction rows can need a separate model later.
 A larger fixed overhead per committed item does not accurately represent that storage.
 
-#### 4.2.10 Deployment, migration, and rollback
+#### 4.2.11 Deployment, migration, and rollback
 
 This is a pre-release schema and behaviour change.
 The item limit drops the adjustable storage overhead. Query evaluated bytes also drop that overhead.
@@ -458,7 +533,7 @@ A deployment must not delete existing state without explicit approval.
 A future coefficient-only change uses the activation rule in section 4.2.5.
 It must preserve item validity and transaction commit eligibility.
 
-#### 4.2.11 Verification
+#### 4.2.12 Verification
 
 Tests must check definitions, not only agreement between two uses of the same estimate.
 
@@ -493,6 +568,14 @@ Tests must check definitions, not only agreement between two uses of the same es
 - Check string and binary keys in canonical byte order.
 - Check that children cover the slice without gaps or overlaps.
 - Replace the test that expects the dominant-item case to return `null`.
+
+**Split decision**
+
+- A range leaf over its cap with `C >= N` answers a split. With `C < N` it returns the `fewer_items` floor.
+- A range leaf over its cap with weights `[111, 5111, 111]` and `N = 3` answers a split, and the planner plans it.
+- A rejected write on a range leaf does not call `planRangeSplit`. Use `EXPLAIN QUERY PLAN` or the real store to
+  show that the count check reads at most `N` index entries or one summary row.
+- Replace the tests that expect the `skewed_bytes` floor from `splitDecision`.
 
 **Query plans and production flows**
 
@@ -598,6 +681,12 @@ Yes. A single item's physical footprint can exceed a configured cap.
 A valid split does not promise that every child fits that cap.
 It separates the available items instead of declaring byte skew an impossible split.
 
+### Why does the split decision not calculate the boundaries?
+
+The decision uses only one fact: whether a split is possible. After section 4.2.8, the item count gives that fact.
+The decision runs before a rejected write gets its error, so a slice scan there blocks the partition for each rejected write.
+The planner calculates the boundaries in the alarm, one time for each split.
+
 ### Why use JSONB bytes for exact item size?
 
 This preserves the existing stored-representation measurement.
@@ -622,6 +711,8 @@ Code paths below are relative to `packages/fokosdb/src`:
 - `shared/expression/runtime.ts` — compiled update-size probes.
 - `shared/query/query-collector.ts` — evaluated-byte and response-byte charges.
 - `server/do-partition.ts` — admission, promotion checks, split decisions, and host integration.
+- `sharding/runtime.ts` — `#admit`, `requestSplitEvaluation`, and `#evaluateSplit`.
+- `sharding/repartition-flow.ts` — `#plan` and its backoff when no boundaries exist.
 
 Repository documents:
 

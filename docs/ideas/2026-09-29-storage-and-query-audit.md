@@ -46,7 +46,7 @@ says how it was checked:
 | F5 | FokosDB | One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
 | F4 | FokosDB | Done. `pending_transactions` repeated per-transaction data on each key; `conditions_json` was never read; the stale queries stepped past lock copies | Medium | Yes |
-| F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
+| F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning. The fix is part of the item-size RFC | Medium | No |
 | F12 | FokosDB | Done. Empty hash keys kept their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
@@ -596,8 +596,11 @@ size of a value does not change the bill. The limit for a key and its value toge
   can repeat the scan while the alarm write is pending, before the split row exists. At the floor, every refused
   write repeats the decision. The implemented over-size RFC already bounds the floor cases; it does not remove
   this request-path cost.
-- **Fix:** Scan in chunks over several background steps, and keep the running totals in the plan head. Or sample
-  the index. Reuse a completed decision scan only when the item state and split arguments still match.
+- **Fix:** The decision does not need the boundaries. It uses only the fact that boundaries exist, and the scan finds
+  only the `skewed_bytes` floor. That floor is a planner defect. The RFC
+  `docs/agent-plans/2026-09-30-item-size-facts-and-range-split.md` (sections 1.5 and 4.2.9) removes the floor. Then
+  the decision checks only the item count, which reads at most N rows, and only `#plan` scans, one time for each
+  split. The planner scan still blocks requests. Measure it before you scan in chunks over several alarm steps.
 
 **F8 — done: commit read each lock row 2 times (Low).** **Code.** `listPendingTxKeys` and `getPendingTxOp` for
 each key read the same rows. Now `commitLocal` reads the rows of the transaction one time with `listPendingTxItems`. The release is one
