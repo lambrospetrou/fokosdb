@@ -790,20 +790,27 @@ wait behind it (see X2).
 - **Why it matters for availability:** A hash child that imports answers each write on its keys with
   `partition_migrating` until the import ends. With `hashSplitN = 4`, that is 1/4 of the keys of the source.
 - **What changed: the hash-key walk.**
-  - `PartitionStore.walkItemsByHashKey` (`shared/partition/partition-store.ts`) walks `items` one hash key at a
-    time. `nextHashKeyStatement` finds the first row of the next key with one seek:
-    `SELECT hk, sk FROM items WHERE hk > ? ORDER BY hk, sk LIMIT 1`.
+  - `PartitionStore.walkItemsByHashKey` and `walkPendingTxByHashKey` (`shared/partition/partition-store.ts`) walk
+    `items` and `pending_transactions` one hash key at a time. Both use one generic walk. `nextHashKeyStatement`
+    finds the first row of the next key with one seek:
+    `SELECT hk, sk FROM <table> WHERE hk > ? ORDER BY hk, sk LIMIT 1`.
   - The walk asks the ownership function one time for each hash key, with the first row of the key. A hash-child
     slice owns whole hash keys, so that answer is correct for each row of the key. The hash and the override
     JOIN therefore run one time for each key, not for each row.
-  - For an owned key, the walk reads the rows with the range statement of F1 (`hk = ? AND sk >= ?`). For a key
-    that it does not own, it gives one `skipped` entry and reads no `data`.
-  - The cursor is `(hk, sk)`. A null `sk` means "after every row of `hk`", so a page can stop after a skipped key.
-    A page can also stop inside an owned key, and the next page continues with `hk = ? AND sk > ?`.
+  - For an owned key, the walk reads the rows with the range statements of F1 (`hk = ? AND sk >= ?`). For a key
+    that it does not own, it gives one `skipped` entry, and reads no `data` and no `pending_tx_info` row.
+  - The cursor has two kinds. `{ kind: "row", row }` holds the row cursor of the stream: `(hk, sk)` for items,
+    `(hk, sk, transaction_id)` for locks. The next page continues after that row, also inside an owned key.
+    `{ kind: "after_key", hk }` continues after every row of `hk`, so a page can stop after a skipped key.
+  - `asHostCursor` checks each cursor that the host reads or receives: the keys must be bytes, and a lock cursor
+    must have a transaction id. A key that is not bytes makes the seek `hk > ?` match no row, so the stream would
+    end with no error and the target would miss its other rows. With the check, the page fails and applies
+    nothing.
   - A skipped key counts as one scanned entry, so `migrationScanRows` also stops a long run of keys that the child
     does not own.
-  - `FokosMigrationHost` (`shared/partition/fokos-migration-host.ts`) uses the walk when the slice has no key
-    range, which is only a hash child. A promoted key and a range slice keep the F1 read.
+  - `FokosMigrationHost` (`shared/partition/fokos-migration-host.ts`) uses the walk in both streams when the slice
+    has no key range, which is only a hash child. A promoted key and a range slice keep the F1 read. One function,
+    `collectStream`, collects the pages of both streams.
   - Old cursors get no special handling, as in F1.
 - **Rejected: `SELECT DISTINCT hk … LIMIT 100`.** SQLite reads each index entry of each key for DISTINCT, and does
   not skip. Replay in SQLite 3.45.1 with 200 keys of 10k rows: 100 keys with DISTINCT took 33 ms, and 100 seeks
@@ -817,19 +824,23 @@ wait behind it (see X2).
   for each key. Each write and each query must compute it. `UNIQUE(split_bucket, hk, sk)` also stops the schema
   from enforcing a unique `(hk, sk)`: a write with a wrong bucket makes a second row for one key. After the walk,
   the bucket only saves one seek for each key of a sibling.
-- **Result:** Each child reads the `data` of its own rows one time. For each key of a sibling, it does one seek.
+- **Result:** Each child reads the `data` of its own rows and locks one time. For each key of a sibling, it does one
+  seek in each table. A lock row can hold a payload of up to 400 KB, so the lock stream gains as much as the items
+  stream.
   The number of pages does not change, because `migrationPageRows` limits each page.
 - **Tests:**
-  - `partition-store.test.ts`, "the hash-key walk gives each row of an owned key, one entry for each other key,
-    and continues after its cursor": one ownership call for each key, the limit inside an owned key, and a cursor
-    after a skipped key.
-  - "the next-key seek reads one index entry, also after a key with many rows": the plan is a covering seek on
-    `hk>?`, and `rowsRead` is 1 after a key of 500 rows.
-  - `repartition-flow.test.ts`, "lets a hash child step past each hash key of a sibling with one scanned entry":
-    with `migrationScanRows: 5`, a child with 6 rows next to 10 sibling keys of 100 rows imports in 4 item pulls.
-    Before the change, the import did not finish in 50 pulls.
+  - `partition-store.test.ts`, "the hash-key walk of items …" and "the hash-key walk of locks …": one ownership
+    call for each key, the limit inside an owned key, and a cursor after a skipped key. The lock test also stops
+    a page between two locks of one key.
+  - "the next-key seek reads one index entry, also after a key with many rows": for both tables, the plan is a
+    covering seek on `hk>?`, and `rowsRead` is 1 after a key of 500 rows.
+  - `repartition-flow.test.ts`, "lets a hash child step past each hash key of a sibling with one scanned entry, in
+    both streams": with `migrationScanRows: 5`, a child with 6 rows and 6 locks next to 10 sibling keys of 100 rows
+    and 100 locks imports in 4 item pulls and 4 lock pulls. Before the change, the import did not finish in 50
+    pulls.
+  - "rejects a page whose next cursor has no key, and applies nothing": three bad cursors, and the child keeps its
+    cursor.
 - **Not done:**
-  - The lock stream still reads the whole `pending_transactions` table for a hash child. Locks are few.
   - `migrationScanRows` stays 10,000. A skipped key now costs one seek, so a higher limit can be correct. Change it
     one time for all streams and for the coordinator, after a measurement in workerd of how long one page blocks
     the source.

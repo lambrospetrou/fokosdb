@@ -204,13 +204,16 @@ export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 export type KeyRange = { hk: KeyBytes; start: KeyBytes; end: KeyBytes | null };
 
 /**
- * The position of `walkItemsByHashKey`. The walk continues strictly after `(hk, sk)`. A null `sk`
- * means after every row of `hk`: the walk skipped that hash key.
+ * The position of a hash-key walk (`walkItemsByHashKey`, `walkPendingTxByHashKey`). `row` continues
+ * strictly after that row. `after_key` continues after every row of `hk`: the walk skipped that hash key.
  */
-export type HashKeyWalkCursor = { hk: KeyBytes; sk: KeyBytes | null };
+export type HashKeyWalkCursor<C extends { hk: KeyBytes; sk: KeyBytes }> = { kind: "row"; row: C } | { kind: "after_key"; hk: KeyBytes };
 
-/** One entry of `walkItemsByHashKey`: a row of an owned hash key, or one hash key that the walk skipped. */
-export type HashKeyWalkEntry = { kind: "item"; item: MigratedItem } | { kind: "skipped"; hk: KeyBytes };
+/** One entry of a hash-key walk: a row of an owned hash key, or one hash key that the walk skipped. */
+export type HashKeyWalkEntry<T> = { kind: "row"; row: T } | { kind: "skipped"; hk: KeyBytes };
+
+/** The tables that a hash-key walk can read. Both have a unique index that starts with `(hk, sk)`. */
+export type HashKeyWalkTable = "items" | "pending_transactions";
 
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
@@ -460,10 +463,10 @@ export function itemsPageStatement(cursor: ScanCursor | null, limit: number, ran
  * The SQL that finds the first row of the next hash key after `after` (null = the first key of the
  * table). It is one seek on a key index, and it reads one index entry, also when `after` has many rows.
  */
-export function nextHashKeyStatement(after: KeyBytes | null): { sql: string; params: unknown[] } {
+export function nextHashKeyStatement(table: HashKeyWalkTable, after: KeyBytes | null): { sql: string; params: unknown[] } {
 	return after === null
-		? { sql: `SELECT hk, sk FROM items ORDER BY hk, sk LIMIT 1`, params: [] }
-		: { sql: `SELECT hk, sk FROM items WHERE hk > ? ORDER BY hk, sk LIMIT 1`, params: [after] };
+		? { sql: `SELECT hk, sk FROM ${table} ORDER BY hk, sk LIMIT 1`, params: [] }
+		: { sql: `SELECT hk, sk FROM ${table} WHERE hk > ? ORDER BY hk, sk LIMIT 1`, params: [after] };
 }
 
 /**
@@ -1281,11 +1284,30 @@ export class PartitionStore {
 		}
 	}
 
+	/** The hash-key walk of `items`, with the rules of `#walkByHashKey`. */
+	walkItemsByHashKey(
+		cursor: HashKeyWalkCursor<ScanCursor> | null,
+		limit: number,
+		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+	): Generator<HashKeyWalkEntry<MigratedItem>> {
+		return this.#walkByHashKey("items", cursor, limit, owns, (after, n, range) => this.queryItemsPage(after, n, range));
+	}
+
+	/** The hash-key walk of `pending_transactions`, with the rules of `#walkByHashKey`. */
+	walkPendingTxByHashKey(
+		cursor: HashKeyWalkCursor<PendingTransactionCursor> | null,
+		limit: number,
+		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+	): Generator<HashKeyWalkEntry<PendingTxItem>> {
+		return this.#walkByHashKey("pending_transactions", cursor, limit, owns, (after, n, range) => this.queryPendingTxPage(after, n, range));
+	}
+
 	/**
-	 * Walks `items` one hash key at a time, strictly after `cursor`, for a read whose rows are not one
+	 * Walks `table` one hash key at a time, strictly after `cursor`, for a read whose rows are not one
 	 * key range (a hash child). `owns` decides each hash key one time, from its first row. The walk
-	 * gives each row of an owned key. For a key that it does not own, it gives one `skipped` entry: one
-	 * seek on the key index steps past all the rows of that key, and reads no `data`.
+	 * gives each row of an owned key, which `readKey` reads with a range on that key. For a key that it
+	 * does not own, it gives one `skipped` entry: one seek on the key index steps past all the rows of
+	 * that key, and reads no `data`.
 	 *
 	 * Do NOT find the next hash key with `SELECT DISTINCT hk ... LIMIT ?`. SQLite reads each index entry
 	 * of each key for DISTINCT, and does not skip. The walk does one `hk > ?` seek for each key.
@@ -1294,23 +1316,25 @@ export class PartitionStore {
 	 * that it does not own. The walk gives fewer than `limit` entries only at the end of the table. The
 	 * caller rules of `queryItemsPage` apply.
 	 */
-	*walkItemsByHashKey(
-		cursor: HashKeyWalkCursor | null,
+	*#walkByHashKey<T, C extends { hk: KeyBytes; sk: KeyBytes }>(
+		table: HashKeyWalkTable,
+		cursor: HashKeyWalkCursor<C> | null,
 		limit: number,
 		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
-	): Generator<HashKeyWalkEntry> {
+		readKey: (after: C | null, limit: number, range: KeyRange) => Iterable<T>,
+	): Generator<HashKeyWalkEntry<T>> {
 		let given = 0;
-		if (cursor !== null && cursor.sk !== null) {
+		if (cursor?.kind === "row") {
 			// The cursor stops on a row only inside an owned key, so the rest of that key is owned.
-			const rest = this.queryItemsPage({ hk: cursor.hk, sk: cursor.sk }, limit, { hk: cursor.hk, start: cursor.sk, end: null });
-			for (const item of rest) {
+			const { row: at } = cursor;
+			for (const row of readKey(at, limit, { hk: at.hk, start: at.sk, end: null })) {
 				given++;
-				yield { kind: "item", item };
+				yield { kind: "row", row };
 			}
 		}
-		let after = cursor?.hk ?? null;
+		let after = cursor === null ? null : cursor.kind === "row" ? cursor.row.hk : cursor.hk;
 		while (given < limit) {
-			const { sql, params } = nextHashKeyStatement(after);
+			const { sql, params } = nextHashKeyStatement(table, after);
 			const first = tryOne(this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params));
 			if (first === undefined) {
 				return;
@@ -1318,9 +1342,9 @@ export class PartitionStore {
 			const hk = fromSqlKey(first.hk);
 			const firstSk = fromSqlKey(first.sk);
 			if (owns(hk, firstSk)) {
-				for (const item of this.queryItemsPage(null, limit - given, { hk, start: firstSk, end: null })) {
+				for (const row of readKey(null, limit - given, { hk, start: firstSk, end: null })) {
 					given++;
-					yield { kind: "item", item };
+					yield { kind: "row", row };
 				}
 			} else {
 				given++;

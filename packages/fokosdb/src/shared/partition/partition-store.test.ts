@@ -19,6 +19,7 @@ import {
 	type ItemLinkId,
 	type KeyRange,
 	type MigratedItem,
+	type PendingTransactionCursor,
 	type PendingTxItem,
 	type ScanCursor,
 	type SqlMetrics,
@@ -1718,7 +1719,7 @@ describe("PartitionStore - migration pages", () => {
 
 	// A hash child owns whole hash keys. The walk asks `owns` one time for each key, with the first row
 	// of the key, and steps past a key that it does not own with one entry.
-	it("the hash-key walk gives each row of an owned key, one entry for each other key, and continues after its cursor", async () => {
+	it("the hash-key walk of items gives each row of an owned key, one entry for each other key, and continues after its cursor", async () => {
 		await withStore((store) => {
 			for (const [hk, sk] of [
 				["a", EMPTY],
@@ -1737,19 +1738,52 @@ describe("PartitionStore - migration pages", () => {
 				asked.push(`${keyLabel(hk)}/${keyLabel(firstSk)}`);
 				return ["a", "c"].includes(keyLabel(hk));
 			};
-			const walk = (cursor: HashKeyWalkCursor | null, limit: number) =>
-				[...store.walkItemsByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry) =>
-					e.kind === "item" ? `${keyLabel(e.item.hk)}/${keyLabel(e.item.sk)}` : `skip ${keyLabel(e.hk)}`,
+			const walk = (cursor: HashKeyWalkCursor<ScanCursor> | null, limit: number) =>
+				[...store.walkItemsByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry<MigratedItem>) =>
+					e.kind === "row" ? `${keyLabel(e.row.hk)}/${keyLabel(e.row.sk)}` : `skip ${keyLabel(e.hk)}`,
 				);
 
 			expect(walk(null, 100)).toEqual(["a/", "a/f", "a/m", "skip b", "c/x", "c/y", "skip d"]);
 			expect(asked).toEqual(["a/", "b/f", "c/x", "d/"]);
 			// The limit counts both kinds of entry, and it can stop inside an owned key.
 			expect(walk(null, 2)).toEqual(["a/", "a/f"]);
-			expect(walk({ hk: kb("a"), sk: kb("f") }, 2)).toEqual(["a/m", "skip b"]);
-			// A null sort key continues after every row of its hash key.
-			expect(walk({ hk: kb("b"), sk: null }, 10)).toEqual(["c/x", "c/y", "skip d"]);
-			expect(walk({ hk: kb("d"), sk: null }, 10)).toEqual([]);
+			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("f") } }, 2)).toEqual(["a/m", "skip b"]);
+			// An `after_key` cursor continues after every row of its hash key.
+			expect(walk({ kind: "after_key", hk: kb("b") }, 10)).toEqual(["c/x", "c/y", "skip d"]);
+			expect(walk({ kind: "after_key", hk: kb("d") }, 10)).toEqual([]);
+		});
+	});
+
+	// Two transactions lock the same key. The cursor compares the transaction id too, so a page that
+	// stops between them loses neither lock.
+	it("the hash-key walk of locks gives each lock of an owned key, one entry for each other key, and continues after its cursor", async () => {
+		await withStore((store) => {
+			for (const [hk, sk, tx] of [
+				["a", kb("m"), "tx2"],
+				["a", kb("m"), "tx1"],
+				["a", kb("t"), "tx3"],
+				["b", EMPTY, "tx4"],
+				["b", kb("f"), "tx5"],
+				["c", kb("x"), "tx6"],
+			] as const) {
+				store.insertPendingLock(lockRow(kb(hk), sk, tx));
+			}
+			const asked: string[] = [];
+			const owns = (hk: KeyBytes, firstSk: KeyBytes) => {
+				asked.push(`${keyLabel(hk)}/${keyLabel(firstSk)}`);
+				return ["a", "c"].includes(keyLabel(hk));
+			};
+			const walk = (cursor: HashKeyWalkCursor<PendingTransactionCursor> | null, limit: number) =>
+				[...store.walkPendingTxByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry<PendingTxItem>) =>
+					e.kind === "row" ? `${keyLabel(e.row.hk)}/${keyLabel(e.row.sk)}/${e.row.transaction_id}` : `skip ${keyLabel(e.hk)}`,
+				);
+
+			expect(walk(null, 100)).toEqual(["a/m/tx1", "a/m/tx2", "a/t/tx3", "skip b", "c/x/tx6"]);
+			expect(asked).toEqual(["a/m", "b/", "c/x"]);
+			expect(walk(null, 1)).toEqual(["a/m/tx1"]);
+			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("m"), transaction_id: "tx1" } }, 2)).toEqual(["a/m/tx2", "a/t/tx3"]);
+			expect(walk({ kind: "row", row: { hk: kb("a"), sk: kb("t"), transaction_id: "tx3" } }, 10)).toEqual(["skip b", "c/x/tx6"]);
+			expect(walk({ kind: "after_key", hk: kb("b") }, 10)).toEqual(["c/x/tx6"]);
 		});
 	});
 
@@ -1759,7 +1793,9 @@ describe("PartitionStore - migration pages", () => {
 		await withStore((store, state) => {
 			for (const hk of ["a", "b", "c"]) {
 				for (let i = 0; i < 500; i++) {
-					store.upsertItem({ hk: kb(hk), sk: kb(`s${String(i).padStart(4, "0")}`), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+					const sk = kb(`s${String(i).padStart(4, "0")}`);
+					store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+					store.insertPendingLock(lockRow(kb(hk), sk, `tx-${hk}-${i}`));
 				}
 			}
 			const plan = ({ sql, params }: { sql: string; params: unknown[] }) =>
@@ -1768,18 +1804,20 @@ describe("PartitionStore - migration pages", () => {
 					.toArray()
 					.map((r) => r.detail)
 					.join(" | ");
-			expect(plan(nextHashKeyStatement(kb("a")))).toMatch(/^SEARCH items USING COVERING INDEX \w+ \(hk>\?\)$/);
+			for (const table of ["items", "pending_transactions"] as const) {
+				expect(plan(nextHashKeyStatement(table, kb("a")))).toMatch(new RegExp(`^SEARCH ${table} USING COVERING INDEX \\w+ \\(hk>\\?\\)$`));
 
-			for (const [after, next] of [
-				[null, "a"],
-				[kb("a"), "b"],
-				[kb("b"), "c"],
-			] as const) {
-				const { sql, params } = nextHashKeyStatement(after);
-				const cursor = state.storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params);
-				const rows = cursor.toArray();
-				expect(rows.map((r) => new Uint8Array(r.hk))).toEqual([new Uint8Array(kb(next))]);
-				expect(cursor.rowsRead).toBe(1);
+				for (const [after, next] of [
+					[null, "a"],
+					[kb("a"), "b"],
+					[kb("b"), "c"],
+				] as const) {
+					const { sql, params } = nextHashKeyStatement(table, after);
+					const cursor = state.storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params);
+					const rows = cursor.toArray();
+					expect(rows.map((r) => new Uint8Array(r.hk))).toEqual([new Uint8Array(kb(next))]);
+					expect(cursor.rowsRead).toBe(1);
+				}
 			}
 		});
 	});

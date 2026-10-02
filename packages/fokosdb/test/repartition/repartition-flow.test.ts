@@ -579,6 +579,37 @@ describe("Repartition — the migration protocol", () => {
 		});
 	});
 
+	// A cursor key that is not bytes makes the next seek match no row, and the stream would end with no
+	// error. The check stops the page, so the child keeps its cursor and does not lose the rest of its rows.
+	it("rejects a page whose next cursor has no key, and applies nothing", async () => {
+		const c = makeCluster();
+		const root = c.hashNode([0]);
+		await root.enter(({ source, store }) => {
+			putItem(store, keyForChild(0, c.base.topology.hashSplitN, "a"), "s1");
+			source.queue({ kind: "hash_split" });
+		});
+		await cutOver(root);
+		const child = await firstChild(c, root);
+
+		for (const bad of [
+			{ kind: "after_key", hk: null },
+			{ kind: "row", row: { hk: kb("a"), sk: undefined } },
+			{ hk: kb("a"), sk: null },
+		]) {
+			c.nextPullPage(root.doName, {
+				phase: "host",
+				page: { stream: "items", items: [] },
+				nextCursor: { phase: "host", inner: { stream: "items", cursor: bad } },
+			});
+			await child.enter(async ({ target, sharding }) => {
+				const rec = target.importRecord()!;
+				sharding.putImport({ ...rec, cursor: { phase: "host", inner: { stream: "items", cursor: null } }, nextAttemptAt: 0 });
+				expect(await target.importOnePage(T0)).toBe("stopped");
+				expect(target.importRecord()!.cursor).toEqual({ phase: "host", inner: { stream: "items", cursor: null } });
+			});
+		}
+	});
+
 	it("retries a pull before cutover at a flat interval and backs off on anything else", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
@@ -778,7 +809,7 @@ describe("Repartition — promotions", () => {
 		});
 	});
 
-	it("lets a hash child step past each hash key of a sibling with one scanned entry", async () => {
+	it("lets a hash child step past each hash key of a sibling with one scanned entry, in both streams", async () => {
 		// Each page scans at most 5 entries. A key of the sibling is one entry, whatever its row count.
 		const c = makeCluster({ runtimeConfig: { migrationScanRows: 5 } });
 		const root = c.hashNode([0]);
@@ -789,30 +820,35 @@ describe("Repartition — promotions", () => {
 			for (const key of own) {
 				putItem(store, key, "s1");
 				putItem(store, key, "s2");
+				putLock(store, key, "s1", `tx-${key}-1`);
+				putLock(store, key, "s1", `tx-${key}-2`);
 			}
 			for (const key of sibling) {
 				for (let i = 0; i < 100; i++) {
 					putItem(store, key, `s${i}`);
+					putLock(store, key, `s${i}`, `tx-${key}-${i}`);
 				}
 			}
 			source.queue({ kind: "hash_split" });
 		});
 		await cutOver(root);
-		const expected = await root.enter(({ store }) =>
-			[...store.queryItemsPage(null, 10_000, null)]
-				.filter(({ hk }) => hashChildIndex(hk, 0, hashSplitN) === 0)
-				.map(({ hk, sk }) => ({ hk, sk })),
-		);
-		expect(expected).toHaveLength(6);
+		const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === 0;
+		const rows = ({ store }: NodeEnv) => ({
+			items: [...store.queryItemsPage(null, 10_000, null)].map(({ hk, sk }) => ({ hk, sk })),
+			locks: [...store.queryPendingTxPage(null, 10_000, null)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+		});
+		const source = await root.enter(rows);
+		const expected = { items: source.items.filter(owned), locks: source.locks.filter(owned) };
+		expect(expected.items).toHaveLength(6);
+		expect(expected.locks).toHaveLength(6);
 
 		const child = await firstChild(c, root);
 		const pulls = await pullsByStream(child);
-		// 6 rows and 10 skipped keys are 16 entries: 3 full pages and 1 last page. A read of each row
-		// scans 1,006 rows, which takes 202 pages.
+		// In each stream, 6 rows and 10 skipped keys are 16 entries: 3 full pages and 1 last page. A read
+		// of each row scans 1,006 rows, which takes 202 pages.
 		expect(pulls.items).toBe(4);
-		await child.enter(({ store }) => {
-			expect([...store.queryItemsPage(null, 10_000, null)].map(({ hk, sk }) => ({ hk, sk }))).toEqual(expected);
-		});
+		expect(pulls.pending_tx).toBe(4);
+		expect(await child.enter(rows)).toEqual(expected);
 	});
 
 	it("names each quarantined lock it imports", async () => {
