@@ -7,7 +7,7 @@
  * `tsdown.config.ts` fails the build when a module of this entry reaches one of those.
  */
 
-export * from "./index-client.js";
+export * from "./exports-client.js";
 
 // ─── Bloom filter ─────────────────────────────────────────────────────────────
 
