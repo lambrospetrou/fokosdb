@@ -145,8 +145,9 @@ export interface FokosShardingRpc {
 	fokosExecuteLocal(req: FokosExecuteLocalRequest): Promise<FokosEnvelope<unknown>>;
 	fokosRequestPromotion(req: FokosRequestPromotionRequest): Promise<FokosRequestPromotionResult>;
 	fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage>;
+	fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage>;
 	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void>;
-	/** Cancel the schedule, delete all storage, abort. The caller traverses the status pages first. */
+	/** Cancel the schedule, delete all storage, abort. The caller reads the status and every promotions page first. */
 	fokosDestroy(): Promise<void>;
 	alarm(info: AlarmInvocationInfo): Promise<void>;
 }
@@ -187,10 +188,9 @@ export interface MigrationHost {
 	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void;
 }
 
-// ─── the paginated administration view ───────────────────────────────────────
+// ─── the administration view ─────────────────────────────────────────────────
 
-export type FokosStatusCursor = { seq: number; targetIndex: number };
-
+/** One repartition, and one of its targets when it has one. */
 export type FokosStatusEntry = {
 	/** `hashKey` is the key a promotion moves, and null for a split. */
 	repartition: { id: string; seq: number; kind: RepartitionKind; state: RepartitionState; hashKey: KeyBytes | null };
@@ -210,13 +210,32 @@ export type FokosStatusPage = {
 	/** The role of this partition, as `FokosLifecycle.role` gives it, or null before it has an identity. */
 	role: "owner" | "router" | null;
 	importState: FokosImportState | null;
-	entries: FokosStatusEntry[];
-	nextCursor: FokosStatusCursor | null;
+	/**
+	 * The split of this partition, one entry for each target in `target.index` order, or one entry with
+	 * no target before the split has targets. Empty when the partition has no split. A partition splits
+	 * at most one time, so this list is short. The promotions are in `fokosPromotions`.
+	 */
+	split: FokosStatusEntry[];
 };
 
 export type FokosStatusRequest = {
-	cursor: FokosStatusCursor | null;
 	rootContext?: FokosRouteContext<unknown>;
+};
+
+/** Resumes the promotions listing strictly after the repartition with this `seq`. */
+export type FokosPromotionsCursor = { seq: number };
+
+export type FokosPromotionsRequest = {
+	cursor: FokosPromotionsCursor | null;
+};
+
+/**
+ * One bounded page of the key promotions of a partition, in `seq` order. A promotion has at most one
+ * target. A queued promotion has no target yet, and its entry has `target: null`.
+ */
+export type FokosPromotionsPage = {
+	entries: FokosStatusEntry[];
+	nextCursor: FokosPromotionsCursor | null;
 };
 
 export type FokosPrepareDestroyRequest = {

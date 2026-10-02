@@ -117,10 +117,10 @@ export type FokosRuntimeConfig = Readonly<{
 	 * read and not sent, so this limit stops a page that finds few rows of its target.
 	 */
 	migrationScanRows: number;
-	/** The maximum number of entries in one page of `fokosStatus`, which lists the splits of a partition. */
-	statusPageEntries: number;
-	/** The maximum estimated size of one page of `fokosStatus`. */
-	statusPageBytes: number;
+	/** The maximum number of entries in one page of `fokosPromotions`, which lists the key promotions of a partition. */
+	promotionsPageEntries: number;
+	/** The maximum estimated size of one page of `fokosPromotions`. */
+	promotionsPageBytes: number;
 }>;
 
 export type FokosRuntimeConfigOverrides = Partial<FokosRuntimeConfig>;
@@ -149,8 +149,8 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	migrationPageBytes: 20 * 1024 * 1024,
 	migrationPageRows: 1_000,
 	migrationScanRows: 10_000,
-	statusPageEntries: 1_000,
-	statusPageBytes: 20 * 1024 * 1024,
+	promotionsPageEntries: 1_000,
+	promotionsPageBytes: 20 * 1024 * 1024,
 });
 
 const RUNTIME_CONFIG_KEYS = Object.keys(DEFAULT_RUNTIME_CONFIG) as (keyof FokosRuntimeConfig)[];
@@ -177,8 +177,8 @@ const MINIMUMS: { [K in keyof FokosRuntimeConfig]?: number } = {
 	migrationPageBytes: 1,
 	migrationPageRows: 1,
 	migrationScanRows: 1,
-	statusPageEntries: 1,
-	statusPageBytes: 1,
+	promotionsPageEntries: 1,
+	promotionsPageBytes: 1,
 };
 
 /**
@@ -224,8 +224,8 @@ function validate(c: FokosRuntimeConfig): void {
 		() => `migrationPageBytes must be at most ${RPC_MESSAGE_MAX_BYTES}, got ${c.migrationPageBytes}`,
 	);
 	check(
-		c.statusPageBytes <= RPC_MESSAGE_MAX_BYTES,
-		() => `statusPageBytes must be at most ${RPC_MESSAGE_MAX_BYTES}, got ${c.statusPageBytes}`,
+		c.promotionsPageBytes <= RPC_MESSAGE_MAX_BYTES,
+		() => `promotionsPageBytes must be at most ${RPC_MESSAGE_MAX_BYTES}, got ${c.promotionsPageBytes}`,
 	);
 	check(c.sourceRetryBaseMs <= c.sourceRetryMaxMs, () => "sourceRetryBaseMs must be at most sourceRetryMaxMs");
 	check(c.importRetryBaseMs <= c.importRetryMaxMs, () => "importRetryBaseMs must be at most importRetryMaxMs");

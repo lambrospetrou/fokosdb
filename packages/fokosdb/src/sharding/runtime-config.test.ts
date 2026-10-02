@@ -34,7 +34,7 @@ describe("resolveRuntimeConfig", () => {
 		[{ maxForwardRetries: -1 }, /maxForwardRetries must be an integer of at least 0/],
 		[{ cutoverHoldRetryMs: 0 }, /cutoverHoldRetryMs must be an integer of at least 1/],
 		[{ migrationPageRows: 0 }, /migrationPageRows must be an integer of at least 1/],
-		[{ statusPageEntries: 0 }, /statusPageEntries must be an integer of at least 1/],
+		[{ promotionsPageEntries: 0 }, /promotionsPageEntries must be an integer of at least 1/],
 	])("rejects a value below its range: %o", (overrides, detail) => {
 		expect(() => resolveRuntimeConfig(overrides)).toThrow(invariantFailure(detail));
 	});
@@ -49,8 +49,8 @@ describe("resolveRuntimeConfig", () => {
 		expect(() => resolveRuntimeConfig({ migrationPageBytes: RPC_MESSAGE_MAX_BYTES + 1 })).toThrow(
 			invariantFailure(/migrationPageBytes must be at most/),
 		);
-		expect(() => resolveRuntimeConfig({ statusPageBytes: RPC_MESSAGE_MAX_BYTES + 1 })).toThrow(
-			invariantFailure(/statusPageBytes must be at most/),
+		expect(() => resolveRuntimeConfig({ promotionsPageBytes: RPC_MESSAGE_MAX_BYTES + 1 })).toThrow(
+			invariantFailure(/promotionsPageBytes must be at most/),
 		);
 		expect(resolveRuntimeConfig({ migrationPageBytes: RPC_MESSAGE_MAX_BYTES }).migrationPageBytes).toBe(RPC_MESSAGE_MAX_BYTES);
 	});

@@ -53,7 +53,7 @@ describe("FokosDB.destroy()", () => {
 
 		for (const doName of doNamesSet) {
 			// A target request carries no context, so a destroyed partition stays uninitialized.
-			const page = await testPartitionStub(doName).fokosStatus({ cursor: null });
+			const page = await testPartitionStub(doName).fokosStatus({});
 			expect(page.initialized).toBe(false);
 		}
 

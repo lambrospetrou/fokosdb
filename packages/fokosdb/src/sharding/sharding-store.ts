@@ -113,7 +113,7 @@ export type RepartitionTargetCounts = {
 	acknowledged: number;
 };
 
-/** One `(repartition, target)` pair of the paginated administration view; `targetIndex` −1 means no target. */
+/** One `(repartition, target)` pair of the administration view; `targetIndex` −1 means no target. */
 export type RepartitionStatusRow = {
 	id: string;
 	seq: number;
@@ -127,8 +127,6 @@ export type RepartitionStatusRow = {
 	initialization: TargetInitialization | null;
 	acknowledged: boolean;
 };
-
-export type RepartitionStatusCursor = { seq: number; targetIndex: number };
 
 /** Scan checkpoint of the route-override stream, in `hash_key` order. */
 export type PromotedKeyCursor = { hashKey: KeyBytes };
@@ -914,13 +912,23 @@ export class FokosShardingStore {
 	// ─── repartition status view ────────────────────────────────────────────
 
 	/**
-	 * One page of the administration view, ordered by `(seq, target_index)` and resumed strictly after
-	 * `cursor`. A repartition with no target appears once with `target_index` −1, so destroy traversal
-	 * and status both see every row exactly once.
+	 * The split of this partition with its targets in `target_index` order, or one row with
+	 * `target_index` −1 before the split has targets. Empty when the partition has no split.
 	 */
-	queryRepartitionStatusPage(cursor: RepartitionStatusCursor | null, limit: number): RepartitionStatusRow[] {
-		const after = cursor ? `WHERE seq > ?2 OR (seq = ?2 AND target_index > ?3)` : ``;
-		const params: unknown[] = cursor ? [limit, cursor.seq, cursor.targetIndex] : [limit];
+	querySplitStatusRows(): RepartitionStatusRow[] {
+		return this.#queryStatusRows(`r.kind IN ('hash_split', 'range_split') ORDER BY t.target_index`, []);
+	}
+
+	/**
+	 * One page of the key promotions in `seq` order, strictly after `afterSeq`. The seek on
+	 * `idx_fokos_repartitions_seq` gives the order, so SQLite stops after `limit` rows and does no sort.
+	 * A promotion has at most one target, so each row is one promotion.
+	 */
+	queryPromotionStatusPage(afterSeq: number | null, limit: number): RepartitionStatusRow[] {
+		return this.#queryStatusRows(`r.kind = 'key_promotion' AND r.seq > ?1 ORDER BY r.seq LIMIT ?2`, [afterSeq ?? -1, limit]);
+	}
+
+	#queryStatusRows(whereAndOrder: string, params: unknown[]): RepartitionStatusRow[] {
 		return this.#storage.sql
 			.exec<{
 				id: string;
@@ -928,24 +936,17 @@ export class FokosShardingStore {
 				kind: RepartitionKind;
 				state: RepartitionState;
 				hash_key: ArrayBuffer | null;
-				target_index: number;
+				target_index: number | null;
 				partition_id: string | null;
 				do_name: string | null;
 				initialization: TargetInitialization | null;
 				acknowledged: number | null;
 			}>(
-				`SELECT * FROM (
-				    SELECT r.id, r.seq, r.kind, r.state, r.hash_key, -1 AS target_index,
-				           NULL AS partition_id, NULL AS do_name, NULL AS initialization, NULL AS acknowledged
-				      FROM fokos_repartitions r
-				     WHERE NOT EXISTS (SELECT 1 FROM fokos_repartition_targets t WHERE t.repartition_id = r.id)
-				    UNION ALL
-				    SELECT r.id, r.seq, r.kind, r.state, r.hash_key, t.target_index,
-				           t.partition_id, t.do_name, t.initialization, t.acknowledged
-				      FROM fokos_repartitions r
-				      JOIN fokos_repartition_targets t ON t.repartition_id = r.id
-				 ) ${after}
-				 ORDER BY seq, target_index LIMIT ?1`,
+				`SELECT r.id, r.seq, r.kind, r.state, r.hash_key, t.target_index,
+				        t.partition_id, t.do_name, t.initialization, t.acknowledged
+				   FROM fokos_repartitions r
+				   LEFT JOIN fokos_repartition_targets t ON t.repartition_id = r.id
+				  WHERE ${whereAndOrder}`,
 				...params,
 			)
 			.toArray()
@@ -955,7 +956,7 @@ export class FokosShardingStore {
 				kind: r.kind,
 				state: r.state,
 				hashKey: r.hash_key === null ? null : fromSqlKey(r.hash_key),
-				targetIndex: r.target_index,
+				targetIndex: r.target_index ?? -1,
 				partitionId: r.partition_id,
 				doName: r.do_name,
 				initialization: r.initialization,

@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5, R6 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5, R6, R8 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
 the `split_bucket` column of X1. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
@@ -287,11 +287,27 @@ My recommendation: do F5 next.
   alarm at the retry time. The request still restores the fallback alarm, for a lost alarm.
 - **Not done:** the import record reads of the deadlines. They need the memory copy of the import record (R4).
 
-**R8 — each status page sorts the whole union (Low).** **Plan.**
+**R8 — done: each status page sorted the whole union (Low).** **Plan + test.**
 
-- **What happens:** Each `fokosStatus` page (destroy traversal and admin) builds the whole UNION ALL after the
-  cursor, and then sorts it. Rows are permanent, so a full walk costs O(rows² / page size).
-- **Fix:** Walk `fokos_repartitions` by `seq` with a LIMIT. Then read the targets of each row with an ordered seek.
+- **What happened:** Each `fokosStatus` page (destroy traversal, walk and admin) built the whole UNION ALL of
+  repartitions and targets after the cursor, and then sorted it. Rows are permanent, so a full walk cost
+  O(rows² / page size). Only promotions made the list long: a partition splits at most one time, and a split has
+  few targets.
+- **What changed:**
+  - `fokosStatus` is not paged. It returns the identity, the role, the import state, and `split`: the split and its
+    targets in `target_index` order. The read uses `idx_fokos_repartitions_split`, and it sorts only the few target
+    rows.
+  - `fokosPromotions({ cursor })` is a new paged RPC. It walks the `key_promotion` rows by `seq` with a `LIMIT`, and
+    a `LEFT JOIN` gives the one target of each promotion. The plan is a seek on `idx_fokos_repartitions_seq` with no
+    temp B-tree, so a page reads about `limit` rows. A full walk is O(rows). The config keys are
+    `promotionsPageEntries` and `promotionsPageBytes`.
+  - `walk` and `destroy` read `fokosStatus`, and then every `fokosPromotions` page. `fokosPromotions` stays
+    available behind the destroy fence.
+  - The partition suites read the promotion of one key with the `promotedKeyStatus` test op. It calls
+    `runtime.promotionState(hashKey)`, which is `routeOverrideFor`: one primary-key read. It also sees the keys
+    that a hash child inherited. `PartitionDO.status()` has no `promotedKeys` list now.
+- **No promoted-key count in the status:** no index covers `kind = 'key_promotion'`, so a count reads every
+  repartition row. Walk reads the status of every partition, so the count would multiply. No caller needs it.
 
 **R9 — postponed: inherited promotions store 3 rows and about 6 copies of the hash key (Low).** **Code.**
 
@@ -300,28 +316,26 @@ My recommendation: do F5 next.
   later hash split copies the rows again. Only the override is needed to route.
 - **Cost:** With a 100 B hash key, one inherited key uses about 880 B and 8 B-tree entries. The override row alone
   is about 110 B. Example: 10,000 promoted keys, each with 3 later hash splits on its path, use about 23 MB in
-  place of about 3 MB. Each inherited row is also one more entry on each `fokosStatus` page, so walk and destroy
-  read more (R8).
+  place of about 3 MB. Each inherited row is also one more entry in the `fokosPromotions` listing, so walk and
+  destroy read more.
 - **What reads the inherited rows:**
   - Routing and the override export of the next split need only "a finished override exists". No caller reads the
     `repartitionId` that `routeOverrideFor` returns.
   - `walk` and `destroy` do not need them. The partition that did the promotion keeps its own row for life, so the
     walk reaches the range root through it. `destroy` is post-order, so that partition stays until the range root
     is deleted.
-  - `PartitionDO.status().promotedKeys` needs them: a child lists the keys it inherited
-    (`read-through.test.ts` checks this).
+  - The `promotedKeyStatus` test op reads them: a child answers for the keys it inherited
+    (`read-through.test.ts` checks this). It reads `routeOverrideFor`, so step 3 keeps that answer.
 - **Fix:**
   1. `fokos_route_overrides.repartition_id` can be NULL. NULL means "the promotion finished at an ancestor".
   2. `#applyOverrides` writes only the override row.
   3. `routeOverrideFor` uses a `LEFT JOIN` and answers `cleaned` for NULL. `hasTerminalRouteOverride` and
      `queryTerminalRouteOverridesPage` add `o.repartition_id IS NULL OR …`.
-  4. For `status().promotedKeys`, either add a paged runtime read of the inherited overrides (the host reads no
-     `fokos_` table), or stop listing inherited keys in the status of a child.
 - **Why it does not depend on the freeze:** The `LEFT JOIN` reads the old and the new form, so no second code path
   is needed. A later version can use the marker `''` in place of NULL, because no repartition has that id, and
   then it needs no schema change. The NULL form needs a table rebuild, which is cheap for the small override table.
-- **Decision:** Postponed. The change saves storage only on partitions with many promoted keys, and it removes a
-  status feature or adds a runtime read. Do it when the storage or the status page cost becomes real.
+- **Decision:** Postponed. The change saves storage only on partitions with many promoted keys. Do it when the
+  storage or the promotions listing cost becomes real.
 
 ### 3.4 KV keys
 

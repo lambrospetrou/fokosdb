@@ -43,6 +43,7 @@ import type {
 	RepartitionRow,
 	RepartitionSlice,
 	RepartitionState,
+	RepartitionStatusRow,
 	RepartitionTargetRow,
 } from "./sharding-store.js";
 import type { FokosSlice } from "./repartition-slice.js";
@@ -58,7 +59,7 @@ import type {
 	FokosPartitionRef,
 	FokosRepartitionPeer,
 	FokosStartImportRequest,
-	FokosStatusCursor,
+	FokosPromotionsCursor,
 	FokosStatusEntry,
 	FokosStoredRepartitionPlan,
 	RouteKey,
@@ -675,34 +676,28 @@ export class RepartitionSource {
 		});
 	}
 
+	/** The split of this partition with its targets, as `FokosStatusPage.split` gives it. */
+	splitEntries(): FokosStatusEntry[] {
+		return this.store.querySplitStatusRows().map(toStatusEntry);
+	}
+
 	/**
-	 * One bounded page of the administration view, ordered by `(seq, target_index)`.
+	 * One bounded page of the key promotions, in `seq` order.
 	 *
 	 * Two limits bound a page: the row count the caller asks for, and `maxBytes` over the estimated
 	 * serialized size. An unbounded promotion count then cannot build a reply that the RPC layer
 	 * refuses. The first entry always goes out, because a page with no entry makes no progress.
 	 */
-	statusEntries(
-		cursor: FokosStatusCursor | null,
+	promotionEntries(
+		cursor: FokosPromotionsCursor | null,
 		limit: number,
-		maxBytes = this.deps.config().statusPageBytes,
-	): { entries: FokosStatusEntry[]; nextCursor: FokosStatusCursor | null } {
-		const rows = this.store.queryRepartitionStatusPage(cursor, limit);
+		maxBytes = this.deps.config().promotionsPageBytes,
+	): { entries: FokosStatusEntry[]; nextCursor: FokosPromotionsCursor | null } {
+		const rows = this.store.queryPromotionStatusPage(cursor?.seq ?? null, limit);
 		const entries: FokosStatusEntry[] = [];
 		let bytes = 0;
 		for (const r of rows) {
-			const entry: FokosStatusEntry = {
-				repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashKey: r.hashKey },
-				target:
-					r.targetIndex < 0 || r.partitionId === null || r.doName === null || r.initialization === null
-						? null
-						: {
-								index: r.targetIndex,
-								ref: { partitionId: r.partitionId, doName: r.doName },
-								initialization: r.initialization,
-								acknowledged: r.acknowledged,
-							},
-			};
+			const entry = toStatusEntry(r);
 			bytes += statusEntryBytes(entry);
 			if (bytes > maxBytes && entries.length > 0) {
 				break;
@@ -710,9 +705,9 @@ export class RepartitionSource {
 			entries.push(entry);
 		}
 		const last = rows[entries.length - 1];
-		// The view is drained when the store ran out of rows AND the byte budget held all of them.
+		// The listing is drained when the store ran out of rows AND the byte budget held all of them.
 		const drained = entries.length === rows.length && rows.length < limit;
-		const nextCursor = !last || drained ? null : { seq: last.seq, targetIndex: last.targetIndex };
+		const nextCursor = !last || drained ? null : { seq: last.seq };
 		return { entries, nextCursor };
 	}
 
@@ -1239,6 +1234,21 @@ function notCutOver(repartitionId: string): FokosUnavailableError {
 		message: "the repartition source still owns this slice; retry after cutover",
 		attributes: { repartitionId },
 	});
+}
+
+function toStatusEntry(r: RepartitionStatusRow): FokosStatusEntry {
+	return {
+		repartition: { id: r.id, seq: r.seq, kind: r.kind, state: r.state, hashKey: r.hashKey },
+		target:
+			r.targetIndex < 0 || r.partitionId === null || r.doName === null || r.initialization === null
+				? null
+				: {
+						index: r.targetIndex,
+						ref: { partitionId: r.partitionId, doName: r.doName },
+						initialization: r.initialization,
+						acknowledged: r.acknowledged,
+					},
+	};
 }
 
 /*

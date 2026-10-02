@@ -67,11 +67,11 @@ import type {
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
 	FokosPrepareDestroyRequest,
+	FokosPromotionsPage,
+	FokosPromotionsRequest,
 	FokosRequestPromotionRequest,
 	FokosShardingRpc,
 	FokosStartImportRequest,
-	FokosStatusCursor,
-	FokosStatusEntry,
 	FokosStatusPage,
 	FokosStatusRequest,
 } from "../sharding/repartition-types.js";
@@ -230,7 +230,6 @@ export type PartitionStatusView = {
 	migrationStatus: "migration_initialized" | "migration_migrating" | "migration_completed" | undefined;
 	parentPartitionContext: FokosPartitionRef | undefined;
 	parentSplitType: SplitType | undefined;
-	promotedKeys: { hashKey: KeyBytes; status: PromotedKeyStatus }[];
 };
 
 // ─── the operation spec ───────────────────────────────────────────────────────
@@ -251,6 +250,8 @@ export type PartitionOps = {
 	debugForcePromoteKey: { req: DebugForcePromoteKeyRequest; res: DebugForcePromoteKeyResponse };
 	/** INTERNAL ONLY FOR TESTING. */
 	status: { req: null; res: PartitionStatusView };
+	/** INTERNAL ONLY FOR TESTING. The promotion status this partition holds for one hash key. */
+	promotedKeyStatus: { req: { hashKey: KeyBytes }; res: PromotedKeyStatus | null };
 };
 
 /** The RPC surface of the class. `db.ts` and the coordinator type their stubs with it. */
@@ -388,6 +389,10 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	async status(ctx: FokosDBRouteContext) {
 		return await this.#api("status", ctx, null);
 	}
+	/** INTERNAL ONLY FOR TESTING. */
+	async promotedKeyStatus(ctx: FokosDBRouteContext, req: { hashKey: KeyBytes }) {
+		return await this.#api("promotedKeyStatus", ctx, req);
+	}
 
 	async fokosInit(req: FokosInitRequest): Promise<void> {
 		return await this.fokos.fokosInit(req);
@@ -409,6 +414,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 	}
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return await this.fokos.fokosStatus(req);
+	}
+	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
+		return await this.fokos.fokosPromotions(req);
 	}
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		await this.fokos.fokosPrepareDestroy(req);
@@ -725,6 +733,14 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				shape: "local",
 				local: async () => await this.statusView(),
 				// A read-only test view stays available behind the destroy fence.
+				allowedWhileDestroying: true,
+			},
+			promotedKeyStatus: {
+				shape: "local",
+				local: async (req) => {
+					const state = this.fokos.promotionState(req.hashKey);
+					return state === undefined ? null : promotedKeyStatusOf(state);
+				},
 				allowedWhileDestroying: true,
 			},
 		};
@@ -1083,22 +1099,16 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 
 	/**
 	 * The view the partition suites read. Every field derives from the runtime's public surface on
-	 * each call, and nothing persists it. A destroy traversal reads the paginated `fokosStatus`
-	 * instead.
+	 * each call, and nothing persists it. The suites read the promotion of one key with
+	 * `promotedKeyStatus`.
 	 */
 	private async statusView(): Promise<PartitionStatusView> {
 		const identity = this.fokos.identity();
 		const routeContext = this.fokos.routeContext();
 		const importInfo = this.fokos.lifecycle().import;
-		const entries: FokosStatusEntry[] = [];
-		let cursor: FokosStatusCursor | null = null;
-		do {
-			const page = await this.fokos.fokosStatus({ cursor });
-			entries.push(...page.entries);
-			cursor = page.nextCursor;
-		} while (cursor !== null);
+		const entries = (await this.fokos.fokosStatus({})).split;
 
-		const split = entries.find((e) => e.repartition.kind !== "key_promotion")?.repartition;
+		const split = entries[0]?.repartition;
 		let splitStatus: SplitStatusView | undefined;
 		if (split) {
 			const splitType: SplitType = split.kind === "hash_split" ? "hash" : "range";
@@ -1109,21 +1119,9 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					status: split.state === "cutover" ? "split_started" : "split_completed",
 					splitType,
 					childPartitionContexts: this.fokos.children().map((child) => ({ ...routeContext, ...child.ref })),
-					migratedChildDoNames: entries
-						.filter((e) => e.repartition.id === split.id && e.target?.acknowledged)
-						.map((e) => e.target!.ref.doName),
+					migratedChildDoNames: entries.filter((e) => e.target?.acknowledged).map((e) => e.target!.ref.doName),
 				};
 			}
-		}
-
-		const promotedKeys: PartitionStatusView["promotedKeys"] = [];
-		const seen = new Set<string>();
-		for (const { repartition } of entries) {
-			if (repartition.kind !== "key_promotion" || repartition.hashKey === null || seen.has(repartition.id)) {
-				continue;
-			}
-			seen.add(repartition.id);
-			promotedKeys.push({ hashKey: repartition.hashKey, status: promotedKeyStatusOf(repartition.state) });
 		}
 
 		return {
@@ -1134,7 +1132,6 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 			migrationStatus: derivedMigrationStatus(importInfo?.state),
 			parentPartitionContext: importInfo?.source,
 			parentSplitType: importInfo ? (importInfo.slice.kind === "hash_child" ? "hash" : "range") : undefined,
-			promotedKeys,
 		};
 	}
 

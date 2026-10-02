@@ -40,8 +40,7 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 		await partition.put({ hashKey: kb("alice"), sortKey: kb("sk1"), data: "tiny", kind: "text" as const });
 
 		await partition.runAlarm(); // an alarm may not be set at all; running it is a no-op if so
-		const s = await partition.status();
-		expect(s.promotedKeys).toHaveLength(0);
+		expect(await partition.promotedKeyStatus("alice")).toBeUndefined();
 	});
 
 	it("does not queue a hash split while a promotion is unfinished", async () => {
@@ -686,7 +685,7 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 
 		// The commit went to the range root first, and the range root stays without an identity.
 		expect(await rangeRoot.controlled.testTxCalls("txCommit")).toHaveLength(1);
-		expect(await rangeRoot.stub.fokosStatus({ cursor: null })).toMatchObject({ initialized: false });
+		expect(await rangeRoot.stub.fokosStatus({})).toMatchObject({ initialized: false });
 	}, 30_000);
 
 	it("prepares and commits at the hash leaf when a Bloom hit names a range root before its cutover", async () => {

@@ -37,6 +37,8 @@ import type {
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
 	FokosPrepareDestroyRequest,
+	FokosPromotionsPage,
+	FokosPromotionsRequest,
 	FokosRequestPromotionRequest,
 	FokosShardingRpc,
 	FokosStartImportRequest,
@@ -1101,6 +1103,14 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 		void this.#applySignals([{ evaluateSplit: true }]);
 	}
 
+	/**
+	 * The state of the promotion that this partition holds for `hashKey`, or undefined if it holds none.
+	 * A hash child holds the promotions it inherited from its parent too. One primary-key read.
+	 */
+	promotionState(hashKey: KeyBytes): RepartitionState | undefined {
+		return this.#store.routeOverrideFor(hashKey)?.state;
+	}
+
 	/** Routes to the current owner of the key first, then queues the promotion there. */
 	async requestPromotion(hashKey: KeyBytes, data?: unknown): Promise<FokosRequestPromotionResult> {
 		return await this.#requestPromotion(hashKey, data);
@@ -1290,9 +1300,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	}
 
 	/**
-	 * One bounded page of every repartition this partition holds, with the target links inside it. A
-	 * root request carries its context and bootstraps an empty root. A target request omits the
-	 * context and never creates an empty partition.
+	 * The identity of this partition and its split with the target links. The key promotions are in
+	 * `fokosPromotions`. A root request carries its context and bootstraps an empty root. A target
+	 * request omits the context and never creates an empty partition.
 	 */
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return await this.#guard("fokosStatus", async () => {
@@ -1301,19 +1311,27 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			}
 			const destroying = this.#store.isDestroying();
 			if (!this.#identity) {
-				return { initialized: false, destroying, ref: null, role: null, importState: null, entries: [], nextCursor: null };
+				return { initialized: false, destroying, ref: null, role: null, importState: null, split: [] };
 			}
-			const config = this.#config();
-			const { entries, nextCursor } = this.#source.statusEntries(req.cursor, config.statusPageEntries, config.statusPageBytes);
 			return {
 				initialized: true,
 				destroying,
 				ref: this.#identity.ref,
 				role: this.#source.routerRole() ? "router" : "owner",
 				importState: this.#target.importState(),
-				entries,
-				nextCursor,
+				split: this.#source.splitEntries(),
 			};
+		});
+	}
+
+	/** One bounded page of the key promotions of this partition. A partition with no identity has none. */
+	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
+		return await this.#guard("fokosPromotions", async () => {
+			if (!this.#identity) {
+				return { entries: [], nextCursor: null };
+			}
+			const config = this.#config();
+			return this.#source.promotionEntries(req.cursor, config.promotionsPageEntries, config.promotionsPageBytes);
 		});
 	}
 
@@ -2107,14 +2125,15 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 
 	/**
 	 * Runs one entry point: the destroy fence first, then `fn`, and every error that leaves is a
-	 * `FokosError` that carries the routing of this partition. `fokosStatus`, `fokosPrepareDestroy`,
-	 * and `fokosDestroy` stay available behind the fence.
+	 * `FokosError` that carries the routing of this partition. `fokosStatus`, `fokosPromotions`,
+	 * `fokosPrepareDestroy`, and `fokosDestroy` stay available behind the fence.
 	 */
 	async #guard<T>(name: string, fn: () => Promise<T>, collector?: () => RouteCollector | undefined): Promise<T> {
 		try {
 			const descriptor = this.#ops[name];
 			const allowedWhileDestroying =
 				name === "fokosStatus" ||
+				name === "fokosPromotions" ||
 				name === "fokosPrepareDestroy" ||
 				name === "fokosDestroy" ||
 				(descriptor?.shape === "local" && descriptor.allowedWhileDestroying === true);

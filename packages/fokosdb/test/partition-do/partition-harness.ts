@@ -138,8 +138,7 @@ export class TestPartition {
 
 	/** The promotion status this partition holds for `hashKey`, or undefined if it holds no entry. */
 	async promotedKeyStatus(hashKey: string): Promise<PromotedKeyStatus | undefined> {
-		const { promotedKeys } = await this.status();
-		return promotedKeys.find((e) => KeyCodec.compare(e.hashKey, kb(hashKey)) === 0)?.status;
+		return (await this.rpc.promotedKeyStatus(this.ctx, { hashKey: kb(hashKey) })) ?? undefined;
 	}
 
 	/** Returns deterministic hash children, including before the split starts. */

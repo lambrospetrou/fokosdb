@@ -12,6 +12,7 @@ import type {
 	FokosMigrationPage,
 	FokosMigrationPullRequest,
 	FokosPrepareDestroyRequest,
+	FokosPromotionsRequest,
 	FokosRequestPromotionRequest,
 	FokosShardingRpc,
 	FokosStartImportRequest,
@@ -389,6 +390,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 	fokosStatus(req: FokosStatusRequest) {
 		return this.fokos.fokosStatus(req);
+	}
+	fokosPromotions(req: FokosPromotionsRequest) {
+		return this.fokos.fokosPromotions(req);
 	}
 	fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
 		return this.fokos.fokosPrepareDestroy(req);

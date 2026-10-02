@@ -1,26 +1,26 @@
 /**
- * `fokosPrepareDestroy` and `fokosStatus` on a real `PartitionDO`.
+ * `fokosPrepareDestroy`, `fokosStatus` and `fokosPromotions` on a real `PartitionDO`.
  *
- * A destroy traversal makes these two RPCs before it deletes anything. The fence stops every
- * background transition, and the paginated status tells the traversal which partitions exist below
- * this one. The router suite covers the traversal order.
+ * A destroy traversal makes these RPCs before it deletes anything. The fence stops every background
+ * transition. The status gives the split targets, and the paginated promotions listing gives the range
+ * roots. Together they tell the traversal which partitions exist below this one. The router suite
+ * covers the traversal order.
  */
 import { runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { describe, it, vi } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { FOKOS_KV_KEYS } from "../../src/sharding/sharding-store.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { kb, makeStub } from "./helpers.js";
 import { CONTROLLED_NS, makePartition, TestPartition } from "./partition-harness.js";
 
-/** Every entry of every page, so a test reads the whole view the traversal would walk. */
-async function allStatusEntries(partition: TestPartition, rootContext?: FokosDBRouteContext) {
+/** Every entry of every promotions page, so a test reads the whole listing the traversal would walk. */
+async function allPromotionEntries(partition: TestPartition) {
 	const entries = [];
 	let cursor = null;
 	do {
-		const page = await partition.stub.fokosStatus({ cursor, rootContext });
+		const page = await partition.stub.fokosPromotions({ cursor });
 		entries.push(...page.entries);
 		cursor = page.nextCursor;
 	} while (cursor !== null);
@@ -31,9 +31,10 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 	it("bootstraps an empty root from its context and reports no repartition", async ({ expect }) => {
 		const { ctx, stub } = makeStub();
 
-		const page = await stub.fokosStatus({ cursor: null, rootContext: ctx });
+		const page = await stub.fokosStatus({ rootContext: ctx });
 
-		expect(page).toMatchObject({ initialized: true, destroying: false, importState: null, entries: [], nextCursor: null });
+		expect(page).toMatchObject({ initialized: true, destroying: false, importState: null, split: [] });
+		expect(await stub.fokosPromotions({ cursor: null })).toEqual({ entries: [], nextCursor: null });
 		expect(page.ref).toEqual({ partitionId: ctx.partitionId, doName: ctx.doName });
 	});
 
@@ -42,7 +43,7 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		const targetName = `test.fokosstatus-uninitialized.${crypto.randomUUID()}`;
 		const stub = testPartitionStub(targetName);
 
-		const page = await stub.fokosStatus({ cursor: null });
+		const page = await stub.fokosStatus({});
 
 		expect(page).toEqual({
 			initialized: false,
@@ -50,9 +51,9 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 			ref: null,
 			role: null,
 			importState: null,
-			entries: [],
-			nextCursor: null,
+			split: [],
 		});
+		expect(await stub.fokosPromotions({ cursor: null })).toEqual({ entries: [], nextCursor: null });
 		// A target request carries no context, so the partition must still have none of its own.
 		await runInDurableObject(stub, (_i: PartitionDO, state: DurableObjectState) => {
 			expect(state.storage.kv.get(FOKOS_KV_KEYS.IDENTITY)).toBeUndefined();
@@ -65,7 +66,7 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		await partition.triggerHashSplit();
 		await partition.awaitSplitCompleted();
 
-		const entries = await allStatusEntries(partition);
+		const entries = (await partition.stub.fokosStatus({})).split;
 		expect(entries).toHaveLength(2);
 		const children = await partition.children();
 		expect(entries.map((e) => e.target?.ref.doName)).toEqual(children.map((c) => c.doName));
@@ -77,8 +78,8 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 
 		// A child reports the same links from its own side: no repartition of its own, and the import it
 		// finished. That answer tells the traversal the child is a leaf.
-		const childPage = await children[0].stub.fokosStatus({ cursor: null });
-		expect(childPage).toMatchObject({ initialized: true, entries: [], nextCursor: null, importState: "active" });
+		const childPage = await children[0].stub.fokosStatus({});
+		expect(childPage).toMatchObject({ initialized: true, split: [], importState: "active" });
 	});
 
 	it("reports the range root a promotion created, so destroy reaches a tree no context names", async ({ expect }) => {
@@ -86,9 +87,11 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		await partition.rpc.debugForcePromoteKey(partition.ctx, { hashKey: kb("alice") });
 		const rangeRoot = await partition.awaitPromoted("alice");
 
-		const entries = await allStatusEntries(partition);
+		expect((await partition.stub.fokosStatus({})).split).toEqual([]);
+		const entries = await allPromotionEntries(partition);
 		expect(entries).toHaveLength(1);
 		expect(entries[0].repartition.kind).toBe("key_promotion");
+		expect(entries[0].repartition.hashKey).toEqual(kb("alice"));
 		expect(entries[0].target?.ref.doName).toBe(rangeRoot.doName);
 	});
 
@@ -98,9 +101,7 @@ describe.concurrent("PartitionDO — fokosStatus", () => {
 		const { ctx: otherCtx } = makeStub();
 
 		await runInDurableObject(partition.stub, async (instance: PartitionDO) => {
-			await expect(instance.fokosStatus({ cursor: null, rootContext: otherCtx })).rejects.toThrow(
-				fokosErrorWith("partition_context_mismatch"),
-			);
+			await expect(instance.fokosStatus({ rootContext: otherCtx })).rejects.toThrow(fokosErrorWith("partition_context_mismatch"));
 		});
 	});
 });
@@ -112,7 +113,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 
 		await partition.stub.fokosPrepareDestroy({});
 
-		const fenced = await partition.stub.fokosStatus({ cursor: null });
+		const fenced = await partition.stub.fokosStatus({});
 		expect(fenced.destroying).toBe(true);
 		// The fence is durable, so nothing the DO wakes up to do can move the state on.
 		await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
@@ -128,10 +129,9 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		// They live until the traversal reaches them, which it does before this partition, and a child
 		// that finishes its import acknowledges here. That acknowledgement moves the split state and one
 		// flag. It adds no link, so it cannot make the traversal miss a partition.
-		const after = await partition.stub.fokosStatus({ cursor: null });
+		const after = await partition.stub.fokosStatus({});
 		expect(after.destroying).toBe(true);
-		expect(after.nextCursor).toEqual(fenced.nextCursor);
-		expect(after.entries.map((e) => e.target?.ref)).toEqual(fenced.entries.map((e) => e.target?.ref));
+		expect(after.split.map((e) => e.target?.ref)).toEqual(fenced.split.map((e) => e.target?.ref));
 	});
 
 	it("rejects every other RPC once fenced, while the destroy traversal calls still answer", async ({ expect }) => {
@@ -149,8 +149,10 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 			);
 		});
 
-		const page = await partition.stub.fokosStatus({ cursor: null });
+		const page = await partition.stub.fokosStatus({});
 		expect(page.destroying).toBe(true);
+		expect(await partition.stub.fokosPromotions({ cursor: null })).toEqual({ entries: [], nextCursor: null });
+		expect(await partition.promotedKeyStatus("hk")).toBeUndefined();
 	});
 
 	it("is idempotent, and a repeated call leaves no alarm behind", async ({ expect }) => {
@@ -170,7 +172,7 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 
 		await stub.fokosPrepareDestroy({ rootContext: ctx });
 
-		const page = await stub.fokosStatus({ cursor: null });
+		const page = await stub.fokosStatus({});
 		expect(page).toMatchObject({ initialized: true, destroying: true });
 	});
 
@@ -206,9 +208,9 @@ describe("PartitionDO — fokosPrepareDestroy", () => {
 		}
 
 		// The parked step recorded its own result, and nothing ran after it. The split never cut over.
-		const after = await partition.stub.fokosStatus({ cursor: null });
+		const after = await partition.stub.fokosStatus({});
 		expect(after.destroying).toBe(true);
-		expect(after.entries.every((e) => e.repartition.state === "queued" || e.repartition.state === "planned")).toBe(true);
+		expect(after.split.every((e) => e.repartition.state === "queued" || e.repartition.state === "planned")).toBe(true);
 		await runInDurableObject(partition.stub, async (_i: PartitionDO, state: DurableObjectState) => {
 			expect(await state.storage.getAlarm()).toBeNull();
 		});

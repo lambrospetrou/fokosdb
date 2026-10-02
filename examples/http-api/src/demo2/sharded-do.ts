@@ -8,6 +8,8 @@ import type {
 	FokosMigrationPullRequest,
 	FokosOperationSpec,
 	FokosPrepareDestroyRequest,
+	FokosPromotionsPage,
+	FokosPromotionsRequest,
 	FokosRequestPromotionRequest,
 	FokosRequestPromotionResult,
 	FokosShardingRpc,
@@ -53,6 +55,10 @@ export abstract class ShardedDurableObject<TPolicy, Ops extends FokosOperationSp
 
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return this.fokos.fokosStatus(req);
+	}
+
+	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
+		return this.fokos.fokosPromotions(req);
 	}
 
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {

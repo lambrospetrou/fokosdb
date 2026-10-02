@@ -86,6 +86,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	fokosExecuteLocal = (req: Rpc.FokosExecuteLocalRequest) => this.fokos.fokosExecuteLocal(req);
 	fokosRequestPromotion = (req: Rpc.FokosRequestPromotionRequest) => this.fokos.fokosRequestPromotion(req);
 	fokosStatus = (req: Rpc.FokosStatusRequest) => this.fokos.fokosStatus(req);
+	fokosPromotions = (req: Rpc.FokosPromotionsRequest) => this.fokos.fokosPromotions(req);
 	fokosPrepareDestroy = (req: Rpc.FokosPrepareDestroyRequest) => this.fokos.fokosPrepareDestroy(req);
 	fokosDestroy = () => this.fokos.fokosDestroy();
 	alarm = (info: AlarmInvocationInfo) => this.fokos.alarm(info);

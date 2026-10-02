@@ -1130,8 +1130,31 @@ describe("Repartition — range splits", () => {
 	});
 });
 
-describe("Repartition — the paginated status view", () => {
-	it("orders every repartition and target by (seq, target_index), with -1 for a repartition with none", async () => {
+describe("Repartition — the status view", () => {
+	it("lists the split with every target in target_index order", async () => {
+		const c = makeCluster({ hashSplitN: 3 });
+		const root = c.hashNode([0]);
+		await plan(root, { kind: "hash_split" });
+
+		const split = await root.enter(({ source }) => source.splitEntries());
+		expect(split.map((e) => [e.repartition.kind, e.repartition.state, e.target?.index])).toEqual([
+			["hash_split", "planned", 0],
+			["hash_split", "planned", 1],
+			["hash_split", "planned", 2],
+		]);
+		expect(await root.enter(({ source }) => source.promotionEntries(null, 1_000))).toEqual({ entries: [], nextCursor: null });
+	});
+
+	it("lists a queued split as one entry with no target", async () => {
+		const c = makeCluster({ hashSplitN: 3 });
+		const root = c.hashNode([0]);
+		await root.enter(({ source }) => void source.queue({ kind: "hash_split" }));
+
+		const split = await root.enter(({ source }) => source.splitEntries());
+		expect(split.map((e) => [e.repartition.kind, e.repartition.state, e.target])).toEqual([["hash_split", "queued", null]]);
+	});
+
+	it("lists the promotions in seq order, with no target for a promotion that is still queued", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
 		await root.enter(({ source }) => {
@@ -1141,43 +1164,42 @@ describe("Repartition — the paginated status view", () => {
 		});
 		await plan(root);
 
-		const page = await root.enter(({ source }) => source.statusEntries(null, 1_000));
+		const page = await root.enter(({ source }) => source.promotionEntries(null, 1_000));
 		expect(page.nextCursor).toBeNull();
 		expect(
-			page.entries.map((e) => [
-				e.repartition.seq,
-				e.repartition.kind,
-				e.repartition.state,
-				e.target?.index ?? -1,
-				e.target?.initialization,
-			]),
+			page.entries.map((e) => [e.repartition.seq, e.repartition.state, e.repartition.hashKey, e.target?.index, e.target?.initialization]),
 		).toEqual([
-			[1, "key_promotion", "planned", 0, "pending"],
-			[2, "key_promotion", "queued", -1, undefined],
+			[1, "planned", kb("hot"), 0, "pending"],
+			[2, "queued", kb("warm"), undefined, undefined],
 		]);
+		expect(await root.enter(({ source }) => source.splitEntries())).toEqual([]);
 	});
 
-	it("stops a page on the entry budget and on the byte budget, and resumes strictly after it", async () => {
+	it("stops a promotions page on the entry budget and on the byte budget, and resumes strictly after it", async () => {
 		const c = makeCluster({ hashSplitN: 3 });
 		const root = c.hashNode([0]);
-		await plan(root, { kind: "hash_split" });
+		await root.enter(({ source }) => {
+			for (const hk of ["a", "b", "c"]) {
+				source.queue({ kind: "key_promotion", hashKey: kb(hk) });
+			}
+		});
 
-		// Three target rows. Two entries per page by count, then one per page by size. A budget below
-		// one entry still emits one entry, or the view never drains.
-		const byCount = await root.enter(({ source }) => source.statusEntries(null, 2));
-		expect(byCount.entries).toHaveLength(2);
-		expect(byCount.nextCursor).toEqual({ seq: 1, targetIndex: 1 });
+		// Two entries per page by count, then one per page by size. A budget below one entry still
+		// emits one entry, or the listing never drains.
+		const byCount = await root.enter(({ source }) => source.promotionEntries(null, 2));
+		expect(byCount.entries.map((e) => e.repartition.seq)).toEqual([1, 2]);
+		expect(byCount.nextCursor).toEqual({ seq: 2 });
 
-		const rest = await root.enter(({ source }) => source.statusEntries(byCount.nextCursor, 2));
-		expect(rest.entries.map((e) => e.target?.index)).toEqual([2]);
+		const rest = await root.enter(({ source }) => source.promotionEntries(byCount.nextCursor, 2));
+		expect(rest.entries.map((e) => e.repartition.seq)).toEqual([3]);
 		expect(rest.nextCursor).toBeNull();
 
-		const byBytes = await root.enter(({ source }) => source.statusEntries(null, 1_000, 1));
-		expect(byBytes.entries.map((e) => e.target?.index)).toEqual([0]);
-		expect(byBytes.nextCursor).toEqual({ seq: 1, targetIndex: 0 });
+		const byBytes = await root.enter(({ source }) => source.promotionEntries(null, 1_000, 1));
+		expect(byBytes.entries.map((e) => e.repartition.seq)).toEqual([1]);
+		expect(byBytes.nextCursor).toEqual({ seq: 1 });
 
-		const after = await root.enter(({ source }) => source.statusEntries(byBytes.nextCursor, 1_000, 1));
-		expect(after.entries.map((e) => e.target?.index)).toEqual([1]);
+		const after = await root.enter(({ source }) => source.promotionEntries(byBytes.nextCursor, 1_000, 1));
+		expect(after.entries.map((e) => e.repartition.seq)).toEqual([2]);
 	});
 });
 
@@ -1220,18 +1242,13 @@ async function cutOver(node: Node, request?: QueueRequest, now = T0): Promise<vo
 		}
 		await node.enter(async ({ source }) => void (await source.sourceStep(at)));
 	}
-	const rows = await node.enter(({ sharding }) => sharding.queryRepartitionStatusPage(null, 50));
-	throw new Error(`${node.doName}: the source did not reach cutover; ${JSON.stringify(rows)}`);
+	const row = await node.enter(({ sharding }) => sharding.firstActiveRepartition());
+	throw new Error(`${node.doName}: the source did not reach cutover; ${JSON.stringify(row)}`);
 }
 
 /** The one repartition this source is still working on, if any. */
 function activeRepartitionId(sharding: FokosShardingStore): string | undefined {
-	for (const row of sharding.queryRepartitionStatusPage(null, 500)) {
-		if (row.state === "queued" || row.state === "planned" || row.state === "cutover") {
-			return row.id;
-		}
-	}
-	return undefined;
+	return sharding.firstActiveRepartition()?.id;
 }
 
 /**

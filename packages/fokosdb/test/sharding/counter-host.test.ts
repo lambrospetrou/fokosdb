@@ -76,7 +76,7 @@ describe.concurrent("Sharding runtime — counter host", () => {
 		}
 
 		expect(nodes).toEqual([]);
-		expect(await stub(table.root.doName).fokosStatus({ cursor: null })).toMatchObject({ initialized: false, role: null });
+		expect(await stub(table.root.doName).fokosStatus({})).toMatchObject({ initialized: false, role: null });
 	});
 
 	it("walks only the owners of a split root with scope owners", async () => {

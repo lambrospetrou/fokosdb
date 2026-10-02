@@ -9,10 +9,10 @@ import { FokosShardingClient, type FokosCallCost, type FokosRetryPolicy } from "
 import { attachRouting } from "./envelope.js";
 import { SHARDING_UNAVAILABLE_CODES } from "./errors.js";
 import { KeyCodec } from "./key-codec.js";
-import type { FokosStatusEntry, FokosStatusPage, RouteKey } from "./repartition-types.js";
+import type { FokosPromotionsPage, FokosStatusEntry, FokosStatusPage, RouteKey } from "./repartition-types.js";
 import type { FokosPartitionRef, FokosRouteContext } from "./route-context.js";
 import type { FokosEnvelope, FokosRouteNode, FokosRouting } from "./runtime-types.js";
-import type { RepartitionState } from "./sharding-store.js";
+import type { RepartitionKind, RepartitionState } from "./sharding-store.js";
 import { FokosError, FokosUnavailableError } from "../shared/errors.js";
 
 type EchoOps = { echo: { req: string; res: string } };
@@ -203,36 +203,34 @@ type Partition = {
 	targets?: Array<{ ref: FokosPartitionRef; state?: RepartitionState }>;
 };
 
-/** A recorded cluster: every partition answers its status from `partitions`, one target per page. */
+/**
+ * A recorded cluster: every partition answers from `partitions`. A target whose ref is a range root is
+ * a promotion, one per promotions page. Any other target is a split target in the status.
+ */
 function makeCluster(partitions: Record<string, Partition>) {
-	/** Every call in order: `fence:<name>`, `page:<name>#<seq>`, `destroy:<name>`. */
+	/** Every call in order: `fence:<name>`, `status:<name>`, `page:<name>#<seq>`, `destroy:<name>`. */
 	const events: string[] = [];
 	const contexts: (string | undefined)[] = [];
 	const statusContexts: (string | undefined)[] = [];
+	const entryOf = (
+		seq: number,
+		index: number,
+		target: { ref: FokosPartitionRef; state?: RepartitionState },
+		kind: RepartitionKind,
+	): FokosStatusEntry => ({
+		repartition: { id: `r${seq}`, seq, kind, state: target.state ?? "completed", hashKey: null },
+		target: { index, ref: target.ref, initialization: "initialized", acknowledged: true },
+	});
+	const isPromotion = (target: { ref: FokosPartitionRef }) => target.ref.partitionId.startsWith("01");
 	const stub = (_ctx: FokosRouteContext<unknown>, doName: string) => ({
 		async fokosPrepareDestroy(req: { rootContext?: FokosRouteContext<unknown> }) {
 			events.push(`fence:${doName}`);
 			contexts.push(req.rootContext?.doName);
 		},
-		async fokosStatus(req: { cursor: { seq: number } | null; rootContext?: FokosRouteContext<unknown> }): Promise<FokosStatusPage> {
+		async fokosStatus(req: { rootContext?: FokosRouteContext<unknown> }): Promise<FokosStatusPage> {
 			const p = partitions[doName] ?? {};
-			const targets = p.targets ?? [];
-			const seq = req.cursor?.seq ?? 0;
-			events.push(`page:${doName}#${seq}`);
+			events.push(`status:${doName}`);
 			statusContexts.push(req.rootContext?.doName);
-			const target = targets[seq];
-			const entry: FokosStatusEntry | undefined = target
-				? {
-						repartition: {
-							id: `r${seq}`,
-							seq,
-							kind: target.ref.partitionId.startsWith("01") ? "key_promotion" : "hash_split",
-							state: target.state ?? "completed",
-							hashKey: null,
-						},
-						target: { index: 0, ref: target.ref, initialization: "initialized", acknowledged: true },
-					}
-				: undefined;
 			const initialized = p.initialized ?? true;
 			return {
 				initialized,
@@ -240,8 +238,17 @@ function makeCluster(partitions: Record<string, Partition>) {
 				ref: initialized ? ref(doName) : null,
 				role: initialized ? (p.role ?? "owner") : null,
 				importState: null,
-				entries: entry ? [entry] : [],
-				nextCursor: seq + 1 < targets.length ? { seq: seq + 1, targetIndex: 0 } : null,
+				split: (p.targets ?? []).filter((t) => !isPromotion(t)).map((t, i) => entryOf(0, i, t, "hash_split")),
+			};
+		},
+		async fokosPromotions(req: { cursor: { seq: number } | null }): Promise<FokosPromotionsPage> {
+			const promotions = (partitions[doName]?.targets ?? []).filter(isPromotion);
+			const seq = req.cursor ? req.cursor.seq + 1 : 0;
+			events.push(`page:${doName}#${seq}`);
+			const target = promotions[seq];
+			return {
+				entries: target ? [entryOf(seq, 0, target, "key_promotion")] : [],
+				nextCursor: seq + 1 < promotions.length ? { seq } : null,
 			};
 		},
 		async fokosDestroy() {
@@ -269,8 +276,8 @@ describe("FokosShardingClient.destroy", () => {
 		expect(destroyed).toEqual(cluster.destroyed());
 		expect(cluster.fenced()).toEqual([root, "child-a", "grandchild", "range-root"]);
 		expect(cluster.contexts).toEqual([root, undefined, undefined, undefined]);
-		// The fence of a partition comes before its first page, and its pages before its destroy.
-		expect(cluster.events.slice(0, 2)).toEqual([`fence:${root}`, `page:${root}#0`]);
+		// The fence of a partition comes before its status, and its pages before its destroy.
+		expect(cluster.events.slice(0, 2)).toEqual([`fence:${root}`, `status:${root}`]);
 		expect(cluster.events.at(-1)).toBe(`destroy:${root}`);
 	});
 
@@ -287,6 +294,24 @@ describe("FokosShardingClient.destroy", () => {
 		expect(cluster.destroyed()).toEqual(["range-root", "child-a", "child-b", root]);
 		// The traversal skips the second link whole, so it reads the fence and the status pages once.
 		expect(cluster.fenced()).toEqual([root, "child-a", "range-root", "child-b"]);
+	});
+
+	it("reads every promotions page and destroys each range root before the partition that promoted it", async () => {
+		const { cluster, root } = clusterOf((r) => ({
+			[r]: { targets: [child("child-a"), { ref: rangeRef("range-1") }, { ref: rangeRef("range-2") }, { ref: rangeRef("range-3") }] },
+		}));
+
+		await cluster.client.destroy();
+
+		expect(cluster.destroyed()).toEqual(["child-a", "range-1", "range-2", "range-3", root]);
+		expect(cluster.events.filter((e) => e.endsWith(`:${root}`) || e.startsWith(`page:${root}#`))).toEqual([
+			`fence:${root}`,
+			`status:${root}`,
+			`page:${root}#0`,
+			`page:${root}#1`,
+			`page:${root}#2`,
+			`destroy:${root}`,
+		]);
 	});
 
 	it("destroys a partition with no targets as a leaf, for every root", async () => {
@@ -367,7 +392,7 @@ describe("FokosShardingClient.walk", () => {
 			break;
 		}
 
-		expect(cluster.events).toEqual([`page:${root}#0`]);
+		expect(cluster.events).toEqual([`status:${root}`]);
 	});
 });
 

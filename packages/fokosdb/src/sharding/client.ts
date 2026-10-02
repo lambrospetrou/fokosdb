@@ -2,7 +2,7 @@ import { tryWhile } from "durable-utils/retries";
 import { isDestroyAbortError } from "../shared/cf-utils.js";
 import invariant from "../shared/invariant.js";
 import { routedError } from "./envelope.js";
-import type { FokosImportState, FokosShardingRpc, FokosStatusCursor, RouteKey } from "./repartition-types.js";
+import type { FokosImportState, FokosPromotionsCursor, FokosShardingRpc, FokosStatusEntry, RouteKey } from "./repartition-types.js";
 import { isRangePartition } from "./partition-id.js";
 import { refOf, type FokosPartitionRef, type FokosRangeConfig, type FokosRouteContext, type FokosTopology } from "./route-context.js";
 import { FokosRouter, publicRouting } from "./router.js";
@@ -70,6 +70,9 @@ export function dropCallCost(e: unknown): void {
 		delete (e as Partial<FokosCallCost>).totalForwardCount;
 	}
 }
+
+/** A status entry with its target. */
+type LinkedEntry = FokosStatusEntry & { target: NonNullable<FokosStatusEntry["target"]> };
 
 /**
  * The caller side of one shard group. It resolves the entry partition of a request, gets the stub,
@@ -225,35 +228,27 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		}
 		seen.add(ctx.doName);
 		const stub = this.#rpc(ctx);
-		let page = await stub.fokosStatus({ cursor: null });
-		if (!page.initialized) {
+		const status = await stub.fokosStatus({});
+		if (!status.initialized) {
 			return;
 		}
-		const role = page.role;
+		const role = status.role;
 		invariant(role, "fokos/client.walk: a partition with an identity has a role");
 		if (!ownersOnly || (role === "owner" && cutOver)) {
-			yield { ctx, kind: isRangePartition(ctx) ? "range" : "hash", role, parent, importState: page.importState };
+			yield { ctx, kind: isRangePartition(ctx) ? "range" : "hash", role, parent, importState: status.importState };
 		}
-		for (;;) {
-			for (const { repartition, target } of page.entries) {
-				if (target) {
-					const via = { ref: refOf(ctx), via: repartition.kind };
-					const targetCutOver = repartition.state !== "queued" && repartition.state !== "planned";
-					yield* this.#walkFrom(this.#targetContext(target.ref), via, targetCutOver, ownersOnly, seen);
-				}
-			}
-			if (page.nextCursor === null) {
-				return;
-			}
-			page = await stub.fokosStatus({ cursor: page.nextCursor });
+		for await (const { repartition, target } of this.#targets(stub, status.split)) {
+			const via = { ref: refOf(ctx), via: repartition.kind };
+			const targetCutOver = repartition.state !== "queued" && repartition.state !== "planned";
+			yield* this.#walkFrom(this.#targetContext(target.ref), via, targetCutOver, ownersOnly, seen);
 		}
 	}
 
 	/**
 	 * Fences and deletes every partition: routers, owners, and targets before their cutover. For every
 	 * root, and then post-order for every target: fence the partition with `fokosPrepareDestroy` (with
-	 * the root context on a root only), read every `fokosStatus` page after the fence is set, visit
-	 * each target, then call `fokosDestroy`.
+	 * the root context on a root only), read `fokosStatus` and every `fokosPromotions` page after the
+	 * fence is set, visit each target, then call `fokosDestroy`.
 	 *
 	 * The fence comes first, so nothing adds a target after the traversal reads the last page. A
 	 * destroy that stops halfway can run again, because each parent that remains still knows its
@@ -270,16 +265,10 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 			visited.add(ctx.doName);
 			const stub = this.#rpc(ctx);
 			await stub.fokosPrepareDestroy({ rootContext });
-			let cursor: FokosStatusCursor | null = null;
-			do {
-				const page = await stub.fokosStatus({ cursor, rootContext });
-				for (const entry of page.entries) {
-					if (entry.target) {
-						await destroyPartition(this.#targetContext(entry.target.ref));
-					}
-				}
-				cursor = page.nextCursor;
-			} while (cursor !== null);
+			const status = await stub.fokosStatus({ rootContext });
+			for await (const { target } of this.#targets(stub, status.split)) {
+				await destroyPartition(this.#targetContext(target.ref));
+			}
 			try {
 				await stub.fokosDestroy();
 			} catch (e) {
@@ -293,6 +282,21 @@ export class FokosShardingClient<TPolicy, Ops extends FokosOperationSpec> {
 		for (const root of this.#router.allRoots()) {
 			await destroyPartition(root, root);
 		}
+	}
+
+	/**
+	 * The entries with a target: the split targets first, then each promotion target. The promotions
+	 * pages are read one at a time, so a caller that stops early reads no more pages.
+	 */
+	async *#targets(stub: FokosShardingRpc, split: FokosStatusEntry[]): AsyncGenerator<LinkedEntry> {
+		const withTarget = (e: FokosStatusEntry): e is LinkedEntry => e.target !== null;
+		yield* split.filter(withTarget);
+		let cursor: FokosPromotionsCursor | null = null;
+		do {
+			const page = await stub.fokosPromotions({ cursor });
+			yield* page.entries.filter(withTarget);
+			cursor = page.nextCursor;
+		} while (cursor !== null);
 	}
 
 	#rpc(ctx: FokosRouteContext<TPolicy>): FokosShardingRpc {

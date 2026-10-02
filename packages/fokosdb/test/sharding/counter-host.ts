@@ -10,6 +10,8 @@ import {
 	type FokosMigrationPullRequest,
 	type FokosOperations,
 	type FokosPrepareDestroyRequest,
+	type FokosPromotionsPage,
+	type FokosPromotionsRequest,
 	type FokosRequestPromotionRequest,
 	type FokosRequestPromotionResult,
 	type FokosRouteContext,
@@ -111,6 +113,10 @@ export class CounterPartitionDO extends DurableObject<Env> implements FokosShard
 
 	async fokosStatus(req: FokosStatusRequest): Promise<FokosStatusPage> {
 		return await this.fokos.fokosStatus(req);
+	}
+
+	async fokosPromotions(req: FokosPromotionsRequest): Promise<FokosPromotionsPage> {
+		return await this.fokos.fokosPromotions(req);
 	}
 
 	async fokosPrepareDestroy(req: FokosPrepareDestroyRequest): Promise<void> {
