@@ -1,11 +1,11 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F4, F8, F10, F11, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
 partition has no override). Decided, no change: F6 and K3. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
-**Updated:** 2026-10-01.
+**Updated:** 2026-10-02.
 
 ## Table of contents
 
@@ -38,7 +38,7 @@ says how it was checked:
 | # | Layer | Finding | Severity | Schema change? |
 |---|---|---|---|---|
 | F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High | No |
-| F11 | FokosDB | Migration fetches payload arrays before the byte budget; a default fetch can hold about 390 MiB | High | No |
+| F11 | FokosDB | Done. Migration fetched payload arrays before the byte budget; a default fetch could hold about 390 MiB | High | No |
 | C5 | FokosDB (TC) | Done. One PREPARING transaction could exceed the 32 MiB migration RPC limit and stop an import | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
 | X2 | Cross | Done. The stale-lock job could run again every ~50 ms, and a slow step blocked the split and import jobs | High | Done with F4 |
@@ -56,13 +56,13 @@ says how it was checked:
 
 ----
 
-The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. I checked the code: F1, F11 and F5 are still open. _slice is not used in fokos-migration-host.ts:63, collectBatch checks the byte budget only after it fetches the rows, and deletion_metadata has only one counter row.
+The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. I checked the code: F1 and F5 are still open. _slice is not used in fokos-migration-host.ts:63, and deletion_metadata has only one counter row. F11 is done.
 
 Priority 1: stuck imports (availability)
 
-1. F11: migration memory bound. One page fetch can hold about 390 MiB of payload, and the isolate limit is 128 MB. Each retry fails on the same batch. The target then never finishes its import, and its keys stay unavailable.
+1. F11: done. The store queries give the migration rows one at a time, and the byte budget stops the SQL read.
 2. F1: use the slice during migration. A promotion reads the whole source to move one key. So the time that a hot key is unavailable depends on the size of the source partition, not on the size of the key.
-   - Do F1 and F11 together. Both change #buildItemsPage and the store queries under it.
+   - Build F1 on the lazy store queries of F11. A slice query must also be a generator.
    - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no finished override exists (done when the partition has no override at all), and read the keys before data. They change the same code path.
 3. C5: done. The coordinator applies the combined image cap when it stores each prepare answer, so one transaction stays below the RPC limit.
 
@@ -91,7 +91,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: start with F11 and F1 as one change, then F5. Before you edit the migrations in place, make the decision on X1.
+My recommendation: start with F1, then F5. Before you edit the migrations in place, make the decision on X1.
 
 
 ## 3. Sharding runtime
@@ -554,22 +554,37 @@ each cycle, but locks are few.
   `hk`. The step reads the keys of a claimed transaction and skips it when no key is owned. The runtime call
   `fokos.sql.movedHashKeys()` had no other user, so it is removed.
 
-**F11 — migration reads payload arrays before it applies the byte budget (High).** **Code + Collector.**
+**F11 — done: migration read payload arrays before it applied the byte budget (High).** **Code + Collector + test.**
 
-- **What happens:** `collectBatch` (`sharding/batch-scan.ts`) fetches a complete array before it checks
-  `budgetBytes`. `#buildItemsPage` and `#buildPendingTxPage` (`shared/partition/fokos-migration-host.ts`) both use
-  this collector. Their store queries materialize every requested row, including `data`.
-- **Example:** The default `migrationPageRows` is 1,000, and `migrationPageBytes` is 20 MiB. With near-maximum
-  400 KiB items, one fetch can hold about 390 MiB of payload before the collector applies its byte budget.
+- **What happened:** `collectBatch` (`sharding/batch-scan.ts`) received a complete array from each fetch before it
+  checked `budgetBytes`. `queryItemsPage` and `queryPendingTxPage` (`shared/partition/partition-store.ts`) put every
+  row of the `LIMIT`, with `data`, into that array. `#buildItemsPage` and `#buildPendingTxPage` use these queries.
+- **Example:** The default `migrationPageRows` is 1,000, and `migrationPageBytes` is 20 MiB. With items of about
+  400 KiB, one fetch held about 390 MiB of payload, and the page kept only about 51 rows.
   [Workers limits](https://developers.cloudflare.com/workers/platform/limits/#memory) allow 128 MB per isolate.
-  The budget bounds the response, not the memory needed to build it.
-- **Read cost:** A collector check with logical row sizes of `400 * 1024 - 128` fetched 1,000 rows and returned 51.
-  The returned cursor resumes after row 51, so the next fetch reads most of the unused payloads again.
-- **Failure:** A split or promotion cuts over, then its source exceeds the memory limit while it builds a page.
-  Repeated attempts can fail on the same batch. The target cannot finish its import, so writes and transaction
-  steps on its keys remain unavailable. This failure was not run in Workers.
-- **Fix:** Stream rows through the byte budget before a payload array can grow beyond it. A slice-aware query
-  (F1) does not fix this memory bound. The item and lock streams both need the bound. No schema change is needed.
+- **Failure:** After cutover, the source ran out of memory while it built a page, and each retry read the same
+  rows again. The target did not finish its import, so writes and transaction steps on its keys stayed
+  unavailable. Also when memory was sufficient, the next page read again the rows that the budget had refused:
+  with rows of 100 KiB, each payload was read about 5 times.
+- **What changed:**
+  - `fetchPage` returns an `Iterable`. `collectBatch` counts the rows of each fetch to find the end of the table.
+    A stop at a limit leaves the loop with `break`, which closes the fetch.
+  - `queryItemsPage` and `queryPendingTxPage` are generators. Each one reads and decodes a row only when the
+    collector asks for the next row. The caller reads the generator in one synchronous block, and does not write
+    to the table while it is open.
+  - The overrides stream still gives an array. Its rows hold only a hash key.
+- **Result:** A page reads at most one row past the byte budget, the item cap or the scan cap. The rows that the
+  filter refuses (for example in a hash split) are decoded and released, and they are not kept. Only the row
+  that the budget refuses is read again on the next page.
+- **Tests:** `batch-scan.test.ts` counts the rows that each fetch gives, and checks that each limit stops the read
+  and closes the fetch. `repartition-flow.test.ts` drains a hash split of rows of about 200 KB with a page budget
+  of 1 MiB, and checks the number of pages and that each row arrives once. Miniflare does not apply the isolate
+  memory limit, so no local test shows the original failure.
+- **Not done:**
+  - The source still reads `data` for the rows that the filter refuses. A statement that reads the keys first
+    and `data` only for the rows that match removes this read (fix 3 of X1).
+  - The RPC copies the page when it sends it. The peak memory of the source is therefore a multiple of
+    `migrationPageBytes`. TODO: measure it in Workers before you increase the default.
 
 **F12 — empty hash keys retain their size-estimate rows and index entries (Medium).** **Code + SQL replay.**
 

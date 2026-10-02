@@ -1153,8 +1153,12 @@ export class PartitionStore {
 	 * Row values are only correct because hk/sk are NOT NULL (see the items migration). A NULL on either
 	 * side makes the comparison NULL instead of true, which drops rows silently. A key with no sort key
 	 * stores the empty blob, which is the byte minimum and compares like any other value.
+	 *
+	 * The generator reads and decodes one row each time the caller asks for the next row, so a caller
+	 * that stops early reads no payload past its stop. Read it in one synchronous block, and do not
+	 * write to `items` while it is open.
 	 */
-	queryItemsPage(cursor: ScanCursor | null, limit: number): MigratedItem[] {
+	*queryItemsPage(cursor: ScanCursor | null, limit: number): Generator<MigratedItem> {
 		type Row = {
 			item_id: ItemLinkId;
 			hk: ArrayBuffer;
@@ -1182,17 +1186,15 @@ export class PartitionStore {
 			);
 		}
 
-		const items: MigratedItem[] = [];
 		for (const { data_kind, ...row } of sqlCursor) {
-			items.push({
+			yield {
 				...row,
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				data: fromSqlData(row.data),
 				kind: kindFromCode(data_kind),
-			});
+			};
 		}
-		return items;
 	}
 
 	/**
@@ -1646,8 +1648,11 @@ export class PartitionStore {
 	 * The cursor MUST stay a row-value comparison, for the reason spelled out on queryItemsPage: the
 	 * equivalent nested `hk > ? OR (hk = ? AND (...))` form cannot seek, so each page rescans from the
 	 * start of the hash key. All three key columns are NOT NULL, which is what makes row values correct.
+	 *
+	 * The generator reads one row at a time, as queryItemsPage does, with the same rules for the caller.
+	 * Do not write to `pending_transactions` or `pending_tx_info` while it is open.
 	 */
-	queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): PendingTxItem[] {
+	*queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): Generator<PendingTxItem> {
 		type Row = Omit<PendingTxItem, "hk" | "sk" | "data" | "kind"> & {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
@@ -1675,17 +1680,15 @@ export class PartitionStore {
 			);
 		}
 
-		const rows: PendingTxItem[] = [];
 		for (const { data_kind, ...row } of sqlCursor) {
-			rows.push({
+			yield {
 				...row,
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				data: fromSqlData(row.data),
 				kind: kindFromNullableCode(data_kind),
-			});
+			};
 		}
-		return rows;
 	}
 
 	// ─── deletion_metadata ──────────────────────────────────────────────────

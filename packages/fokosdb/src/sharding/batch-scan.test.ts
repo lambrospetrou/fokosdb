@@ -5,19 +5,30 @@ type Row = { id: number; bytes: number };
 type Cursor = { afterId: number };
 
 // In-memory table keyed by ascending id, paged exactly like the SQL queries:
-// strictly after the cursor, ordered, LIMIT pageSize.
+// strictly after the cursor, ordered, LIMIT pageSize. Each fetch gives its rows one at a time, as
+// the store generators do. `pulled` counts the rows that the scan read, and `closed` counts the
+// fetches that ended, by exhaustion or by a stop of the scan.
 function makeTable(rows: Row[]) {
 	const sorted = [...rows].sort((a, b) => a.id - b.id);
 	const fetchCalls: Array<{ cursor: Cursor | null; pageSize: number }> = [];
+	const stats = { pulled: 0, closed: 0 };
+	function* page(start: number, pageSize: number): Generator<Row> {
+		try {
+			for (const row of sorted.slice(start, start + pageSize)) {
+				stats.pulled++;
+				yield row;
+			}
+		} finally {
+			stats.closed++;
+		}
+	}
 	return {
 		fetchCalls,
-		fetchPage: (cursor: Cursor | null, pageSize: number): Row[] => {
+		stats,
+		fetchPage: (cursor: Cursor | null, pageSize: number): Iterable<Row> => {
 			fetchCalls.push({ cursor, pageSize });
 			const start = cursor === null ? 0 : sorted.findIndex((r) => r.id > cursor.afterId);
-			if (start === -1) {
-				return [];
-			}
-			return sorted.slice(start, start + pageSize);
+			return page(start === -1 ? sorted.length : start, pageSize);
 		},
 	};
 }
@@ -239,6 +250,54 @@ describe("collectBatch", () => {
 		expect(result.rows).toHaveLength(12);
 		// The last fetch asks for the remainder of the cap, not another whole page.
 		expect(table.fetchCalls.map((c) => c.pageSize)).toEqual([10, 2]);
+	});
+
+	it("reads one row past the byte budget and closes the fetch", () => {
+		// The rows after the stop stay unread, so a page never holds payloads that the budget refuses.
+		const table = makeTable(rows(...Array.from({ length: 100 }, (_, i) => [i + 1, 40] as [number, number])));
+		const result = collectBatch({
+			fetchPage: table.fetchPage,
+			advanceCursor,
+			estimateBytes,
+			budgetBytes: 100,
+			pageSize: 100,
+			startCursor: null,
+		});
+		expect(result.rows.map((r) => r.id)).toEqual([1, 2]);
+		expect(table.stats).toEqual({ pulled: 3, closed: 1 });
+	});
+
+	it("reads no row past the item cap and closes the fetch", () => {
+		const table = makeTable(rows(...Array.from({ length: 100 }, (_, i) => [i + 1, 10] as [number, number])));
+		const result = collectBatch({
+			fetchPage: table.fetchPage,
+			advanceCursor,
+			estimateBytes,
+			budgetBytes: 1_000_000,
+			maxItems: 5,
+			pageSize: 100,
+			startCursor: null,
+		});
+		expect(result.rows).toHaveLength(5);
+		expect(result.nextCursor).toEqual({ afterId: 5 });
+		expect(table.stats).toEqual({ pulled: 5, closed: 1 });
+	});
+
+	it("reads no row past the scanned-row cap when the filter rejects every row", () => {
+		const table = makeTable(rows(...Array.from({ length: 100 }, (_, i) => [i + 1, 10] as [number, number])));
+		const result = collectBatch({
+			fetchPage: table.fetchPage,
+			advanceCursor,
+			estimateBytes,
+			include: () => false,
+			budgetBytes: 1_000_000,
+			maxScannedRows: 7,
+			pageSize: 100,
+			startCursor: null,
+		});
+		expect(result.rows).toEqual([]);
+		expect(result.nextCursor).toEqual({ afterId: 7 });
+		expect(table.stats).toEqual({ pulled: 7, closed: 1 });
 	});
 
 	it("starts from a provided startCursor", () => {

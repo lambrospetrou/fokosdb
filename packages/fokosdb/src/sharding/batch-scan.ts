@@ -7,13 +7,19 @@
  *   re-evaluates rows that were already filtered out.
  * - The first matched row is always included even if it alone exceeds the byte budget,
  *   so a single oversized row cannot stall progress.
- * - Scanning stops when a fetched page is shorter than the page size asked for (the table is exhausted).
+ * - Scanning stops when a fetch gives fewer rows than the page size asked for (the table is exhausted).
+ * - The scan reads at most one row past a limit. `fetchPage` gives its rows one at a time, and a
+ *   stop closes the fetch, so a page holds no payload that the budget does not admit.
  * - `nextCursor` is non-null when the byte budget or the item cap stopped the scan. A null
  *   `nextCursor` means the scan reached the end of the table.
  */
 export type CollectBatchOptions<TRow, TCursor> = {
-	/** Fetches the next page of rows strictly after `cursor` (null = from the start). */
-	fetchPage: (cursor: TCursor | null, pageSize: number) => TRow[];
+	/**
+	 * Fetches the next page of rows strictly after `cursor` (null = from the start). Give the rows one
+	 * at a time, for example from a generator over a SQL cursor: the scan stops reading at the first
+	 * limit, and a `break` closes the fetch. An array is also correct, but it holds every row in memory.
+	 */
+	fetchPage: (cursor: TCursor | null, pageSize: number) => Iterable<TRow>;
 	/** Returns the cursor positioned at `row` (resume continues strictly after it). */
 	advanceCursor: (row: TRow) => TCursor;
 	/** Optional row filter; non-matching rows still advance the cursor. */
@@ -61,12 +67,9 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 			reachedLimit = true;
 			break;
 		}
-		const page = fetchPage(cursor, remainingScan);
-		if (page.length === 0) {
-			break;
-		}
-
-		for (const row of page) {
+		let fetched = 0;
+		for (const row of fetchPage(cursor, remainingScan)) {
+			fetched++;
 			if (!include || include(row)) {
 				const rowBytes = estimateBytes(row);
 				if (rows.length > 0 && totalBytes + rowBytes > budgetBytes) {
@@ -92,11 +95,7 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 				break;
 			}
 		}
-		if (reachedLimit) {
-			break;
-		}
-
-		if (page.length < remainingScan) {
+		if (reachedLimit || fetched < remainingScan) {
 			break;
 		}
 	}

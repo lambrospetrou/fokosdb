@@ -142,7 +142,10 @@ describe("PartitionDO - splitting", () => {
 			slice: { kind: "hash_child", childIndex: 0, depth: 1 },
 		});
 		const attempts = async () =>
-			await runInDurableObject(child, (_i: PartitionDO, state: DurableObjectState) => new FokosShardingStore(state.storage).getImport()!.attempts);
+			await runInDurableObject(
+				child,
+				(_i: PartitionDO, state: DurableObjectState) => new FokosShardingStore(state.storage).getImport()!.attempts,
+			);
 
 		// The new import is due, so the request starts a pass. The pull fails because the source has not
 		// cut over, and the import waits for its retry.

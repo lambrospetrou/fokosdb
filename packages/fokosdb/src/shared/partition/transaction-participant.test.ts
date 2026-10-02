@@ -383,7 +383,7 @@ describe("TransactionParticipant - prepare", () => {
 			});
 
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
-			expect(store.queryPendingTxPage(null, 1)[0]).toMatchObject({
+			expect([...store.queryPendingTxPage(null, 1)][0]).toMatchObject({
 				ttl_epoch_utc_seconds: 777,
 				transaction_ts: request.transactionTimestamp,
 				coordinator_json: JSON.stringify(request.coordinator),

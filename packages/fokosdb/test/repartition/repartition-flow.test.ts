@@ -273,7 +273,7 @@ describe("Repartition — initialization and cutover", () => {
 		await root.enter(async ({ source }) => void (await source.sourceStep(T0)));
 		await drainImport(rangeRoot);
 		await rangeRoot.enter(({ store }) => {
-			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
+			expect([...store.queryPendingTxPage(null, 10)]).toEqual([lockRow("alice", "s1"), lockRow("alice", "s2", "tx-late")]);
 			const participant = new TransactionParticipant({
 				store,
 				maxClockSkewMs: () => 0,
@@ -283,7 +283,7 @@ describe("Repartition — initialization and cutover", () => {
 			});
 			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 2, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
 			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
-			expect(store.queryPendingTxPage(null, 10)).toEqual([lockRow("alice", "s1")]);
+			expect([...store.queryPendingTxPage(null, 10)]).toEqual([lockRow("alice", "s1")]);
 		});
 
 		// The completion transaction deletes the copies.
@@ -343,8 +343,8 @@ describe("Repartition — the migration protocol", () => {
 		await cutOver(root);
 
 		const rows = ({ store }: NodeEnv) => ({
-			items: store.queryItemsPage(null, 1_000_000).map(({ hk, sk, data }) => ({ hk, sk, data })),
-			locks: store.queryPendingTxPage(null, 1_000_000).map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
+			items: [...store.queryItemsPage(null, 1_000_000)].map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: [...store.queryPendingTxPage(null, 1_000_000)].map(({ hk, sk, transaction_id }) => ({ hk, sk, transaction_id })),
 		});
 		const source = await root.enter(rows);
 
@@ -396,7 +396,7 @@ describe("Repartition — the migration protocol", () => {
 
 		await childA.enter(({ store, target }) => {
 			expect(target.importState()).toBe("imported");
-			expect(store.queryItemsPage(null, 100).map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2"]);
+			expect([...store.queryItemsPage(null, 100)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2"]);
 		});
 		await childA.enter(({ storage }) => {
 			// The estimate is maintained page by page, from the sizes SQLite measured on each insert, so
@@ -404,9 +404,9 @@ describe("Repartition — the migration protocol", () => {
 			expect(keySizeEstimate(storage, keyA)).toBe(storedBytes(storage, keyA));
 		});
 		await childB.enter(({ store }) => {
-			expect(store.queryItemsPage(null, 100)).toHaveLength(1);
+			expect([...store.queryItemsPage(null, 100)]).toHaveLength(1);
 			// A lock inside the slice follows its key, so commit or cancel can still find it.
-			expect(store.queryPendingTxPage(null, 10).map((r) => r.transaction_id)).toEqual(["tx-b"]);
+			expect([...store.queryPendingTxPage(null, 10)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
 		});
 
 		// The acknowledgements complete the source, which then drops its now-redundant lock copies.
@@ -416,16 +416,16 @@ describe("Repartition — the migration protocol", () => {
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect(store.queryPendingTxPage(null, 10)).toEqual([]);
+			expect([...store.queryPendingTxPage(null, 10)]).toEqual([]);
 			// A split keeps its item rows: only a promotion gives them back.
-			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
+			expect([...store.queryItemsPage(null, 100)]).toHaveLength(3);
 			expect(sharding.getPlanHead("r1")).toBeDefined();
 		});
 
 		await root.enter(({ source, store, sharding }) => {
 			expect(source.sourceCleanupStep()).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
-			expect(store.queryItemsPage(null, 100)).toHaveLength(3);
+			expect([...store.queryItemsPage(null, 100)]).toHaveLength(3);
 			// The final cleanup deletes the plan chain.
 			expect(sharding.getPlanHead("r1")).toBeUndefined();
 			expect(source.sourceCleanupStep()).toBe("idle");
@@ -517,7 +517,7 @@ describe("Repartition — the migration protocol", () => {
 			// A page that arrives now must not put the row back: the record says the import is over, and
 			// the ingest inserts an absent row rather than failing on it.
 			expect(await target.importOnePage()).toBe("idle");
-			expect(store.queryItemsPage(null, 10)).toHaveLength(0);
+			expect([...store.queryItemsPage(null, 10)]).toHaveLength(0);
 		});
 	});
 
@@ -538,7 +538,7 @@ describe("Repartition — the migration protocol", () => {
 			const rec = target.importRecord()!;
 			expect(rec.state).toBe("awaiting_data");
 			expect(rec.cursor).toBeNull();
-			expect(store.queryItemsPage(null, 10)).toHaveLength(0);
+			expect([...store.queryItemsPage(null, 10)]).toHaveLength(0);
 		});
 
 		// A page whose cursor walks back to an earlier phase is refused for the same reason.
@@ -663,7 +663,7 @@ describe("Repartition — promotions", () => {
 		await drainImport(rangeRoot);
 
 		await rangeRoot.enter(({ store }) => {
-			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
+			expect([...store.queryItemsPage(null, 10)].map((r) => KeyCodec.decode(r.sk))).toEqual(["s1", "s2", "s3"]);
 		});
 		await sendAck(rangeRoot);
 
@@ -679,7 +679,7 @@ describe("Repartition — promotions", () => {
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			// Only the promoted key went back; every other key this partition owns stayed.
-			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
+			expect([...store.queryItemsPage(null, 10)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 		});
 	});
 
@@ -709,7 +709,7 @@ describe("Repartition — promotions", () => {
 		await drainImport(rangeRoot);
 		await rangeRoot.enter(({ store }) => {
 			// The payload, the coordinator reference, the timestamps, and the quarantine came across.
-			expect(store.queryPendingTxPage(null, 1_000)).toEqual([...wide, guarded]);
+			expect([...store.queryPendingTxPage(null, 1_000)]).toEqual([...wide, guarded]);
 		});
 		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1));
 
@@ -737,11 +737,11 @@ describe("Repartition — promotions", () => {
 			expect(lockCount(store, "bob")).toBe(1);
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
-			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
+			expect([...store.queryItemsPage(null, 10)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 			expect(lockCount(store, "bob")).toBe(1);
 		});
 		// The target keeps its locks.
-		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 1_000)).toHaveLength(MAX_ITEMS_PER_TX + 1));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 1_000)]).toHaveLength(MAX_ITEMS_PER_TX + 1));
 	});
 
 	it("names each quarantined lock it imports", async () => {
@@ -777,7 +777,7 @@ describe("Repartition — promotions", () => {
 			expect.objectContaining({ transactionId: "tx-bad", coordinatorRef: "not-json", doName: rangeRoot.doName }),
 		]);
 		// The open lock came across with the guarded ones.
-		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(4));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10)]).toHaveLength(4));
 	});
 
 	it("writes one line for each page of a quarantined transaction that spans pages", async () => {
@@ -847,7 +847,53 @@ describe("Repartition — promotions", () => {
 		} finally {
 			logged.mockRestore();
 		}
-		await rangeRoot.enter(({ store }) => expect(store.queryPendingTxPage(null, 10)).toHaveLength(1));
+		await rangeRoot.enter(({ store }) => expect([...store.queryPendingTxPage(null, 10)]).toHaveLength(1));
+	});
+
+	it("stops each page of large rows at the byte budget and resumes after its last row", async () => {
+		// One row is about 200 KB, so a page of 1 MiB holds at most 5 rows of either stream.
+		const c = makeCluster({ runtimeConfig: { migrationPageBytes: 1024 * 1024 } });
+		const root = c.hashNode([0]);
+		const { hashSplitN } = c.base.topology;
+		const large = (i: number) => `${i}-`.padEnd(100_000, "x");
+		await root.enter(({ source, store }) => {
+			for (let i = 0; i < 12; i++) {
+				putItem(store, `k${i % 4}`, `s${i}`, large(i));
+				store.insertPendingLock({ ...lockRow(`l${i % 4}`, `s${i}`, `tx-${i}`), data: large(i) });
+			}
+			source.queue({ kind: "hash_split" });
+		});
+		await cutOver(root);
+
+		const rows = ({ store }: NodeEnv) => ({
+			items: [...store.queryItemsPage(null, 1_000_000)].map(({ hk, sk, data }) => ({ hk, sk, data })),
+			locks: [...store.queryPendingTxPage(null, 1_000_000)].map(({ hk, sk, transaction_id, data }) => ({ hk, sk, transaction_id, data })),
+		});
+		const source = await root.enter(rows);
+
+		for (let childIndex = 0; childIndex < hashSplitN; childIndex++) {
+			const child = await targetNode(c, root, childIndex);
+			const pages = { items: 0, locks: 0 };
+			for (let i = 0; (await child.enter(({ target }) => target.importState())) !== "imported"; i++) {
+				expect(i, `${child.doName}: the import did not finish`).toBeLessThan(50);
+				const before = await child.enter(rows);
+				expect(await child.enter(async ({ target }) => await target.importOnePage())).toBe("progressed");
+				const after = await child.enter(rows);
+				const added = { items: after.items.length - before.items.length, locks: after.locks.length - before.locks.length };
+				expect(added.items).toBeLessThanOrEqual(5);
+				expect(added.locks).toBeLessThanOrEqual(5);
+				pages.items += added.items > 0 ? 1 : 0;
+				pages.locks += added.locks > 0 ? 1 : 0;
+			}
+
+			const owned = ({ hk }: { hk: KeyBytes }) => hashChildIndex(hk, 0, hashSplitN) === childIndex;
+			const imported = await child.enter(rows);
+			expect(imported.items).toEqual(source.items.filter(owned));
+			expect(imported.locks).toEqual(source.locks.filter(owned));
+			// Only the byte budget can split these rows into pages: the row cap is 1000.
+			expect(pages.items).toBe(Math.ceil(imported.items.length / 5));
+			expect(pages.locks).toBe(Math.ceil(imported.locks.length / 5));
+		}
 	});
 
 	it("hands a finished promotion to the hash child that inherits the key, with no item copy", async () => {
@@ -883,7 +929,7 @@ describe("Repartition — promotions", () => {
 				targetIndex: 0,
 			});
 			// The data lives in a range tree that neither partition owns, so no item copy came with it.
-			expect(store.queryItemsPage(null, 10).map((r) => KeyCodec.decode(r.hk))).toEqual([plain]);
+			expect([...store.queryItemsPage(null, 10)].map((r) => KeyCodec.decode(r.hk))).toEqual([plain]);
 		});
 	});
 

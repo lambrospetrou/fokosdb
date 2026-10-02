@@ -12,6 +12,7 @@ import {
 	PartitionStore,
 	queryScanStatement,
 	type ItemLinkId,
+	type MigratedItem,
 	type ScanCursor,
 	type SqlMetrics,
 	type StoredItem,
@@ -266,12 +267,12 @@ describe("PartitionStore - items", () => {
 			] as const) {
 				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			const page1 = store.queryItemsPage(null, 2);
+			const page1 = [...store.queryItemsPage(null, 2)];
 			expect(page1.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([
 				["a", "1"],
 				["a", "2"],
 			]);
-			const page2 = store.queryItemsPage({ hk: kb("a"), sk: kb("2") }, 2);
+			const page2 = [...store.queryItemsPage({ hk: kb("a"), sk: kb("2") }, 2)];
 			expect(page2.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([["b", "1"]]);
 		});
 	});
@@ -294,7 +295,7 @@ describe("PartitionStore - items", () => {
 			const seen: string[] = [];
 			let cursor: { hk: KeyBytes; sk: KeyBytes } | null = null;
 			for (;;) {
-				const page = store.queryItemsPage(cursor, 1);
+				const page: MigratedItem[] = [...store.queryItemsPage(cursor, 1)];
 				if (page.length === 0) {
 					break;
 				}
@@ -395,7 +396,7 @@ describe("PartitionStore - items", () => {
 			// The migration writer carries the formula independently of upsertItem — both must agree.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
-			const migrated = store.queryItemsPage(null, 10)[0];
+			const migrated = [...store.queryItemsPage(null, 10)][0];
 			store.insertItemIfAbsent({ ...migrated, item_id: linkId(migrated.item_id + 1), sk: kb("j2") });
 			// Same row under a longer sk: the only difference must be octet_length(sk).
 			expect(readEst("j2")).toBe(readEst("j")! - kb("j").byteLength + kb("j2").byteLength);
@@ -684,7 +685,7 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// Migration-style read: no json() decode, so json data is the raw JSONB blob.
-			const migrated = store.queryItemsPage(null, 10)[0];
+			const migrated = [...store.queryItemsPage(null, 10)][0];
 			expect(migrated.kind).toBe("json");
 			expect(migrated.data).toBeInstanceOf(Uint8Array);
 
@@ -909,7 +910,7 @@ describe("PartitionStore - items", () => {
 				last_read_ts: 1,
 				last_write_ts: 1,
 			});
-			const rows = () => store.queryItemsPage(null, 10).map((r) => ({ item_id: r.item_id, data: r.data }));
+			const rows = () => [...store.queryItemsPage(null, 10)].map((r) => ({ item_id: r.item_id, data: r.data }));
 
 			store.insertItemIfAbsent(copied(1000, "a", "first"));
 			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
@@ -1203,7 +1204,7 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(row);
 
 			expect(store.listPendingTxItems(row.transaction_id)[0].ttl_epoch_utc_seconds).toBe(777);
-			expect(store.queryPendingTxPage(null, 1)[0].ttl_epoch_utc_seconds).toBe(777);
+			expect([...store.queryPendingTxPage(null, 1)][0].ttl_epoch_utc_seconds).toBe(777);
 		});
 	});
 
@@ -1316,9 +1317,9 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(lockRow("a", "1", "tx2"));
 			store.insertPendingLock(lockRow("a", "1", "tx1"));
 			store.insertPendingLock(lockRow("b", "1", "tx3"));
-			const page1 = store.queryPendingTxPage(null, 2);
+			const page1 = [...store.queryPendingTxPage(null, 2)];
 			expect(page1.map((r) => r.transaction_id)).toEqual(["tx1", "tx2"]);
-			const page2 = store.queryPendingTxPage({ hk: kb("a"), sk: kb("1"), transaction_id: "tx2" }, 2);
+			const page2 = [...store.queryPendingTxPage({ hk: kb("a"), sk: kb("1"), transaction_id: "tx2" }, 2)];
 			expect(page2.map((r) => r.transaction_id)).toEqual(["tx3"]);
 		});
 	});

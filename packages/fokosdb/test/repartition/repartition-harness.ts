@@ -307,7 +307,7 @@ export function lockRow(hk: string, sk: string, transactionId = "tx-1"): Pending
 
 /** The number of lock rows under one hash key in a node's store. */
 export function lockCount(store: PartitionStore, hk: string): number {
-	return store.queryPendingTxPage(null, 1_000_000).filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
+	return [...store.queryPendingTxPage(null, 1_000_000)].filter((row) => KeyCodec.compare(row.hk, kb(hk)) === 0).length;
 }
 
 /** The running size estimate of one hash key, which the import maintains page by page. */
