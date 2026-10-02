@@ -18,6 +18,35 @@ export const RPC_MESSAGE_MAX_BYTES = 20 * 1024 * 1024;
 export const PROMOTION_BLOOM_MAX_BYTES = 1.5 * 1024 * 1024;
 
 /**
+ * The default number of keys in the first layer of the promotion Bloom filter.
+ *
+ * Each new layer holds 2x the keys of the layer before it, at half its false positive rate. The filter
+ * does not add a layer that makes it larger than `PROMOTION_BLOOM_MAX_BYTES`. At a 1% false positive
+ * rate (`tools/bloom-filter-sizing.js`):
+ *
+ *   First layer │ Layers │ First layer size │ Size when full │ Most keys
+ *   ────────────┼────────┼──────────────────┼────────────────┼──────────
+ *            1K │      9 │           1.3 KB │        1.29 MB │   511,000
+ *            2K │      8 │           2.7 KB │        1.20 MB │   510,000
+ *            4K │      7 │           5.4 KB │        1.11 MB │   508,000
+ *            8K │      6 │          10.8 KB │        1.02 MB │   504,000
+ *           16K │      5 │          21.5 KB │       943.8 KB │   496,000
+ *           32K │      4 │          43.1 KB │       837.8 KB │   480,000
+ *           64K │      3 │          86.2 KB │       715.8 KB │   448,000
+ *          128K │      3 │         172.3 KB │        1.40 MB │   896,000
+ *          256K │      2 │         344.6 KB │        1.10 MB │   768,000
+ *          300K │      2 │         403.8 KB │        1.29 MB │   900,000
+ *          512K │      1 │         689.2 KB │       689.2 KB │   512,000
+ *
+ * 128K holds almost as many keys as the largest option (300K), with a first layer of less than half
+ * the size. The runtime writes the whole filter each time it learns a new promoted key, and reads it
+ * whole at each start. In local workerd, one write costs about 3.5 ms at all sizes from 1.3 KB to
+ * 1.3 MB, so the size has a small effect there. In production, the commit also waits for replication,
+ * which can take longer for a large write, and then a smaller first layer helps. A lookup of a key that is not in the filter checks all layers, at about 130 ns each.
+ */
+export const PROMOTION_BLOOM_DEFAULT_EXPECTED_KEYS = 128_000;
+
+/**
  * Words that the comments below use:
  *
  * - Background work: the split and migration steps and the host jobs. The runtime runs them after a
@@ -135,7 +164,7 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	hashArenaBytes: 1024 * 1024,
 	rangeHierarchyMaxRows: 10_000,
 	rangeHierarchyRefreshMs: 60_000,
-	promotionBloomExpectedKeys: 300_000,
+	promotionBloomExpectedKeys: PROMOTION_BLOOM_DEFAULT_EXPECTED_KEYS,
 	promotionBloomFalsePositiveRate: 0.01,
 	maxForwardRetries: 8,
 	sourceRetryBaseMs: 5_000,

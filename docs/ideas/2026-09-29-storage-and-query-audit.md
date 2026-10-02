@@ -32,6 +32,8 @@ says how it was checked:
 - **Code, not run:** follows from the code path, but a test must confirm it.
 - **Collector:** the production `collectBatch` ran with logical row sizes, without payload allocation.
 - **SQL replay:** the current statements ran against the matching schema in SQLite 3.45.1.
+- **Local benchmark:** a test Worker ran in local workerd (`wrangler dev`, SQLite-backed DO, state on disk). It
+  does not include the replication of a production commit.
 
 ## 2. Summary
 
@@ -52,7 +54,7 @@ says how it was checked:
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
-| R7 | Runtime | The Bloom filter (~360 KB) is written whole each time the partition learns one promoted key | Medium | Optional |
+| R7 | Runtime | Decided: keep one KV value; the default first layer is now 128K. The Bloom filter (~172 KB) is written whole each time the partition learns one promoted key; the write costs ~3.5 ms locally at any size | Medium | No |
 
 ----
 
@@ -77,8 +79,8 @@ You must decide these now, also when the answer is "no":
 7. R11: done. The route context carries a policy version.
 8. C2 keeps one route context for each participant, for transactions across tables. K3 is decided: no change. R9 is postponed, and it does
    not depend on the freeze (see R9).
-9. R7 (paged Bloom filter) does not depend on the freeze. The filter is a cache, so its storage can change at any
-   time.
+9. R7: decided, no paged Bloom filter. Each row written has a cost, so the filter stays one KV value. The filter is
+   a cache, so its storage can change at any time.
 
 Priority 4: cost and background work (no schema change)
 
@@ -232,18 +234,73 @@ My recommendation: do F5 next.
   removed the path to the key, it reads every learned slice between the covering slice and the key (536 µs, ~5,000
   rows in the gap case above).
 
-**R7 — the Bloom filter is written as one KV value (Medium).** **Code.**
+**R7 — decided: the Bloom filter stays one KV value with a 128K first layer (Medium).** **Code + Local
+benchmark.**
 
-- **What happens:** The runtime writes about 360 KB (300k keys at 1 %) each time a hash partition learns one new
-  promoted key (`sharding/runtime.ts:1792`). The output gate of that request waits for the write. The runtime also
-  reads the whole value at each start of the DO.
-- **Example:** A router learns 2,000 promoted keys: about 720 MB of writes over its life.
-- **Fix without a schema change:** The Bloom filter is a cache, so write it with a delay: mark it dirty and write
-  it at most once per interval. A crash loses only hints, which cost one more hop.
-- **Fix with a schema change:** Store the bits as 4 KB pages in a table, and write only the ≤ k pages that changed
-  (k = 7 at 1 %).
-- **No freeze date:** The filter is a cache. A later version can delete the old KV key and learn the promoted keys
-  again. Until it learns a key, a request to that key costs one more forward.
+- **What happens:** `#learn` writes the whole filter each time a hash partition learns at least one new promoted
+  key (`sharding/runtime.ts:1905`). One `#learn` call writes once, also when it learns many keys. A key that the
+  filter already holds causes no write. The output gate of that request waits for the write. The runtime also
+  reads the whole value at each start of the DO (K7).
+- **Size:** the default first layer holds 128,000 keys (`PROMOTION_BLOOM_DEFAULT_EXPECTED_KEYS`). It held
+  300,000 keys before. Layer i uses the error rate `1 % × 0.5^(i+1)`, so the first layer uses 0.5 %: 172.3 KB
+  and k = 8.
+- **Example:** A router learns 2,000 promoted keys: 2,000 writes of 172.3 KB, about 340 MB over its life. With
+  the earlier 300K first layer, it was 2,000 writes of 403.8 KB, about 790 MB.
+- **Layers for each first-layer size** (`tools/bloom-filter-sizing.js`, the 1.5 MB limit of
+  `PROMOTION_BLOOM_MAX_BYTES`). `BloomFilter.add` does not create a layer that goes above the limit; it returns
+  `Full`.
+
+  | First layer | Layers | First layer size | Size when full | Most keys |
+  |---|---|---|---|---|
+  | 1K | 9 | 1.3 KB | 1.29 MB | 511,000 |
+  | 2K | 8 | 2.7 KB | 1.20 MB | 510,000 |
+  | 4K | 7 | 5.4 KB | 1.11 MB | 508,000 |
+  | 8K | 6 | 10.8 KB | 1.02 MB | 504,000 |
+  | 16K | 5 | 21.5 KB | 943.8 KB | 496,000 |
+  | 32K | 4 | 43.1 KB | 837.8 KB | 480,000 |
+  | 64K | 3 | 86.2 KB | 715.8 KB | 448,000 |
+  | **128K (default)** | 3 | 172.3 KB | 1.40 MB | 896,000 |
+  | 256K | 2 | 344.6 KB | 1.10 MB | 768,000 |
+  | 300K | 2 | 403.8 KB | 1.29 MB | 900,000 |
+  | 512K | 1 | 689.2 KB | 689.2 KB | 512,000 |
+
+- **Cost of more layers (measured, Node 24, `BloomFilter.has`):** a key that is not in the filter checks every
+  layer. Each layer costs about 130 ns, most of it for the two `xxhash-wasm` calls. With 9 layers, one lookup
+  costs about 1.25 µs. This is less than 1 % of a request.
+- **Cost of the size (Local benchmark):** the stored value has the shape of `BloomFilterSnapshot` with random
+  bits. Each put changes one byte and writes the whole value again. Values are p50 round trips, from 300
+  requests for each row. The cost of the operation is the time above the empty request.
+
+  | Size | Empty request | 1 get | 1 put |
+  |---|---|---|---|
+  | 1.3 KB | 10.9 ms | 11.2 ms | 14.4 ms |
+  | 5.4 KB | 10.9 ms | 11.3 ms | 14.3 ms |
+  | 21.5 KB | 10.9 ms | 11.4 ms | 14.7 ms |
+  | 86.2 KB | 10.5 ms | 11.4 ms | 15.1 ms |
+  | 178.9 KB | 10.7 ms | 11.7 ms | 14.5 ms |
+  | 236.0 KB | 10.9 ms | 11.0 ms | 14.8 ms |
+  | 284.0 KB | 10.4 ms | 11.8 ms | 14.3 ms |
+  | 403.8 KB | 11.1 ms | 11.8 ms | 15.1 ms |
+  | 1.32 MB | 10.4 ms | 12.1 ms | 14.9 ms |
+
+  - One put adds about 3.5–4 ms at all sizes. The differences between sizes are smaller than the noise
+    (about ±0.5 ms). The commit of the request costs most of the time, not the bytes.
+  - One get adds about 0.3–1.7 ms, and it grows a little with the size.
+  - 50 operations in one request show the part that grows with the size, because SQLite commits once. Each put
+    costs about 0.25 ms at 1.3 KB, 0.37 ms at 403.8 KB and 0.61 ms at 1.32 MB. Each get costs about 0.19 ms,
+    0.26 ms and 0.58 ms.
+  - The timer in the DO does not move during a request, so the benchmark measures from the client.
+- **Not measured:** the replication of a production commit, which can take longer for a larger value. Also not
+  measured: a get from a cold start (K7). All gets in the benchmark found the pages in memory.
+- **Decision:** use a 128K first layer. It holds 896,000 keys, almost as many as 300K (900,000), and its first
+  layer is less than half the size. Locally the size saves less than 1 ms on each write, but a smaller write can
+  help when production replication is slow. A filter that exists keeps its stored sizes, because `fromSnapshot`
+  reads them.
+- **Rejected: the bits in 4 KB rows.** Each row written has a cost, so one learned key would write up to k rows
+  in place of one.
+- **Open, no schema change:** write the filter with a delay. Mark it dirty and write it at most once per
+  interval. This is the only change that writes fewer rows. A crash loses only the keys learned after the last
+  write, and each of those keys costs one more forward until the partition learns it again.
 - **Hash arena:** It uses the same pattern, but it is small and changes seldom (Low).
 
 **R11 — done: policy "last writer wins" could write on every request (Low–Medium).** **Code + test.**
@@ -357,7 +414,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokos/import` | runtime | a few hundred B; up to ~3 KB with a cursor of large keys | each migration page, retry, start and acknowledgement | 1 time per request (`#dispatch`), 2 times per pass (two job deadlines), `lifecycle()`, and each log line (`#logParams`) |
 | `__fokos/jobs` | runtime | a small record | after a job step that changes it; `scheduleJob` when the new time is earlier | 2 times per pass, and in each `scheduleJob`: each accepted `txPrepare`, each coordinator `initiateWrite`, and each completed coordinator transaction |
 | `__fokos/cache/hash_arena` | runtime | ≤ 1 MB | when the tree it learns grows | once, at the first forward |
-| `__fokos/cache/promotion_bloom` | runtime | ~360 KB at the defaults | each new promoted key it learns (R7) | each start, whole |
+| `__fokos/cache/promotion_bloom` | runtime | ~172 KB at the defaults, up to 1.40 MB | each new promoted key it learns (R7) | each start, whole |
 | `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
 
 **K1 — done: the host keys have one prefix. A new naming scheme does not make a read faster (no change needed for speed).**
@@ -423,12 +480,14 @@ size of a value does not change the bill. The limit for a key and its value toge
 - One record for all jobs is the right shape: the jobs are few, and the scheduler reads all of them together.
 - **Not done:** a copy in memory can go out of date when a host transaction rolls back a write. See R4.
 
-**K7 — the Bloom filter is read whole at each start (Low–Medium).** **Code.**
+**K7 — the Bloom filter is read whole at each start (Low–Medium).** **Code + Local benchmark.**
 
-- The constructor reads and deserializes the whole value (~360 KB at the defaults) inside `blockConcurrencyWhile`.
-  So the first request of each hash partition that ever learned a promoted key waits for it.
-- The paged storage of R7 also fixes this: a lookup tests k bits (k = 7 at 1 %), so it needs at most k pages of
-  4 KB, and the object can read a page when a lookup first needs it.
+- The constructor reads and deserializes the whole value (~172 KB at the defaults, up to 1.40 MB) inside
+  `blockConcurrencyWhile`. So the first request of each hash partition that ever learned a promoted key waits for
+  it.
+- In the local benchmark of R7, a warm get costs about 1.0 ms more than an empty request at 178.9 KB, and about
+  1.7 ms more at 1.32 MB. A get from a cold start was not measured.
+- No change: R7 keeps the filter as one KV value, so the read stays whole.
 - A lazy read of the whole value helps less. Each request on a hash partition asks the filter, so the first request
   pays the same cost. Only control calls, for example `fokosStatus`, would skip it.
 
@@ -942,12 +1001,13 @@ The SQL migrations can still be edited in place.
   - F5: the delete buckets. The migration page must also carry the buckets, so a later change must accept pages
     of the old format during a deploy.
 - **Breaking, not tied to the freeze:**
-  - R7: paged Bloom storage. The filter is a cache, and a later version can learn it again.
   - R9: postponed. Finished promotions as override rows only. A `LEFT JOIN` reads both forms, and the marker `''`
     needs no schema change.
 - **Decided, no change:** C2 keeps `tc_participants.partition_context_json` for each participant. The fields
-  that repeat the DO name can go later, with no schema change.
-- **No schema change:** R3, R4 (and K2), R6, R8, R10, X1, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6.
+  that repeat the DO name can go later, with no schema change. R7 keeps the Bloom filter as one KV value, because
+  a filter in pages writes more rows.
+- **No schema change:** R3, R4 (and K2), R6, R7 (and K7), R8, R10, X1, F1, F3, F7, F11, F12, F13, C2, C4, C5 and
+  K6.
 
 ## 7. What was checked and is fine
 
