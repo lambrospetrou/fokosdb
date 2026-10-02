@@ -1,8 +1,8 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
-destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
-partition has no override). Decided, no change: F6 and K3. Skipped: C3. Postponed: R9. The other findings are not decided
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, C1, C5, X1, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
+destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
+the `split_bucket` column of X1. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
 **Updated:** 2026-10-02.
@@ -40,7 +40,7 @@ says how it was checked:
 | F1 | FokosDB | Done. A promotion or a range split read the whole source table, including `data`, for each target. A promoted key was not available for writes during that time | High | No |
 | F11 | FokosDB | Done. Migration fetched payload arrays before the byte budget; a default fetch could hold about 390 MiB | High | No |
 | C5 | FokosDB (TC) | Done. One PREPARING transaction could exceed the 32 MiB migration RPC limit and stop an import | High | No |
-| X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
+| X1 | Cross | Done. A hash split read the whole source once for each child, with a per-row hash and a per-row JOIN | High | No (decided) |
 | X2 | Cross | Done. The stale-lock job could run again every ~50 ms, and a slow step blocked the split and import jobs | High | Done with F4 |
 | C1 | FokosDB (TC) | Done. `tx_recovery` did a full scan and sort of `tc_state` every 5 s | High | Additive index |
 | F5 | FokosDB | One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
@@ -61,7 +61,7 @@ The next most important items are the ones that can stop an import. A stuck impo
 Priority 1: stuck imports (availability)
 
 1. F11: done. The store queries give the migration rows one at a time, and the byte budget stops the SQL read.
-2. F1: done. A promotion and a range split read only the key range of their slice, with the same generators as F11. The X1 fixes that need no schema change are still open (see X1).
+2. F1: done. A promotion and a range split read only the key range of their slice, with the same generators as F11. X1 is done: a hash child walks the source one hash key at a time.
 3. C5: done. The coordinator applies the combined image cap when it stores each prepare answer, so one transaction stays below the RPC limit.
 
 Priority 2: correctness under load (and cheapest now)
@@ -72,7 +72,7 @@ Priority 3: schema decisions before the freeze
 
 You must decide these now, also when the answer is "no":
 
-5. X1 split_bucket: you can add it now or never.
+5. X1 split_bucket: decided, no column. The hash-key walk gives most of the gain with no schema change (see X1).
 6. C3: skipped. The measured gain is small (see C3).
 7. R11: done. The route context carries a policy version.
 8. C2 keeps one route context for each participant, for transactions across tables. K3 is decided: no change. R9 is postponed, and it does
@@ -89,7 +89,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: do F5 next. Before you edit the migrations in place, make the decision on X1.
+My recommendation: do F5 next.
 
 
 ## 3. Sharding runtime
@@ -434,8 +434,8 @@ size of a value does not change the bill. The limit for a key and its value toge
   - The lock cursor stays a row value on `(sk, transaction_id)` after `hk = ?`, because two locks on one key can
     be on the two sides of a page boundary.
   - `buildPage` calls `sliceKeyRange(slice)` once and gives the range to both streams. A promoted key reads
-    `[empty sort key, last row of the key]`. A range slice reads `[start, end)`. A hash child gets null and reads
-    the whole table (X1). `belongsToTarget` still filters each row for all kinds.
+    `[empty sort key, last row of the key]`. A range slice reads `[start, end)`. A hash child gets null, and X1
+    gives it the hash-key walk. `belongsToTarget` filters each row of a promoted key and of a range slice.
   - Old cursors get no special handling. An import that is in progress during the deploy can skip rows. This is
     accepted before the release.
 - **Plans** (`EXPLAIN QUERY PLAN` in workerd, exact text; SQLite shows `sk>?` also for `sk >= ?`):
@@ -620,8 +620,7 @@ each cycle, but locks are few.
   of 1 MiB, and checks the number of pages and that each row arrives once. Miniflare does not apply the isolate
   memory limit, so no local test shows the original failure.
 - **Not done:**
-  - The source still reads `data` for the rows that the filter refuses. A statement that reads the keys first
-    and `data` only for the rows that match removes this read (fix 3 of X1).
+  - Done with X1: a hash child reads no `data` for the rows of a key that it does not own.
   - The RPC copies the page when it sends it. The peak memory of the source is therefore a multiple of
     `migrationPageBytes`. TODO: measure it in Workers before you increase the default.
 
@@ -777,28 +776,63 @@ wait behind it (see X2).
 
 ## 5. Issues that cross both layers
 
-**X1 — a hash split reads the whole source once for each child (High).** **Code.**
+**X1 — done: a hash split read the whole source once for each child (High).** **Code + Plan + test.**
 
-- **What happens:**
+- **What happened:**
   - Only a JS hash of `hk` at the partition depth gives the child index. `items` is ordered by `(hk, sk)`, so a
-    child finds its rows only when the source reads every row, with `data`.
-  - `belongsToTarget` (`sharding/repartition-flow.ts`) runs `hasTerminalRouteOverride`, a JOIN, for each row.
-    The override flag of R4 skips the JOIN when the partition has no override, which includes the coordinator.
-- **Example:** A 1 GB partition has 10M rows and `hashSplitN = 4`. The source reads about 4 GB, and runs 40M hashes
-  and 40M JOINs. It builds each page synchronously, with up to 10k scanned rows.
-- **Still the case after F1:** A hash child has no key range, so `buildPage` gives the store a null range. The
-  child reads the whole table through the same generators as a promotion and a range split, and
-  `belongsToTarget` filters each row.
-- **Fix without a schema change:**
-  1. Keep the answer for the last hash key. Rows arrive in `hk` order, so there is one hash and one lookup per key.
-  2. Skip the JOIN when the partition has no finished override. Done for a partition with no override at all (R4).
-     A partition that holds an override that is not finished still runs the JOIN for each row.
-  3. Read the keys from `idx_items_scan` first, and read `data` only for the rows that match.
-- **Fix with a schema change (now or never):** Add a column `split_bucket = hashChildIndex(hk, depth, hashSplitN)`,
-  computed on insert, and put it first in both key indexes: `UNIQUE(split_bucket, hk, sk)`. Each child's rows are
-  then one index range. A child computes the column again for its own depth when it imports a row. A range
-  partition stores 0. The cost is one hash for each write and one byte for each index entry, and each point and
-  range query adds `split_bucket = ?`.
+    child found its rows only when the source read every row, with `data`.
+  - `belongsToTarget` (`sharding/repartition-flow.ts`) ran a hash and `hasTerminalRouteOverride`, a JOIN, for each
+    row.
+  - After F1, a hash child still had no key range, so `buildPage` gave the store a null range, and the child read
+    the whole table.
+- **Example:** A 1 GB partition has 10M rows and `hashSplitN = 4`. The source read about 4 GB, and ran 40M hashes
+  and 40M JOINs.
+- **Why it matters for availability:** A hash child that imports answers each write on its keys with
+  `partition_migrating` until the import ends. With `hashSplitN = 4`, that is 1/4 of the keys of the source.
+- **What changed: the hash-key walk.**
+  - `PartitionStore.walkItemsByHashKey` (`shared/partition/partition-store.ts`) walks `items` one hash key at a
+    time. `nextHashKeyStatement` finds the first row of the next key with one seek:
+    `SELECT hk, sk FROM items WHERE hk > ? ORDER BY hk, sk LIMIT 1`.
+  - The walk asks the ownership function one time for each hash key, with the first row of the key. A hash-child
+    slice owns whole hash keys, so that answer is correct for each row of the key. The hash and the override
+    JOIN therefore run one time for each key, not for each row.
+  - For an owned key, the walk reads the rows with the range statement of F1 (`hk = ? AND sk >= ?`). For a key
+    that it does not own, it gives one `skipped` entry and reads no `data`.
+  - The cursor is `(hk, sk)`. A null `sk` means "after every row of `hk`", so a page can stop after a skipped key.
+    A page can also stop inside an owned key, and the next page continues with `hk = ? AND sk > ?`.
+  - A skipped key counts as one scanned entry, so `migrationScanRows` also stops a long run of keys that the child
+    does not own.
+  - `FokosMigrationHost` (`shared/partition/fokos-migration-host.ts`) uses the walk when the slice has no key
+    range, which is only a hash child. A promoted key and a range slice keep the F1 read.
+  - Old cursors get no special handling, as in F1.
+- **Rejected: `SELECT DISTINCT hk … LIMIT 100`.** SQLite reads each index entry of each key for DISTINCT, and does
+  not skip. Replay in SQLite 3.45.1 with 200 keys of 10k rows: 100 keys with DISTINCT took 33 ms, and 100 seeks
+  took 0.3 ms. The two plans have the same text, `SEARCH … COVERING INDEX … (hk>?)`.
+- **Rejected: `key_size_estimates` as the list of hash keys.** It has one row for each key, but no schema rule
+  keeps it equal to `items`. Promotion completion deletes the estimate of the promoted key before the cleanup
+  deletes its rows. A future write path that forgets the estimate would make a split lose rows with no error. The
+  seeks on the items index read the real rows, at the same cost.
+- **Rejected: a `split_bucket` column.** It puts `hashChildIndex(hk, depth, hashSplitN)` first in the key indexes,
+  so the rows of each child are one index range. It repeats one value for each row, but the walk needs it one time
+  for each key. Each write and each query must compute it. `UNIQUE(split_bucket, hk, sk)` also stops the schema
+  from enforcing a unique `(hk, sk)`: a write with a wrong bucket makes a second row for one key. After the walk,
+  the bucket only saves one seek for each key of a sibling.
+- **Result:** Each child reads the `data` of its own rows one time. For each key of a sibling, it does one seek.
+  The number of pages does not change, because `migrationPageRows` limits each page.
+- **Tests:**
+  - `partition-store.test.ts`, "the hash-key walk gives each row of an owned key, one entry for each other key,
+    and continues after its cursor": one ownership call for each key, the limit inside an owned key, and a cursor
+    after a skipped key.
+  - "the next-key seek reads one index entry, also after a key with many rows": the plan is a covering seek on
+    `hk>?`, and `rowsRead` is 1 after a key of 500 rows.
+  - `repartition-flow.test.ts`, "lets a hash child step past each hash key of a sibling with one scanned entry":
+    with `migrationScanRows: 5`, a child with 6 rows next to 10 sibling keys of 100 rows imports in 4 item pulls.
+    Before the change, the import did not finish in 50 pulls.
+- **Not done:**
+  - The lock stream still reads the whole `pending_transactions` table for a hash child. Locks are few.
+  - `migrationScanRows` stays 10,000. A skipped key now costs one seek, so a higher limit can be correct. Change it
+    one time for all streams and for the coordinator, after a measurement in workerd of how long one page blocks
+    the source.
 
 **X2 — done: a job's own deadline can make it run without pause (High).**
 
@@ -842,8 +876,7 @@ wait behind it (see X2).
 The SQL migrations can still be edited in place.
 
 - **Breaking:**
-  - X1: `split_bucket`, if it is wanted. Now or never: a later change must rewrite each row and both key indexes
-    of every partition.
+  - X1: decided, no `split_bucket`. The hash-key walk needs no schema change.
   - R11: done, a policy version in the route context.
 - **Additive, but cheapest now:**
   - F5: the delete buckets. The migration page must also carry the buckets, so a later change must accept pages
@@ -854,7 +887,7 @@ The SQL migrations can still be edited in place.
     needs no schema change.
 - **Decided, no change:** C2 keeps `tc_participants.partition_context_json` for each participant. The fields
   that repeat the DO name can go later, with no schema change.
-- **No schema change:** R3, R4 (and K2), R6, R8, R10, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6.
+- **No schema change:** R3, R4 (and K2), R6, R8, R10, X1, F1, F3, F7, F11, F12, F13, C2, C4, C5 and K6.
 
 ## 7. What was checked and is fine
 

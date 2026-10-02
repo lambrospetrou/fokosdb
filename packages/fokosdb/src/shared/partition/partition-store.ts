@@ -203,6 +203,15 @@ export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 /** One hash key, and its sort keys from `start` (inclusive) to `end` (exclusive; null = to the last row of the key). */
 export type KeyRange = { hk: KeyBytes; start: KeyBytes; end: KeyBytes | null };
 
+/**
+ * The position of `walkItemsByHashKey`. The walk continues strictly after `(hk, sk)`. A null `sk`
+ * means after every row of `hk`: the walk skipped that hash key.
+ */
+export type HashKeyWalkCursor = { hk: KeyBytes; sk: KeyBytes | null };
+
+/** One entry of `walkItemsByHashKey`: a row of an owned hash key, or one hash key that the walk skipped. */
+export type HashKeyWalkEntry = { kind: "item"; item: MigratedItem } | { kind: "skipped"; hk: KeyBytes };
+
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
 	hk: KeyBytes;
@@ -445,6 +454,16 @@ export function itemsPageStatement(cursor: ScanCursor | null, limit: number, ran
 		sql: `SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ${where}ORDER BY hk, sk LIMIT ?`,
 		params: [...params, limit],
 	};
+}
+
+/**
+ * The SQL that finds the first row of the next hash key after `after` (null = the first key of the
+ * table). It is one seek on a key index, and it reads one index entry, also when `after` has many rows.
+ */
+export function nextHashKeyStatement(after: KeyBytes | null): { sql: string; params: unknown[] } {
+	return after === null
+		? { sql: `SELECT hk, sk FROM items ORDER BY hk, sk LIMIT 1`, params: [] }
+		: { sql: `SELECT hk, sk FROM items WHERE hk > ? ORDER BY hk, sk LIMIT 1`, params: [after] };
 }
 
 /**
@@ -1259,6 +1278,55 @@ export class PartitionStore {
 				data: fromSqlData(row.data),
 				kind: kindFromCode(data_kind),
 			};
+		}
+	}
+
+	/**
+	 * Walks `items` one hash key at a time, strictly after `cursor`, for a read whose rows are not one
+	 * key range (a hash child). `owns` decides each hash key one time, from its first row. The walk
+	 * gives each row of an owned key. For a key that it does not own, it gives one `skipped` entry: one
+	 * seek on the key index steps past all the rows of that key, and reads no `data`.
+	 *
+	 * Do NOT find the next hash key with `SELECT DISTINCT hk ... LIMIT ?`. SQLite reads each index entry
+	 * of each key for DISTINCT, and does not skip. The walk does one `hk > ?` seek for each key.
+	 *
+	 * `limit` counts the entries of both kinds, so the scan limit of a caller also stops a run of keys
+	 * that it does not own. The walk gives fewer than `limit` entries only at the end of the table. The
+	 * caller rules of `queryItemsPage` apply.
+	 */
+	*walkItemsByHashKey(
+		cursor: HashKeyWalkCursor | null,
+		limit: number,
+		owns: (hk: KeyBytes, firstSk: KeyBytes) => boolean,
+	): Generator<HashKeyWalkEntry> {
+		let given = 0;
+		if (cursor !== null && cursor.sk !== null) {
+			// The cursor stops on a row only inside an owned key, so the rest of that key is owned.
+			const rest = this.queryItemsPage({ hk: cursor.hk, sk: cursor.sk }, limit, { hk: cursor.hk, start: cursor.sk, end: null });
+			for (const item of rest) {
+				given++;
+				yield { kind: "item", item };
+			}
+		}
+		let after = cursor?.hk ?? null;
+		while (given < limit) {
+			const { sql, params } = nextHashKeyStatement(after);
+			const first = tryOne(this.#storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params));
+			if (first === undefined) {
+				return;
+			}
+			const hk = fromSqlKey(first.hk);
+			const firstSk = fromSqlKey(first.sk);
+			if (owns(hk, firstSk)) {
+				for (const item of this.queryItemsPage(null, limit - given, { hk, start: firstSk, end: null })) {
+					given++;
+					yield { kind: "item", item };
+				}
+			} else {
+				given++;
+				yield { kind: "skipped", hk };
+			}
+			after = hk;
 		}
 	}
 

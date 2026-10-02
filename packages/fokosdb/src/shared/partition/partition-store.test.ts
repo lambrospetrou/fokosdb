@@ -10,9 +10,12 @@ import {
 	estimateItemBytes,
 	estimateProjectedRowBytes,
 	itemsPageStatement,
+	nextHashKeyStatement,
 	PartitionStore,
 	pendingTxPageStatement,
 	queryScanStatement,
+	type HashKeyWalkCursor,
+	type HashKeyWalkEntry,
 	type ItemLinkId,
 	type KeyRange,
 	type MigratedItem,
@@ -1710,6 +1713,74 @@ describe("PartitionStore - migration pages", () => {
 				"b/t",
 			]);
 			expect(pairs(store.queryItemsPage({ hk: kb("b"), sk: kb("f") }, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/m"]);
+		});
+	});
+
+	// A hash child owns whole hash keys. The walk asks `owns` one time for each key, with the first row
+	// of the key, and steps past a key that it does not own with one entry.
+	it("the hash-key walk gives each row of an owned key, one entry for each other key, and continues after its cursor", async () => {
+		await withStore((store) => {
+			for (const [hk, sk] of [
+				["a", EMPTY],
+				["a", kb("f")],
+				["a", kb("m")],
+				["b", kb("f")],
+				["b", kb("m")],
+				["c", kb("x")],
+				["c", kb("y")],
+				["d", EMPTY],
+			] as const) {
+				store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			const asked: string[] = [];
+			const owns = (hk: KeyBytes, firstSk: KeyBytes) => {
+				asked.push(`${keyLabel(hk)}/${keyLabel(firstSk)}`);
+				return ["a", "c"].includes(keyLabel(hk));
+			};
+			const walk = (cursor: HashKeyWalkCursor | null, limit: number) =>
+				[...store.walkItemsByHashKey(cursor, limit, owns)].map((e: HashKeyWalkEntry) =>
+					e.kind === "item" ? `${keyLabel(e.item.hk)}/${keyLabel(e.item.sk)}` : `skip ${keyLabel(e.hk)}`,
+				);
+
+			expect(walk(null, 100)).toEqual(["a/", "a/f", "a/m", "skip b", "c/x", "c/y", "skip d"]);
+			expect(asked).toEqual(["a/", "b/f", "c/x", "d/"]);
+			// The limit counts both kinds of entry, and it can stop inside an owned key.
+			expect(walk(null, 2)).toEqual(["a/", "a/f"]);
+			expect(walk({ hk: kb("a"), sk: kb("f") }, 2)).toEqual(["a/m", "skip b"]);
+			// A null sort key continues after every row of its hash key.
+			expect(walk({ hk: kb("b"), sk: null }, 10)).toEqual(["c/x", "c/y", "skip d"]);
+			expect(walk({ hk: kb("d"), sk: null }, 10)).toEqual([]);
+		});
+	});
+
+	// One seek finds the next hash key. A statement that reads each row of the key returns the same
+	// row, so only the plan and the read count find that regression.
+	it("the next-key seek reads one index entry, also after a key with many rows", async () => {
+		await withStore((store, state) => {
+			for (const hk of ["a", "b", "c"]) {
+				for (let i = 0; i < 500; i++) {
+					store.upsertItem({ hk: kb(hk), sk: kb(`s${String(i).padStart(4, "0")}`), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				}
+			}
+			const plan = ({ sql, params }: { sql: string; params: unknown[] }) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+			expect(plan(nextHashKeyStatement(kb("a")))).toMatch(/^SEARCH items USING COVERING INDEX \w+ \(hk>\?\)$/);
+
+			for (const [after, next] of [
+				[null, "a"],
+				[kb("a"), "b"],
+				[kb("b"), "c"],
+			] as const) {
+				const { sql, params } = nextHashKeyStatement(after);
+				const cursor = state.storage.sql.exec<{ hk: ArrayBuffer; sk: ArrayBuffer }>(sql, ...params);
+				const rows = cursor.toArray();
+				expect(rows.map((r) => new Uint8Array(r.hk))).toEqual([new Uint8Array(kb(next))]);
+				expect(cursor.rowsRead).toBe(1);
+			}
 		});
 	});
 

@@ -21,6 +21,8 @@ import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
 	PartitionStore,
+	type HashKeyWalkCursor,
+	type HashKeyWalkEntry,
 	type KeyRange,
 	type MigratedItem,
 	type PendingTransactionCursor,
@@ -35,7 +37,7 @@ type BelongsToTarget = (key: RouteKey) => boolean;
 
 /** Where the host has got to. The flow stores it verbatim and never reads inside it. */
 export type FokosDBHostCursor =
-	| { stream: "items"; cursor: ScanCursor | null }
+	| { stream: "items"; cursor: HashKeyWalkCursor | null }
 	| { stream: "pending_tx"; cursor: PendingTransactionCursor | null };
 
 export type FokosDBHostPage =
@@ -57,8 +59,9 @@ export class FokosMigrationHost implements MigrationHost {
 
 	/**
 	 * The slice limits the read: a promoted key or a range slice reads only the rows of its key range.
-	 * A hash child has no key range, so it reads the whole table. `belongsToTarget` is the ownership
-	 * function of the slice; the flow owns it, and every row that the read gives passes through it.
+	 * A hash child has no key range, so it walks the table one hash key at a time. `belongsToTarget` is
+	 * the ownership function of the slice, and the flow owns it. A range read passes each row through
+	 * it. The hash-key walk passes the first row of each hash key through it.
 	 * `budget` holds the page budgets of the source. The request carries no budget.
 	 */
 	buildPage(
@@ -94,13 +97,33 @@ export class FokosMigrationHost implements MigrationHost {
 	// ─── items ────────────────────────────────────────────────────────────────
 
 	#buildItemsPage(
-		cursor: ScanCursor | null,
+		cursor: HashKeyWalkCursor | null,
 		range: KeyRange | null,
 		belongsToTarget: BelongsToTarget,
 		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
+		const { rows, nextCursor } =
+			range === null ? this.#collectByHashKey(cursor, belongsToTarget, budget) : this.#collectRange(cursor, range, belongsToTarget, budget);
+		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
+		// keeps each page to a single stream.
+		const next: FokosDBHostCursor = nextCursor ? { stream: "items", cursor: nextCursor } : { stream: "pending_tx", cursor: null };
+		return { page: { stream: "items", items: rows }, nextCursor: next };
+	}
+
+	#collectRange(
+		cursor: HashKeyWalkCursor | null,
+		range: KeyRange,
+		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
+	): { rows: MigratedItem[]; nextCursor: HashKeyWalkCursor | null } {
 		const { store } = this.deps;
-		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
+		let start: ScanCursor | null = null;
+		if (cursor !== null) {
+			const { hk, sk } = cursor;
+			invariant(sk !== null, "fokos/migration-host: a range read cannot continue after a skipped hash key");
+			start = { hk, sk };
+		}
+		return collectBatch<MigratedItem, ScanCursor>({
 			fetchPage: (c, pageSize) => store.queryItemsPage(c, pageSize, range),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
@@ -109,12 +132,34 @@ export class FokosMigrationHost implements MigrationHost {
 			maxItems: budget.pageRows,
 			maxScannedRows: budget.scanRows,
 			pageSize: budget.pageRows,
+			startCursor: start,
+		});
+	}
+
+	/**
+	 * The read of a hash child. A hash-child slice owns whole hash keys: the answer of `belongsToTarget`
+	 * does not depend on the sort key. So the first row of a key decides for each row of the key, and a
+	 * key that the child does not own costs one seek and one scanned entry.
+	 */
+	#collectByHashKey(
+		cursor: HashKeyWalkCursor | null,
+		belongsToTarget: BelongsToTarget,
+		budget: FokosMigrationPageBudget,
+	): { rows: MigratedItem[]; nextCursor: HashKeyWalkCursor | null } {
+		const { store } = this.deps;
+		const owns = (hk: KeyBytes, firstSk: KeyBytes) => belongsToTarget({ hashKey: hk, sortKey: firstSk });
+		const { rows, nextCursor } = collectBatch<HashKeyWalkEntry, HashKeyWalkCursor>({
+			fetchPage: (c, pageSize) => store.walkItemsByHashKey(c, pageSize, owns),
+			advanceCursor: (entry) => (entry.kind === "item" ? { hk: entry.item.hk, sk: entry.item.sk } : { hk: entry.hk, sk: null }),
+			include: (entry) => entry.kind === "item",
+			estimateBytes: (entry) => (entry.kind === "item" ? estimateItemBytes(entry.item) : 0),
+			budgetBytes: budget.pageBytes,
+			maxItems: budget.pageRows,
+			maxScannedRows: budget.scanRows,
+			pageSize: budget.pageRows,
 			startCursor: cursor,
 		});
-		// A drained stream hands over to the next one with a fresh cursor. That costs one extra RPC and
-		// keeps each page to a single stream.
-		const next: FokosDBHostCursor = nextCursor ? { stream: "items", cursor: nextCursor } : { stream: "pending_tx", cursor: null };
-		return { page: { stream: "items", items: rows }, nextCursor: next };
+		return { rows: rows.flatMap((entry) => (entry.kind === "item" ? [entry.item] : [])), nextCursor };
 	}
 
 	#applyItems(items: readonly MigratedItem[]): void {
