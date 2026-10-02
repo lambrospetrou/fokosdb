@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5, R6 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
 the `split_bucket` column of X1. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
@@ -87,7 +87,7 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
+11. R4/K2 (the import state) and K6. R6 is done. Each fix is small and local, and you can do them at any time after the freeze.
 
 My recommendation: do F5 next.
 
@@ -200,14 +200,37 @@ My recommendation: do F5 next.
   eviction already makes the sort rare. A counter row was also not used: it costs one more billed read and write on
   each insert, and the eviction counts exactly anyway.
 
-**R6 — `findDeepestKnownRangeSlice` reads all slices of the key (Low–Medium).** **Plan.**
+**R6 — done: `findDeepestKnownRangeSlice` read all slices of the key (Low–Medium).** **Plan + test.**
 
-- **What happens:** The plan is `SEARCH PK (hk=? AND start<?)` + `TEMP B-TREE`. The query reads every learned slice
-  of the hash key that starts at or before the sort key, and then sorts them. It runs for each key of each request
-  to a promoted key.
-- **Fix:** Slices of one depth do not overlap, so do one seek per depth:
-  `WHERE hk=? AND depth=? AND sk_start_boundary<=? ORDER BY sk_start_boundary DESC LIMIT 1`. The existing
-  `idx_fokos_range_hierarchy_depth` index supports it.
+- **What happened:** The plan was `SEARCH PK (hk=? AND start<?)` + `TEMP B-TREE`. The end test was not part of
+  the seek, so the query read every learned slice of the hash key that starts at or before the sort key, at all
+  depths, and then sorted them. It runs for each key of each request to a promoted key.
+- **Example:** One hash key holds 10k learned slices of a binary range tree (depth 14). A lookup read about half of
+  them, about 5,000 rows.
+- **What changed** (`sharding/sharding-store.ts`): Slices of one depth do not overlap. Thus at one depth, only the
+  slice with the largest start at or before the sort key can contain it.
+  1. One seek finds the deepest learned depth of the hash key: `ORDER BY depth DESC LIMIT 1`.
+  2. From that depth down to depth 1, one statement for each depth. An inner query takes
+     `WHERE hk=? AND depth=? AND sk_start_boundary<=? ORDER BY sk_start_boundary DESC LIMIT 1`. An outer filter
+     checks the end. The first depth whose slice contains the sort key gives the result. Learned depths start at
+     1, because the range root is never stored.
+  3. Both statements use `idx_fokos_range_hierarchy_depth` as a covering index, with no temp B-tree.
+- **Why the end test is outside the seek:** In the inner `WHERE`, it would make SQLite walk back over the slices
+  of that depth until one covers the key. Outside, each seek reads at most one row.
+- **Cost:** At most D+1 seeks, and each seek reads at most one row. Eviction gaps do not change this. If rows of
+  one depth overlap, the result can only be a shallower slice, which costs one more forward.
+- **Measured** (10k rows of one hash key, Python sqlite3, about 2 µs of driver cost for each statement):
+
+  | Case | Old query | Per-depth loop |
+  |---|---|---|
+  | Full tree learned, random keys | 340 µs, ~5,000 rows | 7.7 µs, ≤ 3 seeks |
+  | Path to the key evicted below depth 2 | 579 µs, ~5,000 rows | 42 µs, 14 seeks |
+
+- **Not done, on purpose:** One statement that walks the slices in `sk_start_boundary DESC` order and stops at the
+  first slice that covers the key. With all slices learned, it reads 1 row (4.8 µs), but it needs a `depth DESC`
+  tie-break, because a left child has the same start as its parent. Its worst case has no bound: when eviction
+  removed the path to the key, it reads every learned slice between the covering slice and the key (536 µs, ~5,000
+  rows in the gap case above).
 
 **R7 — the Bloom filter is written as one KV value (Medium).** **Code.**
 

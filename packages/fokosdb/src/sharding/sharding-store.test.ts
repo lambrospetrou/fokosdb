@@ -91,6 +91,19 @@ describe("FokosShardingStore - learnRangeBoundary", () => {
 		});
 	});
 
+	it("goes up one depth at a time when the nearest slice at a depth ends before the key", async () => {
+		await withStore((store) => {
+			const hk = kb("h");
+			store.learnRangeBoundary(hk, kb("m"), UNBOUNDED, 1, REFRESH_MS);
+			store.learnRangeBoundary(hk, kb("m"), kb("t"), 2, REFRESH_MS);
+			store.learnRangeBoundary(hk, kb("m"), kb("p"), 3, REFRESH_MS);
+			// The depth-3 slice ["m","p") is the nearest start for "r" but ends before it; depth 2 covers it.
+			expect(store.findDeepestKnownRangeSlice(hk, kb("r"))).toEqual({ depth: 2, startBoundary: kb("m"), endBoundary: kb("t") });
+			// For "u", neither depth 3 nor depth 2 covers it, so the result is depth 1.
+			expect(store.findDeepestKnownRangeSlice(hk, kb("u"))).toEqual({ depth: 1, startBoundary: kb("m"), endBoundary: null });
+		});
+	});
+
 	it("returns null when no stored slice covers the key", async () => {
 		await withStore((store) => {
 			const hk = kb("h");

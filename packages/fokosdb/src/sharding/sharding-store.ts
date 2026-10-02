@@ -1077,36 +1077,49 @@ export class FokosShardingStore {
 	findDeepestKnownRangeSlice(hk: KeyBytes, sortKey: KeyBytes): LearnedRangeSlice | null {
 		// Boundaries are stored with the empty sentinel `[]` for unbounded edges. `[]` is the byte
 		// minimum, which is correct for an unbounded start (`start <= sortKey` always holds) but NOT for
-		// an unbounded end — hence the explicit sentinel check in the WHERE clause. Real keys are never
-		// empty (KeyCodec rejects empty input), so `[]` is an unambiguous "unbounded" tag. The result
-		// decodes `[]` back to `null` for both edges, so callers can feed `resolveRangePartitionContext`
-		// directly.
+		// an unbounded end — hence the explicit sentinel check on the end. Real keys are never empty
+		// (KeyCodec rejects empty input), so `[]` is an unambiguous "unbounded" tag. The result decodes
+		// `[]` back to `null` for both edges, so callers can feed `resolveRangePartitionContext` directly.
 		const unbounded = KeyCodec.encodeOptional(undefined);
-		const row = tryOne(
-			this.#storage.sql.exec<{ depth: number; sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
-				`SELECT depth, sk_start_boundary, sk_end_boundary
-				 FROM fokos_range_hierarchy
-				 WHERE hk = ?
-				   AND sk_start_boundary <= ?
-				   AND (sk_end_boundary > ? OR sk_end_boundary = ?)
-				 ORDER BY depth DESC
-				 LIMIT 1`,
-				hk,
-				sortKey,
-				sortKey,
-				unbounded,
-			),
+		const deepest = tryOne(
+			this.#storage.sql.exec<{ depth: number }>(`SELECT depth FROM fokos_range_hierarchy WHERE hk = ? ORDER BY depth DESC LIMIT 1`, hk),
 		);
-		if (!row) {
+		if (!deepest) {
 			return null;
 		}
 
-		const start = fromSqlKey(row.sk_start_boundary);
-		const end = fromSqlKey(row.sk_end_boundary);
-		return {
-			depth: row.depth,
-			startBoundary: start.length === 0 ? null : start,
-			endBoundary: end.length === 0 ? null : end,
-		};
+		// The slices of one depth do not overlap. Thus at each depth, only the slice with the largest
+		// start at or before the sort key can contain it, and one index seek finds that slice. The end
+		// test is outside the seek, so a seek reads at most one row. A lookup costs at most one seek for
+		// each depth, and eviction gaps do not change this. Learned depths start at 1, because the range
+		// root is never stored. If rows of one depth overlap, the result can only be a shallower slice,
+		// which is safe: it costs one more forward.
+		for (let depth = deepest.depth; depth >= 1; depth--) {
+			const row = tryOne(
+				this.#storage.sql.exec<{ sk_start_boundary: ArrayBuffer; sk_end_boundary: ArrayBuffer }>(
+					`SELECT sk_start_boundary, sk_end_boundary FROM (
+					     SELECT sk_start_boundary, sk_end_boundary
+					     FROM fokos_range_hierarchy
+					     WHERE hk = ?1 AND depth = ?2 AND sk_start_boundary <= ?3
+					     ORDER BY sk_start_boundary DESC
+					     LIMIT 1)
+					 WHERE sk_end_boundary > ?3 OR sk_end_boundary = ?4`,
+					hk,
+					depth,
+					sortKey,
+					unbounded,
+				),
+			);
+			if (row) {
+				const start = fromSqlKey(row.sk_start_boundary);
+				const end = fromSqlKey(row.sk_end_boundary);
+				return {
+					depth,
+					startBoundary: start.length === 0 ? null : start,
+					endBoundary: end.length === 0 ? null : end,
+				};
+			}
+		}
+		return null;
 	}
 }
