@@ -999,7 +999,7 @@ export class PartitionStore {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
 		if (deleted || opts.bumpTxOrderTsAlways) {
-			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, delEst, opts.hk);
+			this.#subtractKeySizeEstimate(opts.hk, delEst);
 		}
 		return { deleted, rowsRead: writeRes.rowsRead, rowsWritten: writeRes.rowsWritten };
 	}
@@ -1048,7 +1048,7 @@ export class PartitionStore {
 			}
 
 			for (const { hk, bytes } of bytesByHashKey.values()) {
-				this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, bytes, hk);
+				this.#subtractKeySizeEstimate(hk, bytes);
 			}
 			// The sweep reclaims rows whose logical deletion happened at expiry, so it advances the
 			// transaction order watermark only and never touches delete_revision.
@@ -1815,6 +1815,24 @@ export class PartitionStore {
 
 	deleteKeySizeEstimate(hk: KeyBytes): void {
 		this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ?`, hk);
+	}
+
+	/**
+	 * Removes the bytes of deleted rows from a key's estimate. When the deleted rows held all the
+	 * bytes of the key, the key has no committed item, so the estimate row and its index entry are
+	 * deleted. Without this, a partition keeps one estimate row for each key it ever stored. The
+	 * estimate is exact and every item row has more than 0 bytes, so a total at or below `bytes`
+	 * means that no item of the key remains. A key that is written again gets a new row from the
+	 * upsert.
+	 */
+	#subtractKeySizeEstimate(hk: KeyBytes, bytes: number): void {
+		// `est_bytes <= bytes` is the same test as `est_bytes - bytes <= 0`: the deleted rows were the
+		// last items of the key. We use `<=` and not `=` so that a total that is too low also goes,
+		// and does not stay as a row of 0 bytes.
+		const removed = this.#storage.sql.exec(`DELETE FROM key_size_estimates WHERE hk = ? AND est_bytes <= ?`, hk, bytes);
+		if (removed.rowsWritten === 0) {
+			this.#storage.sql.exec(`UPDATE key_size_estimates SET est_bytes = MAX(0, est_bytes - ?) WHERE hk = ?`, bytes, hk);
+		}
 	}
 
 	/**

@@ -263,6 +263,33 @@ describe("PartitionStore - items", () => {
 			const del = store.deleteItem({ hk: kb("hk"), sk: kb("s1"), txOrderTs: 10 });
 			expect(del.deleted).toBe(true);
 			expect(kseBytes(state, "hk")).toBe(est2);
+
+			// Deleting the last item of the key deletes its estimate row.
+			store.deleteItem({ hk: kb("hk"), sk: kb("s2"), txOrderTs: 11 });
+			expect(kseBytes(state, "hk")).toBeUndefined();
+
+			// A new write of the key starts a new estimate.
+			const r4 = store.upsertItem({ hk: kb("hk"), sk: kb("s3"), data: "c", kind: "text", ttlAt: null, txOrderTs: 12 });
+			expect(r4.keyEstBytes).toBe(expectedRowBytes("c", kb("hk"), kb("s3")));
+			expect(kseBytes(state, "hk")).toBe(r4.keyEstBytes);
+		});
+	});
+
+	it("keeps no estimate row for a key that has no items", async () => {
+		await withStore((store, state) => {
+			const estimateRows = () => state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM key_size_estimates`).one().n;
+			for (let i = 0; i < 20; i++) {
+				store.upsertItem({ hk: kb(`k${i}`), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			for (let i = 0; i < 10; i++) {
+				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 2 });
+			}
+			// The transactional delete form, also for a row that is already gone.
+			for (let i = 10; i < 20; i++) {
+				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 3, bumpTxOrderTsAlways: true });
+				store.deleteItem({ hk: kb(`k${i}`), sk: kb("s"), txOrderTs: 4, bumpTxOrderTsAlways: true });
+			}
+			expect(estimateRows()).toBe(0);
 		});
 	});
 
@@ -1010,7 +1037,8 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(kb("b"), kb("s")).row).toBeUndefined();
 			expect(store.getItem(kb("a"), kb("next")).row).toBeDefined();
 			expect(kseBytes(state, "a")).toBe(nextBytes + nullBytes + futureBytes);
-			expect(kseBytes(state, "b")).toBe(0);
+			// The sweep removed the last item of "b", so its estimate row is gone.
+			expect(kseBytes(state, "b")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(20 * 1000 * TX_ORDER_TS_UNITS_PER_MS);
 			// The sweep advances the transaction order watermark to the largest expiry it reclaimed,
 			// but it is not a user delete: the revision stays at zero.
@@ -1022,7 +1050,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(kb("a"), kb("next")).row).toBeUndefined();
 			expect(store.getItem(kb("c"), kb("exact")).row).toBeUndefined();
 			expect(kseBytes(state, "a")).toBe(nullBytes + futureBytes);
-			expect(kseBytes(state, "c")).toBe(0);
+			expect(kseBytes(state, "c")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 
 			expect(store.getItem(kb("locked"), kb("s")).row).toBeDefined();

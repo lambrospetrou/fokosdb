@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, C1, C5, X1, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
 the `split_bucket` column of X1. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
@@ -47,7 +47,7 @@ says how it was checked:
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
 | F4 | FokosDB | Done. `pending_transactions` repeated per-transaction data on each key; `conditions_json` was never read; the stale queries stepped past lock copies | Medium | Yes |
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning | Medium | No |
-| F12 | FokosDB | Empty hash keys retain their size-estimate rows and index entries | Medium | No |
+| F12 | FokosDB | Done. Empty hash keys kept their size-estimate rows and index entries | Medium | No |
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
@@ -83,7 +83,7 @@ You must decide these now, also when the answer is "no":
 Priority 4: cost and background work (no schema change)
 
 9. F3: delete the item rows of split sources. At depth d you keep d+1 copies of the data. First measure the cost of a DELETE FROM items with no WHERE clause on Durable Objects.
-10. F13, F12 and F7.
+10. F13 and F7. F12 is done.
 
 Priority 5: small request-path fixes
 
@@ -558,7 +558,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 - **Related:** Each item size change updates `key_size_estimates` and its `key_size_estimates_by_bytes` index.
   The index also stores the hash key, because the table is WITHOUT ROWID. Count both B-tree updates and the extra
   key storage. `largestKeysAtLeast` uses a bounded covering seek, confirmed with `EXPLAIN QUERY PLAN` in SQLite
-  3.45.1. Empty keys retain both entries (F12).
+  3.45.1. A key with no items keeps no entry (F12).
 
 **F7 — the range split boundary scan blocks the request path and runs again during planning (Medium).** **Code.**
 
@@ -624,19 +624,28 @@ each cycle, but locks are few.
   - The RPC copies the page when it sends it. The peak memory of the source is therefore a multiple of
     `migrationPageBytes`. TODO: measure it in Workers before you increase the default.
 
-**F12 — empty hash keys retain their size-estimate rows and index entries (Medium).** **Code + SQL replay.**
+**F12 — done: empty hash keys kept their size-estimate rows and index entries (Medium).** **Code + SQL replay + test.**
 
-- **What happens:** `deleteItem` and `deleteExpiredItems` (`shared/partition/partition-store.ts`) reduce
-  `key_size_estimates.est_bytes` to zero, but keep the row. Only promotion completion and cleanup call
-  `deleteKeySizeEstimate`. The `key_size_estimates_by_bytes` index also keeps an entry for each empty key.
+- **What happened:** `deleteItem` and `deleteExpiredItems` (`shared/partition/partition-store.ts`) reduced
+  `key_size_estimates.est_bytes` to zero, but kept the row. Only promotion completion and cleanup called
+  `deleteKeySizeEstimate`. The `key_size_estimates_by_bytes` index also kept an entry for each empty key.
 - **Example:** Create one item under each new hash key, then delete it or let its TTL expire. The estimate table
-  grows with all keys ever written, not with live keys. A replay of the create/delete statements in SQLite 3.45.1
+  grew with all keys ever written, not with live keys. A replay of the create/delete statements in SQLite 3.45.1
   retained 10,000 zero-byte estimate rows after 10,000 cycles.
-- **Failure:** A small live dataset accumulates estimate rows and duplicated keys in the index. This increases
-  storage and can trigger size-based repartition even when the live items fit below the cap.
-- **Fix:** Remove an estimate when its key has no committed item. Keep the removal in the same transaction as the
-  item deletion and estimate update. Pending-only keys already use the lock-table fallback in `splitDecision`.
-  No schema change is needed.
+- **Failure:** A small live dataset accumulated estimate rows and duplicated keys in the index. This increased
+  storage. The split decision reads `databaseSize`, so the rows could start a size-based repartition only
+  through the file size, after millions of dead keys at a cap of 1 GB.
+- **What changed:** Both delete paths call `#subtractKeySizeEstimate`. It first runs
+  `DELETE FROM key_size_estimates WHERE hk = ? AND est_bytes <= ?` with the deleted bytes. When that deletes no
+  row, it runs the old `UPDATE`. The estimate is exact and each item row has more than 0 bytes, so a total at or
+  below the deleted bytes means that the key has no committed item. Both statements run in the transaction of
+  the item deletion. A key that is written again gets a new row from the upsert. The TTL sweep calls the helper
+  once for each key of its chunk.
+- **Cost:** No extra write. The delete of the last item of a key does one write, as before. The delete of
+  another item reads one more row.
+- **Tests:** `partition-store.test.ts` checks that the delete of the last item removes the row, that a new write
+  starts a new estimate, that the TTL sweep removes the rows of the keys it empties, and that deletes through
+  the transactional form leave no rows. This includes a delete of a row that is already gone.
 
 **F13 — completion deletes all lock copies in one synchronous transaction (Medium).** **Code.**
 
