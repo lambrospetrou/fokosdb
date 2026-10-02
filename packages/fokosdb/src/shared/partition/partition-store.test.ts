@@ -9,10 +9,14 @@ import invariant from "../invariant.js";
 import {
 	estimateItemBytes,
 	estimateProjectedRowBytes,
+	itemsPageStatement,
 	PartitionStore,
+	pendingTxPageStatement,
 	queryScanStatement,
 	type ItemLinkId,
+	type KeyRange,
 	type MigratedItem,
+	type PendingTxItem,
 	type ScanCursor,
 	type SqlMetrics,
 	type StoredItem,
@@ -267,12 +271,12 @@ describe("PartitionStore - items", () => {
 			] as const) {
 				store.upsertItem({ hk: kb(hk), sk: kb(sk), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			}
-			const page1 = [...store.queryItemsPage(null, 2)];
+			const page1 = [...store.queryItemsPage(null, 2, null)];
 			expect(page1.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([
 				["a", "1"],
 				["a", "2"],
 			]);
-			const page2 = [...store.queryItemsPage({ hk: kb("a"), sk: kb("2") }, 2)];
+			const page2 = [...store.queryItemsPage({ hk: kb("a"), sk: kb("2") }, 2, null)];
 			expect(page2.map((r) => [KeyCodec.decode(r.hk), KeyCodec.decode(r.sk)])).toEqual([["b", "1"]]);
 		});
 	});
@@ -295,7 +299,7 @@ describe("PartitionStore - items", () => {
 			const seen: string[] = [];
 			let cursor: { hk: KeyBytes; sk: KeyBytes } | null = null;
 			for (;;) {
-				const page: MigratedItem[] = [...store.queryItemsPage(cursor, 1)];
+				const page: MigratedItem[] = [...store.queryItemsPage(cursor, 1, null)];
 				if (page.length === 0) {
 					break;
 				}
@@ -304,30 +308,6 @@ describe("PartitionStore - items", () => {
 				cursor = { hk: row.hk, sk: row.sk };
 			}
 			expect(seen).toEqual(["a/", "a/m", "b/", "c/q"]);
-		});
-	});
-
-	// The keyset cursors must SEEK on the full key tuple. An `hk > ? OR (hk = ? AND sk > ?)` rewrite
-	// still returns correct rows, so only the query plan catches the regression: SQLite would bind just
-	// `hk>?` and re-check the rest, making every page O(rows already passed).
-	it("keyset cursors seek on the whole key tuple", async () => {
-		await withStore((_store, state) => {
-			const plan = (sql: string, ...params: unknown[]) =>
-				state.storage.sql
-					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
-					.toArray()
-					.map((r) => r.detail)
-					.join(" | ");
-
-			expect(plan(`SELECT hk, sk FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT 1`, kb("a"), kb("1"))).toContain("(hk,sk)>(?,?)");
-			expect(
-				plan(
-					`SELECT hk, sk FROM pending_transactions WHERE (hk, sk, transaction_id) > (?, ?, ?) ORDER BY hk, sk, transaction_id LIMIT 1`,
-					kb("a"),
-					kb("1"),
-					"tx",
-				),
-			).toContain("(hk,sk,transaction_id)>(?,?,?)");
 		});
 	});
 
@@ -396,7 +376,7 @@ describe("PartitionStore - items", () => {
 			// The migration writer carries the formula independently of upsertItem — both must agree.
 			const jsonText = JSON.stringify({ hello: "world", n: 12345 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
-			const migrated = [...store.queryItemsPage(null, 10)][0];
+			const migrated = [...store.queryItemsPage(null, 10, null)][0];
 			store.insertItemIfAbsent({ ...migrated, item_id: linkId(migrated.item_id + 1), sk: kb("j2") });
 			// Same row under a longer sk: the only difference must be octet_length(sk).
 			expect(readEst("j2")).toBe(readEst("j")! - kb("j").byteLength + kb("j2").byteLength);
@@ -685,7 +665,7 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: jsonText, kind: "json", ttlAt: null, txOrderTs: 1 });
 
 			// Migration-style read: no json() decode, so json data is the raw JSONB blob.
-			const migrated = [...store.queryItemsPage(null, 10)][0];
+			const migrated = [...store.queryItemsPage(null, 10, null)][0];
 			expect(migrated.kind).toBe("json");
 			expect(migrated.data).toBeInstanceOf(Uint8Array);
 
@@ -910,7 +890,7 @@ describe("PartitionStore - items", () => {
 				last_read_ts: 1,
 				last_write_ts: 1,
 			});
-			const rows = () => [...store.queryItemsPage(null, 10)].map((r) => ({ item_id: r.item_id, data: r.data }));
+			const rows = () => [...store.queryItemsPage(null, 10, null)].map((r) => ({ item_id: r.item_id, data: r.data }));
 
 			store.insertItemIfAbsent(copied(1000, "a", "first"));
 			expect(rows()).toEqual([{ item_id: 1000, data: "first" }]);
@@ -1204,7 +1184,7 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(row);
 
 			expect(store.listPendingTxItems(row.transaction_id)[0].ttl_epoch_utc_seconds).toBe(777);
-			expect([...store.queryPendingTxPage(null, 1)][0].ttl_epoch_utc_seconds).toBe(777);
+			expect([...store.queryPendingTxPage(null, 1, null)][0].ttl_epoch_utc_seconds).toBe(777);
 		});
 	});
 
@@ -1317,9 +1297,9 @@ describe("PartitionStore - pending transactions", () => {
 			store.insertPendingLock(lockRow("a", "1", "tx2"));
 			store.insertPendingLock(lockRow("a", "1", "tx1"));
 			store.insertPendingLock(lockRow("b", "1", "tx3"));
-			const page1 = [...store.queryPendingTxPage(null, 2)];
+			const page1 = [...store.queryPendingTxPage(null, 2, null)];
 			expect(page1.map((r) => r.transaction_id)).toEqual(["tx1", "tx2"]);
-			const page2 = [...store.queryPendingTxPage({ hk: kb("a"), sk: kb("1"), transaction_id: "tx2" }, 2)];
+			const page2 = [...store.queryPendingTxPage({ hk: kb("a"), sk: kb("1"), transaction_id: "tx2" }, 2, null)];
 			expect(page2.map((r) => r.transaction_id)).toEqual(["tx3"]);
 		});
 	});
@@ -1602,6 +1582,179 @@ describe("PartitionStore - computeRangeSplitBoundaries", () => {
 			store.upsertItem({ hk: kb("hk"), sk: kb("m"), data: "H".repeat(5000), kind: "text", ttlAt: null, txOrderTs: 1 });
 			store.upsertItem({ hk: kb("hk"), sk: kb("z"), data: "x", kind: "text", ttlAt: null, txOrderTs: 1 });
 			expect(store.computeRangeSplitBoundaries(kb("hk"), null, null, 3)).toBeNull();
+		});
+	});
+});
+
+describe("PartitionStore - migration pages", () => {
+	const EMPTY = KeyCodec.encodeOptional(undefined);
+
+	function lockRow(hk: KeyBytes, sk: KeyBytes, transactionId: string) {
+		return {
+			hk,
+			sk,
+			transaction_id: transactionId,
+			transaction_ts: 123,
+			operation: "put",
+			data: "d",
+			kind: "text" as const,
+			ttl_epoch_utc_seconds: null,
+			coordinator_json: '{"doName":"tc-1"}',
+			created_at: 1000,
+			guarded_at: null,
+			next_recovery_at: 6000,
+		};
+	}
+
+	const pairs = (rows: Iterable<{ hk: KeyBytes; sk: KeyBytes }>) => [...rows].map((r) => `${keyLabel(r.hk)}/${keyLabel(r.sk)}`);
+
+	// A cursor or a range must SEEK on all its bounds. A statement that seeks only on `hk=?`, or only on
+	// the start of the range, returns the same rows, so only the plan finds the regression: each page
+	// then reads all the rows before it again. The text must match exactly. SQLite shows `sk>?` also
+	// for `sk >= ?`.
+	it("each page statement seeks on all its bounds", async () => {
+		await withStore((_store, state) => {
+			const plan = ({ sql, params }: { sql: string; params: unknown[] }) =>
+				state.storage.sql
+					.exec<{ detail: string }>(`EXPLAIN QUERY PLAN ${sql}`, ...params)
+					.toArray()
+					.map((r) => r.detail)
+					.join(" | ");
+			const open: KeyRange = { hk: kb("h"), start: EMPTY, end: null };
+			const closed: KeyRange = { hk: kb("h"), start: kb("a"), end: kb("z") };
+			const itemCursor = { hk: kb("h"), sk: kb("b") };
+			const lockCursor = { hk: kb("h"), sk: kb("b"), transaction_id: "tx" };
+			const items = "items USING INDEX sqlite_autoindex_items_1";
+			const locks = "p USING INDEX sqlite_autoindex_pending_transactions_1";
+			const info = " | SEARCH t USING INDEX sqlite_autoindex_pending_tx_info_1 (transaction_id=?)";
+
+			expect(plan(itemsPageStatement(null, 5, null))).toBe(`SCAN ${items}`);
+			expect(plan(itemsPageStatement(itemCursor, 5, null))).toBe(`SEARCH ${items} ((hk,sk)>(?,?))`);
+			expect(plan(itemsPageStatement(null, 5, open))).toBe(`SEARCH ${items} (hk=? AND sk>?)`);
+			expect(plan(itemsPageStatement(itemCursor, 5, open))).toBe(`SEARCH ${items} (hk=? AND sk>?)`);
+			expect(plan(itemsPageStatement(null, 5, closed))).toBe(`SEARCH ${items} (hk=? AND sk>? AND sk<?)`);
+			expect(plan(itemsPageStatement(itemCursor, 5, closed))).toBe(`SEARCH ${items} (hk=? AND sk>? AND sk<?)`);
+
+			expect(plan(pendingTxPageStatement(null, 5, null))).toBe(`SCAN ${locks}${info}`);
+			expect(plan(pendingTxPageStatement(lockCursor, 5, null))).toBe(`SEARCH ${locks} ((hk,sk,transaction_id)>(?,?,?))${info}`);
+			expect(plan(pendingTxPageStatement(null, 5, open))).toBe(`SEARCH ${locks} (hk=? AND sk>?)${info}`);
+			expect(plan(pendingTxPageStatement(lockCursor, 5, open))).toBe(`SEARCH ${locks} (hk=? AND (sk,transaction_id)>(?,?))${info}`);
+			expect(plan(pendingTxPageStatement(null, 5, closed))).toBe(`SEARCH ${locks} (hk=? AND sk>? AND sk<?)${info}`);
+			expect(plan(pendingTxPageStatement(lockCursor, 5, closed))).toBe(
+				`SEARCH ${locks} (hk=? AND (sk,transaction_id)>(?,?) AND sk<?)${info}`,
+			);
+		});
+	});
+
+	// The plan proves the seek. This test proves the cost: a range page reads the rows that it returns
+	// and the one row after them, and no row of the other keys or of the sort keys above the range.
+	it("a range page reads only the rows that it returns", async () => {
+		await withStore((store, state) => {
+			const sk = (i: number) => kb(`k${String(i).padStart(4, "0")}`);
+			for (let i = 0; i < 500; i++) {
+				for (const hk of ["a", "c"]) {
+					store.upsertItem({ hk: kb(hk), sk: sk(i), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+					store.insertPendingLock(lockRow(kb(hk), sk(i), `tx-${hk}-${i}`));
+				}
+			}
+			for (let i = 0; i < 600; i++) {
+				store.upsertItem({ hk: kb("b"), sk: sk(i), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+				store.insertPendingLock(lockRow(kb("b"), sk(i), `tx-b-${i}`));
+			}
+			const range: KeyRange = { hk: kb("b"), start: sk(50), end: sk(100) };
+			const run = ({ sql, params }: { sql: string; params: unknown[] }) => {
+				const cursor = state.storage.sql.exec(sql, ...params);
+				const returned = cursor.toArray().length;
+				return { returned, rowsRead: cursor.rowsRead };
+			};
+
+			for (const statement of [itemsPageStatement(null, 1_000, range), itemsPageStatement({ hk: kb("b"), sk: sk(60) }, 1_000, range)]) {
+				const { returned, rowsRead } = run(statement);
+				expect(returned).toBeGreaterThan(0);
+				expect(rowsRead).toBeLessThanOrEqual(returned + 1);
+			}
+			// The JOIN reads one `pending_tx_info` row for each lock that it returns. The seek on
+			// `(sk, transaction_id) > (?, ?)` also reads the cursor row, and then steps past it.
+			{
+				const { returned, rowsRead } = run(pendingTxPageStatement(null, 1_000, range));
+				expect(returned).toBe(50);
+				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 1);
+			}
+			{
+				const { returned, rowsRead } = run(pendingTxPageStatement({ hk: kb("b"), sk: sk(60), transaction_id: "tx-b-60" }, 1_000, range));
+				expect(returned).toBe(39);
+				expect(rowsRead).toBeLessThanOrEqual(2 * returned + 2);
+			}
+		});
+	});
+
+	it("a range page returns only the rows of its hash key in [start, end), and continues after its cursor", async () => {
+		await withStore((store) => {
+			for (const [hk, sk] of [
+				["a", EMPTY],
+				["a", kb("m")],
+				["b", EMPTY],
+				["b", kb("f")],
+				["b", kb("m")],
+				["b", kb("t")],
+				["c", EMPTY],
+			] as const) {
+				store.upsertItem({ hk: kb(hk), sk, data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
+			}
+			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual(["b/", "b/f", "b/m", "b/t"]);
+			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/f", "b/m"]);
+			expect(pairs(store.queryItemsPage(null, 10, { hk: kb("b"), start: EMPTY, end: kb("f") }))).toEqual(["b/"]);
+			expect(pairs(store.queryItemsPage({ hk: kb("b"), sk: EMPTY }, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual([
+				"b/f",
+				"b/m",
+				"b/t",
+			]);
+			expect(pairs(store.queryItemsPage({ hk: kb("b"), sk: kb("f") }, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/m"]);
+		});
+	});
+
+	it("a range page of locks returns only the locks of its hash key in [start, end), and continues after its cursor", async () => {
+		await withStore((store) => {
+			for (const [hk, sk, tx] of [
+				["a", kb("m"), "tx1"],
+				["b", EMPTY, "tx1"],
+				["b", kb("f"), "tx2"],
+				["b", kb("m"), "tx3"],
+				["b", kb("t"), "tx4"],
+				["c", EMPTY, "tx5"],
+			] as const) {
+				store.insertPendingLock(lockRow(kb(hk), sk, tx));
+			}
+			expect(pairs(store.queryPendingTxPage(null, 10, { hk: kb("b"), start: EMPTY, end: null }))).toEqual(["b/", "b/f", "b/m", "b/t"]);
+			expect(pairs(store.queryPendingTxPage(null, 10, { hk: kb("b"), start: kb("f"), end: kb("t") }))).toEqual(["b/f", "b/m"]);
+			expect(
+				pairs(
+					store.queryPendingTxPage({ hk: kb("b"), sk: kb("f"), transaction_id: "tx2" }, 10, { hk: kb("b"), start: kb("f"), end: null }),
+				),
+			).toEqual(["b/m", "b/t"]);
+		});
+	});
+
+	// Two transactions lock the same key. With a page of one row, the page boundary falls between them,
+	// so the cursor must compare the transaction id too, or the second lock is lost.
+	it("a range page of locks keeps two locks of one key that a page boundary separates", async () => {
+		await withStore((store) => {
+			store.insertPendingLock(lockRow(kb("b"), kb("m"), "tx2"));
+			store.insertPendingLock(lockRow(kb("b"), kb("m"), "tx1"));
+			store.insertPendingLock(lockRow(kb("b"), kb("t"), "tx3"));
+			const range: KeyRange = { hk: kb("b"), start: EMPTY, end: null };
+			const seen: string[] = [];
+			let cursor: { hk: KeyBytes; sk: KeyBytes; transaction_id: string } | null = null;
+			for (;;) {
+				const page: PendingTxItem[] = [...store.queryPendingTxPage(cursor, 1, range)];
+				if (page.length === 0) {
+					break;
+				}
+				const row = page[0];
+				seen.push(`${keyLabel(row.sk)}/${row.transaction_id}`);
+				cursor = { hk: row.hk, sk: row.sk, transaction_id: row.transaction_id };
+			}
+			expect(seen).toEqual(["m/tx1", "m/tx2", "t/tx3"]);
 		});
 	});
 });

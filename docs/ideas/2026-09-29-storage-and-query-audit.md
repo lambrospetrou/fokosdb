@@ -1,6 +1,6 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F4, F8, F10, F11, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, C1, C5, X2, R3, R5 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence), R10 (the lazy lifecycle and the request gate) and X1 (fix 2, when the
 partition has no override). Decided, no change: F6 and K3. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
@@ -37,7 +37,7 @@ says how it was checked:
 
 | # | Layer | Finding | Severity | Schema change? |
 |---|---|---|---|---|
-| F1 | FokosDB | A promotion or a range split reads the whole source table, including `data`, for each target. A promoted key is not available for writes during that time | High | No |
+| F1 | FokosDB | Done. A promotion or a range split read the whole source table, including `data`, for each target. A promoted key was not available for writes during that time | High | No |
 | F11 | FokosDB | Done. Migration fetched payload arrays before the byte budget; a default fetch could hold about 390 MiB | High | No |
 | C5 | FokosDB (TC) | Done. One PREPARING transaction could exceed the 32 MiB migration RPC limit and stop an import | High | No |
 | X1 | Cross | A hash split reads the whole source once for each child, with a per-row hash and a per-row JOIN | High | Optional (now or never) |
@@ -56,14 +56,12 @@ says how it was checked:
 
 ----
 
-The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. I checked the code: F1 and F5 are still open. _slice is not used in fokos-migration-host.ts:63, and deletion_metadata has only one counter row. F11 is done.
+The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. F1, F11 and C5 are done. F5 is still open: deletion_metadata has only one counter row.
 
 Priority 1: stuck imports (availability)
 
 1. F11: done. The store queries give the migration rows one at a time, and the byte budget stops the SQL read.
-2. F1: use the slice during migration. A promotion reads the whole source to move one key. So the time that a hot key is unavailable depends on the size of the source partition, not on the size of the key.
-   - Build F1 on the lazy store queries of F11. A slice query must also be a generator.
-   - Add the X1 fixes that need no schema change in the same pass: keep the hash answer for the last hk, skip the JOIN when no finished override exists (done when the partition has no override at all), and read the keys before data. They change the same code path.
+2. F1: done. A promotion and a range split read only the key range of their slice, with the same generators as F11. The X1 fixes that need no schema change are still open (see X1).
 3. C5: done. The coordinator applies the combined image cap when it stores each prepare answer, so one transaction stays below the RPC limit.
 
 Priority 2: correctness under load (and cheapest now)
@@ -91,7 +89,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the import state), R6 and K6. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: start with F1, then F5. Before you edit the migrations in place, make the decision on X1.
+My recommendation: do F5 next. Before you edit the migrations in place, make the decision on X1.
 
 
 ## 3. Sharding runtime
@@ -401,23 +399,64 @@ size of a value does not change the bill. The limit for a key and its value toge
 
 ### 4.1 PartitionDO
 
-**F1 — migration ignores the slice (High).** **Code.**
+**F1 — done: migration ignored the slice (High).** **Code + Plan + test.**
 
-- **What happens:** `#buildItemsPage` (`shared/partition/fokos-migration-host.ts:90`) never uses `_slice`. It pages
-  `queryItemsPage` from the first row of `items` to the last row, and it reads `data` for each row.
-  `queryRangeItemsPage` exists, but nothing in `src/` calls it.
-- **Example (promotion):** A 1 GB hash partition with 5M rows promotes one key. The target pulls about 500 pages,
-  and most pages have no items. The source reads about 1 GB for one key.
-- **Example (range split):** In a range split with N children, each child reads from row 0 to the end of the table.
-  The source reads the table N times.
-- **Why it matters for availability:** A promotion cuts over while its key holds locks. After cutover, the range
+- **What happened:** `#buildItemsPage` (`shared/partition/fokos-migration-host.ts`) did not use the slice. It paged
+  `queryItemsPage` from the first row of `items` to the last row, and it read `data` for each row. The lock stream
+  did the same. `queryRangeItemsPage` existed, but nothing in `src/` called it.
+- **Example (promotion):** A 1 GB hash partition with 5M rows promotes one key. The target pulled about 500 pages,
+  and most pages had no items. The source read about 1 GB for one key.
+- **Example (range split):** In a range split with N children, each child read from row 0 to the end of the table.
+  The source read the table N times.
+- **Why it mattered for availability:** A promotion cuts over while its key holds locks. After cutover, the range
   root is `awaiting_data` or `importing`. Each write and each transaction step on the key answers
   `partition_migrating` until the import ends, and the root cannot sweep its stale locks (`canSweepLocally` is
-  false). A commit fan-out that waits longer than `fanoutRequestBudgetMs` (5 s) goes to `tx_recovery`. Because of
-  F1, the import of a 250 MB key from a 1 GB partition reads the full 1 GB. The time that the hot key is not
-  available follows the size of the source partition, not the size of the key.
-- **Fix:** Seek to `(slice.hashKey, slice.start)`, and end the stream when the scan goes past the slice. There is
-  no schema change.
+  false). A commit fan-out that waits longer than `fanoutRequestBudgetMs` (5 s) goes to `tx_recovery`. The import
+  of a 250 MB key from a 1 GB partition read the full 1 GB. The time that the hot key was not available followed
+  the size of the source partition, not the size of the key.
+- **What changed:**
+  - `partition-store.ts` has the type `KeyRange` (`hk`, `start` inclusive, `end` exclusive or null).
+    `queryItemsPage` and `queryPendingTxPage` take `range: KeyRange | null`. A null range reads the whole table,
+    as before. `queryRangeItemsPage` is deleted.
+  - The two builders `itemsPageStatement` and `pendingTxPageStatement` make the SQL, and the generators run
+    exactly that SQL. The WHERE clause:
+
+    | Case | Items | Locks |
+    |---|---|---|
+    | no range, no cursor | none | none |
+    | no range, cursor | `(hk, sk) > (?, ?)` | `(p.hk, p.sk, p.transaction_id) > (?, ?, ?)` |
+    | range, no cursor | `hk = ? AND sk >= ?` | `p.hk = ? AND p.sk >= ?` |
+    | range, cursor | `hk = ? AND sk > ?` | `p.hk = ? AND (p.sk, p.transaction_id) > (?, ?)` |
+    | range with end | add `AND sk < ?` | add `AND p.sk < ?` |
+
+  - With a range, the cursor replaces `start`. The statement never holds both bounds: SQLite could then seek on
+    `start` and check each row after it, and each page would start again at the first row of the slice.
+  - The lock cursor stays a row value on `(sk, transaction_id)` after `hk = ?`, because two locks on one key can
+    be on the two sides of a page boundary.
+  - `buildPage` calls `sliceKeyRange(slice)` once and gives the range to both streams. A promoted key reads
+    `[empty sort key, last row of the key]`. A range slice reads `[start, end)`. A hash child gets null and reads
+    the whole table (X1). `belongsToTarget` still filters each row for all kinds.
+  - Old cursors get no special handling. An import that is in progress during the deploy can skip rows. This is
+    accepted before the release.
+- **Plans** (`EXPLAIN QUERY PLAN` in workerd, exact text; SQLite shows `sk>?` also for `sk >= ?`):
+  - Items with a range: `SEARCH items USING INDEX sqlite_autoindex_items_1 (hk=? AND sk>?)`, and with an end
+    `(hk=? AND sk>? AND sk<?)`. The cursor gives the same text.
+  - Locks with a range and a cursor: `SEARCH p USING INDEX sqlite_autoindex_pending_transactions_1 (hk=? AND
+    (sk,transaction_id)>(?,?) AND sk<?)`, then `SEARCH t USING INDEX sqlite_autoindex_pending_tx_info_1
+    (transaction_id=?)`.
+  - No plan has a `TEMP B-TREE`.
+- **Tests:**
+  - `partition-store.test.ts`, "each page statement seeks on all its bounds": the exact plan of all 12 forms (items
+    and locks; no range, a range, and a range with an end; with and without a cursor).
+  - "a range page reads only the rows that it returns": 500 rows on each key before and after the slice key, and
+    500 rows of the slice key above `end`. An items page reads at most the rows it returns + 1. A lock page reads
+    at most 2 × returned + 1, and + 2 with a cursor: the JOIN reads one `pending_tx_info` row for each lock, and
+    the seek reads the cursor row and steps past it.
+  - The range results for items and locks: the edges, the empty sort key, `end = null`, a cursor, and two locks
+    on one key that a page of one row separates.
+  - `repartition-flow.test.ts`, with `migrationScanRows: 5`: a promotion next to keys of 50 rows, and a range
+    split. Each stream of each target finishes in one pull, and each child receives exactly its interval. Before
+    the change, the promotion took 21 item pulls.
 
 **F3 — split sources keep all their item rows for life (High, cost).** **Code.**
 
@@ -747,6 +786,9 @@ wait behind it (see X2).
     The override flag of R4 skips the JOIN when the partition has no override, which includes the coordinator.
 - **Example:** A 1 GB partition has 10M rows and `hashSplitN = 4`. The source reads about 4 GB, and runs 40M hashes
   and 40M JOINs. It builds each page synchronously, with up to 10k scanned rows.
+- **Still the case after F1:** A hash child has no key range, so `buildPage` gives the store a null range. The
+  child reads the whole table through the same generators as a promotion and a range split, and
+  `belongsToTarget` filters each row.
 - **Fix without a schema change:**
   1. Keep the answer for the last hash key. Rows arrive in `hk` order, so there is one hash and one lookup per key.
   2. Skip the JOIN when the partition has no finished override. Done for a partition with no override at all (R4).

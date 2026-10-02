@@ -200,6 +200,9 @@ export type PendingTxKey = { hashKey: KeyBytes; sortKey: KeyBytes };
 
 export type ScanCursor = { hk: KeyBytes; sk: KeyBytes; inclusive?: boolean };
 
+/** One hash key, and its sort keys from `start` (inclusive) to `end` (exclusive; null = to the last row of the key). */
+export type KeyRange = { hk: KeyBytes; start: KeyBytes; end: KeyBytes | null };
+
 /** The bounds of one sort-key range scan of the items table under a single hash key. */
 export type RangeScanBounds = {
 	hk: KeyBytes;
@@ -401,6 +404,96 @@ export function queryScanStatement(opts: RangeScanBounds & { limit: number; sele
 			? `SELECT sk, est_row_bytes FROM items INDEXED BY idx_items_scan WHERE ${conds.join(" AND ")} ${order}`
 			: `SELECT hk, sk, est_row_bytes, ${DATA_SELECT_DECODED}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ${order}`;
 	return { sql, params: [...params, opts.limit] };
+}
+
+/**
+ * The SQL of one migration page of `items`, in (hk, sk) order, strictly after `cursor`. A migration
+ * read returns json rows as the raw JSONB blob (no `json()` decode), so the target inserts it unchanged.
+ * `range` limits the read to one hash key and one sort-key interval. A null `range` reads the whole table.
+ *
+ * Without a range, the cursor MUST stay a row-value comparison `(hk, sk) > (?, ?)`. Do NOT rewrite it
+ * as `hk > ? OR (hk = ? AND sk > ?)`: SQLite cannot seek on that form. It takes only `hk > ?` as the
+ * index bound and checks each remaining row. A range partition holds one hash key, so each page would
+ * start again at the first row of that key, and a full pass would be quadratic. Measured over 50k rows
+ * under one hk: 337 page reads for a late page against 4 for the row-value form.
+ *
+ * With a range, the cursor replaces `start`. Do NOT add both bounds: SQLite can then seek on `start`
+ * and check each row after it, and each page starts again at the first row of the range.
+ *
+ * Row values are correct only because hk and sk are NOT NULL (see the items migration). A NULL on
+ * either side makes the comparison NULL, not true, and the read drops rows with no error. A key with
+ * no sort key stores the empty blob, which is the byte minimum and compares like any other value.
+ */
+export function itemsPageStatement(cursor: ScanCursor | null, limit: number, range: KeyRange | null): { sql: string; params: unknown[] } {
+	const conds: string[] = [];
+	const params: unknown[] = [];
+	if (range === null) {
+		if (cursor) {
+			conds.push("(hk, sk) > (?, ?)");
+			params.push(cursor.hk, cursor.sk);
+		}
+	} else {
+		conds.push("hk = ?", cursor ? "sk > ?" : "sk >= ?");
+		params.push(range.hk, cursor ? cursor.sk : range.start);
+		if (range.end !== null) {
+			conds.push("sk < ?");
+			params.push(range.end);
+		}
+	}
+	const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
+	return {
+		sql: `SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ${where}ORDER BY hk, sk LIMIT ?`,
+		params: [...params, limit],
+	};
+}
+
+/**
+ * The SQL of one migration page of `pending_transactions`, in (hk, sk, transaction_id) order,
+ * strictly after `cursor`. `range` limits the read as in `itemsPageStatement`.
+ *
+ * The cursor MUST stay a row-value comparison, for the reason that `itemsPageStatement` gives. With a
+ * range, the cursor replaces `start`, and it stays a row value on `(sk, transaction_id)` after
+ * `hk = ?`: two locks on one key can be on the two sides of a page boundary. All three key columns
+ * are NOT NULL, which makes row values correct.
+ *
+ * Each row carries the `pending_tx_info` row of its transaction, so the target can write both from one
+ * page. A transaction whose locks span pages sends its row again, and the insert merges it.
+ */
+export function pendingTxPageStatement(
+	cursor: PendingTransactionCursor | null,
+	limit: number,
+	range: KeyRange | null,
+): { sql: string; params: unknown[] } {
+	const conds: string[] = [];
+	const params: unknown[] = [];
+	if (range === null) {
+		if (cursor) {
+			conds.push("(p.hk, p.sk, p.transaction_id) > (?, ?, ?)");
+			params.push(cursor.hk, cursor.sk, cursor.transaction_id);
+		}
+	} else {
+		conds.push("p.hk = ?");
+		params.push(range.hk);
+		if (cursor) {
+			conds.push("(p.sk, p.transaction_id) > (?, ?)");
+			params.push(cursor.sk, cursor.transaction_id);
+		} else {
+			conds.push("p.sk >= ?");
+			params.push(range.start);
+		}
+		if (range.end !== null) {
+			conds.push("p.sk < ?");
+			params.push(range.end);
+		}
+	}
+	const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
+	return {
+		sql: `SELECT p.hk, p.sk, p.transaction_id, p.operation, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
+		             t.transaction_ts, t.coordinator_json, t.created_at, t.guarded_at, t.next_recovery_at
+		        FROM pending_transactions p JOIN pending_tx_info t ON t.transaction_id = p.transaction_id
+		       ${where}ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`,
+		params: [...params, limit],
+	};
 }
 
 // ---------------------------------------------------------------------------
@@ -1141,24 +1234,11 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Pages the items table in (hk, sk) order, strictly after `cursor`. This is a migration read: json
-	 * rows return the raw JSONB blob verbatim (no `json()` decode) so the child re-inserts it unchanged.
-	 *
-	 * The cursor MUST stay a row-value comparison `(hk, sk) > (?, ?)`. Do NOT rewrite it as
-	 * `hk > ? OR (hk = ? AND sk > ?)`: SQLite cannot seek on that form — it takes only `hk > ?` as the
-	 * index bound and re-checks every remaining row. A range partition holds one hash key, so each page
-	 * would restart at that key's first row and a full pass would be quadratic. Measured over 50k rows
-	 * under one hk: 337 page reads for a late page against 4 for the row-value form.
-	 *
-	 * Row values are only correct because hk/sk are NOT NULL (see the items migration). A NULL on either
-	 * side makes the comparison NULL instead of true, which drops rows silently. A key with no sort key
-	 * stores the empty blob, which is the byte minimum and compares like any other value.
-	 *
-	 * The generator reads and decodes one row each time the caller asks for the next row, so a caller
-	 * that stops early reads no payload past its stop. Read it in one synchronous block, and do not
-	 * write to `items` while it is open.
+	 * Pages `items` with the statement of `itemsPageStatement`. The generator reads and decodes one row
+	 * each time the caller asks for the next row, so a caller that stops early reads no payload past
+	 * its stop. Read it in one synchronous block, and do not write to `items` while it is open.
 	 */
-	*queryItemsPage(cursor: ScanCursor | null, limit: number): Generator<MigratedItem> {
+	*queryItemsPage(cursor: ScanCursor | null, limit: number, range: KeyRange | null): Generator<MigratedItem> {
 		type Row = {
 			item_id: ItemLinkId;
 			hk: ArrayBuffer;
@@ -1170,23 +1250,8 @@ export class PartitionStore {
 			last_read_ts: number;
 			last_write_ts: number;
 		};
-
-		let sqlCursor: SqlStorageCursor<Row>;
-		if (!cursor) {
-			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items ORDER BY hk, sk LIMIT ?`,
-				limit,
-			);
-		} else {
-			sqlCursor = this.#storage.sql.exec<Row>(
-				`SELECT item_id, hk, sk, data, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE (hk, sk) > (?, ?) ORDER BY hk, sk LIMIT ?`,
-				cursor.hk,
-				cursor.sk,
-				limit,
-			);
-		}
-
-		for (const { data_kind, ...row } of sqlCursor) {
+		const { sql, params } = itemsPageStatement(cursor, limit, range);
+		for (const { data_kind, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
 			yield {
 				...row,
 				hk: fromSqlKey(row.hk),
@@ -1195,64 +1260,6 @@ export class PartitionStore {
 				kind: kindFromCode(data_kind),
 			};
 		}
-	}
-
-	/**
-	 * Pages one hashKey's items in the given direction with explicit per-end inclusivity.
-	 *
-	 * - `lower`: start bound (value + inclusive flag). When cursor is absent, emits `sk >= lower`
-	 *   (inclusive) or `sk > lower` (exclusive). When cursor is present, resumes after the cursor
-	 *   (`sk > cursor.sk`, or `sk >= cursor.sk` when `cursorInclusive`) — the lower bound is ignored.
-	 * - `upper`: end bound (value + inclusive flag), or `null` for unbounded. Emits `sk <= upper`
-	 *   (inclusive) or `sk < upper` (exclusive).
-	 * - `cursorInclusive`: when a cursor is present, include the cursor row itself instead of
-	 *   resuming strictly past it. Used by the range-walk's boundary continuation cursor.
-	 *
-	 * Callers that always want lower-inclusive / upper-exclusive (e.g. migration) pass
-	 * `lowerInclusive: true, upperInclusive: false`.
-	 *
-	 * `decodeJson` selects the data projection: public reads (queryItems) pass `true` to decode json
-	 * rows to JSON text in SQL; migration reads pass `false` to copy the raw JSONB blob verbatim.
-	 */
-	queryRangeItemsPage(opts: {
-		hk: KeyBytes;
-		lower: KeyBytes;
-		lowerInclusive: boolean;
-		upper: KeyBytes | null;
-		upperInclusive: boolean;
-		cursor: ScanCursor | null;
-		limit: number;
-		direction: "asc" | "desc";
-		decodeJson: boolean;
-	}): MigratedItem[] {
-		type Row = {
-			item_id: ItemLinkId;
-			hk: ArrayBuffer;
-			sk: ArrayBuffer;
-			data: string | ArrayBuffer;
-			data_kind: number;
-			ttl_epoch_utc_seconds: number | null;
-			v: number;
-			last_read_ts: number;
-			last_write_ts: number;
-		};
-		const dataProjection = opts.decodeJson ? DATA_SELECT_DECODED : "data";
-		const { conds, params } = rangeScanConditions(opts);
-
-		const page = this.#storage.sql
-			.exec<Row>(
-				`SELECT item_id, hk, sk, ${dataProjection}, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts FROM items WHERE ${conds.join(" AND ")} ORDER BY sk ${opts.direction === "asc" ? "ASC" : "DESC"} LIMIT ?`,
-				...params,
-				opts.limit,
-			)
-			.toArray();
-		return page.map(({ data_kind, ...row }) => ({
-			...row,
-			hk: fromSqlKey(row.hk),
-			sk: fromSqlKey(row.sk),
-			data: fromSqlData(row.data),
-			kind: kindFromCode(data_kind),
-		}));
 	}
 
 	/**
@@ -1643,44 +1650,19 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Pages pending_transactions in (hk, sk, transaction_id) order, strictly after `cursor`.
-	 *
-	 * The cursor MUST stay a row-value comparison, for the reason spelled out on queryItemsPage: the
-	 * equivalent nested `hk > ? OR (hk = ? AND (...))` form cannot seek, so each page rescans from the
-	 * start of the hash key. All three key columns are NOT NULL, which is what makes row values correct.
-	 *
-	 * The generator reads one row at a time, as queryItemsPage does, with the same rules for the caller.
-	 * Do not write to `pending_transactions` or `pending_tx_info` while it is open.
+	 * Pages `pending_transactions` with the statement of `pendingTxPageStatement`. The generator reads
+	 * one row at a time, as queryItemsPage does, with the same rules for the caller. Do not write to
+	 * `pending_transactions` or `pending_tx_info` while it is open.
 	 */
-	*queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number): Generator<PendingTxItem> {
+	*queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number, range: KeyRange | null): Generator<PendingTxItem> {
 		type Row = Omit<PendingTxItem, "hk" | "sk" | "data" | "kind"> & {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			data: string | ArrayBuffer | null;
 			data_kind: number | null;
 		};
-
-		// Each row carries the `pending_tx_info` row of its transaction, so the target can write both from one
-		// page. A transaction whose locks span pages sends its row again, and the insert merges it.
-		const select = `SELECT p.hk, p.sk, p.transaction_id, p.operation, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
-		                       t.transaction_ts, t.coordinator_json, t.created_at, t.guarded_at, t.next_recovery_at
-		                  FROM pending_transactions p JOIN pending_tx_info t ON t.transaction_id = p.transaction_id`;
-		let sqlCursor: SqlStorageCursor<Row>;
-		if (!cursor) {
-			sqlCursor = this.#storage.sql.exec<Row>(`${select} ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`, limit);
-		} else {
-			sqlCursor = this.#storage.sql.exec<Row>(
-				`${select}
-				 WHERE (p.hk, p.sk, p.transaction_id) > (?, ?, ?)
-				 ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`,
-				cursor.hk,
-				cursor.sk,
-				cursor.transaction_id,
-				limit,
-			);
-		}
-
-		for (const { data_kind, ...row } of sqlCursor) {
+		const { sql, params } = pendingTxPageStatement(cursor, limit, range);
+		for (const { data_kind, ...row } of this.#storage.sql.exec<Row>(sql, ...params)) {
 			yield {
 				...row,
 				hk: fromSqlKey(row.hk),

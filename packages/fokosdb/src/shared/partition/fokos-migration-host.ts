@@ -21,6 +21,7 @@ import {
 	estimateItemBytes,
 	estimatePendingTxBytes,
 	PartitionStore,
+	type KeyRange,
 	type MigratedItem,
 	type PendingTransactionCursor,
 	type PendingTxItem,
@@ -55,19 +56,22 @@ export class FokosMigrationHost implements MigrationHost {
 	constructor(private readonly deps: FokosMigrationHostDeps) {}
 
 	/**
-	 * `belongsToTarget` is the ownership function of the slice; the flow owns it and every row passes
-	 * through it. `budget` holds the page budgets of the source. The request carries no budget.
+	 * The slice limits the read: a promoted key or a range slice reads only the rows of its key range.
+	 * A hash child has no key range, so it reads the whole table. `belongsToTarget` is the ownership
+	 * function of the slice; the flow owns it, and every row that the read gives passes through it.
+	 * `budget` holds the page budgets of the source. The request carries no budget.
 	 */
 	buildPage(
 		cursor: unknown,
-		_slice: FokosSlice,
+		slice: FokosSlice,
 		belongsToTarget: BelongsToTarget,
 		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const from = asHostCursor(cursor);
+		const range = sliceKeyRange(slice);
 		return from.stream === "items"
-			? this.#buildItemsPage(from.cursor, belongsToTarget, budget)
-			: this.#buildPendingTxPage(from.cursor, belongsToTarget, budget);
+			? this.#buildItemsPage(from.cursor, range, belongsToTarget, budget)
+			: this.#buildPendingTxPage(from.cursor, range, belongsToTarget, budget);
 	}
 
 	/**
@@ -91,12 +95,13 @@ export class FokosMigrationHost implements MigrationHost {
 
 	#buildItemsPage(
 		cursor: ScanCursor | null,
+		range: KeyRange | null,
 		belongsToTarget: BelongsToTarget,
 		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<MigratedItem, ScanCursor>({
-			fetchPage: (c, pageSize) => store.queryItemsPage(c, pageSize),
+			fetchPage: (c, pageSize) => store.queryItemsPage(c, pageSize, range),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimateItemBytes,
@@ -150,12 +155,13 @@ export class FokosMigrationHost implements MigrationHost {
 
 	#buildPendingTxPage(
 		cursor: PendingTransactionCursor | null,
+		range: KeyRange | null,
 		belongsToTarget: BelongsToTarget,
 		budget: FokosMigrationPageBudget,
 	): { page: FokosDBHostPage; nextCursor: FokosDBHostCursor | null } {
 		const { store } = this.deps;
 		const { rows, nextCursor } = collectBatch<PendingTxItem, PendingTransactionCursor>({
-			fetchPage: (c, pageSize) => store.queryPendingTxPage(c, pageSize),
+			fetchPage: (c, pageSize) => store.queryPendingTxPage(c, pageSize, range),
 			advanceCursor: (row) => ({ hk: row.hk, sk: row.sk, transaction_id: row.transaction_id }),
 			include: (row) => belongsToTarget({ hashKey: row.hk, sortKey: row.sk }),
 			estimateBytes: estimatePendingTxBytes,
@@ -226,6 +232,18 @@ export class FokosMigrationHost implements MigrationHost {
 				// The log sink failed. The page must apply all the same.
 			}
 		}
+	}
+}
+
+/** The key range that holds every row of the slice, or null when the rows of the slice are not one key range. */
+function sliceKeyRange(slice: FokosSlice): KeyRange | null {
+	switch (slice.kind) {
+		case "promoted_key":
+			return { hk: slice.hashKey, start: KeyCodec.encodeOptional(undefined), end: null };
+		case "range":
+			return { hk: slice.hashKey, start: slice.start ?? KeyCodec.encodeOptional(undefined), end: slice.end };
+		case "hash_child":
+			return null;
 	}
 }
 
