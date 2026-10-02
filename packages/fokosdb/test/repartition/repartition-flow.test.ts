@@ -357,7 +357,12 @@ describe("Repartition — the migration protocol", () => {
 				const cursor = await child.enter(({ target }) => target.importRecord()!.cursor);
 				const stream = cursor?.phase !== "host" ? "overrides" : ((cursor.inner as { stream?: "pending_tx" } | null)?.stream ?? "items");
 				pulls[stream]++;
-				expect(await child.enter(async ({ target }) => await target.importOnePage())).toBe("progressed");
+				// A step uses a time that is not before the last step, for the reason that `drainImport` gives.
+				const outcome = await child.enter(async ({ target }) => {
+					const now = Math.max(Date.now(), target.importRecord()?.nextAttemptAt ?? 0);
+					return await target.importOnePage(now);
+				});
+				expect(outcome).toBe("progressed");
 			}
 			expect(pulls.items, `${child.doName}: the items stream took one page`).toBeGreaterThan(1);
 			expect(pulls.pending_tx, `${child.doName}: the lock stream took one page`).toBeGreaterThan(1);
@@ -989,7 +994,12 @@ describe("Repartition — promotions", () => {
 			for (let i = 0; (await child.enter(({ target }) => target.importState())) !== "imported"; i++) {
 				expect(i, `${child.doName}: the import did not finish`).toBeLessThan(50);
 				const before = await child.enter(rows);
-				expect(await child.enter(async ({ target }) => await target.importOnePage())).toBe("progressed");
+				// A step uses a time that is not before the last step, for the reason that `drainImport` gives.
+				const outcome = await child.enter(async ({ target }) => {
+					const now = Math.max(Date.now(), target.importRecord()?.nextAttemptAt ?? 0);
+					return await target.importOnePage(now);
+				});
+				expect(outcome).toBe("progressed");
 				const after = await child.enter(rows);
 				const added = { items: after.items.length - before.items.length, locks: after.locks.length - before.locks.length };
 				expect(added.items).toBeLessThanOrEqual(5);
