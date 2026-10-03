@@ -49,7 +49,12 @@ export type PartitionDOConfig = Readonly<{
 	/** The stale transaction locks that one step of the stale transaction job reads. */
 	staleLockScanRows: number;
 	/** The items of a promoted hash key that one step of the source cleanup deletes. */
-	promotedKeyCleanupRows: number;
+	cleanupPromotedKeyRows: number;
+	/**
+	 * The lock copies that one step of the source cleanup deletes after a split or a promotion. A step
+	 * deletes all copies of one transaction together, so it can delete up to 99 rows more.
+	 */
+	cleanupTxLockCopyRows: number;
 }>;
 
 export type PartitionDOConfigOverrides = Partial<Omit<PartitionDOConfig, "ttlSweep">> & { ttlSweep?: Partial<TtlSweepConfig> };
@@ -115,7 +120,8 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 		ttlSweepDelayMs: 500,
 	},
 	staleLockScanRows: 10,
-	promotedKeyCleanupRows: 1_000,
+	cleanupPromotedKeyRows: 10_000,
+	cleanupTxLockCopyRows: 10_000,
 });
 
 export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFreeze({
@@ -144,7 +150,8 @@ export function resolvePartitionConfig(overrides: PartitionDOConfigOverrides): P
 	check(c.promotionFraction > 0 && c.promotionFraction < 1, () => `promotionFraction must be in (0, 1), got ${c.promotionFraction}`);
 	checkInteger(c, "maxClockSkewMs", 0);
 	checkInteger(c, "staleLockScanRows", 1);
-	checkInteger(c, "promotedKeyCleanupRows", 1);
+	checkInteger(c, "cleanupPromotedKeyRows", 1);
+	checkInteger(c, "cleanupTxLockCopyRows", 1);
 	validateTtlSweepConfig(c.ttlSweep);
 	return c;
 }

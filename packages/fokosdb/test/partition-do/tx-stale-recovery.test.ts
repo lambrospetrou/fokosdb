@@ -106,7 +106,8 @@ describe("PartitionDO — stale transaction recovery", () => {
 			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
 
 			expect(recoverTransaction).not.toHaveBeenCalled();
-			expect(store.listPendingTxKeys(transactionId).length).toBe(1);
+			// In `completed`, the source cleanup of the same alarm deletes the lock copy.
+			expect(store.listPendingTxKeys(transactionId).length).toBe(state_ === "cutover" ? 1 : 0);
 			expect(await state.storage.getAlarm()).toBeNull();
 		});
 	});

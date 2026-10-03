@@ -1,6 +1,6 @@
 /**
- * A promotion source keeps the lock rows of the key it moved until the completion transaction
- * deletes them, and it makes no local decision about them.
+ * A promotion source keeps the lock rows of the key it moved until the source cleanup after the
+ * completion deletes them, and it makes no local decision about them.
  *
  * Most tests build the state that a cutover leaves, and do not run a cutover: a `key_promotion` row
  * in `cutover` with its route override, and lock rows under the moved key. The repartition row is
@@ -17,7 +17,14 @@ import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import { DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS, MAX_ITEMS_PER_TX } from "../../src/shared/transaction-limits.js";
 import { captureConsoleError, kb, lockKeys, makeStub, withOpIndex } from "./helpers.js";
-import { CONTROLLED_NS, keepTestLocks, makePartition, PROMOTION_TEST_MAX_SIZE_MB, type TestPartition } from "./partition-harness.js";
+import {
+	CONTROLLED_NS,
+	drainUntil,
+	keepTestLocks,
+	makePartition,
+	PROMOTION_TEST_MAX_SIZE_MB,
+	type TestPartition,
+} from "./partition-harness.js";
 
 const LOCK_AGE_GUARD_LOG = "fokos/partition: lock-age guard: over-age lock with not_found";
 const REPAIR_FAILED_LOG = "fokos/partition: forced resolution failed";
@@ -83,6 +90,15 @@ function prepareOf(transactionId: string, keys: { hashKey: string; sortKey: stri
 			keys.map((key) => ({ hashKey: kb(key.hashKey), sortKey: kb(key.sortKey), operation: "put" as const, data, kind: "text" as const })),
 		),
 	};
+}
+
+/** Drives the source cleanup until `partition` holds no lock row of `transactionId`. */
+async function awaitNoCopies(partition: TestPartition, transactionId: string): Promise<void> {
+	await drainUntil(
+		[partition],
+		async () => (await lockKeys(partition.stub, transactionId)).length === 0,
+		`${transactionId} copies deleted`,
+	);
 }
 
 describe("PartitionDO — a promotion source and the locks of the key it moved", () => {
@@ -444,7 +460,7 @@ describe("PartitionDO — the locks of a key that a real promotion moves", () =>
 
 			await partition.controlled.testRefuseAcks(false);
 			await partition.awaitPromoted("alice");
-			expect(await lockKeys(partition.stub, transactionId)).toEqual([]);
+			await awaitNoCopies(partition, transactionId);
 		} finally {
 			await partition.controlled.testRefuseAcks(false);
 		}
@@ -502,7 +518,8 @@ describe("PartitionDO — the locks of a key that a real promotion moves", () =>
 			await partition.controlled.testRefuseAcks(false);
 		}
 
-		// After the completion the source holds no copy. The range root resolves the rows it owns.
+		// After the cleanup the source holds no copy. The range root resolves the rows it owns.
+		await awaitNoCopies(partition, moved);
 		await expect(forceCommit(partition, moved)).resolves.toEqual({ outcome: "committed", resolvedLocally: 0, forwarded: 0 });
 		expect(await guardsOf(rangeRoot, moved)).toEqual([77]);
 		await expect(forceCommit(rangeRoot, moved)).resolves.toEqual({ outcome: "committed", resolvedLocally: 1, forwarded: 0 });
@@ -563,8 +580,8 @@ describe("PartitionDO — the locks on a hash split router", () => {
 		}
 
 		await partition.awaitSplitCompleted();
-		// The completion deletes the copies of the router. The second child keeps its lock.
-		expect(await lockKeys(partition.stub, transactionId)).toEqual([]);
+		// The cleanup deletes the copies of the router. The second child keeps its lock.
+		await awaitNoCopies(partition, transactionId);
 		expect(await lockKeys(secondChild.stub, transactionId)).toEqual([`${second}/sk`]);
 		await expect(partition.rpc.debugForceResolveTransaction(partition.ctx, { transactionId, outcome: "cancel" })).resolves.toEqual({
 			outcome: "cancelled",

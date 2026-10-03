@@ -1228,7 +1228,7 @@ describe("PartitionStore - pending transactions", () => {
 			}
 			expect(store.hasAnyPendingTx()).toBe(true);
 
-			store.deletePendingTxForHashKey(kb("hk"));
+			expect(store.deletePendingTxCopiesBatch(kb("hk"), 10)).toBe(true);
 			expect(store.hasAnyPendingTx()).toBe(false);
 		});
 	});
@@ -1266,17 +1266,51 @@ describe("PartitionStore - pending transactions", () => {
 
 			store.deletePendingTxKeys("tx1", [{ hashKey: kb("a"), sortKey: kb("1") }]);
 			expect(pendingTxRow(state, "tx1")).toBeDefined();
-			// A promotion completion deletes the copies of one hash key.
-			store.deletePendingTxForHashKey(kb("a"));
+			// The cleanup after a promotion deletes the copies of one hash key.
+			expect(store.deletePendingTxCopiesBatch(kb("a"), 10)).toBe(true);
 			expect(pendingTxRow(state, "tx1")).toBeDefined();
-			store.deletePendingTxForHashKey(kb("b"));
+			expect(store.deletePendingTxCopiesBatch(kb("b"), 10)).toBe(true);
 			expect(pendingTxRow(state, "tx1")).toBeUndefined();
 			expect(pendingTxRow(state, "tx2")).toBeUndefined();
 
 			store.insertPendingLock(lockRow("c", "1", "tx3"));
-			store.deleteAllPendingTx();
+			expect(store.deletePendingTxCopiesBatch(null, 10)).toBe(true);
 			expect(pendingTxRow(state, "tx3")).toBeUndefined();
 			expect(store.hasAnyPendingTx()).toBe(false);
+		});
+	});
+
+	it("deletes the lock copies in steps of whole transactions", async () => {
+		await withStore((store, state) => {
+			// tx1 and tx2 lock three keys each. tx3 locks one key of "a" and one key of "b".
+			for (const [hk, sk, tx] of [
+				["a", "1", "tx1"],
+				["a", "2", "tx1"],
+				["a", "3", "tx1"],
+				["a", "4", "tx2"],
+				["a", "5", "tx2"],
+				["a", "6", "tx2"],
+				["a", "7", "tx3"],
+				["b", "1", "tx3"],
+			]) {
+				store.insertPendingLock(lockRow(hk, sk, tx));
+			}
+			const remaining = () => ["tx1", "tx2", "tx3"].map((tx) => store.listPendingTxKeys(tx).length);
+
+			// A budget of 1 row still deletes all copies of the transaction that the step starts: tx1
+			// holds the first key of "a".
+			expect(store.deletePendingTxCopiesBatch(kb("a"), 1)).toBe(false);
+			expect(remaining()).toEqual([0, 3, 2]);
+
+			expect(store.deletePendingTxCopiesBatch(kb("a"), 5)).toBe(true);
+			// The row of "b" is not a copy, so tx3 keeps it and its transaction row.
+			expect(remaining()).toEqual([0, 0, 1]);
+			expect(pendingTxRow(state, "tx3")).toBeDefined();
+
+			expect(store.deletePendingTxCopiesBatch(null, 1)).toBe(false);
+			expect(store.deletePendingTxCopiesBatch(null, 1)).toBe(true);
+			expect(store.hasAnyPendingTx()).toBe(false);
+			expect(state.storage.sql.exec<{ n: number }>(`SELECT COUNT(*) AS n FROM pending_tx_info`).one().n).toBe(0);
 		});
 	});
 

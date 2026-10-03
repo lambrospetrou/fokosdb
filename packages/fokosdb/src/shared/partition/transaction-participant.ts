@@ -376,7 +376,7 @@ export class TransactionParticipant {
 	 * Applies the part of a commit that this partition owns. Each decision uses the owned rows of the
 	 * transaction: whether local work remains, whether the request matches, and which rows to apply
 	 * and release. A row of a key that a promotion moved away is a copy. The new owner resolves it,
-	 * and the completion of the promotion deletes it here.
+	 * and the source cleanup after the promotion deletes it here.
 	 */
 	commitLocal(request: CommitRequest): CommitLocalResult {
 		const promotionCandidates: PromotionCandidate[] = [];

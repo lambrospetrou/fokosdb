@@ -286,12 +286,14 @@ describe("Repartition — initialization and cutover", () => {
 			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([lockRow("alice", "s1")]);
 		});
 
-		// The completion transaction deletes the copies.
+		// The completion keeps the copies, and the cleanup deletes them.
 		await sendAck(rangeRoot);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect(lockCount(store, "alice")).toBe(0);
+			expect(lockCount(store, "alice")).toBe(2);
 		});
+		await cleanUpSource(root);
+		await root.enter(({ store }) => expect(lockCount(store, "alice")).toBe(0));
 	});
 
 	it("retains the plan head through cutover and reuses it after a partial initialization", async () => {
@@ -414,14 +416,14 @@ describe("Repartition — the migration protocol", () => {
 			expect([...store.queryPendingTxPage(null, 10, null)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
 		});
 
-		// The acknowledgements complete the source, which then drops its now-redundant lock copies.
+		// The acknowledgements complete the source. The source keeps its lock copies until the cleanup.
 		for (const child of [childA, childB]) {
 			await sendAck(child);
 		}
 		await childA.enter(({ target }) => expect(target.importState()).toBe("active"));
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([]);
+			expect([...store.queryPendingTxPage(null, 10, null)].map((r) => r.transaction_id)).toEqual(["tx-b"]);
 			// A split keeps its item rows: only a promotion gives them back.
 			expect([...store.queryItemsPage(null, 100, null)]).toHaveLength(3);
 			expect(sharding.getPlanHead("r1")).toBeDefined();
@@ -430,6 +432,8 @@ describe("Repartition — the migration protocol", () => {
 		await root.enter(({ source, store, sharding }) => {
 			expect(source.sourceCleanupStep()).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
+			// The cleanup deletes the lock copies, and a split keeps its item rows.
+			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([]);
 			expect([...store.queryItemsPage(null, 100, null)]).toHaveLength(3);
 			// The final cleanup deletes the plan chain.
 			expect(sharding.getPlanHead("r1")).toBeUndefined();
@@ -719,7 +723,7 @@ describe("Repartition — promotions", () => {
 		});
 	});
 
-	it("carries the locks of the promoted key, and deletes the source copies at completion only", async () => {
+	it("carries the locks of the promoted key, and deletes the source copies in the cleanup only", async () => {
 		const c = makeCluster();
 		const root = c.hashNode([0]);
 		await root.enter(({ source, store }) => {
@@ -753,25 +757,34 @@ describe("Repartition — promotions", () => {
 		await sendAck(rangeRoot);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			// The completion transaction deletes all copies of the key at one time, so no call can
-			// send on only a part of one transaction. The lock of the other key stays.
-			expect(lockCount(store, "alice")).toBe(0);
+			// The completion deletes no lock row, so the acknowledgement stays small.
+			expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1);
 			expect(lockCount(store, "bob")).toBe(1);
 		});
 
-		// A repeat of the last acknowledgement deletes nothing more and changes no state.
+		// A repeat of the last acknowledgement deletes nothing and changes no state.
 		await root.peer.fokosMigrationAck(ack);
 		await root.enter(({ store, sharding }) => {
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect(lockCount(store, "bob")).toBe(1);
+			expect(lockCount(store, "alice")).toBe(MAX_ITEMS_PER_TX + 1);
 		});
 
-		// The item cleanup takes more than one step. Each step deletes items only.
+		// The cleanup deletes the lock copies first, then the items. Each step has a budget of
+		// CLEANUP_BATCH rows, but it deletes all copies of a transaction that it starts, so no call can
+		// send on only a part of one transaction. The lock of the other key stays.
 		await root.enter(({ source, store, sharding }) => {
 			expect(source.sourceCleanupStep(T0)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("completed");
-			expect(lockCount(store, "bob")).toBe(1);
+			expect(store.listPendingTxKeys("tx-a")).toEqual([]);
+			expect(lockCount(store, "alice")).toBe(1);
+			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(4);
+
 			expect(source.sourceCleanupStep(T0 + 5_000)).toBe("progressed");
+			expect(sharding.getRepartition("r1")!.state).toBe("completed");
+			expect(lockCount(store, "alice")).toBe(0);
+			expect([...store.queryItemsPage(null, 10, null)]).toHaveLength(2);
+
+			expect(source.sourceCleanupStep(T0 + 10_000)).toBe("progressed");
 			expect(sharding.getRepartition("r1")!.state).toBe("cleaned");
 			expect([...store.queryItemsPage(null, 10, null)].map((r) => KeyCodec.decode(r.hk))).toEqual(["bob"]);
 			expect(lockCount(store, "bob")).toBe(1);
@@ -1278,6 +1291,16 @@ async function drainImport(node: Node): Promise<void> {
 	if (state !== "imported" && state !== "active") {
 		throw new Error(`${node.doName}: the import did not complete; state is ${state ?? "absent"}`);
 	}
+}
+
+/** Runs the source cleanup steps of "r1" until the repartition is `cleaned`. */
+async function cleanUpSource(node: Node): Promise<void> {
+	await node.enter(({ source, sharding }) => {
+		for (let i = 0; sharding.getRepartition("r1")!.state !== "cleaned"; i++) {
+			expect(i, "cleanup steps").toBeLessThan(100);
+			expect(source.sourceCleanupStep(T0 + i * 60_000)).toBe("progressed");
+		}
+	});
 }
 
 /** Sends the acknowledgement of a target that has imported, at a time that is not before its last step. */

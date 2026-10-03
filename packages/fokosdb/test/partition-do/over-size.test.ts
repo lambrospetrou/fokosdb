@@ -194,7 +194,7 @@ describe("PartitionDO - a hash leaf that refuses a write for size", () => {
 
 	it("queues a hash split while a promotion cleans up, and no child receives a row of the promoted key", async () => {
 		const partition = makePartition({ ns: CONTROLLED_NS, hashSplitN: 2 });
-		await partition.controlled.testConfig({ promotedKeyCleanupRows: 1 });
+		await partition.controlled.testConfig({ cleanupPromotedKeyRows: 1 });
 		// One cleanup step, then a long pause: the promotion stays `completed` for the test.
 		await partition.controlled.testRuntimeConfig({ cleanupRetryMs: 60_000 });
 		await putRows(partition, "large", 40, 12 * 1024);

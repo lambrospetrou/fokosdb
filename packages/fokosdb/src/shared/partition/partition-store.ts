@@ -1720,25 +1720,34 @@ export class PartitionStore {
 	}
 
 	/**
-	 * Promotion completion: the target holds every lock of the key, so the copies here are not
-	 * necessary. One statement deletes them all, so a transaction never keeps only a part of its copies.
+	 * Deletes the lock copies that a completed repartition left here, until it deletes `maxRows` rows
+	 * or no copy remains. With `hk`, the copies are the rows of that hash key (a promotion). With null,
+	 * every lock row is a copy (a split). Returns true when no copy remains.
+	 *
+	 * One statement deletes all copies of one transaction, so a transaction never keeps only a part of
+	 * its copies. A transaction has at most MAX_ITEMS_PER_TX (100) rows, thus one call can delete up
+	 * to 99 rows more than `maxRows`.
 	 */
-	deletePendingTxForHashKey(hk: KeyBytes): void {
-		const transactionIds = new Set(
-			this.#storage.sql
-				.exec<{ transaction_id: string }>(`DELETE FROM pending_transactions WHERE hk = ? RETURNING transaction_id`, hk)
-				.toArray()
-				.map((row) => row.transaction_id),
-		);
-		for (const transactionId of transactionIds) {
-			this.#deletePendingTxIfUnlocked(transactionId);
+	deletePendingTxCopiesBatch(hk: KeyBytes | null, maxRows: number): boolean {
+		const sql = this.#storage.sql;
+		let deleted = 0;
+		while (deleted < maxRows) {
+			const next = tryOne(
+				hk === null
+					? sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions LIMIT 1`)
+					: sql.exec<{ transaction_id: string }>(`SELECT transaction_id FROM pending_transactions WHERE hk = ? LIMIT 1`, hk),
+			);
+			if (!next) {
+				return true;
+			}
+			const rows =
+				hk === null
+					? sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ? RETURNING 1`, next.transaction_id)
+					: sql.exec(`DELETE FROM pending_transactions WHERE transaction_id = ? AND hk = ? RETURNING 1`, next.transaction_id, hk);
+			deleted += rows.toArray().length;
+			this.#deletePendingTxIfUnlocked(next.transaction_id);
 		}
-	}
-
-	/** Split completion: children own authoritative copies; the parent's locks are redundant. */
-	deleteAllPendingTx(): void {
-		this.#storage.sql.exec(`DELETE FROM pending_transactions`);
-		this.#storage.sql.exec(`DELETE FROM pending_tx_info`);
+		return false;
 	}
 
 	/**

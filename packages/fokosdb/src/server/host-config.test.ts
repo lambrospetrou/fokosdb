@@ -42,7 +42,7 @@ describe("resolvePartitionConfig", () => {
 		[{ promotionFraction: Number.NaN }, /promotionFraction must be in \(0, 1\)/],
 		[{ maxClockSkewMs: -1 }, /maxClockSkewMs must be an integer of at least 0/],
 		[{ staleLockScanRows: 0 }, /staleLockScanRows must be an integer of at least 1/],
-		[{ promotedKeyCleanupRows: 2.5 }, /promotedKeyCleanupRows must be an integer/],
+		[{ cleanupPromotedKeyRows: 2.5 }, /cleanupPromotedKeyRows must be an integer/],
 		[{ ttlSweep: { chunkSize: 0 } }, /chunkSize must be an integer greater than zero/],
 	])("rejects %o", (overrides, detail) => {
 		expect(() => resolvePartitionConfig(overrides)).toThrow(invariantFailure(detail));

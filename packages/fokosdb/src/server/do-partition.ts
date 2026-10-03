@@ -775,32 +775,35 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				store: this.#store,
 				logParams: () => ({ ...this.logParams(), ...this.fokos.identity().ref }),
 			}),
-			// Each target now holds its own locks, so the copies here are not necessary. One delete
-			// removes them all, so no call can send on only a part of one transaction. A promotion
-			// deletes the copies of its key only, because the other keys stay here. A split deletes
-			// all copies.
-			//
-			// A promotion also deletes the size estimate of its key. Every new write of the key goes to
-			// the range tree, so nothing here reads the estimate again. Without the delete, the key stays
-			// in the promotion list of the split decision until the cleanup deletes its last row, and
-			// the split behind it waits. The cleanup keeps its own delete of the estimate as a guard.
+			// A promotion deletes the size estimate of its key. Every new write of the key goes to the
+			// range tree, so nothing here reads the estimate again. Without the delete, the key stays in
+			// the promotion list of the split decision until the cleanup deletes its last row, and the
+			// split behind it waits. The cleanup keeps its own delete of the estimate as a guard.
 			beforeComplete: (plan) => {
 				if (plan.kind === "key_promotion") {
-					const hashKey = promotedKeyOf(plan);
-					this.#store.deletePendingTxForHashKey(hashKey);
-					this.#store.deleteKeySizeEstimate(hashKey);
-					return;
+					this.#store.deleteKeySizeEstimate(promotedKeyOf(plan));
 				}
-				this.#store.deleteAllPendingTx();
 			},
-			// A split keeps its item rows. Only a promotion has rows to give back: its key moved, and
-			// the rest of its keys stay here.
+			// Each target now holds its own locks, so the lock copies here are not necessary. The
+			// cleanup deletes them in steps of a limited size, because one large delete holds every
+			// request of this partition until its write is durable. Each step deletes complete
+			// transactions, so no call can send on only a part of one transaction. A promotion deletes
+			// the copies of its key only, because the other keys stay here. A split deletes all copies.
+			//
+			// A split keeps its item rows. Only a promotion has item rows to give back: its key moved,
+			// and the rest of its keys stay here.
 			cleanupSourceStep: (plan) => {
+				const { cleanupTxLockCopyRows, cleanupPromotedKeyRows } = this.config();
 				if (plan.kind !== "key_promotion") {
-					return true;
+					// FIXME: A split keeps its item rows. A delete of the rows writes rows, and each row written
+					// has a cost. Compare that cost with the storage cost before a split deletes them.
+					return this.#store.deletePendingTxCopiesBatch(null, cleanupTxLockCopyRows);
 				}
 				const hashKey = promotedKeyOf(plan);
-				this.#store.deleteItemsBatchForHashKey(hashKey, this.config().promotedKeyCleanupRows);
+				if (!this.#store.deletePendingTxCopiesBatch(hashKey, cleanupTxLockCopyRows)) {
+					return false;
+				}
+				this.#store.deleteItemsBatchForHashKey(hashKey, cleanupPromotedKeyRows);
 				if (this.#store.hasItemsForHashKey(hashKey)) {
 					return false;
 				}

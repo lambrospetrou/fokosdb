@@ -225,18 +225,14 @@ export function makeCluster(opts: ClusterOptions = {}): Cluster {
 				evaluateSplit: () => false,
 				migration: new FokosMigrationHost({ store, logParams: () => ({ doName, partitionId: ctx.partitionId }) }),
 				computeRangeBoundaries: ({ hashKey, start, end, childCount }) => store.computeRangeSplitBoundaries(hashKey, start, end, childCount),
-				beforeComplete: (plan) => {
-					if (plan.kind === "key_promotion") {
-						store.deletePendingTxForHashKey(promotedKeyOf(plan));
-						return;
-					}
-					store.deleteAllPendingTx();
-				},
 				cleanupSourceStep: (plan) => {
 					if (plan.kind !== "key_promotion") {
-						return true;
+						return store.deletePendingTxCopiesBatch(null, CLEANUP_BATCH);
 					}
 					const hashKey = promotedKeyOf(plan);
+					if (!store.deletePendingTxCopiesBatch(hashKey, CLEANUP_BATCH)) {
+						return false;
+					}
 					store.deleteItemsBatchForHashKey(hashKey, CLEANUP_BATCH);
 					if (store.hasItemsForHashKey(hashKey)) {
 						return false;

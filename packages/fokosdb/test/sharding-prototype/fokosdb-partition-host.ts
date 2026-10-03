@@ -507,9 +507,13 @@ function partitionHooks(host: PartitionDO): FokosShardingHooks<FokosDBPolicy> {
 			todo(`store.rangeBoundaries(${hashKey.length}, ${childCount}, ${JSON.stringify([start, end]) ?? "null"})`),
 		migration: todo("FokosDBMigrationHost, unchanged"),
 		// No `beforeCutover`: a lock moves with its key, so nothing here holds a cutover back.
-		beforeComplete: (plan) =>
-			plan.kind === "key_promotion" ? todo("store.deletePendingTxForHashKey, every copy of the key") : todo("onSplitCompleted"),
-		cleanupSourceStep: (plan) => (plan.kind === "key_promotion" ? todo<boolean>("delete promoted items, one bounded step") : true),
+		beforeComplete: (plan) => (plan.kind === "key_promotion" ? todo("store.deleteKeySizeEstimate of the key") : undefined),
+		cleanupSourceStep: (plan) =>
+			todo<boolean>(
+				plan.kind === "key_promotion"
+					? "delete lock copies, then promoted items, one bounded step"
+					: "delete lock copies, one bounded step",
+			),
 		admit: ({ admissionTag, policy }) => {
 			if (admissionTag !== "write") {
 				return "allow";

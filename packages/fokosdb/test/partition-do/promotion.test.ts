@@ -88,9 +88,13 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 	 * payload of the prepare.
 	 */
 	async function commitAliceOnRangeRoot(partition: TestPartition, rangeRoot: TestPartition, transactionId: string): Promise<void> {
-		// The import brought the lock, and the completion transaction deleted the copy on the source.
+		// The import brought the lock, and the source cleanup deletes the copy on the source.
 		expect(await lockKeys(rangeRoot.stub, transactionId)).toEqual(["alice/sk1"]);
-		expect(await lockKeys(partition.stub, transactionId)).toEqual([]);
+		await drainUntil(
+			[partition],
+			async () => (await lockKeys(partition.stub, transactionId)).length === 0,
+			"the copy of alice/sk1 deleted",
+		);
 
 		await expect(
 			partition.rpc.txCommit(partition.ctx, {

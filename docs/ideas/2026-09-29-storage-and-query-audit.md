@@ -1,11 +1,11 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, C1, C5, X1, X2, R3, R5, R6, R8 and R11. Partly done: R4 (the override flag and the
+**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, F13, C1, C5, X1, X2, R3, R5, R6, R8 and R11. Partly done: R4 (the override flag and the
 destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
 the `split_bucket` column of X1. Skipped: C3. Postponed: R9. The other findings are not decided
 or implemented.
 **Date:** 2026-09-29
-**Updated:** 2026-10-02.
+**Updated:** 2026-10-03.
 
 ## Table of contents
 
@@ -50,7 +50,7 @@ says how it was checked:
 | F4 | FokosDB | Done. `pending_transactions` repeated per-transaction data on each key; `conditions_json` was never read; the stale queries stepped past lock copies | Medium | Yes |
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning. The fix is part of the item-size RFC | Medium | No |
 | F12 | FokosDB | Done. Empty hash keys kept their size-estimate rows and index entries | Medium | No |
-| F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
+| F13 | FokosDB | Done. The last migration acknowledgement deleted all lock copies in one synchronous transaction. Now the source cleanup deletes them in bounded steps | Medium | No |
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
 | C2 | FokosDB (TC) | Done. The commit path wrote P `commit_outcome` rows and a separate PREPARED state that `completeTransaction` deleted or replaced a few milliseconds later. Now about 2N + 3P + 9 row writes | Medium | No |
@@ -86,7 +86,7 @@ You must decide these now, also when the answer is "no":
 Priority 4: cost and background work (no schema change)
 
 9. F3: delete the item rows of split sources. At depth d you keep d+1 copies of the data. First measure the cost of a DELETE FROM items with no WHERE clause on Durable Objects.
-10. F13 and F7. F12 is done.
+10. F7. F12 and F13 are done.
 
 Priority 5: small request-path fixes
 
@@ -775,9 +775,28 @@ each cycle, but locks are few.
   starts a new estimate, that the TTL sweep removes the rows of the keys it empties, and that deletes through
   the transactional form leave no rows. This includes a delete of a row that is already gone.
 
-**F13 — completion deletes all lock copies in one synchronous transaction (Medium).** **Code.**
+**F13 — done: completion deleted all lock copies in one synchronous transaction (Medium).** **Code + test.**
 
-- **What happens:** `acceptAck` (`sharding/repartition-flow.ts`) runs `beforeComplete` inside the transaction of
+- **What changed:**
+  - `beforeComplete` deletes no lock row. For a promotion it deletes only the size estimate of the key.
+  - `cleanupSourceStep` calls `deletePendingTxCopiesBatch` (`shared/partition/partition-store.ts`) for a split
+    and for a promotion. For a promotion, the step deletes the lock copies of the key first, and the items after
+    them. Each step deletes at most `cleanupTxLockCopyRows` (1,000) lock rows, every `cleanupRetryMs` (5 s).
+  - The method deletes all copies of one transaction in one statement, so a transaction never keeps only a part
+    of its copies. It can delete up to 99 rows more than the budget, because one transaction has at most
+    `MAX_ITEMS_PER_TX` rows.
+- **Why not measure first:** A local run does not show the real cost. In production, the WAL frames of a large
+  delete go to the durability followers before the output gate opens, and every request of the partition waits.
+- **Why the copies can stay after `completed`:** A split source is a router, and the stale-lock job does not run
+  on a router. A promotion source skips a transaction with only copies, and a later hash split does not copy
+  the promoted key, because `belongsToTarget` refuses a key with a terminal route override.
+- **Tests:** `partition-store.test.ts` checks that a step deletes whole transactions and keeps the rows of
+  another hash key. `repartition-flow.test.ts` checks that the acknowledgement deletes no copy, and that the
+  cleanup deletes the copies before the items of a promoted key.
+
+The finding was:
+
+- **What happened:** `acceptAck` (`sharding/repartition-flow.ts`) runs `beforeComplete` inside the transaction of
   the last acknowledgement. `PartitionDO` then calls `deletePendingTxForHashKey` for a promotion, or
   `deleteAllPendingTx` for a split (`shared/partition/partition-store.ts`). Neither deletion has a batch limit.
 - **Example:** A source retains 1,000 transactions with 100 lock rows each. One split completion deletes all
@@ -785,9 +804,9 @@ each cycle, but locks are few.
   but it does not bound this lock deletion.
 - **Failure:** Other requests wait for the synchronous deletion and its commit. The completion cost grows with
   the whole copied lock set. TODO: measure the duration at the target transaction count and payload sizes.
-- **Fix direction:** Measure this path before selecting a cleanup method. If the work needs stages, start only
-  after the targets hold the locks. Preserve the per-transaction key-set rule: remove no partial copy that a
-  routed commit or forced resolution can mistake for the complete set. No schema change is required by the finding.
+- **Fix direction:** If the work needs stages, start only after the targets hold the locks. Preserve the
+  per-transaction key-set rule: remove no partial copy that a routed commit or forced resolution can mistake for
+  the complete set. No schema change is required by the finding.
 
 ### 4.2 TransactionCoordinatorDO
 
@@ -1064,6 +1083,5 @@ The SQL migrations can still be edited in place.
 - The idempotency sweep of the coordinator (covering partial index on `completed_at`).
 - The token lookups of the coordinator.
 - Lock release: one `DELETE` by primary key for each owned key.
-- The item cleanup batches of promotions and the cleanup batches of the coordinator ledger. Lock-copy deletion
-  at completion is separate (F13).
+- The item and lock-copy cleanup batches of repartitions, and the cleanup batches of the coordinator ledger.
 - The hash arena snapshot: it writes only the used part, and only when the tree grows.
