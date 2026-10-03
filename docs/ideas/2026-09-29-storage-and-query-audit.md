@@ -54,7 +54,7 @@ says how it was checked:
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
-| R7 | Runtime | Decided: keep one KV value; the default first layer is now 128K. The Bloom filter (~172 KB) is written whole each time the partition learns one promoted key; the write costs ~3.5 ms locally at any size | Medium | No |
+| R7 | Runtime | Done. The Bloom filter stays one KV value with a 128K first layer (~172 KB). The runtime writes it at most once per `promotionBloomFlushMs` (5 s), with `allowUnconfirmed`, in place of once for each new promoted key | Medium | No |
 
 ----
 
@@ -79,8 +79,8 @@ You must decide these now, also when the answer is "no":
 7. R11: done. The route context carries a policy version.
 8. C2 keeps one route context for each participant, for transactions across tables. K3 is decided: no change. R9 is postponed, and it does
    not depend on the freeze (see R9).
-9. R7: decided, no paged Bloom filter. Each row written has a cost, so the filter stays one KV value. The filter is
-   a cache, so its storage can change at any time.
+9. R7: done. The filter stays one KV value, because each row written has a cost. The runtime writes it at most
+   once per `promotionBloomFlushMs`. The filter is a cache, so its storage can change at any time.
 
 Priority 4: cost and background work (no schema change)
 
@@ -234,18 +234,19 @@ My recommendation: do F5 next.
   removed the path to the key, it reads every learned slice between the covering slice and the key (536 µs, ~5,000
   rows in the gap case above).
 
-**R7 — decided: the Bloom filter stays one KV value with a 128K first layer (Medium).** **Code + Local
-benchmark.**
+**R7 — done: the Bloom filter stays one KV value with a 128K first layer, and its writes are throttled (Medium).**
+**Code + Local benchmark + test.**
 
-- **What happens:** `#learn` writes the whole filter each time a hash partition learns at least one new promoted
-  key (`sharding/runtime.ts:1905`). One `#learn` call writes once, also when it learns many keys. A key that the
-  filter already holds causes no write. The output gate of that request waits for the write. The runtime also
-  reads the whole value at each start of the DO (K7).
+- **What happened:** `#learn` wrote the whole filter each time a hash partition learned at least one new
+  promoted key. One `#learn` call wrote once, also when it learned many keys. A key that the filter already
+  held caused no write. The output gate of that request waited for the write. The runtime also reads the whole
+  value at each start of the DO (K7).
 - **Size:** the default first layer holds 128,000 keys (`PROMOTION_BLOOM_DEFAULT_EXPECTED_KEYS`). It held
   300,000 keys before. Layer i uses the error rate `1 % × 0.5^(i+1)`, so the first layer uses 0.5 %: 172.3 KB
   and k = 8.
-- **Example:** A router learns 2,000 promoted keys: 2,000 writes of 172.3 KB, about 340 MB over its life. With
-  the earlier 300K first layer, it was 2,000 writes of 403.8 KB, about 790 MB.
+- **Example, before the throttle:** A router learns 2,000 promoted keys: 2,000 writes of 172.3 KB, about
+  340 MB over its life. With the earlier 300K first layer, it was 2,000 writes of 403.8 KB, about 790 MB. With
+  the throttle, the number of writes is at most one per 5 s while the router learns new keys.
 - **Layers for each first-layer size** (`tools/bloom-filter-sizing.js`, the 1.5 MB limit of
   `PROMOTION_BLOOM_MAX_BYTES`). `BloomFilter.add` does not create a layer that goes above the limit; it returns
   `Full`.
@@ -298,9 +299,36 @@ benchmark.**
   reads them.
 - **Rejected: the bits in 4 KB rows.** Each row written has a cost, so one learned key would write up to k rows
   in place of one.
-- **Open, no schema change:** write the filter with a delay. Mark it dirty and write it at most once per
-  interval. This is the only change that writes fewer rows. A crash loses only the keys learned after the last
-  write, and each of those keys costs one more forward until the partition learns it again.
+- **What changed (throttled write):**
+  - `promotionBloomFlushMs` in `FokosRuntimeConfig` (default 5,000) sets the longest time that a new key stays
+    only in memory. `#learn` calls `throttleTrailing(...).schedule(flushMs)` (`shared/tsutils.ts`). The first
+    call starts a timer, and the calls before it fires do nothing. When the timer fires, `#flushBloom` writes
+    the current filter once, so the write includes all keys of the interval.
+  - The throttle reads no clock. The Workers runtime does not advance `Date.now()` while code runs, so a check
+    of timestamps does not work in a request.
+  - `#flushBloom` uses the async `storage.put` with `allowUnconfirmed: true`
+    (`putPromotionBloomUnconfirmed`), because the sync KV API has no options. `getPromotionBloom` reads the same
+    key with the sync API (Local benchmark: a timer-task write read back with `kv.get`, also after a restart).
+  - The write runs in a timer task of its own. If a sync write is in the same implicit transaction, the
+    filter write becomes part of a confirmed commit, and `allowUnconfirmed` has no effect. Thus the write does
+    not run in the alarm pass or in a request.
+  - With `promotionBloomFlushMs = 0`, the runtime writes the filter at once, in the request that learns the
+    key. The tests that read the stored filter (`useSmallBloom`) use 0.
+  - `fokosDestroy` clears all timers before `deleteAll`, so a write that waits does not run after a destroy.
+  - A lost write costs only hints: when the instance stops before the timer fires, each key of that interval
+    costs one more forward until the partition learns it again.
+- **Local benchmark of the write types** (p50 / p90 round trip in ms, 300 requests per row):
+
+  | Size | No write | sync `kv.put` | async `put` | async `put`, `allowUnconfirmed` | write in a timer task |
+  |---|---|---|---|---|---|
+  | 5.3 KB | 11.6 / 14.2 | 14.8 / 17.1 | 14.7 / 16.7 | 14.4 / 16.5 | 15.6 / 17.4 |
+  | 172.3 KB | 11.7 / 15.0 | 14.3 / 16.4 | 15.0 / 17.1 | 14.9 / 17.3 | 16.0 / 18.0 |
+  | 1.32 MB | 10.8 / 12.8 | 15.4 / 17.5 | 15.6 / 18.1 | 15.5 / 17.5 | 16.5 / 18.9 |
+
+  - Locally, `allowUnconfirmed` does not reduce the wait. The probable cause is that local workerd runs the
+    SQLite commit on the DO thread; this was not verified. In production the output gate also waits for
+    replication, so only a production test can show the gain of `allowUnconfirmed`.
+  - The sure gain of the throttle is fewer commits and fewer rows written: at most one per interval.
 - **Hash arena:** It uses the same pattern, but it is small and changes seldom (Low).
 
 **R11 — done: policy "last writer wins" could write on every request (Low–Medium).** **Code + test.**
@@ -414,7 +442,7 @@ size of a value does not change the bill. The limit for a key and its value toge
 | `__fokos/import` | runtime | a few hundred B; up to ~3 KB with a cursor of large keys | each migration page, retry, start and acknowledgement | 1 time per request (`#dispatch`), 2 times per pass (two job deadlines), `lifecycle()`, and each log line (`#logParams`) |
 | `__fokos/jobs` | runtime | a small record | after a job step that changes it; `scheduleJob` when the new time is earlier | 2 times per pass, and in each `scheduleJob`: each accepted `txPrepare`, each coordinator `initiateWrite`, and each completed coordinator transaction |
 | `__fokos/cache/hash_arena` | runtime | ≤ 1 MB | when the tree it learns grows | once, at the first forward |
-| `__fokos/cache/promotion_bloom` | runtime | ~172 KB at the defaults, up to 1.40 MB | each new promoted key it learns (R7) | each start, whole |
+| `__fokos/cache/promotion_bloom` | runtime | ~172 KB at the defaults, up to 1.40 MB | at most once per `promotionBloomFlushMs` (5 s) while it learns new promoted keys (R7) | each start, whole |
 | `__fokos/repartition/<id>/plan/00000001` | runtime | policy and host data of queue time, and the planned depth and ancestors | at queue and at plan | each hook call through `#hookPlan`, and `#head()` in `#plan` and in each target initialization step |
 
 **K1 — done: the host keys have one prefix. A new naming scheme does not make a read faster (no change needed for speed).**

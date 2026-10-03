@@ -531,8 +531,14 @@ export class FokosShardingStore {
 		return this.#storage.kv.get<PartialRangeTopologySnapshot>(FOKOS_KV_KEYS.PROMOTION_BLOOM);
 	}
 
-	putPromotionBloom(snapshot: PartialRangeTopologySnapshot): void {
-		this.#storage.kv.put<PartialRangeTopologySnapshot>(FOKOS_KV_KEYS.PROMOTION_BLOOM, snapshot);
+	/**
+	 * Writes the filter with the async API and `allowUnconfirmed`, so outgoing messages do not wait for
+	 * this write. The sync API has no such option, and `getPromotionBloom` reads the same key. A sync
+	 * write in the same commit makes the whole commit confirmed, so call this from a task that makes no
+	 * other writes.
+	 */
+	putPromotionBloomUnconfirmed(snapshot: PartialRangeTopologySnapshot): Promise<void> {
+		return this.#storage.put<PartialRangeTopologySnapshot>(FOKOS_KV_KEYS.PROMOTION_BLOOM, snapshot, { allowUnconfirmed: true });
 	}
 
 	// ─── fokos_repartitions ─────────────────────────────────────────────────

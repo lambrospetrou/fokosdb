@@ -518,12 +518,13 @@ export async function keepTestLocks(...holders: TestPartition[]): Promise<void> 
  * false positive rate. After the partition learns one promoted key, many other hash keys are false
  * positives of the filter, and `findKey` finds them in a small number of tries. The partition reads
  * the setting when it creates its filter, thus call this before it learns its first promotion. The
- * setting applies only to these instances, and a stored filter keeps its size after a restart. Each
- * partition must be in the `CONTROLLED_NS` namespace.
+ * setting applies only to these instances, and a stored filter keeps its size after a restart. The
+ * partition also writes its filter in the request that learns a key, so `storedBloom` reads it at once.
+ * Each partition must be in the `CONTROLLED_NS` namespace.
  */
 export async function useSmallBloom(...partitions: TestPartition[]): Promise<void> {
 	for (const partition of partitions) {
-		await partition.controlled.testRuntimeConfig({ promotionBloomExpectedKeys: 1 });
+		await partition.controlled.testRuntimeConfig({ promotionBloomExpectedKeys: 1, promotionBloomFlushMs: 0 });
 	}
 }
 

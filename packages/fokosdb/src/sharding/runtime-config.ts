@@ -98,6 +98,14 @@ export type FokosRuntimeConfig = Readonly<{
 	/** The false positive rate of that Bloom filter. Read when the filter is created. */
 	promotionBloomFalsePositiveRate: number;
 	/**
+	 * The longest time that a newly learned promoted key stays only in the memory of the Bloom filter.
+	 * The runtime writes the whole filter at most once in this time, in a timer task of its own, so the
+	 * write does not add to the commit of a request. A key that is not written when the instance stops
+	 * costs one more forward until the partition learns it again. 0 writes the filter in the request
+	 * that learns the key.
+	 */
+	promotionBloomFlushMs: number;
+	/**
 	 * A cache can send a request to a partition that no longer owns the key. The runtime then finds the
 	 * owner again without that cache, and sends the request again. This is the maximum number of these
 	 * retries for one request.
@@ -166,6 +174,7 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	rangeHierarchyRefreshMs: 60_000,
 	promotionBloomExpectedKeys: PROMOTION_BLOOM_DEFAULT_EXPECTED_KEYS,
 	promotionBloomFalsePositiveRate: 0.01,
+	promotionBloomFlushMs: 5_000,
 	maxForwardRetries: 8,
 	sourceRetryBaseMs: 5_000,
 	sourceRetryMaxMs: 5 * 60_000,
@@ -194,6 +203,7 @@ const MINIMUMS: { [K in keyof FokosRuntimeConfig]?: number } = {
 	rangeHierarchyMaxRows: 1,
 	rangeHierarchyRefreshMs: 0,
 	promotionBloomExpectedKeys: 1,
+	promotionBloomFlushMs: 0,
 	maxForwardRetries: 0,
 	sourceRetryBaseMs: 1,
 	sourceRetryMaxMs: 1,

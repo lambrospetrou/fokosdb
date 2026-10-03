@@ -12,6 +12,7 @@
 import { FokosError, FokosInternalError, FokosRoutingError, FokosUnavailableError } from "../shared/errors.js";
 import invariant from "../shared/invariant.js";
 import { DESTROY_ABORT_SENTINEL } from "../shared/cf-utils.js";
+import { throttleTrailing } from "../shared/tsutils.js";
 import { AddResult } from "./bloom-filter.js";
 import { attachRouting, envelope, RouteCollector, routedError } from "./envelope.js";
 import { SHARDING_INTERNAL_CODES, SHARDING_ROUTING_CODES, SHARDING_UNAVAILABLE_CODES } from "./errors.js";
@@ -186,6 +187,9 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 	#rangeAncestors: RangeAncestorInfo[] = [];
 	#hashArena: HashTopology | null = null;
 	#bloom: PartialRangeTopology | null = null;
+
+	/** Writes the Bloom filter at most once per `promotionBloomFlushMs`, in a timer task of its own. */
+	readonly #bloomFlushThrottled = throttleTrailing(() => this.#flushBloom());
 	/** The plan of every visit `rangeVisits` returned, by the visit object, so `forwardRangeVisit` can fall back. */
 	readonly #plans = new WeakMap<FokosRangeVisit, PlannedVisit>();
 
@@ -1902,8 +1906,31 @@ export class FokosShardingRuntime<TPolicy, Ops extends FokosOperationSpec> imple
 			this.#store.putHashArena(arena.toSnapshot());
 		}
 		if (bloomChanged) {
-			this.#store.putPromotionBloom(this.#bloom!.toSnapshot());
+			const bloom = this.#bloom;
+			invariant(bloom, "fokos/runtime: expected a promotion Bloom filter to exist before flushing");
+			const flushMs = this.#config().promotionBloomFlushMs;
+			if (flushMs === 0) {
+				this.#bloomFlushThrottled.forceRun();
+			} else {
+				this.#bloomFlushThrottled.schedule(flushMs);
+			}
 		}
+	}
+
+	#flushBloom(): void {
+		if (!this.#bloom) {
+			return;
+		}
+		// In a timer task of its own, this write is best-effort: `allowUnconfirmed` lets the outgoing
+		// messages of other requests go without waiting for it.
+		void this.#store.putPromotionBloomUnconfirmed(this.#bloom.toSnapshot()).catch((error: unknown) => {
+			console.error({
+				...this.#logParams(),
+				message: "fokos/runtime: writing the promotion Bloom filter failed.",
+				error: String(error),
+				errorProps: error,
+			});
+		});
 	}
 
 	#bloomForLearning(): PartialRangeTopology {
