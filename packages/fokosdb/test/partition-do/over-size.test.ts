@@ -85,7 +85,7 @@ async function prepare(partition: TestPartition, hashKey: string, sortKeys: stri
 			})),
 		),
 	});
-	expect(res.outcome).toBe("accepted");
+	expect(res).toMatchObject({ outcome: "accepted" });
 	return transactionId;
 }
 

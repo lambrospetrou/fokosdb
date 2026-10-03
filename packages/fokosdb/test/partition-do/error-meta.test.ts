@@ -25,7 +25,7 @@ async function lockItem(node: TestPartition, keys: ItemKeys): Promise<() => Prom
 		coordinator: testCoordinatorRef(),
 		items: withOpIndex([{ ...keys, operation: "put", data: "pending", kind: "text" }]),
 	});
-	expect(res.outcome).toBe("accepted");
+	expect(res).toMatchObject({ outcome: "accepted" });
 	return () => node.rpc.txCancel(node.ctx, { transactionId, items: [keys] });
 }
 

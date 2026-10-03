@@ -44,7 +44,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				],
 			}),
 		);
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 		expect("results" in res).toBe(false);
 	});
 
@@ -77,7 +77,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				}),
 			);
 
-			expect(res.outcome).toBe("cancelled");
+			expect(res).toMatchObject({ outcome: "cancelled" });
 			if (res.outcome !== "cancelled") {
 				return;
 			}
@@ -127,7 +127,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				}),
 			);
 
-			expect(res.outcome).toBe("cancelled");
+			expect(res).toMatchObject({ outcome: "cancelled" });
 			if (res.outcome !== "cancelled") {
 				return;
 			}
@@ -185,7 +185,7 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				}),
 			);
 
-			expect(res.outcome).toBe("cancelled");
+			expect(res).toMatchObject({ outcome: "cancelled" });
 			if (res.outcome !== "cancelled") {
 				return;
 			}
@@ -357,14 +357,14 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 				}),
 			);
 
-			expect(res.outcome).toBe("cancelled");
+			expect(res).toMatchObject({ outcome: "cancelled" });
 			if (res.outcome !== "cancelled") {
 				return;
 			}
 
 			expect(res.results).toHaveLength(2);
 			const op0 = res.results[0];
-			expect(op0.outcome).toBe("rejected");
+			expect(op0).toMatchObject({ outcome: "rejected" });
 			if (op0.outcome === "rejected" && op0.reason.code === "condition_failed") {
 				expect(op0.reason.code).toBe("condition_failed");
 				expect(op0.reason.hashKey).toEqual(binHk);
@@ -527,21 +527,21 @@ describe("transactWriteItems returnValuesOnConditionCheckFailure and per-operati
 			// Cap at 100 bytes: opIndex 0 (50 bytes) fits, opIndex 1 (60 bytes) takes total to 110 > 100 so dropped
 			applyImageCap(items, 100);
 
-			expect(items[0].outcome).toBe("rejected");
+			expect(items[0]).toMatchObject({ outcome: "rejected" });
 			if (items[0].outcome === "rejected" && items[0].reason.code === "condition_failed") {
 				expect(items[0].reason.item).toBeDefined();
 				expect(items[0].itemOmitted).toBeUndefined();
 			}
 
-			expect(items[1].outcome).toBe("rejected");
+			expect(items[1]).toMatchObject({ outcome: "rejected" });
 			if (items[1].outcome === "rejected" && items[1].reason.code === "condition_failed") {
 				expect(items[1].reason.item).toBeUndefined();
 				expect(items[1].itemOmitted).toBe("response_too_large");
 			}
 
-			expect(items[2].outcome).toBe("passed");
+			expect(items[2]).toMatchObject({ outcome: "passed" });
 
-			expect(items[3].outcome).toBe("rejected");
+			expect(items[3]).toMatchObject({ outcome: "rejected" });
 			if (items[3].outcome === "rejected" && items[3].reason.code === "condition_failed") {
 				expect(items[3].reason.item).toBeUndefined();
 				expect(items[3].itemOmitted).toBe("response_too_large");

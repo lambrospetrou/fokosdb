@@ -93,7 +93,9 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	it("commits its owned rows and keeps the copies of the moved key", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		expect((await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1"))).outcome).toBe("accepted");
+		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1"))).toMatchObject({
+			outcome: "accepted",
+		});
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -141,7 +143,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 				{ hashKey: "carol", sortKey: "sk" },
 			]),
 		);
-		expect(prepared.outcome).toBe("accepted");
+		expect(prepared).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -156,7 +158,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	it("releases nothing for a cancel with no key", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		expect((await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).outcome).toBe("accepted");
+		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -170,7 +172,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	it("releases the rows of the keys a cancel names and keeps the copies", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		expect((await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).outcome).toBe("accepted");
+		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }]))).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -187,7 +189,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		const keys = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => ({ hashKey: "bob", sortKey: `sk${String(i).padStart(3, "0")}` }));
-		expect((await rpc.txPrepare(ctx, prepareOf(transactionId, keys, "many"))).outcome).toBe("accepted");
+		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, keys, "many"))).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -366,7 +368,9 @@ describe("PartitionDO — stale recovery on a promotion source", () => {
 /** Prepares one transaction on `keys` at `partition`, and returns its id. */
 async function prepareOn(partition: TestPartition, keys: { hashKey: string; sortKey: string }[]): Promise<string> {
 	const transactionId = crypto.randomUUID();
-	expect((await partition.rpc.txPrepare(partition.ctx, prepareOf(transactionId, keys, `v-${keys[0].sortKey}`))).outcome).toBe("accepted");
+	expect(await partition.rpc.txPrepare(partition.ctx, prepareOf(transactionId, keys, `v-${keys[0].sortKey}`))).toMatchObject({
+		outcome: "accepted",
+	});
 	return transactionId;
 }
 

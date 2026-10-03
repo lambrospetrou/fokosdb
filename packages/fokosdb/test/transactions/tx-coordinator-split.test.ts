@@ -115,7 +115,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const items = keysAcrossPartitions(db, 2, "tc-split-ledger").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `tc-split-ledger-${crypto.randomUUID()}`;
 		const first = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
-		expect(first.outcome).toBe("committed");
+		expect(first).toMatchObject({ outcome: "committed" });
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		await queueCoordinatorSplit(root);
@@ -155,7 +155,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			// The source answers `partition_migrating` at PREPARED, and db.ts retries with the same token
 			// until the child has imported the ledger row and resumes it.
 			const result = await write;
-			expect(result.outcome).toBe("committed");
+			expect(result).toMatchObject({ outcome: "committed" });
 
 			// One transaction, committed once on each participant, under the id the source created.
 			const commits = await txCalls(db, keys, "txCommit");
@@ -212,7 +212,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const items = keysAcrossPartitions(db, 2, "tc-split-recovery").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `tc-split-recovery-${crypto.randomUUID()}`;
 		const first = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
-		expect(first.outcome).toBe("committed");
+		expect(first).toMatchObject({ outcome: "committed" });
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		await queueCoordinatorSplit(root);
@@ -253,7 +253,9 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		const db = makeDB({ controlled: true });
 		const items = keysAcrossPartitions(db, 2, "tc-split-refused").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `tc-split-refused-${crypto.randomUUID()}`;
-		expect((await writeOutcome(db.transactWriteItems({ items, clientRequestToken: `${token}-first` }))).outcome).toBe("committed");
+		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: `${token}-first` }))).toMatchObject({
+			outcome: "committed",
+		});
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		await runInDurableObject(coordinatorStub(root.doName), async (instance: TransactionCoordinatorDO, state: DurableObjectState) => {
@@ -274,14 +276,18 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 		});
 		await awaitSplitSettled(root, token);
 
-		expect((await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }))).outcome).toBe("committed");
+		// The token selects the coordinator, not the keys. New keys have no stamp, so a partition cannot
+		// refuse the stamp of the new coordinator when its clock is behind the clock of the root. The
+		// first write cannot be repeated to avoid this, because a replay of the token returns the same cancel.
+		const after = keysAcrossPartitions(db, 2, "tc-split-refused-after").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
+		expect(await writeOutcome(db.transactWriteItems({ items: after, clientRequestToken: token }))).toMatchObject({ outcome: "committed" });
 	});
 
 	it("does not split a coordinator with one token above its cap, and logs the floor once", async () => {
 		const db = makeDB({ controlled: true });
 		const items = keysAcrossPartitions(db, 2, "tc-split-floor").map((key) => ({ ...key, operation: "put" as const, data: "v" }));
 		const token = `tc-split-floor-${crypto.randomUUID()}`;
-		expect((await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }))).outcome).toBe("committed");
+		expect(await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }))).toMatchObject({ outcome: "committed" });
 
 		const root = coordinatorRouter(db).allRoots()[0];
 		const logged = captureConsoleError();

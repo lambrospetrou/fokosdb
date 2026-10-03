@@ -36,7 +36,7 @@ describe("transactions - an update plan at the binding limit", () => {
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 		const res = await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "update", update: widestUpdate(), ttlAt }] });
 
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 		const got = await db.getItem(key);
 		invariant(got.found, "expected the updated item");
 		expect(Object.keys(got.item.data as Record<string, unknown>)).toHaveLength(EXPRESSION_LIMITS.updateActions);
@@ -68,7 +68,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		const res = await writeOutcomeWithClockRetry(db, {
 			items: [{ ...key, operation: "update", update }],
 		});
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
 			found: true,
@@ -91,7 +91,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		const res = await writeOutcomeWithClockRetry(db, {
 			items: [{ ...key, operation: "update", update }],
 		});
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
 			found: true,
@@ -172,7 +172,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		});
 
 		// The whole result is the message, so that a cancel shows the reason of each operation.
-		expect(res.outcome, JSON.stringify(res)).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 		expect(await db.getItem(existing)).toMatchObject({ found: true, item: { version: 2, data: { n: 11 } } });
 		expect(await db.getItem(absent)).toMatchObject({ found: true, item: { version: 1, data: { n: 10 } } });
 	});
@@ -357,7 +357,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 		const res = await writeOutcomeWithClockRetry(db, {
 			items: [{ ...key, operation: "update", update }],
 		});
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(key)).resolves.toMatchObject({
 			found: true,
@@ -445,7 +445,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 				items: [{ ...key, operation: "update", update: update1 }],
 			}),
 		);
-		expect(res1.outcome).toBe("committed");
+		expect(res1).toMatchObject({ outcome: "committed" });
 
 		// Idempotent retry with identical token and operation returns same outcome
 		const res2 = await writeOutcome(
@@ -493,7 +493,7 @@ describe.each([true, false])("transactions - update expressions (singlePartition
 				{ ...kCheck, operation: "check", condition: { op: "eq", args: [{ ref: "data", path: "$.verified" }, { val: true }] } },
 			],
 		});
-		expect(res.outcome).toBe("committed");
+		expect(res).toMatchObject({ outcome: "committed" });
 
 		await expect(db.getItem(kPut)).resolves.toMatchObject({ found: true, item: { data: { created: true } } });
 		await expect(db.getItem(kUpdate)).resolves.toMatchObject({ found: true, item: { data: { num: 15 } } });

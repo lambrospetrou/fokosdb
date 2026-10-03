@@ -238,12 +238,12 @@ describe.concurrent("PartitionDO — range split", () => {
 				coordinator: testCoordinatorRef(),
 				items: withOpIndex([{ ...key, operation: "put", data: "v", kind: "text" }]),
 			});
-			expect(prepare.value.outcome).toBe("accepted");
+			expect(prepare.value).toMatchObject({ outcome: "accepted" });
 			expect(prepare.routing.forwardCount).toBe(1);
 			expect(executedBy(prepare).ref.doName).toBe(owner.doName);
 
 			const commit = await hashPartition.stub.txCommit(hashPartition.ctx, { transactionId, transactionTimestamp, items: [key] });
-			expect(commit.value.outcome).toBe("committed");
+			expect(commit.value).toMatchObject({ outcome: "committed" });
 			expect(commit.routing.forwardCount).toBe(1);
 			expect(executedBy(commit).ref.doName).toBe(owner.doName);
 

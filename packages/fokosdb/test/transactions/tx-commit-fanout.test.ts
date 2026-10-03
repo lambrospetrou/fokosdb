@@ -41,7 +41,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 
 		const result = await writeOutcome(db.transactWriteItems({ items }));
 
-		expect(result.outcome).toBe("committed");
+		expect(result).toMatchObject({ outcome: "committed" });
 		// One commit RPC per participant, and every wire item is a bare key: the payload each
 		// participant applies comes from its own pending_transactions rows, not from the wire.
 		const commits = await txCalls(db, keys, "txCommit");
@@ -83,7 +83,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		await coordinator.testConfig({});
 		await reachable();
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
-		expect(replay.outcome).toBe("committed");
+		expect(replay).toMatchObject({ outcome: "committed" });
 		// Read-your-writes: every written key, on every participant, returns the new value.
 		for (const key of keys) {
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: `data-${key.hashKey}` } });
@@ -112,7 +112,7 @@ describe("transactions - commit fan-out: keys only, and the gated committed answ
 		await childrenMigrated();
 		await coordinator.testConfig({});
 		const replay = await writeOutcome(db.transactWriteItems({ items, clientRequestToken: token }));
-		expect(replay.outcome).toBe("committed");
+		expect(replay).toMatchObject({ outcome: "committed" });
 		for (const key of keys) {
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: `data-${key.hashKey}` } });
 		}

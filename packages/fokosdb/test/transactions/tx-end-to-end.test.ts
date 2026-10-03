@@ -158,7 +158,7 @@ describe("transactions - end-to-end", () => {
 
 		const txResult = await writeOutcomeWithClockRetry(db, { items: operations });
 
-		expect(txResult.outcome).toBe("committed");
+		expect(txResult).toMatchObject({ outcome: "committed" });
 		expect(txResult).toMatchObject({
 			outcome: "committed",
 			transactionId: expect.any(String),
@@ -212,7 +212,7 @@ describe("transactions - end-to-end", () => {
 			],
 		});
 
-		expect(txResult.outcome).toBe("cancelled");
+		expect(txResult).toMatchObject({ outcome: "cancelled" });
 		invariant(txResult.outcome === "cancelled");
 		// Every operation keeps the answer of its own partition, so the check reports its failed condition.
 		expect(txResult.results.at(-1)).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -239,7 +239,7 @@ describe("transactions - end-to-end", () => {
 		const cancelled = await writeOutcomeWithClockRetry(db, {
 			items: [{ hashKey: putKey, operation: "put" as const, data: "cancelled" }, check({ op: "false" })],
 		});
-		expect(cancelled.outcome).toBe("cancelled");
+		expect(cancelled).toMatchObject({ outcome: "cancelled" });
 		invariant(cancelled.outcome === "cancelled");
 		expect(cancelled.results.at(-1)).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
 		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: false });
@@ -248,7 +248,7 @@ describe("transactions - end-to-end", () => {
 		const committed = await writeOutcomeWithClockRetry(db, {
 			items: [{ hashKey: putKey, operation: "put" as const, data: "committed" }, check({ op: "true" })],
 		});
-		expect(committed.outcome).toBe("committed");
+		expect(committed).toMatchObject({ outcome: "committed" });
 		await expect(db.getItem({ hashKey: putKey })).resolves.toMatchObject({ found: true, item: { data: "committed" } });
 		await expect(db.getItem({ hashKey: checkKey })).resolves.toMatchObject({ found: false });
 	});
@@ -277,7 +277,7 @@ describe("transactions - end-to-end", () => {
 			})),
 		});
 
-		expect(txResult.outcome).toBe("cancelled");
+		expect(txResult).toMatchObject({ outcome: "cancelled" });
 
 		for (const k of keys) {
 			const result = await db.getItem(k);
@@ -317,7 +317,7 @@ describe("transactions - end-to-end", () => {
 		if (putResult.status === "rejected") {
 			// prepare ran before putItem arrived → putItem was blocked by the pending lock.
 			// The transaction must have committed cleanly.
-			expect(tx.outcome).toBe("committed");
+			expect(tx).toMatchObject({ outcome: "committed" });
 			const shared = await db.getItem({ hashKey: "iso-shared" });
 			expect(shared.found).toBe(true);
 			invariant(shared.found);
@@ -485,19 +485,19 @@ describe("transactions - end-to-end", () => {
 		const tx1 = r1.value;
 		const tx2 = r2.value;
 
-		expect(tx1.outcome).toBe("committed");
-		expect(tx2.outcome).toBe("committed");
+		expect(tx1).toMatchObject({ outcome: "committed" });
+		expect(tx2).toMatchObject({ outcome: "committed" });
 
 		let value = undefined;
 		expect(firstRetries + secondRetries).toBeGreaterThan(0);
 		if (firstRetries > 0) {
 			value = tx1;
-			expect(tx1.outcome).toBe("committed");
-			expect(tx2.outcome).toBe("committed");
+			expect(tx1).toMatchObject({ outcome: "committed" });
+			expect(tx2).toMatchObject({ outcome: "committed" });
 		} else if (secondRetries > 0) {
 			value = tx2;
-			expect(tx1.outcome).toBe("committed");
-			expect(tx2.outcome).toBe("committed");
+			expect(tx1).toMatchObject({ outcome: "committed" });
+			expect(tx2).toMatchObject({ outcome: "committed" });
 		}
 
 		// Both applied serially: tx1(v1) → tx2(v2).
@@ -518,8 +518,8 @@ describe("transactions - end-to-end", () => {
 
 		// The partition takes no lock for either, so neither can conflict with the other: they serialize
 		// inside the single-threaded DO and both commit on their first attempt.
-		expect(tx1.outcome).toBe("committed");
-		expect(tx2.outcome).toBe("committed");
+		expect(tx1).toMatchObject({ outcome: "committed" });
+		expect(tx2).toMatchObject({ outcome: "committed" });
 
 		// Applied one after the other, so the surviving value is one of the two and the item saw two writes.
 		const result = await db.getItem({ hashKey: "ser-fast-key" });
@@ -727,10 +727,10 @@ describe("transactions - end-to-end", () => {
 		];
 
 		const result1 = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
-		expect(result1.outcome).toBe("committed");
+		expect(result1).toMatchObject({ outcome: "committed" });
 
 		const result2 = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
-		expect(result2.outcome).toBe("committed");
+		expect(result2).toMatchObject({ outcome: "committed" });
 		invariant(result1.outcome === "committed" && result2.outcome === "committed");
 		expect(result2.transactionId).toBe(result1.transactionId);
 		expect(result2.idempotencyToken).toBe(result1.idempotencyToken);
@@ -771,7 +771,7 @@ describe("transactions - end-to-end", () => {
 		const token = `idemp-mismatch-${crypto.randomUUID()}`;
 		const operations = [{ hashKey: "mismatch-1", operation: "put" as const, data: "original" }];
 		const first = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
-		expect(first.outcome).toBe("committed");
+		expect(first).toMatchObject({ outcome: "committed" });
 
 		// Same key, different payload — the case that silently lost the write.
 		await expect(
@@ -801,7 +801,7 @@ describe("transactions - end-to-end", () => {
 
 		// The legitimate replay still works — the guard rejects different work, not retries.
 		const replay = await writeOutcome(db.transactWriteItems({ items: operations, clientRequestToken: token }));
-		expect(replay.outcome).toBe("committed");
+		expect(replay).toMatchObject({ outcome: "committed" });
 	});
 
 	it("delete operations in a transaction remove items atomically", async () => {
@@ -823,7 +823,7 @@ describe("transactions - end-to-end", () => {
 			],
 		});
 
-		expect(txResult.outcome).toBe("committed");
+		expect(txResult).toMatchObject({ outcome: "committed" });
 
 		expect((await db.getItem({ hashKey: "del-0" })).found).toBe(false);
 		expect((await db.getItem({ hashKey: "del-1" })).found).toBe(false);
@@ -861,7 +861,7 @@ describe("transactions - end-to-end", () => {
 			],
 		});
 
-		expect(txResult.outcome).toBe("cancelled");
+		expect(txResult).toMatchObject({ outcome: "cancelled" });
 
 		const result = await db.getItem({ hashKey: "rollback-put" });
 		expect(result.found).toBe(true);
@@ -893,7 +893,7 @@ describe("transactions - end-to-end", () => {
 						clientRequestToken: `tcdist-token-${i}`,
 					}),
 				);
-				expect(result.outcome).toBe("committed");
+				expect(result).toMatchObject({ outcome: "committed" });
 			}
 
 			// One getByName call per transactWriteItems, and each names a root coordinator of the table.
@@ -939,7 +939,7 @@ describe("transactions - end-to-end", () => {
 
 		vi.advanceTimersByTime(1);
 		const rerouted = await writeOutcome(db3.transactWriteItems({ items: [operation], clientRequestToken: token }));
-		expect(rerouted.outcome).toBe("committed");
+		expect(rerouted).toMatchObject({ outcome: "committed" });
 		expect(rerouted.transactionId).not.toBe(first.transactionId);
 		await expect(db3.getItem({ hashKey: operation.hashKey })).resolves.toMatchObject({ found: true, item: { version: 2 } });
 	});

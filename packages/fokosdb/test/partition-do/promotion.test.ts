@@ -78,7 +78,7 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "from-the-lock", kind: "text" }]),
 		});
-		expect(prepare.outcome).toBe("accepted");
+		expect(prepare).toMatchObject({ outcome: "accepted" });
 		return transactionId;
 	}
 
@@ -387,7 +387,7 @@ describe("PartitionDO — transaction commit and promotion candidates", () => {
 				{ hashKey: kb("hot"), sortKey: kb("sk1"), operation: "put", data: PROMOTION_BIG_DATA, kind: "text" },
 			]),
 		});
-		expect(prepare.outcome).toBe("accepted");
+		expect(prepare).toMatchObject({ outcome: "accepted" });
 
 		await rangeRoot.controlled.testTxResponse("txCommit", { error: "simulated child commit failure", times: 1 });
 
@@ -492,7 +492,7 @@ describe.concurrent("PartitionDO — a transaction through a hash jump to a part
 				{ hashKey: kb(h2), sortKey: kb("b"), operation: "put", data: "v2", kind: "text" },
 			]),
 		});
-		expect(prepare.outcome).toBe("accepted");
+		expect(prepare).toMatchObject({ outcome: "accepted" });
 		const keys = [
 			{ hashKey: kb(h1), sortKey: kb("a") },
 			{ hashKey: kb(h2), sortKey: kb("b") },
@@ -588,12 +588,12 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ ...key, operation: "put", data: "v", kind: "text" }]),
 		});
-		expect(prepare.value.outcome).toBe("accepted");
+		expect(prepare.value).toMatchObject({ outcome: "accepted" });
 		expect(prepare.routing.forwardCount).toBe(1);
 		expect(executedBy(prepare).ref.doName).toBe(owner.doName);
 
 		const commit = await partition.stub.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: [key] });
-		expect(commit.value.outcome).toBe("committed");
+		expect(commit.value).toMatchObject({ outcome: "committed" });
 		expect(commit.routing.forwardCount).toBe(1);
 		expect(executedBy(commit).ref.doName).toBe(owner.doName);
 
@@ -631,7 +631,7 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 				coordinator: testCoordinatorRef(),
 				items: withOpIndex(keys.map((key) => ({ ...key, operation: "put" as const, data: "v", kind: "text" as const }))),
 			});
-			expect(prepare.outcome).toBe("accepted");
+			expect(prepare).toMatchObject({ outcome: "accepted" });
 			expect(await partition.rpc.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: keys })).toMatchObject({
 				outcome: "committed",
 			});
@@ -640,7 +640,7 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 			const shot = await partition.rpc.txExecuteSingleShot(partition.ctx, {
 				items: withOpIndex(keys.map((key) => ({ ...key, operation: "put" as const, data: "v2", kind: "text" as const }))),
 			});
-			expect(shot.outcome).toBe("committed");
+			expect(shot).toMatchObject({ outcome: "committed" });
 			for (const key of keys) {
 				expect(await partition.get(key)).toMatchObject({ found: true, item: { data: "v2" } });
 			}
@@ -675,11 +675,11 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ ...key, operation: "put", data: "v2", kind: "text" }]),
 		});
-		expect(prepare.value.outcome).toBe("accepted");
+		expect(prepare.value).toMatchObject({ outcome: "accepted" });
 		expect(executedBy(prepare).ref.doName).toBe(partition.doName);
 
 		const commit = await partition.stub.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: [key] });
-		expect(commit.value.outcome).toBe("committed");
+		expect(commit.value).toMatchObject({ outcome: "committed" });
 		expect(executedBy(commit).ref.doName).toBe(partition.doName);
 		expect(await partition.localItemCount(hashKey)).toBe(2);
 
@@ -717,12 +717,12 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 				coordinator: testCoordinatorRef(),
 				items: withOpIndex([{ ...key, operation: "put", data: "v2", kind: "text" }]),
 			});
-			expect(prepare.value.outcome).toBe("accepted");
+			expect(prepare.value).toMatchObject({ outcome: "accepted" });
 			expect(prepare.routing.forwardCount).toBe(1);
 			expect(executedBy(prepare).ref.doName).toBe(partition.doName);
 
 			const commit = await partition.stub.txCommit(partition.ctx, { transactionId, transactionTimestamp, items: [key] });
-			expect(commit.value.outcome).toBe("committed");
+			expect(commit.value).toMatchObject({ outcome: "committed" });
 			expect(commit.routing.forwardCount).toBe(1);
 			expect(executedBy(commit).ref.doName).toBe(partition.doName);
 			expect(await partition.localItemCount(hashKey)).toBe(2);

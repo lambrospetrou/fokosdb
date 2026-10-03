@@ -36,7 +36,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
 			]),
 		});
-		expect(prepareResp.outcome).toBe("accepted");
+		expect(prepareResp).toMatchObject({ outcome: "accepted" });
 
 		await rpc.txCommit(ctx, {
 			transactionId: txId,
@@ -73,7 +73,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "bob-data", kind: "text" },
 			]),
 		});
-		expect(prepareResp.outcome).toBe("accepted");
+		expect(prepareResp).toMatchObject({ outcome: "accepted" });
 
 		// Cancel via the hash DO. alice is promoted, so its lock lives on the range root and only the
 		// routed fan-out can release it; bob's lock is local. Both must be gone below.
@@ -96,7 +96,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 				{ hashKey: kb("bob"), sortKey: kb("sk1"), operation: "put", data: "retried", kind: "text" },
 			]),
 		});
-		expect(prepareResp2.outcome).toBe("accepted");
+		expect(prepareResp2).toMatchObject({ outcome: "accepted" });
 		await rpc.txCancel(ctx, {
 			transactionId: txId2,
 			items: [
@@ -238,7 +238,7 @@ describe("PartitionDO — single-shot transaction", () => {
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("shot-locked"), sortKey: kb("sk"), operation: "put", data: "two-phase", kind: "text" }]),
 		});
-		expect(prepared.outcome).toBe("accepted");
+		expect(prepared).toMatchObject({ outcome: "accepted" });
 
 		const res = await rpc.txExecuteSingleShot(ctx, {
 			items: withOpIndex([
@@ -283,7 +283,7 @@ describe("PartitionDO — single-shot transaction", () => {
 			const res = await rpc.txExecuteSingleShot(ctx, {
 				items: withOpIndex([{ hashKey: kb(`shot-split-${i}`), sortKey: kb("sk"), operation: "put", data, kind: "bytes" }]),
 			});
-			expect(res.outcome).toBe("committed");
+			expect(res).toMatchObject({ outcome: "committed" });
 			if ((await rpc.status(ctx)).splitStatus) {
 				break;
 			}
@@ -403,7 +403,7 @@ describe("PartitionDO — single-partition read snapshot", () => {
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("snap-locked"), sortKey: kb("sk"), operation: "put", data: "pending", kind: "text" }]),
 		});
-		expect(prepared.outcome).toBe("accepted");
+		expect(prepared).toMatchObject({ outcome: "accepted" });
 
 		const res = await rpc.txReadSnapshot(ctx, {
 			items: [

@@ -269,7 +269,7 @@ describe("transactions - single-partition fast path", () => {
 		// A partition keeps no record of finished transactions, so only the coordinator's ledger can
 		// answer the replay — which is why a token holds a transaction on that path.
 		expect(await calls()).toMatchObject({ txExecuteSingleShot: 0, initiateWrite: 2 });
-		expect(first.outcome).toBe("committed");
+		expect(first).toMatchObject({ outcome: "committed" });
 		expect(replay).toEqual(first);
 	});
 
@@ -419,7 +419,7 @@ describe("transactions - the item size limit is enforced before any write", () =
 				}),
 			);
 
-			expect(res.outcome).toBe("committed");
+			expect(res).toMatchObject({ outcome: "committed" });
 			await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { version: 2, data: { k: value } } });
 		}
 	});

@@ -700,7 +700,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toEqual([
 					{ outcome: "rejected", reason: clockSkew },
@@ -929,7 +929,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 
 			const response = await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
 
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				// The raw error of the prepare is stored as the foreign_error that wraps it.
 				expect(response.results).toEqual([
@@ -984,7 +984,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results[0]).toEqual({ outcome: "passed" });
 				expect(response.results[1]).toMatchObject({
@@ -1019,7 +1019,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toEqual([
 					{ outcome: "rejected", reason: { ...clockSkew, hashKey: "hk1" } },
@@ -1167,11 +1167,11 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(stateRow.results_json).not.toContain('"item"');
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toHaveLength(2);
 				expect(response.results[1]).toEqual({ outcome: "passed" });
-				expect(response.results[0].outcome).toBe("rejected");
+				expect(response.results[0]).toMatchObject({ outcome: "rejected" });
 				if (response.results[0].outcome === "rejected" && response.results[0].reason.code === "condition_failed") {
 					expect(response.results[0].reason.item?.data).toBe(largeData);
 				}
@@ -1198,7 +1198,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				expect(response.results).toHaveLength(2);
 				expect(response.results[0]).toEqual({ outcome: "not_evaluated" });
@@ -1419,7 +1419,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			tc.sweepExpiredTransactions();
 			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items: [] });
 
-			expect(result.outcome).toBe("committed");
+			expect(result).toMatchObject({ outcome: "committed" });
 			expect(result.transactionId).not.toBe(oldTransactionId);
 			expect(countRows(state, "tc_state")).toBe(1);
 		});
@@ -1483,7 +1483,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 			expect(row.completed_at).toBeTypeOf("number");
 
 			const response = tc.loadFinalResponse(TX_ID, TOKEN);
-			expect(response.outcome).toBe("cancelled");
+			expect(response).toMatchObject({ outcome: "cancelled" });
 			if (response.outcome === "cancelled") {
 				// p1 owns both operations, so both report its one error.
 				expect(response.results).toMatchObject([
