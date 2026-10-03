@@ -5,7 +5,7 @@
 - **Done:** K1, K5, F1, F4, F8, F10, F11, F12, F13, C1, C2, C4, C5, X1, X2, R3, R5, R6, R7, R8 and R11.
 - **Partly done:** R4 (the override flag and the destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle
   and the request gate).
-- **Spec written, not built:** F5 (`docs/agent-plans/2026-10-03-delete-buckets.md`).
+- **Spec written, not built:** F5 (`docs/agent-plans/2026-10-03-max-deleted-version.md`).
 - **Fix in another RFC:** F7 (`docs/agent-plans/2026-09-30-item-size-facts-and-range-split.md`).
 - **Decided, no change:** F6, K3, K4, K7, and the `split_bucket` column of X1.
 - **Skipped:** C3.
@@ -54,7 +54,7 @@ says how it was checked:
 | X1 | Cross | Done. A hash split read the whole source once for each child, with a per-row hash and a per-row JOIN | High | No (decided) |
 | X2 | Cross | Done. The stale-lock job could run again every ~50 ms, and a slow step blocked the split and import jobs | High | Done with F4 |
 | C1 | FokosDB (TC) | Done. `tx_recovery` did a full scan and sort of `tc_state` every 5 s | High | Additive index |
-| F5 | FokosDB | Spec written, not built (`docs/agent-plans/2026-10-03-delete-buckets.md`). One partition-wide delete counter makes read transactions abort on unrelated deletes | High | Additive table |
+| F5 | FokosDB | Spec written, not built (`docs/agent-plans/2026-10-03-max-deleted-version.md`). One partition-wide delete counter makes read transactions abort on unrelated deletes | High | One column replaced |
 | F3 | FokosDB | Split sources keep all item rows for life: depth d keeps d+1 copies of the data | High (cost) | No |
 | F4 | FokosDB | Done. `pending_transactions` repeated per-transaction data on each key; `conditions_json` was never read; the stale queries stepped past lock copies | Medium | Yes |
 | F7 | FokosDB | The range-boundary scan blocks the request path and runs again during planning. The fix is part of the item-size RFC | Medium | No |
@@ -68,7 +68,7 @@ says how it was checked:
 
 ----
 
-The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. F1, F11 and C5 are done. F5 is still open: deletion_metadata has only one counter row. The spec `docs/agent-plans/2026-10-03-delete-buckets.md` addresses it.
+The next most important items are the ones that can stop an import. A stuck import keeps keys unavailable. After those come the schema changes that you must decide before the freeze. F1, F11 and C5 are done. F5 is still open: deletion_metadata has only one counter row. The spec `docs/agent-plans/2026-10-03-max-deleted-version.md` addresses it.
 
 Priority 1: stuck imports (availability)
 
@@ -78,7 +78,7 @@ Priority 1: stuck imports (availability)
 
 Priority 2: correctness under load (and cheapest now)
 
-4. F5: delete buckets. Spec written: `docs/agent-plans/2026-10-03-delete-buckets.md`. With one delete counter for the whole partition, about 98 % of multi-partition reads abort at 200 deletes per second. Transactional inserts also fail on deletes of other keys. The change adds one table, and the wire format does not change. It is cheapest to do now.
+4. F5: the highest deleted item version. Spec written: `docs/agent-plans/2026-10-03-max-deleted-version.md`. With one delete counter for the whole partition, about 98 % of multi-partition reads abort at 200 deletes per second. The change replaces `delete_revision` with `max_deleted_v`, so a read of a found item compares only its version. It replaces one column and one field of the migration page. It is cheapest to do now.
 
 Priority 3: schema decisions before the freeze
 
@@ -101,7 +101,7 @@ Priority 5: small request-path fixes
 
 11. R4/K2 (the import state) and K6: not planned. R6 and C4 are done. Each fix is small and local, and you can do them at any time after the freeze.
 
-The audit is closed. The next step is to build F5 from `docs/agent-plans/2026-10-03-delete-buckets.md`.
+The audit is closed. The next step is to build F5 from `docs/agent-plans/2026-10-03-max-deleted-version.md`.
 
 
 ## 3. Sharding runtime
@@ -630,7 +630,8 @@ size of a value does not change the bill. The limit for a key and its value toge
 
 **F5 — one partition-wide delete counter (High).** **Code.**
 
-- **Spec:** `docs/agent-plans/2026-10-03-delete-buckets.md` addresses this finding. It is not built yet.
+- **Spec:** `docs/agent-plans/2026-10-03-max-deleted-version.md` addresses this finding. It is not built yet. `docs/ideas/2026-10-03-delete-buckets.md` keeps the
+  bucket design below as an idea for later.
 
 - **What happens:**
   - `readForTransactionLocal` reports one `delete_revision` for the whole partition. `client/db.ts:867` aborts a
@@ -1089,8 +1090,8 @@ The SQL migrations can still be edited in place.
   - X1: decided, no `split_bucket`. The hash-key walk needs no schema change.
   - R11: done, a policy version in the route context.
 - **Additive, but cheapest now:**
-  - F5: the delete buckets (spec `docs/agent-plans/2026-10-03-delete-buckets.md`). The migration page must also carry the buckets, so a later change must accept pages
-    of the old format during a deploy.
+  - F5: `max_deleted_v` replaces `delete_revision` (spec `docs/agent-plans/2026-10-03-max-deleted-version.md`). The migration page carries the new value, so a
+    later change must accept pages of the old format during a deploy.
 - **Breaking, not tied to the freeze:**
   - R9: postponed. Finished promotions as override rows only. A `LEFT JOIN` reads both forms, and the marker `''`
     needs no schema change.

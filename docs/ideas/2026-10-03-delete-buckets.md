@@ -3,7 +3,10 @@
 **State:** Draft
 **Date:** 2026-10-03
 **Author:** Lambros Petrou
-**Status:** Not built. The partition keeps one `deletion_metadata` row.
+**Status:** Not built. An idea for later. `docs/agent-plans/2026-10-03-max-deleted-version.md` replaces
+`delete_revision` with `max_deleted_v` in the one `deletion_metadata` row. After that change, a read of a found item
+no longer fails on an unrelated delete. Buckets then help only a read of an absent item and the prepare of an absent
+item. A bucket would hold `max_deleted_v` in place of `revision`.
 
 ## Table of Contents
 
