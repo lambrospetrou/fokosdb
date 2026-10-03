@@ -98,6 +98,12 @@ export type TransactionCoordinatorDOConfig = Readonly<{
 	sweepDeleteChunkRows: number;
 	/** The non-terminal transactions that one step of the `tx_recovery` job reads. */
 	recoveryScanRows: number;
+	/**
+	 * The transactions that one step of the `tx_recovery` job drives at the same time. A Worker has at
+	 * most 6 outgoing calls that wait for an answer, and the platform queues the other calls. Thus a
+	 * value above 6 does not make the step faster.
+	 */
+	recoveryConcurrentDrives: number;
 	/** The size at which a coordinator splits when the table has no smaller split size. At most the storage limit. */
 	maxDatabaseBytes: number;
 }>;
@@ -128,10 +134,11 @@ export const DEFAULT_COORDINATOR_CONFIG: TransactionCoordinatorDOConfig = deepFr
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	fanoutRequestBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
 	participantRetry: { baseDelayMs: 100, maxDelayMs: 2_000, prepareMaxAttempts: 3, prepareRecoveryMaxAttempts: 5 },
-	alarmRecoveryBudgetMs: 30_000,
+	alarmRecoveryBudgetMs: 15_000,
 	sweepBatchRows: 1_000,
 	sweepDeleteChunkRows: 100,
 	recoveryScanRows: 100,
+	recoveryConcurrentDrives: 6,
 	maxDatabaseBytes: 5 * 1024 * 1024 * 1024,
 });
 
@@ -186,6 +193,7 @@ export function resolveCoordinatorConfig(overrides: TransactionCoordinatorDOConf
 		() => `sweepDeleteChunkRows must be at most ${SQL_MAX_BOUND_PARAMETERS}, got ${c.sweepDeleteChunkRows}`,
 	);
 	checkInteger(c, "recoveryScanRows", 1);
+	checkInteger(c, "recoveryConcurrentDrives", 1);
 	checkInteger(c, "maxDatabaseBytes", 1);
 	check(
 		c.maxDatabaseBytes <= DO_STORAGE_MAX_BYTES,

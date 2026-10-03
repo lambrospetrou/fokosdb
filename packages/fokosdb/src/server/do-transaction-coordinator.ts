@@ -1397,40 +1397,47 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * One step of the `tx_recovery` job: drives the due transactions one at a time, earliest
-	 * `next_recovery_at` first, for at most `recoveryScanRows` transactions and `alarmRecoveryBudgetMs`.
+	 * One step of the `tx_recovery` job: drives the due transactions, earliest `next_recovery_at`
+	 * first, for at most `recoveryScanRows` transactions and `alarmRecoveryBudgetMs`. At most
+	 * `recoveryConcurrentDrives` drives run at the same time.
 	 *
-	 * Each iteration claims one transaction and then drives it. The claim moves `next_recovery_at`
-	 * forward with `nextRecoveryAt`, so a transaction that the drive does not finish, for example
-	 * because a participant is down, goes behind the others. A transaction that the step does not reach
-	 * keeps its place. Each drive gets at most `fanoutRequestBudgetMs`, so one participant that does not
-	 * answer cannot use the whole step.
+	 * Each worker claims one transaction and then drives it. When the drive ends, the worker claims the
+	 * next one. The claim is synchronous, so two workers never claim the same transaction. The claim
+	 * moves `next_recovery_at` forward with `nextRecoveryAt`, so a transaction that the drive does not
+	 * finish, for example because a participant is down, goes behind the others. A transaction that the
+	 * step does not reach keeps its place. Each drive gets at most `fanoutRequestBudgetMs`. Thus one
+	 * participant that does not answer holds only one worker for that time, and the other workers
+	 * continue.
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
 		const startedAt = this.fokosNow();
-		const { staleTransactionMs, recoveryScanRows, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } = this.config();
-		// FIXME: claim a batch of transactions in one storage transaction and drive them concurrently,
-		// with a bounded fan-out.
-		for (let driven = 0; driven < recoveryScanRows; driven++) {
-			const remainingMs = startedAt + alarmRecoveryBudgetMs - this.fokosNow();
-			if (remainingMs <= 0) {
-				return;
+		const { staleTransactionMs, recoveryScanRows, recoveryConcurrentDrives, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } =
+			this.config();
+		let claimed = 0;
+		const worker = async (): Promise<void> => {
+			while (claimed < recoveryScanRows) {
+				const remainingMs = startedAt + alarmRecoveryBudgetMs - this.fokosNow();
+				if (remainingMs <= 0) {
+					return;
+				}
+				const [row] = this.claimDueTransactions(startedAt, 1, staleTransactionMs);
+				if (!row) {
+					return;
+				}
+				claimed++;
+				try {
+					await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state, Math.min(fanoutRequestBudgetMs, remainingMs));
+				} catch (e) {
+					console.error({
+						message: "fokos/tc: recovery failed",
+						transactionId: row.transaction_id,
+						state: row.state,
+						error: String(e),
+					});
+				}
 			}
-			const [row] = this.claimDueTransactions(startedAt, 1, staleTransactionMs);
-			if (!row) {
-				return;
-			}
-			try {
-				await this.driveTransaction(row.transaction_id, row.idempotency_token, row.state, Math.min(fanoutRequestBudgetMs, remainingMs));
-			} catch (e) {
-				console.error({
-					message: "fokos/tc: recovery failed",
-					transactionId: row.transaction_id,
-					state: row.state,
-					error: String(e),
-				});
-			}
-		}
+		};
+		await Promise.all(Array.from({ length: recoveryConcurrentDrives }, worker));
 	}
 
 	/**

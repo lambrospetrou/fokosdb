@@ -73,6 +73,7 @@ describe("resolveCoordinatorConfig", () => {
 		[{ sweepBatchRows: 0 }, /sweepBatchRows must be an integer of at least 1/],
 		[{ sweepDeleteChunkRows: 101 }, /sweepDeleteChunkRows must be at most 100/],
 		[{ recoveryScanRows: 0 }, /recoveryScanRows must be an integer of at least 1/],
+		[{ recoveryConcurrentDrives: 0 }, /recoveryConcurrentDrives must be an integer of at least 1/],
 		[{ maxDatabaseBytes: 10_000_000_001 }, /maxDatabaseBytes must be at most 9000000000/],
 	])("rejects %o", (overrides, detail) => {
 		expect(() => resolveCoordinatorConfig(overrides)).toThrow(invariantFailure(detail));

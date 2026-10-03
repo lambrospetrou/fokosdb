@@ -1,9 +1,18 @@
 # Audit — storage schemas and queries of the sharding runtime and FokosDB
 
-**State:** Findings. Done: K1, K5, F1, F4, F8, F10, F11, F12, F13, C1, C5, X1, X2, R3, R5, R6, R8 and R11. Partly done: R4 (the override flag and the
-destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle and the request gate). Decided, no change: F6, K3 and
-the `split_bucket` column of X1. Skipped: C3. Postponed: R9. Spec written, not built: F5 (`docs/agent-plans/2026-10-03-delete-buckets.md`). The other findings are not decided
-or implemented.
+**State:** Closed. No more work is planned from this audit.
+
+- **Done:** K1, K5, F1, F4, F8, F10, F11, F12, F13, C1, C2, C4, C5, X1, X2, R3, R5, R6, R7, R8 and R11.
+- **Partly done:** R4 (the override flag and the destroy fence), K2 (the destroy fence) and R10 (the lazy lifecycle
+  and the request gate).
+- **Spec written, not built:** F5 (`docs/agent-plans/2026-10-03-delete-buckets.md`).
+- **Fix in another RFC:** F7 (`docs/agent-plans/2026-09-30-item-size-facts-and-range-split.md`).
+- **Decided, no change:** F6, K3, K4, K7, and the `split_bucket` column of X1.
+- **Skipped:** C3.
+- **Postponed:** R9.
+- **Open, not planned:** F3, K6, the import record of R4 and K2, and the deadline reads of R10. Each section says
+  what a later fix must do.
+
 **Date:** 2026-09-29
 **Updated:** 2026-10-03.
 
@@ -90,9 +99,9 @@ Priority 4: cost and background work (no schema change)
 
 Priority 5: small request-path fixes
 
-11. R4/K2 (the import state) and K6. R6 is done. Each fix is small and local, and you can do them at any time after the freeze.
+11. R4/K2 (the import state) and K6: not planned. R6 and C4 are done. Each fix is small and local, and you can do them at any time after the freeze.
 
-My recommendation: build F5 next, from `docs/agent-plans/2026-10-03-delete-buckets.md`.
+The audit is closed. The next step is to build F5 from `docs/agent-plans/2026-10-03-delete-buckets.md`.
 
 
 ## 3. Sharding runtime
@@ -911,9 +920,23 @@ The finding was:
     `transaction_id`.
 - **Decision:** Skipped. Convert only `tc_state` if its migration is edited for another reason, for example C2.
 
-**C4 — recovery drives one transaction at a time (Low).** **Code.** Recovery drives transactions one at a time
-(FIXME at `:1273`) in a step of up to `alarmRecoveryBudgetMs` (30 s). The split and import jobs of the coordinator
-wait behind it (see X2).
+**C4 — done: recovery drove one transaction at a time (Low).** **Code + test.**
+
+- **What happened:** `recoverStaleTransactions` drove the due transactions one at a time, in a step of up to
+  `alarmRecoveryBudgetMs` (30 s). Each drive to a participant that does not answer waits `fanoutRequestBudgetMs`
+  (5 s). Three problems followed:
+  - About 6 due transactions with one down participant used a whole step. A healthy transaction that was due
+    after them waited.
+  - A healthy drive takes about 20–50 ms, so recovery finished about 20–50 transactions per second. For example,
+    a restart that left 2,000 transactions unfinished kept their keys locked for about 40–100 s.
+  - Passes never overlap. The import and repartition jobs of the next pass waited for the step, up to 30 s.
+- **Done:** The step runs `recoveryConcurrentDrives` (default 6) workers. Each worker claims one transaction and
+  drives it, and then claims the next one. `claimDueTransactions` is synchronous, so two workers never claim the
+  same transaction. Concurrent drives of one transaction were already safe (X2). The default is 6, because a
+  Worker has at most 6 outgoing calls that wait for an answer, and the platform queues the other calls.
+- **Done:** `alarmRecoveryBudgetMs` is 10 s, not 30 s, so the other jobs wait less.
+- **Test:** "drives up to recoveryConcurrentDrives transactions at the same time, so a drive that waits does not
+  stop the others". It times out with the old loop.
 
 **C5 — done: one PREPARING transaction could exceed the migration RPC limit (High).** **Code + test.**
 

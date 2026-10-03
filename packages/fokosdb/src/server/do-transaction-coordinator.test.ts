@@ -1425,6 +1425,43 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 		});
 	});
 
+	it("drives up to recoveryConcurrentDrives transactions at the same time, so a drive that waits does not stop the others", async () => {
+		await withCoordinator(async (tc, state) => {
+			const now = Date.now();
+			vi.spyOn(tc, "fokosNow").mockReturnValue(now);
+			state.storage.sql.exec(`DELETE FROM tc_state`);
+			const ids = Array.from({ length: 10 }, (_, i) => `tx-${i}`);
+			ids.forEach((transactionId, i) =>
+				insertState(state, { token: `token-${transactionId}`, transactionId, state: "COMMITTING", createdAt: now - 60_000 + i }),
+			);
+			let release!: () => void;
+			const stuck = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			let inFlight = 0;
+			let maxInFlight = 0;
+			const finished: string[] = [];
+			vi.spyOn(tc, "driveTransaction").mockImplementation(async (transactionId) => {
+				inFlight++;
+				maxInFlight = Math.max(maxInFlight, inFlight);
+				// The earliest transaction waits, as for a participant that does not answer. It continues
+				// only after all the other drives end. The other drives wait for one microtask, so that
+				// each worker starts its drive before a drive ends.
+				await (transactionId === "tx-0" ? stuck : Promise.resolve());
+				inFlight--;
+				finished.push(transactionId);
+				if (finished.length === ids.length - 1) {
+					release();
+				}
+			});
+
+			await tc.recoverStaleTransactions();
+
+			expect(maxInFlight).toBe(DEFAULT_COORDINATOR_CONFIG.recoveryConcurrentDrives);
+			expect(finished).toEqual([...ids.slice(1), "tx-0"]);
+		});
+	});
+
 	it("runs the sweep job after the recovery job exhausts its budget", async () => {
 		await withCoordinator(async (tc, state) => {
 			let now = BASE_TIME;
