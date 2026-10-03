@@ -1569,9 +1569,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/**
 	 * One page of the transactions that a split target owns, with their rows in all four tables. The
-	 * cursor is the last `transaction_id` read. A page reads at most `budget.pageRows` ledger rows and
-	 * keeps its payload near `budget.pageBytes`: it stops before the transaction that would cross that
-	 * budget, and always holds at least one.
+	 * cursor is the last `transaction_id` read. A page reads at most `budget.scanRows` ledger rows, holds
+	 * at most `budget.pageRows` transactions, and keeps its payload near `budget.pageBytes`: it stops
+	 * before the transaction that would cross that budget, and always holds at least one.
 	 */
 	private buildMigrationPage(
 		cursor: string | null,
@@ -1582,7 +1582,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			`SELECT transaction_id, idempotency_token, state, transaction_ts, created_at, completed_at, next_recovery_at, results_json, operations_hash
              FROM tc_state WHERE transaction_id > ? ORDER BY transaction_id LIMIT ?`,
 			cursor ?? "",
-			budget.pageRows + 1,
+			budget.scanRows + 1,
 		);
 		const page: MigratedTransaction[] = [];
 		let bytes = 0;
@@ -1590,7 +1590,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		let last: string | null = null;
 		for (const row of rows) {
 			// The extra row only shows that the ledger continues after this page.
-			if (scanned === budget.pageRows) {
+			if (scanned === budget.scanRows || page.length === budget.pageRows) {
 				return { page, nextCursor: last };
 			}
 			if (belongsToTarget(tokenKey(row.idempotency_token))) {

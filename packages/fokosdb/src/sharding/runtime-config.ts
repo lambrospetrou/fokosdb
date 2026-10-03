@@ -168,7 +168,7 @@ export type FokosMigrationPageBudget = { pageBytes: number; pageRows: number; sc
 export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	fallbackAlarmMs: 5_000,
 	fastPathDelayMs: 50,
-	importPagesPerPass: 16,
+	importPagesPerPass: 4,
 	hashArenaBytes: 1024 * 1024,
 	rangeHierarchyMaxRows: 10_000,
 	rangeHierarchyRefreshMs: 60_000,
@@ -185,8 +185,8 @@ export const DEFAULT_RUNTIME_CONFIG: FokosRuntimeConfig = Object.freeze({
 	notCutOverRetryMs: 10_000,
 	nonRetryableRetryMs: 5 * 60_000,
 	migrationPageBytes: 20 * 1024 * 1024,
-	migrationPageRows: 1_000,
-	migrationScanRows: 10_000,
+	migrationPageRows: 20_000,
+	migrationScanRows: 100_000,
 	promotionsPageEntries: 1_000,
 	promotionsPageBytes: 20 * 1024 * 1024,
 });

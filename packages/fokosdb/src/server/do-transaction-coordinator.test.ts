@@ -6,7 +6,7 @@ import * as doStubs from "../shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
 import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
-import { KeyCodec } from "../sharding/key-codec.js";
+import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosRouter } from "../sharding/router.js";
 import { FOKOS_KV_KEYS } from "../sharding/sharding-store.js";
 import { IDEMPOTENCY_WINDOW_MS, MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX } from "../shared/transaction-limits.js";
@@ -1725,6 +1725,28 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 			// A page that the target owns no row of still advances the cursor past the rows it read.
 			const none = tc.buildMigrationPage(null, () => false, budget);
 			expect(none).toEqual({ page: [], nextCursor: ids[budget.pageRows - 1] });
+		});
+	});
+
+	it("stops a page at the scan budget and at the transaction budget, each on its own", async () => {
+		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 3, scanRows: 10 };
+		await withCoordinator((tc, state) => {
+			const ids = Array.from({ length: 30 }, (_, i) => `tx-${String(i).padStart(5, "0")}`);
+			for (const id of ids) {
+				insertState(state, { token: `token-${id}`, transactionId: id, state: "COMMITTED", createdAt: BASE_TIME });
+			}
+			const idsOf = (page: { state: { transaction_id: string } }[]) => page.map((tx) => tx.state.transaction_id);
+
+			// Every row belongs to the target: the transaction budget stops the page before the scan budget.
+			const dense = tc.buildMigrationPage(null, () => true, budget);
+			expect(dense).toMatchObject({ nextCursor: ids[2] });
+			expect(idsOf(dense.page)).toEqual(ids.slice(0, 3));
+
+			// One row in five belongs to the target: the scan budget stops the page after 10 rows read.
+			const owned = new Set(ids.filter((_, i) => i % 5 === 0).map((id) => `token-${id}`));
+			const sparse = tc.buildMigrationPage(null, (key) => owned.has(KeyCodec.decode(key.hashKey as KeyBytes) as string), budget);
+			expect(sparse).toMatchObject({ nextCursor: ids[9] });
+			expect(idsOf(sparse.page)).toEqual([ids[0], ids[5]]);
 		});
 	});
 

@@ -30,7 +30,10 @@ export type MigrationStream = "overrides" | "items" | "pending_tx";
  */
 export type PullGateSpec = { stream: MigrationStream; target?: string; afterRead?: boolean };
 
-export type PullStats = { calls: number; heldTargets: string[] };
+/** One served pull: its target, its stream, when the source received and answered it, and the rows of its page. */
+export type PullRecord = { target: string; stream: MigrationStream; receivedAt: number; answeredAt: number; rows: number };
+
+export type PullStats = { calls: number; heldTargets: string[]; pulls: PullRecord[] };
 
 type Gate = { held: Promise<void>; release: () => void };
 
@@ -50,6 +53,12 @@ export function streamOf(req: FokosMigrationPullRequest): MigrationStream {
 	return (req.cursor.inner as { stream?: string } | null)?.stream === "pending_tx" ? "pending_tx" : "items";
 }
 
+/** The rows of one host page: its items or its locks. */
+function pageRows(page: unknown): number {
+	const p = page as { items?: unknown[]; pendingTransactions?: unknown[] };
+	return (p.items ?? p.pendingTransactions ?? []).length;
+}
+
 /** The transaction operations that this class logs, and that a test can make answer or fail. */
 export type TxOp = "txReadSnapshot" | "txReadForTransaction" | "txExecuteSingleShot" | "txCommit" | "txCancel";
 export type TxRequest<Op extends TxOp> = Parameters<PartitionDO[Op]>[1];
@@ -63,7 +72,7 @@ export type TxResponseRule<Op extends TxOp> = ({ error: string } | { value: TxRe
 
 export class ControlledPartitionDO extends PartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
-	#pullStats: PullStats = { calls: 0, heldTargets: [] };
+	#pullStats: PullStats = { calls: 0, heldTargets: [], pulls: [] };
 	#initGate: Gate | null = null;
 	#initCalls = 0;
 	#refuseAcks = false;
@@ -158,7 +167,11 @@ export class ControlledPartitionDO extends PartitionDO {
 			}
 			await pullGate.held;
 		}
-		return page ?? (await super.fokosMigrationPull(req));
+		const receivedAt = Date.now();
+		page ??= await super.fokosMigrationPull(req);
+		const rows = page.phase === "overrides" ? page.overrides.length : pageRows(page.page);
+		this.#pullStats.pulls.push({ target: req.target.doName, stream: streamOf(req), receivedAt, answeredAt: Date.now(), rows });
+		return page;
 	}
 
 	override async fokosMigrationAck(req: FokosMigrationAckRequest): Promise<void> {

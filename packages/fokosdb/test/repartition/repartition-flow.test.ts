@@ -320,10 +320,10 @@ describe("Repartition — initialization and cutover", () => {
 
 describe("Repartition — the migration protocol", () => {
 	it("resumes each stream after its last row when the slice needs more than one page", async () => {
-		const c = makeCluster();
+		const c = makeCluster({ runtimeConfig: { migrationPageRows: 1_000 } });
 		const root = c.hashNode([0]);
 		const { hashSplitN } = c.base.topology;
-		// More than one page of rows and of locks (a page holds 1000 rows) for each child. Three sort
+		// More than one page of rows and of locks (a page holds 1000 rows here) for each child. Three sort
 		// keys per hash key, the first of them empty, so that a page can end inside one hash key.
 		await root.enter(({ source, store }) => {
 			for (let i = 0; i < 1_500; i++) {
