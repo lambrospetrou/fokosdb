@@ -116,7 +116,7 @@ export const DEFAULT_PARTITION_CONFIG: PartitionDOConfig = deepFreeze({
 	staleTransactionMs: DEFAULT_STALE_TRANSACTION_MS,
 	coordinatorFanoutBudgetMs: DEFAULT_FANOUT_REQUEST_BUDGET_MS,
 	promotionFraction: 0.25,
-	maxClockSkewMs: 5_000,
+	maxClockSkewMs: 2_000,
 	ttlSweep: {
 		chunkSize: 100,
 		sleepMs: 1_000,
