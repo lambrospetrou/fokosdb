@@ -271,6 +271,13 @@ export type ReadSnapshotResponse =
 
 // ─── TC State Machine ─────────────────────────────────────────────────────────
 
+/**
+ * Commit:  CREATED → PREPARING → COMMITTING → COMMITTED
+ * Cancel:  CREATED → PREPARING → CANCELLING → CANCELLED
+ *
+ * The coordinator does not write PREPARED. A row that older code wrote, or that a migration page from
+ * older code holds, can be PREPARED. It has the same meaning as COMMITTING: the decision is commit.
+ */
 export type TCState = "CREATED" | "PREPARING" | "PREPARED" | "COMMITTING" | "COMMITTED" | "CANCELLING" | "CANCELLED";
 
 // ─── TransactionCoordinatorDO — recoverTransaction ───────────────────────────

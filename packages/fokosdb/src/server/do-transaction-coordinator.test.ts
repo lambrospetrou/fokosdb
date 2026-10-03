@@ -83,12 +83,13 @@ type CoordinatorInternals = {
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
 	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void;
 	storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void;
-	markPrepared(transactionId: string, idempotencyToken: string): void;
+	markCommitting(transactionId: string, idempotencyToken: string): void;
 	drivePrepare(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<InitiateWriteResponseEncoded>;
 	runPrepareRecovery(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
 	runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
 	runCancel(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void>;
 	stripPayload(transactionId: string): void;
+	completeTransaction(transactionId: string, idempotencyToken: string, terminalState: "COMMITTED" | "CANCELLED"): Promise<void>;
 };
 
 function seed(state: DurableObjectState, tcState: TCState, results?: TransactWriteOperationResultEncoded[], createdAt?: number): void {
@@ -596,7 +597,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("keeps the payload in the PREPARED transition", async () => {
+	it("keeps the payload in the COMMITTING transition", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			state.storage.sql.exec(`UPDATE tc_items SET conditions_json = '{"op":"test"}' WHERE transaction_id = ?`, TX_ID);
@@ -607,7 +608,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			const stateRow = state.storage.sql
 				.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE idempotency_token = ?`, TOKEN)
 				.toArray()[0];
-			expect(stateRow.state).toBe("PREPARED");
+			expect(stateRow.state).toBe("COMMITTING");
 			const items = state.storage.sql
 				.exec<{
 					hk: ArrayBuffer;
@@ -863,13 +864,13 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
-	it("does not move to PREPARED while a participant has no stored accepted answer", async () => {
+	it("does not move to COMMITTING while a participant has no stored accepted answer", async () => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "PREPARING");
 			insertParticipant(state, { name: "p1", prepare: "accepted" });
 			insertParticipant(state, { name: "p2" });
 
-			tc.markPrepared(TX_ID, TOKEN);
+			tc.markCommitting(TX_ID, TOKEN);
 
 			expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("PREPARING");
 		});
@@ -1225,6 +1226,103 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 			expect(countRows(state, "tc_participants")).toBe(1);
 		});
 	});
+
+	describe("commit outcomes", () => {
+		function twoParticipants(state: DurableObjectState, tcState: TCState) {
+			seed(state, tcState);
+			state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+			insertParticipant(state, { name: "p1", prepare: "accepted" });
+			insertParticipant(state, { name: "p2", prepare: "accepted" });
+		}
+
+		function mockCommits(failing: Set<string>) {
+			const committedBy: string[] = [];
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				(_env, _ctx, name) =>
+					({
+						txCommit: async (_pCtx: unknown, req: { transactionId: string }) => {
+							if (failing.has(name)) {
+								throw new Error(`${name} unreachable`);
+							}
+							if (req.transactionId === TX_ID) {
+								committedBy.push(name);
+							}
+							return enveloped({ outcome: "committed" as const });
+						},
+					}) as unknown as DurableObjectStub<PartitionDO>,
+			);
+			return committedBy;
+		}
+
+		const commitOutcomes = (state: DurableObjectState) =>
+			state.storage.sql
+				.exec<{
+					partition_do_name: string;
+					commit_outcome: string | null;
+				}>(`SELECT partition_do_name, commit_outcome FROM tc_participants WHERE transaction_id = ? ORDER BY partition_do_name`, TX_ID)
+				.toArray();
+
+		it("writes no commit outcome when every participant confirms", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state, "COMMITTING");
+				mockCommits(new Set());
+				const complete = vi.spyOn(tc, "completeTransaction").mockResolvedValue();
+
+				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(complete).toHaveBeenCalledWith(TX_ID, TOKEN, "COMMITTED");
+				expect(commitOutcomes(state)).toEqual([
+					{ partition_do_name: "p1", commit_outcome: null },
+					{ partition_do_name: "p2", commit_outcome: null },
+				]);
+			});
+		});
+
+		it("stores the confirmed outcomes when a participant does not confirm, and sends only the missing commit later", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state, "COMMITTING");
+				mockCommits(new Set(["p2"]));
+
+				// A short budget: the fan-out retries p2 until the deadline.
+				await tc.runCommit(TX_ID, TOKEN, 300);
+
+				expect(commitOutcomes(state)).toEqual([
+					{ partition_do_name: "p1", commit_outcome: "committed" },
+					{ partition_do_name: "p2", commit_outcome: null },
+				]);
+				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTING");
+
+				const committedBy = mockCommits(new Set());
+				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(committedBy).toEqual(["p2"]);
+				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
+			});
+		});
+
+		it("moves a PREPARED row from older code to COMMITTING, and completes it", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state, "PREPARED");
+				mockCommits(new Set());
+
+				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state`).one().state).toBe("COMMITTED");
+			});
+		});
+
+		it("fails an invariant and sends no commit when a participant has no items", async () => {
+			await withCoordinator(async (tc, state) => {
+				twoParticipants(state, "COMMITTING");
+				insertParticipant(state, { name: "p3", prepare: "accepted" });
+				const committedBy = mockCommits(new Set());
+
+				await expect(tc.runCommit(TX_ID, TOKEN, BUDGET_MS)).rejects.toThrow(fokosErrorWith("invariant_failed"));
+
+				expect(committedBy).toEqual([]);
+			});
+		});
+	});
 });
 
 describe("TransactionCoordinatorDO - idempotency sweep", () => {
@@ -1449,15 +1547,15 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 		});
 	});
 
-	it("leaves a PREPARED transaction in PREPARED when crossing the bound", async () => {
+	it("leaves a COMMITTING transaction in COMMITTING when crossing the bound", async () => {
 		await withCoordinator(async (tc, state) => {
-			seed(state, "PREPARED", undefined, Date.now() - 30_000);
+			seed(state, "COMMITTING", undefined, Date.now() - 30_000);
 			insertParticipant(state, { name: "p1", prepare: "accepted" });
 
 			tc.cancelTransactionInStore(TX_ID, TOKEN);
 
 			const row = state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).toArray()[0];
-			expect(row.state).toBe("PREPARED");
+			expect(row.state).toBe("COMMITTING");
 		});
 	});
 
@@ -1502,7 +1600,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 				const { txCommit, txCancel } = mockPartitions(async () => {
 					// The other drive received an accept from both participants and wrote the commit decision.
 					state.storage.sql.exec(`UPDATE tc_participants SET prepare_outcome = 'accepted' WHERE transaction_id = ?`, TX_ID);
-					tc.markPrepared(TX_ID, TOKEN);
+					tc.markCommitting(TX_ID, TOKEN);
 					throw new Error("p2 unreachable from this drive");
 				});
 
@@ -1510,7 +1608,7 @@ describe("TransactionCoordinatorDO - bounded preparing hold", () => {
 
 				expect(callsFor(txCancel)).toEqual([]);
 				expect(callsFor(txCommit)).toEqual([]);
-				expect(stateOf(state)).toBe("PREPARED");
+				expect(stateOf(state)).toBe("COMMITTING");
 			});
 		});
 

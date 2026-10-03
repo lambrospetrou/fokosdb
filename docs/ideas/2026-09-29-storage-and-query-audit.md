@@ -53,6 +53,7 @@ says how it was checked:
 | F13 | FokosDB | The last migration acknowledgement deletes all lock copies in one synchronous transaction | Medium | No |
 | R3 | Runtime | Done. The router facts are read once for each request or owner check, not for each key | Medium | No |
 | R5 | Runtime | Done. `learnRangeBoundary` counted the whole table on each insert and each refresh | Medium | No |
+| C2 | FokosDB (TC) | Done. The commit path wrote P `commit_outcome` rows and a separate PREPARED state that `completeTransaction` deleted or replaced a few milliseconds later. Now about 2N + 3P + 9 row writes | Medium | No |
 | C3 | FokosDB (TC) | Skipped. WITHOUT ROWID tables use 3x storage only for rows of about 1–2.5 KB, and most of those rows are short-lived | Low | Yes |
 | R7 | Runtime | Done. The Bloom filter stays one KV value with a 128K first layer (~172 KB). The runtime writes it at most once per `promotionBloomFlushMs` (5 s), with `allowUnconfirmed`, in place of once for each new promoted key | Medium | No |
 
@@ -811,7 +812,7 @@ The finding was:
   queries with `completed_at IS NULL`. `completeTransaction` sets the state and `completed_at` together, so
   "non-terminal" and "`completed_at IS NULL`" mean the same thing.
 
-**C2 — writes on the happy path that it does not need (Medium).** **Code.**
+**C2 — done: writes on the happy path that it does not need (Medium).** **Code + test.**
 
 - **What happens:** One transaction with N items and P participants does about 3N + 4P + 10 row writes. The extra
   writes are:
@@ -822,13 +823,31 @@ The finding was:
     only until its first claim, about `staleTransactionMs` after its creation. `buildMigrationPage` does not
     carry the payload of a transaction in these states. No step after the prepare reads the payload: `runCommit`
     and `runCancel` read only the keys.
-  - `prepare_outcome = 'accepted'` and `commit_outcome = 'committed'` add 2P updates. Only the recovery path needs
-    them, and a new prepare or commit is idempotent.
-  - The move from PREPARED to COMMITTING is a separate write.
+  - Done: `commit_outcome = 'committed'` added P updates. Now `runCommit` writes them only when some commit does
+    not confirm, and only for the participants that confirmed. Then it counts the stored outcomes, because a
+    parallel drive can store the rest. When every commit confirms, `completeTransaction` deletes the rows and no
+    outcome is written. A missing outcome costs one more `txCommit`, and the participant answers it with the
+    idempotent success.
+  - Done: the move from PREPARED to COMMITTING was a separate write. Now `markCommitting` moves PREPARING directly
+    to COMMITTING, and `runCommit` reads the state and writes no row. An UPDATE that writes the same value again
+    also counts as one row written. `runCommit` moves a PREPARED row from older code to COMMITTING.
   - `partition_context_json` stores a full route context for each participant of each transaction, although one
     coordinator group serves one table. This part is decided: keep it (see "Schema" below).
-- **Fix:** Write these values only when the request path cannot finish. That gives about 2N + 2P + 8 writes.
-  The `stripPayload` part is done, so a transaction now does about 2N + 4P + 10 row writes.
+- **Measurement:** `cursor.rowsWritten` in a Durable Object test (miniflare, the SQLite of workerd):
+  - Two UPDATEs of one row in one `transactionSync` count 2 rows. The storage does not combine them.
+  - An UPDATE that writes the same value again counts 1 row. An UPDATE that matches no row counts 0.
+  - An UPDATE of a column in an index counts 2 rows. An UPDATE that only removes the row from a partial index
+    counts 1. The counter seems to count inserts into the table and index B-trees, and not deletes.
+  - Thus a merge of two states saves a row only if no later step writes the same state again.
+- **Result:** A transaction now does about 2N + 3P + 9 row writes on the commit path.
+- **Tests:** `do-transaction-coordinator.test.ts`, block "commit outcomes": no outcome when every participant
+  confirms; only the confirmed outcomes when one participant fails, and the next drive sends only the missing
+  commit; a PREPARED row from older code completes; a participant with no items fails an invariant and gets no
+  commit.
+- **Keep `prepare_outcome = 'accepted'`:** `markCommitting` decides from the stored answers, not from the answers in
+  memory. Two drives of one transaction can run at the same time. A partition can reject the prepare of one drive,
+  and then accept the prepare of the other drive. The stored first answer is the rejection, so the transaction must
+  cancel, although the second drive saw only accepted answers in memory.
 - **Schema, decided: keep one context for each participant.** The coordinator calls each participant, also in
   recovery, with its stored route context: `policy.ns`, `topology.jurisdiction` and `doName` select the stub, and
   the partition checks `partitionId`, `topology` and `policyVersion`. A later feature can add transactions across

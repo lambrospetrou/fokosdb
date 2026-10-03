@@ -726,8 +726,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 *
 	 * - COMMITTED: every participant confirmed the commit, so "committed" also promises
 	 *   read-your-writes — a caller that receives it can read what it wrote on every participant.
-	 * - PREPARED / COMMITTING: the decision is durable and PREPARED is the point of no return
-	 *   (nothing transitions PREPARED → CANCELLING; both writers of CANCELLING guard on state =
+	 * - COMMITTING (or PREPARED from older code): the decision is durable and is the point of no return
+	 *   (nothing transitions COMMITTING → CANCELLING; the writer of CANCELLING guards on state =
 	 *   'PREPARING'), so the transaction WILL commit — but some participant has not applied it yet.
 	 *   Answering "committed" would let a caller read a stale value from that participant, so these
 	 *   states throw the commit-pending error instead. The `tx_recovery` job finishes the fan-out, and a retry
@@ -798,7 +798,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * Removes the payload that no step needs after PREPARED or CANCELLING. The request path does not
+	 * Removes the payload that no step needs after COMMITTING or CANCELLING. The request path does not
 	 * call it: a transaction that completes deletes its rows a few milliseconds later, and a strip
 	 * before that only adds one write for each item. The `tx_recovery` claim calls it, so a transaction
 	 * that does not complete keeps its payload only until its first claim. It writes no row when the
@@ -1081,13 +1081,21 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 
 	/**
-	 * Moves PREPARING to PREPARED, the point of no return. The stored answers decide, not the answers
-	 * that the caller holds in memory: every participant must have a stored accepted answer.
+	 * Writes the commit decision: PREPARING moves to COMMITTING. This is the point of no return.
+	 *
+	 * The stored answers decide, not the answers that the caller holds in memory. Every participant
+	 * must have a stored accepted answer. Two drives of one transaction can run at the same time, and a
+	 * participant keeps only its first answer. Thus a participant can reject the prepare of one drive and
+	 * then accept the prepare of the other drive. The drive that got the accept sees only accepted answers
+	 * in memory, but the stored answer is the rejection, and the transaction must cancel.
+	 *
+	 * The statement writes nothing when the state is not PREPARING. In that case, another drive has
+	 * already written a decision, and the caller follows the stored state.
 	 */
-	private markPrepared(transactionId: string, idempotencyToken: string): void {
+	private markCommitting(transactionId: string, idempotencyToken: string): void {
 		this.transition(idempotencyToken, () =>
 			this.ctx.storage.sql.exec(
-				`UPDATE tc_state SET state = 'PREPARED' WHERE transaction_id = ? AND state = 'PREPARING'
+				`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state = 'PREPARING'
 				   AND NOT EXISTS (SELECT 1 FROM tc_participants WHERE transaction_id = ? AND prepare_outcome IS NOT 'accepted')`,
 				transactionId,
 				transactionId,
@@ -1148,8 +1156,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const allAccepted = prepareResults.every((r) => r.status === "fulfilled" && r.value.result.outcome === "accepted");
 
 		if (allAccepted) {
-			// All accepted — PREPARED is the point of no return
-			this.markPrepared(transactionId, idempotencyToken);
+			// All answers in memory are accepted. markCommitting checks the stored answers again.
+			this.markCommitting(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs).catch((e: unknown) => {
 				// A split moved the token: the client retries, and the new owner commits.
 				if (FokosError.isCode(e, SHARDING_UNAVAILABLE_CODES.partition_migrating)) {
@@ -1177,27 +1185,30 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private async runCommit(transactionId: string, idempotencyToken: string, requestBudgetMs: number): Promise<void> {
 		// More than one drive of a transaction can run at the same time: the request, a retry with the
-		// same token, the `tx_recovery` job, and a participant's recovery call. Each one sends commits
+		// same token, the `tx_recovery` job, and a participant's recovery call. Each drive sends commits
 		// only when the stored decision is commit. A drive whose own decision lost sends nothing.
-		const decisionWinner = this.transition(
-			idempotencyToken,
-			() =>
-				this.ctx.storage.sql.exec(
-					`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state IN ('PREPARED', 'COMMITTING')`,
-					transactionId,
-				).rowsWritten > 0,
-		);
-		if (!decisionWinner) {
+		//
+		// This step writes no row for a COMMITTING transaction: markCommitting already wrote the decision.
+		// An UPDATE that writes the same value again also counts as one row written. A PREPARED row from
+		// older code moves to COMMITTING here, because completeTransaction expects COMMITTING.
+		// FIXME: Remove the fallback after all older code that writes PREPARED rows is gone.
+		const stateRow = this.transition(idempotencyToken, () => {
+			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'COMMITTING' WHERE transaction_id = ? AND state = 'PREPARED'`, transactionId);
+			return this.loadStateRow(transactionId);
+		});
+		invariant(stateRow, () => `fokos/tc: runCommit found no tc_state row for transaction ${transactionId}`);
+		if (stateRow.state !== "COMMITTING") {
 			return;
 		}
 
-		const stateRow = this.loadStateRow(transactionId)!;
 		// Keys only, as in runCancel: every participant applies the payload from its own
 		// pending_transactions rows, which prepare wrote, so the commit RPC carries routing
 		// information and never up to MAX_PAYLOAD_BYTES_PER_TX of data the participant already holds.
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
 		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
+		// A participant with a stored 'committed' outcome got its commit from an earlier drive, and this
+		// drive does not send it again.
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
@@ -1205,42 +1216,69 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 			)
 			.toArray();
+		const pendingKeys = pendingParticipants.map((p) => {
+			const keys = keysByPartition.get(p.partition_do_name);
+			// initiateWrite makes a participant only from the items that route to it, and nothing deletes
+			// an item before completeTransaction. A commit with no keys does not release the locks.
+			invariant(keys?.length, () => `fokos/tc: participant ${p.partition_do_name} of transaction ${transactionId} has no items`);
+			return toTransactionItemKeys(keys);
+		});
 
-		await Promise.allSettled(
-			pendingParticipants.map(async (p) => {
+		// Each result is the DO name of a participant that confirmed the commit, or null.
+		const results = await Promise.allSettled(
+			pendingParticipants.map(async (p, i): Promise<string | null> => {
 				// Past the request budget, stop dispatching: this participant stays unconfirmed, the
 				// transaction stays in COMMITTING, the caller receives the commit-pending error, and the
 				// `tx_recovery` job finishes the fan-out.
 				if (this.fokosNow() > deadlineMs) {
-					return;
+					return null;
 				}
 				const pCtx = deserializePartitionContext(p.partition_context_json);
-				const keys = toTransactionItemKeys(keysByPartition.get(p.partition_do_name) ?? []);
 				await this.partitionClient(pCtx).send(
 					"txCommit",
 					pCtx,
-					{ transactionId, transactionTimestamp: stateRow.transaction_ts, items: keys },
-					keys,
+					{ transactionId, transactionTimestamp: stateRow.transaction_ts, items: pendingKeys[i] },
+					pendingKeys[i],
 					{ retry: this.fanoutRetry(deadlineMs) },
 				);
-				this.ctx.storage.sql.exec(
-					`UPDATE tc_participants SET commit_outcome = 'committed' WHERE transaction_id = ? AND partition_do_name = ?`,
-					transactionId,
-					p.partition_do_name,
-				);
+				return p.partition_do_name;
 			}),
 		);
+		const confirmed = results.flatMap((r) => (r.status === "fulfilled" && r.value !== null ? [r.value] : []));
 
-		// Defensive: only advance to COMMITTED when all participants confirmed.
-		const uncommitted = one(
-			this.ctx.storage.sql.exec<{ n: number }>(
-				`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`,
-				transactionId,
-			),
-		).n;
-		if (uncommitted === 0) {
-			await this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
+		// Usual path: every pending participant confirmed in this drive. The transaction completes now,
+		// and completeTransaction deletes the tc_participants rows. Thus the drive writes no
+		// 'committed' outcome, because nothing reads it.
+		//
+		// Other path: some participant did not confirm. The drive stores the confirmed outcomes, so that a
+		// later drive sends only the commits that are missing. A missing outcome is not an error: a commit
+		// that the participant already applied gets the idempotent success, and the participant writes
+		// nothing. Then the drive counts the stored outcomes, because a parallel drive can have stored
+		// the outcomes that this drive did not get.
+		if (confirmed.length < pendingParticipants.length) {
+			const uncommitted = this.ctx.storage.transactionSync(() => {
+				for (const partitionDoName of confirmed) {
+					this.ctx.storage.sql.exec(
+						`UPDATE tc_participants SET commit_outcome = 'committed'
+						  WHERE transaction_id = ? AND partition_do_name = ? AND commit_outcome IS NULL
+						    AND EXISTS (SELECT 1 FROM tc_state WHERE transaction_id = ? AND state = 'COMMITTING')`,
+						transactionId,
+						partitionDoName,
+						transactionId,
+					);
+				}
+				return one(
+					this.ctx.storage.sql.exec<{ n: number }>(
+						`SELECT COUNT(*) as n FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL`,
+						transactionId,
+					),
+				).n;
+			});
+			if (uncommitted > 0) {
+				return;
+			}
 		}
+		await this.completeTransaction(transactionId, idempotencyToken, "COMMITTED");
 	}
 
 	/** `requestBudgetMs` bounds the fan-out exactly as it does in runCommit. */
@@ -1349,7 +1387,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const heldTooLong = this.fokosNow() - stateRow.created_at > maxPreparingHoldMs(this.config());
 
 		if (allAccepted) {
-			this.markPrepared(transactionId, idempotencyToken);
+			this.markCommitting(transactionId, idempotencyToken);
 			await this.runCommit(transactionId, idempotencyToken, requestBudgetMs);
 		} else if (anyRejected || heldTooLong) {
 			this.cancelTransactionInStore(transactionId, idempotencyToken);
