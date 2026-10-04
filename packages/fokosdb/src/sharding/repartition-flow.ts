@@ -366,6 +366,16 @@ export class RepartitionSource {
 					this.#deferSource(row, now, jitterBackoff(row.attempts, sourceRetryBaseMs, sourceRetryMaxMs));
 					return "progressed";
 				}
+				// The children tile [start, end) with these boundaries. A boundary out of order or out of the
+				// interval gives a key no owner, or two owners. The hook is host code, so the flow checks it.
+				invariant(boundaries.length === n - 1, () => `fokos/repartition.plan: ${boundaries.length} boundaries for ${n} children`);
+				boundaries.forEach((b, i) =>
+					invariant(
+						KeyCodec.compare(b, i === 0 ? (rp.start ?? KeyCodec.encodeOptional(undefined)) : boundaries[i - 1]) > 0 &&
+							(rp.end === null || KeyCodec.compare(b, rp.end) < 0),
+						() => `fokos/repartition.plan: boundary ${i} (${KeyCodec.keyForLog(b)}) is out of order or outside the interval`,
+					),
+				);
 				const starts: (KeyBytes | null)[] = [rp.start, ...boundaries];
 				const ends: (KeyBytes | null)[] = [...boundaries, rp.end];
 				planned.rangeDepth = depth + 1;
@@ -733,6 +743,12 @@ export class RepartitionSource {
 			if (counts.acknowledged < counts.total) {
 				return;
 			}
+			// The cutover needs every target initialized. The completion lets the source drop the state it
+			// kept for its targets, so a target that was never initialized loses its slice.
+			invariant(
+				counts.total > 0 && counts.initialized === counts.total,
+				() => `fokos/repartition.acceptAck: ${row.id} completes with ${counts.initialized} of ${counts.total} targets initialized`,
+			);
 
 			this.store.setRepartitionState(row.id, "completed", { completedAt: now });
 			// Every target now holds its own copy of the slice, so the host can drop what it kept for them.
@@ -918,12 +934,29 @@ export class RepartitionTarget {
 			this.#deferImport(rec, now, new Error(`the page cursor moves back from ${requested.phase} to ${page.nextCursor.phase}`));
 			return "stopped";
 		}
+		// A cursor that does not move forward makes the target pull the same page again and again.
+		if (
+			requested.phase === "overrides" &&
+			page.nextCursor?.phase === "overrides" &&
+			!overridesCursorAfter(page.nextCursor.inner, requested.inner)
+		) {
+			this.#deferImport(rec, now, new Error("the overrides cursor of the page does not move forward"));
+			return "stopped";
+		}
+		// A row outside the slice of this target belongs to a sibling or to the source, and two partitions
+		// would then own it.
+		const n = this.deps.identity().ctx.topology.hashSplitN;
+		if (page.phase === "overrides" && !page.overrides.every((o) => sliceIncludesHashKey(rec.slice, o.hashKey, n))) {
+			this.#deferImport(rec, now, new Error("the overrides page holds a hash key outside the slice of this target"));
+			return "stopped";
+		}
 		if (page.phase === "host") {
 			try {
 				this.deps.hooks.migration.validatePage(
 					requested.inner,
 					page.page,
 					page.nextCursor?.phase === "host" ? page.nextCursor.inner : null,
+					(key) => sliceIncludesItem(rec.slice, key.hashKey, key.sortKey, n),
 				);
 			} catch (error) {
 				this.#deferImport(rec, now, error);
@@ -1176,7 +1209,17 @@ export class RepartitionTarget {
 		return rec.nextAttemptAt;
 	}
 
+	/**
+	 * A target imports one slice of one repartition, and its state only moves forward. A state that
+	 * moves back makes a complete target refuse its requests again, or import a page a second time.
+	 */
 	#putImport(record: FokosImportRecord): void {
+		const stored = this.importRecord();
+		invariant(
+			!stored || (stored.repartitionId === record.repartitionId && IMPORT_ORDER[record.state] >= IMPORT_ORDER[stored.state]),
+			() =>
+				`fokos/repartition: the import of ${stored?.repartitionId} in ${stored?.state} cannot become ${record.repartitionId} in ${record.state}`,
+		);
 		this.store.putImport(record);
 	}
 
@@ -1228,6 +1271,13 @@ function retryDelay(
 }
 
 const PHASE_ORDER: Record<FokosMigrationCursor["phase"], number> = { overrides: 0, host: 1 };
+
+const IMPORT_ORDER: Record<FokosImportState, number> = { awaiting_data: 0, importing: 1, imported: 2, active: 3 };
+
+/** True when `next` is strictly after `requested` in the `hash_key` order of the overrides stream. */
+function overridesCursorAfter(next: PromotedKeyCursor | null, requested: PromotedKeyCursor | null): boolean {
+	return next !== null && (requested === null || KeyCodec.compare(next.hashKey, requested.hashKey) > 0);
+}
 
 function notCutOver(repartitionId: string): FokosUnavailableError {
 	return new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.repartition_not_cut_over, {

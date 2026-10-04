@@ -176,6 +176,10 @@ export type FokosRepartitionPeer = Omit<FokosPartitionControlRpc, "fokosExecuteL
  * slice it tests the hash key and `[start, end)`. For a `promoted_key` slice it tests the hash key only.
  *
  * `budget` holds the active page budgets of the runtime. The host keeps each page inside them.
+ *
+ * `validatePage` runs on the target before the page transaction, and a throw delays the import with
+ * no write. `inSlice` is true for a key in the slice of the target. It does not read the route
+ * overrides, so it accepts each key that `belongsToTarget` accepts, and some more.
  */
 export interface MigrationHost {
 	buildPage(
@@ -185,7 +189,7 @@ export interface MigrationHost {
 		budget: FokosMigrationPageBudget,
 	): { page: unknown; nextCursor: unknown };
 	applyPage(page: unknown, slice: FokosSlice): void;
-	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void;
+	validatePage(cursor: unknown, page: unknown, nextCursor: unknown, inSlice: (key: RouteKey) => boolean): void;
 }
 
 // ─── the administration view ─────────────────────────────────────────────────

@@ -13,6 +13,8 @@
  * - `nextCursor` is non-null when the byte budget or the item cap stopped the scan. A null
  *   `nextCursor` means the scan reached the end of the table.
  */
+import invariant from "../shared/invariant.js";
+
 export type CollectBatchOptions<TRow, TCursor> = {
 	/**
 	 * Fetches the next page of rows strictly after `cursor` (null = from the start). Give the rows one
@@ -100,5 +102,8 @@ export function collectBatch<TRow, TCursor>(opts: CollectBatchOptions<TRow, TCur
 		}
 	}
 
+	// A page that stops at a limit must have read a row. If not, its cursor is the start cursor, and the
+	// caller reads the same page again and again.
+	invariant(!reachedLimit || scanned > 0, "fokos/batch-scan: a page stopped at a limit before it read a row");
 	return { rows, nextCursor: reachedLimit ? cursor : null, totalBytes };
 }

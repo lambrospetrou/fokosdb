@@ -90,8 +90,18 @@ export class FokosMigrationHost implements MigrationHost {
 		this.#applyPendingTx(p);
 	}
 
-	validatePage(cursor: unknown, page: unknown, nextCursor: unknown): void {
+	validatePage(cursor: unknown, page: unknown, nextCursor: unknown, inSlice: BelongsToTarget): void {
 		assertHostPageFollowsCursor(cursor, page, nextCursor);
+		const p = page as FokosDBHostPage;
+		for (const row of p.stream === "items" ? p.items : p.pendingTransactions) {
+			// The closure is made only on a failure, because a page can hold many rows.
+			if (!inSlice({ hashKey: row.hk, sortKey: row.sk })) {
+				invariant(
+					false,
+					() => `fokos/migration-host: the ${p.stream} page holds ${KeyCodec.pairForLog(row.hk, row.sk)}, outside the slice`,
+				);
+			}
+		}
 	}
 
 	// ─── items ────────────────────────────────────────────────────────────────
@@ -382,4 +392,31 @@ export function assertHostPageFollowsCursor(cursor: unknown, page: unknown, next
 		STREAM_ORDER[next.stream] <= STREAM_ORDER[requested.stream] + 1,
 		() => `fokos/migration-host: the page cursor skips a stream from ${requested.stream} to ${next.stream}`,
 	);
+	// A cursor that does not move forward makes the target pull the same page again and again.
+	invariant(
+		next.stream !== requested.stream ||
+			(next.cursor !== null && (requested.cursor === null || comparePositions(next.cursor, requested.cursor) > 0)),
+		() => `fokos/migration-host: the ${requested.stream} cursor of the page does not move forward`,
+	);
+}
+
+type StreamPosition = NonNullable<FokosDBHostCursor["cursor"]>;
+
+/**
+ * Compares two positions of one stream in its read order: `(hk, sk)` for items, and
+ * `(hk, sk, transaction_id)` for locks. `after_key` is after every row of its hash key. A
+ * transaction id is ASCII, so the string order of JavaScript is the byte order of SQLite.
+ */
+function comparePositions(a: StreamPosition, b: StreamPosition): number {
+	const hk = (p: StreamPosition) => (p.kind === "row" ? p.row.hk : p.hk);
+	const byHashKey = KeyCodec.compare(hk(a), hk(b));
+	if (byHashKey !== 0 || a.kind === "after_key" || b.kind === "after_key") {
+		return byHashKey || Number(a.kind === "after_key") - Number(b.kind === "after_key");
+	}
+	const bySortKey = KeyCodec.compare(a.row.sk, b.row.sk);
+	if (bySortKey !== 0) {
+		return bySortKey;
+	}
+	const tx = (p: typeof a.row) => ("transaction_id" in p ? p.transaction_id : "");
+	return tx(a.row) < tx(b.row) ? -1 : tx(a.row) > tx(b.row) ? 1 : 0;
 }

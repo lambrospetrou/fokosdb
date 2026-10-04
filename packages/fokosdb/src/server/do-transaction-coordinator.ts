@@ -490,10 +490,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			migration: {
 				buildPage: (cursor, _slice, belongsToTarget, budget) => this.buildMigrationPage(cursor as string | null, belongsToTarget, budget),
 				applyPage: (page) => this.applyMigrationPage(page as MigratedTransaction[]),
-				validatePage: (_cursor, page) => {
+				validatePage: (_cursor, page, _nextCursor, inSlice) => {
 					invariant(Array.isArray(page), "fokos/tc: a migration page must be an array of transactions");
 					for (const tx of page as MigratedTransaction[]) {
 						assertMigratedTransaction(tx);
+						invariant(
+							inSlice(tokenKey(tx.state.idempotency_token)),
+							() => `fokos/tc: migrated transaction ${tx.state.transaction_id} is outside the slice`,
+						);
 					}
 				},
 			},
