@@ -3,19 +3,39 @@
 **State:** Draft
 **Date:** 2026-10-03
 **Author:** Lambros
-**Status:** Nothing is built. The design decisions in section 4 are agreed.
 
 ## Table of contents
 
 - [1. Overview and context](#1-overview-and-context)
   - [1.1 The current write transaction](#11-the-current-write-transaction)
-  - [1.2 The problem](#12-the-problem)
-  - [1.3 Glossary](#13-glossary)
+  - [1.2 Versions and deletion metadata](#12-versions-and-deletion-metadata)
+  - [1.3 The problem](#13-the-problem)
+  - [1.4 Glossary](#14-glossary)
 - [2. Goals and requirements](#2-goals-and-requirements)
+  - [2.1 In scope](#21-in-scope)
+  - [2.2 Requirements](#22-requirements)
+  - [2.3 Out of scope](#23-out-of-scope)
 - [3. Milestones](#3-milestones)
 - [4. Proposed solution](#4-proposed-solution)
   - [4.1 High-level overview](#41-high-level-overview)
   - [4.2 Technical details](#42-technical-details)
+    - [4.2.1 Public API](#421-public-api)
+    - [4.2.2 Validation and limits](#422-validation-and-limits)
+    - [4.2.3 Evaluate](#423-evaluate)
+    - [4.2.4 Apply](#424-apply)
+    - [4.2.5 The paths](#425-the-paths)
+    - [4.2.6 Item identity](#426-item-identity)
+    - [4.2.7 Lock row and commit](#427-lock-row-and-commit)
+    - [4.2.8 Versions at prepare and at commit](#428-versions-at-prepare-and-at-commit)
+    - [4.2.9 Coordinator](#429-coordinator)
+    - [4.2.10 Result rules](#4210-result-rules)
+    - [4.2.11 Condition failure images](#4211-condition-failure-images)
+    - [4.2.12 Routing, retries, recovery, and migration](#4212-routing-retries-recovery-and-migration)
+    - [4.2.13 Invariants](#4213-invariants)
+    - [4.2.14 Performance](#4214-performance)
+    - [4.2.15 Deployment](#4215-deployment)
+    - [4.2.16 Testing](#4216-testing)
+    - [4.2.17 Fatal prepare errors](#4217-fatal-prepare-errors)
 - [5. Alternative options](#5-alternative-options)
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
@@ -27,12 +47,12 @@
 `FokosDB.transactWriteItems` applies up to `MAX_ITEMS_PER_TX` (100) operations atomically. Each operation is a
 `put`, a `delete`, a `check`, or an `update`. Each operation has an optional condition.
 
-The current behavior has these properties:
+The current code has these properties:
 
 - `validateTransactWriteOperations` rejects two operations on the same `(hashKey, sortKey)` pair with
   `transact_duplicate_key`.
 - `db.ts` gives each operation its request position as `opIndex`. Every result carries `opIndex` back, so each node
-  merges results by request order.
+  merges the results in request order.
 - A cancelled transaction raises `FokosTransactionCancelledError`. Its `results[i]` answers request operation `i`,
   with the outcome `passed`, `rejected`, or `not_evaluated`.
 - Two execution paths exist. The single-partition path sends the whole set to one partition through
@@ -41,25 +61,52 @@ The current behavior has these properties:
 - A participant stores one `pending_transactions` row for each key. The row holds the effect that commit applies:
   the operation, the data, the kind, and the TTL. Prepare materializes an update into its new document.
 - SQLite evaluates each condition and each update against the committed `items` row.
+- The single-partition path applies the operations in request order. The two-phase commit applies the keys in the
+  order that the coordinator sends them. `loadItemKeys` has no `ORDER BY`, so that order is not the request order.
 
-### 1.2 The problem
+### 1.2 Versions and deletion metadata
+
+The design depends on these rules of `PartitionStore`. The RFC `2026-10-03-max-deleted-version.md` defines them.
+
+- Each partition has one `deletion_metadata` row with `max_deleted_v` and `max_delete_tx_order_ts`.
+- A write to an existing row sets `v = v + 1`. A new row starts at `v = max_deleted_v + 1`. Thus the `v` of a key
+  never repeats, also after a delete and a recreate.
+- A delete that removes a row raises `max_deleted_v` to the `v` of the row. It also raises
+  `max_delete_tx_order_ts` to at least the `last_read_ts` of the row.
+- A new row starts with `last_read_ts` and `last_write_ts` at least `max_delete_tx_order_ts`. Thus the timestamp
+  watermark of a key never goes down, and a late prepare of a committed transaction gets `timestamp_conflict`.
+- A read transaction compares `version` for an item that it finds in both phases. It compares `max_deleted_v` for an
+  item that is absent in both phases.
+
+The store writes `upsertItem`, `updateItemSingleShot`, `deleteItem`, and `bumpItemReadTs` apply these rules. This
+design changes none of them.
+
+### 1.3 The problem
 
 A caller cannot send two operations for the same item in one transaction. For example, a caller cannot check an item,
 then update it, then check the result, all in one atomic request.
 
-### 1.3 Glossary
+### 1.4 Glossary
 
 - **Item** — one `(hashKey, sortKey)` pair. A missing `sortKey` is the empty sort key. Two keys are the same item
-  only when their encoded bytes are equal (section 4.2.4.2).
+  only when their encoded bytes are equal (section 4.2.6).
 - **Operation** — one entry of the request `items` array. Its `opIndex` is its position in that array.
 - **Sequence** — the operations of one item, in `opIndex` order.
+- **Repeated item** — an item with two or more operations in the request. A request with a repeated item is a
+  **repeated request**.
+- **Write** — a `put` or an `update`. A `delete` and a `check` are not writes.
+- **Store write** — one call of `upsertItem`, `updateItemSingleShot`, `deleteItem`, or `bumpItemReadTs`.
+- **Standalone operations** — the operations of a request, applied one by one in `opIndex` order as one-operation
+  transactions with the same transaction timestamp `T`.
 - **Committed state** — the `items` row of an item before the transaction starts.
-- **Private state** — the state of an item after the earlier operations of its sequence. Only the transaction that
-  makes it can see it.
-- **Final image** — the effect of the whole sequence of an item, as one lock row holds it: the final data or "absent",
-  and the number of writes (section 4.2.6).
-- **Single-op key** — an item with one operation in the request. **Multi-op key** — an item with two or more.
-- **Evaluation block** and **lock block** — the two `transactionSync` calls of a prepare (section 4.2.5).
+- **Temporary write** — a store write that the evaluate step makes, so that a later operation sees its effect.
+- **Temporary state** — the state that the temporary writes of the earlier operations left. Only the evaluate step of
+  the same transaction can see it.
+- **Last-write data** — the stored data, kind, and TTL of an item immediately after the last write of its sequence.
+- **Operation list** — the `(opIndex, operation type)` pairs of one item, in a lock row.
+- **Version reference** — a condition plan or an update plan whose `requiredColumns` contains `"v"`. The expression
+  reads `{ ref: "v" }`.
+- **Evaluate** and **apply** — the two steps of the engine (sections 4.2.3 and 4.2.4).
 
 ## 2. Goals and requirements
 
@@ -67,31 +114,31 @@ then update it, then check the result, all in one atomic request.
 
 1. `transactWriteItems` accepts `executionMode: "standard" | "ordered_per_item"`. The default is `"standard"`.
 2. Standard mode keeps its current behavior. It continues to reject repeated items with `transact_duplicate_key`.
-3. In `"ordered_per_item"` mode, a request can contain more than one operation for the same item.
-4. The operations of each item run in `opIndex` order. Each operation sees the effects of the earlier operations of
-   its item.
-5. For each operation, the partition evaluates the condition and its own checks first, and then applies the
-   operation.
-6. Each operation acts as a standalone write. Each write increments `v`. A delete of the committed row increments
-   `delete_revision`. A put after a delete creates a new row with `v = 1`. `delete_revision` and
-   `max_delete_tx_order_ts` change by the net effect of the sequence, on both paths (section 4.2.6.1).
-7. All operations of one transaction use the same transaction timestamp.
+3. In `"ordered_per_item"` mode, a request can contain more than one operation for the same item, on both paths.
+4. Every request applies its operations in `opIndex` order, in both modes and on both paths.
+5. Prepare evaluates, and apply writes:
+   - Each operation sees the effects of the earlier operations of the request.
+   - Its condition, its update check, its size check, and its condition failure image use the temporary state at
+     prepare.
+   - Apply then makes the store writes of the operations in `opIndex` order, at the moment the transaction applies.
+   - On the two-phase path, other requests run between the two steps. Thus a row that the transaction creates can
+     get a higher `v` at apply than at prepare (section 4.2.8).
+6. For the same start state, the single-partition path and the two-phase path give the same result. Only the
+   timestamps can differ, because the two paths take `T` from different clocks.
+7. All operations of one transaction use the same transaction timestamp `T`.
 8. The first failure of an item is the only failure that the item reports. The later operations of that item get
-   `not_evaluated`. The other items continue, so that the result can report their outcomes.
-9. One failure cancels the whole transaction. Continued evaluation collects diagnostics. It does not permit a partial
-   commit.
-10. The result type stays the same: one result for each `opIndex`, as section 4.2.3 defines.
-11. A condition failure image shows the state immediately before the failed operation, private changes included.
-12. Both execution paths support ordered mode: the single-partition path and the two-phase path.
-13. The coordinator uses `PRIMARY KEY (transaction_id, op_index)` for `tc_items` in both modes. A schema migration
-    changes existing databases atomically, and it keeps every `op_index`.
+   `not_evaluated`. The other items continue, so that the result reports their outcomes. One failure cancels the whole
+   transaction, and the continued evaluation does not permit a partial commit.
+9. The result type stays the same: one result for each `opIndex` (section 4.2.10).
+10. The coordinator uses `PRIMARY KEY (transaction_id, op_index)` for `tc_items` in both modes.
 
 ### 2.2 Requirements
 
-- The private state of a transaction must be invisible to every other request.
-- Prepare must persist the accepted final image of each item. Commit must not evaluate a condition again.
-- The sequence must keep the rules for versions, TTL, timestamps, deletion metadata, and item size.
-- A participant must hold one lock for each item.
+- The temporary state of a transaction must be invisible to every other request.
+- Prepare must persist everything that commit applies. Commit must not evaluate a condition or an update plan.
+- A condition or an update value must not read a `v` that apply can change (section 4.2.8).
+- The rules of section 1.2 must hold. The design must reach them only through the current store writes.
+- A participant must hold one lock row for each item.
 - Every node must agree which operations belong to one item. Each node compares the key bytes, and no hash value
   decides that two keys are the same item.
 - Commit and cancel must send each item key one time.
@@ -99,86 +146,112 @@ then update it, then check the result, all in one atomic request.
 - The idempotency fingerprint must include the execution mode.
 - The current request validation and limits must stay. `MAX_ITEMS_PER_TX` (100) and `MAX_PAYLOAD_BYTES_PER_TX` (4 MB)
   count operations, not unique items.
-- The ordering guarantee applies to each item. Different partitions can run in parallel.
+- A request with no repeated item must cost the same as now: no temporary write and one storage transaction.
 
 ### 2.3 Out of scope
 
-- **A global order across items or partitions.** The guarantee applies to each item only.
+- **A global order across partitions.** Each partition applies its operations in `opIndex` order. Different
+  partitions apply in parallel.
+- **The same `v` at prepare and at commit for a new row.** A standard `put` of an absent item has the same behavior
+  now (section 4.2.8).
 - **The `clientRequestToken` rule of the single-partition path.** A request with a token skips that path in both
   modes. A later change will look at that rule again.
-- **A mixed-version deployment.** The schema and the API can change in a way that breaks old code. Section 4.2.15
-  gives the deployment rules.
-- **A separate public method.** Section 5 records the reason.
+- **Compatibility with existing data.** The schema changes edit the current migrations in place. A deployment must
+  destroy the existing Durable Object namespaces (section 4.2.15).
+- **A separate public method.** Section 5 gives the reason.
 
 ## 3. Milestones
 
-Each milestone ships alone. Milestones 1 to 3 keep the behavior of standard mode, with one exception: after
-milestone 2, two different keys with the same hash are two items, and the client no longer rejects them as a
-duplicate. Milestone 4 makes ordered mode available.
+Each milestone ships alone. Milestones 1 to 4 keep the results of standard mode, with two exceptions:
 
-1. **Coordinator schema.** Change `tc_items` to `PRIMARY KEY (transaction_id, op_index)` with a schema migration.
-   Send each key one time in commit and cancel. Section 4.2.9.
-2. **Final image in the lock row.** Add `version_delta` to `pending_transactions`, the `replace` operation, and the
-   `PendingLockOperation` type. Make commit apply them with an exhaustive `switch`, add the store method that deletes
-   the row of a `replace` and changes only `delete_revision`, and make `commitLocal` refuse a duplicate key. Make the
-   migration stream carry the new column. Add `KeyPairMap` and use it at each identity site in place of
-   `KeyCodec.pairKey`. Sections 4.2.4.2 and 4.2.6 to 4.2.8.
-3. **The sequence engine.** Make `prepareLocal` and `executeSingleShot` use one function that groups operations by
-   item and runs each sequence. Read `deletion_metadata` before the loop. Apply the timestamp rule, the result rules,
-   the final images, and the delete effect on the single-partition path. Sections 4.2.3 to 4.2.6.1.
-4. **Public API.** Add `executionMode`, validate its value, skip the duplicate check in ordered mode, add the mode to
-   the fingerprint, expose the mode in the HTTP example, and update the public documentation. Sections 4.2.1, 4.2.2,
-   and 4.2.9.
-5. **Cross-path tests.** Add the tests of section 4.2.16 that cover recovery, migration, and idempotent retries in
-   ordered mode.
+- After milestone 2, two different keys with the same hash are two items. The client no longer rejects them as a
+  duplicate.
+- After milestone 3, the two-phase commit applies in `opIndex` order. A new row can then get a different `v` when the
+  same transaction also deletes another item of the partition.
+
+Milestone 5 makes ordered mode available. Milestone 7 comes after the ordered-mode work. It changes how the
+coordinator handles a prepare error that a retry cannot clear.
+
+1. **Coordinator schema.** Edit the `tc_items` migration in place to `PRIMARY KEY (transaction_id, op_index)`. Send
+   each key one time in commit and cancel. Section 4.2.9.
+2. **Item identity.** Add `KeyPairMap`, and use it at each identity site in place of `KeyCodec.pairKey`. Remove
+   `KeyCodec.pairKey`. Section 4.2.6.
+3. **Operation list and apply.** Edit the `pending_transactions` migration in place to add `op_list`. Write one entry
+   for each lock row. Make commit apply all owned lock rows in `opIndex` order, refuse a duplicate key, and refuse a
+   duplicate `opIndex`. Make the migration stream carry the new column. Sections 4.2.4 and 4.2.7.
+4. **Evaluate.** Make `prepareLocal` and `executeSingleShot` run the evaluate step in `opIndex` order, with temporary
+   writes for a repeated request. Add the two blocks of a prepare and the version-reference check of the partition.
+   Sections 4.2.3, 4.2.5, and 4.2.8.
+5. **Public API.** Add `executionMode` and validate its value. Skip the duplicate check in ordered mode, and add the
+   version-reference check of the client. Add the mode to the fingerprint, expose the mode in the HTTP example, and
+   update the public documentation. Sections 4.2.1, 4.2.2, and 4.2.9.
+6. **Cross-path tests.** Add the tests of section 4.2.16.
+7. **Fatal prepare errors.** Make `prepareRetry` stop on a `FokosValidationError`. Make `runPrepareRecovery` cancel a
+   transaction when a participant stored such an error. Section 4.2.17.
+
+Until milestone 7 ships, the coordinator retries a prepare that fails the version-reference check of the
+partition. A recovery drive then keeps the transaction in `PREPARING` until `maxPreparingHoldMs`. The transaction
+still cancels and applies nothing. Only a caller that does not use `db.ts` can reach this case, because the client
+check refuses the request first.
 
 ## 4. Proposed solution
 
 ### 4.1 High-level overview
 
-The client accepts repeated items when the caller selects `"ordered_per_item"`. Nothing below the client reads the
-mode. The coordinator and the partition always run each item as a sequence. A standard request is a set of sequences
-that each have one operation, so standard mode keeps its current behavior.
+An ordered transaction gives the result of its standalone operations. The Durable Object runs one event at a time.
+Thus the engine can run the operations of a request one by one, with the current store writes, inside one storage
+transaction.
 
-The partition groups the operations of a request by item and sorts each group by `opIndex`. For each operation, it
-checks the lock, evaluates the condition, runs the update and size checks, and checks the timestamp. When another
-operation of the same item follows, the partition applies the operation to `items` as a private write. The last
-operation of an item makes no private write.
+The client accepts repeated items only when the caller selects `"ordered_per_item"`. Nothing below the client reads
+the mode. The coordinator and the partition run the same code for every request. A request with no repeated item
+takes the same steps as now.
 
-A prepare uses two `transactionSync` calls with no `await` between them:
+The engine has two steps:
 
-1. The evaluation block runs every sequence and builds the final image of each multi-op key. Then it throws, and
-   SQLite rolls back every private write.
-2. When every operation passed, the lock block writes one lock row for each item, with its final image.
+1. **Evaluate.** For each operation in `opIndex` order, it checks the lock, the condition, the update and the size,
+   and the timestamp. In a repeated request, it also applies each passed operation as a temporary write, so that the
+   next operation sees it. It reads the last-write data of each repeated item.
+2. **Apply.** For each operation in `opIndex` order, it makes one store write: `upsertItem` for a write, `deleteItem`
+   for a `delete`, and `bumpItemReadTs` for a `check`.
 
-No other request can run between the two blocks, so no request sees the private state. Commit writes the final image
-of each lock row and evaluates nothing.
+The paths use the steps in this way:
 
-The single-partition path uses the same sequence engine in one `transactionSync`. When every operation passed, it
-applies the last operation of each item and keeps all writes. When one operation failed, it throws to roll back.
+- **Single-partition path.** One `transactionSync`. In a repeated request, the temporary writes of evaluate are the
+  real writes, so the block keeps them when every operation passed. In a request with no repeated item, evaluate
+  writes nothing, and apply runs after it, as now. When one operation failed, the block throws and rolls back.
+- **Prepare on the two-phase path.** In a repeated request, evaluate runs in its own `transactionSync` and then
+  throws, so SQLite rolls back every temporary write. A second `transactionSync`, the lock block, writes one lock row
+  for each item: its last-write data and its operation list. In a request with no repeated item, evaluate writes
+  nothing, so the lock rows follow in the same block, as now.
+- **Commit on the two-phase path.** Apply reads the operation lists of the owned lock rows and sorts the entries by
+  `opIndex`. It makes one store write for each entry. Each write of an item uses its last-write data.
 
-Only a multi-op key makes private writes, and an item with *n* operations makes *n − 1* of them. A transaction with no
-repeated item, in either mode, costs the same as a standard transaction costs now.
-
-The coordinator stores one `tc_items` row for each operation, keyed by `opIndex`. It sends all operations of an item to
-the participant in one prepare. It sends each key one time in commit and cancel.
+The data in the middle of a sequence is invisible to other requests. The visible values depend only on the order and
+the types of the operations: `v`, `max_deleted_v`, the timestamps, and `key_size_estimates`. Thus apply with the
+last-write data gives the same result as the standalone operations (section 4.2.4). A condition or an update value
+that reads `v` after a write or a delete of the same item reads a `v` that apply can change. The client and the
+partition refuse such a request (section 4.2.8).
 
 ```text
-db.ts ── validate (repeated items only in ordered mode), fingerprint includes the mode
+db.ts ── validate (repeated items only in ordered mode, version references), fingerprint includes the mode
   │
   ├── single-partition path ──► partition: one transactionSync
-  │                               sequence engine: check → apply, per operation
-  │                               all passed → keep writes │ one failed → throw, roll back
+  │                               evaluate in opIndex order
+  │                               repeated request: each passed operation is a real write
+  │                               no repeated item: apply after evaluate, as now
+  │                               all passed → commit │ one failed → throw, roll back
   │
   └── two-phase path ──► coordinator: tc_items (transaction_id, op_index)
-                           │ prepare: all operations of each item, sorted by opIndex
+                           │ prepare: all operations of the partition
                            ▼
                          partition prepare
-                           evaluation block: sequence engine, read final images, throw → roll back
-                           lock block: one lock row per item, with its final image
+                           evaluate block: temporary writes, last-write data, throw → roll back
+                           lock block: one lock row per item: last-write data + operation list
                            │
                            ▼ commit / cancel: unique keys
-                         partition commit: write the final image, evaluate nothing
+                         partition commit
+                           apply: entries of all owned lock rows, sorted by opIndex, one store write each
+                           release the lock rows, in the same transactionSync
 ```
 
 ### 4.2 Technical details
@@ -197,6 +270,7 @@ export type TransactWriteItemsOptions = {
 ```
 
 `TransactWriteItemsResult`, `TransactWriteOperationResult`, and `FokosTransactionCancelledError` do not change.
+`TransactWriteItemsResult` carries no `v`, so no response depends on the values that apply writes.
 
 The HTTP example exposes the mode. `TransactWriteItemsBodySchema` in `examples/http-api/src/rpc/schemas.ts` gets
 `executionMode` as an optional field with the two values. The `transactWriteItems` route in
@@ -205,19 +279,24 @@ The HTTP example exposes the mode. `TransactWriteItemsBodySchema` in `examples/h
 These documentation comments change:
 
 - `TransactWriteOperationResult` — `not_evaluated` also means that an earlier operation of the same item failed.
-- `returnValuesOnConditionCheckFailure` — in ordered mode, the image can show a private state. The transaction
-  cancelled, so that state was never committed.
+- `returnValuesOnConditionCheckFailure` — in ordered mode, the image can show a temporary state. The transaction
+  cancelled, so that state never committed.
+- The public `version` — in ordered mode, a condition or an update value that reads `v` must come before every
+  `put`, `update`, and `delete` of the same item. An earlier `check` is permitted. Otherwise the request fails with
+  `transact_version_after_write` (section 4.2.2).
+- `TransactWriteItemsOptions.executionMode` — the same rule in one sentence, and the reason: the `v` of a row that
+  the transaction creates can be higher at commit than at prepare (section 4.2.8).
 
 #### 4.2.2 Validation and limits
 
 `db.ts` validates `executionMode` before any other check of the request. A value other than `"standard"` or
 `"ordered_per_item"` fails with a `FokosValidationError` with the new code `transact_execution_mode_invalid` in
 `VALIDATION_CODES`. An absent value is `"standard"`. The check runs on both paths, before the request leaves the
-client, so no node below the client sees a mode that is not valid.
+client. Thus no node below the client sees a mode that is not valid.
 
 `validateTransactWriteOperations` in `shared/transaction-limits.ts` gets the execution mode. In ordered mode, it skips
-the `transact_duplicate_key` check. In standard mode, the check finds a duplicate with `KeyPairMap`, so it rejects two
-operations only when their key bytes are equal (section 4.2.4.2). Every other check stays the same for both modes:
+the `transact_duplicate_key` check. In standard mode, the check finds a duplicate with `KeyPairMap`. Thus it rejects
+two operations only when their key bytes are equal (section 4.2.6). Every other check stays the same for both modes:
 
 - The key validation and the canonical key bytes.
 - `MAX_ITEMS_PER_TX` (100), counted over operations.
@@ -225,12 +304,427 @@ operations only when their key bytes are equal (section 4.2.4.2). Every other ch
 - `MAX_ITEM_BYTES` (400 KB) for the data of each put.
 - The rules for each operation type: data, condition, and update plan.
 
-`db.ts` keeps `opIndex = i` for request position `i`. `InitiateWriteRequest` gets `executionMode`, which the
-coordinator uses only for the fingerprint. `SingleShotRequest` and `PrepareRequest` do not carry the mode.
+**The version-reference check.** `validateTransactWriteOperations` refuses an operation when both are true:
 
-#### 4.2.3 Result rules
+- Its condition plan or its update plan is a version reference.
+- An earlier operation of the same item in the request is a `put`, an `update`, or a `delete`.
 
-Every operation gets one result, at the position of its `opIndex`.
+The refusal is a `FokosValidationError` with the new code `transact_version_after_write` in `VALIDATION_CODES`. Its
+attributes are the `opIndex` of the operation, the `opIndex` of the earlier operation, and the keys. An earlier
+`check` does not count, because a `check` does not change `v`. The check groups the operations by item with
+`KeyPairMap`, and it reads only the `requiredColumns` of the compiled plans. It runs in both modes, but it never
+refuses in standard mode, because standard mode has no repeated item. Section 4.2.8 gives the reason for the rule.
+
+The check is conservative:
+
+- On a row that exists before the transaction and that the sequence does not delete, `v` is the same at prepare and at
+  apply. A version reference after a write is then safe.
+- The client cannot know that the row exists, so it also refuses that request.
+- A caller has three options. It can put the condition on `v` on the first operation of the item, where it reads the
+  committed `v`. It can use a literal in place of an update value that reads `v`. It can send two transactions.
+
+The client is the validation boundary. The partition runs the same check as a guard (section 4.2.3, step 2). Thus a
+caller that sends the RPC without `db.ts` cannot store a `v` that apply changes.
+
+`db.ts` keeps `opIndex = i` for request position `i`. `InitiateWriteRequest` gets `executionMode`, and the
+coordinator uses it only for the fingerprint. `SingleShotRequest` and `PrepareRequest` do not carry the mode.
+
+#### 4.2.3 Evaluate
+
+One function in `TransactionParticipant` serves `prepareLocal` and `executeSingleShot`. It replaces the check pass of
+both methods and the duplicate-key invariant at the start of `prepareLocal`. It does these steps:
+
+1. Sort the operations by `opIndex`. The order of the request array does not matter.
+2. Group the operations by item with `KeyPairMap` (section 4.2.6). The grouping finds the repeated items and keeps
+   the state of each item: failed or not, the lock result, and the committed stamps. Then run the version-reference
+   check of section 4.2.2 on the groups. When an operation fails it, throw the same `FokosValidationError`. The check
+   runs before the first SQL statement, so the throw writes nothing. Section 4.2.17 gives what the coordinator does
+   with the error.
+3. On the two-phase path of a repeated request, read the committed `max_delete_tx_order_ts` one time, before the
+   first temporary write (section 4.2.3.1).
+4. For each operation, in `opIndex` order:
+   1. When an earlier operation of the item failed, give it `not_evaluated`.
+   2. At the first operation of the item, check the lock against the committed state. A lock of another transaction
+      gives `pending_conflict`. A lock of this transaction makes every operation of the item `passed`, with no
+      evaluation and no temporary write (section 4.2.12).
+   3. Evaluate the condition against `items`. On a failure, read the image with `#imageForFailedCondition`.
+   4. Run `#precheckWrite` against `items`.
+   5. On the two-phase path, check the timestamp against the committed stamps (section 4.2.3.1).
+   6. When a check fails, record the failure, and mark the item as failed.
+   7. When the operation passed and the request is a repeated request, apply the operation as a temporary write.
+   8. When the operation is the last write of a repeated item, read the last-write data from the row that it wrote.
+5. Return one result for each operation, the last-write data of each repeated item, and whether a temporary write
+   occurred.
+
+Step 4.7 uses the current store writes with `T`: `upsertItem` for a `put`, `updateItemSingleShot` for an `update`,
+`deleteItem` with `bumpTxOrderTsAlways` for a `delete`, and `bumpItemReadTs` for a `check`. In a repeated request,
+each item gets temporary writes, also an item with one operation. Thus the temporary state at each operation is the
+state that apply gives at the same position, for every item.
+
+At steps 4.3 and 4.4 of an operation, `items` holds the state that the earlier operations left. In a request with no
+repeated item, evaluate makes no temporary write, so each check reads the committed state, as now.
+
+When an operation fails, evaluate drops the last-write data that it read, because no lock block and no commit follow.
+
+The temporary writes report promotion candidates, and evaluate discards them. On the single-partition path, the block
+reports the candidate of the last write of each item whose final state is present, when the block commits.
+
+##### 4.2.3.1 The timestamp rule
+
+The timestamp check uses only the committed state from before the transaction. Conditions, update checks, and size
+checks use the temporary state.
+
+The reason: all operations of a transaction use one timestamp `T`. A check against the temporary state rejects valid
+sequences:
+
+- `put → check`: the put sets `last_read_ts = last_write_ts = T`. The check then finds `T <= T`.
+- `delete → put`: the delete sets `max_delete_tx_order_ts` to at least `T`. The put of the absent item then finds
+  `T <= T`.
+
+The committed values come from two places. Evaluate reads each of them before a temporary write can change it:
+
+- **`max_delete_tx_order_ts`** — `deletion_metadata` holds one value for the whole partition (`id = 1`). A temporary
+  delete of any item raises it. Thus evaluate reads it one time, before the first operation, and uses that value for
+  every item.
+- **The stamps of an item** — `last_read_ts` and `last_write_ts` belong to the row of the item. Only the operations of
+  that item write the row. The first operation of the item reads them, as now, and evaluate keeps them for the later
+  operations of the item.
+
+Without the first rule, a temporary delete of one item makes a later absent item fail. An example: item A exists and
+has `delete → put`, and item B is absent and has `put`. The temporary delete of A raises the watermark to `T`, and the
+put of B then finds `T <= T`.
+
+Each operation applies its own watermark rule, as now: a `check` uses `last_write_ts`, and a mutation uses
+`last_read_ts`. The failure goes to the first operation that does not pass.
+
+This changes one detail of `prepareLocal`. The current code takes the stamps from the condition read or the update
+probe (`conditionResult ?? probe`). For operation 2 and later of an item, that read sees the temporary row. Thus
+evaluate must use the kept stamps for those operations.
+
+`clock_skew` and `pending_conflict` also use the committed state. The single-partition path has no timestamp check,
+as now.
+
+#### 4.2.4 Apply
+
+One function in `TransactionParticipant` applies a list of entries. Each entry is an `opIndex`, an operation type,
+an item key, and the source of the data of the item. The function does these steps:
+
+1. Check with `invariant()` that no two entries have the same `opIndex`.
+2. Sort the entries by `opIndex`.
+3. For each entry, make one store write with `T`:
+   - **`put` and `update`** — `upsertItem` with the data, kind, and TTL of the source.
+   - **`delete`** — `deleteItem` with `bumpTxOrderTsAlways`.
+   - **`check`** — `bumpItemReadTs`.
+4. Return the promotion candidate of the last write of each item whose final state is present.
+
+The callers give these sources:
+
+| Caller | Item | Source of the data |
+| --- | --- | --- |
+| Commit on the two-phase path | every item | the `data`, `data_kind`, and TTL of the lock row |
+| Single-partition path, no repeated item | the item of a `put` | the request data, as now |
+| Single-partition path, no repeated item | the item of an `update` | the update plan: the entry uses `updateItemSingleShot`, as now |
+
+The single-partition path of a repeated request does not call apply. Its temporary writes are already the writes of
+apply in `opIndex` order (section 4.2.5).
+
+**Why the last-write data gives the same result.** Every write of an item in apply uses the last-write data, also
+the writes in the middle of the sequence. The data of those writes is invisible: they run in the same
+`transactionSync`, and a later write or delete replaces them. The visible values do not depend on that data:
+
+- `v` goes up by 1 for each write of a row. A new row starts at `max_deleted_v + 1`.
+- A delete raises `max_deleted_v` to the `v` of the row, and `max_delete_tx_order_ts` to at least its `last_read_ts`.
+- Each write moves the stamps to `MAX(current, T)`, or to at least `max_delete_tx_order_ts` for a new row.
+- Each write and delete changes `key_size_estimates` by the difference between the old row and the new row. Thus the
+  sum ends at the size of the final row.
+- Each insert of a new row gets a new `item_id`, in the same order.
+
+The last-write data itself is the same at prepare and at apply. An update value can read only the keys, the TTL, the
+data, and `v` of its own item. The first three do not depend on `max_deleted_v`, and the version-reference check
+keeps `v` stable (section 4.2.8).
+
+An example on item A with `v = 4`, in a partition with `max_deleted_v = 2`. The sequence is
+`put(1 KB) → delete → put(5 KB)`. The lock row holds the 5 KB data and the operation list `[put, delete, put]`:
+
+| Step | Standalone operations | Apply with the last-write data |
+| --- | --- | --- |
+| `put` | `v = 5`, 1 KB | `v = 5`, 5 KB |
+| `delete` | `max_deleted_v = 5` | `max_deleted_v = 5` |
+| `put` | new row, `v = 6`, 5 KB | new row, `v = 6`, 5 KB |
+
+When the final state of an item is absent, apply uses its last-write data only for the writes before the last delete.
+When the sequence has no write, the item has no data, and apply makes no `upsertItem` call for it.
+
+The last write passed `#precheckWrite`, so the last-write data fits in `MAX_ITEM_BYTES`. Thus each write of apply
+passes the size guard of `upsertItem`.
+
+#### 4.2.5 The paths
+
+**The single-partition path.** `executeSingleShot` runs one `transactionSync`:
+
+1. Run evaluate.
+2. When one operation failed, throw a sentinel that carries the results. SQLite rolls back every write.
+3. In a repeated request, the temporary writes are the real writes of every operation, in `opIndex` order. The block
+   returns, and all writes commit.
+4. In a request with no repeated item, evaluate wrote nothing. Run apply with the request as the source, and return.
+
+**The prepare.** `prepareLocal` runs one or two `transactionSync` calls:
+
+1. **The evaluate block.** It runs evaluate. It copies every condition failure image and the last-write data into
+   JavaScript.
+2. When evaluate made a temporary write, the block throws a sentinel that carries the results and the last-write
+   data. SQLite rolls back every write of the block.
+3. When evaluate made no temporary write and every operation passed, the same block continues with the lock writes,
+   as now.
+4. **The lock block.** After a rollback, it runs only when every operation passed. It writes the `pending_tx_info`
+   row and one `pending_transactions` row for each item. It writes no lock row for an item that this transaction
+   already locks (section 4.2.12).
+
+The two blocks are safe for these reasons:
+
+- No `await` runs between them, and the Durable Object runs one JavaScript event at a time. No other request can read
+  `items` between the blocks.
+- The evaluate block commits nothing. When the object stops between the two blocks, no lock exists, and the
+  coordinator sends the prepare again.
+- The `dispatch` of the sharding runtime does not wrap a local handler in a `transactionSync`. The blocks are top-level
+  transactions, so they need no nested transaction.
+- `PartitionStore` keeps no in-memory state. Its fields are `#storage` and `#migrations`, and it does not use
+  `ctx.storage.kv`. Thus a rollback leaves no stale value in memory.
+
+A rollback must not change any in-memory state. This applies to each value that a block changes: the Bloom filter,
+the size estimates, the TTL timer, and every cache. Promotion candidates and job signals go to `call.signal(...)` only
+after the block committed.
+
+**The commit.** `commitLocal` runs one `transactionSync`, as now:
+
+1. Read the owned lock rows, and compare their keys with the request (section 4.2.7).
+2. Build one apply entry for each pair of the operation list of each owned row. The source of each entry is its lock
+   row.
+3. Run apply.
+4. Release the lock rows of the request keys.
+
+Apply and the release run in one `transactionSync`. Thus a commit applies all operations of the partition and
+releases its locks, or it changes nothing.
+
+#### 4.2.6 Item identity
+
+**The problem.** In the current code, each identity site uses `KeyCodec.pairKey`. It is a 128-bit value made of two
+xxhash64 values with a fixed public seed. It is a hash, so two different keys can have the same value. A caller can
+find two such sort keys with a birthday search of about 2^32 hashes.
+
+The current client rejects such a pair as a false `transact_duplicate_key`, so the pair never reaches a partition.
+Ordered mode skips that check. The coordinator and SQLite compare the key bytes, but the participant compares
+`pairKey`. The two sides then disagree about the number of items:
+
+- When evaluate groups by `pairKey`, two items become one sequence. One item gets no lock, but its operations report
+  `passed`. Commit writes only the other item, so the transaction is not atomic.
+- When evaluate groups by bytes, commit collapses the two keys into one entry. Then one of two failures occurs:
+  - The duplicate check throws on each try. The transaction stays in `COMMITTING` and keeps both locks.
+  - Commit writes the lock row of one item into the other item.
+
+**The rule.** Two keys are the same item only when the bytes of their hash keys and of their sort keys are equal. A
+hash value can select where to look for a key, but only a byte comparison decides that two keys are equal.
+
+**The primitive.** `KeyPairMap<V>` in `sharding/key-codec.ts` is a map from a `(hashKey, sortKey)` pair to a value:
+
+- Up to 8 entries, it keeps the entries in an array. It finds a key with a byte comparison of each entry.
+- Above 8 entries, it also keeps a `Map` from `keyPairHash(hashKey, sortKey)` to the entries with that hash. It finds
+  a key with one hash and a byte comparison of the entries in that bucket.
+- `keyPairHash` in `sharding/key-codec.ts` is `hash32(sortKey, hash32(hashKey, KEY_PAIR_SEED))`. `KEY_PAIR_SEED` is a
+  random 32-bit value. The module makes it one time, with `crypto.getRandomValues`, when the isolate loads it. The map
+  lives only in the memory of one call, so the seed does not have to be stable. A caller cannot know the seed, so a
+  caller cannot choose keys that go into one bucket.
+- The byte comparison checks the two lengths first. Then it compares the bytes from the last byte to the first. The
+  sort key goes first, because two keys of one transaction usually have the same hash key and differ in the sort key.
+- It allocates no string and no `BigInt` for a key.
+
+A map with a hash key only, such as the owner cache of `ownsByHashKey`, uses the same class with the empty sort key.
+
+**The sites.** Each of these uses `KeyPairMap`:
+
+- The duplicate check and the version-reference check of `validateTransactWriteOperations` (section 4.2.2).
+- The duplicate-key invariant of `prepareLocal`, until milestone 4 replaces it with the grouping of evaluate.
+- The grouping of evaluate (section 4.2.3, step 2).
+- `commitLocal`: the key set of the request, the map of owned lock rows, the duplicate-key check (section 4.2.7), and
+  the owner cache of `ownsByHashKey`.
+- `validateTransactGetItemKeys`, and the pairing of the two phases of a read transaction in `db.ts`. These sites are
+  safe now, because the client rejects a colliding pair. They change so that the codebase has one identity rule.
+
+After the change, `KeyCodec.pairKey` has no caller, and the change removes it. The coordinator needs no change. SQLite
+compares `BLOB` values by bytes, so `SELECT DISTINCT` in `loadItemKeys` and the primary keys of `tc_items` and
+`pending_transactions` already use the rule.
+
+**The measured cost.** A workerd test inside `@cloudflare/vitest-plugin` measured the work to find the distinct items
+of one request. Each value is the median of 7 batches of at least 200 ms. The 2 KiB keys are the worst case. A long
+shared prefix makes a comparison from the first byte slow. A long shared suffix makes a comparison from the last byte
+slow.
+
+| Option | 2 ops, 1 item | 10 ops, one hash key | 100 ops, one hash key | 100 ops, 100 hash keys | 100 ops, 2 KiB keys, shared prefix | 8 ops, 2 KiB keys, shared suffix | 100 ops, 2 KiB keys, shared suffix |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `pairKey` `Set` (current code, not exact) | 0.28 µs | 1.6 µs | 16 µs | 47 µs | 51 µs | 3.9 µs | 75 µs |
+| `pairKey` `Map` and a byte check | 0.35 µs | 1.9 µs | 19 µs | 80 µs | 58 µs | 4.2 µs | 110 µs |
+| Byte comparison of each pair | 0.03 µs | 0.16 µs | 18 µs | 49 µs | 19 µs | 55 µs | 10 ms |
+| Sort, then compare neighbors | 0.13 µs | 1.3 µs | 6.8 µs | 4.3 µs | 250 µs | 18 µs | 246 µs |
+| base64 text in a `Set` | 0.55 µs | 2.9 µs | 29 µs | 30 µs | 173 µs | 13 µs | 178 µs |
+| hex text in a `Set` | 0.33 µs | 1.7 µs | 17 µs | 15 µs | 590 µs | 44 µs | 568 µs |
+| `hash32` `Map` and a byte check | 0.24 µs | 1.2 µs | 12 µs | 12 µs | 69 µs | 5.2 µs | 68 µs |
+| **`KeyPairMap`** (array up to 8, then `hash32`) | **0.03 µs** | **1.3 µs** | **13 µs** | **13 µs** | **71 µs** | **57 µs** | **71 µs** |
+
+The results:
+
+- For a small request with short keys, `KeyPairMap` is the fastest option: 0.03 µs for 2 operations, against
+  0.28 µs for the current code. Above 8 entries, it costs the same as the `hash32` map.
+- Its worst case is about 71 µs, at 100 operations with 2 KiB keys. With the hash, the worst case grows with the bytes
+  of the keys, and not with the square of the number of operations. The byte comparison of each pair takes 10 ms in
+  its worst case, and the sort takes 250 µs.
+- The 71 µs bound needs keys that spread over the buckets. With a fixed public seed, a caller can make 100 keys with
+  one hash value. The map then costs the same as the byte comparison of each pair: 10 ms. The random seed of
+  `keyPairHash` prevents this.
+- The array part has its own worst case, 57 µs at 8 operations with 2 KiB keys. That is less than the worst case of
+  the hash part, so the limit of 8 does not raise the worst case of the map.
+- With short keys, it costs less than the `pairKey` `Set` of the current code. With 2 KiB keys, it costs up to 20 µs
+  more, because the exact answer needs a byte comparison.
+- `hash32` returns a number, so the map needs no `BigInt`. A 32-bit hash has more collisions than `pairKey`. A
+  collision costs one more byte comparison and does not change the answer. With 100 keys, a collision occurs in about
+  one request of a million.
+- Each value is small compared with one RPC of the transaction. The choice keeps the exact answer and a bounded worst
+  case at no cost in the usual path.
+
+#### 4.2.7 Lock row and commit
+
+The change edits the `pending_transactions` migration of `PartitionStore` in place and adds one column:
+
+```sql
+op_list               TEXT    NOT NULL,
+```
+
+`op_list` holds the operation list of the item as JSON: an array of `[opIndex, operation]` pairs in `opIndex` order,
+for example `[[0,"delete"],[1,"put"],[4,"update"]]`. A lock row of an item with one operation holds one pair. Each
+store method that reads `op_list` checks its form with `invariant()`: an array of pairs, each `opIndex` an integer,
+and each operation one of `put`, `update`, `delete`, or `check`.
+
+The other columns of a lock row:
+
+- **`operation`** — the last operation of the sequence that is not a `check`, or `check` when every operation is a
+  `check`. `readForTransactionLocal` reads it for `hasPendingWrite`, as now. Apply does not read it.
+- **`data`, `data_kind`, `ttl_epoch_utc_seconds`** — the last-write data of the item, or none when the sequence has no
+  write.
+
+The data of each lock row comes from one of these places:
+
+| Item | Where the lock row data comes from | Copied into JavaScript? |
+| --- | --- | --- |
+| One `put` | the request data, as now | no, it is already in memory |
+| One `update` | `INSERT … SELECT` on the committed row, inside SQLite, as now | no |
+| One `delete` or `check` | no data | no |
+| Repeated item with a write | the row after its last temporary write (section 4.2.3, step 4.8) | **yes** |
+| Repeated item with no write | no data | no |
+
+The temporary row exists only inside the evaluate block, and the lock block runs after the rollback. That is why a
+repeated item must copy its data.
+
+The read at step 4.8 is a new store method. It returns the stored bytes, the kind, and the TTL of the row.
+`getItemImage` is not correct for it, because it decodes JSONB to JSON text, and a JSONB to text to JSONB round trip is
+not size-stable. The comment of `insertPendingUpdateLock` gives the reason: the bytes that the checks measured must be
+the bytes that commit writes. `itemDataExpr` binds a JSONB `Uint8Array` verbatim, so `upsertItem` writes the stored
+bytes without a change.
+
+**The size of a lock row.** A lock row holds one copy of the data and the operation list:
+
+| Part | Largest size |
+| --- | --- |
+| `hk` and `sk` | 1024 B + 512 B (`MAX_HASH_KEY_BYTES`, `MAX_SORT_KEY_BYTES`) |
+| Last-write data | 400 KB (`MAX_ITEM_BYTES`) |
+| `op_list` | 100 pairs of about 15 B: about 1.5 KB |
+
+The largest row is about 403 KB. A lock row of the current code holds up to 400 KB, so the change adds only the
+operation list. The list holds no data, no condition, and no update plan.
+
+**Commit.** `commitLocal` keeps its rules for the key set, the copies, and the release of each key. It adds these
+rules:
+
+- It fails with an `invariant()` error when the request contains one key two times. The check, the key set of the
+  request, and the map of owned lock rows use `KeyPairMap` (section 4.2.6).
+  - The check is necessary because `commitLocal` compares the size of the request key set with the number of owned
+    lock rows. A duplicate key passes that comparison, and apply then applies the entries of one lock row two times.
+  - The check is an invariant because the coordinator sends unique keys (section 4.2.9). A duplicate key is thus a
+    defect in the code, not an input of a caller. The commit fails, and the coordinator stays non-terminal and
+    retries.
+- It applies the entries of all owned lock rows in one apply call, in `opIndex` order. The order of the keys in the
+  request does not matter.
+- It takes everything that it applies from the lock rows. The commit request carries keys only, as now, and
+  `stripPayload` can remove the payload of the coordinator in `COMMITTING`.
+
+A cancel with a duplicate key releases the same lock two times, which changes nothing. Thus cancel keeps its current
+behavior.
+
+The migration stream must carry the new column. `pendingTxPageStatement` selects it, and `insertPendingLock` writes it
+on the target.
+
+#### 4.2.8 Versions at prepare and at commit
+
+The single-partition path evaluates and applies in one block, so the temporary state and the committed state are the
+same.
+
+On the two-phase path, other requests run between prepare and commit. The locks keep each locked row unchanged:
+
+- A non-transactional write to a locked item fails.
+- Another transaction gets `pending_conflict`.
+- The TTL sweep skips a locked item.
+
+The partition-wide `deletion_metadata` row has no lock. A delete of another item can raise `max_deleted_v` between
+prepare and commit. A row that the transaction creates then gets a higher `v` at commit than in the temporary state.
+An example on an absent item X with `put → update → check`, in a partition with `max_deleted_v = 10`:
+
+1. Evaluate creates the temporary row with `v = 11`. The `check` sees `v = 12`.
+2. Before the commit, a delete of another item with `v = 50` raises `max_deleted_v` to 50.
+3. Apply creates X with `v = 51`, then updates it to `v = 52`.
+
+Commit must not write the `v` of the temporary state. A new row must start above the `max_deleted_v` of the moment
+it is written. A read transaction depends on that rule to find an item that is created and deleted between its two
+phases. A standard `put` of an absent item has the same behavior now: its `v` comes from the `max_deleted_v` of the
+commit.
+
+When the row of the item exists before the transaction and the sequence has no `delete`, the committed `v` is the
+temporary `v`, because apply adds 1 for each write.
+
+**The difference must not reach a decision or the data.** In the example, a condition of the `check` on `v` passes on
+`v = 12` at prepare, and that row never exists. An update value that reads `v` stores a `v` in the data that the
+committed row does not have. For example, `put X → update X SET $.prevVersion = v` stores `11`, and X commits with
+`v = 52`. The version-reference check refuses both requests: the client check of section 4.2.2, and the partition
+check of section 4.2.3, step 2. Thus the higher `v` at commit is visible only as the `v` of the row.
+
+#### 4.2.9 Coordinator
+
+**Schema.** The change edits the `tc_items` migration in place. The primary key becomes:
+
+```sql
+PRIMARY KEY (transaction_id, op_index)
+```
+
+The other columns do not change. `db.ts` gives each operation of a transaction a different `op_index`, so the new key
+holds every operation.
+
+**Keys and payload.**
+
+- `initiateWrite` writes one `tc_items` row for each operation, as now.
+- `loadItems` reads the rows `ORDER BY op_index`, as now. Thus a prepare and a prepare from recovery send the
+  operations in request order. The participant sorts them again (section 4.2.3).
+- `loadItemKeys` must return each `(hk, sk, partition_do_name)` one time, for example with `SELECT DISTINCT`.
+  `runCommit` and `runCancel` use it, so commit and cancel send each key one time. All operations of an item have the
+  same `partition_do_name`, because the root partition depends on the hash key only. The order of the keys does not
+  matter, because apply sorts by `opIndex`.
+- `cancelTransactionInStore` builds the positional results from `loadItems`, as now.
+- `applyMigrationPage` uses `INSERT OR REPLACE INTO tc_items`. The new primary key keeps the insert idempotent.
+
+**Fingerprint.** `hashTransactionOperations` gets the execution mode. In standard mode, the hash must stay the same as
+now. In ordered mode, the function chains the mode into the hash. `db.ts` sends `"standard"` when the caller gives no
+mode, so a missing mode and `"standard"` give the same hash. `tc_state` gets no column for the mode, because the
+fingerprint is the only use of the mode, and `operations_hash` holds it.
+
+#### 4.2.10 Result rules
+
+Every operation gets one result, at the position of its `opIndex`:
 
 - **Every operation of the item passed.** Each operation gets `passed`.
 - **Operation *k* failed a check of its own.** The operations before *k* get `passed`. Operation *k* gets `rejected`
@@ -243,803 +737,505 @@ Every operation gets one result, at the position of its `opIndex`.
   `error_id`, as now.
 - **This transaction already holds the lock of the item** (a repeated prepare). Each operation gets `passed`.
 
-The checks of one operation run in the current order: the lock, the condition, `#precheckWrite`, then the timestamp.
-The first check that fails gives the reason.
-
-`applyImageCap` already sorts by `opIndex` before it caps the image bytes. The grouping by item does not change which
-images it drops.
-
-#### 4.2.4 The sequence engine
-
-One function in `TransactionParticipant` serves `prepareLocal` and `executeSingleShot`. The function does these steps:
-
-1. Group the operations by item with `KeyPairMap` (section 4.2.4.2). Sort each group by `opIndex`. The order of the
-   request array does not matter.
-2. Read the committed `deletion_metadata` row one time, before the first private write. The two-phase path uses
-   `max_delete_tx_order_ts` for the timestamp check (section 4.2.4.1). The single-partition path reads the row only
-   when the request has a multi-op key, and uses both values for its last write (section 4.2.5).
-3. For each item, check the lock one time, against the committed state.
-4. For each operation of the item, in order:
-   1. Evaluate the condition against `items`. On a failure, read the image with `#imageForFailedCondition`.
-   2. Run `#precheckWrite` against `items`.
-   3. On the two-phase path, check the timestamp against the committed stamps (section 4.2.4.1).
-   4. When a check fails, record the failure, mark the later operations of the item `not_evaluated`, and continue
-      with the next item.
-   5. When the operation passed and another operation of the same item follows, apply the operation to `items` as a
-      private write.
-5. Return one result for each operation. When every operation passed, also return the lock operation of each item
-   (section 4.2.6). On the two-phase path, then also build the final image of each multi-op key. The private rows are
-   still in `items` at this point, because the block has not rolled back yet.
-
-Step 4.5 uses the current store writes: `upsertItem`, `updateItemSingleShot`, `deleteItem` with
-`bumpTxOrderTsAlways`, and `bumpItemReadTs`. Each write uses the transaction timestamp. Both callers make the same
-private writes. The last operation of an item makes no private write, and so the only operation of a single-op key
-makes none. A transaction with no repeated item therefore makes no private write, and a rejected one pays only the
-reads of its checks, as now.
-
-At step 4.1 and step 4.2 of operation *k*, `items` holds the state that operations 1 to *k − 1* left. For a single-op
-key, that is the committed state, so the result is the same as now.
-
-Every switch over an operation type is exhaustive. The engine, the final image, and the commit apply each handle every
-member of the type, and the compiler rejects a missing member. A value that the code reads from storage is not typed
-by the compiler, so the code checks it with `invariant()` before it uses it.
-
-The store writes collect promotion candidates. The engine discards the candidates of a write that rolls back.
-
-##### 4.2.4.1 The timestamp rule
-
-The timestamp check uses only the committed state from before the transaction. Conditions, update checks, and size
-checks use the private state.
-
-The reason: all operations of a transaction use one timestamp `T`. A check against the private state rejects valid
-sequences:
-
-- `put → check`: the put sets `last_read_ts = last_write_ts = T`. The check then finds `T <= T`.
-- `delete → put`: the delete sets `max_delete_tx_order_ts = T`. The put of the absent item then finds `T <= T`.
-
-The committed values come from two places, and the engine reads each of them before a private write can change it:
-
-- **`max_delete_tx_order_ts`** — `deletion_metadata` holds one value for the whole partition (`id = 1`). A private
-  delete of any item changes it. The engine therefore reads it one time, at the start of the evaluation block and
-  before it processes the first item, and uses that value for every item.
-- **The stamps of an item** — `last_read_ts` and `last_write_ts` belong to the row of the item. Only the operations of
-  that item write the row. The first operation of the item reads them, as now, and the engine keeps them for the later
-  operations of the item.
-
-Without the first rule, a private delete of one item makes a later absent item fail. An example: item A, which exists,
-has `delete → put`, and item B, which is absent, has `put`. The private delete of A sets the watermark to `T`, and the
-put of B then finds `T <= T`.
-
-Each operation applies its own watermark rule, as now: a `check` uses `last_write_ts`, and a mutation uses
-`last_read_ts`. The failure goes to the first operation that does not pass.
-
-This changes one detail of `prepareLocal`. Now it takes the stamps from the condition read or the update probe
-(`conditionResult ?? probe`). For operation 2 and later, that read sees the private row. The engine must use the kept
-stamps for those operations.
-
-`clock_skew` and `pending_conflict` also use the committed state. The single-partition path has no timestamp check,
-as now.
-
-##### 4.2.4.2 Item identity
-
-**The problem.** Now each identity site in the code uses `KeyCodec.pairKey`. It is a 128-bit value made of two xxhash64
-values with a fixed public seed. It is a hash, so two different keys can have the same value. A caller can find two
-such sort keys with a birthday search of about 2^32 hashes.
-
-Now the client rejects such a pair as a false `transact_duplicate_key`, so the pair never reaches a partition. Ordered
-mode skips that check. The coordinator and SQLite compare the key bytes, but the participant compares `pairKey`. The
-two sides then disagree about the number of items, with these results:
-
-- If the engine groups by `pairKey`, two items become one sequence. One item gets no lock, but its operations report
-  `passed`. Commit writes only the other item, so the transaction is not atomic.
-- If the engine groups by bytes, commit collapses the two keys into one entry. Then one of two failures occurs:
-  - The duplicate check throws on each attempt, and a `PREPARED` transaction stays in `COMMITTING` and keeps both
-    locks.
-  - Commit writes the lock row of one item into the other item.
-
-**The rule.** Two keys are the same item only when the bytes of their hash keys and of their sort keys are equal. A
-hash value can select where to look for a key, but only a byte comparison decides that two keys are equal.
-
-**The primitive.** `KeyPairMap<V>` in `sharding/key-codec.ts` is a map from a `(hashKey, sortKey)` pair to a value:
-
-- Up to 8 entries, it keeps the entries in an array and finds a key with a byte comparison of each entry.
-- Above 8 entries, it also keeps a `Map` from `hash32(sortKey, hash32(hashKey))` to the entries with that hash. It
-  finds a key with one hash and a byte comparison of the entries in that bucket.
-- The byte comparison checks the two lengths first, then compares the bytes from the last byte to the first. The
-  sort key goes first, because two keys of one transaction usually have the same hash key and differ in the sort key.
-- It allocates no string and no `BigInt` for a key.
-
-A map with a hash key only, such as the owner cache of `ownsByHashKey`, uses the same class with the empty sort key.
-
-**The sites.** Each of these uses `KeyPairMap`:
-
-- The duplicate check of `validateTransactWriteOperations` (section 4.2.2).
-- The grouping of the sequence engine (section 4.2.4, step 1).
-- `commitLocal`: the key set of the request, the map of owned lock rows, the duplicate-key check (section 4.2.8), and
-  the owner cache of `ownsByHashKey`.
-- `validateTransactGetItemKeys`, and the pairing of the two phases of a read transaction in `db.ts`. These sites are
-  safe now, because the client rejects a colliding pair. They change so that the codebase has one identity rule.
-
-After the change, `KeyCodec.pairKey` has no caller, and the change removes it. The coordinator needs no change: SQLite
-compares `BLOB` values by bytes, so `SELECT DISTINCT` in `loadItemKeys` and the primary keys of `tc_items` and
-`pending_transactions` already use the rule.
-
-**The measured cost.** A workerd test inside `@cloudflare/vitest-plugin` measured the work to find the distinct items
-of one request. Each value is the median of 7 batches of at least 200 ms. The 2 KiB keys are the worst case: a long
-shared prefix makes a comparison from the first byte slow, and a long shared suffix makes a comparison from the last
-byte slow.
-
-| Option | 2 ops, 1 item | 10 ops, one hash key | 100 ops, one hash key | 100 ops, 100 hash keys | 100 ops, 2 KiB keys, shared prefix | 8 ops, 2 KiB keys, shared suffix | 100 ops, 2 KiB keys, shared suffix |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `pairKey` `Set` (now, not exact) | 0.28 µs | 1.6 µs | 16 µs | 47 µs | 51 µs | 3.9 µs | 75 µs |
-| `pairKey` `Map` and a byte check | 0.35 µs | 1.9 µs | 19 µs | 80 µs | 58 µs | 4.2 µs | 110 µs |
-| Byte comparison of each pair | 0.03 µs | 0.16 µs | 18 µs | 49 µs | 19 µs | 55 µs | 10 ms |
-| Sort, then compare neighbors | 0.13 µs | 1.3 µs | 6.8 µs | 4.3 µs | 250 µs | 18 µs | 246 µs |
-| base64 text in a `Set` | 0.55 µs | 2.9 µs | 29 µs | 30 µs | 173 µs | 13 µs | 178 µs |
-| hex text in a `Set` | 0.33 µs | 1.7 µs | 17 µs | 15 µs | 590 µs | 44 µs | 568 µs |
-| `hash32` `Map` and a byte check | 0.24 µs | 1.2 µs | 12 µs | 12 µs | 69 µs | 5.2 µs | 68 µs |
-| **`KeyPairMap`** (array up to 8, then `hash32`) | **0.03 µs** | **1.3 µs** | **13 µs** | **13 µs** | **71 µs** | **57 µs** | **71 µs** |
-
-The results:
-
-- For a small request with short keys, `KeyPairMap` is the fastest option: 0.03 µs for 2 operations, against
-  0.28 µs now. Above 8 entries, it costs the same as the `hash32` map.
-- Its worst case is about 71 µs, at 100 operations with 2 KiB keys. The hash makes the worst case grow with the
-  bytes of the keys, and not with the square of the number of operations. The byte comparison of each pair takes
-  10 ms in its worst case, and the sort takes 250 µs.
-- The array part has its own worst case, 57 µs at 8 operations with 2 KiB keys. That is less than the worst case of
-  the hash part, so the limit of 8 does not raise the worst case of the map.
-- With short keys, it costs less than the `pairKey` `Set` that the code uses now. With 2 KiB keys, it costs up to
-  20 µs more, because the exact answer needs a byte comparison.
-- `hash32` returns a number, so the map needs no `BigInt`. A 32-bit hash has more collisions than `pairKey`. A
-  collision costs one more byte comparison and does not change the answer. With 100 keys, a collision occurs in
-  about one request of a million.
-- Each value is small compared with one RPC of the transaction. The choice keeps the exact answer and a bounded worst
-  case at no cost in the usual path.
-
-#### 4.2.5 Private state: the two blocks of a prepare
-
-`prepareLocal` runs two `transactionSync` calls:
-
-1. **The evaluation block.** It runs the sequence engine. It copies every condition failure image into JavaScript.
-   When every operation passed, it builds the final image of each multi-op key after the loop. Then it always throws a
-   sentinel that carries the results. SQLite rolls back every write of the block.
-2. **The lock block.** It runs only when every operation passed. It writes the `pending_tx_info` row and one
-   `pending_transactions` row for each item. It writes no lock row for an item that this transaction already locks.
-   The engine did not evaluate such an item (section 4.2.10), so the item has no final image, and its lock row
-   already holds the final image of the first prepare.
-
-The two blocks are safe for these reasons:
-
-- No `await` runs between them, and the Durable Object runs one JavaScript event at a time. No other request can read
-  `items` between the blocks.
-- The evaluation block commits nothing. When the object stops between the two blocks, no lock exists, and the
-  coordinator sends the prepare again.
-- The `dispatch` of the sharding runtime does not wrap a local handler in a `transactionSync`. The blocks are top-level
-  transactions, and nested transactions are not necessary.
-- `PartitionStore` keeps no in-memory state. Its fields are `#storage` and `#migrations`, and it does not use
-  `ctx.storage.kv`. A rollback therefore leaves no stale value in memory.
-
-`executeSingleShot` runs the sequence engine in one `transactionSync`:
-
-1. When the request has a multi-op key, the engine reads the committed `deletion_metadata` row before the loop
-   (section 4.2.4, step 2).
-2. The engine runs every sequence. Its private deletes change `deletion_metadata`, as the store writes do now.
-3. When one operation failed, the block throws a sentinel that carries the results. SQLite rolls back every write.
-4. When every operation passed, the block applies the last operation of each item, as its apply loop does now. For a
-   single-op key, the last operation is its only operation. For a multi-op key, the last operation applies on top of
-   the private writes of the earlier operations.
-5. When the request has a multi-op key, the block writes `deletion_metadata` one time: the value from step 1 plus the
-   delete effect of each item (section 4.2.6.1). This write replaces the changes of the private deletes. Then the
-   block returns, and all writes commit.
-
-Without a multi-op key, the block skips steps 1 and 5. Each item then has one operation, so the replay already gives
-the delete effect of each item, and standard mode costs the same as now.
-
-This path builds no final image. Step 5 gives the single-partition path the same end state as the two-phase path. The
-item rows, `key_size_estimates`, and `item_id` already agree without it:
-
-- Each write of the replay keeps `key_size_estimates` equal to the size of the current row, so after the sequence it
-  holds the size of the final row.
-- A delete followed by an insert gives a new `item_id` on both paths. A `replace` row also deletes and inserts.
-- The final row has the same data, `v`, TTL, and timestamps on both paths (section 4.2.6).
-
-Only `deletion_metadata` differs, because the replay changes it for each delete and the lock row changes it at most one
-time for each item. Section 4.2.6.1 gives an example and its effect on other transactions.
-
-A rollback must not change any in-memory state. This applies to each value that a block changes: the Bloom filter,
-the size estimates, the TTL timer, and every cache. Promotion candidates and job signals go to `call.signal(...)` only
-after the block committed.
-
-#### 4.2.6 The final image of an item
-
-The lock row of an item holds its final image. Commit applies that image to the committed row and evaluates nothing.
-
-Now a lock row holds one operation, and commit takes the rest from the committed row: `upsertItem` sets `v = v + 1`,
-and `deleteItem` increments `delete_revision` when a row exists. A sequence collapses into one lock row, so commit
-needs two more facts:
-
-1. **The number of writes.** `put → update` must give `v + 2`.
-2. **Whether the sequence deleted the committed row and wrote it again.** `delete → put` must increment
-   `delete_revision` and start `v` again at 1. A read transaction compares `version` and `deleteRevision`. Without the
-   increment, it can miss the delete, because `v` can return to its old value.
-
-The lock row stores both facts as relative values. Commit applies them to the committed row at commit time, as it
-applies `v + 1` now.
-
-| Sequence | Lock `operation` | Data | `version_delta` |
-| --- | --- | --- | --- |
-| Every operation is a `check` | `check` | none | not used |
-| The final state is absent | `delete` | none | not used |
-| The final state is present, and the rule for `replace` is false | `put` or `update` | the final data | see below |
-| The final state is present, and the rule for `replace` is true | `replace` | the final data | see below |
-
-The rule for `replace` is true when the committed row exists and the sequence contains a `delete`. A write before the
-delete does not change the rule. The delete removes the row of the item, also when an earlier write of the sequence
-changed that row.
-
-`version_delta` is the number of writes after the last delete of the sequence. When the sequence has no delete, it is
-the number of writes. A write is a `put` or an `update`.
-
-The lock block writes the row of a single-op key as now. Its `version_delta` is 1, which is the default value.
-
-For a multi-op key, the engine computes the `operation` and `version_delta` from the whole sequence. The final data,
-kind, and TTL come from the last write of the sequence: the last `put` or `update` after the last `delete`. A `check`
-adds nothing to the final state, and the last operation makes no private write.
-
-| Last write of the sequence | Final data, kind, and TTL | Read? |
-| --- | --- | --- |
-| `put`, as the last operation or with only `check`s after it | the data, kind, and `ttlAt` of that `put` | no |
-| `update`, as the last operation | a document `SELECT` of the update on the private row | yes |
-| `update`, with only `check`s after it | the private row as the update left it | yes |
-| no write after the last `delete` | absent | no |
-| no write and no `delete` (only `check`s) | none: a `check` row | no |
-
-The details of the two reads:
-
-- **The document `SELECT`.** It runs `plan.documentSql` on the private row, with the `LEFT JOIN` that
-  `insertPendingUpdateLock` uses. The kind is `json`. The TTL is the `ttlAt` of the update, else the TTL of the private
-  row. This is a new store method: the `SELECT` part of `insertPendingUpdateLock`, which returns the document and does
-  not insert it.
-- **The private row read.** It returns the stored bytes, the kind, and the TTL of the row that the update wrote.
-
-Both reads must return the stored bytes. `getItemImage` is not correct for them, because it decodes JSONB to JSON
-text, and a JSONB to text to JSONB round trip is not size-stable. Section 4.2.7 gives the reason in detail.
-
-The last write passed `#precheckWrite`, so the final data fits in `MAX_ITEM_BYTES`.
-
-The data of each lock row comes from one of these places. Only the marked case copies data out of SQLite into
-JavaScript:
-
-| Case | Where the lock row data comes from | Copied into JavaScript? |
-| --- | --- | --- |
-| Single-op `put` | the request data | no, it is already in memory |
-| Single-op `update` | `INSERT … SELECT` on the committed row, inside SQLite, as now | no |
-| `delete`, or `check` with no write | no data | no |
-| Multi-op key whose last write is a `put` | the request data of that `put` | no |
-| Multi-op key whose last write is an `update` | the private row, through one of the two reads above | **yes** |
-| Single-partition path, any key | no lock row: the writes commit directly | no |
-
-The private row exists only inside the evaluation block, and the lock block runs after the rollback. That is why the
-marked case must copy the data. A single-op `update` reads the committed row, which still exists in the lock block, so
-its `INSERT … SELECT` stays in SQLite.
-
-These two kinds of image are different, and they have opposite reasons:
-
-- **A condition failure image** (`all_old`) exists only for an operation whose condition failed, that asked for
-  `all_old`, and whose item exists (section 4.2.11).
-- **A final image** exists only when every operation passed, because it is the data that commit writes.
-
-A `check` after a write does not change the lock row. The write already moves `last_read_ts` to `T`.
-
-Examples:
-
-| Sequence on an item with `v = 4` | Lock row | Result at commit |
-| --- | --- | --- |
-| `put → update` | `update`, `version_delta = 2` | `v = 6` |
-| `check → put` | `put`, `version_delta = 1` | `v = 5` |
-| `delete → put` | `replace`, `version_delta = 1` | `v = 1`, `delete_revision + 1` |
-| `put → delete → put` | `replace`, `version_delta = 1` | `v = 1`, `delete_revision + 1` |
-| `update → delete → put → update` | `replace`, `version_delta = 2` | `v = 2`, `delete_revision + 1` |
-| `put → delete → put → delete` | `delete` | the row is deleted, `delete_revision + 1` |
-| `check → check` | `check` | `last_read_ts` moves to `T` |
-
-| Sequence on an absent item | Lock row | Result at commit |
-| --- | --- | --- |
-| `put → update` | `update`, `version_delta = 2` | `v = 2` |
-| `put → delete → put` | `put`, `version_delta = 1` | `v = 1` |
-| `put → delete` | `delete` | `max_delete_tx_order_ts` moves to `T`, as now |
-
-##### 4.2.6.1 The delete effect of an item
-
-`deletion_metadata` holds one `delete_revision` and one `max_delete_tx_order_ts` for the whole partition. Both paths
-change it with the delete effect of each item, which depends only on the lock operation of the item and on the
-committed row:
-
-| Lock operation | Committed row | `delete_revision` | `max_delete_tx_order_ts` |
-| --- | --- | --- | --- |
-| `replace` | exists | + 1 | no change |
-| `delete` | exists | + 1 | `MAX(current, T)` |
-| `delete` | absent | no change | `MAX(current, T)` |
-| `put`, `update`, `check` | either | no change | no change |
-
-`replace` does not change `max_delete_tx_order_ts`, for these reasons:
-
-- The watermark orders a transaction on an absent item. An absent item has no row, so no row holds its stamps.
-- After a `replace`, the item is present. Its new row holds `last_read_ts = last_write_ts = T`.
-- On the two-phase path, prepare accepted `T` only above the `last_read_ts` of the committed row. The new stamps are
-  therefore not lower than the old stamps, and a later transaction on the item orders against `T` through the row,
-  as after a `put`.
-- On the single-partition path, `T` is the clock of the partition, as now. The watermark takes `MAX(current, T)` and
-  not the old stamps of the row, so a change of the watermark gives no ordering that the row does not give.
-- `replace` leaves no item absent, so the watermark has nothing to order.
-
-`replace` still increments `delete_revision`, because `v` starts again at 1 and a read transaction must see the
-change (section 4.2.6). This is the one delete that removes a row and changes only `delete_revision`. `deleteItem`
-cannot apply this effect, because it changes both values in one statement when it deletes a row.
-
-On the two-phase path, commit applies the effect through the store writes of section 4.2.8. On the single-partition
-path, step 5 of `executeSingleShot` applies it (section 4.2.5). One function maps a lock operation and the existence
-of the committed row to the delete effect, and the single-partition path uses only that function. A test runs every
-sequence on both paths and compares `deletion_metadata`, so the function and the store writes of commit cannot drift
-apart.
-
-The effect is not a replay of each delete. It is the effect of the net operation of the item, which is the operation
-that a standard transaction sends for the same end state:
-
-- `put → delete → put` on an absent item leaves the same state as a standard `put`.
-- `put → delete → put → delete` on an existing item leaves the same state as a standard `delete`.
-
-A replay of each delete changes `deletion_metadata` for deletes that have no net effect. Because the values are shared
-by the whole partition, that makes other transactions abort with no benefit. An example with
-`put → delete → put` on an absent item B, at timestamp `T`, in a partition with `delete_revision = 10` and
-`max_delete_tx_order_ts = W`, where `W < T`:
-
-| | Replay of each delete | Delete effect of the item |
-| --- | --- | --- |
-| Item B | present, `v = 1` | present, `v = 1` |
-| `delete_revision` | 11 | 10 |
-| `max_delete_tx_order_ts` | `T` | `W` |
-
-With the replay, these two failures can occur on other items of the partition:
-
-1. A multi-partition `transactGetItems` reads item C, which did not change, before and after the commit. Its two reads
-   of `deleteRevision` differ, and it aborts with `read_conflict`.
-2. A later two-phase prepare on an absent item D has a coordinator timestamp `T' <= T`. This happens when the clock of
-   the coordinator is behind the clock of the partition, within `maxClockSkewMs`. The prepare fails with
-   `timestamp_conflict`.
-
-Both aborts are safe, because the caller retries. With the delete effect, neither abort occurs. An ordered
-transaction makes other transactions abort no more often than the standard transaction with the same net effect. A
-`replace` has no standard equivalent. Its only effect on other transactions is the `delete_revision` increment, which
-can abort a read transaction as in failure 1.
-
-In standard mode each item has one operation, so its delete effect is the effect of that operation on both paths, as
-now.
-
-#### 4.2.7 Lock row schema and its migration
-
-A new partition schema migration adds one column to `pending_transactions`:
-
-```sql
-ALTER TABLE pending_transactions ADD COLUMN version_delta INTEGER NOT NULL DEFAULT 1;
-```
-
-`operation` also gets the value `replace`. The column is `TEXT` with no constraint, so the value needs no schema change.
-
-The lock row gets its own operation type, `PendingLockOperation = "put" | "update" | "replace" | "delete" | "check"`.
-It is separate from `TransactionOperationType`, so that a wire request cannot carry `replace`. `PendingTxItem.operation`
-and the result of `pendingLockFor` use the new type in place of `string`. Each store method that reads
-`pending_transactions.operation` checks the value with `invariant()` and returns the typed value.
-
-The lock rows that exist need no data change. Each of them holds one operation, and `DEFAULT 1` gives the current
-result at commit.
-
-The data of a `put`, `update`, or `replace` row has the form that `upsertItem` binds verbatim. When the last write of
-the item is a `put`, it is the request data, as now. When the last write is an `update`, the row holds the stored
-bytes, which are JSONB for kind `json`. `itemDataExpr` binds a JSONB `Uint8Array` verbatim. The comment of
-`insertPendingUpdateLock` gives the reason for the stored bytes: a JSONB to text to JSONB round trip changes the size,
-so the bytes that the checks measured must be the bytes that commit writes.
-
-The migration stream must carry the new column. `pendingTxPageStatement` selects it, and `insertPendingLock` writes it
-on the target.
-
-#### 4.2.8 Commit and the single-partition path
-
-`commitLocal` raises a `FokosInternalError` when the request contains one key two times. The proposed code is
-`commit_duplicate_key` in `INTERNAL_CODES`, next to `commit_keyset_mismatch`. The check, the key set of the request,
-and the map of owned lock rows use `KeyPairMap`, so two keys are one key only when their bytes are equal (section
-4.2.4.2).
-
-- **Why the check is necessary.** Now `commitLocal` compares the size of the request key set with the number of owned
-  lock rows. A duplicate key passes that comparison, and `#applyCommitItems` then applies the same lock row two times:
-  a `put` row with `version_delta = 2` gives `v + 4`.
-- **Why it is an internal error.** The coordinator sends unique keys (section 4.2.9), so a duplicate key is a defect in
-  the code, not an input of a caller. The commit fails, and the coordinator stays non-terminal and retries, as for
-  `commit_keyset_mismatch`.
-- **Cancel.** A cancel with a duplicate key releases the same lock two times, which changes nothing, so cancel keeps
-  its current behavior.
-
-`#applyCommitItems` applies each lock row with the transaction timestamp `T`. It is an exhaustive `switch` over
-`PendingLockOperation`:
-
-- **`put` and `update`** — upsert the row with the stored data, kind, and TTL. On an existing row, set
-  `v = v + version_delta`. On a new row, set `v = version_delta`. Move `last_read_ts` and `last_write_ts` to
-  `MAX(current, T)`, as `upsertItem` does now.
-- **`replace`** — delete the committed row and subtract its size from `key_size_estimates`, as `deleteItem` does.
-  When the statement deleted a row, increment `delete_revision`. Do not change `max_delete_tx_order_ts` (section
-  4.2.6.1). This is a new store method, because `deleteItem` changes both values. Then insert the row with the
-  stored data, kind, and TTL, and `v = version_delta`.
-- **`delete`** — call `deleteItem` with `bumpTxOrderTsAlways`, as now.
-- **`check`** — call `bumpItemReadTs`, as now.
-
-`upsertItem` gets `version_delta` as an input. The current callers pass 1.
-
-The store updates `key_size_estimates` from the final row, as it does now. Commit reports promotion candidates for
-`put`, `update`, and `replace` rows. The rules of `commitLocal` for the key set, the copies, and the release of each key
-stay the same.
-
-Commit applies relative values, so it gives the correct result on the committed row that it finds. It does not depend
-on an unchanged committed row between prepare and commit.
-
-`executeSingleShot` does not write lock rows. It applies each operation directly (section 4.2.5).
-
-#### 4.2.9 Coordinator
-
-**Schema migration.** A new coordinator migration rebuilds `tc_items` with the new primary key:
-
-```sql
-CREATE TABLE tc_items_new (
-    transaction_id      TEXT    NOT NULL,
-    hk                  BLOB    NOT NULL,
-    sk                  BLOB    NOT NULL DEFAULT x'',
-    op_index            INTEGER NOT NULL,
-    operation           TEXT    NOT NULL,
-    data                ANY,
-    data_kind           INTEGER,
-    ttl_epoch_utc_seconds INTEGER,
-    conditions_json     TEXT,
-    update_json         TEXT,
-    partition_do_name   TEXT    NOT NULL,
-    return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (transaction_id, op_index)
-) WITHOUT ROWID, STRICT;
-INSERT INTO tc_items_new SELECT transaction_id, hk, sk, op_index, operation, data, data_kind, ttl_epoch_utc_seconds,
-    conditions_json, update_json, partition_do_name, return_values_on_condition_check_failure FROM tc_items;
-DROP TABLE tc_items;
-ALTER TABLE tc_items_new RENAME TO tc_items;
-```
-
-The migration copies `op_index` unchanged. It cannot fail on the new key, because `db.ts` gives each operation of a
-transaction a different `op_index`. `runAllSync` runs it in one `transactionSync`, so an active transaction keeps all
-of its rows or the migration does not apply.
-
-**Keys and payload.**
-
-- `initiateWrite` writes one `tc_items` row for each operation, as now.
-- `loadItems` reads the rows `ORDER BY op_index`, as now. A prepare and a prepare from recovery therefore send the
-  operations of an item in request order. The participant sorts them again (section 4.2.4).
-- `loadItemKeys` must return each `(hk, sk, partition_do_name)` one time, for example with `SELECT DISTINCT`.
-  `runCommit` and `runCancel` use it, so commit and cancel send each key one time. All operations of an item have the
-  same `partition_do_name`, because the root partition depends on the hash key only.
-- `cancelTransactionInStore` builds the positional results from `loadItems`, as now.
-- `applyMigrationPage` uses `INSERT OR REPLACE INTO tc_items`. The new primary key keeps the insert idempotent.
-
-**Fingerprint.** `hashTransactionOperations` gets the execution mode. In standard mode, the hash must stay the same as
-now, so that a stored `operations_hash` keeps its meaning. In ordered mode, the function chains the mode into the hash.
-`db.ts` sends `"standard"` when the caller gives no mode, so a missing mode and `"standard"` give the same hash.
-`tc_state` gets no column for the mode.
-
-#### 4.2.10 Routing, retries, recovery, and migration
-
-- **Routing.** `txPrepare` is a `group` operation. All operations of an item must go to the same owner in one
-  sub-request. The runtime must resolve equal keys of one dispatch to the same owner, also when the Bloom filter
-  takes part. A test must prove this rule.
-- **Order.** The participant sorts each item by `opIndex`. A change of the array order by routing, forwarding, or
-  migration has no effect.
-- **Repeated prepare.** When this transaction already holds the lock of an item, every operation of the item gets
-  `passed`, and the engine does not evaluate the item again. The lock block writes no lock row for that item (section
-  4.2.5). Its lock row and the `pending_tx_info` row of the transaction already exist and do not change. When every
-  item of the request is locked by this transaction, the lock block writes nothing, and the prepare answers
-  `accepted`. `insertPendingLock` keeps `INSERT OR IGNORE`, because the migration stream can send one lock row two
-  times.
-- **Commit and cancel.** The coordinator sends unique keys (section 4.2.9). The lock row has one row for each key, so
-  `commitLocal` compares the same key sets as now.
-- **Recovery.** The stale-transaction job and `debugForceResolveTransaction` read the keys from the lock rows. These
-  keys are unique.
-- **Partition migration.** A lock row moves with its final image (section 4.2.7).
-- **Coordinator migration.** A migration page carries the `tc_items` rows with their `op_index`.
+The checks of one operation run in the order of section 4.2.3, step 4: the lock, the condition, `#precheckWrite`, and
+then the timestamp. The first check that fails gives the reason.
+
+`applyImageCap` already sorts by `opIndex` before it caps the image bytes. Thus the grouping by item does not change
+which images it drops.
 
 #### 4.2.11 Condition failure images
 
 `#imageForFailedCondition` reads the row from `items` in the same block as the condition. For operation *k*, `items`
-holds the private state that operations 1 to *k − 1* left. The image therefore shows the state immediately before
-operation *k*, with its private data, `v`, and TTL.
+holds the temporary state that the earlier operations left. Thus the image shows the state immediately before
+operation *k*, with its temporary data, `v`, and TTL.
 
 - When an earlier operation deleted the item, the condition sees no item, and the result has no image.
 - When the first operation of an item fails, the image shows the committed state, as now.
-- The evaluation block copies the image into JavaScript before it rolls back.
+- The evaluate block copies the image into JavaScript before it rolls back.
 - `MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX` (10 MiB) and `applyImageCap` apply as now.
 
-#### 4.2.12 Invariants
+#### 4.2.12 Routing, retries, recovery, and migration
 
-- **No request sees a private state.** The evaluation block always rolls back. No `await` runs between the two
-  blocks.
+- **Routing.** `txPrepare` is a `group` operation. All operations of an item must go to the same owner in one
+  sub-request. The runtime must resolve equal keys of one dispatch to the same owner, also when the Bloom filter
+  takes part. A test must prove this rule.
+- **Order.** The participant sorts by `opIndex` in evaluate and in apply. Thus a change of the array order by routing,
+  forwarding, or migration has no effect.
+- **Repeated prepare.** When this transaction already holds the lock of an item, every operation of the item gets
+  `passed`. Evaluate does not evaluate the item again, and the lock block writes no lock row for it, because its lock
+  row already holds the result of the first prepare. When this transaction locks every item of the request, the
+  prepare writes nothing and answers `accepted`. `insertPendingLock` keeps `INSERT OR IGNORE`, because the migration
+  stream can send one lock row two times.
+- **Late prepare after a commit.** The commit removed the lock rows. The timestamp check then rejects the prepare of
+  each item that has a `put`, an `update`, or a `delete`:
+  - A write stamps `last_read_ts` and `last_write_ts` with at least `T`.
+  - A `delete` raises the watermark to at least `T`.
+  - An item with only `check`s can pass, present or absent. A `check` compares `last_write_ts`, and its commit raises
+    only `last_read_ts`.
+
+  When every item of the late prepare has only `check`s, the prepare passes and takes a lock again. The
+  stale-transaction job then asks the coordinator, which answers `COMMITTED`, or `not_found` after the idempotency
+  window. The partition then commits the lock, which applies the `check`s again, or it cancels the new lock. Neither
+  changes an item. Until then, the lock refuses non-transactional writes to its keys. Standard mode has the same
+  behavior now (`2026-10-03-max-deleted-version.md`). A fix needs a record of finished transactions in the partition,
+  and this design does not add one.
+- **Repeated commit.** The first commit released the lock rows in the same `transactionSync` as apply. A repeated
+  commit finds no owned row and answers the idempotent `committed`. Apply never runs two times.
+- **Commit with part of the keys.** The current key-set check fails it with `commit_keyset_mismatch`, and the
+  coordinator retries. Thus a partition applies all of its entries in one call.
+- **Cancel.** It deletes the lock rows by key, as now.
+- **Recovery.** The stale-transaction job and `debugForceResolveTransaction` send the outcome through `dispatch`. The
+  owner applies its lock rows with the same apply.
+- **Partition migration.** A lock row moves with its last-write data and its `op_list` (section 4.2.7). The target
+  merges `max_deleted_v` with `MAX` before it accepts a write. When a split puts the items of one transaction on two
+  partitions, each partition applies its own entries in `opIndex` order.
+- **Coordinator migration.** A migration page carries the `tc_items` rows with their `op_index`.
+
+#### 4.2.13 Invariants
+
+Each invariant names the mechanism that holds it:
+
+- **No request sees a temporary state.** The evaluate block of a prepare always rolls back when it made a temporary
+  write. No `await` runs between the two blocks (section 4.2.5).
 - **A transaction commits all items or none.** Prepare writes locks only when every operation passed. The
   single-partition path rolls back on one failure.
-- **Commit evaluates nothing.** The lock row holds the final image.
-- **Commit gives each write of the sequence its version increment.** The lock row stores `version_delta` and
-  `replace`, and commit applies them to the committed row (section 4.2.8).
+- **Commit evaluates nothing.** The lock row holds the last-write data and the operation list.
+- **No plan reads a `v` that apply can change.** The client and evaluate both run the version-reference check
+  (section 4.2.8).
+- **Each partition applies in `opIndex` order.** Evaluate and apply sort by `opIndex`. Apply refuses a duplicate
+  `opIndex`.
+- **The rules of section 1.2 hold.** Every change to `items` and `deletion_metadata` goes through the current store
+  writes. No path writes `v` or `deletion_metadata` with a value that it computed.
 - **One lock for each item.** `pending_transactions` keeps `PRIMARY KEY (hk, sk, transaction_id)`. The lock block
   writes one row for each item.
-- **Each `opIndex` keeps its value.** `db.ts` sets it. `tc_items` uses it as its key. Every wire type carries it.
-- **Each item runs in request order.** The participant sorts each group by `opIndex`.
-- **A rollback leaves memory unchanged.** `PartitionStore` has no in-memory state. Signals go out only after a
-  commit.
-
-#### 4.2.13 Concurrency and failure
-
-- **Requests on the same partition.** The Durable Object runs one event at a time. Each block is synchronous, so no
-  other request runs inside a block or between the two blocks of a prepare.
-- **More than one drive of a transaction.** A request, a retry with the same token, and `tx_recovery` can send the same
-  prepare at the same time. The lock check of a repeated prepare answers `passed` for each operation (section 4.2.10).
-  The coordinator rules for `PREPARED` and `CANCELLING` do not change.
-- **Stop between the blocks.** The evaluation block committed nothing, so no lock exists. The coordinator sends the
-  prepare again.
-- **Stop after the lock block.** The lock rows hold the final images. The coordinator commits or cancels as now.
-- **Migration during prepare.** A partition that imports answers `partition_migrating`, as now.
+- **Each `opIndex` keeps its value.** `db.ts` sets it. `tc_items` uses it as its key. Every wire type and `op_list`
+  carry it.
+- **A rollback leaves memory unchanged.** `PartitionStore` has no in-memory state, and signals go out only after a
+  commit (section 4.2.5).
 
 #### 4.2.14 Performance
 
-- **Single-op keys, in both modes.** The engine makes no private write for a single-op key. The evaluation block makes
-  the same reads as the current check pass, and its rollback has no write to undo. The lock block makes the same
-  writes as now. A rejected transaction pays only the reads.
-- **Multi-op keys.** A multi-op key with *n* operations costs *n* condition evaluations and *n − 1* private writes in
-  the evaluation block. A key whose last write is an `update` adds one read for the final image. It pays the private
-  writes also when the transaction is rejected, because a later operation needs the state that an earlier one wrote.
-  Section 4.2.14.1 gives the memory, and section 4.2.14.2 gives the measured cost.
-- **Commit.** Commit makes one write for each item, not one for each operation.
-- **Wire.** Commit and cancel send unique keys. A prepare carries each operation, as now.
-- **Single-partition path.** A request with a multi-op key reads and writes the `deletion_metadata` row one more time
-  (section 4.2.5). A request with no multi-op key costs the same as now.
+| Request | Evaluate | Lock block | Apply at commit or in the single-partition block |
+| --- | --- | --- | --- |
+| No repeated item, both paths | reads only, as now | one row for each item, as now | one write for each operation, as now |
+| Repeated request, two-phase path | one temporary write for each passed operation, rolled back | one row for each item | one write for each operation |
+| Repeated request, single-partition path | one write for each passed operation, kept | none | none: the evaluate writes are the apply writes |
 
-##### 4.2.14.1 Memory of the final images
+- A repeated request on the two-phase path writes each operation two times: one time in evaluate, which rolls back,
+  and one time at commit. A rejected repeated request pays the temporary writes up to the operation that failed.
+- Commit writes each operation, not each item. This is the same number of writes as the standalone operations.
+- Each write of apply in the middle of a sequence writes the last-write data, up to 400 KB. The writes run in one
+  `transactionSync`.
 
-A prepare holds the final images of its multi-op keys in JavaScript between the evaluation block and the lock block.
-The data must leave SQLite, because the rollback of the evaluation block discards every row that the block wrote.
+##### 4.2.14.1 Memory of the last-write data
 
-Only a multi-op key whose last write is an `update` copies data out of SQLite (section 4.2.6). A last write that is a
-`put` uses the request data, which is already in memory, and an absent final state has no data. The evaluation block
-builds the final images only when every operation passed, so it never holds final images and condition failure images
-at the same time.
+A prepare holds the last-write data of its repeated items in JavaScript between the evaluate block and the lock block.
+The data must leave SQLite, because the rollback discards every row that the block wrote.
 
-The worst case is about 20 MB. A request has at most `MAX_ITEMS_PER_TX` (100) operations, so it has at most 50 multi-op
-keys, and each final image is at most `MAX_ITEM_BYTES` (400 KB). An example:
+The worst case of an accepted prepare is about 20 MB. A request has at most `MAX_ITEMS_PER_TX` (100) operations, so it
+has at most 50 repeated items. Each last-write data is at most `MAX_ITEM_BYTES` (400 KB). An example:
 
-1. A request has 50 items, each with `update → update`. Each committed item holds 400 KB. The request payload is small,
-   because an update carries no data, so `MAX_PAYLOAD_BYTES_PER_TX` does not limit it.
-2. The evaluation block applies the first update of each item as a private write: 50 writes.
-3. Every operation passed. After the loop, the block runs the document `SELECT` of the second update of each item, and
-   copies 50 JSONB documents of 400 KB into JavaScript: 20 MB.
-4. The block throws, and SQLite rolls back the 50 private writes. The 50 documents stay in JavaScript.
-5. The lock block writes 50 lock rows from the documents. The documents are then garbage.
+1. A request has 50 items, each with `update → update`. Each committed item holds 400 KB. An update carries no data,
+   so the request payload is small, and `MAX_PAYLOAD_BYTES_PER_TX` does not limit it.
+2. Evaluate makes 100 temporary writes and reads the row after the second update of each item: 50 copies of 400 KB,
+   20 MB in all.
+3. The block throws, and SQLite rolls back the temporary writes. The 50 copies stay in JavaScript.
+4. The lock block writes 50 lock rows from the copies. The copies are then garbage.
 
-The memory of a Durable Object is 128 MB. Standard mode already holds a larger worst case: `prepareLocal` collects
-every condition failure image before `applyImageCap` drops the images above 10 MiB. A rejected request with 100
-operations on items of 400 KB therefore holds about 40 MB of images.
+A rejected prepare can hold copies and condition failure images at the same time, until it drops the copies. Each
+operation adds at most one copy or one image of at most 400 KB, so the peak is at most about 40 MB. The memory of a
+Durable Object is 128 MB. Standard mode already has the same worst case: `prepareLocal` collects every condition
+failure image before `applyImageCap` drops the images above 10 MiB. Thus a rejected request with 100 operations on
+items of 400 KB holds about 40 MB of images.
 
-##### 4.2.14.2 Measured cost of the evaluation block
+##### 4.2.14.2 Measured cost
 
-A scratch test measured the evaluation block on Durable Object storage in the local Workers runtime of
-`@cloudflare/vitest-plugin`. The block ran the reads of the prechecks (`getItemStamp`, `measureItemBytes`,
-`probeUpdate`), the private writes (`upsertItem`, `updateItemSingleShot`, `deleteItem`), and the read of the final row.
-Each key had a committed JSON item before the test. The operations were `put` and `update` in turn. Every item had two
-or more operations, so the rollback column shows ordered mode when every item is a multi-op key.
+A scratch benchmark measured each step on Durable Object storage in the local Workers runtime of
+`@cloudflare/vitest-plugin`, on the current `PartitionStore`:
 
-The test compared three modes:
+- **A repeated request** runs the steps of this design with the current store methods:
+  - Evaluate: `pendingLockFor` and `getItemStamp` at the first operation of an item, and `measureItemBytes` or
+    `probeUpdate` for each operation.
+  - The temporary writes: `upsertItem`, `updateItemSingleShot`, and `deleteItem`.
+  - The read of the last-write data of each item.
+  - The lock block: `insertPendingLock` with the copied data, and `insertPendingUpdateLock` for an item with one
+    `update`.
+  - The commit: `listPendingTxItems`, one store write for each operation in `opIndex` order with the last-write data,
+    and `deletePendingTxKeys`.
+- **A request with no repeated item** runs the current `prepareLocal`, `commitLocal`, and `executeSingleShot`, because
+  the design keeps that code.
+- The operations have no condition. The benchmark keeps the operation lists in JavaScript, so the numbers do not
+  include the `op_list` column, which is at most about 1.5 KB for each item.
+- Each item holds a committed JSON item of the given size before each run. A `put` writes a document of the same
+  size. An `update` sets `$.n` to `if_not_exists($.n, 0) + 1`.
 
-- **reads only** — the prechecks with no private write. This is the cost of standard mode.
-- **rollback** — the evaluation block of ordered mode, which throws at the end.
-- **commit** — the same block, which commits at the end.
+The columns:
+
+- **reads only** — the checks of evaluate with no temporary write.
+- **evaluate block** — the checks, the temporary writes, the reads of the last-write data, and the rollback.
+- **prepare** — the evaluate block and then the lock block. For a request with no repeated item, it is the one block
+  of `prepareLocal`.
+- **commit** — the apply and the release of the locks, in one `transactionSync`.
+- **single-partition path** — evaluate with the temporary writes kept, in one `transactionSync` that commits.
 
 Each value is the median of 15 runs, less the median of an empty `runInDurableObject` call (2 ms). The timer has a
-resolution of 1 ms. `rowsWritten` is the sum that the store writes report.
+resolution of 1 ms. The benchmark ran two times, and the table gives both values.
 
-| Transaction | reads only | rollback | commit | `rowsWritten` |
-| --- | --- | --- | --- | --- |
-| 2 items × 2 operations, 100 B | 0 ms | 4 ms | 5 ms | 8 |
-| 10 items × 10 operations, 1 KB, 1 delete for each item | 2 ms | 8 ms | 8 ms | 200 |
-| 1 item × 100 operations, 40 KB | 3 ms | 18 ms | 18 ms | 200 |
-| 10 items × 2 operations, 380 KB | 5 ms | 49 ms | 57 ms | 40 |
-| 50 items × 2 operations, 1 KB | 3 ms | 10 ms | 8 ms | 200 |
+| Transaction | reads only | evaluate block | prepare | commit | single-partition path |
+| --- | --- | --- | --- | --- | --- |
+| 2 items × 2 operations, 100 B | 0 / 0 ms | 4 / 4 ms | 4 / 5 ms | 4 / 5 ms | 4 / 5 ms |
+| 10 items × 10 operations, 1 KB, 1 delete for each item | 1 / 2 ms | 7 / 8 ms | 8 / 8 ms | 6 / 6 ms | 7 / 7 ms |
+| 1 item × 100 operations, 40 KB | 3 / 3 ms | 16 / 17 ms | 17 / 17 ms | 6 / 6 ms | 17 / 16 ms |
+| 10 items × 2 operations, 380 KB | 6 / 6 ms | 63 / 63 ms | 80 / 80 ms | 31 / 113 ms | 44 / 46 ms |
+| 50 items × 2 operations, 1 KB | 1 / 2 ms | 8 / 9 ms | 9 / 9 ms | 7 / 8 ms | 8 / 9 ms |
+| 1 item × 100 updates, 390 KB | 7 / 7 ms | 27 / 29 ms | 29 / 29 ms | 15 / 15 ms | 29 / 27 ms |
+| 50 items × 2 updates, 390 KB | 13 / 16 ms | 216 / 226 ms | 291 / 299 ms | 163 / 168 ms | 184 / 191 ms |
+| 1 item × 2 updates and 98 items × 1 update, 390 KB | 14 / 14 ms | 386 / 376 ms | 550 / 552 ms | 301 / 304 ms | 305 / 309 ms |
+| 100 items × 1 update, 390 KB, no repeated item | 17 / 16 ms | — | 168 / 167 ms | 290 / 275 ms | 291 / 292 ms |
 
 The results:
 
-- A rollback costs the same as a commit of the same writes. The cost comes from the writes, not from the rollback.
-- The cost grows with the bytes that the block writes. The largest case writes 10 items of 380 KB, two times each,
-  in about 50 ms.
+- The cost grows with the bytes that a step writes to different rows. 100 updates of one 390 KB item take about
+  28 ms in the evaluate block. 100 updates over 50 items of 390 KB take about 220 ms.
+- With small data, the evaluate block costs the same as the single-partition path, which makes the same writes and
+  commits. With large data, the rollback costs 20 % to 40 % more: 63 ms against 45 ms, 221 ms against 188 ms, and
+  381 ms against 307 ms.
+- The worst case of section 4.2.14.3 is the row with 1 repeated item and 98 single updates. Its prepare takes about
+  550 ms, against about 168 ms for the prepare of 100 single updates with no repeated item. The evaluate block takes
+  about 380 ms of the 550 ms.
+- The commit of a repeated request costs less than its single-partition path, because the commit makes no check:
+  15 ms against 28 ms for 1 item with 100 updates. For many large items, the commit costs the same as the commit of a
+  request with no repeated item: about 300 ms for 99 items and about 280 ms for 100 items.
+- The single-partition path of a repeated request costs about the same as a request with no repeated item: about
+  307 ms for 99 items and about 291 ms for 100 items.
+- The commit of "10 items × 2 operations, 380 KB" gave 31 ms in one run and 113 ms in the other. The other cells
+  changed by at most 15 ms between the two runs.
 - The pricing page of Durable Objects does not say if a rolled-back row counts as a row written. In the worst case,
-  each private write counts: 200 rows cost $0.0002 at $1.00 for each million rows.
-- The lock block is not in these numbers. It writes one lock row for each item, as a standard prepare does now.
-- The measured block wrote every operation. The design writes *n − 1* operations for an item with *n*, so the private
-  writes of an item with 2 operations are half of the measured writes.
+  each temporary write counts. One temporary write writes about 2 rows, the item and its `key_size_estimates` row,
+  so one evaluate block writes at most about 200 rows. They cost $0.0002 at $1.00 for each million rows.
 
-**The worst case.** `MAX_ITEMS_PER_TX` (100) limits a prepare to 99 private writes. `MAX_PAYLOAD_BYTES_PER_TX`
-does not limit their bytes, because an `update` carries no data (section 4.2.14.1). Each private write can rewrite
-an item of `MAX_ITEM_BYTES`, so one prepare can write about 40 MB that the rollback discards.
+The local runtime is not the production runtime. These numbers compare the steps with each other, and they do not
+predict the latency in production. Section 4.2.14.3 gives the cost of a rollback in production.
 
-A second scratch test measured this case with the design as written: *n − 1* private writes for each item, and the
-document `SELECT` of section 4.2.6 for each final image. Each committed item was a JSON document of about 390 KB.
-Each operation was an `update` that sets `$.n` to `$.n + 1`. Each value is the median of 15 runs, less the median of
-an empty `runInDurableObject` call (3 to 4 ms). The test ran two times, and the table gives both values.
+##### 4.2.14.3 Replication of the temporary writes
 
-| Transaction | reads only | evaluation block | prepare (both blocks) | single-partition path |
-| --- | --- | --- | --- | --- |
-| 1 item × 100 operations | 9 / 10 ms | 28 / 30 ms | 33 / 39 ms | 27 / 29 ms |
-| 50 items × 2 operations | 12 / 13 ms | 40 / 51 ms | 121 / 218 ms | 40 / 43 ms |
-| 100 items × 1 operation (standard mode) | 15 / 16 ms | 16 / 16 ms | 240 / 418 ms | 51 / 53 ms |
+A rolled-back evaluate block can still write WAL frames. SQLite can write the pages of a large transaction to the WAL
+before the end of the transaction, and the rollback then discards them. A Durable Object sends its WAL frames to the
+durability followers before the output gate opens. Thus the temporary writes can delay the other requests of the
+partition, also when they roll back.
 
-- **reads only** — the lock check and the update probe of each operation.
-- **evaluation block** — the reads, the private writes, the final images, and the rollback.
-- **prepare** — the evaluation block and then the lock block.
-- **single-partition path** — the reads and every write of every operation, with a commit.
+The request limits bound this cost:
 
-The results:
+- One evaluate block makes at most `MAX_ITEMS_PER_TX` (100) temporary writes. Each one writes at most `MAX_ITEM_BYTES`
+  (400 KB), so one block writes at most about 40 MB.
+- The lock block writes one row for each item: in a repeated request, at most 99 rows of up to 400 KB, about 40 MB.
 
-- The worst case of the evaluation block, 1 item with 100 operations, takes about 30 ms. Its 99 private writes of
-  about 390 KB all change one row.
-- The lock block costs more than the evaluation block when the final images are large. A standard prepare of 100
-  updates of 390 KB items takes 240 to 418 ms now, and almost all of it is the lock block. Ordered mode does not add
-  to the lock block: it writes one lock row for each item, as standard mode does.
-- On the single-partition path, ordered mode adds no write. That path writes every operation in both modes.
-- A repeated prepare and a drive of the `tx_recovery` job run the evaluation block again. A rejected prepare also
-  pays for its private writes, up to the operation that failed.
-- The evaluation block of the worst case costs less than the lock block of a standard prepare of 100 large updates.
-  Ordered mode needs no smaller limit.
+Thus one prepare event of a repeated request writes at most about 80 MB: the evaluate block, which rolls back, and
+the lock block, which commits. A standard prepare writes at most about 40 MB, in its lock block only. An example of
+the worst case: one item with `update → update` and 98 single `update` operations on other items, each item of
+400 KB, all in one partition. Every item gets temporary writes (section 4.2.3), so evaluate writes about 40 MB. The
+lock block then writes 99 lock rows, also about 40 MB.
 
-The local runtime is not the production runtime. These numbers compare the modes with each other. They do not
-predict the latency in production.
+The design adds no limit for this cost. The upper bound is two times the bound of a standard prepare, and a standard
+commit already writes up to 40 MB in one event.
 
-#### 4.2.15 Deployment and rollback
+The local runtime has no replication, so the measurements of section 4.2.14.2 do not show this cost.
 
-- The two schema migrations run in the constructor, inside `blockConcurrencyWhile`, before the first request.
-- Old and new code must not run at the same time. An old participant ignores the mode and sees repeated items as
-  separate operations.
-- The standard-mode fingerprint does not change. A retry of a transaction from before the deployment keeps its
-  `operations_hash`.
-- A rollback to old code is not supported after a migration ran. Old code cannot read the new `tc_items` key, the
-  `version_delta` column, or a `replace` lock row.
+#### 4.2.15 Deployment
+
+- The change edits the migrations of `tc_items` and `pending_transactions` in place. It adds no migration entry.
+- A deployment must destroy the existing Durable Object namespaces of the partitions and the coordinators.
+- The standard-mode fingerprint does not change.
 
 #### 4.2.16 Testing
 
 The tests use the current suites in `test/partition-do/`, `test/transactions/`, `test/repartition/`, and
 `test/property-based/`.
 
-- **Repeated-item sequences.** `put → update`, `put → check`, `delete → put`, `put → delete`, `check → check`, and
-  long sequences. Each test checks the data, `v`, the TTL, `delete_revision`, `max_delete_tx_order_ts`, and the
-  timestamps after commit.
+The **reference run** is the oracle of the sequence tests. It applies the standalone operations on a
+`TransactionParticipant` with the same start state:
+
+- Each operation is a one-operation call of `executeSingleShot`. Its `txOrderTimestamp` returns the `T` of the run
+  under test.
+- A one-operation transaction uses the transactional store writes: `deleteItem` with `bumpTxOrderTsAlways`, and
+  `bumpItemReadTs` for a `check`.
+- The single-partition path has no timestamp check, so operations with the same `T` do not reject each other.
+- Non-transactional requests are not a reference. Each one takes its own `T`. A non-transactional delete of an absent
+  item does not raise `max_delete_tx_order_ts`. No non-transactional `check` exists.
+
+The sequence tests:
+
+- **Repeated-item sequences.** `put → update`, `put → check`, `delete → put`, `put → delete`, `put → delete → put`,
+  `check → check`, and long sequences, on an existing item and on an absent item. Each test runs on a
+  `TransactionParticipant`: `executeSingleShot` with `txOrderTimestamp` pinned to `T`, and `prepareLocal` with
+  `commitLocal` at the transaction timestamp `T`. It compares the data, `v`, the TTL, `max_deleted_v`,
+  `max_delete_tx_order_ts`, `key_size_estimates`, and the timestamps with the reference run.
+- **Both paths, end to end.** Each sequence also runs through `db.ts` on the single-partition path and on the two-phase
+  path, from the same start state. Both paths give the same result. Only the values that come from `T` can differ.
+- **Order across items.** A request `[put B, delete A]` and a request `[delete A, put B]` on one partition give B the
+  `v` of the standalone operations, on both paths. The test chooses keys whose byte order is the reverse of the request
+  order.
+- **Property-based.** A `fast-check` suite runs random ordered transactions on a `TransactionParticipant` with one
+  pinned `T`: on the single-partition path, on the two-phase path, and as the reference run. All three give the same
+  items, `deletion_metadata`, and `key_size_estimates`, the stamps included. The generator makes no version reference
+  after a write, because the version-reference tests cover that case.
+
+The evaluate tests:
+
 - **First failure.** A failure at each position of a sequence. Check the `passed`, `rejected`, and `not_evaluated`
   results, and the results of the other items.
-- **Full rollback.** A failure on one item leaves every item unchanged, on both paths.
-- **Both paths.** Each sequence test runs on the single-partition path and on the two-phase path, and expects the
-  same item rows, `key_size_estimates`, and `deletion_metadata` on both.
-- **Delete effect.** `put → delete → put` on an absent item changes neither `delete_revision` nor
-  `max_delete_tx_order_ts`, on both paths. A concurrent multi-partition `transactGetItems` of another item in the
-  partition commits. `delete → put` on an existing item increments `delete_revision` and does not change
-  `max_delete_tx_order_ts`, on both paths. After it, a prepare on another absent item with a timestamp at or below
-  `T` and above the earlier watermark is accepted, and a prepare on the replaced item at or below `T` fails with
-  `timestamp_conflict`.
+- **Full rollback.** A failure on one item leaves every item and `deletion_metadata` unchanged, on both paths.
 - **Timestamp rule.** `put → check` and `delete → put` pass. A sequence fails with `timestamp_conflict` against a newer
   committed stamp, at the first operation whose rule fails. A transaction with an existing item A (`delete → put`) and
   an absent item B (`put`) in one partition commits, in both orders of A and B in the request.
-- **Duplicate commit key.** A `txCommit` request with one key two times fails with `commit_duplicate_key` and changes
-  no row.
-- **Images.** An `all_old` image of operation *k* shows the private state before *k*. A private delete gives no image.
+- **Images.** An `all_old` image of operation *k* shows the temporary state before *k*. A temporary delete gives no
+  image.
 - **Item size.** An intermediate state above `MAX_ITEM_BYTES` fails the operation that makes it.
-- **Final image.** For each row of the last-write table in section 4.2.6, the committed row is the same as the row
-  that a private write of the last operation gives. The last operation of an item makes no private write. A
-  `put → check` sequence makes no read for its final image.
-- **Idempotent retries.** A retry with the same token and the same mode gets the stored outcome. A retry with a
-  different mode gets the token mismatch error. A standard-mode fingerprint keeps its current value.
+- **No repeated item.** A request with no repeated item makes no temporary write and runs one `transactionSync` in
+  prepare.
+- **Memory.** A rolled-back block leaves no change in memory.
+
+The version tests:
+
+- **Version after prepare.** A delete of another item between prepare and commit gives a new row of the transaction a
+  `v` above the new `max_deleted_v`.
+- **Version-reference check, client.** In ordered mode, these requests fail with `transact_version_after_write` and
+  send no RPC: `put → check` with a condition on `v`, and `put → update` with an update value that reads `v`. The same
+  operations after a `delete` or an `update` fail in the same way. A condition on `v` on the first operation of the
+  item passes, and so does one after a `check` only. The error names the `opIndex` of the refused operation and of
+  the earlier write.
+- **Version-reference check, partition.** A `txPrepare` request and a `txExecuteSingleShot` request that skip `db.ts`
+  and carry `put X → update X SET $.prevVersion = v` throw `transact_version_after_write`. Neither writes a row, a
+  lock row, or `deletion_metadata`.
+
+The lock row and commit tests:
+
+- **Last-write data.** For a sequence that ends in an `update`, the lock row holds the stored JSONB bytes, and commit
+  writes the same bytes. For a sequence that ends absent after a write, apply raises `max_deleted_v` as the standalone
+  operations do.
+- **Duplicate commit key and duplicate `opIndex`.** A `txCommit` request with one key two times fails and changes no
+  row. A lock row set with one `opIndex` two times fails apply and changes no row.
+- **Item identity.** A unit test of `KeyPairMap` finds two different sort keys with the same `keyPairHash` for the
+  seed of the test isolate. On average, a search finds such a pair after about 80 000 random keys. The map keeps the
+  two keys as two entries in one bucket. The unit test also covers equal keys, a length difference, a difference in
+  the first byte, a difference in the last byte, and the change from the array to the hash at the ninth entry.
+- **Identity sites.** A Durable Object can load the module in another isolate with another seed, so these tests do
+  not depend on a collision. They send more than 8 keys that differ only in their last byte, so the hash part of
+  `KeyPairMap` answers. Each site of section 4.2.6 treats the keys as different items: standard mode accepts them,
+  evaluate makes one sequence for each key, prepare writes one lock row for each key, and commit applies each lock row
+  to its own item.
+
+The protocol tests:
+
 - **Mode validation.** An `executionMode` other than the two values fails with `transact_execution_mode_invalid`, with
   and without a `clientRequestToken`, and sends no RPC. An absent mode gives the same result and the same fingerprint
   as `"standard"`.
-- **Recovery.** A repeated prepare, the coordinator `tx_recovery` job, and the partition stale-transaction job resolve
-  an ordered transaction.
-- **Repeated prepare of a multi-op key.** A second prepare of an accepted ordered transaction answers `accepted`. It
-  changes no lock row and no `pending_tx_info` row, and the commit after it gives the same item rows as a commit after
-  one prepare.
-- **Item identity.** The test finds two different sort keys with the same `hash32(sortKey, hash32(hashKey))`. On
-  average, a search finds such a pair after about 80 000 random keys. Each site of section 4.2.4.2 treats the two
-  keys as two items: standard mode accepts them, the engine makes two sequences, prepare writes two lock rows, and
-  commit applies each lock row to its own item. The request holds more than 8 keys, so the hash part of `KeyPairMap`
-  answers. A unit test of `KeyPairMap` covers equal keys, a length difference, a difference in the first byte, a
-  difference in the last byte, and the change from the array to the hash at the ninth entry.
-- **Partition migration.** A hash split and a promotion move a lock row with its final image. Commit on the target
-  applies the image.
-- **Coordinator migration.** A coordinator split moves `tc_items` rows with their `op_index`.
-- **Schema migrations.** A database with active transactions keeps every `tc_items` row and every `op_index`. A lock
-  row from before the migration gets `version_delta = 1` and commits with the same result as before.
+- **Idempotent retries.** A retry with the same token and the same mode gets the stored outcome. A retry with a
+  different mode gets the token mismatch error. A standard-mode fingerprint keeps its current value.
+- **Repeated prepare of a repeated item.** A second prepare of an accepted ordered transaction answers `accepted`. It
+  changes no lock row and no `pending_tx_info` row. The commit after it gives the same result as a commit after one
+  prepare.
+- **Late prepare.** After the commit of each sequence that has a `put`, an `update`, or a `delete`, a late prepare of
+  the same transaction gets `timestamp_conflict`. After the commit of `check → check`, on a present item and on an
+  absent item, a late prepare passes. The commit that the stale-transaction job then sends changes no item.
+- **Recovery.** A repeated prepare, a repeated commit, the coordinator `tx_recovery` job, and the partition
+  stale-transaction job resolve an ordered transaction. A repeated commit applies nothing.
 - **Routing.** Equal keys of one `txPrepare` dispatch go to one owner in one sub-request, with the Bloom filter on.
-- **Memory.** A rolled-back block leaves no change in memory.
-- **Property-based.** A `fast-check` suite compares random ordered transactions with a reference model of standalone
-  operations. For `deletion_metadata`, the model applies the delete effect of section 4.2.6.1 and not a replay of
-  each delete. The suite runs each transaction on both paths and expects the same state.
+- **Partition migration.** A hash split and a promotion move a lock row with its last-write data and its `op_list`.
+  Commit on the target applies the entries.
+- **Coordinator migration.** A coordinator split moves the `tc_items` rows with their `op_index`.
+
+Section 4.2.17 gives the tests of milestone 7.
+
+#### 4.2.17 Fatal prepare errors
+
+Milestone 7 ships this section after the ordered-mode work. It applies to every prepare, in both modes.
+
+**The problem.** The coordinator treats every prepare error as transient:
+
+- `prepareRetry` retries every error except `partition_over_size`. It tries up to `prepareMaxAttempts` times in
+  `drivePrepare` and up to `prepareRecoveryMaxAttempts` times in `runPrepareRecovery`.
+- `runPrepareRecovery` treats a participant whose prepare threw as undecided. The transaction stays in `PREPARING`
+  until `maxPreparingHoldMs`. Each pass of the `tx_recovery` job sends the prepare again, and the other participants
+  keep their locks for that time.
+
+Some errors cannot clear on a retry, because the same request gets the same error each time. The version-reference
+check of the partition (section 4.2.3, step 2) is one of them. A later check that only the partition can make can be
+another one.
+
+**The rule.** A `FokosValidationError` from a prepare is fatal. A validation error says that the request is not
+valid, so the same request gets it again. The category survives each RPC hop, because `FokosError.is` reads `_tag`.
+The other categories stay retryable:
+
+- `FokosExpressionError`, because an expression error can depend on the item data, and the data can change before
+  the next try.
+- `FokosUnavailableError`, `FokosRoutingError`, and `FokosInternalError`. They include the errors of a split, a
+  migration, and the runtime.
+
+In the current code, a prepare can raise these validation errors: `item_too_large` from the size guard of the store,
+`partition_context_options_invalid`, and the key-encoding errors of `KeyCodec`. Each one gives the same answer for the
+same request.
+
+**The changes.**
+
+1. `prepareRetry` returns `false` from `shouldRetry` when `FokosValidationError.is(err)` is true, as it does now for
+   `partition_over_size`. `drivePrepare` and `runPrepareRecovery` both use `prepareRetry`, so one change covers both
+   drives.
+2. `runPrepareRecovery` cancels when a participant has a fatal error. After its fan-out, it reads each participant
+   whose `prepare_outcome` is NULL, and it builds the stored error from `error_json` with `FokosError.fromWire`. When
+   `FokosValidationError.is` is true for one of them, the transaction goes to `cancelTransactionInStore` and
+   `runCancel`, the same as for `anyRejected`.
+3. `drivePrepare` does not change. It already cancels when a participant did not accept.
+
+**Why the cancel is safe.**
+
+- The transaction is in `PREPARING`, so no participant has committed. `markCommitting` needs an accepted answer from
+  every participant, so a participant with a fatal error already blocks the commit decision.
+- `storePrepareError` writes `error_json` only while the state is `PREPARING` and the participant has no answer.
+- A router can lock the keys of one child and then throw the error of another child. `runCancel` sends a cancel to
+  every participant without a cancel outcome, a participant with no answer included. Thus the cancel releases those
+  locks.
+
+**The result for the caller.** `cancelTransactionInStore` gives each operation of the participant the stored code and
+`error_id` (`participantFailure`). The caller gets `FokosTransactionCancelledError`, and the results carry the code,
+for example `transact_version_after_write`. The single-partition path does not change. `db.ts` does not retry it, and
+it reports the error as a cancelled transaction.
+
+**Tests.**
+
+- A prepare that throws a `FokosValidationError` gets one try in `drivePrepare`, and the transaction cancels. The
+  results carry the code and the `error_id`.
+- A recovery drive that gets a `FokosValidationError` cancels at once, before `maxPreparingHoldMs`. The cancel
+  releases the locks of the participants that accepted.
+- A `FokosExpressionError` and a `partition_migrating` error are still retried.
 
 ## 5. Alternative options
 
-- **Evaluate the private state in JavaScript.** SQLite evaluates every condition and every update now. A second
+**The execution model.**
+
+- **Collapse each sequence into one net write with a version delta.** The lock row holds the net operation and the
+  number of writes, and commit makes one write for each item. Commit then skips the deletes in the middle of a
+  sequence. The `v` of the item and of other new rows, and `max_deleted_v`, then differ from the standalone operations
+  and between the two paths. Each difference needs its own rule, and some need new store methods.
+- **A `replace` lock operation that deletes and inserts the row at commit.** It records one delete inside a sequence.
+  It needs a fifth lock operation and a new store method, and it still skips the other deletes of the sequence.
+- **Evaluate the temporary state in JavaScript.** SQLite evaluates every condition and every update now. A second
   evaluator in JavaScript can give a different answer than SQLite.
-- **A scratch table for the private state.** The compiled condition and update plans read `items`. A scratch table
+- **A scratch table for the temporary state.** The compiled condition and update plans read `items`. A scratch table
   needs a second form of each plan and more code.
+- **Temporary writes for every request.** This removes the condition "repeated request" from evaluate. It adds writes
+  and a rollback to every standard prepare.
+- **Temporary writes only for repeated items, in a repeated request.** It saves the temporary writes of the other
+  items. A temporary delete of a repeated item then raises `max_deleted_v` before an earlier delete of another item
+  runs. Thus a condition on `v` sees a state that apply does not give.
+- **No temporary write for the last operation of an item.** It saves one temporary write for each repeated item. The
+  last-write data then needs a separate read for each case: a document `SELECT` of the last update, or the request
+  data of the last put. Each case needs its own code and test.
+- **Roll back the single-partition block and then run apply.** This gives one apply path for both paths. The
+  temporary writes of the single-partition path are already the writes of apply in `opIndex` order, so the rollback
+  only adds writes.
+- **Check the timestamp against the temporary state.** All operations use one timestamp, so valid sequences fail
+  (section 4.2.3.1).
+
+**The prepare.**
+
 - **Nested `transactionSync` (savepoints).** The Durable Object documentation does not describe nested transactions.
   Two top-level blocks need no nesting.
-- **Store the operation list in the lock row and replay it at commit.** A lock row can then hold up to 100 times
-  `MAX_ITEM_BYTES`, and commit does the work again. The final image is one row.
-- **Store the absolute final version and two delete counters in the lock row.** This gives a strict replay of each
-  operation, also for `delete_revision` and `max_delete_tx_order_ts`. It needs three columns and a data migration of
-  the lock rows that exist. The final `v` is correct only when the committed row does not change between prepare and
-  commit, so commit must also check that rule. The strict replay of `deletion_metadata` also makes other transactions
-  abort for deletes that have no net effect (section 4.2.6.1).
-- **On the single-partition path, roll back and then apply the final images with the commit apply.** This gives one
-  definition of the delete effect. It adds a rollback, a second block, and a read of the final image for each
-  multi-op key. One write of `deletion_metadata` at the end of the block gives the same end state (section 4.2.5).
-- **Undo the private writes by hand, so that the lock block can read the final images in SQLite.** The block copies
-  the committed rows aside, writes the lock rows with `INSERT … SELECT` from the private rows, and then restores
-  `items`, `key_size_estimates`, and `deletion_metadata`. One missed restore corrupts the committed state.
-- **A second pass for each multi-op key, to hold one final image at a time.** After the evaluation block, the prepare
-  runs the private writes of each multi-op key again, reads its final image, rolls back, and writes its lock row. A stop
-  in the middle leaves the locks of some items, and the repeated prepare of the coordinator completes the rest. The
-  peak memory goes from about 20 MB to 400 KB, but the private writes of every multi-op key run two times, and the
-  prepare runs two blocks for each multi-op key. The 20 MB worst case is less than the 40 MB of condition failure
-  images that standard mode can hold now (section 4.2.14.1).
-- **Private writes for every item in prepare.** This makes one path for all items, but it adds writes and a rollback
-  to every standard-mode prepare.
-- **A private write for the last operation of a multi-op key.** The final image is then one read of the final row,
-  with one rule for all operation types. It costs one more write for each multi-op key, which is double the private
-  writes of an item with 2 operations.
-- **A separate method `transactWriteOrderedItems()`.** It is a wrapper of one line, but it doubles the public types,
-  the documentation, and the HTTP surface. The `executionMode` option gives the same function.
-- **Send the mode to the partition.** The engine gives the same result for both modes. The client is the validation
-  boundary, so the partition needs no mode.
-- **Check the timestamp against the private state.** All operations use one timestamp, so valid sequences fail
-  (section 4.2.4.1).
+- **Undo the temporary writes by hand, so that the lock block can read the data in SQLite.** The block copies the
+  committed rows aside, writes the lock rows from the temporary rows, and then restores `items`,
+  `key_size_estimates`, and `deletion_metadata`. One missed restore corrupts the committed state.
+- **A second pass for each repeated item, to hold one copy at a time.** After the evaluate block, the prepare runs the
+  temporary writes of each repeated item again, reads its data, rolls back, and writes its lock row. The peak memory
+  goes from about 20 MB to 400 KB, but the temporary writes run two times. The 20 MB worst case is less than the 40 MB
+  of condition failure images that standard mode can hold now (section 4.2.14.1).
+
+**The lock row and commit.**
+
+- **Store each operation with its data in the lock rows, and replay the data at commit.** One lock row for each item
+  can then exceed the row limit of 2 MB: 10 puts of 400 KB on one item hold 4 MB. One lock row for each operation
+  changes the rule of one lock row for each key at every site that reads locks. The last-write data gives the same
+  visible result (section 4.2.4).
+- **Send the operations with the commit request.** Commit then depends on the payload of the coordinator, which
+  `stripPayload` can remove, and each commit retry carries up to 4 MB.
+- **Store the absolute final `v` in the lock row.** For a new row, this value can be below the `max_deleted_v` of the
+  commit. A read transaction then misses a create and a delete between its phases (section 4.2.8).
+- **Write `deletion_metadata` one time at the end of the single-partition block, with a net effect for each item.**
+  The write replaces values that the store writes raised with `MAX`, so it can lower `max_deleted_v` and
+  `max_delete_tx_order_ts`. A lower watermark lets a late prepare of a committed transaction apply again, and a lower
+  `max_deleted_v` lets a `v` repeat.
+
+**Item identity.**
+
 - **Keep `pairKey`, and reject a hash collision at the client in ordered mode.** This keeps the false
   `transact_duplicate_key` of standard mode, and every site still depends on one client check. A caller that sends
   the RPC without `db.ts` reaches the participant with the collision.
 - **Other forms of exact identity.** A byte comparison of each pair takes 10 ms in its worst case. A sort takes
-  250 µs. A base64 or hex text key allocates a string for each key and costs up to 590 µs. Section 4.2.4.2 gives the
-  measurements.
+  250 µs. A base64 or hex text key allocates a string for each key and costs up to 590 µs (section 4.2.6).
+- **A fixed public seed for `keyPairHash`.** A caller can then make keys that all go into one bucket. The map then
+  costs the same as the byte comparison of each pair: 10 ms.
+
+**The API and the validation.**
+
+- **A separate method `transactWriteOrderedItems()`.** It is a wrapper of one line, but it doubles the public types,
+  the documentation, and the HTTP surface. The `executionMode` option gives the same function.
+- **Send the mode to the partition.** The engine gives the same result for both modes. The client is the validation
+  boundary, so the partition needs no mode.
+- **A precise version-reference rule in evaluate.** Evaluate refuses a version reference only when an earlier
+  operation of the same transaction created the current temporary row. This removes the conservative refusals of
+  section 4.2.2. It needs a new public rejection code and new result rules. The single-partition path must apply it
+  too, although `v` is exact there, or the two paths give different results. The caller learns of the refusal only at
+  run time, and the answer depends on whether the row existed.
+- **The version-reference check at the client only.** A caller that sends the RPC without `db.ts` can then store a
+  `v` in the data that the committed row does not have.
+- **A list of fatal codes in `prepareRetry`.** Each new check that only the partition can make then needs a change to
+  the coordinator. The category rule of section 4.2.17 needs none.
 
 ## 6. Frequently asked questions
 
 **Does ordered mode change a request with no repeated item?**
-No. Each item is a sequence of one operation, and the result is the same as in standard mode.
+No. The request makes no temporary write and takes the same steps as standard mode.
+
+**Do standard mode and ordered mode use different code?**
+No. Below the client, the code reads the request, not the mode. A standard request is a request with no repeated
+item.
 
 **Can an ordered transaction commit in part?**
 No. One failure cancels the transaction. The other items continue only to report their results.
 
 **Is there an order across items?**
-No. The order applies to the operations of each item. Different partitions run in parallel.
-
-**Which image does `all_old` return?**
-The state immediately before the failed operation, with the private changes of the earlier operations of its item.
-
-**Why is the two-block prepare safe without nested transactions?**
-No `await` runs between the blocks, and the first block commits nothing. Section 4.2.5 gives the full reasons.
+Yes, inside one partition: each partition applies all of its operations in `opIndex` order. There is no order across
+partitions.
 
 **Do the two paths leave the same state?**
-Yes. The item rows and `key_size_estimates` agree without extra work. The single-partition path writes
-`deletion_metadata` one time at the end, with the same delete effect that commit applies (sections 4.2.5 and 4.2.6.1).
+Yes, for the same start state. Both paths make the same store writes in `opIndex` order. Only the values that come
+from `T` can differ.
 
-**Can a prepare keep the final images in SQLite and out of JavaScript?**
-Not with a rollback: the rollback discards every row that the evaluation block wrote, so the final data must leave
-SQLite to reach the lock block. Section 5 lists the two options that avoid the copy or reduce it, and their cost. The
-worst case is about 20 MB (section 4.2.14.1).
+**Which image does `all_old` return?**
+The state immediately before the failed operation, with the temporary changes of the earlier operations
+(section 4.2.11).
 
-**What happens to a lock that was prepared before the deployment?**
-It gets `version_delta = 1`, the default value of the new column. A lock row from before the deployment holds one
-operation, so commit gives the same result as before (section 4.2.7).
+**Why is the two-block prepare safe without nested transactions?**
+No `await` runs between the blocks, and the first block commits nothing (section 4.2.5).
+
+**Does commit write the data of each operation?**
+No. Each write of an item uses its last-write data. The data in the middle of a sequence is invisible, and the visible
+values depend only on the order and the types of the operations (section 4.2.4).
+
+**Why can a condition on `v` not follow a write of the same item?**
+On the two-phase path, the `v` of a row that the transaction creates can be higher at commit than at prepare. The
+condition then decides on a `v` that the committed row does not have (section 4.2.8). A condition on `v` on the first
+operation of the item reads the committed `v` and is permitted.
+
+**What happens when a prepare fails a check that the client did not make?**
+The partition throws a `FokosValidationError`. After milestone 7, the coordinator does not retry it and cancels the
+transaction at once (section 4.2.17).
+
+**Can a lock row exceed the row limit?**
+No. A lock row holds one copy of the data, up to 400 KB, and an operation list of about 1.5 KB (section 4.2.7).
+
+**Can a prepare keep the last-write data in SQLite and out of JavaScript?**
+Not with a rollback, because the rollback discards every row that the evaluate block wrote. Section 5 gives the options
+that avoid the copy or reduce it, and their cost.
 
 **Why does the coordinator not store the mode in a column?**
 Nothing below the client reads the mode. The fingerprint is its only use, and `operations_hash` holds it.
@@ -1052,6 +1248,7 @@ No. A request with a token uses the two-phase path in both modes.
 References:
 
 - `AGENTS.md`
+- `docs/agent-plans/2026-10-03-max-deleted-version.md`
 - `docs/agent-plans/2026-08-23-single-partition-transaction-fast-path.md`
 - `docs/agent-plans/2026-09-02-update-expressions.md`
 - `docs/agent-plans/2026-09-05-item-order-timestamps-and-read-revisions.md`
@@ -1059,5 +1256,6 @@ References:
 - `docs/agent-plans/2026-09-27-learned-routes-for-every-dispatch-shape.md`
 - `docs/agent-plans/2026-09-29-promotion-moves-its-locks.md`
 - [SQLite-backed Durable Object Storage](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)
+- [Durable Objects limits](https://developers.cloudflare.com/durable-objects/platform/limits/)
 - [Durable Objects pricing](https://developers.cloudflare.com/durable-objects/platform/pricing/)
 - [ATC 2023, Idziorek et al.](https://www.usenix.org/system/files/atc23-idziorek.pdf)
