@@ -26,10 +26,11 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 		// Transaction touches alice/sk2 (forwarded to range root) and bob/sk1 (local).
 		const txId = crypto.randomUUID();
+		const transactionTimestamp = Date.now();
 		const coordinator = testCoordinatorRef();
 		const prepareResp = await rpc.txPrepare(ctx, {
 			transactionId: txId,
-			transactionTimestamp: Date.now(),
+			transactionTimestamp,
 			coordinator,
 			items: withOpIndex([
 				{ hashKey: kb("alice"), sortKey: kb("sk2"), operation: "put", data: "from-txn", kind: "text" },
@@ -40,7 +41,7 @@ describe("PartitionDO — transactions spanning local and promoted keys", () => 
 
 		await rpc.txCommit(ctx, {
 			transactionId: txId,
-			transactionTimestamp: Date.now(),
+			transactionTimestamp,
 			// Keys only: the participant applies the payload from its own pending_transactions rows.
 			items: [
 				{ hashKey: kb("alice"), sortKey: kb("sk2") },

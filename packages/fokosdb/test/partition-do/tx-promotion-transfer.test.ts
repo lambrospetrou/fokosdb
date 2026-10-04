@@ -109,16 +109,19 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 	it("commits its owned rows and keeps the copies of the moved key", async () => {
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
-		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1"))).toMatchObject({
-			outcome: "accepted",
-		});
+		const prepare = prepareOf(transactionId, [{ hashKey: "bob", sortKey: "sk" }], "bob-v1");
+		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
 		});
 
 		await expect(
-			rpc.txCommit(ctx, { transactionId, transactionTimestamp: Date.now(), items: [{ hashKey: kb("bob"), sortKey: kb("sk") }] }),
+			rpc.txCommit(ctx, {
+				transactionId,
+				transactionTimestamp: prepare.transactionTimestamp,
+				items: [{ hashKey: kb("bob"), sortKey: kb("sk") }],
+			}),
 		).resolves.toEqual({ outcome: "committed" });
 
 		expect(await lockKeys(stub, transactionId)).toEqual(["alice/sk"]);
@@ -205,7 +208,8 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		const { ctx, stub, rpc } = makeStub();
 		const transactionId = crypto.randomUUID();
 		const keys = Array.from({ length: MAX_ITEMS_PER_TX }, (_, i) => ({ hashKey: "bob", sortKey: `sk${String(i).padStart(3, "0")}` }));
-		expect(await rpc.txPrepare(ctx, prepareOf(transactionId, keys, "many"))).toMatchObject({ outcome: "accepted" });
+		const prepare = prepareOf(transactionId, keys, "many");
+		expect(await rpc.txPrepare(ctx, prepare)).toMatchObject({ outcome: "accepted" });
 		await runInDurableObject(stub, (_instance: PartitionDO, state: DurableObjectState) => {
 			insertLock(state, transactionId, "alice");
 			cutOverPromotion(state, "alice");
@@ -215,7 +219,7 @@ describe("PartitionDO — a promotion source and the locks of the key it moved",
 		await expect(
 			rpc.txCommit(ctx, {
 				transactionId,
-				transactionTimestamp: Date.now(),
+				transactionTimestamp: prepare.transactionTimestamp,
 				items: keys.map((key) => ({ hashKey: kb(key.hashKey), sortKey: kb(key.sortKey) })),
 			}),
 		).resolves.toEqual({ outcome: "committed" });
@@ -438,10 +442,12 @@ describe("PartitionDO — the locks of a key that a real promotion moves", () =>
 			{ hashKey: "alice", sortKey: "sk1" },
 			{ hashKey: "bob", sortKey: "sk1" },
 		];
-		const transactionId = await prepareOn(partition, keys);
+		const prepare = prepareOf(crypto.randomUUID(), keys, "v-sk1");
+		expect(await partition.rpc.txPrepare(partition.ctx, prepare)).toMatchObject({ outcome: "accepted" });
+		const { transactionId } = prepare;
 		const commit = {
 			transactionId,
-			transactionTimestamp: Date.now(),
+			transactionTimestamp: prepare.transactionTimestamp,
 			items: keys.map((key) => ({ hashKey: kb(key.hashKey), sortKey: kb(key.sortKey) })),
 		};
 		try {

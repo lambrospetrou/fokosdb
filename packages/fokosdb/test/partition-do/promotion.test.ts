@@ -69,17 +69,18 @@ describe.concurrent("PartitionDO — promotion detection and queuing", () => {
 });
 
 describe.concurrent("PartitionDO — promotion cutover and routing", () => {
-	/** Prepares a put of alice/sk1 on `partition`, and returns the transaction id. */
-	async function prepareAlice(partition: TestPartition): Promise<string> {
+	/** Prepares a put of alice/sk1 on `partition`, and returns the transaction id and timestamp. */
+	async function prepareAlice(partition: TestPartition): Promise<{ transactionId: string; transactionTimestamp: number }> {
 		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = Date.now();
 		const prepare = await partition.rpc.txPrepare(partition.ctx, {
 			transactionId,
-			transactionTimestamp: Date.now(),
+			transactionTimestamp,
 			coordinator: testCoordinatorRef(),
 			items: withOpIndex([{ hashKey: kb("alice"), sortKey: kb("sk1"), operation: "put", data: "from-the-lock", kind: "text" }]),
 		});
 		expect(prepare).toMatchObject({ outcome: "accepted" });
-		return transactionId;
+		return { transactionId, transactionTimestamp };
 	}
 
 	/**
@@ -87,7 +88,11 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 	 * commits the transaction through the source. The commit goes to the range root, which applies the
 	 * payload of the prepare.
 	 */
-	async function commitAliceOnRangeRoot(partition: TestPartition, rangeRoot: TestPartition, transactionId: string): Promise<void> {
+	async function commitAliceOnRangeRoot(
+		partition: TestPartition,
+		rangeRoot: TestPartition,
+		{ transactionId, transactionTimestamp }: { transactionId: string; transactionTimestamp: number },
+	): Promise<void> {
 		// The import brought the lock, and the source cleanup deletes the copy on the source.
 		expect(await lockKeys(rangeRoot.stub, transactionId)).toEqual(["alice/sk1"]);
 		await drainUntil(
@@ -99,7 +104,7 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 		await expect(
 			partition.rpc.txCommit(partition.ctx, {
 				transactionId,
-				transactionTimestamp: Date.now(),
+				transactionTimestamp,
 				items: [{ hashKey: kb("alice"), sortKey: kb("sk1") }],
 			}),
 		).resolves.toEqual({ outcome: "committed" });
@@ -115,11 +120,11 @@ describe.concurrent("PartitionDO — promotion cutover and routing", () => {
 		const rangeRoot = partition.rangeRoot("alice");
 		await keepTestLocks(partition, rangeRoot);
 
-		const transactionId = await prepareAlice(partition);
+		const prepared = await prepareAlice(partition);
 		await partition.triggerPromotion("alice");
 		expect((await partition.awaitPromoted("alice")).doName).toBe(rangeRoot.doName);
 
-		await commitAliceOnRangeRoot(partition, rangeRoot, transactionId);
+		await commitAliceOnRangeRoot(partition, rangeRoot, prepared);
 	});
 
 	it("forwards a write and a read of a promoted key to the range root", async () => {

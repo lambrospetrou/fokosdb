@@ -233,6 +233,13 @@ export class TransactionParticipant {
 		invariant(request.coordinator?.v === COORDINATOR_REF_VERSION, "fokos/partition.prepare: the coordinator reference version is required");
 		invariant(request.coordinator.idempotencyToken, "fokos/partition.prepare: the coordinator idempotencyToken is required");
 		invariant(request.coordinator.doName, "fokos/partition.prepare: the coordinator doName is required");
+		// One key has one lock row. A second item of the same key passes the checks, and its lock insert
+		// is ignored, so a commit would apply one of the two operations.
+		const requestKeys = new Set(request.items.map((item) => KeyCodec.pairKey(item.hashKey, item.sortKey)));
+		invariant(
+			requestKeys.size === request.items.length,
+			() => `fokos/partition.prepare: transaction ${request.transactionId} names a key twice`,
+		);
 		const coordinatorJson = JSON.stringify(request.coordinator);
 
 		const now = this.#now();
@@ -257,6 +264,8 @@ export class TransactionParticipant {
 
 		return this.#store.transactionSync<PrepareResponse>(() => {
 			const results: ParticipantOperationResultEncoded[] = [];
+			// The opIndexes of the items that this transaction has locked already.
+			const lockedBefore = new Set<number>();
 			for (const item of request.items) {
 				const { opIndex } = item;
 				const sk = item.sortKey;
@@ -266,6 +275,7 @@ export class TransactionParticipant {
 
 				if (pendingRow) {
 					if (pendingRow.transaction_id === request.transactionId) {
+						lockedBefore.add(opIndex);
 						results.push({ outcome: "passed", opIndex });
 						continue; // idempotent re-prepare for this item
 					}
@@ -351,11 +361,13 @@ export class TransactionParticipant {
 			};
 			for (const item of request.items) {
 				const sk = item.sortKey;
+				let inserted: boolean;
 				if (item.operation === "update") {
 					invariant(item.update, "fokos/partition.prepare: update item missing update plan");
-					this.#store.insertPendingUpdateLock({ hk: item.hashKey, sk, tx, plan: item.update, ttlAt: item.ttlAt });
+					inserted =
+						this.#store.insertPendingUpdateLock({ hk: item.hashKey, sk, tx, plan: item.update, ttlAt: item.ttlAt }).rowsWritten > 0;
 				} else {
-					this.#store.insertPendingLock({
+					inserted = this.#store.insertPendingLock({
 						...tx,
 						hk: item.hashKey,
 						sk,
@@ -366,6 +378,12 @@ export class TransactionParticipant {
 						ttl_epoch_utc_seconds: item.ttlAt ?? null,
 					});
 				}
+				// The check pass found no lock of another transaction on this key. An accepted item with no
+				// lock row makes the commit find no row to apply, and report success for a write it skipped.
+				invariant(
+					inserted || lockedBefore.has(item.opIndex),
+					() => `fokos/partition.prepare: no lock row written for ${KeyCodec.pairForLog(item.hashKey, sk)}`,
+				);
 			}
 
 			return { outcome: "accepted" };
@@ -387,7 +405,7 @@ export class TransactionParticipant {
 			// synchronous block. A row outside the request is owned only when the owner check says so. On the
 			// usual path no row is outside the request, and the method does not call the owner check.
 			const ownsRow = ownsByHashKey(this.#ownerCheck());
-			const ownedRows = new Map<ReturnType<typeof KeyCodec.pairKey>, PendingLock>();
+			const ownedRows = new Map<bigint, PendingLock>();
 			for (const row of this.#store.listPendingTxItems(request.transactionId)) {
 				const key = KeyCodec.pairKey(row.hk, row.sk);
 				if (requestKeySet.has(key) || ownsRow(row)) {
@@ -413,6 +431,14 @@ export class TransactionParticipant {
 					});
 				}
 			}
+			// Each lock row of a transaction reads its timestamp from the same pending_tx_info row. The
+			// prepare compared that timestamp with the item watermarks, so the commit must stamp the same one.
+			const [first] = ownedRows.values();
+			invariant(
+				first.transaction_ts === request.transactionTimestamp,
+				() =>
+					`fokos/partition.commit: transaction ${request.transactionId} prepared at ${first.transaction_ts} commits at ${request.transactionTimestamp}`,
+			);
 
 			this.#applyCommitItems(request.items, ownedRows, request.transactionTimestamp, promotionCandidates);
 			// The owned set and the request have the same keys here. The release deletes these keys one
@@ -434,10 +460,8 @@ export class TransactionParticipant {
 		for (const item of items) {
 			const sk = item.sortKey;
 			const pendingRow = pendingRows.get(KeyCodec.pairKey(item.hashKey, sk));
-
-			if (!pendingRow) {
-				continue;
-			}
+			// The caller has proved that the request and the owned lock rows hold the same keys.
+			invariant(pendingRow, () => `fokos/partition.commit: no lock row for ${KeyCodec.pairForLog(item.hashKey, sk)}`);
 
 			if (pendingRow.operation === "put" || pendingRow.operation === "update") {
 				// A put/update always persisted both data and kind; assert together so upsertItem gets a real kind.
@@ -458,7 +482,12 @@ export class TransactionParticipant {
 				promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
 			} else if (pendingRow.operation === "delete") {
 				this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
-			} else if (pendingRow.operation === "check") {
+			} else {
+				// The release after this loop deletes the lock, so an operation that applies nothing here is a lost write.
+				invariant(
+					pendingRow.operation === "check",
+					() => `fokos/partition.commit: unknown operation ${pendingRow.operation} (${KeyCodec.pairForLog(item.hashKey, sk)})`,
+				);
 				this.#store.bumpItemReadTs(item.hashKey, sk, transactionTimestamp);
 			}
 		}

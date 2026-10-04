@@ -492,6 +492,9 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				applyPage: (page) => this.applyMigrationPage(page as MigratedTransaction[]),
 				validatePage: (_cursor, page) => {
 					invariant(Array.isArray(page), "fokos/tc: a migration page must be an array of transactions");
+					for (const tx of page as MigratedTransaction[]) {
+						assertMigratedTransaction(tx);
+					}
 				},
 			},
 			// Every child has acknowledged its import, so the rows of this router are old copies.
@@ -637,10 +640,20 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		}));
 		const participantOf: string[] = [];
 		for (const p of participants) {
+			invariant(p.items.length > 0, () => `fokos/tc: participant ${p.doName} of transaction ${transactionId} has no items`);
 			for (const item of p.items) {
+				invariant(participantOf[item.opIndex] === undefined, () => `fokos/tc: operation ${item.opIndex} routes to two participants`);
 				participantOf[item.opIndex] = p.doName;
 			}
 		}
+		// results_json is positional to the request, and each commit and cancel sends a participant the
+		// keys of its tc_items rows. Thus each operation must have its request index and one participant.
+		request.items.forEach((item, i) =>
+			invariant(
+				item.opIndex === i && participantOf[i] !== undefined,
+				() => `fokos/tc: operation ${i} of transaction ${transactionId} has opIndex ${item.opIndex} and participant ${participantOf[i]}`,
+			),
+		);
 
 		const createdAt = this.fokosNow();
 		this.transition(idempotencyToken, () => {
@@ -738,7 +751,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * - CREATED / PREPARING: genuinely undecided — those, and only those, ask the caller to retry.
 	 */
 	private loadFinalResponse(transactionId: string, idempotencyToken: string, existingRow?: TcStateRow): InitiateWriteResponseEncoded {
-		const row = existingRow ?? this.loadStateRow(transactionId)!;
+		const row = existingRow ?? this.loadStateRow(transactionId);
+		invariant(row, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
 		switch (row.state) {
 			case "COMMITTED":
 				// The transaction is all-or-nothing, so "committed" already says every operation applied.
@@ -1119,10 +1133,11 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			this.ctx.storage.sql.exec(`UPDATE tc_state SET state = 'PREPARING' WHERE transaction_id = ? AND state = 'CREATED'`, transactionId);
 			return this.loadStateRow(transactionId);
 		});
+		invariant(row, () => `fokos/tc: drivePrepare found no tc_state row for transaction ${transactionId}`);
 		// Another drive can start between the insert of the transaction and this call, for example a
 		// retry with the same token. When that drive has already decided, a prepare from this drive can
 		// lock keys after the cancel released them.
-		if (row?.state !== "PREPARING") {
+		if (row.state !== "PREPARING") {
 			return this.loadFinalResponse(transactionId, idempotencyToken, row);
 		}
 
@@ -1217,6 +1232,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			)
 			.toArray();
 		const pendingKeys = pendingParticipants.map((p) => {
+			// markCommitting writes COMMITTING only after every participant has a stored accept. runCancel
+			// writes a cancel outcome only in CANCELLING, and CANCELLING never becomes COMMITTING. A commit
+			// to a participant that did not accept, or that released its locks, breaks atomicity.
+			invariant(
+				p.prepare_outcome === "accepted" && p.cancel_outcome === null,
+				() =>
+					`fokos/tc: participant ${p.partition_do_name} of committing transaction ${transactionId} has prepare ${p.prepare_outcome} and cancel ${p.cancel_outcome}`,
+			);
 			const keys = keysByPartition.get(p.partition_do_name);
 			// initiateWrite makes a participant only from the items that route to it, and nothing deletes
 			// an item before completeTransaction. A commit with no keys does not release the locks.
@@ -1295,17 +1318,25 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const keysByPartition = groupByPartition(this.loadItemKeys(transactionId));
 		const deadlineMs = this.fokosNow() + requestBudgetMs;
 
-		// Cancel any participant not yet committed and not yet cancelled — this includes both
+		// Cancel any participant not yet cancelled — this includes both
 		// confirmed 'accepted' and NULL-outcome participants that may have silently locked items
 		// (e.g., response lost in transit). PartitionDO.cancel is a no-op DELETE, so sending it
 		// to a participant that never prepared is safe.
 		const pendingParticipants = this.ctx.storage.sql
 			.exec<TcParticipantRow>(
 				`SELECT transaction_id, partition_do_name, partition_context_json, prepare_outcome, commit_outcome, cancel_outcome
-                 FROM tc_participants WHERE transaction_id = ? AND commit_outcome IS NULL AND cancel_outcome IS NULL`,
+                 FROM tc_participants WHERE transaction_id = ? AND cancel_outcome IS NULL`,
 				transactionId,
 			)
 			.toArray();
+		// runCommit stores a commit outcome only in COMMITTING, and COMMITTING never becomes CANCELLING.
+		// A cancel to a participant that applied the commit breaks atomicity.
+		for (const p of pendingParticipants) {
+			invariant(
+				p.commit_outcome === null,
+				() => `fokos/tc: participant ${p.partition_do_name} of cancelling transaction ${transactionId} has commit ${p.commit_outcome}`,
+			);
+		}
 
 		await Promise.allSettled(
 			pendingParticipants.map(async (p) => {
@@ -1411,8 +1442,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 */
 	private async recoverStaleTransactions(): Promise<void> {
 		const startedAt = this.fokosNow();
-		const { staleTransactionMs, recoveryScanRows, recoveryConcurrentDrives, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } =
-			this.config();
+		const { staleTransactionMs, recoveryScanRows, recoveryConcurrentDrives, alarmRecoveryBudgetMs, fanoutRequestBudgetMs } = this.config();
 		let claimed = 0;
 		const worker = async (): Promise<void> => {
 			while (claimed < recoveryScanRows) {
@@ -1736,7 +1766,8 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 
 	/** The prepare fan-out of a stored transaction: the state, the participants, and their items. */
 	private loadPrepareFanout(transactionId: string): PrepareFanout {
-		const stateRow = this.loadStateRow(transactionId)!;
+		const stateRow = this.loadStateRow(transactionId);
+		invariant(stateRow, () => `fokos/tc: no tc_state row for transaction ${transactionId}`);
 		const itemsByPartition = groupByPartition(this.loadItems(transactionId));
 		return {
 			transactionTs: stateRow.transaction_ts,
@@ -1826,6 +1857,33 @@ function isPastPrepare(state: TCState): boolean {
 			return _exhaustive;
 		}
 	}
+}
+
+/**
+ * Throws when a migrated transaction breaks a rule of the ledger. The `tx_recovery` job finds a
+ * transaction through `completed_at IS NULL` and its `next_recovery_at`, and the `idempotency_sweep`
+ * job through `completed_at`. Thus a terminal state that has no `completed_at`, or a non-terminal state
+ * that has one, hides the transaction from one of the jobs. The completion deletes the item and
+ * participant rows in the same storage transaction as the terminal state.
+ */
+function assertMigratedTransaction({ state, items, participants, results }: MigratedTransaction): void {
+	const id = state.transaction_id;
+	const terminal = state.state === "COMMITTED" || state.state === "CANCELLED";
+	invariant(
+		terminal === (state.completed_at !== null) && terminal === (state.next_recovery_at === null),
+		() =>
+			`fokos/tc: migrated transaction ${id} in state ${state.state} has completed_at ${state.completed_at} and next_recovery_at ${state.next_recovery_at}`,
+	);
+	invariant(
+		!terminal || (items.length === 0 && participants.length === 0),
+		() => `fokos/tc: migrated terminal transaction ${id} has ${items.length} item and ${participants.length} participant rows`,
+	);
+	invariant(
+		items.every((r) => r.transaction_id === id) &&
+			participants.every((r) => r.transaction_id === id) &&
+			results.every((r) => r.transaction_id === id),
+		() => `fokos/tc: migrated transaction ${id} has a row of another transaction`,
+	);
 }
 
 /** The size of one migrated transaction, near its serialized size: the payloads and the text columns. */

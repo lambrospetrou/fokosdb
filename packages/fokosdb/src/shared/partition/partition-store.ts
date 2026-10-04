@@ -1443,10 +1443,13 @@ export class PartitionStore {
 		);
 	}
 
-	/** Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. */
-	insertPendingLock(row: PendingTxItem): void {
+	/**
+	 * Idempotent lock insertion — used by prepare and by migration ingestion of parent locks. Returns
+	 * false when a lock row of the key and the transaction exists already.
+	 */
+	insertPendingLock(row: PendingTxItem): boolean {
 		this.#upsertPendingTx(row);
-		this.#storage.sql.exec(
+		const res = this.#storage.sql.exec(
 			// pending_transactions is never queried by JSON path, so a put's json data is stored raw, as
 			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
 			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
@@ -1460,6 +1463,7 @@ export class PartitionStore {
 			codeFromNullableKind(row.kind),
 			row.ttl_epoch_utc_seconds,
 		);
+		return res.rowsWritten > 0;
 	}
 
 	/**

@@ -281,7 +281,8 @@ describe("Repartition — initialization and cutover", () => {
 				// The range root owns every key of the promoted hash key.
 				ownerCheck: () => () => true,
 			});
-			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 2, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
+			// lockRow writes the transaction timestamp 1.
+			participant.commitLocal({ transactionId: "tx-late", transactionTimestamp: 1, items: [{ hashKey: kb("alice"), sortKey: kb("s2") }] });
 			expect(store.getItem(kb("alice"), kb("s2")).row).toMatchObject({ data: "pending", v: 1 });
 			expect([...store.queryPendingTxPage(null, 10, null)]).toEqual([lockRow("alice", "s1")]);
 		});
