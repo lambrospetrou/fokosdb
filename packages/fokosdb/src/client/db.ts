@@ -749,17 +749,17 @@ export class FokosDB {
 		// The public boundary — the single exit where the internal representation becomes the public one:
 		// decode the KeyBytes back to public keys (the empty sentinel maps to an absent sortKey, same as
 		// queryItems), parse json text once into a JsonValue, and drop the read-transaction bookkeeping
-		// (deleteRevision / hasPendingWrite) so callers never depend on it. Those two are meaningless in a
+		// (maxDeletedV / hasPendingWrite) so callers never depend on it. Those two are meaningless in a
 		// committed read regardless — the driver raises an error when any item has a pending write.
 		return {
 			items: response.items.map((encoded, index) => {
-				const { deleteRevision: _deleteRevision, hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item } = encoded;
+				const { hasPendingWrite: _hasPendingWrite, hashKey, sortKey, ...item } = encoded;
 				const keys = {
 					hashKey: KeyCodec.decode(hashKey),
 					sortKey: sortKey.byteLength === 0 ? undefined : KeyCodec.decode(sortKey),
 				};
 				if (!item.found) {
-					return { ...keys, ...item };
+					return { ...keys, found: false as const };
 				}
 				if (item.kind === "projected") {
 					// items[i] answers request.items[i], so the record's names come from that item's own plan.
@@ -858,21 +858,22 @@ export class FokosDB {
 		// returns a bigint, a primitive, so Map lookup compares by value.
 		const itemIdentity = (r: ReadForTransactionItemResultEncoded): bigint => KeyCodec.pairKey(r.hashKey, r.sortKey);
 
-		// Did both phases observe the same committed state? `version` (the item's `v`) is the primary
-		// datum: a monotonic per-item counter, so unlike a wall-clock timestamp it cannot miss two writes
-		// landing inside the same millisecond. This mirrors the LSN comparison the DynamoDB paper uses
-		// for its read transactions. `deleteRevision` is the owner partition's user-delete counter: it
-		// catches a delete-and-recreate that lands back on the same version, and an absent-create-delete
-		// sequence. An unrelated user delete in the same partition is a conservative conflict. An item
-		// absent in both phases compares equal and is not a conflict. Item timestamps are not compared.
+		// Did both phases observe the same committed state? An item found in both phases compares
+		// `version` (the item's `v`). The `v` of a key never repeats in a partition, also after a delete
+		// and a recreate, so a different `v` shows each write between the phases. Unlike a wall-clock
+		// timestamp, it cannot miss two writes in the same millisecond. This is the LSN comparison of the
+		// DynamoDB paper for its read transactions. An item absent in both phases compares
+		// `maxDeletedV`, the `max_deleted_v` of the owner partition: a create and a delete between the
+		// phases raise it. A delete of another item can also raise it, which is a false conflict. Item
+		// timestamps are not compared.
 		const sameCommittedState = (a: ReadForTransactionItemResultEncoded, b: ReadForTransactionItemResultEncoded): boolean => {
 			if (a.found !== b.found) {
 				return false;
 			}
-			if (a.found && b.found && a.version !== b.version) {
-				return false;
+			if (a.found && b.found) {
+				return a.version === b.version;
 			}
-			return a.deleteRevision === b.deleteRevision;
+			return !a.found && !b.found && a.maxDeletedV === b.maxDeletedV;
 		};
 
 		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so

@@ -472,9 +472,9 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
-	// The old-estimate lookup that upsertItem and deleteItem share. Without INDEXED BY, SQLite picks
+	// The old-estimate lookup of the two upsert statements. Without INDEXED BY, SQLite picks
 	// sqlite_autoindex_items_1 and fetches the table row for est_row_bytes — correct, but one row
-	// fetch per put and per delete. Both halves are asserted: that the hint still works, and that it
+	// fetch per put. Both halves are asserted: that the hint still works, and that it
 	// is still needed, so the pin can be dropped if SQLite ever starts choosing the covering index.
 	it("the old-estimate lookup stays index-only, and needs the INDEXED BY hint to do so", async () => {
 		await withStore((_store, state) => {
@@ -989,7 +989,7 @@ describe("PartitionStore - TTL deletion", () => {
 						      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
 						      LIMIT ?2
 						 )
-						 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds`,
+						 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 						100,
 						10,
 					)
@@ -1040,9 +1040,9 @@ describe("PartitionStore - TTL deletion", () => {
 			// The sweep removed the last item of "b", so its estimate row is gone.
 			expect(kseBytes(state, "b")).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(20 * 1000 * TX_ORDER_TS_UNITS_PER_MS);
-			// The sweep advances the transaction order watermark to the largest expiry it reclaimed,
-			// but it is not a user delete: the revision stays at zero.
-			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 20 * 1000 * TX_ORDER_TS_UNITS_PER_MS, deleteRevision: 0 });
+			// The sweep advances the transaction order watermark to the largest expiry it reclaimed, and
+			// max_deleted_v to the largest v it removed.
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 20 * 1000 * TX_ORDER_TS_UNITS_PER_MS, maxDeletedV: 1 });
 
 			store.bumpMaxDeleteTxOrderTs(200_000 * TX_ORDER_TS_UNITS_PER_MS);
 			const second = store.deleteExpiredItems(100, 2);
@@ -1058,7 +1058,7 @@ describe("PartitionStore - TTL deletion", () => {
 			expect(store.getItem(kb("a"), kb("null")).row).toBeDefined();
 			expect(store.getItem(kb("a"), kb("future")).row).toBeDefined();
 			expect(store.deleteExpiredItems(100, 2)).toEqual({ deletedRows: 0, deletedBytes: 0 });
-			expect(store.getDeletionMetadata().deleteRevision).toBe(0);
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(1);
 		});
 	});
 });
@@ -1081,20 +1081,17 @@ describe("PartitionStore - deletion watermark", () => {
 			// Absent row, default behavior: no bump.
 			const miss = store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100 });
 			expect(miss.deleted).toBe(false);
-			expect(store.getMaxDeleteTxOrderTs()).toBe(0);
-			expect(store.deleteRevisionFor(kb("hk"))).toBe(0);
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 0, maxDeletedV: 0 });
 
-			// Absent row, transactional behavior: bump the watermark regardless, without a revision.
+			// Absent row, transactional behavior: bump the watermark regardless. No row means no v to record.
 			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 100, bumpTxOrderTsAlways: true });
-			expect(store.getMaxDeleteTxOrderTs()).toBe(100);
-			expect(store.deleteRevisionFor(kb("hk"))).toBe(0);
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 100, maxDeletedV: 0 });
 
 			// Present row: bump both.
 			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs: 1 });
 			const hit = store.deleteItem({ hk: kb("hk"), sk: kb("s"), txOrderTs: 200 });
 			expect(hit.deleted).toBe(true);
-			expect(store.getMaxDeleteTxOrderTs()).toBe(200);
-			expect(store.deleteRevisionFor(kb("hk"))).toBe(1);
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 200, maxDeletedV: 1 });
 		});
 	});
 
@@ -1127,8 +1124,8 @@ describe("PartitionStore - deletion watermark", () => {
 			const hitWrites = metadataStatements();
 			expect(hitWrites).toHaveLength(1);
 			expect(hitWrites[0]).toContain("max_delete_tx_order_ts");
-			expect(hitWrites[0]).toContain("delete_revision");
-			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 200, deleteRevision: 1 });
+			expect(hitWrites[0]).toContain("max_deleted_v");
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 200, maxDeletedV: 1 });
 
 			// The transactional absent delete advances the watermark only, in one statement.
 			statements.length = 0;
@@ -1136,14 +1133,14 @@ describe("PartitionStore - deletion watermark", () => {
 			expect(miss.deleted).toBe(false);
 			const missWrites = metadataStatements();
 			expect(missWrites).toHaveLength(1);
-			expect(missWrites[0]).not.toContain("delete_revision");
-			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, deleteRevision: 1 });
+			expect(missWrites[0]).not.toContain("max_deleted_v");
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, maxDeletedV: 1 });
 
 			// The non-transactional absent delete writes no metadata at all.
 			statements.length = 0;
 			store.deleteItem({ hk: kb("hk"), sk: kb("absent"), txOrderTs: 400 });
 			expect(metadataStatements()).toHaveLength(0);
-			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, deleteRevision: 1 });
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 300, maxDeletedV: 1 });
 		});
 	});
 
@@ -1156,7 +1153,7 @@ describe("PartitionStore - deletion watermark", () => {
 			// A real user delete first, so both metadata fields are non-zero.
 			store.deleteItem({ hk: kb("bob"), sk: kb("s"), txOrderTs: 555 });
 			const before = store.getDeletionMetadata();
-			expect(before).toEqual({ maxDeleteTxOrderTs: 555, deleteRevision: 1 });
+			expect(before).toEqual({ maxDeleteTxOrderTs: 555, maxDeletedV: 1 });
 
 			// The cleanup a promotion runs over the hash key it is moving.
 			store.deleteItemsBatchForHashKey(kb("alice"), 1000);
@@ -1164,6 +1161,119 @@ describe("PartitionStore - deletion watermark", () => {
 
 			expect(store.hasItemsForHashKey(kb("alice"))).toBe(false);
 			expect(store.getDeletionMetadata()).toEqual(before);
+		});
+	});
+});
+
+describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", () => {
+	const text = (store: PartitionStore, hk: string, txOrderTs: number) =>
+		store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs }).version;
+	const setA = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+	const row = (store: PartitionStore, hk: string) => store.getItem(kb(hk), kb("s")).row;
+
+	it("starts the first item row of a new partition at v = 1", async () => {
+		await withStore((store) => {
+			expect(text(store, "x", 1)).toBe(1);
+			expect(store.updateItemSingleShot({ hk: kb("y"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(1);
+		});
+	});
+
+	it("starts a recreated row above the last v of the earlier lifetime, for both create statements", async () => {
+		await withStore((store) => {
+			text(store, "x", 1);
+			text(store, "x", 1);
+			expect(text(store, "x", 1)).toBe(3);
+			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1 });
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(3);
+			expect(text(store, "x", 1)).toBe(4);
+			// An update of the existing row keeps v + 1.
+			expect(text(store, "x", 1)).toBe(5);
+
+			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 1 });
+			expect(store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(6);
+			expect(store.updateItemSingleShot({ hk: kb("x"), sk: kb("s"), plan: setA, txOrderTs: 1 }).version).toBe(7);
+		});
+	});
+
+	it("never lowers max_deleted_v on a delete of a row with a lower v", async () => {
+		await withStore((store) => {
+			text(store, "old", 1);
+			text(store, "hot", 1);
+			text(store, "hot", 1);
+			store.deleteItem({ hk: kb("hot"), sk: kb("s"), txOrderTs: 1 });
+			store.deleteItem({ hk: kb("old"), sk: kb("s"), txOrderTs: 1 });
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(2);
+		});
+	});
+
+	it("raises max_deleted_v to the highest v of a sweep chunk, and a recreate starts above it", async () => {
+		await withStore((store) => {
+			const expiring = (hk: string) => store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+			expiring("a");
+			expiring("b");
+			expiring("b");
+			expect(expiring("b").version).toBe(3);
+			expect(store.deleteExpiredItems(100, 10).deletedRows).toBe(2);
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(3);
+			expect(text(store, "b", 1)).toBe(4);
+		});
+	});
+
+	it("raises max_delete_tx_order_ts to the last_read_ts of a removed row", async () => {
+		await withStore((store) => {
+			text(store, "x", 100);
+			store.bumpItemReadTs(kb("x"), kb("s"), 200);
+			store.deleteItem({ hk: kb("x"), sk: kb("s"), txOrderTs: 160 });
+			expect(store.getMaxDeleteTxOrderTs()).toBe(200);
+		});
+	});
+
+	it("raises max_delete_tx_order_ts to the last_read_ts of an expired row above its expiry time", async () => {
+		await withStore((store) => {
+			const expiryTs = 10 * 1000 * TX_ORDER_TS_UNITS_PER_MS;
+			store.upsertItem({ hk: kb("x"), sk: kb("s"), data: "d", kind: "text", ttlAt: 10, txOrderTs: 1 });
+			store.bumpItemReadTs(kb("x"), kb("s"), expiryTs + 5);
+			expect(store.deleteExpiredItems(100, 10).deletedRows).toBe(1);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(expiryTs + 5);
+		});
+	});
+
+	it("stamps a new row with at least max_delete_tx_order_ts, for both create statements", async () => {
+		await withStore((store) => {
+			store.bumpMaxDeleteTxOrderTs(200);
+			text(store, "put", 160);
+			expect(row(store, "put")).toMatchObject({ last_read_ts: 200, last_write_ts: 200 });
+			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 160 });
+			expect(row(store, "upd")).toMatchObject({ last_read_ts: 200, last_write_ts: 200 });
+
+			// A create with a higher timestamp keeps its own.
+			text(store, "later", 300);
+			expect(row(store, "later")).toMatchObject({ last_read_ts: 300, last_write_ts: 300 });
+		});
+	});
+
+	it("does not take max_delete_tx_order_ts into the stamps of an update of an existing row", async () => {
+		await withStore((store) => {
+			text(store, "put", 100);
+			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 100 });
+			store.bumpMaxDeleteTxOrderTs(500);
+
+			text(store, "put", 150);
+			expect(row(store, "put")).toMatchObject({ v: 2, last_read_ts: 150, last_write_ts: 150 });
+			store.updateItemSingleShot({ hk: kb("upd"), sk: kb("s"), plan: setA, txOrderTs: 150 });
+			expect(row(store, "upd")).toMatchObject({ v: 2, last_read_ts: 150, last_write_ts: 150 });
+		});
+	});
+
+	it("mergeDeletionMetadata takes the MAX of each value, and a retry gives the same result", async () => {
+		await withStore((store) => {
+			store.mergeDeletionMetadata({ maxDeleteTxOrderTs: 100, maxDeletedV: 7 });
+			store.mergeDeletionMetadata({ maxDeleteTxOrderTs: 100, maxDeletedV: 7 });
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 100, maxDeletedV: 7 });
+
+			store.mergeDeletionMetadata({ maxDeleteTxOrderTs: 50, maxDeletedV: 3 });
+			expect(store.getDeletionMetadata()).toEqual({ maxDeleteTxOrderTs: 100, maxDeletedV: 7 });
+			expect(text(store, "x", 1)).toBe(8);
 		});
 	});
 });

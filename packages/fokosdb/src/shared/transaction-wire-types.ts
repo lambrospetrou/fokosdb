@@ -167,10 +167,11 @@ export type ReadForTransactionRequest = {
  * contract ("encode at entry, decode at exit, compare bytes in between"), the driver compares bytes
  * and never decodes. `db.ts` decodes at the public exit.
  *
- * `deleteRevision` / `hasPendingWrite` are read-driver bookkeeping and are stripped by `db.ts`.
- * `version` detects every write to a live row, because `v = v + 1` runs on every upsert.
- * `deleteRevision` is the owner partition's user-delete counter; it detects a delete and recreate
- * that returns `v` to its first value, and an absent-create-delete sequence.
+ * `maxDeletedV` / `hasPendingWrite` are read-driver bookkeeping and are stripped by `db.ts`.
+ * `version` detects every write to a found item: `v = v + 1` runs on every write, and a recreated
+ * row starts above every earlier `v` of its key. `maxDeletedV` is the `max_deleted_v` of the owner
+ * partition, and only an absent item carries it: a create and a delete between the two phases of a
+ * read raise it.
  *
  * json data is JSON text here, and the type is free of the recursive JsonValue so the Workers-RPC type
  * machinery does not instantiate infinitely deep.
@@ -184,7 +185,6 @@ export type ReadForTransactionRequest = {
 export type ReadForTransactionItemResultEncoded = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
-	deleteRevision: number;
 	hasPendingWrite: boolean;
 } & (
 	| {
@@ -196,7 +196,7 @@ export type ReadForTransactionItemResultEncoded = {
 			ttlAt?: number;
 	  }
 	| { found: true; projected: ProjectedWireRow; kind: "projected"; version: number; ttlAt?: number }
-	| { found: false }
+	| { found: false; maxDeletedV: number }
 );
 
 export type ReadForTransactionResponse = {

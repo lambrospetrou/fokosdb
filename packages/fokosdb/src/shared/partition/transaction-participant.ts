@@ -624,11 +624,10 @@ export class TransactionParticipant {
 	readForTransactionLocal(request: Pick<ReadForTransactionRequest, "items">): ReadForTransactionResponse {
 		const results: ReadForTransactionItemResultEncoded[] = [];
 
-		let deleteRevision: number | undefined;
-		// One deletion-metadata read per RPC, shared by every item of the request.
-		// In the future we could shard deletion revision to reduce contention by having X buckets,
-		// and hash each hash key to determine which bucket to check.
-		const deleteRevisionFor = (hk: KeyBytes) => (deleteRevision ??= this.#store.deleteRevisionFor(hk));
+		// At most one deletion-metadata read per RPC, shared by every absent item of the request. A
+		// found item needs no value: the read compares its `v`.
+		let maxDeletedV: number | undefined;
+		const readMaxDeletedV = () => (maxDeletedV ??= this.#store.getMaxDeletedV());
 
 		for (const item of request.items) {
 			const sk = item.sortKey;
@@ -654,7 +653,6 @@ export class TransactionParticipant {
 					// `v` stays: the two-phase driver compares it for every found item.
 					version: itemRow.version,
 					...(itemRow.ttlAt === undefined ? {} : { ttlAt: itemRow.ttlAt }),
-					deleteRevision: deleteRevisionFor(item.hashKey),
 					hasPendingWrite,
 				});
 			} else if (itemRow) {
@@ -669,7 +667,6 @@ export class TransactionParticipant {
 					// caller can feed it straight back into an attribute_equals condition.
 					version: itemRow.v,
 					ttlAt: itemRow.ttl_epoch_utc_seconds ?? undefined,
-					deleteRevision: deleteRevisionFor(item.hashKey),
 					hasPendingWrite,
 				});
 			} else {
@@ -677,7 +674,7 @@ export class TransactionParticipant {
 					found: false,
 					hashKey,
 					sortKey,
-					deleteRevision: deleteRevisionFor(item.hashKey),
+					maxDeletedV: readMaxDeletedV(),
 					hasPendingWrite,
 				});
 			}

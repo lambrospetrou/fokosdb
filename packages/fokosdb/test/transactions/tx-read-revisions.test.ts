@@ -23,7 +23,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const key = keysInOnePartition(db, 1, "check-between")[0];
 		await db.putItem({ ...key, data: "value" });
 
-		// A check advances only the read watermark: `version` and the delete revision stand still.
+		// A check advances only the read watermark: `version` stands still.
 		const result = await betweenPhases(
 			db,
 			key,
@@ -80,13 +80,13 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		await expect(read).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: key.hashKey }));
 	});
 
-	it("a delete and recreate that lands back on the same version still aborts the read", async () => {
+	it("a delete and recreate between the phases aborts the read", async () => {
 		const db = makeDB({ singlePartitionFastPath: false, controlled: true });
 		const key = keysInOnePartition(db, 1, "recreate")[0];
 		await db.putItem({ ...key, data: "value" });
 
-		// The recreated item reads back at version 1 — the same `v` phase 1 saw — so `found` and
-		// `version` agree across the phases. Only the delete revision moved.
+		// `found` agrees across the phases. The recreated item starts above the `v` of the deleted one,
+		// so `version` is different.
 		const read = betweenPhases(
 			db,
 			key,
@@ -104,7 +104,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const key = keysInOnePartition(db, 1, "absent-flip")[0];
 
 		// The item is absent in both phases, so `found` agrees and there is no `version` to compare.
-		// Only the delete revision moved.
+		// The delete raised the max_deleted_v of the partition to the `v` of the created item.
 		const read = betweenPhases(
 			db,
 			key,
@@ -117,15 +117,14 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		await expect(read).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: key.hashKey }));
 	});
 
-	it("an unrelated user delete in the same partition aborts the read", async () => {
+	it("an unrelated user delete in the same partition does not abort the read of a found item", async () => {
 		const db = makeDB({ singlePartitionFastPath: false, controlled: true });
 		const [key, sibling] = keysInOnePartition(db, 2, "unrelated-delete");
 		await db.putItem({ ...key, data: "value" });
 		await db.putItem({ ...sibling, data: "sibling" });
 
-		// The delete revision is partition-wide, so a delete of an item the read never asked about
-		// still moves it. That makes this abort conservative: the read could have been answered.
-		const read = betweenPhases(
+		// The delete raises max_deleted_v of the partition, but a found item compares only `version`.
+		const result = await betweenPhases(
 			db,
 			key,
 			async (instance, _state, pCtx) => {
@@ -133,7 +132,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			},
 			() => db.transactGetItems({ items: [key] }),
 		);
-		await expect(read).rejects.toThrow(fokosErrorWith("read_conflict", { hashKey: key.hashKey }));
+		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 	});
 
 	it("a TTL sweep between the phases does not abort the read", async () => {
@@ -143,8 +142,8 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		const ttlAt = Math.floor(Date.now() / 1000) + 3600;
 		await db.putItem({ ...sibling, data: "expiring", ttlAt });
 
-		// The sweep removes the expired sibling. It advances the transaction order watermark but
-		// counts no user delete, so the delete revision — and the read — is undisturbed.
+		// The sweep removes the expired sibling and raises max_deleted_v of the partition. A found item
+		// compares only `version`, so the read is undisturbed.
 		const result = await betweenPhases(
 			db,
 			key,
@@ -156,7 +155,7 @@ describe("transactGetItems — read revisions and pending checks", () => {
 		expect(result).toMatchObject({ items: [{ found: true, data: "value", version: 1 }] });
 	});
 
-	it("a user delete in a different partition does not change this partition's revision", async () => {
+	it("a user delete in a different partition does not abort the read", async () => {
 		const db = makeDB({ singlePartitionFastPath: false, controlled: true });
 		const [key, other] = keysAcrossPartitions(db, 2, "other-partition");
 		await db.putItem({ ...key, data: "value" });

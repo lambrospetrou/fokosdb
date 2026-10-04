@@ -1,10 +1,11 @@
 # RFC — Replace the delete revision with the highest deleted item version, and keep the key watermark across deletes
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-03
 **Author:** Lambros Petrou
-**Status:** Not built. The partition keeps `delete_revision` in its one `deletion_metadata` row. A late prepare can
-apply a committed transaction a second time.
+**Status:** Implemented. The `deletion_metadata` row keeps `max_deleted_v` in place of `delete_revision`. A read
+transaction compares `version` for a found item and `max_deleted_v` for an absent item. A late prepare of a committed
+put, update or delete gets `timestamp_conflict`.
 
 ## Table of Contents
 
@@ -266,7 +267,9 @@ An update keeps `v = v + 1`. It does not read `max_deleted_v`.
 
 - When the `DELETE` removed a row, the store sets `max_deleted_v = MAX(max_deleted_v, ?)` with the `v` of the removed
   row, and `max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?)`. This is one `UPDATE` of the one row, the same
-  as today. The `DELETE` gets `v` with `RETURNING v`.
+  as today. The store reads `est_row_bytes`, `v` and `last_read_ts` of the row in one read before the `DELETE`, in
+  the same synchronous call. The `DELETE` does not use `RETURNING`, because `RETURNING` adds one row read to each
+  delete, also when no row exists.
 - When the row was absent and `bumpTxOrderTsAlways` is set, the store sets only `max_delete_tx_order_ts`. A delete
   that removes no row leaves no `v` to record.
 
@@ -385,7 +388,7 @@ Section 1.3 gives the problem.
 
 **The rules.** Each rule changes a statement that this RFC already changes. No rule adds a row written.
 
-- **Delete.** `deleteItem` returns `last_read_ts` with `v` (`RETURNING v, last_read_ts`). The one metadata `UPDATE`
+- **Delete.** `deleteItem` reads `last_read_ts` with `v` before the `DELETE` (section 4.2.4). The one metadata `UPDATE`
   sets `max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, <tx order ts>, <last_read_ts of the row>)`. A delete of an
   absent row with `bumpTxOrderTsAlways` keeps its current rule.
 - **TTL sweep.** `deleteExpiredItems` returns `last_read_ts` with `v`. The one metadata `UPDATE` for each chunk moves

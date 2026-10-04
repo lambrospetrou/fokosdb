@@ -63,15 +63,16 @@ describe("write conditions", () => {
 		const key = { hashKey: `condition-${condition.op}-${crypto.randomUUID()}` };
 		const data = { status: "active", score: 5, tags: ["blue", "green"] };
 
-		await db.putItem({ ...key, data });
-		await expect(db.putItem({ ...key, data, condition })).resolves.toMatchObject({ version: 2 });
+		// Other tests delete items of the same partition, so a new item starts above version 1.
+		const { version } = await db.putItem({ ...key, data });
+		await expect(db.putItem({ ...key, data, condition })).resolves.toMatchObject({ version: version + 1 });
 		await expect(db.deleteItem({ ...key, condition })).resolves.toMatchObject({ deleted: true });
 	});
 
 	it("does not write when a JSON condition fails", async () => {
 		const db = sharedDb;
 		const key = { hashKey: `condition-failure-${crypto.randomUUID()}` };
-		await db.putItem({ ...key, data: { status: "active" } });
+		const { version } = await db.putItem({ ...key, data: { status: "active" } });
 		const condition = {
 			op: "eq",
 			args: [{ ref: "data", path: "$.status" }, { val: "disabled" }],
@@ -79,22 +80,22 @@ describe("write conditions", () => {
 
 		await expect(db.putItem({ ...key, data: { status: "overwritten" }, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.deleteItem({ ...key, condition })).rejects.toThrow(fokosErrorWith("condition_failed"));
-		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version: 1 } });
+		await expect(db.getItem(key)).resolves.toMatchObject({ found: true, item: { data: { status: "active" }, version } });
 	});
 
 	it("applies the constant conditions to present and missing items", async () => {
 		const db = sharedDb;
 		const present = { hashKey: `condition-constant-${crypto.randomUUID()}` };
 		const missing = { hashKey: `condition-constant-${crypto.randomUUID()}` };
-		await db.putItem({ ...present, data: "v1" });
+		const { version } = await db.putItem({ ...present, data: "v1" });
 
 		await expect(db.putItem({ ...present, data: "v2", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.deleteItem({ ...present, condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
 		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "false" } })).rejects.toThrow(fokosErrorWith("condition_failed"));
-		await expect(db.getItem(present)).resolves.toMatchObject({ found: true, item: { data: "v1", version: 1 } });
+		await expect(db.getItem(present)).resolves.toMatchObject({ found: true, item: { data: "v1", version } });
 		await expect(db.getItem(missing)).resolves.toMatchObject({ found: false });
 
-		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "true" } })).resolves.toMatchObject({ version: 1 });
+		await expect(db.putItem({ ...missing, data: "v1", condition: { op: "true" } })).resolves.toMatchObject({ version: expect.any(Number) });
 	});
 });
 
@@ -555,7 +556,7 @@ describe("transactions - end-to-end", () => {
 			// the value a caller feeds back into an attribute_equals condition.
 			expect(item.version).toBe(1);
 			// The 2PC bookkeeping is stripped at the public boundary.
-			expect(item).not.toHaveProperty("deleteRevision");
+			expect(item).not.toHaveProperty("maxDeletedV");
 			expect(item).not.toHaveProperty("hasPendingWrite");
 		}
 	});
@@ -845,7 +846,7 @@ describe("transactions - end-to-end", () => {
 	it("atomicity: failed condition on a delete rolls back puts in the same transaction", async () => {
 		const db = sharedDb;
 
-		await db.putItem({ hashKey: "rollback-put", data: "original" });
+		const { version } = await db.putItem({ hashKey: "rollback-put", data: "original" });
 
 		vi.advanceTimersByTime(1);
 
@@ -867,7 +868,7 @@ describe("transactions - end-to-end", () => {
 		expect(result.found).toBe(true);
 		invariant(result.found);
 		expect(result.item.data).toBe("original");
-		expect(result.item.version).toBe(1);
+		expect(result.item.version).toBe(version);
 	});
 
 	it("coordinator distribution: 10 transactions across 3 coordinators land on multiple TCs", async () => {

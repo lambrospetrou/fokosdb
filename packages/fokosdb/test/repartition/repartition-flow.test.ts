@@ -573,7 +573,7 @@ describe("Repartition — the migration protocol", () => {
 
 		c.nextPullPage(root.doName, {
 			phase: "host",
-			page: { stream: "pending_tx", pendingTransactions: [], deletionMetadata: { maxDeleteTxOrderTs: 0, deleteRevision: 0 } },
+			page: { stream: "pending_tx", pendingTransactions: [], deletionMetadata: { maxDeleteTxOrderTs: 0, maxDeletedV: 0 } },
 			nextCursor: null,
 		});
 		await child.enter(async ({ target, sharding }) => {

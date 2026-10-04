@@ -245,15 +245,61 @@ async function untilUnlocked<T>(fn: () => Promise<T>): Promise<{ value: T; waite
 
 // ─── The model ────────────────────────────────────────────────────────────────
 
-export type ModelItem = { data: ItemData; kind: DataKind; version: number };
-export type Model = { items: Map<string, ModelItem> };
+/**
+ * One item of the model. A new item starts at `max_deleted_v + 1` of its partition, and the model does
+ * not know the partition. Its version is then only a lower bound (`versionIsLowerBound`): the
+ * version of the key never repeats, so it is above every earlier version of the key. The first read
+ * or write answer that reports the version gives the exact value.
+ */
+export type ModelItem = { data: ItemData; kind: DataKind; version: number; versionIsLowerBound?: boolean };
+/** `removedVersions` holds the last known version of each key that the model removed. */
+export type Model = { items: Map<string, ModelItem>; removedVersions: Map<string, number> };
 
-/** Applies the put of a command to the model. A new item starts at version 1, an overwrite adds one. */
-function applyPut(m: Model, key: ItemKey, data: ItemData): number {
+export const emptyModel = (): Model => ({ items: new Map(), removedVersions: new Map() });
+
+/** The version of the next write of `id`: an overwrite adds one, a create is above every earlier version. */
+function nextVersion(m: Model, id: string): Pick<ModelItem, "version" | "versionIsLowerBound"> {
+	const item = m.items.get(id);
+	if (item !== undefined) {
+		return { version: item.version + 1, versionIsLowerBound: item.versionIsLowerBound };
+	}
+	return { version: (m.removedVersions.get(id) ?? 0) + 1, versionIsLowerBound: true };
+}
+
+/** Applies the put of a command to the model. */
+function applyPut(m: Model, key: ItemKey, data: ItemData): void {
 	const id = keyId(key);
-	const version = (m.items.get(id)?.version ?? 0) + 1;
-	m.items.set(id, { data, kind: expectedDataKind(data), version });
-	return version;
+	m.items.set(id, { data, kind: expectedDataKind(data), ...nextVersion(m, id) });
+}
+
+/** Applies the delete of a command to the model. */
+function applyDelete(m: Model, key: ItemKey): void {
+	const id = keyId(key);
+	const item = m.items.get(id);
+	if (item !== undefined) {
+		m.removedVersions.set(id, Math.max(item.version, m.removedVersions.get(id) ?? 0));
+		m.items.delete(id);
+	}
+}
+
+/** True when the database can report `actual` for the model item. */
+function versionAgrees(item: ModelItem, actual: number): boolean {
+	return item.versionIsLowerBound ? actual >= item.version : actual === item.version;
+}
+
+const describeVersion = (item: ModelItem): string => `v${item.versionIsLowerBound ? "≥" : ""}${item.version}`;
+
+/** Compares the version the database reported for `key` with the model, and keeps the exact value. */
+function expectVersion(m: Model, key: ItemKey, actual: unknown): void {
+	const item = m.items.get(keyId(key));
+	expect(item, `the model holds no item for ${keyId(key)}`).toBeDefined();
+	expect(typeof actual).toBe("number");
+	expect(
+		versionAgrees(item!, actual as number),
+		`${keyId(key)} reported v${actual as number}, the model holds ${describeVersion(item!)}`,
+	).toBe(true);
+	item!.version = actual as number;
+	item!.versionIsLowerBound = false;
 }
 
 /**
@@ -289,7 +335,7 @@ function applyUpdate(m: Model, key: ItemKey, actions: readonly ModelUpdateAction
 	if (document === null) {
 		throw new Error("an update that does not apply must not commit");
 	}
-	m.items.set(id, { data: document, kind: "json", version: (m.items.get(id)?.version ?? 0) + 1 });
+	m.items.set(id, { data: document, kind: "json", ...nextVersion(m, id) });
 }
 
 /** Compares one read answer (a `getItem` result or one `transactGetItems` entry) with the model. */
@@ -299,7 +345,8 @@ function expectRead(m: Model, key: ItemKey, res: unknown): void {
 		expect(res).toMatchObject({ found: false, ...key });
 		return;
 	}
-	expect(res).toMatchObject({ found: true, ...key, kind: expected.kind, version: expected.version });
+	expect(res).toMatchObject({ found: true, ...key, kind: expected.kind });
+	expectVersion(m, key, (res as { version: unknown }).version);
 	// `toMatchObject` matches a SUBSET of an object value, so it accepts a document that kept a field
 	// the model removed. The data of a found item is therefore compared exactly.
 	expect((res as { data: unknown }).data).toEqual(expected.data);
@@ -326,7 +373,7 @@ function applyTxOps(m: Model, ops: readonly TxOp[]): void {
 		if (op.operation === "put") {
 			applyPut(m, op.key, op.data);
 		} else if (op.operation === "delete") {
-			m.items.delete(keyId(op.key));
+			applyDelete(m, op.key);
 		} else if (op.operation === "update") {
 			applyUpdate(m, op.key, op.actions);
 		}
@@ -501,7 +548,7 @@ async function seedPool(db: FokosDB, m: Model, keys: readonly ItemKey[], seedDat
 	}
 	const last = keys[keys.length - 1];
 	await untilUnlocked(() => db.deleteItem(last));
-	m.items.delete(keyId(last));
+	applyDelete(m, last);
 }
 
 /**
@@ -526,7 +573,7 @@ async function expectModelMatches(db: FokosDB, m: Model, keys: readonly ItemKey[
 
 /** The model the pool holds now, built from the answers of `readPool`. */
 function poolModel(items: readonly MaybeReadItem[], keys: readonly ItemKey[]): Model {
-	const model: Model = { items: new Map() };
+	const model = emptyModel();
 	keys.forEach((key, i) => {
 		const read = items[i];
 		if (read.found) {
@@ -550,7 +597,9 @@ async function expectKeyUnlocked(m: Model, db: FokosDB, key: ItemKey, stats: Tra
 	if (item === undefined) {
 		expect(value).toMatchObject({ item: key, deleted: false });
 	} else {
-		expect(value).toMatchObject({ item: key, version: applyPut(m, key, item.data) });
+		expect(value).toMatchObject({ item: key });
+		applyPut(m, key, item.data);
+		expectVersion(m, key, (value as PutItemResult).version);
 	}
 	stats.lockProbes++;
 	if (waited) {
@@ -578,7 +627,9 @@ export class PutItem extends ModelCommand {
 	}
 	async run(m: Model, db: FokosDB): Promise<void> {
 		const res = await untilAvailable(() => db.putItem({ ...this.key, data: this.data }));
-		expect(res).toMatchObject({ item: this.key, version: applyPut(m, this.key, this.data) });
+		expect(res).toMatchObject({ item: this.key });
+		applyPut(m, this.key, this.data);
+		expectVersion(m, this.key, res.version);
 	}
 	toString(): string {
 		return `PutItem(${keyId(this.key)})`;
@@ -606,7 +657,7 @@ export class DeleteItem extends ModelCommand {
 		const id = keyId(this.key);
 		const res = await untilAvailable(() => db.deleteItem(this.key));
 		expect(res).toMatchObject({ item: this.key, deleted: m.items.has(id) });
-		m.items.delete(id);
+		applyDelete(m, this.key);
 	}
 	toString(): string {
 		return `DeleteItem(${keyId(this.key)})`;
@@ -779,7 +830,7 @@ export function arbRun(
  * divergence no read command observed.
  */
 export async function runCommands(db: FokosDB, run: Run, seedData?: readonly ItemData[]): Promise<void> {
-	const model: Model = { items: new Map() };
+	const model = emptyModel();
 	await seedPool(db, model, run.keys, seedData);
 	await fc.asyncModelRun(() => ({ model, real: db }), run.cmds);
 	await expectModelMatches(db, model, run.keys);
@@ -917,12 +968,27 @@ function stateSignature(m: Model, keys: readonly ItemKey[]): string {
 	return keys
 		.map((key) => {
 			const item = m.items.get(keyId(key));
-			return `${keyId(key)} → ${item === undefined ? "absent" : `v${item.version} ${item.kind} ${canonicalData(item.data)}`}`;
+			return `${keyId(key)} → ${item === undefined ? "absent" : `${describeVersion(item)} ${item.kind} ${canonicalData(item.data)}`}`;
 		})
 		.join("\n");
 }
 
-const cloneModel = (m: Model): Model => ({ items: new Map([...m.items].map(([id, item]) => [id, { ...item }])) });
+/** True when the observed state can be the candidate state: a lower-bound version accepts a higher one. */
+function stateAgrees(candidate: Model, observed: Model, keys: readonly ItemKey[]): boolean {
+	return keys.every((key) => {
+		const want = candidate.items.get(keyId(key));
+		const got = observed.items.get(keyId(key));
+		if (want === undefined || got === undefined) {
+			return want === got;
+		}
+		return want.kind === got.kind && canonicalData(want.data) === canonicalData(got.data) && versionAgrees(want, got.version);
+	});
+}
+
+const cloneModel = (m: Model): Model => ({
+	items: new Map([...m.items].map(([id, item]) => [id, { ...item }])),
+	removedVersions: new Map(m.removedVersions),
+});
 
 function permutations<T>(items: readonly T[]): T[][] {
 	if (items.length <= 1) {
@@ -944,10 +1010,9 @@ function applyWhenPremisesHold(m: Model, ops: readonly TxOp[]): boolean {
 
 /** True when some order of the committed transactions turns `before` into the observed state. */
 function someOrderExplains(before: Model, committed: readonly (readonly TxOp[])[], observed: Model, keys: readonly ItemKey[]): boolean {
-	const target = stateSignature(observed, keys);
 	return permutations(committed).some((order) => {
 		const candidate = cloneModel(before);
-		return order.every((ops) => applyWhenPremisesHold(candidate, ops)) && stateSignature(candidate, keys) === target;
+		return order.every((ops) => applyWhenPremisesHold(candidate, ops)) && stateAgrees(candidate, observed, keys);
 	});
 }
 
@@ -1059,6 +1124,11 @@ class ContendingTransactWrites implements fc.AsyncCommand<Model, FokosDB> {
 			`no order of the committed transactions leaves the state the batch left\n${this.describe(before, observed, outcomes)}`,
 		).toBe(true);
 		// The observed state agrees with an order of the batch, so the run goes on from it.
+		for (const key of this.keys) {
+			if (!observed.items.has(keyId(key))) {
+				applyDelete(m, key);
+			}
+		}
 		m.items = observed.items;
 
 		const replayed = this.transactions[this.replayIndex];

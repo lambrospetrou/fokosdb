@@ -559,6 +559,80 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
+	// A late copy of the prepare of a committed transaction must get a conflict, also after a write that
+	// stamps the partition clock removed or created the key. The coordinator clock of the transaction is
+	// ahead of the partition clock, inside maxClockSkewMs.
+	describe("rejects a late prepare of a committed transaction", () => {
+		const X = { hashKey: kb("x"), sortKey: KeyCodec.encodeOptional(undefined) };
+		const aheadTs = (BASE_NOW + 1_500) * TX_ORDER_TS_UNITS_PER_MS;
+
+		function commitAhead(participant: TransactionParticipant, item: Omit<TransactionItem, "opIndex">): PrepareRequest {
+			const request = prepareReq({ transactionTimestamp: aheadTs, items: [item] });
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(participant.commitLocal(request).response).toEqual({ outcome: "committed" });
+			return request;
+		}
+
+		it.each([
+			[
+				"a single-shot delete",
+				(participant: TransactionParticipant) => participant.executeSingleShot({ items: withOpIndex([{ ...X, operation: "delete" }]) }),
+			],
+			// The single-item delete of PartitionDO: one deleteItem at the partition clock.
+			[
+				"a single-item delete",
+				(_p: TransactionParticipant, store: PartitionStore) =>
+					store.deleteItem({ hk: X.hashKey, sk: X.sortKey, txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS }),
+			],
+		])("after the transaction put X and %s removed it", async (_name, deleteX) => {
+			await withParticipant(({ participant, store }) => {
+				const request = commitAhead(participant, { ...X, operation: "put", data: "from-tx", kind: "text" });
+				deleteX(participant, store);
+				expect(store.getItem(X.hashKey, X.sortKey).row).toBeUndefined();
+
+				expect(participant.prepareLocal(request)).toMatchObject({
+					outcome: "rejected",
+					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
+				});
+				expect(store.getItem(X.hashKey, X.sortKey).row).toBeUndefined();
+			});
+		});
+
+		it.each([
+			[
+				"a single-shot put",
+				(participant: TransactionParticipant) =>
+					participant.executeSingleShot({ items: withOpIndex([{ ...X, operation: "put", data: "new", kind: "text" }]) }),
+			],
+			// The single-item put of PartitionDO: one upsertItem at the partition clock.
+			[
+				"a single-item put",
+				(_p: TransactionParticipant, store: PartitionStore) =>
+					store.upsertItem({
+						hk: X.hashKey,
+						sk: X.sortKey,
+						data: "new",
+						kind: "text",
+						ttlAt: null,
+						txOrderTs: BASE_NOW * TX_ORDER_TS_UNITS_PER_MS,
+					}),
+			],
+		])("after the transaction deleted X and %s created it again", async (_name, putX) => {
+			await withParticipant(({ participant, store }) => {
+				store.upsertItem({ hk: X.hashKey, sk: X.sortKey, data: "old", kind: "text", ttlAt: null, txOrderTs: 1 });
+				const request = commitAhead(participant, { ...X, operation: "delete" });
+				putX(participant, store);
+				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ data: "new", v: 2, last_read_ts: aheadTs });
+
+				expect(participant.prepareLocal(request)).toMatchObject({
+					outcome: "rejected",
+					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
+				});
+				expect(store.getItem(X.hashKey, X.sortKey).row?.data).toBe("new");
+			});
+		});
+	});
+
 	it("rejects every operation with clock_skew when the transaction timestamp is too far ahead of the injected clock", async () => {
 		await withParticipant(({ participant, clock }) => {
 			const skewed = prepareReq({
@@ -664,11 +738,11 @@ describe("TransactionParticipant - commit", () => {
 			expect(put).toMatchObject({ data: "new-value", ttl_epoch_utc_seconds: 777, last_read_ts: commitTs, last_write_ts: commitTs });
 			expect(commit.promotionCandidates).toEqual([{ hashKey: kb("to-put"), keyEstBytes: expect.any(Number) }]);
 
-			// delete: row gone, the deletion watermark advanced to the commit timestamp, and the
-			// delete revision counted the removed row.
+			// delete: row gone, the deletion watermark advanced to the commit timestamp, and
+			// max_deleted_v recorded the v of the removed row.
 			expect(store.getItem(kb("to-delete"), KeyCodec.encodeOptional(undefined)).row).toBeUndefined();
 			expect(store.getMaxDeleteTxOrderTs()).toBe(commitTs);
-			expect(store.getDeletionMetadata().deleteRevision).toBe(1);
+			expect(store.getDeletionMetadata().maxDeletedV).toBe(1);
 
 			// check: data untouched, only the read watermark advanced.
 			expect(store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row).toMatchObject({
@@ -681,7 +755,7 @@ describe("TransactionParticipant - commit", () => {
 			expect(store.listPendingTxKeys(request.transactionId).length).toBe(0);
 
 			// A commit retry finds no locks and applies nothing a second time: every timestamp and
-			// the delete revision stay exactly where the first commit left them.
+			// both deletion-metadata values stay exactly where the first commit left them.
 			const afterCommit = {
 				put: store.getItem(kb("to-put"), KeyCodec.encodeOptional(undefined)).row,
 				check: store.getItem(kb("to-check"), KeyCodec.encodeOptional(undefined)).row,
@@ -940,15 +1014,13 @@ describe("TransactionParticipant - readForTransaction", () => {
 
 			invariant(before.found && after.found);
 			expect(before.ttlAt).toBe(777);
-			// The delete revision does not change for an overwrite, so it cannot see this write at all.
-			expect(before.deleteRevision).toBe(after.deleteRevision);
-			// `v` does, which is why it is the primary conflict datum.
+			// `v` moves, which is why it is the conflict datum of a found item.
 			expect(before.version).toBe(1);
 			expect(after.version).toBe(2);
 		});
 	});
 
-	it("echoes canonical KeyBytes and returns data, deleteRevision, and hasPendingWrite per item", async () => {
+	it("echoes canonical KeyBytes and returns data, maxDeletedV of an absent item, and hasPendingWrite per item", async () => {
 		await withParticipant(({ participant, store }) => {
 			store.upsertItem({
 				hk: kb("existing"),
@@ -982,18 +1054,43 @@ describe("TransactionParticipant - readForTransaction", () => {
 					kind: "text",
 					version: 1,
 					ttlAt: undefined,
-					deleteRevision: 0,
 					hasPendingWrite: false,
 				},
 				{
 					found: false,
 					hashKey: kb("locked-absent"),
 					sortKey: ABSENT,
-					deleteRevision: 0,
+					maxDeletedV: 0,
 					hasPendingWrite: true,
 				},
-				{ found: false, hashKey: kb("missing"), sortKey: ABSENT, deleteRevision: 0, hasPendingWrite: false },
+				{ found: false, hashKey: kb("missing"), sortKey: ABSENT, maxDeletedV: 0, hasPendingWrite: false },
 			]);
+		});
+	});
+
+	it("reports the max_deleted_v of the partition for an absent item, and a delete of another item raises it", async () => {
+		await withParticipant(({ participant, store }) => {
+			const sk = KeyCodec.encodeOptional(undefined);
+			const read = () =>
+				participant.readForTransactionLocal({
+					items: [
+						{ hashKey: kb("found"), sortKey: sk },
+						{ hashKey: kb("absent"), sortKey: sk },
+					],
+				}).items;
+			store.upsertItem({ hk: kb("found"), sk, data: "f", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+			store.upsertItem({ hk: kb("other"), sk, data: "o", kind: "text", ttlAt: null, txOrderTs: 1 });
+
+			const before = read();
+			store.deleteItem({ hk: kb("other"), sk, txOrderTs: 2 });
+			const after = read();
+
+			// The found item carries no delete value, so the delete of another item leaves it unchanged.
+			expect(after[0]).toEqual(before[0]);
+			expect(after[0]).not.toHaveProperty("maxDeletedV");
+			expect(before[1]).toMatchObject({ found: false, maxDeletedV: 0 });
+			expect(after[1]).toMatchObject({ found: false, maxDeletedV: 2 });
 		});
 	});
 

@@ -45,7 +45,7 @@ export type FokosDBHostPage =
 	| {
 			stream: "pending_tx";
 			pendingTransactions: PendingTxItem[];
-			deletionMetadata: { maxDeleteTxOrderTs: number; deleteRevision: number };
+			deletionMetadata: { maxDeleteTxOrderTs: number; maxDeletedV: number };
 	  };
 
 export type FokosMigrationHostDeps = {

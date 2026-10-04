@@ -119,16 +119,27 @@ const arbScenario = fc.record({ seed: arbSeed, requests: fc.array(arbRequest, { 
 /** Runs the write sequence against the database and returns the state it must leave behind. */
 async function applySeed(db: FokosDB, ops: readonly SeedOp[]): Promise<QueryModel> {
 	const model: QueryModel = new Map();
+	// The last version of each removed key. A create starts at `max_deleted_v + 1` of its partition,
+	// so the test knows only that it is above every earlier version of the key.
+	const removedVersions = new Map<string, number>();
 	for (const op of ops) {
 		const id = itemId(op.hashKey, op.sortKey);
 		if (op.op === "put") {
-			const version = (model.get(id)?.version ?? 0) + 1;
 			const res = await db.putItem({ hashKey: op.hashKey, sortKey: op.sortKey, data: op.data });
-			expect(res.version).toBe(version);
-			recordItem(model, op.hashKey, op.sortKey, op.data, version);
+			const current = model.get(id);
+			if (current === undefined) {
+				expect(res.version).toBeGreaterThan(removedVersions.get(id) ?? 0);
+			} else {
+				expect(res.version).toBe(current.version + 1);
+			}
+			recordItem(model, op.hashKey, op.sortKey, op.data, res.version);
 		} else {
 			const res = await db.deleteItem({ hashKey: op.hashKey, sortKey: op.sortKey });
-			expect(res.deleted).toBe(model.has(id));
+			const current = model.get(id);
+			expect(res.deleted).toBe(current !== undefined);
+			if (current !== undefined) {
+				removedVersions.set(id, current.version);
+			}
 			model.delete(id);
 		}
 	}

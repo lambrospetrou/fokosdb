@@ -359,7 +359,7 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 		});
 	});
 
-	it("item can be re-created after deletion (version resets to 1)", async ({ expect }) => {
+	it("item can be re-created after deletion, and its version starts above the last one", async ({ expect }) => {
 		const { ctx, rpc } = makeStub();
 
 		await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "v1", kind: "text" as const });
@@ -367,10 +367,11 @@ describe.concurrent("PartitionDO - deleteItem", () => {
 		await rpc.apiDeleteItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") });
 		const result = await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk"), data: "fresh", kind: "text" as const });
 
-		expect(result).toMatchObject({ outcome: "ok", version: 1 });
+		// The version of a key never repeats: the recreate starts above the last version, 2.
+		expect(result).toMatchObject({ outcome: "ok", version: 3 });
 		expect(await rpc.apiGetItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk") })).toMatchObject({
 			found: true,
-			item: { data: "fresh", version: 1 },
+			item: { data: "fresh", version: 3 },
 		});
 	});
 

@@ -661,12 +661,24 @@ const sqlMigrations: SQLSchemaMigration[] = [
 
             CREATE INDEX IF NOT EXISTS pending_transactions_transaction_id ON pending_transactions (transaction_id, hk, sk);
 
+            -- deletion_metadata: one row (id = 1) with the delete values of the whole partition. The values stay after the
+            -- delete of an item row, so they describe keys that have no row.
+            --
+            -- max_delete_tx_order_ts : the highest transaction order timestamp of a delete or of a TTL expiry, and at least
+            --                          the last_read_ts of each removed row. The prepare of an absent item rejects a
+            --                          transaction timestamp that is not greater than this value. A new item row starts with
+            --                          last_read_ts and last_write_ts at least this value. Thus the timestamp watermark of a
+            --                          key never goes down, and a late prepare of a committed transaction gets a conflict.
+            -- max_deleted_v          : the highest v of an item row that a delete or a TTL expiry removed. A new item row
+            --                          starts at max_deleted_v + 1, so the v of a key never repeats, also after a delete and a
+            --                          recreate. A read transaction compares this value for an item that is absent in both
+            --                          phases. A read compares v for an item that is found in both phases.
             CREATE TABLE IF NOT EXISTS deletion_metadata (
                 id                     INTEGER PRIMARY KEY CHECK (id = 1),
                 max_delete_tx_order_ts INTEGER NOT NULL DEFAULT 0,
-                delete_revision        INTEGER NOT NULL DEFAULT 0
+                max_deleted_v          INTEGER NOT NULL DEFAULT 0
             ) STRICT;
-            INSERT OR IGNORE INTO deletion_metadata (id, max_delete_tx_order_ts, delete_revision) VALUES (1, 0, 0);`,
+            INSERT OR IGNORE INTO deletion_metadata (id, max_delete_tx_order_ts, max_deleted_v) VALUES (1, 0, 0);`,
 	},
 	{
 		idMonotonicInc: 3,
@@ -829,8 +841,8 @@ export class PartitionStore {
 
 	/**
 	 * The row's currently stored `est_row_bytes`, or 0 when the row is absent. `upsertItem` and
-	 * `deleteItem` both need it to compute the `key_size_estimates` delta, and it is the only read
-	 * either of them does, so it sits on both write paths.
+	 * `updateItemSingleShot` need it to compute the `key_size_estimates` delta. `deleteItem` reads the
+	 * size together with the `v` and the `last_read_ts` of the row, so it does not use this read.
 	 *
 	 * `INDEXED BY idx_items_scan` is a deliberate plan pin, not decoration. `idx_items_scan
 	 * (hk, sk, est_row_bytes)` covers this query exactly, but SQLite prefers
@@ -840,7 +852,7 @@ export class PartitionStore {
 	 *   without the hint: SEARCH items USING INDEX sqlite_autoindex_items_1 (hk=? AND sk=?)
 	 *   with the hint:    SEARCH items USING COVERING INDEX idx_items_scan (hk=? AND sk=?)
 	 *
-	 * The hint removes that table-row fetch from every put and every delete. It saves page reads, not
+	 * The hint removes that table-row fetch from every put. It saves page reads, not
 	 * billed rows — SQLite reports one row read either way. `INDEXED BY` makes the dependency on
 	 * `idx_items_scan` hard: dropping or renaming that index fails this query loudly rather than
 	 * silently regressing both write paths. A query-plan test asserts the pin still works AND that it
@@ -926,18 +938,25 @@ export class PartitionStore {
 		//
 		// bumpItemReadTs applies the same rule to the read watermark alone, for the transactional
 		// "check" operation.
+		//
+		// A new row starts at max_deleted_v + 1 with its stamps at least max_delete_tx_order_ts, so its v
+		// and its timestamp watermark never go below those of an earlier, deleted row of the key. The
+		// conflict branch uses ?5 and not `excluded`, because `excluded` holds the stamps of the insert
+		// branch, which include the partition delete timestamp.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
 			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-			 SELECT ?1, ?2, ?3, ?4, 1, ?5, ?5, ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
-			 WHERE ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
+			 SELECT ?1, ?2, ?3, ?4, d.max_deleted_v + 1, MAX(?5, d.max_delete_tx_order_ts), MAX(?5, d.max_delete_tx_order_ts),
+			        ${estRowBytesExpr(dataExpr, "?1", "?2")}, ${dataExpr}
+			   FROM deletion_metadata AS d
+			  WHERE d.id = 1 AND ${estRowBytesExpr(dataExpr, "?1", "?2")} <= ?7
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   est_row_bytes = excluded.est_row_bytes,
 			   v = v + 1,
-			   last_read_ts = MAX(last_read_ts, excluded.last_read_ts),
-			   last_write_ts = MAX(last_write_ts, excluded.last_write_ts)
+			   last_read_ts = MAX(last_read_ts, ?5),
+			   last_write_ts = MAX(last_write_ts, ?5)
 			 RETURNING v, est_row_bytes`,
 			opts.hk,
 			opts.sk,
@@ -977,24 +996,32 @@ export class PartitionStore {
 	 * Deletes an item, keeping the deletion metadata and key-size estimate consistent.
 	 * `bumpTxOrderTsAlways` gives the transactional-delete behavior: it advances the transaction order watermark and
 	 * the estimate even when the row was already absent. The non-transactional path updates them only
-	 * when the statement deleted a row. `delete_revision` advances only when a row was removed;
-	 * `max_delete_tx_order_ts` also advances for an absent row when `bumpTxOrderTsAlways`.
-	 * The metrics cover the DELETE statement ONLY.
+	 * when the statement deleted a row. `max_deleted_v` advances only when a row was removed, because
+	 * an absent row has no `v`; `max_delete_tx_order_ts` also advances for an absent row when
+	 * `bumpTxOrderTsAlways`. The metrics cover the DELETE statement ONLY.
 	 */
 	deleteItem(opts: { hk: KeyBytes; sk: KeyBytes; txOrderTs: number; bumpTxOrderTsAlways?: boolean }): {
 		deleted: boolean;
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		const delEst = this.#storedEstRowBytes(opts.hk, opts.sk);
+		// One read gives the size and the values that the deletion metadata records. The DELETE runs in
+		// the same synchronous call, so it removes this same row. Do not move the read into a RETURNING
+		// clause of the DELETE: RETURNING adds one row read to each delete, also when no row exists.
+		const before = tryOne(
+			this.#storage.sql.exec<{ est_row_bytes: number; v: number; last_read_ts: number }>(
+				`SELECT est_row_bytes, v, last_read_ts FROM items WHERE hk = ? AND sk = ?`,
+				opts.hk,
+				opts.sk,
+			),
+		);
+		const delEst = before?.est_row_bytes ?? 0;
 
 		const writeRes = this.#storage.sql.exec(`DELETE FROM items WHERE hk = ? AND sk = ?`, opts.hk, opts.sk);
 		const deleted = writeRes.rowsWritten > 0;
 		if (deleted) {
-			this.#storage.sql.exec(
-				`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?), delete_revision = delete_revision + 1 WHERE id = 1`,
-				opts.txOrderTs,
-			);
+			invariant(before !== undefined, "fokos/partition-store.deleteItem: the DELETE removed a row that the read before it did not find");
+			this.#raiseDeletionMetadata(Math.max(opts.txOrderTs, before.last_read_ts), before.v);
 		} else if (opts.bumpTxOrderTsAlways) {
 			this.bumpMaxDeleteTxOrderTs(opts.txOrderTs);
 		}
@@ -1015,7 +1042,7 @@ export class PartitionStore {
 	deleteExpiredItems(nowSeconds: number, limit: number): { deletedRows: number; deletedBytes: number } {
 		return this.transactionSync(() => {
 			const rows = this.#storage.sql
-				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number }>(
+				.exec<{ hk: ArrayBuffer; est_row_bytes: number; ttl_epoch_utc_seconds: number; v: number; last_read_ts: number }>(
 					`DELETE FROM items
 					 WHERE item_id IN (
 					     SELECT i.item_id FROM items i INDEXED BY idx_items_ttl
@@ -1025,7 +1052,7 @@ export class PartitionStore {
 					      ORDER BY i.ttl_epoch_utc_seconds, i.hk, i.sk
 					      LIMIT ?2
 					 )
-					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds`,
+					 RETURNING hk, est_row_bytes, ttl_epoch_utc_seconds, v, last_read_ts`,
 					nowSeconds,
 					limit,
 				)
@@ -1033,7 +1060,8 @@ export class PartitionStore {
 
 			const bytesByHashKey = new Map<string, { hk: KeyBytes; bytes: number }>();
 			let deletedBytes = 0;
-			let maxExpirySeconds = 0;
+			let maxDeleteTxOrderTs = 0;
+			let maxDeletedV = 0;
 			for (const row of rows) {
 				const hk = fromSqlKey(row.hk);
 				const key = hk.toBase64({ alphabet: "base64url" });
@@ -1044,16 +1072,18 @@ export class PartitionStore {
 					bytesByHashKey.set(key, { hk, bytes: row.est_row_bytes });
 				}
 				deletedBytes += row.est_row_bytes;
-				maxExpirySeconds = Math.max(maxExpirySeconds, row.ttl_epoch_utc_seconds);
+				maxDeleteTxOrderTs = Math.max(maxDeleteTxOrderTs, row.ttl_epoch_utc_seconds * 1000 * TX_ORDER_TS_UNITS_PER_MS, row.last_read_ts);
+				maxDeletedV = Math.max(maxDeletedV, row.v);
 			}
 
 			for (const { hk, bytes } of bytesByHashKey.values()) {
 				this.#subtractKeySizeEstimate(hk, bytes);
 			}
-			// The sweep reclaims rows whose logical deletion happened at expiry, so it advances the
-			// transaction order watermark only and never touches delete_revision.
+			// The logical delete of an expired row happened at its expiry. The sweep records the removed
+			// rows the same as a user delete, so a later create of the key starts above their v and their
+			// stamps.
 			if (rows.length > 0) {
-				this.bumpMaxDeleteTxOrderTs(maxExpirySeconds * 1000 * TX_ORDER_TS_UNITS_PER_MS);
+				this.#raiseDeletionMetadata(maxDeleteTxOrderTs, maxDeletedV);
 			}
 
 			return { deletedRows: rows.length, deletedBytes };
@@ -1536,21 +1566,23 @@ export class PartitionStore {
 		// The source is a LEFT JOIN over items, so the document expression reads the stored row when
 		// there is one and the empty pre-image when there is not, and one statement covers both. The
 		// WHERE clause holds the size guard: when it removes the source row, neither branch runs and the
-		// statement returns nothing.
+		// statement returns nothing. The one deletion_metadata row gives the start values of a new row,
+		// with the same rules and the same reason as upsertItem.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
 			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, 1, ${txOrderTsParam}, ${txOrderTsParam},
+			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, d.max_deleted_v + 1,
+			        MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
 			        ${estRowBytesExpr(docExpr, hkParam, skParam)}, ${docExpr}
-			   FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ${hkParam} AND i.sk = ${skParam}
-			  WHERE ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
+			   FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hk = ${hkParam} AND i.sk = ${skParam}
+			  WHERE d.id = 1 AND ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
 			 ON CONFLICT(hk, sk) DO UPDATE SET
 			   data = excluded.data,
 			   data_kind = excluded.data_kind,
 			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
 			   est_row_bytes = excluded.est_row_bytes,
 			   v = v + 1,
-			   last_read_ts = MAX(last_read_ts, excluded.last_read_ts),
-			   last_write_ts = MAX(last_write_ts, excluded.last_write_ts)
+			   last_read_ts = MAX(last_read_ts, ${txOrderTsParam}),
+			   last_write_ts = MAX(last_write_ts, ${txOrderTsParam})
 			 RETURNING v, est_row_bytes`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
@@ -1794,34 +1826,40 @@ export class PartitionStore {
 	}
 
 	/**
-	 * The delete revision a transactional read reports for `hk`. The hash key parameter is not used yet,
-	 * but it will be used when we have per-bucket revision; today one partition-wide counter serves every key.
+	 * Raises both deletion-metadata values with MAX in one statement. After a delete, `maxDeleteTxOrderTs`
+	 * is the highest of the delete timestamps and of the `last_read_ts` of the removed rows, and
+	 * `maxDeletedV` is the highest `v` of the removed rows.
 	 */
-	deleteRevisionFor(_hk: KeyBytes): number {
-		return (
-			tryOne(this.#storage.sql.exec<{ delete_revision: number }>(`SELECT delete_revision FROM deletion_metadata WHERE id = 1`))
-				?.delete_revision ?? 0
+	#raiseDeletionMetadata(maxDeleteTxOrderTs: number, maxDeletedV: number): void {
+		this.#storage.sql.exec(
+			`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?), max_deleted_v = MAX(max_deleted_v, ?) WHERE id = 1`,
+			maxDeleteTxOrderTs,
+			maxDeletedV,
 		);
 	}
 
-	/** Both deletion-metadata values in one read: the migration metadata RPC serves them together. */
-	getDeletionMetadata(): { maxDeleteTxOrderTs: number; deleteRevision: number } {
+	/** The `max_deleted_v` that a transactional read reports for an absent item. */
+	getMaxDeletedV(): number {
+		return (
+			tryOne(this.#storage.sql.exec<{ max_deleted_v: number }>(`SELECT max_deleted_v FROM deletion_metadata WHERE id = 1`))
+				?.max_deleted_v ?? 0
+		);
+	}
+
+	/** Both deletion-metadata values in one read: each `pending_tx` migration page carries them. */
+	getDeletionMetadata(): { maxDeleteTxOrderTs: number; maxDeletedV: number } {
 		const row = tryOne(
 			this.#storage.sql.exec<{
 				max_delete_tx_order_ts: number;
-				delete_revision: number;
-			}>(`SELECT max_delete_tx_order_ts, delete_revision FROM deletion_metadata WHERE id = 1`),
+				max_deleted_v: number;
+			}>(`SELECT max_delete_tx_order_ts, max_deleted_v FROM deletion_metadata WHERE id = 1`),
 		);
-		return { maxDeleteTxOrderTs: row?.max_delete_tx_order_ts ?? 0, deleteRevision: row?.delete_revision ?? 0 };
+		return { maxDeleteTxOrderTs: row?.max_delete_tx_order_ts ?? 0, maxDeletedV: row?.max_deleted_v ?? 0 };
 	}
 
 	/** Migration ingest: idempotent, merges both values with MAX. */
-	mergeDeletionMetadata(meta: { maxDeleteTxOrderTs: number; deleteRevision: number }): void {
-		this.#storage.sql.exec(
-			`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?), delete_revision = MAX(delete_revision, ?) WHERE id = 1`,
-			meta.maxDeleteTxOrderTs,
-			meta.deleteRevision,
-		);
+	mergeDeletionMetadata(meta: { maxDeleteTxOrderTs: number; maxDeletedV: number }): void {
+		this.#raiseDeletionMetadata(meta.maxDeleteTxOrderTs, meta.maxDeletedV);
 	}
 
 	// ─── key_size_estimates ─────────────────────────────────────────────────

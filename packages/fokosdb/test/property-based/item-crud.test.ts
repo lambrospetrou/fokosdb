@@ -15,13 +15,13 @@ import {
 	arbItemKey,
 	arbRun,
 	DeleteItem,
+	emptyModel,
 	expectedDataKind,
 	GetItem,
 	makeTestDB,
 	prefixHashKey,
 	propertyRuns,
 	PutItem,
-	type Model,
 } from "./harness.js";
 
 // Every property runs the scenario many times against real Durable Objects, and a shrink runs it
@@ -33,18 +33,17 @@ const PROPERTY_TIMEOUT_MS = PROPERTY_RUNS * 4_000;
 describe("FokosDB item CRUD — stateless properties", () => {
 	it("put then get returns the same key, data, kind and version for any key and data", { timeout: PROPERTY_TIMEOUT_MS }, async () => {
 		// One table serves every run. The prefix is drawn outside the arbitrary, so a shrink replay
-		// gets a fresh hash key too, and the version:1 assertions below stay honest.
+		// gets a fresh hash key too. The runs delete items, so a new item starts above version 1.
 		const db = makeTestDB();
 		await fc.assert(
 			fc.asyncProperty(arbItemKey, arbItemData, async (rawKey, data) => {
 				const key = { ...rawKey, hashKey: prefixHashKey(crypto.randomUUID(), rawKey.hashKey) };
 
 				const put = await db.putItem({ ...key, data });
-				expect(put.version).toBe(1);
 
 				const get = await db.getItem(key);
 				assert(get.found);
-				expect(get.item).toMatchObject({ ...key, kind: expectedDataKind(data), version: 1 });
+				expect(get.item).toMatchObject({ ...key, kind: expectedDataKind(data), version: put.version });
 				// `toMatchObject` matches a SUBSET of an object value, so the data is compared exactly.
 				expect(get.item.data).toEqual(data);
 
@@ -77,7 +76,7 @@ describe("FokosDB item CRUD — model-based property", () => {
 				for (const key of run.keys) {
 					await db.deleteItem(key);
 				}
-				const setup = () => ({ model: { items: new Map() } as Model, real: db });
+				const setup = () => ({ model: emptyModel(), real: db });
 				await fc.asyncModelRun(setup, run.cmds);
 			}),
 			{ numRuns: PROPERTY_RUNS },
