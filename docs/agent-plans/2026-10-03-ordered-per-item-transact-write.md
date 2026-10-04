@@ -186,8 +186,8 @@ coordinator handles a prepare error that a retry cannot clear.
    version-reference check of the client. Add the mode to the fingerprint, expose the mode in the HTTP example, and
    update the public documentation. Sections 4.2.1, 4.2.2, and 4.2.9.
 6. **Cross-path tests.** Add the tests of section 4.2.16.
-7. **Fatal prepare errors.** Make `prepareRetry` stop on a `FokosValidationError`. Make `runPrepareRecovery` cancel a
-   transaction when a participant stored such an error. Section 4.2.17.
+7. **Fatal prepare errors.** Make `prepareRetry` stop on a `FokosValidationError`. Keep the first stored fatal error.
+   Make `runPrepareRecovery` check for it before and after its fan-out, and cancel the transaction. Section 4.2.17.
 
 Until milestone 7 ships, the coordinator retries a prepare that fails the version-reference check of the
 partition. A recovery drive then keeps the transaction in `PREPARING` until `maxPreparingHoldMs`. The transaction
@@ -911,8 +911,14 @@ The results:
 - The commit of "10 items × 2 operations, 380 KB" gave 31 ms in one run and 113 ms in the other. The other cells
   changed by at most 15 ms between the two runs.
 - The pricing page of Durable Objects does not say if a rolled-back row counts as a row written. In the worst case,
-  each temporary write counts. One temporary write writes about 2 rows, the item and its `key_size_estimates` row,
-  so one evaluate block writes at most about 200 rows. They cost $0.0002 at $1.00 for each million rows.
+  each temporary write counts. The
+  [storage API](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/) counts each index update
+  as another row write. The item and its `key_size_estimates` row are not the full count.
+  A first put without a TTL writes five entries: the item, its two indexes, the size estimate, and its index.
+  With a TTL, the `idx_items_ttl` entry adds one more write. A repeated request can put 100 times over 99 absent items.
+  Its 99 first inserts alone write 495 entries, or $0.000495 at $1.00 for each million rows. This is an example,
+  not an upper bound. The operation and the index changes decide the count. A delete also writes deletion metadata.
+  Any billing estimate must include these writes. The charge for rolled-back writes remains unknown.
 
 The local runtime is not the production runtime. These numbers compare the steps with each other, and they do not
 predict the latency in production. Section 4.2.14.3 gives the cost of a rollback in production.
@@ -1076,30 +1082,48 @@ In the current code, a prepare can raise these validation errors: `item_too_larg
 `partition_context_options_invalid`, and the key-encoding errors of `KeyCodec`. Each one gives the same answer for the
 same request.
 
+**Stored fatal errors.** A stored fatal error must survive a restart and every concurrent drive. The current
+`storePrepareError` replaces `error_json` while the participant has no answer. Recovery sends that participant's
+prepare again before it checks the error. A transport failure can then replace the fatal error. The transaction
+stays in `PREPARING` and keeps the other participants' locks until the hold deadline.
+
 **The changes.**
 
 1. `prepareRetry` returns `false` from `shouldRetry` when `FokosValidationError.is(err)` is true, as it does now for
    `partition_over_size`. `drivePrepare` and `runPrepareRecovery` both use `prepareRetry`, so one change covers both
    drives.
-2. `runPrepareRecovery` cancels when a participant has a fatal error. After its fan-out, it reads each participant
-   whose `prepare_outcome` is NULL, and it builds the stored error from `error_json` with `FokosError.fromWire`. When
-   `FokosValidationError.is` is true for one of them, the transaction goes to `cancelTransactionInStore` and
-   `runCancel`, the same as for `anyRejected`.
-3. `drivePrepare` does not change. It already cancels when a participant did not accept.
+2. `storePrepareError` keeps the first stored fatal error. It writes only while the transaction is `PREPARING` and
+   the participant has no answer. When `error_json` is not NULL, it builds the error with `FokosError.fromWire`.
+   When `FokosValidationError.is` is true, it writes nothing. Otherwise, it can store the new error or replace a
+   transient error. The stored-error check and the update run in one `transactionSync`, with no `await` between them.
+3. `storePrepareAnswer` also checks the stored error inside its current `transactionSync`. When that error is fatal,
+   it writes no answer or image. The participant keeps its NULL `prepare_outcome`. Thus a concurrent answer cannot
+   hide the fatal error or let `markCommitting` record a commit decision. An answer stored before an error keeps
+   its current protection: `storePrepareError` writes nothing when `prepare_outcome` is not NULL.
+4. `runPrepareRecovery` checks for a stored fatal error before it starts any prepare RPC. It checks each participant
+   whose `prepare_outcome` is NULL, through `FokosError.fromWire` and `FokosValidationError.is`. When it finds one,
+   it calls `cancelTransactionInStore` and `runCancel`, then returns without a prepare fan-out. Otherwise, it runs
+   the fan-out and reads the participants again. A stored fatal error then causes the same cancel as `anyRejected`.
+   The first check handles a restart. The second check handles an error from this fan-out or a concurrent drive.
+5. `drivePrepare` keeps its current cancellation path. It already cancels when a participant did not accept.
 
 **Why the cancel is safe.**
 
-- The transaction is in `PREPARING`, so no participant has committed. `markCommitting` needs an accepted answer from
-  every participant, so a participant with a fatal error already blocks the commit decision.
-- `storePrepareError` writes `error_json` only while the state is `PREPARING` and the participant has no answer.
+- The transaction is in `PREPARING`, so no participant has committed. A participant with a stored fatal error keeps
+  its NULL outcome. `markCommitting` needs an accepted answer from every participant, so that error blocks commit.
+- A concurrent error or answer cannot replace a stored fatal error. Its code and `error_id` stay unchanged until
+  `cancelTransactionInStore` copies them into the final results.
+- The decision guards stay unchanged. `cancelTransactionInStore` changes only `PREPARING`, and `runCancel` sends
+  only in `CANCELLING`. A recovery drive that lost to a commit decision sends no cancel.
 - A router can lock the keys of one child and then throw the error of another child. `runCancel` sends a cancel to
   every participant without a cancel outcome, a participant with no answer included. Thus the cancel releases those
   locks.
 
 **The result for the caller.** `cancelTransactionInStore` gives each operation of the participant the stored code and
-`error_id` (`participantFailure`). The caller gets `FokosTransactionCancelledError`, and the results carry the code,
-for example `transact_version_after_write`. The single-partition path does not change. `db.ts` does not retry it, and
-it reports the error as a cancelled transaction.
+`error_id` (`participantFailure`). For a fatal error, these are the code and `error_id` of the first stored fatal error.
+The caller gets `FokosTransactionCancelledError`, and the results carry the code, for example
+`transact_version_after_write`. The single-partition path does not change. `db.ts` does not retry it, and it reports
+the error as a cancelled transaction.
 
 **Tests.**
 
@@ -1107,6 +1131,16 @@ it reports the error as a cancelled transaction.
   results carry the code and the `error_id`.
 - A recovery drive that gets a `FokosValidationError` cancels at once, before `maxPreparingHoldMs`. The cancel
   releases the locks of the participants that accepted.
+- A restart leaves a stored fatal error and an accepted participant's locks in `PREPARING`. Recovery sends no prepare,
+  cancels the transaction, and releases those locks. The final results keep the fatal code and `error_id`.
+- After a fatal error is stored, a concurrent drive returns a transport error or another validation error.
+  `storePrepareError` keeps the first fatal error, with its code and `error_id`. Recovery cancels without another
+  prepare.
+- A concurrent prepare answer after a stored fatal error changes no outcome or image. `markCommitting` writes nothing.
+- An answer stored before an error keeps its outcome. An error that arrives after the decision changes nothing.
+- A transient stored error can be replaced by a fatal error. The recovery check after the fan-out cancels the
+  transaction.
+- A recovery drive that lost to a concurrent commit decision sends no cancel.
 - A `FokosExpressionError` and a `partition_migrating` error are still retried.
 
 ## 5. Alternative options

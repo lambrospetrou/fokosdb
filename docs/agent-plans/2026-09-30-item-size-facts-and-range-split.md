@@ -12,6 +12,8 @@
   - [4.1 High-level overview](#41-high-level-overview)
   - [4.2 Technical details](#42-technical-details)
   - [4.3 Open questions](#43-open-questions)
+    - [4.3.1 Summary index and activation](#431-summary-index-and-activation)
+    - [4.3.2 Planner scan and the CPU limit](#432-planner-scan-and-the-cpu-limit)
 - [5. Alternative options](#5-alternative-options)
 - [6. Frequently asked questions](#6-frequently-asked-questions)
 - [7. References](#7-references)
@@ -184,6 +186,7 @@ A write that admission rejects must get its error without a scan of the items.
 6. A migration retry must contribute facts only for rows that it inserts.
 7. The planner must read a complete owned slice and its summary in one `transactionSync` snapshot.
 8. With at least `N` distinct items, the planner must produce `N` non-empty children.
+   An empty child is a partition with no item, and its boundaries separate no keys.
 9. Each boundary must separate adjacent keys in canonical byte order.
 10. Storage-model changes must not reprice old items only when later writes touch them.
 11. Size and count scans must remain index-only. They must not read item data for size accounting.
@@ -200,6 +203,8 @@ Deliver the complete change as one milestone. No delivery dates are specified.
    The milestone edits the existing schema migration in place (section 4.2.11).
    The planner change of section 4.2.8 and the split decision of section 4.2.9 ship together.
    This prevents the retry loop that section 4.2.9 describes.
+
+Section 4.3 has open questions. They must be closed before the milestone starts.
 
 ## 4. Proposed solution
 
@@ -314,6 +319,10 @@ An import has partial facts until its data is complete.
 A source can retain copies after ownership moves. Its summary follows the existing completion and cleanup lifecycle.
 Those copies must not become a new owned slice for the range planner.
 
+A summary row represents the rows of its key only while the row exists.
+A promotion deletes the summary row of its key in `beforeComplete`, but the copies stay until the cleanup.
+After that point, the summary does not represent those copies.
+
 The summary remains keyed by `hk`.
 A single-key total lookup reads one summary row, without an item scan.
 
@@ -387,6 +396,12 @@ Findings:
 - The current estimate is 2.6 times too low for a 408-byte key and 100-byte data.
 - Rows of about 1 KB to 1.5 KB fill a 4,096-byte page badly. They add 300 to 1,200 bytes of page waste for each row.
   The model does not represent this waste. Rows of mixed sizes reduce it.
+- For 1,000-byte data, the model is too low by about 20% to 23%.
+  With a 16-byte key, the model gives 1,101 bytes and the measurement gives 1,429 bytes.
+  With a 408-byte key, the model gives 2,473 bytes and the measurement gives 3,076 bytes.
+- A range boundary uses only the relative weights of the rows in one slice. Thus the same error on each row
+  changes no boundary. The error moves a boundary only when one slice holds rows of different sizes.
+- The promotion threshold compares an absolute estimate. There, a low estimate promotes a key later.
 - The measurement uses the current schema. The revised scan index also holds `ttl_epoch_utc_seconds`.
   Repeat the measurement after the schema change, and update the initial values if they differ by more than 10%.
 - Local workerd has no replication. Replication does not change the file size.
@@ -418,17 +433,18 @@ It can still need schema or index work. That work must account for the number of
 
 The caller continues to compose atomic operations with `PartitionStore.transactionSync`.
 
-| Operation                  | Required fact change                                            |
-| -------------------------- | --------------------------------------------------------------- |
-| Insert                     | Add the new row facts and increment `item_count`                 |
-| Overwrite or update        | Apply new facts minus old facts; keep `item_count` unchanged     |
-| Delete of an existing item | Subtract the old row facts and decrement `item_count`            |
-| Delete of an absent item   | Change no item facts                                            |
-| TTL sweep                  | Subtract facts for each deleted row, grouped by hash key         |
-| Migration insert           | Add facts only when `insertItemIfAbsent` inserts the row         |
-| Migration retry            | Add no facts for an existing row                                |
-| Source copy cleanup        | Preserve the existing moved-key summary and copy lifecycle       |
-| Metadata-only mutation     | Keep encoded byte facts unchanged unless a modeled fact changes |
+| Operation                      | Required fact change                                                 |
+| ------------------------------ | -------------------------------------------------------------------- |
+| Insert                         | Add the new row facts and increment `item_count`                     |
+| Overwrite or update            | Apply new facts minus old facts; keep `item_count` unchanged         |
+| Delete of an existing item     | Subtract the old row facts and decrement `item_count`                |
+| Delete of an absent item       | Change no item facts                                                 |
+| TTL sweep                      | Subtract facts for each deleted represented row, grouped by hash key |
+| Migration insert               | Add facts only when `insertItemIfAbsent` inserts the row             |
+| Migration retry                | Add no facts for an existing row                                     |
+| Source copy cleanup            | Preserve the existing moved-key summary and copy lifecycle           |
+| Delete of an unrepresented row | Change no item facts                                                 |
+| Metadata-only mutation         | Keep encoded byte facts unchanged unless a modeled fact changes      |
 
 Each write path that changes the summary returns `key_storage_estimate` of section 4.2.4 for that key.
 This covers `upsertItem` and `updateItemSingleShot`, and the `keyEstBytes` that `TransactionParticipant`
@@ -437,8 +453,27 @@ with the same threshold.
 
 When `item_count` of a key becomes 0, delete the summary row of the key in the same statement sequence.
 A key that is written again gets a new summary row from the insert.
-A fact that becomes negative is an `invariant` failure. Do not clamp a fact with `MAX(0, …)`.
-A clamp hides the defect that made the summary and the rows different.
+
+When a delete removes a row whose key has no summary row, the delete changes no item facts.
+The summary did not represent that row, so a subtraction makes the summary wrong.
+This rule applies to every delete path: the TTL sweep, the source cleanup, and the single-item delete.
+The TTL sweep deletes copies of a promoted key, because it does not check the owner of a row.
+It must not create a summary row or a negative fact for such a copy.
+
+When a write would make a fact of an existing summary row negative, the summary and the rows are different.
+A write path must not throw for this case, and it must not clamp the fact with `MAX(0, …)`.
+
+- A throw rolls back the write. On a commit apply, the coordinator in `COMMITTING` then retries forever, and the lock stays.
+- A clamp hides the defect and keeps the wrong summary.
+
+Instead, the write path does these steps in the same storage transaction:
+
+1. Log the defect one time, with the key, the stored facts, and the delta.
+2. After the item change, calculate the facts of the key again from the covering scan index.
+3. Write the calculated facts to the summary row, or delete the row when the key has no item.
+
+The recount reads every row of the key. On a range leaf, that is the complete slice.
+The recount runs only after a defect, so the normal write path does not pay this cost.
 
 A change from null TTL to non-null TTL adds the row to both TTL aggregates.
 The reverse change subtracts it. A TTL timestamp change between non-null values leaves those aggregates unchanged.
@@ -554,12 +589,12 @@ Only `#plan` scans rows. It calls `computeRangeBoundaries` in the alarm, one tim
 If deletes make `C < N` after the decision, the planner returns `null` and waits with backoff.
 This is the current behaviour of `#plan`.
 
-| Case                                          | Before                 | After                          |
-| --------------------------------------------- | ---------------------- | ------------------------------ |
-| A write that admission rejects                | One slice scan         | One count check                |
-| A rejection before the split row exists       | One more slice scan    | One count check                |
-| A rejection at the floor                      | One slice scan         | One count check                |
-| The planner                                   | One slice scan         | One slice scan                 |
+| Case                                    | Before              | After           |
+| --------------------------------------- | ------------------- | --------------- |
+| A write that admission rejects          | One slice scan      | One count check |
+| A rejection before the split row exists | One more slice scan | One count check |
+| A rejection at the floor                | One slice scan      | One count check |
+| The planner                             | One slice scan      | One slice scan  |
 
 The in-memory cache of the floor result (section 4.3.1 of `2026-09-27-over-size-split-trigger.md`) is then not
 necessary. Do not implement it.
@@ -592,7 +627,7 @@ The time is linear in the rows that the scan reads, at about 0.9 µs for each ro
 The JavaScript iteration of the cursor costs about 17 times more than the SQLite index walk.
 A range leaf with 10M rows and `N = 4` blocks the partition for about 7 s on this machine. Production CPUs can be slower.
 Every request of the partition waits for that time. Compare it with the current CPU limit on the Durable Object limits page.
-A scan in chunks over several alarm steps is a separate change.
+A scan in chunks over several alarm steps is a separate change. Section 4.3.2 keeps the CPU limit as an open question.
 
 #### 4.2.10 Extension for supporting tables
 
@@ -642,6 +677,11 @@ Tests must check definitions, not only agreement between two uses of the same es
 - Check migration retries, page grouping, restart, and source copy cleanup.
 - Compare every active aggregate with the corresponding SQL sum and count.
 - Check that transactional prepare and cancel do not add committed-item facts.
+- After `beforeComplete` of a promotion, let the TTL sweep delete an expired copy of the promoted key.
+  Check that the sweep succeeds, creates no summary row, and changes no other summary row.
+- Write a wrong summary row directly with SQL in the test. Then commit a delete of that key.
+  Check that the commit succeeds, the defect log appears one time, and the summary equals the SQL sums again.
+- Every other test treats the defect log as a failure.
 
 **Storage models and size consumers**
 
@@ -691,7 +731,13 @@ This RFC does not change those commands or the test infrastructure.
 
 #### 4.3.1 Summary index and activation
 
-TODO: Select one of the options below for the promotion lookup of section 4.2.5.
+TODO: Select an option for the promotion lookup of section 4.2.5.
+
+Constraints for the selected option:
+
+- The lookup must not use an expression index. Its query must repeat the index expression exactly, and a difference
+  silently removes the index from the plan.
+- The lookup must not use an index that is difficult to change when a model coefficient changes.
 
 `largestKeysAtLeast` returns at most `PROMOTION_CANDIDATES_MAX` (5) hash keys whose `key_storage_estimate` is at or
 above a threshold, largest first. The estimate is an expression over the summary facts, not a stored fact.
@@ -700,7 +746,7 @@ Thus the lookup needs an access path for that expression.
 The current summary table is `WITHOUT ROWID` with `hk` as its primary key. An index entry of such a table contains
 `hk`, so an index on the estimate can answer `SELECT hk` without a table read. Keep this shape for the new summary.
 
-**Option A. Expression index on the summary.**
+**Option A. Expression index on the summary.** The constraints above reject this option.
 
 - Create an index on the model expression of section 4.2.4. The query repeats the same expression.
   One shared constant holds the expression text for the index and the query.
@@ -715,11 +761,18 @@ The current summary table is `WITHOUT ROWID` with `hk` as its primary key. An in
 
 - Keep a column such as `est_bytes` in the summary, and index it as today.
 - Each write path calculates the column from the new facts in the same upsert.
+- An UPSERT `DO UPDATE SET` evaluates each expression with the old column values, not with the values that the same
+  `SET` assigns. Thus the estimate expression must use `col + excluded.col` for each fact.
+  One shared SQL builder must produce this expression for every write path.
 - Write cost: the same as today. Each write path has one more expression to keep correct.
 - Coefficient change: `UPDATE` every summary row. Each changed row is a billed row write.
   An update in batches gives a mixture of old and new values until it ends. That needs a model version column
   and a rule for which version the lookup trusts.
-- Failure mode: a write path with an old or wrong expression stores a wrong value. No check finds it.
+- Failure mode: a write path with an old or wrong expression stores a wrong value.
+  The stored value and its facts are in the same summary row. Thus a test, or a check when the lookup reads the
+  row, can calculate the estimate from the facts and compare.
+- The lookup can calculate the exact estimate from the facts of the rows that it returns.
+  Then a wrong stored value can only change which keys the lookup finds, not the estimate of a returned key.
 
 **Option C. No index.**
 
@@ -730,13 +783,29 @@ The current summary table is `WITHOUT ROWID` with `hk` as its primary key. An in
   The scan with this expression and a top-5 sort is not measured.
 - Failure mode: no wrong value is possible. The cost grows with the number of hash keys in the leaf.
 
+**Option D. Plain indexes on exact facts, in descending order.**
+
+- Index one or more exact facts of the summary in descending order, for example `item_bytes DESC`.
+  A coefficient change does not change these indexes, because the facts do not depend on coefficients.
+- The lookup walks an index from the largest value and calculates the estimate of each row from its facts.
+  It selects the keys at or above the threshold.
+- The lookup needs a stop rule that proves that no later row of the walk reaches the threshold.
+  All coefficients are 0 or more, `key_bytes ≤ item_bytes`, `ttl_key_bytes ≤ key_bytes`, and
+  `ttl_item_count ≤ item_count`. Thus `key_storage_estimate ≤ (1 + key_index_factor + ttl_key_factor) * item_bytes +
+  (base_overhead + ttl_overhead) * item_count`.
+  A stop rule from one index must also limit the `item_count` term.
+- Write cost: one more index entry write for each summary update, for each extra index.
+- Failure mode: a stop rule that is too early misses a key. A stop rule that is too late reads more rows.
+- TODO: Select the indexed facts and the stop rule, and measure the rows that the walk reads.
+
 **Comparison.**
 
-| Option | Extra code on write paths | Coefficient change           | Lookup cost        | Effect of a defect   |
-| ------ | ------------------------- | ---------------------------- | ------------------ | -------------------- |
-| A      | None                      | Rebuild the index            | At most 5 entries  | Slow, correct result |
-| B      | One expression per path   | Update every summary row     | At most 5 entries  | Wrong result         |
-| C      | None                      | None                         | Full summary scan  | Slow, correct result |
+| Option | Extra code on write paths | Coefficient change       | Lookup cost              | Effect of a defect                    |
+| ------ | ------------------------- | ------------------------ | ------------------------ | ------------------------------------- |
+| A      | None                      | Rebuild the index        | At most 5 entries        | Slow, correct result                  |
+| B      | One shared SQL builder    | Update every summary row | At most 5 entries        | Wrong candidates; a check can find it |
+| C      | None                      | None                     | Full summary scan        | Slow, correct result                  |
+| D      | None                      | None                     | Depends on the stop rule | A missed key, or a slow walk          |
 
 Before the first release, a coefficient change is an in-place edit of the migration and a new deploy.
 Then the coefficient-change cost does not apply to any option.
@@ -744,9 +813,30 @@ Then the coefficient-change cost does not apply to any option.
 After the release, options A and B both write one entry for each hash key when a coefficient changes.
 One large write blocks every request of the partition until its replication ends.
 Thus that rebuild needs a bound, or a step-by-step job, for a hash leaf with many keys.
+Options C and D write nothing when a coefficient changes.
 
 TODO: Specify index replacement, restart recovery, and activation for the selected option.
 The procedure must preserve the rules in section 4.2.5.
+
+#### 4.3.2 Planner scan and the CPU limit
+
+TODO: Decide how the planner stays below the CPU limit of a Durable Object.
+
+The planner of section 4.2.8 reads about `(N - 1) / N` of the rows of the slice in one `transactionSync`.
+Section 4.2.9 measured about 0.9 µs for each row and 146 MB for each 1M small rows.
+
+- `rangeSplitConditions.maxSizeMb` has no upper limit, and `rangeSplitN` can be up to 255.
+- At a cap of 10 GB, a leaf of small rows holds about 70M rows. With `N = 4`, the scan takes about 47 s.
+- The default CPU limit of a Durable Object invocation is 30 s. The limit can go up to 5 minutes with `limits.cpu_ms`.
+- When the scan goes past the limit, the alarm fails and `#plan` runs again. The leaf stays over its cap and
+  refuses writes.
+- At the default cap of 500 MB, the scan blocks the partition for about 2.5 s for each plan.
+
+Options:
+
+- Keep item facts for each sort-key bucket (section 5.7). The planner then reads the bucket rows and bounded bucket scans.
+- Limit `rangeSplitConditions.maxSizeMb`, so that the scan stays below the CPU limit.
+- Scan the slice in chunks over some alarm steps. A chunk scan does not read one snapshot of the slice.
 
 ## 5. Alternative options
 
@@ -784,6 +874,155 @@ The envelope estimate also does not represent SQLite indexes.
 Whole-slice materialization replaces the streaming memory constraint.
 A maintained structure adds work to every mutation.
 Neither is needed to correct prefix accounting or preserve non-empty children.
+
+### 5.7 Keep item facts for each sort-key bucket
+
+This option removes the slice scan from the planner. Section 2.2 puts histograms out of scope, so this RFC does not select it.
+It is a candidate for a later change.
+
+The per-key facts of section 4.2.3 tell how many bytes a key has. They do not tell where those bytes are in sort-key order.
+The planner needs that position, so it scans. This option stores the same five facts for each bucket of sort keys.
+The aggregate model of section 4.2.4 is exact for any group of rows, so it also prices one bucket exactly.
+
+Unlike section 5.6, this option adds no row write to a mutation. A write still changes one summary row.
+
+#### 5.7.1 Schema
+
+```sql
+CREATE TABLE key_facts (
+  hk BLOB NOT NULL, lower_sk BLOB NOT NULL,          -- inclusive lower bound
+  item_count INTEGER NOT NULL, item_bytes INTEGER NOT NULL, key_bytes INTEGER NOT NULL,
+  ttl_item_count INTEGER NOT NULL, ttl_key_bytes INTEGER NOT NULL,
+  PRIMARY KEY (hk, lower_sk)) WITHOUT ROWID, STRICT;
+```
+
+The bucket of a row is the bucket row with the greatest `lower_sk ≤ sk`.
+
+- A hash partition keeps one row for each key, with `lower_sk = x''`. This row is the per-key summary of section 4.2.3.
+- A range partition keeps many bucket rows for its one hash key.
+- `largestKeysAtLeast` runs only on a hash partition, where each key has one row.
+- A range partition needs no per-key total, because `promotionCandidates` returns no key there.
+
+#### 5.7.2 Bucket size
+
+The host calculates one target bucket weight `S`, in model bytes, from the cap of the range leaf:
+
+```text
+S = clamp(rangeSplitConditions.maxSizeMb * 1 MiB / 256, 64 KiB, 4 MiB)
+```
+
+- The divisor 256 gives about 256 buckets for a leaf at its cap.
+- The upper bound of 4 MiB limits one bucket scan to about 25,000 small rows.
+- The lower bound of 64 KiB prevents one bucket for each row when the cap is small.
+- The host reads `S` from the current policy at each use. After a cap change, the job moves the buckets toward the new `S`.
+
+Each bucket must stay in a band:
+
+| Condition                                         | Action                |
+| ------------------------------------------------- | --------------------- |
+| Weight above `2S` and `item_count` of 2 or more   | Split the bucket      |
+| Combined weight of two adjacent buckets below `S` | Merge the two buckets |
+| `item_count = 0`, and not the first bucket        | Delete the bucket row |
+
+A split gives two halves of about `W/2`, which is at least `S`. Thus a new half does not merge again at once.
+
+The band also gives the number of buckets. Two adjacent buckets weigh at least `S` together, so a slice of weight `B`
+has at most `2B / S + 1` buckets. At the default cap of 500 MB, a full leaf has 250 to 500 bucket rows.
+At 10 GB, it has at most about 5,000 rows, about 300 KB.
+
+#### 5.7.3 Sources of bucket bounds
+
+Only three steps create a `lower_sk`.
+
+**First bucket.** The first item of a key creates the bucket with `lower_sk = x''`, the smallest encoded sort key.
+A merge never deletes this bucket, because a merge deletes the upper row. When the key has no item, its last row goes.
+
+**Import.** A target that imports answers `partition_migrating` to every operation except reads.
+The pages arrive in strict `(hk, sk)` order. Thus each inserted row is above every earlier row and goes into the last bucket.
+`applyPage` does these steps:
+
+1. Read the last bucket one time, with `ORDER BY lower_sk DESC LIMIT 1`.
+2. Add the facts of each inserted row to that bucket.
+3. When a row would put the bucket above `S`, and the bucket holds an item, open a new bucket.
+   The new `lower_sk` is `KeyCodec.shortestSeparator(prev_sk, sk)`.
+   For the first row of a page, one seek gets `prev_sk`: `sk < ? ORDER BY sk DESC LIMIT 1`.
+
+A page commits with its cursor. Thus a retry applies the whole page again or finds it applied.
+A row that `insertItemIfAbsent` skips adds no facts. Each promoted range root and each range child gets buckets of about `S`.
+
+**Split.** The job splits a bucket of weight `W` above `2S` in one `transactionSync`:
+
+1. Read the rows of the bucket in sort-key order from the covering index `(hk, sk, item_bytes, ttl_epoch_utc_seconds)`.
+   The read starts at the `lower_sk` of the bucket and stops before the `lower_sk` of the next bucket.
+2. Add the exact facts of the prefix, row by row.
+3. Select the gap nearest `min(W / 2, S)`. A gap exists only between two rows.
+4. Set the new `lower_sk` to `KeyCodec.shortestSeparator` of the two keys at the gap.
+5. Write the prefix facts to the old row. Insert the new row with the total facts minus the prefix facts.
+
+The target `min(W / 2, S)` limits one scan to about `S` of rows when the job is late.
+Each pass then cuts one bucket of about `S`, and the rest of the bucket splits on the next pass.
+
+**Merge.** The job adds the facts of the upper row to the lower row and deletes the upper row. A merge reads no item.
+The rule "greatest `lower_sk ≤ sk`" then puts the rows of the upper bucket in the lower bucket.
+
+#### 5.7.4 Write path and job trigger
+
+- A write on a range leaf finds its bucket with one index seek:
+  `UPDATE … WHERE hk = ? AND lower_sk = (SELECT MAX(lower_sk) … WHERE lower_sk <= ?)`.
+- The `UPDATE` returns the bucket facts. The host calculates the weight and compares it with `S`.
+- When the weight is above `2S`, or below `S / 2` after a delete, the host signals the job `range_buckets` with `call.signal({ jobs })`.
+- The job keeps no durable state. After a restart, the next write to a large bucket signals the job again.
+- The job reads the complete bucket table, at most about 5,000 rows. It needs no index on the weight.
+- The TTL sweep groups the deleted rows by bucket. This adds one seek for each row on a range leaf, and no seek on a hash leaf.
+
+When the sort keys only increase, the last bucket grows. Each cut scans about `S` of rows after about `S` of writes.
+Thus the job reads about one more index entry for each row written.
+
+#### 5.7.5 Planner
+
+1. Read the bucket rows of `[start, end)`. Calculate each bucket weight with the aggregate model, and add the total `B`.
+2. Use the `lower_sk` of each bucket except the first as a candidate boundary.
+3. For each target `i * B / N`, select the nearest candidate after the previous boundary.
+   Keep enough buckets with items for the children that remain.
+4. Optional: scan only the bucket around a target, and select the exact gap in that bucket.
+5. When fewer than `N` buckets hold items, use the streaming scan of section 4.2.8.
+
+Each candidate is a valid boundary:
+
+- A split or an import puts the separator above the last key of the previous bucket. A merge or a delete only removes keys.
+- The candidate is at most the first key of its own bucket. Thus it is inside `(start, end)`.
+- `item_count` is exact, so each child holds an item. The planner needs no repair pass.
+
+The decision of section 4.2.9 can use `SUM(item_count)` of the buckets, or the bounded count check.
+
+A child does not receive the bucket rows of its parent. Each child builds its own buckets during its import.
+Thus the repartition protocol does not change.
+
+#### 5.7.6 Cost
+
+| Default 500 MB leaf, about 3.4M rows, `N = 4` | Section 4.2.8                    | Bucket facts                              |
+| --------------------------------------------- | -------------------------------- | ----------------------------------------- |
+| A write that admission rejects                | One bounded count check          | The same                                  |
+| The planner                                   | About 2.5M index entries, 2.3 s  | About 256 bucket rows and 3 bucket scans  |
+| The planner on a 10 GB leaf                   | About 47 s, above the 30 s limit | About 2,500 bucket rows and bounded scans |
+| A coefficient change                          | Reprices the summary             | Reprices each bucket; bounds stay valid   |
+
+The 47 s value uses the rate of section 4.2.9 for about 70M rows. The default CPU limit of a Durable Object is 30 s.
+
+#### 5.7.7 Edge cases
+
+| Case                               | Result                                                                     |
+| ---------------------------------- | -------------------------------------------------------------------------- |
+| One item above `2S`                | The job does not split a bucket with one item. The planner keeps it whole. |
+| Many deletes before the job merges | Extra small buckets stay. The planner result stays valid.                  |
+| `rangeSplitN` up to 255            | The planner uses buckets when 255 buckets hold items. Else it scans.       |
+| A hash leaf                        | It keeps the first bucket only and never splits it.                        |
+
+#### 5.7.8 Costs of this option
+
+- One more table shape, one more host job, and a bucket lookup in the write path and the TTL sweep.
+- The import, the planner, and the job must all keep the rule "greatest `lower_sk ≤ sk`". A defect there gives wrong facts.
+- A boundary is exact only after the optional bucket scan. Without it, the error is at most one bucket weight.
 
 ## 6. Frequently asked questions
 
