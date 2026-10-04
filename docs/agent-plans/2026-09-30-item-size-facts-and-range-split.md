@@ -190,11 +190,16 @@ A write that admission rejects must get its error without a scan of the items.
 12. The physical split trigger and admission guard must continue to use `sql.databaseSize`.
 13. No test can need a new production hook.
 14. The split decision of a range leaf must not scan the items of its slice.
-    It must use only the item-count check of the planner, and it must read at most `N` index entries or one summary row.
+    It must use only the item-count check of the planner, and it must read at most `N` index entries.
 
 ## 3. Timeline and milestones
 
-TODO: Supply the implementation order and reviewable milestones. No delivery dates are specified.
+Deliver the complete change as one milestone. No delivery dates are specified.
+
+1. **Item-size facts, storage model, and range split.** Sections 4.2.1 to 4.2.12 in one change.
+   The milestone edits the existing schema migration in place (section 4.2.11).
+   The planner change of section 4.2.8 and the split decision of section 4.2.9 ship together.
+   This prevents the retry loop that section 4.2.9 describes.
 
 ## 4. Proposed solution
 
@@ -276,7 +281,11 @@ The scan index must cover:
 
 - `hk` and `sk`.
 - `item_bytes`.
-- The TTL status needed by the storage model.
+- `ttl_epoch_utc_seconds`, as a plain column and the last column of the index.
+
+Do not index the expression `ttl_epoch_utc_seconds IS NOT NULL`.
+An indexed expression can stop SQLite from using the index as a covering index, as a generated column does.
+The query-plan tests must show the covering scan with the plain column.
 
 The old-facts read on a write path must also use this covering index.
 The index must permit a range scan to calculate key lengths without reading item data.
@@ -315,9 +324,9 @@ Use the following model for one row:
 ```text
 row_storage_estimate =
     item_bytes
-  + 2 * key_bytes
+  + key_index_factor * key_bytes
   + base_overhead
-  + (has_ttl ? key_bytes + ttl_overhead : 0)
+  + (has_ttl ? ttl_key_factor * key_bytes + ttl_overhead : 0)
 ```
 
 Use its aggregate form for one hash key:
@@ -325,20 +334,62 @@ Use its aggregate form for one hash key:
 ```text
 key_storage_estimate =
     item_bytes
-  + 2 * key_bytes
+  + key_index_factor * key_bytes
   + item_count * base_overhead
-  + ttl_key_bytes
+  + ttl_key_factor * ttl_key_bytes
   + ttl_item_count * ttl_overhead
 ```
 
 The item bytes already contain the table's key copy.
-The factor of two adds the copies in the unique index and the scan index.
-The TTL term adds the key copy and fixed cost in the partial TTL index.
+`key_index_factor` adds the copies in the unique index and the scan index. The structural value is 2.
+`ttl_key_factor` adds the key copy in the partial TTL index. The structural value is 1.
+Both measured factors are higher than the structural values, because index pages hold fewer bytes than their size.
 
 `base_overhead` estimates fixed costs of the item row and its always-present indexes.
 `ttl_overhead` estimates the remaining fixed cost of the TTL index entry.
-Their initial values remain open in section 4.3.1.
-The existing 108 bytes are context, not a measured value for the revised schema.
+
+Initial values, from the measurement below:
+
+| Coefficient        | Initial value |
+| ------------------ | ------------- |
+| `key_index_factor` | 2.5           |
+| `base_overhead`    | 45 bytes      |
+| `ttl_key_factor`   | 1.25          |
+| `ttl_overhead`     | 15 bytes      |
+
+**Measurement of the current schema.** Date: 2026-10-04.
+Each case inserts 20,000 rows of one hash key into a new `PartitionDO` with the current migration.
+The result is the increase of `sql.databaseSize` divided by the row count.
+The runtime is local workerd under `@cloudflare/vitest-plugin`. The page size is 4,096 bytes.
+`key` is `octet_length(hk) + octet_length(sk)`. `item` is `data + key`. `over` is `per row - item`.
+Rows inserted in sort-key order and in random order differ by less than 4%. The table shows sort-key order.
+
+| key | data  | TTL | per row | over  | Current estimate (`item + 108`) |
+| --- | ----- | --- | ------- | ----- | ------------------------------- |
+| 16  | 100   | no  | 198     | 82    | 224                             |
+| 108 | 100   | no  | 520     | 312   | 316                             |
+| 208 | 100   | no  | 854     | 546   | 416                             |
+| 408 | 100   | no  | 1,610   | 1,102 | 616                             |
+| 16  | 1,000 | no  | 1,429   | 413   | 1,124                           |
+| 108 | 1,000 | no  | 1,646   | 538   | 1,216                           |
+| 208 | 1,000 | no  | 1,880   | 672   | 1,316                           |
+| 408 | 1,000 | no  | 3,076   | 1,668 | 1,516                           |
+| 16  | 100   | yes | 244     | 128   | 224                             |
+| 108 | 100   | yes | 666     | 458   | 316                             |
+| 208 | 100   | yes | 1,111   | 803   | 416                             |
+| 408 | 100   | yes | 2,122   | 1,614 | 616                             |
+
+Findings:
+
+- For 100-byte data without TTL, `over ≈ 2.5 * key + 45` is within 10% for all four key lengths.
+  With a factor of 2, the remainder grows from 50 to 286 bytes as the key grows. Thus a fixed overhead cannot replace the factor.
+- A TTL adds about `1.25 * key + 15` bytes.
+- The current estimate is 2.6 times too low for a 408-byte key and 100-byte data.
+- Rows of about 1 KB to 1.5 KB fill a 4,096-byte page badly. They add 300 to 1,200 bytes of page waste for each row.
+  The model does not represent this waste. Rows of mixed sizes reduce it.
+- The measurement uses the current schema. The revised scan index also holds `ttl_epoch_utc_seconds`.
+  Repeat the measurement after the schema change, and update the initial values if they differ by more than 10%.
+- Local workerd has no replication. Replication does not change the file size.
 
 These estimates do not equal physical database size.
 They omit shared partition state and temporary transaction storage.
@@ -354,7 +405,7 @@ The lookup must use the same model as direct per-key estimates and range weights
 
 An expression index over the per-key facts is one option.
 A coefficient change then rebuilds the summary index, not every item.
-The index strategy and activation procedure remain open in section 4.3.3.
+The index strategy and activation procedure remain open in section 4.3.1.
 
 A deployment must not use an old index with a new estimate expression.
 It must not expose a partially rebuilt summary as a complete one.
@@ -378,6 +429,16 @@ The caller continues to compose atomic operations with `PartitionStore.transacti
 | Migration retry            | Add no facts for an existing row                                |
 | Source copy cleanup        | Preserve the existing moved-key summary and copy lifecycle       |
 | Metadata-only mutation     | Keep encoded byte facts unchanged unless a modeled fact changes |
+
+Each write path that changes the summary returns `key_storage_estimate` of section 4.2.4 for that key.
+This covers `upsertItem` and `updateItemSingleShot`, and the `keyEstBytes` that `TransactionParticipant`
+sends to `promotionCandidates`. The write-path promotion check and `largestKeysAtLeast` then compare the same value
+with the same threshold.
+
+When `item_count` of a key becomes 0, delete the summary row of the key in the same statement sequence.
+A key that is written again gets a new summary row from the insert.
+A fact that becomes negative is an `invariant` failure. Do not clamp a fact with `MAX(0, …)`.
+A clamp hides the defect that made the summary and the rows different.
 
 A change from null TTL to non-null TTL adds the row to both TTL aggregates.
 The reverse change subtracts it. A TTL timestamp change between non-null values leaves those aggregates unchanged.
@@ -418,28 +479,51 @@ Keep `planRangeSplit` inside one `transactionSync` snapshot.
 Its inputs remain the hash key, this leaf's owned `[start, end)` slice, and the requested child count `N`.
 The summary must describe exactly that complete owned slice.
 
-Let `C` be its exact item count. Let `B` be its estimated storage bytes under the active model.
+Let `B` be the estimated storage bytes of the slice, from its summary under the active model.
 For boundary `i`, the cumulative byte target is `i * B / N`.
+`B` controls only the balance. An incorrect `B` gives a worse balance, but the result is still valid.
+
+The planner does not use the item count of the summary. It uses the bounded count check of section 4.2.9.
 
 The planner must:
 
-1. Return `fewer_items` when `C < N`.
+1. Apply the count check of section 4.2.9. Return `fewer_items` when the slice has fewer than `N` items.
 2. Read the ordered rows through a streaming covering-index cursor.
 3. Calculate each row's weight with the model in section 4.2.4.
 4. Measure each candidate prefix at the actual boundary between adjacent keys.
-5. Select the feasible prefix nearest the cumulative byte target.
-6. Keep at least one item after the previous boundary and one item for each remaining child.
-7. Create each boundary with `KeyCodec.shortestSeparator` on the adjacent keys.
-8. Return exactly `N - 1` strictly increasing boundaries when `C >= N`.
+5. For each target in order, select the gap nearest the target, after the previous boundary.
+   When two gaps have the same distance from the target, select the earlier gap.
+6. Keep the last `N` rows of the scan in a buffer. These rows have `N - 1` gaps.
+7. Stop the scan when it has `N - 1` boundaries.
+8. If the cursor ends with fewer than `N - 1` boundaries, repair the result (see below).
+9. Create each boundary with `KeyCodec.shortestSeparator` on the adjacent keys.
+10. Return exactly `N - 1` strictly increasing boundaries.
 
 For a cut after `k` items, the lower prefix contains only those `k` items.
 The next item belongs to the upper child and must not contribute to that prefix.
 
-A feasible cut must follow the previous cut and leave enough items for all remaining children.
-A dominant item can force a target away from equal balance. The planner must still select a feasible cut.
-Equal-distance choices remain open in section 4.3.2.
+A gap is the position between two adjacent rows. No gap exists before the first row or after the last row.
+Thus each child gets at least one row. Step 5 does not reserve rows for later children.
+The forward pass can therefore end with fewer than `N - 1` boundaries, for example when a dominant item is last.
 
-The scan must remain streaming. It can stop once it has enough information for the last boundary.
+**Repair.** Keep the boundaries that are before the first gap of the buffer.
+Fill the missing boundaries from the gaps of the buffer, latest gap first.
+Use a gap of the buffer that already holds a boundary before an unused gap.
+The count check found at least `N` rows. Thus the buffer has `N - 1` gaps, and the repair always finds enough gaps.
+The repair makes the last children small. This occurs only when the bytes are skewed toward the end of the slice.
+
+Example: weights `[111, 111, 5111]` and `N = 3`. The targets are 1,777 and 3,555.
+The forward pass finds no boundary, because the only prefix above a target ends at the last row.
+The repair uses the two gaps of the buffer. The children are `[111]`, `[111]`, and `[5111]`.
+
+Example: weights `[111, 5111, 111]` and `N = 3`.
+The first target selects the gap after the first row (111 is nearer to 1,777 than 5,222).
+The second target selects the gap after the second row, the only gap that remains. No repair is necessary.
+
+This algorithm does not give the optimal balance. An optimal partition needs the prefix sums of all rows or many scans.
+The requirement is `N` non-empty children near the byte targets. A child that is still over its cap splits again.
+
+The scan must remain streaming. Its memory is the buffer of `N` rows and the boundaries.
 It must not use repeated OFFSET walks or materialize the complete slice.
 
 Remove `skewed_bytes` as a normal range floor.
@@ -452,12 +536,13 @@ An accounting or ownership inconsistency is not evidence that valid items cannot
 #### 4.2.9 Split decision without a boundary scan
 
 With the planner of section 4.2.8, `fewer_items` is the only range floor.
-So the planner returns boundaries exactly when `C >= N`, and the decision needs no boundaries.
+Let `C` be the number of items in the owned slice.
+The planner returns boundaries exactly when `C >= N`, so the decision needs no boundaries.
 
 For a range leaf over its cap, `PartitionDO.splitDecision` must:
 
-1. Apply the same item-count check as step 1 of section 4.2.8, on the same owned slice and `N`.
-   The check reads one summary row, or at most `N` entries of the covering index.
+1. Apply the count check: count the items of the owned slice through the covering index, with `LIMIT N`.
+   The check reads at most `N` index entries. The planner uses the same function.
 2. Answer a split when `C >= N`.
 3. Return the `fewer_items` floor when `C < N`.
 4. Not call `planRangeSplit` or `computeRangeSplitBoundaries`.
@@ -487,8 +572,27 @@ Each retry scans the complete slice, up to every `sourceRetryMaxMs`, and the spl
 
 **Cost that stays.** The planner scan still reads about `(N - 1) / N` of the rows of the slice in one
 `transactionSync`. No other request on the partition runs during the scan.
-TODO: Measure the duration of one planner scan for a range leaf with 10M rows in a Durable Object.
-If the scan is too long, a scan in chunks over several alarm steps is a separate change.
+
+Measurement of the current `planRangeSplit`. Date: 2026-10-04.
+The runtime is local workerd under `@cloudflare/vitest-plugin`, on an AMD Ryzen 9 7940HS.
+Each row has an 8-byte hash key, a 16-byte sort key, and 20 bytes of data. 1M rows use 146 MB of database.
+Each time is the wall time of one `runInDurableObject` call, because the clock of a Worker does not advance during synchronous code.
+An empty call takes about 30 ms.
+
+| Rows | N  | Planner time | Full JavaScript iteration | Full `COUNT(*)` in SQL |
+| ---- | -- | ------------ | ------------------------- | ---------------------- |
+| 1M   | 2  | 0.49 s       | 0.89 s                    | 0.05 s                 |
+| 1M   | 4  | 0.73 s       |                           |                        |
+| 1M   | 16 | 0.92 s       |                           |                        |
+| 2M   | 2  | 0.96 s       | 1.78 s                    | 0.07 s                 |
+| 2M   | 4  | 1.43 s       |                           |                        |
+| 2M   | 16 | 1.80 s       |                           |                        |
+
+The time is linear in the rows that the scan reads, at about 0.9 µs for each row.
+The JavaScript iteration of the cursor costs about 17 times more than the SQLite index walk.
+A range leaf with 10M rows and `N = 4` blocks the partition for about 7 s on this machine. Production CPUs can be slower.
+Every request of the partition waits for that time. Compare it with the current CPU limit on the Durable Object limits page.
+A scan in chunks over several alarm steps is a separate change.
 
 #### 4.2.10 Extension for supporting tables
 
@@ -510,25 +614,17 @@ Do not create placeholder tables, a cost registry, or a generic plug-in framewor
 Temporary transaction rows can need a separate model later.
 A larger fixed overhead per committed item does not accurately represent that storage.
 
-#### 4.2.11 Deployment, migration, and rollback
+#### 4.2.11 Deployment and migration
 
 This is a pre-release schema and behaviour change.
 The item limit drops the adjustable storage overhead. Query evaluated bytes also drop that overhead.
 Range boundaries and promotion decisions use the revised estimate.
 Key encoding, DO names, and committed item contents remain unchanged.
 
-The current code can reject an item that the revised exact-item rule accepts.
-Therefore, rollback to the old validity rule is not automatically safe.
-It can also conflict with a transaction that the new code already prepared.
-
-Existing state must not silently mix old estimates with new facts.
-Editing a completed schema migration does not update objects that already ran it.
-The policy for existing local objects remains open in section 4.3.4.
-
-If migration preserves existing state, it must preserve items, item IDs, locks, and prepared transactions.
-It must prevent size consumers from reading incomplete aggregates.
-Any backfill must be bounded and must resume safely after a crash.
-A deployment must not delete existing state without explicit approval.
+Edit the existing schema migration of `PartitionStore` in place. Do not add a new migration entry.
+Remove `key_size_estimates` and its index, and create the new per-key summary from the start.
+A deployment must use new namespaces. Existing Durable Objects are destroyed, not migrated.
+No old code runs next to the new code, so the change needs no backfill and no rollback procedure.
 
 A future coefficient-only change uses the activation rule in section 4.2.5.
 It must preserve item validity and transaction commit eligibility.
@@ -562,6 +658,8 @@ Tests must check definitions, not only agreement between two uses of the same es
 - Four equal weights and two children must split into two items per child.
 - Three weights `[111, 5111, 111]` and three children must produce three non-empty children.
 - Check dominant items at the beginning, middle, and end.
+- Weights `[111, 111, 5111]` and three children must use the repair and give `[111]`, `[111]`, `[5111]`.
+- Check that the planner result does not change when the summary item count is wrong.
 - Check exactly `N` items, fewer than `N` items, an empty slice, and variable sort-key lengths.
 - Check non-null TTL costs and variable data sizes.
 - Check explicit owned slice bounds and shortest separators.
@@ -574,7 +672,7 @@ Tests must check definitions, not only agreement between two uses of the same es
 - A range leaf over its cap with `C >= N` answers a split. With `C < N` it returns the `fewer_items` floor.
 - A range leaf over its cap with weights `[111, 5111, 111]` and `N = 3` answers a split, and the planner plans it.
 - A rejected write on a range leaf does not call `planRangeSplit`. Use `EXPLAIN QUERY PLAN` or the real store to
-  show that the count check reads at most `N` index entries or one summary row.
+  show that the count check reads at most `N` index entries.
 - Replace the tests that expect the `skewed_bytes` floor from `splitDecision`.
 
 **Query plans and production flows**
@@ -582,6 +680,7 @@ Tests must check definitions, not only agreement between two uses of the same es
 - Use `EXPLAIN QUERY PLAN` to assert covering scans for sizes and count queries.
 - Check the covering old-facts read on write paths.
 - Check the indexed promotion threshold lookup under the active expression.
+- Check that the write-path `keyEstBytes` equals the estimate that `largestKeysAtLeast` compares, for a key with long sort keys and TTLs.
 - Check range split, migration, promotion, and transaction flows in the Workers runtime.
 - Use the existing partition harness for repartition tests. Add no production test hook.
 
@@ -590,33 +689,64 @@ This RFC does not change those commands or the test infrastructure.
 
 ### 4.3 Open questions
 
-#### 4.3.1 Initial fixed overheads
+#### 4.3.1 Summary index and activation
 
-TODO: Measure and select `base_overhead` and `ttl_overhead` for the revised table and indexes.
-The current 108-byte constant does not establish both values.
-Their values affect balance and promotion estimates, but not exact item validity.
+TODO: Select one of the options below for the promotion lookup of section 4.2.5.
 
-#### 4.3.2 Equal-distance boundary choices
+`largestKeysAtLeast` returns at most `PROMOTION_CANDIDATES_MAX` (5) hash keys whose `key_storage_estimate` is at or
+above a threshold, largest first. The estimate is an expression over the summary facts, not a stored fact.
+Thus the lookup needs an access path for that expression.
 
-TODO: Select a deterministic rule when two feasible prefixes have the same distance from a byte target.
-The choices are the earlier or later feasible prefix.
-The rule changes boundary placement, not ownership correctness or the non-empty-child requirement.
+The current summary table is `WITHOUT ROWID` with `hk` as its primary key. An index entry of such a table contains
+`hk`, so an index on the estimate can answer `SELECT hk` without a table read. Keep this shape for the new summary.
 
-#### 4.3.3 Summary index and activation
+**Option A. Expression index on the summary.**
 
-TODO: Select the indexed representation of the derived per-key estimate.
-An expression index avoids a persisted price per item. A cached derived summary needs explicit refresh and activation.
+- Create an index on the model expression of section 4.2.4. The query repeats the same expression.
+  One shared constant holds the expression text for the index and the query.
+- Write cost: no extra row writes. A summary update already rewrites its index entry.
+- Coefficient change: drop the index and create it again. This rewrites one index entry for each hash key in one
+  statement.
+- Failure mode: when the query expression and the index expression differ, SQLite does not use the index.
+  It scans the summary table. The result is slow but correct. A query-plan test finds the difference.
+- SQLite uses an expression index only when the query contains the same expression. The test must assert the plan.
 
-TODO: Specify index replacement, restart recovery, and activation for the selected representation.
+**Option B. Stored estimate column with a plain index.**
+
+- Keep a column such as `est_bytes` in the summary, and index it as today.
+- Each write path calculates the column from the new facts in the same upsert.
+- Write cost: the same as today. Each write path has one more expression to keep correct.
+- Coefficient change: `UPDATE` every summary row. Each changed row is a billed row write.
+  An update in batches gives a mixture of old and new values until it ends. That needs a model version column
+  and a rule for which version the lookup trusts.
+- Failure mode: a write path with an old or wrong expression stores a wrong value. No check finds it.
+
+**Option C. No index.**
+
+- `largestKeysAtLeast` calculates the estimate for each summary row, and sorts the result in SQLite.
+- Write cost: none. Coefficient change: none.
+- Read cost: one full scan of the summary for each hash-leaf split decision. The decision runs at each write that
+  admission rejects. A scan of 1M index entries with `COUNT(*)` took about 0.05 s in the measurement of section 4.2.9.
+  The scan with this expression and a top-5 sort is not measured.
+- Failure mode: no wrong value is possible. The cost grows with the number of hash keys in the leaf.
+
+**Comparison.**
+
+| Option | Extra code on write paths | Coefficient change           | Lookup cost        | Effect of a defect   |
+| ------ | ------------------------- | ---------------------------- | ------------------ | -------------------- |
+| A      | None                      | Rebuild the index            | At most 5 entries  | Slow, correct result |
+| B      | One expression per path   | Update every summary row     | At most 5 entries  | Wrong result         |
+| C      | None                      | None                         | Full summary scan  | Slow, correct result |
+
+Before the first release, a coefficient change is an in-place edit of the migration and a new deploy.
+Then the coefficient-change cost does not apply to any option.
+
+After the release, options A and B both write one entry for each hash key when a coefficient changes.
+One large write blocks every request of the partition until its replication ends.
+Thus that rebuild needs a bound, or a step-by-step job, for a hash leaf with many keys.
+
+TODO: Specify index replacement, restart recovery, and activation for the selected option.
 The procedure must preserve the rules in section 4.2.5.
-
-#### 4.3.4 Existing local state and rollback
-
-TODO: Decide whether the pre-release change must preserve existing local objects through a schema migration.
-A fresh-namespace policy is another option, but it cannot silently delete existing data.
-
-TODO: Specify the selected migration steps and a safe rollback policy.
-A rollback cannot assume that items or prepared transactions still fit the old validity rule.
 
 ## 5. Alternative options
 
@@ -666,7 +796,7 @@ The actual database size continues to control the physical cap.
 ### Does a coefficient change need a schema migration?
 
 It needs no rewrite of item facts.
-It can need a summary-index change. Section 4.3.3 leaves that activation procedure open.
+It can need a summary-index change. Section 4.3.1 leaves that activation procedure open.
 A new fact for a supporting table can need a bounded backfill.
 
 ### Can a split remain unequal?
