@@ -24,6 +24,7 @@ export class CustomPartitionDO extends PartitionDO {}
 // Partition tests that must hold, count, answer, or fail one call use this class. The module lists its test controls.
 export { ControlledPartitionDO } from "./controlled-partition-do.js";
 export { ControlledTransactionCoordinatorDO } from "./controlled-transaction-coordinator-do.js";
+export { ReadTtlRecreatePartitionDO } from "./transactions/read-ttl-recreate-partition-do.js";
 
 // The example host of the sharding runtime. It uses no FokosDB module.
 export { CounterPartitionDO } from "./sharding/counter-host.js";

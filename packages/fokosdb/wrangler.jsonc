@@ -19,6 +19,7 @@
 				"TransactionCoordinatorDO",
 				"CustomPartitionDO",
 				"ControlledPartitionDO",
+				"ReadTtlRecreatePartitionDO",
 				"ControlledTransactionCoordinatorDO",
 				"ErrorProbeDO",
 				"CounterPartitionDO",
@@ -43,6 +44,10 @@
 			{
 				"class_name": "ControlledPartitionDO",
 				"name": "CONTROLLED_PARTITION_DO",
+			},
+			{
+				"class_name": "ReadTtlRecreatePartitionDO",
+				"name": "READ_TTL_RECREATE_PARTITION_DO",
 			},
 			{
 				"class_name": "ControlledTransactionCoordinatorDO",

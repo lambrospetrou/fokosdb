@@ -1,0 +1,22 @@
+{
+	"name": "@fokosdb-repro/read-ttl-recreate",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "cf build",
+		"check": "cf workers types && tsc --noEmit",
+		"cf-typegen": "cf workers types",
+		"dev": "cf dev",
+		"deploy": "cf deploy --profile personal",
+		"test:remote": "node check.mjs"
+	},
+	"dependencies": {
+		"fokosdb": "workspace:*"
+	},
+	"devDependencies": {
+		"@cloudflare/vite-plugin": "2.0.0-beta.sha-52b0dc0e9",
+		"cf": "1.0.0-beta.10",
+		"typescript": "^5.9.3",
+		"vite": "8.2.2"
+	}
+}

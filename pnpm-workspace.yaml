@@ -1,6 +1,7 @@
 packages:
   - "packages/*"
   - "examples/*"
+  - "spec/repro/*"
 
 # Native dependencies whose install scripts must run: workerd and esbuild unpack the platform
 # binaries the Workers runtime and its bundler need, and hurl fetches its release archive.
