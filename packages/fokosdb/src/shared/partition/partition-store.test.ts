@@ -157,6 +157,22 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("measureItemBytesWithStamp returns the measured size and the item stamps, and reads at most one row", async () => {
+		await withStore((store) => {
+			const value = JSON.stringify({ a: 1 });
+			const absent = store.measureItemBytesWithStamp({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
+			expect(absent).toMatchObject({ itemPresent: false, lastReadTs: null, lastWriteTs: null });
+			expect(absent.estRowBytes).toBe(store.measureItemBytes({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" }));
+			expect(absent.rowsRead).toBeLessThanOrEqual(1);
+
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: "old", kind: "text", ttlAt: null, txOrderTs: 42 });
+			store.bumpItemReadTs(kb("hk"), kb("s"), 50);
+			const present = store.measureItemBytesWithStamp({ hk: kb("hk"), sk: kb("s"), data: value, kind: "json" });
+			expect(present).toMatchObject({ estRowBytes: absent.estRowBytes, itemPresent: true, lastReadTs: 50, lastWriteTs: 42 });
+			expect(present.rowsRead).toBe(1);
+		});
+	});
+
 	it("getItemProjected returns the wire cells, the version, and the ttl of one row", async () => {
 		await withStore((store) => {
 			const doc = { n: 7, s: "x", none: null, k: [1, 2] };
@@ -1022,6 +1038,7 @@ describe("PartitionStore - TTL deletion", () => {
 				transaction_id: "tx-locked",
 				transaction_ts: 1,
 				operation: "put",
+				op_list: [[0, "put"] as [number, "put"]],
 				data: "pending",
 				kind: "text",
 				ttl_epoch_utc_seconds: null,
@@ -1286,6 +1303,7 @@ describe("PartitionStore - pending transactions", () => {
 			transaction_id: transactionId,
 			transaction_ts: 123,
 			operation: "put",
+			op_list: [[0, "put"] as [number, "put"]],
 			data: "d",
 			kind: "text" as const,
 			ttl_epoch_utc_seconds: null,
@@ -1327,6 +1345,39 @@ describe("PartitionStore - pending transactions", () => {
 
 			expect(store.listPendingTxItems(row.transaction_id)[0].ttl_epoch_utc_seconds).toBe(777);
 			expect([...store.queryPendingTxPage(null, 1, null)][0].ttl_epoch_utc_seconds).toBe(777);
+		});
+	});
+
+	it("returns the operation list on commit and migration reads, and refuses a list that is not valid", async () => {
+		await withStore((store, state) => {
+			const opList: [number, "put" | "delete" | "check"][] = [
+				[0, "delete"],
+				[3, "put"],
+				[4, "check"],
+			];
+			store.insertPendingLock({ ...lockRow("hk", "s", "tx-ops"), op_list: opList });
+			expect(store.listPendingTxItems("tx-ops")[0].op_list).toEqual(opList);
+			expect([...store.queryPendingTxPage(null, 1, null)][0].op_list).toEqual(opList);
+
+			for (const bad of ["[]", '[[0,"frobnicate"]]', '[[0.5,"put"]]', "[[0]]", '{"0":"put"}']) {
+				state.storage.sql.exec(`UPDATE pending_transactions SET op_list = ?`, bad);
+				expect(() => store.listPendingTxItems("tx-ops")).toThrow(fokosErrorWith("invariant_failed"));
+			}
+		});
+	});
+
+	it("readItemData returns the stored JSONB of a json item, which upsertItem stores again unchanged", async () => {
+		await withStore((store, state) => {
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: '{"k":"he said \\"hi\\""}', kind: "json", ttlAt: 42, txOrderTs: 1 });
+			const read = store.readItemData(kb("hk"), kb("s"));
+			expect(read).toMatchObject({ kind: "json", ttl_epoch_utc_seconds: 42 });
+			expect(read?.data).toBeInstanceOf(Uint8Array);
+			const stored = () => new Uint8Array(state.storage.sql.exec<{ data: ArrayBuffer }>(`SELECT data FROM items`).one().data);
+			expect(stored()).toEqual(read?.data);
+
+			store.upsertItem({ hk: kb("hk"), sk: kb("s"), data: read!.data, kind: read!.kind, ttlAt: 42, txOrderTs: 2 });
+			expect(stored()).toEqual(read?.data);
+			expect(store.readItemData(kb("hk"), kb("absent"))).toBeUndefined();
 		});
 	});
 
@@ -1772,6 +1823,7 @@ describe("PartitionStore - migration pages", () => {
 			transaction_id: transactionId,
 			transaction_ts: 123,
 			operation: "put",
+			op_list: [[0, "put"] as [number, "put"]],
 			data: "d",
 			kind: "text" as const,
 			ttl_epoch_utc_seconds: null,

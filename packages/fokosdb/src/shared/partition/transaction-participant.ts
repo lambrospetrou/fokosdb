@@ -14,13 +14,14 @@ import {
 	type SingleShotResponse,
 	type TransactionItem,
 	type TransactionItemKey,
+	type TransactionOperationType,
 	type TransactionTimestamp,
 } from "../transaction-wire-types.js";
 import invariant from "../invariant.js";
 import { FokosInternalError, INTERNAL_CODES } from "../errors.js";
 import { unexpectedTransactionStateError } from "../errors-operations.js";
-import { KeyCodec, type KeyBytes } from "../../sharding/key-codec.js";
-import type { PartitionStore, PendingTxInfo, StalePendingTx } from "./partition-store.js";
+import { KeyCodec, KeyPairMap, type KeyBytes } from "../../sharding/key-codec.js";
+import type { OpList, PartitionStore, PendingTxInfo, StalePendingTx, StoredItemData } from "./partition-store.js";
 import {
 	applyImageCap,
 	conditionFailedReason,
@@ -29,8 +30,8 @@ import {
 	nextRecoveryAt,
 	txOrderTimestampNow,
 	TX_ORDER_TS_UNITS_PER_MS,
+	validateVersionReferences,
 } from "../transaction-limits.js";
-import type { UpdateProbeResult } from "../expression/runtime.js";
 
 /**
  * Reads the coordinator reference of a lock row. The value comes from storage, and a lock row can
@@ -69,16 +70,144 @@ export function parseCoordinatorRef(json: string, transactionId: string): Coordi
 export function ownsByHashKey(
 	owns: (key: { hashKey: KeyBytes; sortKey: KeyBytes }) => boolean,
 ): (row: { hk: KeyBytes; sk: KeyBytes }) => boolean {
-	const answers = new Map<bigint, boolean>();
+	const answers = new KeyPairMap<boolean>();
 	return (row) => {
-		const id = KeyCodec.mapKey(row.hk);
-		let owned = answers.get(id);
+		let owned = answers.get(row.hk, NO_SORT_KEY);
 		if (owned === undefined) {
 			owned = owns({ hashKey: row.hk, sortKey: row.sk });
-			answers.set(id, owned);
+			answers.set(row.hk, NO_SORT_KEY, owned);
 		}
 		return owned;
 	};
+}
+
+const NO_SORT_KEY = KeyCodec.encodeOptional(undefined);
+
+/** True for an operation that writes the data of its item. */
+function isWrite(operation: string): boolean {
+	return operation === "put" || operation === "update";
+}
+
+/** The operations of one item in a request, in `opIndex` order, and the state of their evaluation. */
+type ItemSequence = {
+	hashKey: KeyBytes;
+	sortKey: KeyBytes;
+	ops: TransactionItem[];
+	/** The last put or update of a sequence of two or more operations. */
+	lastWrite: TransactionItem | undefined;
+	/** An operation of the item failed. The later operations of the item get `not_evaluated`. */
+	failed: boolean;
+	/** This transaction held the lock of the item before this prepare. */
+	lockedBefore: boolean;
+	/** The item stamps before the transaction: undefined until the first operation reads them, null for an absent item. */
+	committedStamp: ItemStamp | null | undefined;
+	/** The stored data after `lastWrite`, which the evaluate step reads. */
+	lastWriteData: StoredItemData | undefined;
+};
+
+/** The operations of a request in `opIndex` order. `seqs[i]` is the sequence of the item of `ops[i]`. */
+type SequencePlan = {
+	ops: TransactionItem[];
+	seqs: ItemSequence[];
+	sequences: KeyPairMap<ItemSequence>;
+	/** The request has an item with two or more operations. */
+	repeated: boolean;
+};
+
+/**
+ * Sorts the operations by `opIndex` and groups them by item with `KeyPairMap`. It also runs the
+ * version-reference check, before the first SQL statement, so a refusal writes nothing.
+ */
+function sequencePlanOf(items: readonly TransactionItem[]): SequencePlan {
+	const ops = [...items].sort((a, b) => a.opIndex - b.opIndex);
+	const sequences = new KeyPairMap<ItemSequence>();
+	const seqs = ops.map((op, i) => {
+		invariant(i === 0 || ops[i - 1].opIndex !== op.opIndex, () => `fokos/partition: opIndex ${op.opIndex} occurs two times`);
+		let seq = sequences.get(op.hashKey, op.sortKey);
+		if (seq) {
+			seq.ops.push(op);
+		} else {
+			seq = {
+				hashKey: op.hashKey,
+				sortKey: op.sortKey,
+				ops: [op],
+				lastWrite: undefined,
+				failed: false,
+				lockedBefore: false,
+				committedStamp: undefined,
+				lastWriteData: undefined,
+			};
+			sequences.set(op.hashKey, op.sortKey, seq);
+		}
+		return seq;
+	});
+	for (const seq of sequences.values()) {
+		seq.lastWrite = seq.ops.length > 1 ? seq.ops.findLast((op) => isWrite(op.operation)) : undefined;
+	}
+	validateVersionReferences(ops);
+	return { ops, seqs, sequences, repeated: sequences.size < ops.length };
+}
+
+/** The lock row `operation` of a sequence: its last operation that is not a check, or check. */
+function lockOperationOf(ops: readonly TransactionItem[]): TransactionOperationType {
+	return ops.findLast((op) => op.operation !== "check")?.operation ?? "check";
+}
+
+/** Where a store write of apply takes the data of a put or an update. */
+type WriteSource = { from: "request"; item: TransactionItem } | { from: "lock"; row: PendingLock };
+
+type ApplyEntry = TransactionItemKey & { opIndex: number; operation: TransactionOperationType; source: WriteSource };
+
+/**
+ * The promotion candidate of the last write of each item. A later delete of the item drops it,
+ * because only an item whose final state is present can grow its key.
+ */
+class ItemGrowth {
+	#last = new KeyPairMap<PromotionCandidate | null>();
+
+	record(entry: TransactionItemKey & { operation: string }, keyEstBytes: number | undefined): void {
+		if (entry.operation === "delete") {
+			this.#last.set(entry.hashKey, entry.sortKey, null);
+		} else if (keyEstBytes !== undefined) {
+			this.#last.set(entry.hashKey, entry.sortKey, { hashKey: entry.hashKey, keyEstBytes });
+		}
+	}
+
+	candidates(): PromotionCandidate[] {
+		return [...this.#last.values()].filter((c) => c !== null);
+	}
+}
+
+/** What the evaluate step returns. `results` holds one result for each operation, in `opIndex` order. */
+type Evaluation = {
+	results: ParticipantOperationResultEncoded[];
+	rejected: boolean;
+	/** The evaluate step wrote to `items`, so its storage transaction must roll back or be the apply. */
+	temporaryWrites: boolean;
+	/** The promotion candidates of the temporary writes. Only the single-partition path keeps them. */
+	growth: PromotionCandidate[];
+};
+
+/**
+ * The path that runs the evaluate step. `twoPhase` alone selects the behavior of the path, and no
+ * other field does.
+ *
+ * - `twoPhase: false` is the single-partition path. Its storage transaction keeps the temporary
+ *   writes as the writes of the transaction. It has no lock of its own, no timestamp check, and no
+ *   lock block.
+ * - `twoPhase: true` is the prepare of the two-phase path. A lock of `transactionId` is a lock of
+ *   this transaction. The step checks the timestamps, and it copies the last-write data for the
+ *   lock block.
+ */
+type EvaluatePath =
+	| { twoPhase: false; txTimestamp: TransactionTimestamp }
+	| { twoPhase: true; txTimestamp: TransactionTimestamp; transactionId: string };
+
+/** Thrown inside a storage transaction to roll back its writes, with the evaluation that the block made. */
+class EvaluationRollback extends Error {
+	constructor(readonly evaluation: Evaluation) {
+		super("fokos/partition: the evaluate block rolls back");
+	}
 }
 
 // A pending check cannot change the item, so a transactional read may serialize on either side of it.
@@ -87,14 +216,17 @@ const READ_ONLY_PENDING_OPERATIONS: ReadonlySet<string> = new Set(["check"]);
 
 type ItemStamp = { last_read_ts: number; last_write_ts: number };
 
+/** A read of one item row that also returned the item timestamps. */
+type ItemRead = { itemPresent: boolean; lastReadTs: number | null; lastWriteTs: number | null };
+
 /** One lock row of a transaction, as commit reads it. */
 type PendingLock = ReturnType<PartitionStore["listPendingTxItems"]>[number];
 
 /**
- * The item timestamps of the row that a condition or an update probe read, or undefined when it
- * found no row. Both columns are NOT NULL, so a live row always carries both values.
+ * The item timestamps of the row that a condition, an update probe or a put measure read, or
+ * undefined when it found no row. Both columns are NOT NULL, so a live row always carries both values.
  */
-function itemStampOf(read: { itemPresent: boolean; lastReadTs: number | null; lastWriteTs: number | null }): ItemStamp | undefined {
+function itemStampOf(read: ItemRead): ItemStamp | undefined {
 	if (!read.itemPresent) {
 		return undefined;
 	}
@@ -186,41 +318,41 @@ export class TransactionParticipant {
 	 * `measureItemBytes` evaluates the put's own data expression, and the update probe evaluates the
 	 * document expression that both the pending row and the single-shot UPDATE store verbatim.
 	 *
-	 * Returns the update probe as well, because prepare reuses its item timestamps instead of
-	 * reading the row a second time.
+	 * Returns the row read as well, because prepare reuses its item timestamps instead of reading the
+	 * row a second time. An update always reads the row with its probe. A put reads the row only when
+	 * `readStamp` is true, in the same statement that measures it.
 	 */
-	#precheckWrite(
-		item: TransactionItem,
-		sk: KeyBytes,
-		rejectionKeys: { hashKey: string | Uint8Array; sortKey?: string | Uint8Array },
-	): { reason: RejectionReasonEncoded | null; probe: UpdateProbeResult | null } {
+	#precheckWrite(item: TransactionItem, readStamp: boolean): { reason: RejectionReasonEncoded | null; read: ItemRead | null } {
+		const { hashKey: hk, sortKey: sk } = item;
 		if (item.operation === "put") {
 			// A put always carries both data and kind; assert together so the measure gets a real kind.
 			invariant(
 				item.data !== undefined && item.kind !== undefined,
-				() => `fokos/partition.precheck: "put" item has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
+				() => `fokos/partition.precheck: "put" item has no data/kind (${KeyCodec.pairForLog(hk, sk)})`,
 			);
-			const bytes = this.#store.measureItemBytes({ hk: item.hashKey, sk, data: item.data, kind: item.kind });
-			return { reason: bytes > MAX_ITEM_BYTES ? { code: "item_too_large", ...rejectionKeys } : null, probe: null };
+			const measureOpts = { hk, sk, data: item.data, kind: item.kind };
+			const read = readStamp ? this.#store.measureItemBytesWithStamp(measureOpts) : null;
+			const bytes = read ? read.estRowBytes : this.#store.measureItemBytes(measureOpts);
+			return { reason: bytes > MAX_ITEM_BYTES ? { code: "item_too_large", ...decodeItemKeys(hk, sk) } : null, read };
 		}
 
 		if (item.operation === "update") {
 			invariant(item.update, "fokos/partition.precheck: update item missing update plan");
-			const probe = this.#store.probeUpdate(item.update, item.hashKey, sk);
+			const probe = this.#store.probeUpdate(item.update, hk, sk);
 			if (!probe.applicable) {
 				// A value that evaluated to bytes is the one cause the probe separates out, because the
 				// caller can act on it. Every other cause — a non-json item, a missing target path, a
 				// missing operand — is reported as one answer, as DynamoDB reports its own.
 				const code = probe.valueTypeOk ? "update_not_applicable" : "update_value_is_bytes";
-				return { reason: { code, ...rejectionKeys }, probe };
+				return { reason: { code, ...decodeItemKeys(hk, sk) }, read: probe };
 			}
 			// An applicable update always measured its result; the probe returns NULL only when it is not.
 			invariant(probe.newSize !== null, "fokos/partition.precheck: applicable update reported no size");
-			return { reason: probe.newSize > MAX_ITEM_BYTES ? { code: "item_too_large", ...rejectionKeys } : null, probe };
+			return { reason: probe.newSize > MAX_ITEM_BYTES ? { code: "item_too_large", ...decodeItemKeys(hk, sk) } : null, read: probe };
 		}
 
 		// delete and check write no data, so neither has a size to test.
-		return { reason: null, probe: null };
+		return { reason: null, read: null };
 	}
 
 	prepareLocal(request: PrepareRequest): PrepareResponse {
@@ -233,14 +365,9 @@ export class TransactionParticipant {
 		invariant(request.coordinator?.v === COORDINATOR_REF_VERSION, "fokos/partition.prepare: the coordinator reference version is required");
 		invariant(request.coordinator.idempotencyToken, "fokos/partition.prepare: the coordinator idempotencyToken is required");
 		invariant(request.coordinator.doName, "fokos/partition.prepare: the coordinator doName is required");
-		// One key has one lock row. A second item of the same key passes the checks, and its lock insert
-		// is ignored, so a commit would apply one of the two operations.
-		const requestKeys = new Set(request.items.map((item) => KeyCodec.pairKey(item.hashKey, item.sortKey)));
-		invariant(
-			requestKeys.size === request.items.length,
-			() => `fokos/partition.prepare: transaction ${request.transactionId} names a key twice`,
-		);
 		const coordinatorJson = JSON.stringify(request.coordinator);
+		// The version-reference check refuses a request that is not valid, before every other answer.
+		const plan = sequencePlanOf(request.items);
 
 		const now = this.#now();
 
@@ -262,132 +389,284 @@ export class TransactionParticipant {
 			};
 		}
 
-		return this.#store.transactionSync<PrepareResponse>(() => {
-			const results: ParticipantOperationResultEncoded[] = [];
-			// The opIndexes of the items that this transaction has locked already.
-			const lockedBefore = new Set<number>();
-			for (const item of request.items) {
-				const { opIndex } = item;
-				const sk = item.sortKey;
-				const rejectionKeys = decodeItemKeys(item.hashKey, sk);
+		const lockBlock = () => this.#writeLocks(plan, request, coordinatorJson, now);
 
-				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
+		// The evaluate block. When it made a temporary write, it throws, and SQLite rolls back every
+		// write of the block. The lock block then runs as a second storage transaction. No `await` runs
+		// between the two blocks, so no other request reads `items` between them. When the evaluate block
+		// made no temporary write, the locks go into the same block.
+		let evaluation: Evaluation;
+		try {
+			evaluation = this.#store.transactionSync(() => {
+				const ev = this.#evaluate(plan, {
+					twoPhase: true,
+					txTimestamp: request.transactionTimestamp,
+					transactionId: request.transactionId,
+				});
+				if (ev.temporaryWrites) {
+					throw new EvaluationRollback(ev);
+				}
+				if (!ev.rejected) {
+					lockBlock();
+				}
+				return ev;
+			});
+		} catch (err) {
+			if (!(err instanceof EvaluationRollback)) {
+				throw err;
+			}
+			evaluation = err.evaluation;
+			if (!evaluation.rejected) {
+				this.#store.transactionSync(lockBlock);
+			}
+		}
 
-				if (pendingRow) {
-					if (pendingRow.transaction_id === request.transactionId) {
-						lockedBefore.add(opIndex);
-						results.push({ outcome: "passed", opIndex });
-						continue; // idempotent re-prepare for this item
-					}
-					results.push({
-						outcome: "rejected",
-						opIndex,
-						reason: {
-							code: "pending_conflict",
-							...rejectionKeys,
-							conflictingTransactionId: pendingRow.transaction_id,
-						},
-					});
+		if (evaluation.rejected) {
+			applyImageCap(evaluation.results);
+			return { outcome: "rejected", results: evaluation.results };
+		}
+		return { outcome: "accepted" };
+	}
+
+	/**
+	 * Runs the checks of each operation in `opIndex` order. `path.twoPhase` selects what the path
+	 * adds (see `EvaluatePath`).
+	 *
+	 * In a request with an item of two or more operations, each passed operation is also applied as a
+	 * temporary write, so the next operation sees its effect. Every item gets temporary writes, also an
+	 * item with one operation, so the state at each operation is the state that apply gives at the
+	 * same position. In a request with no repeated item, this writes nothing.
+	 *
+	 * Conditions, update checks, and size checks read `items`, which holds the state that the earlier
+	 * operations left. The timestamp check uses only the state from before the transaction: all
+	 * operations of a transaction use one timestamp, so a check against a temporary state rejects valid
+	 * sequences such as `put → check` and `delete → put`.
+	 */
+	#evaluate(plan: SequencePlan, path: EvaluatePath): Evaluation {
+		const { ops, seqs } = plan;
+		// An accepted prepare and a committed single-shot transaction return no result for each operation.
+		// Thus `results` stays empty until the first rejection. That rejection first adds `passed` for
+		// each earlier operation, because no operation before it failed.
+		const results: ParticipantOperationResultEncoded[] = [];
+		const growth = new ItemGrowth();
+		let rejected = false;
+		let temporaryWrites = false;
+		// The deletion watermark is one value for the whole partition, and a temporary delete of any item
+		// raises it. Thus a repeated request reads it before the first temporary write.
+		let committedMaxDeleteTs = path.twoPhase && plan.repeated ? this.#store.getMaxDeleteTxOrderTs() : undefined;
+
+		const pass = (i: number) => {
+			if (rejected) {
+				results.push({ outcome: "passed", opIndex: ops[i].opIndex });
+			}
+		};
+		const reject = (i: number, reason: RejectionReasonEncoded, imageBytes?: number) => {
+			if (!rejected) {
+				rejected = true;
+				for (let j = 0; j < i; j++) {
+					results.push({ outcome: "passed", opIndex: ops[j].opIndex });
+				}
+			}
+			results.push({ outcome: "rejected", opIndex: ops[i].opIndex, reason, ...(imageBytes === undefined ? {} : { imageBytes }) });
+			seqs[i].failed = true;
+		};
+
+		for (let i = 0; i < ops.length; i++) {
+			const op = ops[i];
+			const seq = seqs[i];
+			if (seq.failed) {
+				results.push({ outcome: "not_evaluated", opIndex: op.opIndex });
+				continue;
+			}
+			const first = op === seq.ops[0];
+
+			if (first) {
+				const pendingRow = this.#store.pendingLockFor(op.hashKey, op.sortKey);
+				if (pendingRow && path.twoPhase && pendingRow.transaction_id === path.transactionId) {
+					// A repeated prepare: the lock row holds the result of the first prepare. The
+					// single-partition path writes no lock, so every lock is a conflict there.
+					seq.lockedBefore = true;
+				} else if (pendingRow) {
+					const keys = decodeItemKeys(op.hashKey, op.sortKey);
+					reject(i, { code: "pending_conflict", ...keys, conflictingTransactionId: pendingRow.transaction_id });
 					continue;
 				}
-
-				const conditionResult = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
-				if (conditionResult && !conditionResult.conditionOk) {
-					const image = this.#imageForFailedCondition(item, sk, conditionResult.itemPresent);
-					results.push({
-						outcome: "rejected",
-						opIndex,
-						reason: conditionFailedReason(rejectionKeys, image),
-						...(image ? { imageBytes: image.imageBytes } : {}),
-					});
-					continue;
-				}
-
-				const { reason: writeReason, probe } = this.#precheckWrite(item, sk, rejectionKeys);
-				if (writeReason) {
-					results.push({ outcome: "rejected", opIndex, reason: writeReason });
-					continue;
-				}
-
-				// The condition or the update probe already read the row, so its timestamps come from that
-				// read. Only an operation that did neither reads the item here.
-				const itemRead = conditionResult ?? probe;
-				const itemStamp = itemRead ? itemStampOf(itemRead) : this.#store.getItemStamp(item.hashKey, sk).row;
-
-				if (itemStamp) {
-					// A check reads the item and does not change it, so only a newer write orders against
-					// it. A content mutation must stay above every earlier read and write.
-					// The last_read_ts is always greater than or equal to the last_write_ts of any previous write,
-					// so using it as the watermark for updates ensures proper ordering against all prior operations.
-					const watermark = item.operation === "check" ? itemStamp.last_write_ts : itemStamp.last_read_ts;
-					if (request.transactionTimestamp <= watermark) {
-						results.push({
-							outcome: "rejected",
-							opIndex,
-							reason: { code: "timestamp_conflict", ...rejectionKeys },
-						});
-						continue;
-					}
-				} else {
-					// No stamp means no live item, so the deletion watermark is the only ordering signal left.
-					// This holds for every operation: a check, which writes nothing but still orders itself
-					// against later transactions, and an update of an absent item, which creates it.
-					if (request.transactionTimestamp <= this.#store.getMaxDeleteTxOrderTs()) {
-						results.push({
-							outcome: "rejected",
-							opIndex,
-							reason: { code: "timestamp_conflict", ...rejectionKeys },
-						});
-						continue;
-					}
-				}
-
-				results.push({ outcome: "passed", opIndex });
+			}
+			if (seq.lockedBefore) {
+				pass(i);
+				continue;
 			}
 
-			if (results.some((r) => r.outcome === "rejected")) {
-				applyImageCap(results);
-				return { outcome: "rejected", results };
+			const conditionResult = op.condition ? this.#store.evaluateCondition(op.condition, op.hashKey, op.sortKey) : null;
+			if (conditionResult && !conditionResult.conditionOk) {
+				const image = this.#imageForFailedCondition(op, op.sortKey, conditionResult.itemPresent);
+				reject(i, conditionFailedReason(decodeItemKeys(op.hashKey, op.sortKey), image), image?.imageBytes);
+				continue;
 			}
 
-			// All checks passed — lock every item.
-			const tx: PendingTxInfo = {
-				transaction_id: request.transactionId,
-				transaction_ts: request.transactionTimestamp,
-				coordinator_json: coordinatorJson,
-				created_at: now,
-				guarded_at: null,
-				next_recovery_at: now + this.#staleTransactionMs(),
-			};
-			for (const item of request.items) {
-				const sk = item.sortKey;
-				let inserted: boolean;
-				if (item.operation === "update") {
-					invariant(item.update, "fokos/partition.prepare: update item missing update plan");
-					inserted =
-						this.#store.insertPendingUpdateLock({ hk: item.hashKey, sk, tx, plan: item.update, ttlAt: item.ttlAt }).rowsWritten > 0;
-				} else {
-					inserted = this.#store.insertPendingLock({
-						...tx,
-						hk: item.hashKey,
-						sk,
-						operation: item.operation,
-						data: item.data ?? null,
-						// data and kind travel together: put carries both; delete/check carry neither (NULL kind).
-						kind: item.kind ?? null,
-						ttl_epoch_utc_seconds: item.ttlAt ?? null,
-					});
+			// A prepare reads the item stamps at the first operation of the item. When no condition read
+			// the row, a put reads the stamps in the statement that measures it.
+			const { reason: writeReason, read } = this.#precheckWrite(op, path.twoPhase && first && !conditionResult);
+			if (writeReason) {
+				reject(i, writeReason);
+				continue;
+			}
+
+			if (path.twoPhase) {
+				if (first) {
+					// The condition, the update probe, or the put measure already read the row, so its
+					// timestamps come from that read. Only an operation that did none of these reads the item
+					// here. Only the operations of this item write its row, so the later operations of the item
+					// use these stamps.
+					const itemRead = conditionResult ?? read;
+					seq.committedStamp = (itemRead ? itemStampOf(itemRead) : this.#store.getItemStamp(op.hashKey, op.sortKey).row) ?? null;
 				}
-				// The check pass found no lock of another transaction on this key. An accepted item with no
-				// lock row makes the commit find no row to apply, and report success for a write it skipped.
+				const stamp = seq.committedStamp;
+				invariant(stamp !== undefined, "fokos/partition.prepare: the first operation of an item read no stamps");
+				// A check reads the item and does not change it, so only a newer write orders against it. A
+				// content mutation must stay above every earlier read and write. No stamp means no live item,
+				// so the deletion watermark is the only ordering signal left. This holds for every
+				// operation: a check, which writes nothing but still orders itself against later
+				// transactions, and an update of an absent item, which creates it.
+				const watermark =
+					stamp === null
+						? (committedMaxDeleteTs ??= this.#store.getMaxDeleteTxOrderTs())
+						: op.operation === "check"
+							? stamp.last_write_ts
+							: stamp.last_read_ts;
+				if (path.txTimestamp <= watermark) {
+					reject(i, { code: "timestamp_conflict", ...decodeItemKeys(op.hashKey, op.sortKey) });
+					continue;
+				}
+			}
+
+			pass(i);
+
+			if (plan.repeated) {
+				growth.record(op, this.#writeRequest(op, path.txTimestamp));
+				temporaryWrites = true;
+				// Only the lock block of a prepare reads the last-write data. The single-partition path keeps
+				// its writes, so it needs no copy.
+				if (op === seq.lastWrite && path.twoPhase) {
+					seq.lastWriteData = this.#store.readItemData(op.hashKey, op.sortKey);
+					invariant(seq.lastWriteData, () => `fokos/partition: no row after a write of ${KeyCodec.pairForLog(op.hashKey, op.sortKey)}`);
+				}
+			}
+		}
+
+		return { results, rejected, temporaryWrites, growth: growth.candidates() };
+	}
+
+	/**
+	 * Writes the `pending_tx_info` row and one lock row for each item that this transaction does not
+	 * lock yet. A lock row holds the operation list of its item and the data of its last write.
+	 */
+	#writeLocks(plan: SequencePlan, request: PrepareRequest, coordinatorJson: string, now: number): void {
+		const tx: PendingTxInfo = {
+			transaction_id: request.transactionId,
+			transaction_ts: request.transactionTimestamp,
+			coordinator_json: coordinatorJson,
+			created_at: now,
+			guarded_at: null,
+			next_recovery_at: now + this.#staleTransactionMs(),
+		};
+		for (const seq of plan.sequences.values()) {
+			if (seq.lockedBefore) {
+				continue;
+			}
+			const { hashKey: hk, sortKey: sk, ops } = seq;
+			const opList: OpList = ops.map((op) => [op.opIndex, op.operation]);
+			const [only] = ops;
+			let inserted: boolean;
+			if (ops.length === 1 && only.operation === "update") {
+				invariant(only.update, "fokos/partition.prepare: update item missing update plan");
+				inserted = this.#store.insertPendingUpdateLock({ hk, sk, tx, plan: only.update, ttlAt: only.ttlAt, opList }).rowsWritten > 0;
+			} else {
+				// One operation takes its data from the request: a put carries data and kind, and a delete or
+				// a check carries neither. A longer sequence takes the data that the evaluate step read after
+				// its last write, because the rollback discarded that row.
 				invariant(
-					inserted || lockedBefore.has(item.opIndex),
-					() => `fokos/partition.prepare: no lock row written for ${KeyCodec.pairForLog(item.hashKey, sk)}`,
+					ops.length === 1 || (seq.lastWrite === undefined) === (seq.lastWriteData === undefined),
+					() => `fokos/partition.prepare: no last-write data for ${KeyCodec.pairForLog(hk, sk)}`,
 				);
+				const data =
+					ops.length === 1
+						? { data: only.data ?? null, kind: only.kind ?? null, ttl_epoch_utc_seconds: only.ttlAt ?? null }
+						: (seq.lastWriteData ?? { data: null, kind: null, ttl_epoch_utc_seconds: null });
+				inserted = this.#store.insertPendingLock({ ...tx, ...data, hk, sk, operation: lockOperationOf(ops), op_list: opList });
 			}
+			// The evaluate step found no lock of another transaction on this key. An accepted item with no
+			// lock row makes the commit find no row to apply, and report success for a write it skipped.
+			invariant(inserted, () => `fokos/partition.prepare: no lock row written for ${KeyCodec.pairForLog(hk, sk)}`);
+		}
+	}
 
-			return { outcome: "accepted" };
-		});
+	/**
+	 * One store write of one operation at `ts`. A put or an update takes its data from `source`: the
+	 * request operation, or the last-write data of a lock row. Returns the size estimate of the key
+	 * after a put or an update.
+	 */
+	#write(hk: KeyBytes, sk: KeyBytes, operation: TransactionOperationType, source: WriteSource, ts: number): number | undefined {
+		if (operation === "delete") {
+			this.#store.deleteItem({ hk, sk, txOrderTs: ts, bumpTxOrderTsAlways: true });
+			return undefined;
+		}
+		if (operation === "check") {
+			// A check writes nothing, but it still orders this transaction against later writes through
+			// the item's read watermark.
+			this.#store.bumpItemReadTs(hk, sk, ts);
+			return undefined;
+		}
+		invariant(isWrite(operation), () => `fokos/partition: unknown operation ${operation} (${KeyCodec.pairForLog(hk, sk)})`);
+		if (source.from === "lock") {
+			const { row } = source;
+			// A lock row with a write always persisted both data and kind; assert together so upsertItem gets a real kind.
+			invariant(
+				row.data !== null && row.kind !== null,
+				() => `fokos/partition.commit: pending "${operation}" row has no data/kind (${KeyCodec.pairForLog(hk, sk)})`,
+			);
+			// For kind=json, a put's row holds JSON text, which upsertItem encodes to JSONB, and the row of an
+			// update or of a longer sequence holds the stored JSONB, which binds verbatim.
+			return this.#store.upsertItem({ hk, sk, data: row.data, kind: row.kind, ttlAt: row.ttl_epoch_utc_seconds, txOrderTs: ts })
+				.keyEstBytes;
+		}
+		const { item } = source;
+		if (operation === "update") {
+			invariant(item.update, "fokos/partition: update item missing update plan");
+			return this.#store.updateItemSingleShot({ hk, sk, plan: item.update, ttlAt: item.ttlAt, txOrderTs: ts }).keyEstBytes;
+		}
+		// A put always carries both data and kind; assert together so upsertItem gets a real kind.
+		invariant(
+			item.data != null && item.kind != null,
+			() => `fokos/partition: "put" item has no data/kind (${KeyCodec.pairForLog(hk, sk)})`,
+		);
+		// For kind=json, data is raw JSON text; upsertItem encodes it to JSONB.
+		return this.#store.upsertItem({ hk, sk, data: item.data, kind: item.kind, ttlAt: item.ttlAt ?? null, txOrderTs: ts }).keyEstBytes;
+	}
+
+	/** One store write of one request operation at `ts`. */
+	#writeRequest(op: TransactionItem, ts: number): number | undefined {
+		return this.#write(op.hashKey, op.sortKey, op.operation, { from: "request", item: op }, ts);
+	}
+
+	/**
+	 * Sorts `entries` in place by `opIndex`, and makes one store write for each entry in that order, at
+	 * `ts`. Returns the promotion candidate of the last write of each item whose final state is present.
+	 *
+	 * Each write of an item uses the same data, also a write in the middle of its sequence. That data is
+	 * invisible: the writes run in one storage transaction, and a later write or delete replaces it. The
+	 * values that other requests see depend only on the order and the types of the writes: `v`,
+	 * `max_deleted_v`, the timestamps, and `key_size_estimates`.
+	 */
+	#apply(entries: ApplyEntry[], ts: number): PromotionCandidate[] {
+		entries.sort((a, b) => a.opIndex - b.opIndex);
+		const growth = new ItemGrowth();
+		for (let i = 0; i < entries.length; i++) {
+			const entry = entries[i];
+			invariant(i === 0 || entries[i - 1].opIndex !== entry.opIndex, () => `fokos/partition: apply got opIndex ${entry.opIndex} two times`);
+			growth.record(entry, this.#write(entry.hashKey, entry.sortKey, entry.operation, entry.source, ts));
+		}
+		return growth.candidates();
 	}
 
 	/**
@@ -397,37 +676,44 @@ export class TransactionParticipant {
 	 * and the source cleanup after the promotion deletes it here.
 	 */
 	commitLocal(request: CommitRequest): CommitLocalResult {
-		const promotionCandidates: PromotionCandidate[] = [];
-
-		this.#store.transactionSync(() => {
-			const requestKeySet = new Set(request.items.map((i) => KeyCodec.pairKey(i.hashKey, i.sortKey)));
+		const promotionCandidates = this.#store.transactionSync((): PromotionCandidate[] => {
+			// The coordinator sends each key one time. A key two times passes the size comparison below,
+			// and apply then applies the entries of one lock row two times. Thus it is a defect in the code.
+			const requestKeys = new KeyPairMap<true>();
+			for (const item of request.items) {
+				invariant(
+					!requestKeys.has(item.hashKey, item.sortKey),
+					() =>
+						`fokos/partition.commit: transaction ${request.transactionId} names ${KeyCodec.pairForLog(item.hashKey, item.sortKey)} two times`,
+				);
+				requestKeys.set(item.hashKey, item.sortKey, true);
+			}
 			// Each key of the request is owned: the runtime resolved it to this partition in this
 			// synchronous block. A row outside the request is owned only when the owner check says so. On the
 			// usual path no row is outside the request, and the method does not call the owner check.
 			const ownsRow = ownsByHashKey(this.#ownerCheck());
-			const ownedRows = new Map<bigint, PendingLock>();
+			const ownedRows = new KeyPairMap<PendingLock>();
 			for (const row of this.#store.listPendingTxItems(request.transactionId)) {
-				const key = KeyCodec.pairKey(row.hk, row.sk);
-				if (requestKeySet.has(key) || ownsRow(row)) {
-					ownedRows.set(key, row);
+				if (requestKeys.has(row.hk, row.sk) || ownsRow(row)) {
+					ownedRows.set(row.hk, row.sk, row);
 				}
 			}
 			// No owned row remains: the rows are gone, or only copies remain. This partition has no
 			// local work, and the answer is the idempotent success.
 			if (ownedRows.size === 0) {
-				return;
+				return [];
 			}
-			if (ownedRows.size !== requestKeySet.size) {
+			if (ownedRows.size !== requestKeys.size) {
 				throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 					message: "pending_transactions and the commit request hold a different number of items",
-					attributes: { transactionId: request.transactionId, pendingItems: ownedRows.size, requestItems: requestKeySet.size },
+					attributes: { transactionId: request.transactionId, pendingItems: ownedRows.size, requestItems: requestKeys.size },
 				});
 			}
-			for (const key of requestKeySet) {
-				if (!ownedRows.has(key)) {
+			for (const { hashKey, sortKey } of requestKeys.entries()) {
+				if (!ownedRows.has(hashKey, sortKey)) {
 					throw new FokosInternalError(INTERNAL_CODES.commit_keyset_mismatch, {
 						message: "a commit request item is not found in pending_transactions",
-						attributes: { transactionId: request.transactionId, key: String(key) },
+						attributes: { transactionId: request.transactionId, key: KeyCodec.pairForLog(hashKey, sortKey) },
 					});
 				}
 			}
@@ -440,57 +726,23 @@ export class TransactionParticipant {
 					`fokos/partition.commit: transaction ${request.transactionId} prepared at ${first.transaction_ts} commits at ${request.transactionTimestamp}`,
 			);
 
-			this.#applyCommitItems(request.items, ownedRows, request.transactionTimestamp, promotionCandidates);
+			// The request items are keys only: every operation and its data come from the lock rows that
+			// prepare wrote. One apply call applies the entries of all owned rows in opIndex order.
+			const entries: ApplyEntry[] = [];
+			for (const row of ownedRows.values()) {
+				const source: WriteSource = { from: "lock", row };
+				for (const [opIndex, operation] of row.op_list) {
+					entries.push({ opIndex, operation, hashKey: row.hk, sortKey: row.sk, source });
+				}
+			}
+			const candidates = this.#apply(entries, request.transactionTimestamp);
 			// The owned set and the request have the same keys here. The release deletes these keys one
 			// by one, and keeps the copies of a moved key.
 			this.#store.deletePendingTxKeys(request.transactionId, request.items);
+			return candidates;
 		});
 
 		return { response: { outcome: "committed" }, promotionCandidates };
-	}
-
-	// Items are keys only: every per-item fact applied here (operation, data, kind) comes from the
-	// partition's own pending_transactions row that prepare wrote. The caller read these rows once.
-	#applyCommitItems(
-		items: TransactionItemKey[],
-		pendingRows: ReadonlyMap<ReturnType<typeof KeyCodec.pairKey>, PendingLock>,
-		transactionTimestamp: number,
-		promotionCandidates: PromotionCandidate[],
-	): void {
-		for (const item of items) {
-			const sk = item.sortKey;
-			const pendingRow = pendingRows.get(KeyCodec.pairKey(item.hashKey, sk));
-			// The caller has proved that the request and the owned lock rows hold the same keys.
-			invariant(pendingRow, () => `fokos/partition.commit: no lock row for ${KeyCodec.pairForLog(item.hashKey, sk)}`);
-
-			if (pendingRow.operation === "put" || pendingRow.operation === "update") {
-				// A put/update always persisted both data and kind; assert together so upsertItem gets a real kind.
-				invariant(
-					pendingRow.data !== null && pendingRow.kind !== null,
-					() => `fokos/partition.commit: pending "${pendingRow.operation}" row has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
-				);
-				const res = this.#store.upsertItem({
-					hk: item.hashKey,
-					sk,
-					// For kind=json a put's row holds JSON text, which upsertItem encodes to JSONB, and an
-					// update's row holds the JSONB that prepare materialized, which binds verbatim.
-					data: pendingRow.data,
-					kind: pendingRow.kind,
-					ttlAt: pendingRow.ttl_epoch_utc_seconds,
-					txOrderTs: transactionTimestamp,
-				});
-				promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
-			} else if (pendingRow.operation === "delete") {
-				this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
-			} else {
-				// The release after this loop deletes the lock, so an operation that applies nothing here is a lost write.
-				invariant(
-					pendingRow.operation === "check",
-					() => `fokos/partition.commit: unknown operation ${pendingRow.operation} (${KeyCodec.pairForLog(item.hashKey, sk)})`,
-				);
-				this.#store.bumpItemReadTs(item.hashKey, sk, transactionTimestamp);
-			}
-		}
 	}
 
 	/**
@@ -507,104 +759,39 @@ export class TransactionParticipant {
 	 */
 	executeSingleShot(request: SingleShotRequest): SingleShotResult {
 		const transactionTimestamp = this.#txOrderTimestamp();
-		const promotionCandidates: PromotionCandidate[] = [];
+		const plan = sequencePlanOf(request.items);
 
-		const response = this.#store.transactionSync<SingleShotResponse>(() => {
-			const results: ParticipantOperationResultEncoded[] = [];
-			for (const item of request.items) {
-				const { opIndex } = item;
-				const sk = item.sortKey;
-				const rejectionKeys = decodeItemKeys(item.hashKey, sk);
-
-				const pendingRow = this.#store.pendingLockFor(item.hashKey, sk);
-				if (pendingRow) {
-					results.push({
-						outcome: "rejected",
-						opIndex,
-						reason: {
-							code: "pending_conflict",
-							...rejectionKeys,
-							conflictingTransactionId: pendingRow.transaction_id,
-						},
-					});
-					continue;
+		// One storage transaction. When one operation failed, the block throws, and SQLite rolls back
+		// every write. In a request with an item of two or more operations, the temporary writes of the
+		// evaluate step are the writes of every operation in opIndex order, so the block keeps them. In a
+		// request with no such item, the evaluate step wrote nothing, and apply writes the request.
+		//
+		// Nothing after the evaluate step may RETURN a rejection. transactionSync commits whatever the
+		// callback wrote when the callback returns. Every rejectable test therefore runs in the evaluate
+		// step, and the store raises on a size guard it can no longer reach, which rolls the whole set back.
+		try {
+			return this.#store.transactionSync((): SingleShotResult => {
+				const ev = this.#evaluate(plan, { twoPhase: false, txTimestamp: transactionTimestamp });
+				if (ev.rejected) {
+					throw new EvaluationRollback(ev);
 				}
-
-				const conditionRes = item.condition ? this.#store.evaluateCondition(item.condition, item.hashKey, sk) : null;
-				if (conditionRes && !conditionRes.conditionOk) {
-					const image = this.#imageForFailedCondition(item, sk, conditionRes.itemPresent);
-					results.push({
-						outcome: "rejected",
-						opIndex,
-						reason: conditionFailedReason(rejectionKeys, image),
-						...(image ? { imageBytes: image.imageBytes } : {}),
-					});
-					continue;
+				if (ev.temporaryWrites) {
+					return { response: { outcome: "committed" }, promotionCandidates: ev.growth };
 				}
-
-				const { reason: writeReason } = this.#precheckWrite(item, sk, rejectionKeys);
-				if (writeReason) {
-					results.push({ outcome: "rejected", opIndex, reason: writeReason });
-					continue;
+				// `plan.ops` is in `opIndex` order, and each `opIndex` occurs one time in it.
+				const growth = new ItemGrowth();
+				for (const op of plan.ops) {
+					growth.record(op, this.#writeRequest(op, transactionTimestamp));
 				}
-
-				results.push({ outcome: "passed", opIndex });
+				return { response: { outcome: "committed" }, promotionCandidates: growth.candidates() };
+			});
+		} catch (err) {
+			if (!(err instanceof EvaluationRollback)) {
+				throw err;
 			}
-
-			if (results.some((r) => r.outcome === "rejected")) {
-				applyImageCap(results);
-				return { outcome: "rejected", results };
-			}
-
-			// Every item passed, so the whole set applies. Reaching this point inside transactionSync is
-			// what makes the transaction atomic: a throw below rolls the statements above back with it.
-			//
-			// Nothing below may RETURN a rejection. transactionSync commits whatever the callback wrote
-			// when the callback returns, so a rejection here would keep the writes of the items already
-			// applied. Every rejectable test therefore ran in the check pass above, and the store raises
-			// on a size guard it can no longer reach, which rolls the whole set back.
-			for (const item of request.items) {
-				const sk = item.sortKey;
-				if (item.operation === "put") {
-					// A put always carries both data and kind; assert together so upsertItem gets a real kind.
-					invariant(
-						item.data != null && item.kind != null,
-						() => `fokos/partition.singleShot: "put" item has no data/kind (${KeyCodec.pairForLog(item.hashKey, sk)})`,
-					);
-					const res = this.#store.upsertItem({
-						hk: item.hashKey,
-						sk,
-						data: item.data,
-						// For kind=json -> data is raw JSON text; upsertItem re-encodes it to JSONB.
-						kind: item.kind,
-						ttlAt: item.ttlAt ?? null,
-						txOrderTs: transactionTimestamp,
-					});
-					promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
-				} else if (item.operation === "update") {
-					invariant(item.update, "fokos/partition.singleShot: update item missing update plan");
-					const res = this.#store.updateItemSingleShot({
-						hk: item.hashKey,
-						sk,
-						plan: item.update,
-						ttlAt: item.ttlAt,
-						txOrderTs: transactionTimestamp,
-					});
-					promotionCandidates.push({ hashKey: item.hashKey, keyEstBytes: res.keyEstBytes });
-				} else if (item.operation === "delete") {
-					this.#store.deleteItem({ hk: item.hashKey, sk, txOrderTs: transactionTimestamp, bumpTxOrderTsAlways: true });
-				} else {
-					// A check writes nothing, but it still orders this transaction against later writes
-					// through the item's read watermark.
-					this.#store.bumpItemReadTs(item.hashKey, sk, transactionTimestamp);
-				}
-			}
-
-			return { outcome: "committed" };
-		});
-		// No guard on the outcome. The check pass above returns a rejection BEFORE the apply loop runs,
-		// so a rejected answer grew no key and the array is empty. A throw discards it with the frame.
-		return { response, promotionCandidates };
+			applyImageCap(err.evaluation.results);
+			return { response: { outcome: "rejected", results: err.evaluation.results }, promotionCandidates: [] };
+		}
 	}
 
 	/**

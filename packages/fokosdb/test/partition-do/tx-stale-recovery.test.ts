@@ -36,6 +36,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 			transaction_id: transactionId,
 			transaction_ts: options?.transactionTimestamp ?? createdAt,
 			operation: "put",
+			op_list: [[0, "put"] as [number, "put"]],
 			data: options?.data ?? "value",
 			kind: "text",
 			ttl_epoch_utc_seconds: null,
@@ -69,6 +70,49 @@ describe("PartitionDO — stale transaction recovery", () => {
 		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
 		return recoverTransaction;
 	}
+
+	it("commits the lock rows of an item with more than one operation, in opIndex order, when the coordinator answers COMMITTED", async () => {
+		const { ctx, stub, rpc } = makeStub();
+		const recoverTransaction = vi.fn(async () => ({ state: "COMMITTED" as const }));
+		vi.spyOn(doStubs, "txCoordinatorStubForParticipant").mockReturnValue({
+			recoverTransactionForParticipant: recoverTransaction,
+		} as unknown as DurableObjectStub<TransactionCoordinatorDO>);
+		await rpc.apiPutItem(ctx, { hashKey: kb("b"), sortKey: kb("sk"), data: "b", kind: "text" });
+
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = (Date.now() + 1) * 1000;
+		const items = [
+			{ hashKey: kb("a"), sortKey: kb("sk"), operation: "put" as const, data: "a1", kind: "text" as const },
+			{ hashKey: kb("b"), sortKey: kb("sk"), operation: "delete" as const },
+			{ hashKey: kb("a"), sortKey: kb("sk"), operation: "put" as const, data: "a2", kind: "text" as const },
+			{ hashKey: kb("b"), sortKey: kb("sk"), operation: "put" as const, data: "b2", kind: "text" as const },
+		].map((item, opIndex) => ({ ...item, opIndex }));
+		const coordinator = testCoordinatorContext();
+		expect(
+			await rpc.txPrepare(ctx, {
+				transactionId,
+				transactionTimestamp,
+				coordinator: { v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` },
+				items,
+			}),
+		).toEqual({ outcome: "accepted" });
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: Date.now() });
+			expect(recoverTransaction).toHaveBeenCalledTimes(1);
+			expect(new PartitionStore(state.storage).listPendingTxKeys(transactionId)).toHaveLength(0);
+		});
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("a"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "a2", version: 2 },
+		});
+		// b had v = 1: the delete raised max_deleted_v to 1, so the new row starts at v = 2.
+		expect(await rpc.apiGetItem(ctx, { hashKey: kb("b"), sortKey: kb("sk") })).toMatchObject({
+			found: true,
+			item: { data: "b2", version: 2 },
+		});
+	});
 
 	// A source that has cut over is a router. Its targets own the keys and hold the true locks.
 	it.each(["cutover", "completed"] as const)("skips stale recovery on a source in %s", async (state_) => {
@@ -455,6 +499,7 @@ describe("PartitionDO — stale transaction recovery", () => {
 				transaction_id: transactionId,
 				transaction_ts: transactionTimestamp,
 				operation: "put",
+				op_list: [[0, "put"] as [number, "put"]],
 				data: "value",
 				kind: "text",
 				ttl_epoch_utc_seconds: ttlAt,

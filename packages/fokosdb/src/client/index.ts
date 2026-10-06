@@ -64,6 +64,7 @@ export type {
 	TransactGetItemsResult,
 	TransactWriteItem,
 	TransactWriteItemsOptions,
+	TransactWriteExecutionMode,
 	TransactWriteItemsResult,
 	TransactWriteOperationResult,
 } from "../shared/transaction-api-types.js";

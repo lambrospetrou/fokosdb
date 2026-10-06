@@ -4,7 +4,17 @@ import type { TransactionCoordinatorDO } from "./do-transaction-coordinator.js";
 import type { PartitionDO } from "./do-partition.js";
 import * as doStubs from "../shared/do-stubs.js";
 import { testCoordinatorContext, testCoordinatorStubByName } from "../../test/stub-helpers.js";
-import { FokosError, FokosUnavailableError, TRANSACTION_PENDING_CODES, UNAVAILABLE_CODES, type FokosErrorWire } from "../shared/errors.js";
+import {
+	EXPRESSION_CODES,
+	FokosError,
+	FokosExpressionError,
+	FokosUnavailableError,
+	FokosValidationError,
+	TRANSACTION_PENDING_CODES,
+	UNAVAILABLE_CODES,
+	VALIDATION_CODES,
+	type FokosErrorWire,
+} from "../shared/errors.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
 import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosRouter } from "../sharding/router.js";
@@ -76,9 +86,13 @@ type CoordinatorInternals = {
 		belongsToTarget: (key: { hashKey: Uint8Array }) => boolean,
 		budget: FokosMigrationPageBudget,
 	): {
-		page: Array<{ state: { transaction_id: string }; items: Array<{ data: unknown; data_kind: unknown; conditions_json: unknown }> }>;
+		page: Array<{
+			state: { transaction_id: string };
+			items: Array<{ op_index: number; data: unknown; data_kind: unknown; conditions_json: unknown }>;
+		}>;
 		nextCursor: string | null;
 	};
+	applyMigrationPage(page: unknown[]): void;
 	loadFinalResponse(transactionId: string, idempotencyToken: string): InitiateWriteResponseEncoded;
 	cancelTransactionInStore(transactionId: string, idempotencyToken: string): void;
 	storePrepareAnswer(transactionId: string, partitionDoName: string, answer: PrepareResponse): void;
@@ -334,6 +348,7 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 				clientRequestToken: TOKEN,
 				table: { topology, rangeConfig: ctx.rangeConfig, policy, policyVersion: ctx.policyVersion },
 				items,
+				executionMode: "standard",
 			});
 
 			const itemRows = state.storage.sql
@@ -352,10 +367,30 @@ describe("TransactionCoordinatorDO - participant resolution", () => {
 		});
 	});
 
+	it("stores the fingerprint of a standard request when the request has no executionMode", async () => {
+		await withCoordinator(async (tc, state, ctx) => {
+			const items: InitiateWriteRequest["items"] = [
+				{ opIndex: 0, hashKey: kb("hk"), sortKey: ABSENT_SK, operation: "put", data: "v", kind: "text" },
+			];
+			vi.spyOn(tc, "drivePrepare").mockResolvedValue({ outcome: "committed", transactionId: TX_ID, idempotencyToken: TOKEN });
+
+			await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items });
+
+			expect(state.storage.sql.exec<{ operations_hash: string }>(`SELECT operations_hash FROM tc_state`).one().operations_hash).toBe(
+				hashTransactionOperations(items, "standard"),
+			);
+		});
+	});
+
 	it("refuses an invalid table topology before it writes anything", async () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			await expect(
-				tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: { ...ctx, topology: { ...ctx.topology, rootTreesN: 0 } }, items: [] }),
+				tc.initiateWriteLocal({
+					clientRequestToken: TOKEN,
+					table: { ...ctx, topology: { ...ctx.topology, rootTreesN: 0 } },
+					items: [],
+					executionMode: "standard",
+				}),
 			).rejects.toThrow(fokosErrorWith("partition_context_options_invalid"));
 			expect(countRows(state, "tc_state")).toBe(0);
 		});
@@ -376,9 +411,9 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				// threshold that is larger than this limit. Thus only the limit of the coordinator applies.
 				vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(5 * 1024 * 1024 * 1024 + 1);
 				expect(tc.hooks().evaluateSplit({ identity: tc.fokos.identity(), policy })).not.toBe(false);
-				await expect(tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, table: ctx, items: [] })).rejects.toThrow(
-					fokosErrorWith("coordinator_over_size"),
-				);
+				await expect(
+					tc.initiateWrite({ ...ctx, policy }, { clientRequestToken: TOKEN, table: ctx, items: [], executionMode: "standard" }),
+				).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
 				expect(countRows(state, "tc_state")).toBe(2);
 			});
 		},
@@ -401,7 +436,7 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		await withCoordinator(async (tc, state, ctx) => {
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items: [] })).rejects.toThrow(
+			await expect(tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items: [], executionMode: "standard" })).rejects.toThrow(
 				fokosErrorWith("coordinator_over_size"),
 			);
 			expect(countRows(state, "tc_state")).toBe(0);
@@ -417,11 +452,11 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 				state: "COMMITTED",
 				createdAt: BASE_TIME,
 				completedAt: BASE_TIME,
-				operationsHash: hashTransactionOperations(items),
+				operationsHash: hashTransactionOperations(items, "standard"),
 			});
 			vi.spyOn(state.storage.sql, "databaseSize", "get").mockReturnValue(OVER_SIZE_BYTES);
 
-			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items })).value).toEqual({
+			expect((await tc.initiateWrite(ctx, { clientRequestToken: TOKEN, table: ctx, items, executionMode: "standard" })).value).toEqual({
 				outcome: "committed",
 				transactionId: TX_ID,
 				idempotencyToken: TOKEN,
@@ -1227,6 +1262,66 @@ describe("TransactionCoordinatorDO - bounded transaction storage", () => {
 		});
 	});
 
+	describe("an item with more than one operation", () => {
+		/** Adds operation 2 on the key of operation 0, so that hk1/sk1 has two tc_items rows. */
+		function seedRepeatedItem(state: DurableObjectState, tcState: TCState) {
+			seed(state, tcState);
+			state.storage.sql.exec(
+				`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, 2, 'check', 'p1')`,
+				TX_ID,
+				kb("hk1"),
+				kb("sk1"),
+			);
+			insertParticipant(state, { prepare: tcState === "COMMITTING" ? "accepted" : undefined });
+		}
+
+		function mockKeys() {
+			const sent: { op: string; keys: string[] }[] = [];
+			const record = (op: string) => async (_pCtx: unknown, req: { items: { hashKey: KeyBytes; sortKey: KeyBytes }[] }) => {
+				sent.push({ op, keys: req.items.map((k) => `${KeyCodec.decode(k.hashKey) as string}/${KeyCodec.decode(k.sortKey) as string}`) });
+				return enveloped({ outcome: op === "txCommit" ? ("committed" as const) : ("cancelled" as const) });
+			};
+			vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+				() => ({ txCommit: record("txCommit"), txCancel: record("txCancel") }) as unknown as DurableObjectStub<PartitionDO>,
+			);
+			return sent;
+		}
+
+		it("stores one tc_items row for each operation", async () => {
+			await withCoordinator(async (_tc, state) => {
+				seedRepeatedItem(state, "PREPARING");
+				expect(countRows(state, "tc_items")).toBe(3);
+			});
+		});
+
+		it("sends each key one time in the commit", async () => {
+			await withCoordinator(async (tc, state) => {
+				seedRepeatedItem(state, "COMMITTING");
+				const sent = mockKeys();
+				vi.spyOn(tc, "completeTransaction").mockResolvedValue();
+
+				await tc.runCommit(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(sent).toHaveLength(1);
+				expect(sent[0].op).toBe("txCommit");
+				expect(sent[0].keys.sort()).toEqual(["hk1/sk1", "hk2/"]);
+			});
+		});
+
+		it("sends each key one time in the cancel", async () => {
+			await withCoordinator(async (tc, state) => {
+				seedRepeatedItem(state, "CANCELLING");
+				const sent = mockKeys();
+
+				await tc.runCancel(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(sent).toHaveLength(1);
+				expect(sent[0].op).toBe("txCancel");
+				expect(sent[0].keys.sort()).toEqual(["hk1/sk1", "hk2/"]);
+			});
+		});
+	});
+
 	describe("commit outcomes", () => {
 		function twoParticipants(state: DurableObjectState, tcState: TCState) {
 			seed(state, tcState);
@@ -1417,7 +1512,7 @@ describe("TransactionCoordinatorDO - idempotency sweep", () => {
 			});
 
 			tc.sweepExpiredTransactions();
-			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items: [] });
+			const result = await tc.initiateWriteLocal({ clientRequestToken: TOKEN, table: ctx, items: [], executionMode: "standard" });
 
 			expect(result).toMatchObject({ outcome: "committed" });
 			expect(result.transactionId).not.toBe(oldTransactionId);
@@ -1813,6 +1908,36 @@ describe("TransactionCoordinatorDO - migration pages", () => {
 	});
 });
 
+describe("TransactionCoordinatorDO - migration of an item with more than one operation", () => {
+	it("moves every tc_items row with its op_index", async () => {
+		const budget: FokosMigrationPageBudget = { pageBytes: 20 * 1024 * 1024, pageRows: 10, scanRows: 10 };
+		await withCoordinator((tc, state) => {
+			seed(state, "PREPARING");
+			state.storage.sql.exec(
+				`INSERT INTO tc_items (transaction_id, hk, sk, op_index, operation, partition_do_name) VALUES (?, ?, ?, 2, 'check', 'p1')`,
+				TX_ID,
+				kb("hk1"),
+				kb("sk1"),
+			);
+			const { page } = tc.buildMigrationPage(null, () => true, budget);
+			expect(page[0].items.map((item) => item.op_index)).toEqual([0, 1, 2]);
+
+			// The target starts empty. A page that comes again is idempotent.
+			for (const table of ["tc_state", "tc_items", "tc_participants", "tc_results"]) {
+				state.storage.sql.exec(`DELETE FROM ${table}`);
+			}
+			tc.applyMigrationPage(page);
+			tc.applyMigrationPage(page);
+			expect(
+				state.storage.sql
+					.exec<{ op_index: number }>(`SELECT op_index FROM tc_items WHERE transaction_id = ? ORDER BY op_index`, TX_ID)
+					.toArray()
+					.map((row) => row.op_index),
+			).toEqual([0, 1, 2]);
+		});
+	});
+});
+
 describe("TransactionCoordinatorDO - recoverTransactionForParticipant", () => {
 	// A lock stores only the name of the coordinator and the token. The coordinator routes the call
 	// with the route context it stored.
@@ -1950,4 +2075,203 @@ describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () =
 			]);
 		});
 	});
+});
+
+describe("TransactionCoordinatorDO - fatal prepare errors", () => {
+	const fatal = () => new FokosValidationError(VALIDATION_CODES.transact_version_after_write, { message: "refused" });
+	const transient = () => new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, { message: "migrating" });
+
+	/** p1 owns operation 0 and p2 owns operation 1. The row is new, so the tx_recovery job does not drive it. */
+	function twoParticipants(
+		state: DurableObjectState,
+		tcState: TCState,
+		p1: Parameters<typeof insertParticipant>[1],
+		p2: Parameters<typeof insertParticipant>[1],
+	) {
+		seed(state, tcState, undefined, Date.now());
+		state.storage.sql.exec(`UPDATE tc_items SET partition_do_name = 'p2' WHERE transaction_id = ? AND op_index = 1`, TX_ID);
+		insertParticipant(state, { name: "p1", ...p1 });
+		insertParticipant(state, { name: "p2", ...p2 });
+	}
+
+	function mockPartitions(prepare: (name: string) => Promise<unknown>) {
+		const txPrepare = vi.fn(async (_ctx: unknown, req: { transactionId: string }, name: string) =>
+			req.transactionId === TX_ID ? await prepare(name) : enveloped({ outcome: "accepted" as const }),
+		);
+		const txCancel = vi.fn(async (_ctx: unknown, _req: unknown, _name: string) => enveloped(undefined));
+		const txCommit = vi.fn(async () => enveloped({ outcome: "committed" as const }));
+		vi.spyOn(doStubs, "partitionStubByName").mockImplementation(
+			(_env, _ctx, name) =>
+				({
+					txPrepare: (ctx: unknown, req: { transactionId: string }) => txPrepare(ctx, req, name),
+					txCancel: (ctx: unknown, req: unknown) => txCancel(ctx, req, name),
+					txCommit,
+				}) as unknown as DurableObjectStub<PartitionDO>,
+		);
+		const callsFor = (fn: typeof txPrepare | typeof txCancel, name?: string) =>
+			fn.mock.calls.filter(
+				(args) => (args[1] as { transactionId?: string }).transactionId === TX_ID && (name === undefined || args[2] === name),
+			);
+		return { txPrepare, txCancel, txCommit, callsFor };
+	}
+
+	const participant = (state: DurableObjectState, name: string) =>
+		state.storage.sql
+			.exec<{
+				prepare_outcome: string | null;
+				error_json: string | null;
+			}>(`SELECT prepare_outcome, error_json FROM tc_participants WHERE transaction_id = ? AND partition_do_name = ?`, TX_ID, name)
+			.one();
+	const storedError = (state: DurableObjectState, name: string) => {
+		const json = participant(state, name).error_json;
+		return json === null ? null : (JSON.parse(json) as FokosErrorWire);
+	};
+	const stateOf = (state: DurableObjectState) =>
+		state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).one().state;
+
+	it("tries a prepare that throws a FokosValidationError one time in drivePrepare, and cancels with its code and error_id", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "CREATED", undefined, Date.now());
+			insertParticipant(state, { name: "p1" });
+			const error = fatal();
+			const { txPrepare, callsFor } = mockPartitions(async () => {
+				throw error;
+			});
+
+			const response = await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(callsFor(txPrepare)).toHaveLength(1);
+			expect(response).toMatchObject({
+				outcome: "cancelled",
+				results: [
+					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
+					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
+				],
+			});
+		});
+	});
+
+	it("cancels in a recovery drive at once, before the hold limit, and releases the locks of the participant that accepted", async () => {
+		await withCoordinator(async (tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			const { txPrepare, txCancel, callsFor } = mockPartitions(async () => {
+				throw fatal();
+			});
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(callsFor(txPrepare, "p2")).toHaveLength(1);
+			expect(callsFor(txCancel, "p1")).toHaveLength(1);
+			expect(stateOf(state)).toBe("CANCELLED");
+		});
+	});
+
+	it("sends no prepare after a restart that left a stored fatal error, cancels, and keeps the fatal code and error_id", async () => {
+		await withCoordinator(async (tc, state) => {
+			const stored = FokosError.toWire(fatal());
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { error: stored });
+			const { txPrepare, txCancel, callsFor } = mockPartitions(async () => enveloped({ outcome: "accepted" as const }));
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(callsFor(txPrepare)).toHaveLength(0);
+			expect(callsFor(txCancel, "p1")).toHaveLength(1);
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
+				outcome: "cancelled",
+				results: [
+					{ outcome: "passed" },
+					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: stored.error_id } },
+				],
+			});
+		});
+	});
+
+	it("keeps the first stored fatal error when a concurrent drive stores a transport error or another validation error", async () => {
+		await withCoordinator((tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			const first = fatal();
+			tc.storePrepareError(TX_ID, "p2", first);
+			tc.storePrepareError(TX_ID, "p2", new Error("Network connection lost."));
+			tc.storePrepareError(TX_ID, "p2", fatal());
+			expect(storedError(state, "p2")).toMatchObject({ code: "transact_version_after_write", error_id: first.error_id });
+		});
+	});
+
+	it("stores no answer after a stored fatal error, so markCommitting writes nothing", async () => {
+		await withCoordinator((tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			tc.storePrepareError(TX_ID, "p2", fatal());
+			tc.storePrepareAnswer(TX_ID, "p2", { outcome: "accepted" });
+			expect(participant(state, "p2").prepare_outcome).toBeNull();
+			tc.markCommitting(TX_ID, TOKEN);
+			expect(stateOf(state)).toBe("PREPARING");
+		});
+	});
+
+	it("keeps an answer stored before an error", async () => {
+		await withCoordinator((tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { prepare: "accepted" });
+			tc.storePrepareError(TX_ID, "p2", fatal());
+			expect(participant(state, "p2")).toEqual({ prepare_outcome: "accepted", error_json: null });
+		});
+	});
+
+	it("replaces a stored transient error with a fatal one, and the check after the fan-out cancels", async () => {
+		await withCoordinator(async (tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, { error: FokosError.toWire(transient()) });
+			const error = fatal();
+			mockPartitions(async () => {
+				throw error;
+			});
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(stateOf(state)).toBe("CANCELLED");
+			expect(tc.loadFinalResponse(TX_ID, TOKEN)).toMatchObject({
+				results: [
+					{ outcome: "passed" },
+					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
+				],
+			});
+		});
+	});
+
+	it("sends no cancel when the recovery drive lost to a concurrent commit decision", async () => {
+		await withCoordinator(async (tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			const { txCancel, callsFor } = mockPartitions(async () => {
+				// The other drive received an accept from p2 and wrote the commit decision.
+				state.storage.sql.exec(`UPDATE tc_participants SET prepare_outcome = 'accepted' WHERE transaction_id = ?`, TX_ID);
+				tc.markCommitting(TX_ID, TOKEN);
+				throw fatal();
+			});
+
+			await tc.runPrepareRecovery(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(callsFor(txCancel)).toHaveLength(0);
+			expect(["COMMITTING", "COMMITTED"]).toContain(stateOf(state));
+		});
+	});
+
+	it.each([
+		["a FokosExpressionError", () => new FokosExpressionError(EXPRESSION_CODES.expression_invalid, { message: "data-dependent" })],
+		["partition_migrating", transient],
+	])(
+		"still retries %s",
+		async (_name, make) => {
+			await withCoordinator(async (tc, state) => {
+				seed(state, "CREATED", undefined, Date.now());
+				insertParticipant(state, { name: "p1" });
+				const { txPrepare, callsFor } = mockPartitions(async () => {
+					throw make();
+				});
+				vi.spyOn(tc, "runCancel").mockResolvedValue();
+
+				await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+
+				expect(callsFor(txPrepare)).toHaveLength(DEFAULT_COORDINATOR_CONFIG.participantRetry.prepareMaxAttempts);
+			});
+		},
+		15_000,
+	);
 });

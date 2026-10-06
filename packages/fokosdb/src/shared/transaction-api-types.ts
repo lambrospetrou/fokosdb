@@ -87,9 +87,11 @@ export type ConditionFailedReason = Extract<RejectionReason, { code: "condition_
  * What happened to one operation of a cancelled `transactWriteItems`, positional to the request:
  * `results[i]` answers the operation sent at index `i`.
  *
- * `passed` means the operation was acceptable, `not_evaluated` that no participant judged it, and
- * `rejected` that one failed it — the reason says why, and carries the old item image when the operation
- * asked for one and the item exists.
+ * `passed` means the operation was acceptable, `not_evaluated` that no participant judged it or that an
+ * earlier operation of the same item failed, and `rejected` that one failed it — the reason says why,
+ * and carries the old item image when the operation asked for one and the item exists. In
+ * "ordered_per_item" mode, the image can show the state that the earlier operations of the same
+ * transaction left. The transaction cancelled, so that state never committed.
  *
  * `itemOmitted` says the image did not fit in some answer on the way back, NOT that every later
  * image is absent: every node caps the image bytes it sends over the operations it owns, so an
@@ -160,7 +162,19 @@ export type TransactWriteItemsOptions = {
 	 * token for a different item set during that window is rejected.
 	 */
 	clientRequestToken?: string;
+	/**
+	 * Defaults to "standard". "ordered_per_item" accepts more than one operation for the same item. The
+	 * operations of an item apply in request order, and each one sees the effects of the earlier ones.
+	 *
+	 * In "ordered_per_item" mode, a condition or an update value that reads `v` must come before every
+	 * put, update, and delete of the same item (an earlier check is permitted), or the request fails with
+	 * `transact_version_after_write`. The reason: the `v` of a row that the transaction creates can be
+	 * higher at commit than at prepare.
+	 */
+	executionMode?: TransactWriteExecutionMode;
 };
+
+export type TransactWriteExecutionMode = "standard" | "ordered_per_item";
 
 /**
  * The public result of FokosDB.transactWriteItems. It carries no outcome: this value exists only when

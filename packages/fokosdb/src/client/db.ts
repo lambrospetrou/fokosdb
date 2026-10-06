@@ -57,6 +57,7 @@ import {
 	validateTransactGetItemCount,
 	validateTransactGetItemKeys,
 	validateTransactWriteOperations,
+	validateExecutionMode,
 	validateClientRequestToken,
 	decodeItemKeys,
 	resolveLimits,
@@ -83,7 +84,7 @@ import {
 } from "../shared/errors-operations.js";
 import invariant from "../shared/invariant.js";
 import { SHARDING_UNAVAILABLE_CODES } from "../sharding/errors.js";
-import { KeyCodec } from "../sharding/key-codec.js";
+import { KeyCodec, KeyPairMap } from "../sharding/key-codec.js";
 import { attachRouting, routedError } from "../sharding/envelope.js";
 import type { FokosPublicRouting } from "../sharding/runtime-types.js";
 import { normalizeSkInterval } from "../sharding/sk-interval.js";
@@ -600,6 +601,7 @@ export class FokosDB {
 	}
 
 	async #transactWriteItems(opts: TransactWriteItemsOptions): Promise<TransactWriteItemsResult> {
+		const executionMode = validateExecutionMode(opts.executionMode);
 		if (opts.clientRequestToken !== undefined) {
 			validateClientRequestToken(opts.clientRequestToken);
 		}
@@ -620,7 +622,7 @@ export class FokosDB {
 			return { ...item, ...encodeItemData(item.data), condition };
 		});
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
-		const keys = validateTransactWriteOperations(prepared, this.#limits);
+		const keys = validateTransactWriteOperations(prepared, this.#limits, executionMode);
 		const items: TCWriteOperation[] = prepared.map((item, i) => {
 			const { hashKey, sortKey } = keys[i];
 			return { ...item, opIndex: i, hashKey, sortKey };
@@ -653,7 +655,7 @@ export class FokosDB {
 		const { value: encoded } = await this.#coordinators.point(
 			"initiateWrite",
 			{ hashKey: encodeHashKey(idempotencyToken, this.#limits), sortKey: encodeSortKey(undefined, this.#limits) },
-			{ clientRequestToken: idempotencyToken, table: this.#table, items },
+			{ clientRequestToken: idempotencyToken, table: this.#table, items, executionMode },
 			{
 				retry: {
 					shouldRetry: (err) => FokosError.isCode(err, SHARDING_UNAVAILABLE_CODES.partition_migrating) && Date.now() < deadline,
@@ -852,12 +854,6 @@ export class FokosDB {
 			throw pendingWriteError();
 		}
 
-		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
-		// flattens the replies, so result order is not request order. KeyCodec.pairKey is the ONE identity
-		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
-		// returns a bigint, a primitive, so Map lookup compares by value.
-		const itemIdentity = (r: ReadForTransactionItemResultEncoded): bigint => KeyCodec.pairKey(r.hashKey, r.sortKey);
-
 		// Did both phases observe the same committed state? An item found in both phases compares
 		// `version` (the item's `v`). The `v` of a key never repeats in a partition, also after a delete
 		// and a recreate, so a different `v` shows each write between the phases. Unlike a wall-clock
@@ -879,20 +875,24 @@ export class FokosDB {
 		// Walk the REQUEST, not the replies: the response is positionally matched to request.items, so
 		// the caller reads result[i] as the answer to items[i] instead of re-matching on keys. Neither
 		// the partition grouping above nor the fan-out inside a PartitionDO preserves order, so the
-		// request order is restored here, once, from the same pairKey identity.
-		const phase1ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
+		// request order is restored here, once.
+		//
+		// Pair the two phases by key, not by position: PartitionDO fans items out to child partitions and
+		// flattens the replies, so result order is not request order. KeyPairMap is the ONE identity
+		// primitive for a (hashKey, sortKey) pair — the same one commitLocal's keyset check uses. It
+		// compares the key bytes.
+		const phase1ByKey = new KeyPairMap<ReadForTransactionItemResultEncoded>();
 		for (const r of phase1Flat) {
-			phase1ByKey.set(itemIdentity(r), r);
+			phase1ByKey.set(r.hashKey, r.sortKey, r);
 		}
-		const phase2ByKey = new Map<bigint, ReadForTransactionItemResultEncoded>();
+		const phase2ByKey = new KeyPairMap<ReadForTransactionItemResultEncoded>();
 		for (const r of phase2Flat) {
-			phase2ByKey.set(itemIdentity(r), r);
+			phase2ByKey.set(r.hashKey, r.sortKey, r);
 		}
 		const items: ReadForTransactionItemResultEncoded[] = [];
 		for (const requested of requestedItems) {
-			const key = KeyCodec.pairKey(requested.hashKey, requested.sortKey);
-			const p1 = phase1ByKey.get(key);
-			const p2 = phase2ByKey.get(key);
+			const p1 = phase1ByKey.get(requested.hashKey, requested.sortKey);
+			const p2 = phase2ByKey.get(requested.hashKey, requested.sortKey);
 			// A requested key with no reply means a participant dropped it — never expected, and not
 			// something to answer with a short array.
 			invariant(p1 && p2, "a participant of a read transaction dropped a requested key");
