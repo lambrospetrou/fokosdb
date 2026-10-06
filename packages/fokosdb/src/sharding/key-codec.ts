@@ -14,9 +14,10 @@
  * from RPC and BLOB reads — a zero-cost cast).
  */
 
-import { hash64 } from "./hash-primitives.js";
+import { hash32, hash64 } from "./hash-primitives.js";
 import { FokosValidationError } from "../shared/errors.js";
 import { SHARDING_VALIDATION_CODES } from "./errors.js";
+import invariant from "../shared/invariant.js";
 
 declare const KEY_BRAND: unique symbol;
 export type KeyBytes = Uint8Array & { readonly [KEY_BRAND]: true };
@@ -225,13 +226,114 @@ function mapKey(k: KeyBytes): bigint {
 }
 
 /**
- * Stable, collision-free string identity for a (hashKey, sortKey) pair.
- * Used for 2PC keyset comparison and duplicate detection.
+ * The seed of `keyPairHash`. The first call makes it, and the isolate keeps it. A `KeyPairMap`
+ * lives only in the memory of one call, so the seed does not have to be stable. A caller cannot
+ * know the seed, so a caller cannot choose keys that go into one bucket.
+ *
+ * The module must not make the seed when it loads: Workers refuse to generate random values in
+ * global scope, and the isolate then fails at startup.
  */
-function pairKey(hk: KeyBytes, sk: KeyBytes): bigint {
-	const hkHash = mapKey(hk);
-	const skHash = mapKey(sk);
-	return (hkHash << 64n) | skHash;
+let keyPairSeed: number | undefined;
+
+/** The bucket hash of a (hashKey, sortKey) pair in a `KeyPairMap`. It is not an identity. */
+export function keyPairHash(hk: KeyBytes, sk: KeyBytes): number {
+	keyPairSeed ??= crypto.getRandomValues(new Uint32Array(1))[0];
+	return hash32(sk, hash32(hk, keyPairSeed));
+}
+
+/**
+ * True IFF they are equal bytes.
+ * It compares the lengths first, then the bytes from the last byte to the first,
+ * since sort keys share the prefix and could be hundreds of bytes.
+ */
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+	if (a.length !== b.length) {
+		return false;
+	}
+	for (let i = a.length - 1; i >= 0; i--) {
+		if (a[i] !== b[i]) {
+			return false;
+		}
+	}
+	return true;
+}
+
+type KeyPairEntry<V> = { hashKey: KeyBytes; sortKey: KeyBytes; value: V };
+
+/** Up to this number of entries in the array before using buckets, a `KeyPairMap` finds a key with a byte comparison of each entry. */
+const KEY_PAIR_MAP_ARRAY_LIMIT = 8;
+
+/**
+ * A map from a (hashKey, sortKey) pair to a value. Two keys are the same entry only when the bytes
+ * of their hash keys and of their sort keys are equal. A hash selects the bucket, and only a byte
+ * comparison decides that two keys are equal.
+ *
+ * Up to 8 entries, it keeps the entries in an array. Above 8 entries, it also keeps a `Map` from
+ * `keyPairHash` to the entries with that hash. The comparison checks the sort key first, because two
+ * keys of one transaction usually have the same hash key and differ in the sort key. A map with a
+ * hash key only uses the empty sort key.
+ */
+export class KeyPairMap<V> {
+	#entries: KeyPairEntry<V>[] = [];
+	#buckets: Map<number, KeyPairEntry<V>[]> | null = null;
+
+	get size(): number {
+		return this.#entries.length;
+	}
+
+	get(hashKey: KeyBytes, sortKey: KeyBytes): V | undefined {
+		return this.#find(hashKey, sortKey)?.value;
+	}
+
+	has(hashKey: KeyBytes, sortKey: KeyBytes): boolean {
+		return this.#find(hashKey, sortKey) !== undefined;
+	}
+
+	set(hashKey: KeyBytes, sortKey: KeyBytes, value: V): this {
+		const found = this.#find(hashKey, sortKey);
+		if (found) {
+			found.value = value;
+			return this;
+		}
+		const entry = { hashKey, sortKey, value };
+		this.#entries.push(entry);
+		if (this.#buckets !== null) {
+			this.#addToBucket(entry);
+		} else if (this.#entries.length > KEY_PAIR_MAP_ARRAY_LIMIT) {
+			this.#buckets = new Map();
+			for (const e of this.#entries) {
+				this.#addToBucket(e);
+			}
+		}
+		return this;
+	}
+
+	/** The entries in insertion order. */
+	entries(): IterableIterator<Readonly<KeyPairEntry<V>>> {
+		return this.#entries.values();
+	}
+
+	*values(): IterableIterator<V> {
+		for (const e of this.#entries) {
+			yield e.value;
+		}
+	}
+
+	#find(hashKey: KeyBytes, sortKey: KeyBytes): KeyPairEntry<V> | undefined {
+		const candidates = this.#buckets === null ? this.#entries : this.#buckets.get(keyPairHash(hashKey, sortKey));
+		return candidates?.find((e) => bytesEqual(e.sortKey, sortKey) && bytesEqual(e.hashKey, hashKey));
+	}
+
+	#addToBucket(entry: KeyPairEntry<V>): void {
+		const hash = keyPairHash(entry.hashKey, entry.sortKey);
+		invariant(this.#buckets, "Buckets must be initialized before adding to them.");
+		const bucket = this.#buckets.get(hash);
+		if (bucket) {
+			bucket.push(entry);
+		} else {
+			this.#buckets.set(hash, [entry]);
+		}
+	}
 }
 
 export const KeyCodec = {
@@ -246,5 +348,4 @@ export const KeyCodec = {
 	keyForLog,
 	pairForLog,
 	mapKey,
-	pairKey,
 } as const;

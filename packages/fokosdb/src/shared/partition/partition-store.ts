@@ -27,6 +27,7 @@ import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS, decodeItemKeys } from "../tra
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import { withExpressionErrors } from "../errors-operations.js";
 import { estRowBytesExpr, itemDataExpr, JSON_KIND_CODE } from "./item-size.js";
+import type { TransactionOperationType } from "../transaction-wire-types.js";
 
 // Public-read data projection: json rows decode to JSON text; bytes/text pass through untouched.
 const DATA_SELECT_DECODED = `CASE WHEN data_kind = ${JSON_KIND_CODE} THEN json(data) ELSE data END AS data`;
@@ -179,16 +180,49 @@ export type PendingTxInfo = {
 	next_recovery_at: number;
 };
 
+/**
+ * The operation list of one lock row: the `[opIndex, operation]` pairs of the operations of its item,
+ * in `opIndex` order. Commit applies one store write for each pair.
+ */
+export type OpList = Array<[opIndex: number, operation: TransactionOperationType]>;
+
+const OP_LIST_OPERATIONS: ReadonlySet<string> = new Set<TransactionOperationType>(["put", "update", "delete", "check"]);
+
+/**
+ * Reads the `op_list` column of a lock row. The value comes from storage, so this checks its form:
+ * an array of pairs, each opIndex an integer, and each operation one of the four operations.
+ */
+function parseOpList(json: string): OpList {
+	const list: unknown = JSON.parse(json);
+	invariant(Array.isArray(list) && list.length > 0, "fokos/partition-store: op_list is not a non-empty array");
+	for (const entry of list) {
+		invariant(
+			Array.isArray(entry) && entry.length === 2 && Number.isInteger(entry[0]) && OP_LIST_OPERATIONS.has(entry[1]),
+			"fokos/partition-store: op_list holds an entry that is not an [opIndex, operation] pair",
+		);
+	}
+	return list as OpList;
+}
+
 /** One lock and the facts of its transaction, as prepare writes them and as migration copies them. */
 export type PendingTxItem = PendingTxInfo & {
 	hk: KeyBytes;
 	sk: KeyBytes;
+	/**
+	 * The last operation of the sequence that is not a `check`, or `check` when every operation is a
+	 * `check`. A transactional read reads it. Commit reads `op_list`.
+	 */
 	operation: string;
-	// data and its kind are absent together: null for delete/check ops, present for put.
+	// data and its kind are absent together: null when the sequence has no put or update.
+	// Otherwise the data that the item has after the last write of its sequence.
 	data: string | Uint8Array | null;
 	kind: DataKind | null;
 	ttl_epoch_utc_seconds: number | null;
+	op_list: OpList;
 };
+
+/** The stored data of one item, as a write of the same item stores it again unchanged. */
+export type StoredItemData = { data: string | Uint8Array; kind: DataKind; ttl_epoch_utc_seconds: number | null };
 
 /** One stale transaction, with what the recovery job needs to reach its coordinator and to set its next attempt. */
 export type StalePendingTx = Pick<PendingTxInfo, "transaction_id" | "coordinator_json" | "created_at">;
@@ -334,7 +368,7 @@ export function estimateProjectedRowBytes(row: ProjectedWireRow): number {
 
 export function estimatePendingTxBytes(row: PendingTxItem): number {
 	const dataSize = row.data == null ? 0 : typeof row.data === "string" ? row.data.length * 2 : row.data.byteLength;
-	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + 8 + dataSize + row.coordinator_json.length * 2 + 64;
+	return row.hk.byteLength + row.sk.byteLength + 32 + 8 + 8 + 8 + dataSize + row.coordinator_json.length * 2 + row.op_list.length * 16 + 64;
 }
 
 /**
@@ -510,7 +544,7 @@ export function pendingTxPageStatement(
 	}
 	const where = conds.length > 0 ? `WHERE ${conds.join(" AND ")} ` : "";
 	return {
-		sql: `SELECT p.hk, p.sk, p.transaction_id, p.operation, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
+		sql: `SELECT p.hk, p.sk, p.transaction_id, p.operation, p.op_list, p.data, p.data_kind, p.ttl_epoch_utc_seconds,
 		             t.transaction_ts, t.coordinator_json, t.created_at, t.guarded_at, t.next_recovery_at
 		        FROM pending_transactions p JOIN pending_tx_info t ON t.transaction_id = p.transaction_id
 		       ${where}ORDER BY p.hk, p.sk, p.transaction_id LIMIT ?`,
@@ -652,7 +686,9 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 sk                    BLOB    NOT NULL DEFAULT x'',
                 transaction_id        TEXT    NOT NULL,
                 operation             TEXT    NOT NULL,
-                data_kind             INTEGER, -- NULL for delete/check (no data); set for put
+                -- JSON array of the [opIndex, operation] pairs of the item, in opIndex order.
+                op_list               TEXT    NOT NULL,
+                data_kind             INTEGER, -- NULL when the sequence has no put or update; set otherwise
                 ttl_epoch_utc_seconds INTEGER,
                 data                  ANY,
 
@@ -892,6 +928,48 @@ export class PartitionStore {
 		return this.#storage.sql
 			.exec<{ est_row_bytes: number }>(`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes`, opts.hk, opts.sk, opts.data)
 			.one().est_row_bytes;
+	}
+
+	/**
+	 * `measureItemBytes` and the item timestamps of `getItemStamp` in one statement. A prepare calls
+	 * it for a put that has no condition, because the timestamp check needs the stamps of that item.
+	 * It reads at most one row, as `getItemStamp` does.
+	 *
+	 * The statement must return a row also for an absent item, because the size is always necessary.
+	 * A plain SELECT returns no row for an absent item. An aggregate with no GROUP BY always returns
+	 * one row. `MAX` makes the statement an aggregate, and it does not choose between rows: the WHERE
+	 * clause names the primary key, so at most one row matches, and `MAX` returns its value. For an
+	 * absent item, `present` is 0 and both stamps are NULL.
+	 */
+	measureItemBytesWithStamp(opts: { hk: KeyBytes; sk: KeyBytes; data: string | Uint8Array; kind: DataKind }): {
+		estRowBytes: number;
+		itemPresent: boolean;
+		lastReadTs: number | null;
+		lastWriteTs: number | null;
+		rowsRead: number;
+	} {
+		const dataExpr = itemDataExpr(opts.kind, opts.data, "?3");
+		const res = this.#storage.sql.exec<{
+			est_row_bytes: number;
+			present: number;
+			last_read_ts: number | null;
+			last_write_ts: number | null;
+		}>(
+			`SELECT ${estRowBytesExpr(dataExpr, "?1", "?2")} AS est_row_bytes, COUNT(*) AS present,
+			        MAX(last_read_ts) AS last_read_ts, MAX(last_write_ts) AS last_write_ts
+			   FROM items WHERE hk = ?1 AND sk = ?2`,
+			opts.hk,
+			opts.sk,
+			opts.data,
+		);
+		const row = res.one();
+		return {
+			estRowBytes: row.est_row_bytes,
+			itemPresent: row.present > 0,
+			lastReadTs: row.last_read_ts,
+			lastWriteTs: row.last_write_ts,
+			rowsRead: res.rowsRead,
+		};
 	}
 
 	/**
@@ -1483,17 +1561,35 @@ export class PartitionStore {
 			// pending_transactions is never queried by JSON path, so a put's json data is stored raw, as
 			// the client's JSON text; the data_kind tag lets commit reconstruct the kind for upsertItem.
 			// An update's row instead holds JSONB, which insertPendingUpdateLock explains.
-			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, data, data_kind, ttl_epoch_utc_seconds)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, op_list, data, data_kind, ttl_epoch_utc_seconds)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
 			row.hk,
 			row.sk,
 			row.transaction_id,
 			row.operation,
+			JSON.stringify(row.op_list),
 			row.data,
 			codeFromNullableKind(row.kind),
 			row.ttl_epoch_utc_seconds,
 		);
 		return res.rowsWritten > 0;
+	}
+
+	/**
+	 * The stored data, kind, and TTL of one item, or undefined when the item is absent. A json item
+	 * returns its raw JSONB blob, not JSON text: `upsertItem` binds the blob verbatim, so a write of the
+	 * returned value stores the same bytes. `getItemImage` decodes JSONB to text, and a JSONB to text to
+	 * JSONB round trip is not size-stable (see `insertPendingUpdateLock`).
+	 */
+	readItemData(hk: KeyBytes, sk: KeyBytes): StoredItemData | undefined {
+		const row = tryOne(
+			this.#storage.sql.exec<{ data: string | ArrayBuffer; data_kind: number; ttl_epoch_utc_seconds: number | null }>(
+				`SELECT data, data_kind, ttl_epoch_utc_seconds FROM items WHERE hk = ? AND sk = ? LIMIT 1`,
+				hk,
+				sk,
+			),
+		);
+		return row && { data: fromSqlData(row.data), kind: kindFromCode(row.data_kind), ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds };
 	}
 
 	/**
@@ -1510,7 +1606,14 @@ export class PartitionStore {
 	 * text bakes the escapes into the blob, so `{"k":"he said \"hi\""}` grows by 4 bytes. Storing the
 	 * blob makes the bytes that `probeUpdate` measured at prepare the exact bytes commit writes.
 	 */
-	insertPendingUpdateLock(opts: { hk: KeyBytes; sk: KeyBytes; tx: PendingTxInfo; plan: CompiledUpdatePlan; ttlAt?: number }): {
+	insertPendingUpdateLock(opts: {
+		hk: KeyBytes;
+		sk: KeyBytes;
+		tx: PendingTxInfo;
+		plan: CompiledUpdatePlan;
+		ttlAt?: number;
+		opList: OpList;
+	}): {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
@@ -1518,14 +1621,15 @@ export class PartitionStore {
 		this.#upsertPendingTx(opts.tx);
 		const tail = new StatementTail(opts.plan);
 		const transactionIdParam = tail.param(opts.tx.transaction_id);
+		const opListParam = tail.param(JSON.stringify(opts.opList));
 		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
 		// here, so the statement carries the branch it needs instead of testing a flag at run time. The
 		// VALUE still binds — see StatementTail for why a per-call value must not be interpolated.
 		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
 
 		const res = this.#storage.sql.exec(
-			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, data_kind, ttl_epoch_utc_seconds, data)
-			SELECT ?1, ?2, ${transactionIdParam}, 'update', ${JSON_KIND_CODE}, ${ttlExpr}, ${opts.plan.documentSql}
+			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, op_list, data_kind, ttl_epoch_utc_seconds, data)
+			SELECT ?1, ?2, ${transactionIdParam}, 'update', ${opListParam}, ${JSON_KIND_CODE}, ${ttlExpr}, ${opts.plan.documentSql}
 			FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
@@ -1665,11 +1769,12 @@ export class PartitionStore {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
 			operation: string;
+			op_list: string;
 			data: string | ArrayBuffer | null;
 			data_kind: number | null;
 			ttl_epoch_utc_seconds: number | null;
 		}>(
-			`SELECT hk, sk, operation, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
+			`SELECT hk, sk, operation, op_list, data, data_kind, ttl_epoch_utc_seconds FROM pending_transactions WHERE transaction_id = ?`,
 			transactionId,
 		);
 		const items: Omit<PendingTxItem, "transaction_id" | "coordinator_json">[] = [];
@@ -1682,6 +1787,7 @@ export class PartitionStore {
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
 				operation: row.operation,
+				op_list: parseOpList(row.op_list),
 				data: fromSqlData(row.data),
 				kind: kindFromNullableCode(row.data_kind),
 				ttl_epoch_utc_seconds: row.ttl_epoch_utc_seconds,
@@ -1792,9 +1898,10 @@ export class PartitionStore {
 	 * `pending_transactions` or `pending_tx_info` while it is open.
 	 */
 	*queryPendingTxPage(cursor: PendingTransactionCursor | null, limit: number, range: KeyRange | null): Generator<PendingTxItem> {
-		type Row = Omit<PendingTxItem, "hk" | "sk" | "data" | "kind"> & {
+		type Row = Omit<PendingTxItem, "hk" | "sk" | "data" | "kind" | "op_list"> & {
 			hk: ArrayBuffer;
 			sk: ArrayBuffer;
+			op_list: string;
 			data: string | ArrayBuffer | null;
 			data_kind: number | null;
 		};
@@ -1804,6 +1911,7 @@ export class PartitionStore {
 				...row,
 				hk: fromSqlKey(row.hk),
 				sk: fromSqlKey(row.sk),
+				op_list: parseOpList(row.op_list),
 				data: fromSqlData(row.data),
 				kind: kindFromNullableCode(data_kind),
 			};

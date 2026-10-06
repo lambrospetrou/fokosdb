@@ -291,6 +291,7 @@ export function lockRow(hk: string, sk: string, transactionId = "tx-1"): Pending
 		transaction_id: transactionId,
 		transaction_ts: 1,
 		operation: "put",
+		op_list: [[0, "put"] as [number, "put"]],
 		data: "pending",
 		kind: "text",
 		ttl_epoch_utc_seconds: null,

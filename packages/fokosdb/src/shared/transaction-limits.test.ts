@@ -16,6 +16,7 @@ import {
 	validateTransactGetItemCount,
 	validateTransactGetItemKeys,
 	validateTransactWriteOperations,
+	validateVersionReferences,
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
 import { KeyCodec } from "../sharding/key-codec.js";
@@ -108,6 +109,13 @@ describe("validateTransactWriteOperations", () => {
 			{ hashKey: "a", sortKey: new Uint8Array([9, 9]), operation: "put", data: "x" },
 		];
 		expect(() => validate(ops)).not.toThrow();
+	});
+
+	// The hash part of KeyPairMap answers above 8 keys. Only equal bytes make a duplicate.
+	it("accepts more than 8 keys that differ only in their last byte, and rejects a repeat of one", () => {
+		const ops = Array.from({ length: 12 }, (_, i) => putOp("a", `sort-key-${String.fromCharCode(65 + i)}`));
+		expect(() => validate(ops)).not.toThrow();
+		expect(() => validate([...ops, putOp("a", "sort-key-E")])).toThrow(fokosErrorWith("transact_duplicate_key", { opIndex: 12 }));
 	});
 
 	it("returns the canonical encoded keys in input order, so the caller never re-encodes", () => {
@@ -300,5 +308,42 @@ describe("resolveLimits", () => {
 		expect(() => encodeSortKey(sortKey, DEFAULT_LIMITS)).toThrow(fokosErrorWith("sort_key_too_large", { limitBytes: MAX_SORT_KEY_BYTES }));
 		expect(encodeHashKey(hashKey, limits).byteLength).toBeGreaterThan(MAX_HASH_KEY_BYTES);
 		expect(encodeSortKey(sortKey, limits).byteLength).toBeGreaterThan(MAX_SORT_KEY_BYTES);
+	});
+});
+
+describe("validateVersionReferences", () => {
+	const readsV = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 3 }] });
+	const setPrevVersion = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
+	const op = (
+		opIndex: number,
+		operation: TransactWriteOperationLike["operation"],
+		extra: Pick<TransactWriteOperationLike, "condition" | "update"> = {},
+	) => ({
+		opIndex,
+		hashKey: KeyCodec.encode("a"),
+		sortKey: KeyCodec.encode("s"),
+		operation,
+		...extra,
+	});
+
+	it.each(["put", "update", "delete"] as const)("refuses a version reference after a %s of the same item", (earlier) => {
+		expect(() => validateVersionReferences([op(0, earlier), op(1, "check", { condition: readsV })])).toThrow(
+			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0, hashKey: "a", sortKey: "s" }),
+		);
+		expect(() => validateVersionReferences([op(0, earlier), op(1, "update", { update: setPrevVersion })])).toThrow(
+			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0 }),
+		);
+	});
+
+	it("accepts a version reference on the first operation of an item, after a check, and on another item", () => {
+		expect(() =>
+			validateVersionReferences([
+				op(0, "check", { condition: readsV }),
+				op(1, "check", { condition: readsV }),
+				op(2, "update", { update: setPrevVersion }),
+				op(3, "put"),
+				{ ...op(4, "check", { condition: readsV }), sortKey: KeyCodec.encode("other") },
+			]),
+		).not.toThrow();
 	});
 });

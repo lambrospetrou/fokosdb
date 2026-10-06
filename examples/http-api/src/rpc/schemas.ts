@@ -139,6 +139,7 @@ const TransactWriteItemBodySchema = v.variant("operation", [
 export const TransactWriteItemsBodySchema = v.object({
 	items: v.array(TransactWriteItemBodySchema),
 	clientRequestToken: v.optional(v.string()),
+	executionMode: v.optional(v.picklist(["standard", "ordered_per_item"])),
 	partitionOptions: PartitionOptionsSchema,
 });
 

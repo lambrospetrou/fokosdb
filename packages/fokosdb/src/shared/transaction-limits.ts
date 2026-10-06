@@ -18,7 +18,8 @@ import type {
 } from "./transaction-wire-types.js";
 import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
-import { KeyCodec, type KeyBytes } from "../sharding/key-codec.js";
+import type { TransactWriteExecutionMode } from "./transaction-api-types.js";
+import { KeyCodec, KeyPairMap, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
@@ -314,9 +315,28 @@ export function encodeSortBound(k: string | Uint8Array, limits: FokosDBLimits): 
 }
 
 /**
+ * The execution mode of a `transactWriteItems` request. An absent value is "standard". The client
+ * checks it before any other check of the request, so no node below the client sees a mode that is
+ * not valid.
+ */
+export function validateExecutionMode(value: unknown): TransactWriteExecutionMode {
+	if (value === undefined || value === "standard" || value === "ordered_per_item") {
+		return value ?? "standard";
+	}
+	throw new FokosValidationError(VALIDATION_CODES.transact_execution_mode_invalid, {
+		message: "executionMode must be 'standard' or 'ordered_per_item'",
+		attributes: { value },
+	});
+}
+
+/**
  * Validates a transact-write operation set: valid keys, item count, duplicate keys, total payload
  * bytes, and the per-operation rules of `TransactWriteItem` — "put" carries data, "delete" and
  * "check" carry none, "check" carries at least one condition. Throws on the first violation.
+ *
+ * "standard" mode refuses two operations on the same item. "ordered_per_item" mode accepts them, and
+ * both modes run the version-reference check (`validateVersionReferences`). The limits count
+ * operations, not unique items.
  *
  * Key policy checks run on the RAW public keys (NUL, lone surrogates). Each key is then encoded
  * EXACTLY ONCE, and the canonical bytes are returned in input order for the caller to reuse — so
@@ -325,6 +345,7 @@ export function encodeSortBound(k: string | Uint8Array, limits: FokosDBLimits): 
 export function validateTransactWriteOperations(
 	ops: readonly TransactWriteOperationLike[],
 	limits: FokosDBLimits,
+	executionMode: TransactWriteExecutionMode = "standard",
 ): Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> {
 	if (ops.length === 0) {
 		throw new FokosValidationError(VALIDATION_CODES.transact_items_empty, { message: "transactWriteItems requires at least 1 item" });
@@ -335,7 +356,7 @@ export function validateTransactWriteOperations(
 			attributes: { limit: MAX_ITEMS_PER_TX, count: ops.length },
 		});
 	}
-	const seen = new Set<bigint>();
+	const seen = new KeyPairMap<true>();
 	const encodedKeys: Array<{ hashKey: KeyBytes; sortKey: KeyBytes }> = [];
 	let totalBytes = 0;
 	for (const [opIndex, op] of ops.entries()) {
@@ -364,21 +385,20 @@ export function validateTransactWriteOperations(
 			throw invalidFields(`transactWriteItems "${op.operation}" operation must not carry an update plan`);
 		}
 		validateReturnValuesOnConditionCheckFailure(op.returnValuesOnConditionCheckFailure);
-		// KeyCodec.pairKey is the ONE identity primitive for a (hashKey, sortKey) pair — the same one
-		// commitLocal's keyset check and the TC's two-phase read pairing use.
+		// KeyPairMap is the ONE identity primitive for a (hashKey, sortKey) pair: two keys are the same
+		// item only when their canonical bytes are equal.
 		//
 		// Do NOT substitute a template string built from the public keys: `${Uint8Array}` renders as a
 		// comma-joined decimal list, so the string sortKey "9,9" and the binary sortKey [9,9] produce the
 		// same text, and two distinct items (KeyCodec 0xFF-tags binary keys) would be rejected as a
 		// duplicate. Identity must be taken over the canonical bytes.
-		const identity = KeyCodec.pairKey(hashKey, sortKey);
-		if (seen.has(identity)) {
+		if (executionMode === "standard" && seen.has(hashKey, sortKey)) {
 			throw new FokosValidationError(VALIDATION_CODES.transact_duplicate_key, {
 				message: "transactWriteItems duplicate key",
 				attributes: { opIndex, hashKey: op.hashKey, sortKey: op.sortKey },
 			});
 		}
-		seen.add(identity);
+		seen.set(hashKey, sortKey, true);
 		if (op.data !== undefined) {
 			validateItemDataSize(op.data, "transactWriteItems");
 			totalBytes += itemDataBytes(op.data);
@@ -397,7 +417,41 @@ export function validateTransactWriteOperations(
 			attributes: { limitBytes: MAX_PAYLOAD_BYTES_PER_TX, bytes: totalBytes },
 		});
 	}
+	validateVersionReferences(ops.map((op, opIndex) => ({ ...op, ...encodedKeys[opIndex], opIndex })));
 	return encodedKeys;
+}
+
+/** True when a compiled plan reads the `v` of its item. */
+function readsVersion(plan: { requiredColumns: readonly string[] } | undefined): boolean {
+	return plan?.requiredColumns.includes("v") === true;
+}
+
+/**
+ * Refuses an operation whose condition or update reads `v` when an earlier operation of the same item
+ * is a put, an update, or a delete. `ops` must be in `opIndex` order.
+ *
+ * On the two-phase path, a delete of another item between prepare and commit can raise
+ * `max_deleted_v`. A row that the transaction creates then gets a higher `v` at commit than at prepare.
+ * A plan that reads `v` after a write or a delete of its item can read such a `v`, so its decision or
+ * the data it stores would not match the committed row. An earlier check does not change `v`, so it
+ * does not count. The check groups the operations by item with `KeyPairMap`.
+ */
+export function validateVersionReferences(
+	ops: readonly (Pick<TransactWriteOperationLike, "operation" | "condition" | "update"> & TransactionItemKey & { opIndex: number })[],
+): void {
+	const earlierWrite = new KeyPairMap<number>();
+	for (const op of ops) {
+		const writeIndex = earlierWrite.get(op.hashKey, op.sortKey);
+		if (writeIndex !== undefined && (readsVersion(op.condition) || readsVersion(op.update))) {
+			throw new FokosValidationError(VALIDATION_CODES.transact_version_after_write, {
+				message: "a condition or an update value that reads the version must come before every put, update, and delete of the same item",
+				attributes: { opIndex: op.opIndex, earlierOpIndex: writeIndex, ...decodeItemKeys(op.hashKey, op.sortKey) },
+			});
+		}
+		if (writeIndex === undefined && op.operation !== "check") {
+			earlierWrite.set(op.hashKey, op.sortKey, op.opIndex);
+		}
+	}
 }
 
 /**
@@ -424,20 +478,19 @@ export function validateTransactGetItemCount(itemCount: number): void {
  * Rejects a `transactGetItems` request in which two items name the same key. The two-phase driver
  * pairs phase 1 with phase 2 by key, so two items naming one key would collapse to a single entry
  * and, with two different projections, one of them would receive the other's record. Runs on the
- * ENCODED keys, after the caller encodes them. Identity is `KeyCodec.pairKey` over the canonical
- * bytes, never a template string over the public keys (the write-side check above gives the reason).
+ * ENCODED keys, after the caller encodes them. Identity is `KeyPairMap` over the canonical bytes,
+ * never a template string over the public keys (the write-side check above gives the reason).
  */
 export function validateTransactGetItemKeys(keys: readonly TransactionItemKey[]): void {
-	const seen = new Set<bigint>();
+	const seen = new KeyPairMap<true>();
 	for (const [itemIndex, item] of keys.entries()) {
-		const identity = KeyCodec.pairKey(item.hashKey, item.sortKey);
-		if (seen.has(identity)) {
+		if (seen.has(item.hashKey, item.sortKey)) {
 			throw new FokosValidationError(VALIDATION_CODES.transact_duplicate_key, {
 				message: "transactGetItems duplicate key",
 				attributes: { itemIndex, ...decodeItemKeys(item.hashKey, item.sortKey) },
 			});
 		}
-		seen.add(identity);
+		seen.set(item.hashKey, item.sortKey, true);
 	}
 }
 

@@ -230,6 +230,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 				transaction_id: first.transactionId,
 				transaction_ts: txOrderTimestampNow(),
 				operation: "put",
+				op_list: [[0, "put"] as [number, "put"]],
 				data: "recovered",
 				kind: "text",
 				ttl_epoch_utc_seconds: null,
@@ -267,6 +268,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 						clientRequestToken: token,
 						table: createTableConfig(db.options()),
 						items: [],
+						executionMode: "standard",
 					}),
 				).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
 				await vi.waitFor(() => expect(instance.fokos.lifecycle().activeRepartition).not.toBeNull(), { timeout: 5_000, interval: 10 });
@@ -303,6 +305,7 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 								clientRequestToken: `${token}-refused-${attempt}`,
 								table: createTableConfig(db.options()),
 								items: [],
+								executionMode: "standard",
 							}),
 						).rejects.toThrow(fokosErrorWith("coordinator_over_size"));
 					}
@@ -346,7 +349,12 @@ describe("transactions - the coordinator pool grows by hash split", () => {
 			await runInDurableObject(child, async (instance: TransactionCoordinatorDO) => {
 				const childCtx = instance.fokos.routeContext();
 				await expect(
-					instance.initiateWrite(childCtx, { clientRequestToken: token, table: createTableConfig(db.options()), items: [] }),
+					instance.initiateWrite(childCtx, {
+						clientRequestToken: token,
+						table: createTableConfig(db.options()),
+						items: [],
+						executionMode: "standard",
+					}),
 				).rejects.toThrow(fokosErrorWith("partition_migrating"));
 				await expect(
 					instance.recoverTransaction(childCtx, { transactionId: first.transactionId, idempotencyToken: token }),

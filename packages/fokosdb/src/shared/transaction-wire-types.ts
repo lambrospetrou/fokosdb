@@ -7,7 +7,7 @@ import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan 
 import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
 import type { FokosDBTableConfig } from "./partition-context.js";
-import type { IdempotencyToken, RejectionReasonOf, TransactionId } from "./transaction-api-types.js";
+import type { IdempotencyToken, RejectionReasonOf, TransactionId, TransactWriteExecutionMode } from "./transaction-api-types.js";
 import type { ConditionCheckImageEncoded, DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 
 // ─── Shared primitives ────────────────────────────────────────────────────────
@@ -324,6 +324,12 @@ export type InitiateWriteRequest = {
 	 */
 	table: FokosDBTableConfig;
 	items: TCWriteOperation[];
+	/**
+	 * The coordinator uses the mode only for the idempotency fingerprint. A participant never reads it.
+	 * An absent value is "standard", so a caller that does not send the field gets the fingerprint of
+	 * a standard request.
+	 */
+	executionMode?: TransactWriteExecutionMode;
 };
 
 export type InitiateWriteResponseEncoded =

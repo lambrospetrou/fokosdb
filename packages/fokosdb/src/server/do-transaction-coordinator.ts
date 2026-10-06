@@ -282,7 +282,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 -- Serialized PrepareResponse with item images stripped (imageBytes kept for capping).
                 answer_json             TEXT,
                 -- The FokosErrorWire of the error of the last prepare attempt that threw. It is written only
-                -- while prepare_outcome is NULL, so a later answer replaces it.
+                -- while prepare_outcome is NULL, so a later answer replaces it. A fatal error (a
+                -- FokosValidationError) stays: no later error replaces it, and no later answer is stored.
                 error_json              TEXT,
                 PRIMARY KEY (transaction_id, partition_do_name)
             ) WITHOUT ROWID, STRICT;
@@ -302,7 +303,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 partition_do_name   TEXT    NOT NULL,
                 -- 1 for "all_old", 0 for "none". Reconstructs TransactionItem during prepare recovery.
                 return_values_on_condition_check_failure INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (transaction_id, hk, sk)
+                -- One row for each operation. More than one operation can have the same (hk, sk).
+                PRIMARY KEY (transaction_id, op_index)
             ) WITHOUT ROWID, STRICT;
 
             -- Stores raw item images for rejected operations requesting all_old.
@@ -610,7 +612,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const idempotencyToken = request.clientRequestToken;
 
 		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
-		const operationsHash = hashTransactionOperations(request.items);
+		const operationsHash = hashTransactionOperations(request.items, request.executionMode ?? "standard");
 
 		const existingRow = this.loadStateRowByToken(idempotencyToken);
 		if (existingRow) {
@@ -890,7 +892,19 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			if (this.loadStateRow(transactionId)?.state !== "PREPARING") {
 				return;
 			}
-			const stored = this.ctx.storage.sql.exec(
+			// A stored fatal error decides the transaction: it cancels. An answer of a concurrent drive
+			// must not hide that error, or let markCommitting record a commit decision.
+			const stored = tryOne(
+				this.ctx.storage.sql.exec<{ error_json: string | null }>(
+					`SELECT error_json FROM tc_participants WHERE transaction_id = ? AND partition_do_name = ?`,
+					transactionId,
+					partitionDoName,
+				),
+			);
+			if (isFatalPrepareError(stored?.error_json ?? null)) {
+				return;
+			}
+			const written = this.ctx.storage.sql.exec(
 				`UPDATE tc_participants SET prepare_outcome = ?, answer_json = ?
 				  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL`,
 				answer.outcome,
@@ -898,7 +912,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 				transactionId,
 				partitionDoName,
 			);
-			if (stored.rowsWritten === 0 || answer.outcome !== "rejected") {
+			if (written.rowsWritten === 0 || answer.outcome !== "rejected") {
 				return;
 			}
 			// An answer with no image adds no bytes, so the cap drops no new image.
@@ -951,18 +965,32 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	 * participant that has answered keeps its answer, and recovery can still re-prepare one that has not.
 	 * It writes only while the transaction is PREPARING: after the decision, the stored results already
 	 * hold the cause.
+	 *
+	 * The first stored fatal error stays (`isFatalPrepareError`). A later error of a concurrent drive,
+	 * for example a transport failure, must not replace it, because recovery cancels on it. A new error
+	 * can replace a transient one. The read and the write run in one storage transaction.
 	 */
 	private storePrepareError(transactionId: string, partitionDoName: string, err: unknown): void {
 		dropCallCost(err);
-		this.ctx.storage.sql.exec(
-			`UPDATE tc_participants SET error_json = ?
-			  WHERE transaction_id = ? AND partition_do_name = ? AND prepare_outcome IS NULL
-			    AND EXISTS (SELECT 1 FROM tc_state WHERE transaction_id = ? AND state = 'PREPARING')`,
-			stringifyTagged(FokosError.toWire(err)),
-			transactionId,
-			partitionDoName,
-			transactionId,
-		);
+		this.ctx.storage.transactionSync(() => {
+			const row = tryOne(
+				this.ctx.storage.sql.exec<{ error_json: string | null }>(
+					`SELECT p.error_json FROM tc_participants p JOIN tc_state s ON s.transaction_id = p.transaction_id
+					  WHERE p.transaction_id = ? AND p.partition_do_name = ? AND p.prepare_outcome IS NULL AND s.state = 'PREPARING'`,
+					transactionId,
+					partitionDoName,
+				),
+			);
+			if (!row || isFatalPrepareError(row.error_json)) {
+				return;
+			}
+			this.ctx.storage.sql.exec(
+				`UPDATE tc_participants SET error_json = ? WHERE transaction_id = ? AND partition_do_name = ?`,
+				stringifyTagged(FokosError.toWire(err)),
+				transactionId,
+				partitionDoName,
+			);
+		});
 	}
 
 	/**
@@ -1389,6 +1417,13 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const existingParticipants = this.loadParticipants(transactionId);
 
 		const nullParticipants = existingParticipants.filter((p) => p.prepare_outcome === null);
+		// A fatal error that an earlier drive stored, for example before a restart. The same prepare
+		// gets the same error, so the drive cancels at once and sends no prepare.
+		if (nullParticipants.some((p) => isFatalPrepareError(p.error_json))) {
+			this.cancelTransactionInStore(transactionId, idempotencyToken);
+			await this.runCancel(transactionId, idempotencyToken, requestBudgetMs);
+			return;
+		}
 		const retry = this.config().participantRetry;
 
 		await Promise.allSettled(
@@ -1413,11 +1448,14 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		);
 
 		const allParticipants = this.loadParticipants(transactionId);
-		// A participant that is still NULL threw again, and a throw is retryable: on its own it decides
-		// nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive later.
-		// Only a real rejection or exceeding the hold deadline commits the transaction to cancelling;
-		// cancelTransactionInStore then reports a still-NULL participant with the error it stored.
-		const anyRejected = allParticipants.some((p) => p.prepare_outcome === "rejected");
+		// A participant that is still NULL threw again. A transient throw is retryable: on its own it
+		// decides nothing, so the transaction stays PREPARING for the `tx_recovery` job to drive later.
+		// Only a real rejection, a fatal error of this fan-out or of a concurrent drive, or exceeding the
+		// hold deadline commits the transaction to cancelling; cancelTransactionInStore then reports a
+		// still-NULL participant with the error it stored.
+		const anyRejected = allParticipants.some(
+			(p) => p.prepare_outcome === "rejected" || (p.prepare_outcome === null && isFatalPrepareError(p.error_json)),
+		);
 		const allAccepted = allParticipants.every((p) => p.prepare_outcome === "accepted");
 		const heldTooLong = this.fokosNow() - stateRow.created_at > maxPreparingHoldMs(this.config());
 
@@ -1797,12 +1835,15 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 			.toArray();
 	}
 
-	/** The routing half of loadItems: no data, no conditions — see runCancel. */
+	/**
+	 * The routing half of loadItems: no data, no conditions — see runCancel. Each key comes one time,
+	 * because commit and cancel send each key one time. SQLite compares the BLOB keys by bytes.
+	 */
 	private loadItemKeys(transactionId: string): Pick<TcItemRow, "hk" | "sk" | "partition_do_name">[] {
 		return this.ctx.storage.sql
 			.exec<
 				Pick<TcItemRow, "hk" | "sk" | "partition_do_name">
-			>(`SELECT hk, sk, partition_do_name FROM tc_items WHERE transaction_id = ?`, transactionId)
+			>(`SELECT DISTINCT hk, sk, partition_do_name FROM tc_items WHERE transaction_id = ?`, transactionId)
 			.toArray();
 	}
 
@@ -1827,13 +1868,26 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 	}
 }
 
-/** The retry rule of a prepare: every error except `partition_over_size`, up to `maxAttempts` attempts. */
+/**
+ * The retry rule of a prepare: every error except `partition_over_size` and a `FokosValidationError`,
+ * up to `maxAttempts` attempts. A validation error says that the request is not valid, so the same
+ * request gets it again on each try.
+ */
 function prepareRetry(retry: ParticipantRetryConfig, maxAttempts: number): FokosRetryPolicy {
 	return {
-		shouldRetry: (err, nextAttempt) => !FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && nextAttempt <= maxAttempts,
+		shouldRetry: (err, nextAttempt) =>
+			!FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && !FokosValidationError.is(err) && nextAttempt <= maxAttempts,
 		baseDelayMs: retry.baseDelayMs,
 		maxDelayMs: retry.maxDelayMs,
 	};
+}
+
+/**
+ * True when a stored prepare error cannot clear on a retry: a `FokosValidationError`. The category
+ * survives each RPC hop, because `FokosError.is` reads `_tag`.
+ */
+function isFatalPrepareError(errorJson: string | null): boolean {
+	return errorJson !== null && FokosValidationError.is(FokosError.fromWire(parseTagged<FokosErrorWire>(errorJson)));
 }
 
 /** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */

@@ -123,7 +123,7 @@ describe("PartitionDO — a migration page that outlives its import record", () 
 				 VALUES ('tx-stale', 1, 1000, '{"v":1,"route":{"doName":"tc-1"},"idempotencyToken":"tok-1"}', 6000)`,
 			);
 			state.storage.sql.exec(
-				`INSERT INTO pending_transactions (hk, sk, transaction_id, operation) VALUES (?, ?, 'tx-stale', 'put')`,
+				`INSERT INTO pending_transactions (hk, sk, transaction_id, operation, op_list) VALUES (?, ?, 'tx-stale', 'put', '[[0,"put"]]')`,
 				kb(HELD_KEY),
 				kb("sk"),
 			);

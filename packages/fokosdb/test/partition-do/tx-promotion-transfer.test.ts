@@ -66,6 +66,7 @@ function insertLock(
 		transaction_id: transactionId,
 		transaction_ts: createdAt,
 		operation: "put",
+		op_list: [[0, "put"] as [number, "put"]],
 		data: options?.data ?? "moved-value",
 		kind: "text",
 		ttl_epoch_utc_seconds: null,

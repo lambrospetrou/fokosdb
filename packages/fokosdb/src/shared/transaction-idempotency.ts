@@ -7,6 +7,7 @@
 
 import { hash64 } from "../sharding/hash-primitives.js";
 import type { TCWriteOperation } from "./transaction-wire-types.js";
+import type { TransactWriteExecutionMode } from "./transaction-api-types.js";
 
 // Domain separation: nothing else in the codebase hashes with this seed, so an operation fingerprint
 // can never be confused with a routing hash.
@@ -55,11 +56,17 @@ function hashOperation(op: TCWriteOperation): bigint {
  *
  * xxHash64 is not cryptographic, which is the right trade here: this catches a client mistake, and a
  * deliberately crafted collision would only mislead the client that crafted it.
+ *
+ * The execution mode is part of the request. "standard" chains nothing, so the fingerprint of a
+ * standard request stays the same as before the mode existed. Any other mode chains its name last.
  */
-export function hashTransactionOperations(ops: readonly TCWriteOperation[]): string {
+export function hashTransactionOperations(ops: readonly TCWriteOperation[], executionMode: TransactWriteExecutionMode): string {
 	let h = hash64(`${ops.length}`, OPERATIONS_SEED);
 	for (const op of ops) {
 		h = hash64(hashOperation(op).toString(16), h);
+	}
+	if (executionMode !== "standard") {
+		h = hash64(`mode|${executionMode}`, h);
 	}
 	return h.toString(16).padStart(16, "0");
 }

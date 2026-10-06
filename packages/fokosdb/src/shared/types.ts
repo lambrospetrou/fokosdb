@@ -29,6 +29,11 @@ export type { ProjectedItem, ProjectedValue } from "./expression/projection.js";
 export const DATA_KINDS = ["bytes", "text", "json"] as const; // index = on-disk code
 export type DataKind = (typeof DATA_KINDS)[number]; // "bytes" | "text" | "json"
 
+/**
+ * "all_old" returns the item image when the condition fails. In a `transactWriteItems` with
+ * "ordered_per_item" mode, the image can show the state that the earlier operations of the same
+ * transaction left. The transaction cancelled, so that state never committed.
+ */
 export type ReturnValuesOnConditionCheckFailure = "none" | "all_old";
 
 /**
@@ -161,6 +166,12 @@ export type ReadItem<T = never> = ItemKey &
 	ReadItemValue<T> & {
 		/** Epoch UTC seconds. The item can remain visible after this instant until background deletion. */
 		ttlAt?: number;
+		/**
+		 * The `v` of the item. Every write increments it, and it never repeats for a key. In a
+		 * `transactWriteItems` with "ordered_per_item" mode, a condition or an update value that reads
+		 * `v` must come before every put, update, and delete of the same item, or the request fails
+		 * with `transact_version_after_write`.
+		 */
 		version: number;
 	};
 
