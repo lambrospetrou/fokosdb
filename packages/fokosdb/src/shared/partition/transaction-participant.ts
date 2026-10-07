@@ -92,7 +92,7 @@ function isWrite(operation: string): boolean {
 type ItemSequence = {
 	hashKey: KeyBytes;
 	sortKey: KeyBytes;
-	ops: TransactionItem[];
+	ops: [TransactionItem, ...TransactionItem[]];
 	/** The last put or update of a sequence of two or more operations. */
 	lastWrite: TransactionItem | undefined;
 	/** An operation of the item failed. The later operations of the item get `not_evaluated`. */
@@ -149,7 +149,7 @@ function sequencePlanOf(items: readonly TransactionItem[]): SequencePlan {
 }
 
 /** The lock row `operation` of a sequence: its last operation that is not a check, or check. */
-function lockOperationOf(ops: readonly TransactionItem[]): TransactionOperationType {
+function lockOperationOf(ops: readonly [TransactionItem, ...TransactionItem[]]): TransactionOperationType {
 	return ops.findLast((op) => op.operation !== "check")?.operation ?? "check";
 }
 
@@ -421,6 +421,26 @@ export class TransactionParticipant {
 			}
 		}
 
+		// The lock block writes the locks of all items together, and each release removes all owned locks
+		// of a transaction on this partition together. Thus this transaction is expected to hold the locks
+		// of all items of the request here, or of none. The evaluate step decides each item alone, so a
+		// mix still gets a safe answer, but the mix is not expected.
+		let lockedItems = 0;
+		for (const seq of plan.sequences.values()) {
+			if (seq.lockedBefore) {
+				lockedItems++;
+			}
+		}
+		if (lockedItems > 0 && lockedItems < plan.sequences.size) {
+			console.warn({
+				message: "fokos/partition.prepare: this transaction already holds the locks of only some items of the request",
+				transactionId: request.transactionId,
+				lockedItems,
+				items: plan.sequences.size,
+				outcome: evaluation.rejected ? "rejected" : "accepted",
+			});
+		}
+
 		if (evaluation.rejected) {
 			applyImageCap(evaluation.results);
 			return { outcome: "rejected", results: evaluation.results };
@@ -433,9 +453,22 @@ export class TransactionParticipant {
 	 * adds (see `EvaluatePath`).
 	 *
 	 * In a request with an item of two or more operations, each passed operation is also applied as a
-	 * temporary write, so the next operation sees its effect. Every item gets temporary writes, also an
-	 * item with one operation, so the state at each operation is the state that apply gives at the
-	 * same position. In a request with no repeated item, this writes nothing.
+	 * temporary write, so the next operation sees its effect. In a request with no repeated item, this
+	 * writes nothing.
+	 *
+	 * The single-partition path keeps its temporary writes as the writes of the transaction, so it
+	 * writes every operation. A prepare rolls its temporary writes back. It writes each put and update
+	 * of an item with two or more operations, because the later operations of the item and the lock
+	 * block read the row. It also writes each delete. No later step of the block reads a skipped write:
+	 *
+	 * - A condition, an update probe, and a size check read only the row of their own item.
+	 * - `max_delete_tx_order_ts` is read before the first temporary write.
+	 * - A delete can raise `max_deleted_v` for the whole partition. Every passed delete must run so
+	 *   that the failure images of later new rows show the same versions on both paths. The
+	 *   version-reference check does not cover the versions in those images.
+	 * - A check changes only `last_read_ts`. No plan and no image reads it, and the timestamp check
+	 *   uses the stamps from before the transaction. Also, later writes use `MAX(current, T)`,
+	 *   so the temporary check's `MAX(current, T)` is redundant.
 	 *
 	 * Conditions, update checks, and size checks read `items`, which holds the state that the earlier
 	 * operations left. The timestamp check uses only the state from before the transaction: all
@@ -542,7 +575,10 @@ export class TransactionParticipant {
 
 			pass(i);
 
-			if (plan.repeated) {
+			// A prepare writes only what a later step of this block reads: each put and update of an item
+			// with two or more operations, and each delete, because a delete can raise max_deleted_v. The
+			// single-partition path keeps every write.
+			if (plan.repeated && (!path.twoPhase || op.operation === "delete" || (isWrite(op.operation) && seq.ops.length > 1))) {
 				growth.record(op, this.#writeRequest(op, path.txTimestamp));
 				temporaryWrites = true;
 				// Only the lock block of a prepare reads the last-write data. The single-partition path keeps

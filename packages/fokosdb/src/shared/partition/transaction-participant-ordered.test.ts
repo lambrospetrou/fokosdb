@@ -310,6 +310,33 @@ describe("ordered per-item execution: evaluate", () => {
 		});
 	});
 
+	it.each<[string, Op[], number]>([
+		["a single delete", [del("A")], 51],
+		["a final delete after writes", [put("A", { n: 5 }), update("A"), del("A")], 53],
+	])("returns the same failure image on both paths after %s of another item", async (_name, beforeDelete, version) => {
+		await withPartition(({ participant, store, storage }) => {
+			for (let i = 0; i < 50; i++) {
+				store.upsertItem({ hk: kb("A"), sk: SK, data: '{"n":1}', kind: "json", ttlAt: null, txOrderTs: 1 });
+			}
+			const before = snapshot(storage);
+			const ops = withOpIndex([
+				...beforeDelete,
+				put("X", { n: 7 }),
+				{ ...check("X", false), returnValuesOnConditionCheckFailure: "all_old" },
+			]);
+			const single = participant.executeSingleShot({ items: ops }).response;
+			invariant(single.outcome === "rejected");
+			expect(single.results[ops.length - 1]).toMatchObject({
+				outcome: "rejected",
+				reason: { code: "condition_failed", item: { data: '{"n":7}', kind: "json", version } },
+			});
+			expect(snapshot(storage)).toEqual(before);
+			expect(participant.prepareLocal(prepareReq(ops))).toEqual(single);
+			expect(snapshot(storage)).toEqual(before);
+			expect(storage.sql.exec(`SELECT COUNT(*) AS n FROM pending_tx_info`).one().n).toBe(0);
+		});
+	});
+
 	it("fails the operation that makes an intermediate state above MAX_ITEM_BYTES", async () => {
 		await withPartition(({ participant, store }) => {
 			seed(store);
@@ -342,6 +369,77 @@ describe("ordered per-item execution: evaluate", () => {
 			expect(participant.prepareLocal(prepareReq(ops))).toEqual({ outcome: "accepted" });
 			expect(blocks).toHaveBeenCalledTimes(2);
 			expect(snapshot(storage)).toEqual({ ...before, locks: 2 });
+		});
+	});
+
+	// A: put → update → check, where the check is last and is not the last write. B and C have one
+	// operation each. X: put → delete, where the delete is last. Only the put of A, the update of A,
+	// and the put of X have a later reader.
+	it("makes temporary writes in a prepare for later readers and every delete", async () => {
+		const ops = [put("A", { n: 5 }), update("A"), check("A", true), del("B"), put("C", { c: 1 }), put("X", { x: 1 }), del("X")];
+		await withPartition(({ participant, store }) => {
+			seed(store);
+			const writes = [
+				vi.spyOn(store, "upsertItem"),
+				vi.spyOn(store, "updateItemSingleShot"),
+				vi.spyOn(store, "deleteItem"),
+				vi.spyOn(store, "bumpItemReadTs"),
+			];
+			expect(participant.prepareLocal(prepareReq(withOpIndex(ops)))).toEqual({ outcome: "accepted" });
+			expect(writes.map((w) => w.mock.calls.length)).toEqual([2, 1, 2, 0]);
+		});
+		await expectSameAsReference(ops);
+	});
+
+	it.each([
+		["present", "A", true],
+		["absent", "X", false],
+	] as const)("uses one prepare block for check-only sequences when the item is %s", async (_name, key, present) => {
+		const ops = [check(key, present), check(key, present)];
+		const reference = await referenceRun(ops);
+		expect(await singlePartitionRun(ops)).toEqual(reference);
+		await withPartition(({ participant, store, storage }) => {
+			seed(store);
+			const before = snapshot(storage);
+			const checks = vi.spyOn(store, "bumpItemReadTs");
+			const blocks = vi.spyOn(store, "transactionSync");
+			const request = prepareReq(withOpIndex(ops));
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(checks).not.toHaveBeenCalled();
+			expect(blocks).toHaveBeenCalledTimes(1);
+			expect(snapshot(storage)).toEqual({ ...before, locks: 1 });
+			const locks = store.listPendingTxItems(request.transactionId);
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(checks).not.toHaveBeenCalled();
+			expect(blocks).toHaveBeenCalledTimes(2);
+			expect(store.listPendingTxItems(request.transactionId)).toEqual(locks);
+			const commit = { transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) };
+			participant.commitLocal(commit);
+			expect(checks).toHaveBeenCalledTimes(2);
+			expect(snapshot(storage)).toEqual(reference);
+			participant.commitLocal(commit);
+			expect(checks).toHaveBeenCalledTimes(2);
+			expect(snapshot(storage)).toEqual(reference);
+		});
+	});
+
+	it.each<[string, Op[], number]>([
+		["check → update → check", [check("A", true), update("A"), check("A", true)], 2],
+		["check → delete", [check("A", true), del("A")], 1],
+	])("skips temporary check writes in %s, but applies every check at commit", async (_name, ops, checkWrites) => {
+		const reference = await referenceRun(ops);
+		expect(await singlePartitionRun(ops)).toEqual(reference);
+		await withPartition(({ participant, store, storage }) => {
+			seed(store);
+			const before = snapshot(storage);
+			const checks = vi.spyOn(store, "bumpItemReadTs");
+			const request = prepareReq(withOpIndex(ops));
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(checks).not.toHaveBeenCalled();
+			expect(snapshot(storage)).toEqual({ ...before, locks: 1 });
+			participant.commitLocal({ transactionId: request.transactionId, transactionTimestamp: T, items: uniqueKeys(request.items) });
+			expect(checks).toHaveBeenCalledTimes(checkWrites);
+			expect(snapshot(storage)).toEqual(reference);
 		});
 	});
 
@@ -533,6 +631,23 @@ describe("ordered per-item execution: lock rows and commit", () => {
 			participant.commitLocal(commit);
 			expect(snapshot(storage)).toEqual(after);
 			expect(JSON.parse(store.getItem(kb("A"), SK).row?.data as string)).toEqual({ n: 6 });
+		});
+	});
+
+	it("warns when this transaction holds the locks of only some items of a repeated prepare", async () => {
+		await withPartition(({ participant, store }) => {
+			seed(store);
+			const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+			const request = prepareReq(withOpIndex([put("A", { n: 5 }), update("A"), put("C", { c: 1 })]));
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(warn).not.toHaveBeenCalled();
+
+			store.deletePendingTxKeys(request.transactionId, [{ hashKey: kb("C"), sortKey: SK }]);
+			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
+			expect(warn).toHaveBeenCalledTimes(1);
+			expect(warn.mock.calls[0][0]).toMatchObject({ transactionId: request.transactionId, lockedItems: 1, items: 2, outcome: "accepted" });
+			expect(store.listPendingTxItems(request.transactionId)).toHaveLength(2);
 		});
 	});
 

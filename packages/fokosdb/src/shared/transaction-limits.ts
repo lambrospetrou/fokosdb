@@ -435,6 +435,11 @@ function readsVersion(plan: { requiredColumns: readonly string[] } | undefined):
  * A plan that reads `v` after a write or a delete of its item can read such a `v`, so its decision or
  * the data it stores would not match the committed row. An earlier check does not change `v`, so it
  * does not count. The check groups the operations by item with `KeyPairMap`.
+ *
+ * The check is conservative: an existing row with no delete in its sequence keeps the same `v` at
+ * prepare and commit. The client cannot know whether the row exists. Thus every put, update, and
+ * delete of the item counts as an earlier write, even when the row exists and its version would
+ * stay the same on both paths.
  */
 export function validateVersionReferences(
 	ops: readonly (Pick<TransactWriteOperationLike, "operation" | "condition" | "update"> & TransactionItemKey & { opIndex: number })[],
