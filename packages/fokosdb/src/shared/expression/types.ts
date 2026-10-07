@@ -25,11 +25,11 @@ export type ConditionExpression =
 	  }
 	| {
 			op: "in";
-			args: readonly [value: ExpressionValue, choice: ExpressionValue, ...choices: ExpressionValue[]];
+			args: readonly [value: ExpressionValue, ...choices: ExpressionValue[]];
 	  }
 	| {
 			op: "and" | "or";
-			args: readonly [ConditionExpression, ConditionExpression, ...ConditionExpression[]];
+			args: readonly ConditionExpression[];
 	  }
 	| { op: "not"; args: readonly [condition: ConditionExpression] }
 	| { op: "exists" | "not_exists"; args: readonly [reference: ExpressionReference] }

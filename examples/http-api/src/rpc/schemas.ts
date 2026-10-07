@@ -39,13 +39,10 @@ const ConditionExpressionSchema: v.GenericSchema<ConditionExpression> = v.lazy((
 			args: v.tuple([ExpressionValueSchema, ExpressionValueSchema]),
 		}),
 		v.strictObject({ op: v.literal("between"), args: v.tuple([ExpressionValueSchema, ExpressionValueSchema, ExpressionValueSchema]) }),
-		v.strictObject({ op: v.literal("in"), args: v.tupleWithRest([ExpressionValueSchema, ExpressionValueSchema], ExpressionValueSchema) }),
+		v.strictObject({ op: v.literal("in"), args: v.tupleWithRest([ExpressionValueSchema], ExpressionValueSchema) }),
 		v.strictObject({
 			op: v.union([v.literal("and"), v.literal("or")]),
-			args: v.tupleWithRest(
-				[v.lazy(() => ConditionExpressionSchema), v.lazy(() => ConditionExpressionSchema)],
-				v.lazy(() => ConditionExpressionSchema),
-			),
+			args: v.array(v.lazy(() => ConditionExpressionSchema)),
 		}),
 		v.strictObject({ op: v.literal("not"), args: v.tuple([v.lazy(() => ConditionExpressionSchema)]) }),
 		v.strictObject({

@@ -230,7 +230,7 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 			return;
 		}
 		case "in": {
-			if (args.length < 2) {
+			if (args.length < 1) {
 				throw new ExpressionError("invalid_arity", "invalid expression argument count");
 			}
 			if (args.length - 1 > EXPRESSION_LIMITS.inChoices) {
@@ -256,7 +256,6 @@ function analyzeCondition(expression: unknown, depth: number, context: AnalysisC
 		}
 		case "and":
 		case "or":
-			assertArity(args, 2, Number.POSITIVE_INFINITY);
 			for (const arg of args) {
 				analyzeCondition(arg, depth + 1, context);
 			}

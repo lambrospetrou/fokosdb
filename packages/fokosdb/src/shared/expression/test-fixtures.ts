@@ -178,7 +178,12 @@ export const VALID_CONDITION_SHAPE_FIXTURES = [
 	{ name: "gt", condition: { op: "gt", args: [{ ref: "v" }, { val: 1 }] } },
 	{ name: "gte", condition: { op: "gte", args: [{ ref: "v" }, { val: 1 }] } },
 	{ name: "between", condition: { op: "between", args: [{ ref: "v" }, { val: 1 }, { val: 3 }] } },
+	{ name: "in without a choice", condition: { op: "in", args: [{ ref: "v" }] } },
 	{ name: "in with one choice", condition: { op: "in", args: [{ ref: "v" }, { val: 1 }] } },
+	{ name: "and with no conditions", condition: { op: "and", args: [] } },
+	{ name: "and with one condition", condition: { op: "and", args: [{ op: "exists", args: [{ ref: "v" }] }] } },
+	{ name: "or with no conditions", condition: { op: "or", args: [] } },
+	{ name: "or with one condition", condition: { op: "or", args: [{ op: "exists", args: [{ ref: "v" }] }] } },
 	{
 		name: "and with two conditions",
 		condition: {
@@ -219,11 +224,7 @@ export const INVALID_CONDITION_SHAPE_FIXTURES = [
 	{ name: "comparison with three arguments", condition: { op: "eq", args: [{ ref: "v" }, { val: 1 }, { val: 2 }] } },
 	{ name: "between with two arguments", condition: { op: "between", args: [{ ref: "v" }, { val: 1 }] } },
 	{ name: "between with four arguments", condition: { op: "between", args: [{ ref: "v" }, { val: 1 }, { val: 2 }, { val: 3 }] } },
-	{ name: "in without a choice", condition: { op: "in", args: [{ ref: "v" }] } },
-	{ name: "and with no conditions", condition: { op: "and", args: [] } },
-	{ name: "and with one condition", condition: { op: "and", args: [{ op: "exists", args: [{ ref: "v" }] }] } },
-	{ name: "or with no conditions", condition: { op: "or", args: [] } },
-	{ name: "or with one condition", condition: { op: "or", args: [{ op: "exists", args: [{ ref: "v" }] }] } },
+	{ name: "in without a value", condition: { op: "in", args: [] } },
 	{ name: "not with no condition", condition: { op: "not", args: [] } },
 	{
 		name: "not with two conditions",

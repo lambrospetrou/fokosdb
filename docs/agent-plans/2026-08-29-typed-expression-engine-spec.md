@@ -149,11 +149,11 @@ type ConditionExpression =
     }
   | {
       op: "in";
-      args: readonly [value: ExpressionValue, choice: ExpressionValue, ...choices: ExpressionValue[]];
+      args: readonly [value: ExpressionValue, ...choices: ExpressionValue[]];
     }
   | {
       op: "and" | "or";
-      args: readonly [ConditionExpression, ConditionExpression, ...ConditionExpression[]];
+      args: readonly ConditionExpression[];
     }
   | { op: "not"; args: readonly [condition: ConditionExpression] }
   | { op: "exists" | "not_exists"; args: readonly [reference: ExpressionReference] }
@@ -171,10 +171,10 @@ Rules:
 
 - Every condition node has only `op` and `args`. Exception: `true` and `false` have only `op`.
 - `true` always passes and `false` always fails, also when the item does not exist.
-- `and` and `or` need at least two conditions.
+- `and` and `or` accept any number of conditions. An empty `and` is `true`, and an empty `or` is `false`.
 - `not`, `exists`, and `not_exists` need one argument.
 - `between` uses `[value, lower, upper]` and includes both bounds.
-- `in` uses `[value, ...choices]` and allows 1-100 choices.
+- `in` uses `[value, ...choices]` and allows 0-100 choices. An `in` with no choices is `false`.
 - A condition root must be a condition. Do not use scalar truthiness.
 - Test Boolean values with `eq` or `ne`.
 - Reject unknown fields.
