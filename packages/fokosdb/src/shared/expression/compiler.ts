@@ -609,6 +609,10 @@ function compileCondition(condition: ConditionExpression, context: CompileContex
 			return compileIn(condition.args, context);
 		case "and":
 		case "or": {
+			// An empty `and` has no condition that fails, and an empty `or` has no condition that passes.
+			if (condition.args.length === 0) {
+				return condition.op === "and" ? "(1)" : "(0)";
+			}
 			const operator = condition.op === "and" ? " AND " : " OR ";
 			return `(${condition.args.map((arg) => compileCondition(arg, context)).join(operator)})`;
 		}
@@ -716,6 +720,10 @@ function comparisonOperator(op: "lt" | "lte" | "gt" | "gte"): string {
 function compileIn(args: readonly ExpressionValue[], context: CompileContext): string {
 	const target = args[0];
 	const choices = args.slice(1);
+	// An `in` with no choices has no value to match.
+	if (choices.length === 0) {
+		return "(0)";
+	}
 	const firstType = literalNativeType(choices[0]);
 	if (firstType !== undefined && firstType !== "null" && choices.every((choice) => literalNativeType(choice) === firstType)) {
 		const mode: ValueMode = isDirectKeyReference(target) && (firstType === "text" || firstType === "bytes") ? "key" : "logical";

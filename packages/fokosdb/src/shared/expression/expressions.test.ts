@@ -242,6 +242,19 @@ describe("expression showcase: existence and logical operators", () => {
 			},
 		},
 		{
+			name: "and over a list with one condition",
+			item: shippedOrder,
+			condition: { op: "and", args: [{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "shipped" }] }] },
+		},
+		{ name: "and over an empty list passes", item: shippedOrder, condition: { op: "and", args: [] } },
+		{ name: "or over an empty list fails", item: shippedOrder, condition: { op: "or", args: [] }, expected: false },
+		{
+			name: "in with no choices fails",
+			item: shippedOrder,
+			condition: { op: "in", args: [{ ref: "data", path: "$.status" }] },
+			expected: false,
+		},
+		{
 			name: "not around a comparison",
 			item: shippedOrder,
 			condition: { op: "not", args: [{ op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "cancelled" }] }] },

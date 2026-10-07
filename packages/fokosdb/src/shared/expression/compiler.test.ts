@@ -61,6 +61,28 @@ describe("condition SQLite compiler", () => {
 		}
 	});
 
+	it("compiles an empty and, an empty or, and an in without choices to SQL constants", () => {
+		for (const [condition, sql] of [
+			[{ op: "and", args: [] }, "(1)"],
+			[{ op: "or", args: [] }, "(0)"],
+			[{ op: "in", args: [{ ref: "data", path: "$.status" }] }, "(0)"],
+		] as const satisfies readonly (readonly [ConditionExpression, string])[]) {
+			const plan = compileConditionExpression(condition);
+			expect(plan.sql).toBe(sql);
+			expect(plan.bindings).toEqual([]);
+		}
+	});
+
+	it("compiles an and or an or with one condition to that condition", () => {
+		const child: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.status" }, { val: "active" }] };
+		const childPlan = compileConditionExpression(child);
+		for (const op of ["and", "or"] as const) {
+			const plan = compileConditionExpression({ op, args: [child] });
+			expect(plan.sql).toBe(`(${childPlan.sql})`);
+			expect(plan.bindings).toEqual(childPlan.bindings);
+		}
+	});
+
 	it("keeps literal and path text out of generated SQL", () => {
 		const path = `$."x'); DROP TABLE items; --"`;
 		const literal = "value'); SELECT random(); --";
