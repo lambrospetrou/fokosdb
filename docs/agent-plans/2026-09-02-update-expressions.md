@@ -158,9 +158,9 @@ Deliver:
   and for a projection.
 - An action registry that holds the target rules of each action kind.
 
-`contexts` is a bitflag, not a set. Most operations belong to every context: 54 allowlisted SQLite functions,
-`size`, and `attribute_type` are all valid in a condition and as an update value, and only `if_not_exists`, `+`,
-`-`, and `*` narrow to `update-value` in this version. A set for each of 60 entries allocates 60 objects to hold
+`contexts` is a bitflag, not a set. Every operation belongs to every context in this version: 54 allowlisted SQLite functions,
+`size`, `attribute_type`, `if_not_exists`, `+`, `-`, and `*` are all valid in a condition, in a filter, in a
+projection, and as an update value. A set for each of 60 entries allocates 60 objects to hold
 one or two members each, and a membership test is then a hash lookup. One integer for each entry costs nothing,
 the default is the constant that names every context, and a narrowed entry states its own flags. The type sets
 in `src/shared/expression/semantic.ts` stay as they are: those are shared instances that every entry reads, not

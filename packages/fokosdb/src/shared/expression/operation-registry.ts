@@ -328,7 +328,7 @@ function nullOrType(arg: ExpressionValue, renderers: OperationRenderers): string
 // numbers, 0 for +/-Infinity, and NULL for NaN. This guard verifies both operands are numbers
 // and the arithmetic result is finite, because JSON cannot store NaN or Infinity.
 function renderArithmeticPresent(symbol: "+" | "-" | "*", args: readonly ExpressionValue[], renderers: OperationRenderers): string {
-	const op = `(${renderers.renderValue(args[0], "sqlite")} ${symbol} ${renderers.renderValue(args[1], "sqlite")})`;
+	const op = `(${renderers.renderValue(args[0], "logical")} ${symbol} ${renderers.renderValue(args[1], "logical")})`;
 	return `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])} AND ${renderers.renderType(args[0])} = 'number' AND ${renderers.renderType(args[1])} = 'number' AND abs(${op}) < 1e999)`;
 }
 
@@ -371,7 +371,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 	},
 	{
 		name: "if_not_exists",
-		contexts: EXPRESSION_CONTEXT_UPDATE_VALUE,
+		contexts: EXPRESSION_CONTEXT_ALL,
 		arity: [2, 2],
 		typeRule: (argFacts) => {
 			const pathTypes = argFacts[0].types;
@@ -387,8 +387,9 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			}
 			return { types: resultTypes };
 		},
+		// "logical" mode reads the complete data of a root scalar as that scalar, not as its JSONB blob.
 		renderValue: (args, renderers) =>
-			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "sqlite")} ELSE ${renderers.renderValue(args[1], "sqlite")} END`,
+			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "logical")} ELSE ${renderers.renderValue(args[1], "logical")} END`,
 		renderJsonValue: (args, renderers) =>
 			`CASE WHEN ${renderers.renderPresent(args[0])} THEN ${renderers.renderValue(args[0], "json")} ELSE ${renderers.renderValue(args[1], "json")} END`,
 		renderPresent: (args, renderers) => {
@@ -406,7 +407,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 	},
 	{
 		name: "+",
-		contexts: EXPRESSION_CONTEXT_UPDATE_VALUE,
+		contexts: EXPRESSION_CONTEXT_ALL,
 		arity: [2, 2],
 		typeRule: (argFacts) => {
 			if (!argFacts[0].types.has("number") || !argFacts[1].types.has("number")) {
@@ -415,13 +416,13 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			const nullable = argFacts[0].types.has("null") || argFacts[1].types.has("null");
 			return nullable ? nullNumberValue : numberValue;
 		},
-		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} + ${renderers.renderValue(args[1], "sqlite")})`,
+		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "logical")} + ${renderers.renderValue(args[1], "logical")})`,
 		renderPresent: (args, renderers) => renderArithmeticPresent("+", args, renderers),
 		renderType: () => "'number'",
 	},
 	{
 		name: "-",
-		contexts: EXPRESSION_CONTEXT_UPDATE_VALUE,
+		contexts: EXPRESSION_CONTEXT_ALL,
 		arity: [2, 2],
 		typeRule: (argFacts) => {
 			if (!argFacts[0].types.has("number") || !argFacts[1].types.has("number")) {
@@ -430,13 +431,13 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			const nullable = argFacts[0].types.has("null") || argFacts[1].types.has("null");
 			return nullable ? nullNumberValue : numberValue;
 		},
-		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} - ${renderers.renderValue(args[1], "sqlite")})`,
+		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "logical")} - ${renderers.renderValue(args[1], "logical")})`,
 		renderPresent: (args, renderers) => renderArithmeticPresent("-", args, renderers),
 		renderType: () => "'number'",
 	},
 	{
 		name: "*",
-		contexts: EXPRESSION_CONTEXT_UPDATE_VALUE,
+		contexts: EXPRESSION_CONTEXT_ALL,
 		arity: [2, 2],
 		typeRule: (argFacts) => {
 			if (!argFacts[0].types.has("number") || !argFacts[1].types.has("number")) {
@@ -445,7 +446,7 @@ const FOKOS_OPERATIONS: readonly OperationDefinition[] = [
 			const nullable = argFacts[0].types.has("null") || argFacts[1].types.has("null");
 			return nullable ? nullNumberValue : numberValue;
 		},
-		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "sqlite")} * ${renderers.renderValue(args[1], "sqlite")})`,
+		renderValue: (args, renderers) => `(${renderers.renderValue(args[0], "logical")} * ${renderers.renderValue(args[1], "logical")})`,
 		renderPresent: (args, renderers) => renderArithmeticPresent("*", args, renderers),
 		renderType: () => "'number'",
 	},

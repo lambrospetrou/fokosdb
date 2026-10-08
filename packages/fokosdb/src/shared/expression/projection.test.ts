@@ -116,14 +116,16 @@ describe("projection validation", () => {
 		expect(validateProjectionExpression([{ expr: { ref: "data", path: "$.items[#-1]" } }]).names).toEqual(["$.items[#-1]"]);
 	});
 
-	it("rejects update-only functions in a projection and in a filter", () => {
-		const updateFns = [
+	it("accepts if_not_exists and arithmetic in a projection and in a filter", () => {
+		const fns = [
 			{ fn: "if_not_exists", args: [{ ref: "data", path: "$.x" }, { val: 0 }] },
 			{ fn: "+", args: [{ val: 1 }, { val: 1 }] },
+			{ fn: "-", args: [{ ref: "data", path: "$.x" }, { val: 1 }] },
+			{ fn: "*", args: [{ ref: "v" }, { val: 2 }] },
 		] as const;
-		for (const fn of updateFns) {
-			expectExpressionError(() => validateProjectionExpression([entry(fn, "x")]), "invalid_function");
-			expectExpressionError(() => compileQueryExpression({ filter: { op: "eq", args: [fn, { val: 0 }] } }), "invalid_function");
+		for (const fn of fns) {
+			expect(validateProjectionExpression([entry(fn, "x")]).names).toEqual(["x"]);
+			expect(compileQueryExpression({ filter: { op: "eq", args: [fn, { val: 0 }] } }).filterSql).not.toBeNull();
 		}
 	});
 
@@ -139,7 +141,14 @@ describe("projection validation", () => {
 			"invalid_type",
 			/complete data/,
 		);
-		// Fokos operations read the logical value and keep accepting the complete data.
+		// if_not_exists returns its argument unchanged, so the same rule applies.
+		expectExpressionError(
+			() => validateProjectionExpression([entry({ fn: "if_not_exists", args: [{ ref: "data" }, { val: 0 }] }, "x")]),
+			"invalid_type",
+			/complete data/,
+		);
+		// Fokos operations that compute a new value read the logical value and keep accepting the complete data.
+		expect(validateProjectionExpression([entry({ fn: "+", args: [{ ref: "data" }, { val: 1 }] }, "n")]).names).toEqual(["n"]);
 		expect(validateProjectionExpression([entry({ fn: "size", args: [{ ref: "data" }] }, "n")]).names).toEqual(["n"]);
 		expect(validateProjectionExpression([entry({ fn: "attribute_type", args: [{ ref: "data" }] }, "t")]).names).toEqual(["t"]);
 		// A filter never returns a function result to a caller, so the same call compiles there.

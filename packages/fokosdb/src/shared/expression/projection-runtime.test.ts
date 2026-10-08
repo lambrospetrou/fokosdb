@@ -213,6 +213,68 @@ describe("projected point read", () => {
 		});
 	});
 
+	it("evaluates if_not_exists and arithmetic in a projection", async () => {
+		const record = await project({ hashKey: "item", kind: "json", data: { n: 7, none: null, flag: false, obj: { a: 1 } } }, [
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.missing" }, { val: 0 }] }, as: "fallback" },
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.n" }, { val: 0 }] }, as: "stored" },
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.none" }, { val: 0 }] }, as: "storedNull" },
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.flag" }, { val: 0 }] }, as: "storedBoolean" },
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.missing" }, { val: true }] }, as: "fallbackBoolean" },
+			{ expr: { fn: "if_not_exists", args: [{ ref: "data", path: "$.obj" }, { val: 0 }] }, as: "storedObject" },
+			{ expr: { fn: "+", args: [{ ref: "data", path: "$.n" }, { val: 1 }] }, as: "sum" },
+			{ expr: { fn: "-", args: [{ ref: "data", path: "$.n" }, { val: 10 }] }, as: "difference" },
+			{ expr: { fn: "*", args: [{ ref: "data", path: "$.n" }, { val: 1.5 }] }, as: "product" },
+			{ expr: { fn: "+", args: [{ ref: "data", path: "$.missing" }, { val: 1 }] }, as: "sumMissing" },
+			{ expr: { fn: "+", args: [{ ref: "data", path: "$.none" }, { val: 1 }] }, as: "sumNull" },
+			{ expr: { fn: "*", args: [{ val: 1e300 }, { val: 1e300 }] }, as: "overflow" },
+		]);
+		expect(record).toEqual({
+			fallback: 0,
+			stored: 7,
+			storedNull: null,
+			storedBoolean: false,
+			fallbackBoolean: true,
+			storedObject: { a: 1 },
+			sum: 8,
+			difference: -3,
+			product: 10.5,
+		});
+	});
+
+	it("reads the complete data of a root scalar as that scalar in arithmetic", async () => {
+		const sum: readonly ProjectionExpression[] = [{ expr: { fn: "+", args: [{ ref: "data" }, { val: 1 }] }, as: "sum" }];
+		expect(await project({ hashKey: "i", kind: "json", data: 5 }, sum)).toEqual({ sum: 6 });
+		expect(await project({ hashKey: "i", kind: "json", data: { n: 5 } }, sum)).toEqual({});
+	});
+
+	it("evaluates if_not_exists and arithmetic inside a condition", async () => {
+		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			const hashKey = KeyCodec.encode("item");
+			const sortKey = KeyCodec.encodeOptional(undefined);
+			putFixture(state.storage, hashKey, sortKey, { hashKey: "item", kind: "json", data: { qty: 3, price: 40 } });
+			const evaluate = (condition: ConditionExpression): boolean =>
+				evaluateConditionPlan(state.storage, compileConditionExpression(condition), hashKey, sortKey).conditionOk;
+			const total = {
+				fn: "*",
+				args: [
+					{ ref: "data", path: "$.qty" },
+					{ ref: "data", path: "$.price" },
+				],
+			} as const;
+			expect(evaluate({ op: "gt", args: [total, { val: 100 }] })).toBe(true);
+			expect(evaluate({ op: "gt", args: [total, { val: 200 }] })).toBe(false);
+			expect(
+				evaluate({ op: "eq", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.discount" }, { val: 0 }] }, { val: 0 }] }),
+			).toBe(true);
+			// A missing operand makes the sum missing, so neither comparison holds.
+			const sumMissing = { fn: "+", args: [{ ref: "data", path: "$.missing" }, { val: 1 }] } as const;
+			expect(evaluate({ op: "eq", args: [sumMissing, { val: 1 }] })).toBe(false);
+			expect(evaluate({ op: "ne", args: [sumMissing, { val: 1 }] })).toBe(false);
+			expect(evaluate({ op: "not_exists", args: [{ ref: "data", path: "$.missing" }] })).toBe(true);
+		});
+	});
+
 	it("evaluates a pass-through function inside a condition", async () => {
 		const stub = testPartitionStub(`expression-projection.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
@@ -429,6 +491,25 @@ describe("query statement", () => {
 			expect(complete[0].v).toBe(1);
 
 			expect(scan(state, plan, "count").map((row) => row.matched)).toEqual([1, 0, 1]);
+		});
+	});
+
+	it("filters and projects with if_not_exists and arithmetic", async () => {
+		const stub = testPartitionStub(`expression-query.${crypto.randomUUID()}`);
+		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
+			for (const fixture of [item("a", { n: 1 }), item("b", {}), item("c", { n: 5 })]) {
+				putFixture(state.storage, KeyCodec.encode("h"), KeyCodec.encode(fixture.sortKey!), fixture);
+			}
+			const n = { fn: "if_not_exists", args: [{ ref: "data", path: "$.n" }, { val: 0 }] } as const;
+			const plan = compileQueryExpression({
+				filter: { op: "lt", args: [{ fn: "+", args: [n, { val: 1 }] }, { val: 3 }] },
+				projection: [{ expr: { fn: "*", args: [n, { val: 10 }] }, as: "scaled" }],
+			});
+			const scanned = scan(state, plan, "projection");
+			expect(scanned.map((row) => row.matched)).toEqual([1, 1, 0]);
+			const names = plan.projection!.names;
+			expect(projectedItemFromWireRow(names, decodeProjectedRow(scanned[0], names.length))).toEqual({ scaled: 10 });
+			expect(projectedItemFromWireRow(names, decodeProjectedRow(scanned[1], names.length))).toEqual({ scaled: 0 });
 		});
 	});
 
