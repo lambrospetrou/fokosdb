@@ -128,28 +128,37 @@ The pass that finds data loss. Give it the most time.
 
 The failure modes this codebase repeats. Check each spec against all of them.
 
-1. **Migration guard.** Every write and transaction RPC on `PartitionDO` must
-   call `ensureMigration`. A child in `migration_migrating` holds incomplete data
-   and incomplete locks. Read RPCs that tolerate stale data read from the parent
-   instead.
-2. **Split routing.** A parent in `split_started` or `split_completed` owns no
-   keys. Writes and locks must reach the children. `cancel` must forward at both
-   states, or pending rows leak forever.
-3. **Swallowed fan-out errors.** When the code forwards to several children, it
-   must attempt every child, collect the failures, and rethrow. A swallowed error
+1. **Migration guard.** Every operation of `PartitionDO` declares `whileMigrating`
+   in its descriptor. A target that imports holds incomplete data and incomplete
+   locks, so a write or transaction operation must use `"throw"` and answer
+   `partition_migrating`. Only a read-only `point` or `range` operation that
+   tolerates stale data can use `"read_source"`.
+2. **Split routing.** A router (a source after the cutover, which `status`
+   reports as `split_started` or `split_completed`) owns no keys. Writes, locks,
+   and `txCancel` must reach the current owners, or pending rows leak forever.
+   Each owner must receive its keys in one sub-request of a `group` dispatch.
+3. **Swallowed fan-out errors.** When the code forwards to several owners, it
+   must attempt every owner, collect the failures, and rethrow
+   (`failurePolicy: "attempt_all"`, `partition_fanout_failed`). A swallowed error
    moves the coordinator to a terminal state with work undone.
-4. **Recovery through private paths.** Recovery must call the public `commit()`
-   and `cancel()`, because the guards and the routing live there.
-5. **`splitN` immutability.** Any change to the split factor after
-   initialization breaks routing and loses data.
+4. **Recovery through private paths.** Recovery must apply an outcome through
+   `this.fokos.dispatch("txCommit" | "txCancel", ...)`, because the guards and
+   the routing live there. Never inline SQL, and never release the locks of a
+   transaction by its transaction id alone: that also deletes the copies of a
+   moved key.
+5. **`hashSplitN` and `rootTreesN` immutability.** A change to either after
+   initialization breaks routing and loses data. `rangeSplitN` can change.
 6. **`PartitionContext` on every RPC.** Durable Objects take no configuration at
    instantiation. New RPCs must carry and validate the context.
 7. **Write-ahead order.** The coordinator writes each state transition to SQLite
    before it sends the outbound RPC.
-8. **`PREPARED` is final.** A prepared transaction must commit. No path may
-   cancel it.
-9. **Idempotency token.** The `clientRequestToken` names the coordinator. Any
-   change to naming, pooling, or the pool size breaks replay.
+8. **`COMMITTING` is final.** It is the point of no return. A transaction in
+   `COMMITTING` (or `PREPARED` from older code) must commit. No path may cancel
+   it. Only `markCommitting` and the `CANCELLING` write decide, and both require
+   `PREPARING`.
+9. **Idempotency token.** The `clientRequestToken` is the route key of the
+   coordinator in the shard group `fokos.tc.<tableName>`. Any change to the
+   token routing or to `coordinatorRootsN` breaks replay.
 10. **Committed state only.** The `items` table holds committed rows.
     `pending_transactions` holds the locks. A spec that writes uncommitted data
     into `items` is wrong.
