@@ -517,21 +517,42 @@ describe("update SQLite compiler", () => {
 		});
 	});
 
-	it("stores a document that a pass-through function returns as a nested document", async () => {
+	it("stores the complete data and a document that a pass-through function returns as nested documents", async () => {
 		const stub = testPartitionStub(`update-passthrough-doc-test.${crypto.randomUUID()}`);
 		await runInDurableObject(stub, async (_instance: PartitionDO, state: DurableObjectState) => {
 			const update: UpdateExpression = [
+				{ action: "set", target: { ref: "data", path: "$.copy" }, value: { ref: "data" } },
 				{
 					action: "set",
-					target: { ref: "data", path: "$.copy" },
-					value: { fn: "sqlite.coalesce", args: [{ ref: "data" }, { val: 0 }] },
+					target: { ref: "data", path: "$.inner" },
+					value: { fn: "sqlite.coalesce", args: [{ ref: "data", path: "$.obj" }, { val: 0 }] },
 				},
 			];
 			const plan = compileUpdateExpression(update);
-			const row = runUpdatePlan(state, plan, JSON.stringify({ a: 1 }));
-			expect(JSON.parse(row.doc)).toEqual({ a: 1, copy: { a: 1 } });
+			const row = runUpdatePlan(state, plan, JSON.stringify({ obj: { a: 1 } }));
+			expect(JSON.parse(row.doc)).toEqual({ obj: { a: 1 }, copy: { obj: { a: 1 } }, inner: { a: 1 } });
 			expect(row.applicable).toBe(1);
 		});
+	});
+
+	it("rejects the complete data as a direct argument of a SQLite function or if_not_exists in an update value", () => {
+		// A SQLite function reads the stored JSONB blob, and the update would write a value made from it
+		// into the document.
+		const values = [
+			{ fn: "sqlite.hex", args: [{ ref: "data" }] },
+			{ fn: "sqlite.length", args: [{ ref: "data" }] },
+			{ fn: "sqlite.coalesce", args: [{ ref: "data" }, { val: 0 }] },
+			{ fn: "sqlite.upper", args: [{ fn: "if_not_exists", args: [{ ref: "data" }, { val: 0 }] }] },
+		] as const;
+		for (const value of values) {
+			const update = [{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression;
+			expect(() => compileUpdateExpression(update), JSON.stringify(value)).toThrow(/complete data in an update value/);
+		}
+		// A Fokos operation that computes a new value reads the logical value.
+		const update: UpdateExpression = [
+			{ action: "set", target: { ref: "data", path: "$.n" }, value: { fn: "size", args: [{ ref: "data" }] } },
+		];
+		expect(() => compileUpdateExpression(update)).not.toThrow();
 	});
 
 	it("rejects an update value that can only be bytes", () => {

@@ -523,6 +523,12 @@ decode. Two layers hold the rule:
 - The compiler carries a per-item test for a value that is bytes for SOME items only: a key reference, which is
   text for a text key and bytes for a binary one, and any SQLite function, which is typed by what it returns
   for the row. The test is the value's own type expression, so it also covers a function that wraps a key.
+- `validateUpdateExpression` refuses the complete `data` reference as a direct argument of a SQLite function or of
+  `if_not_exists`. A SQLite function reads the stored form of the data, which is the JSONB blob for a JSON item.
+  Without the rule, `sqlite.hex` or `sqlite.length` over the complete data writes the internal encoding into the
+  document as text or as a number, and the type test cannot see it. `if_not_exists` returns its argument
+  unchanged, so a SQLite function around it would read the same blob. To copy the complete document, set the
+  `data` reference itself.
 
 **Only this cause is reported on its own.** The probe evaluates `valueTypeSql` beside `applicableSql`, and the
 participant answers `update_value_is_bytes` instead of `update_not_applicable` when it fails. It is the one
