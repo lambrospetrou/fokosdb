@@ -30,7 +30,13 @@ describe.concurrent("Sharding runtime — counter host", () => {
 
 	it("keeps every write when the children split again", async () => {
 		const table = makeCounterTable();
-		for (let i = 0; i < 30; i++) {
+		for (let i = 0; i < 5; i++) {
+			await table.increment(`user-${i % 8}`);
+		}
+		// The root serves writes until its split cuts over. Wait for the cutover, so the children get
+		// enough writes to split again however long the first split takes.
+		await table.settle((n) => n[0].stats.role === "router");
+		for (let i = 5; i < 40; i++) {
 			await table.increment(`user-${i % 8}`);
 		}
 		const nodes = await table.settle((n) => n.length > 5);
