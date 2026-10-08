@@ -501,14 +501,18 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 		argFacts.push(analyzeValue(args[i], depth + 1, context));
 	}
 
-	// A SQLite function reads the stored form of a value. For a JSON item the stored form of the
-	// complete data is the JSONB blob, which must never reach a caller, so a projection forbids it
-	// as a direct argument. Every other context keeps accepting it because the result never leaves
-	// the statement.
-	if (context.expressionContext === "projection" && operation.name.startsWith("sqlite.")) {
+	// A SQLite function reads the stored form of a value, and `if_not_exists` returns its argument
+	// unchanged. For a JSON item the stored form of the complete data is the JSONB blob, which must
+	// never reach a caller, so a projection forbids it as a direct argument of either. Every other
+	// context keeps accepting it because the result never leaves the statement.
+	const sqliteFunction = operation.name.startsWith("sqlite.");
+	if (context.expressionContext === "projection" && (sqliteFunction || operation.name === "if_not_exists")) {
 		for (const arg of args) {
 			if (typeof arg === "object" && arg !== null && (arg as { ref?: unknown }).ref === "data" && !Object.hasOwn(arg, "path")) {
-				throw new ExpressionError("invalid_type", "a SQLite function must not take the complete data in a projection");
+				throw new ExpressionError(
+					"invalid_type",
+					`${sqliteFunction ? "a SQLite function" : "if_not_exists"} must not take the complete data in a projection`,
+				);
 			}
 		}
 	}

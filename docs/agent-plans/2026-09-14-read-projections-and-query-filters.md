@@ -345,10 +345,11 @@ Value rules:
   public read boundary.
 - A JSON array or object is the parsed `JsonValue`.
 - A JSON path on text or byte data is `missing`.
-- A SQLite function must not take the complete `data` reference as a direct argument. A SQLite function
-  reads the stored form of a value, and for a JSON item that is the JSONB blob, which is not a public form.
-  Validation rejects it with `invalid_type`. `size` and `attribute_type` accept the complete `data`, and a
-  filter or a condition keeps accepting it, because their result never leaves the statement.
+- A SQLite function and `if_not_exists` must not take the complete `data` reference as a direct argument. A
+  SQLite function reads the stored form of a value, and `if_not_exists` returns its argument unchanged. For a
+  JSON item the stored form is the JSONB blob, which is not a public form. Validation rejects it with
+  `invalid_type`. `size`, `attribute_type`, `+`, `-`, and `*` accept the complete `data`, and a filter or a
+  condition keeps accepting it, because their result never leaves the statement.
 - The pass-through functions `sqlite.coalesce`, `sqlite.ifnull`, `sqlite.nullif`, and `sqlite.iif` take the
   type of the argument they return, so a JSON Boolean, array, or object passes through with its JSON type.
   Every other SQLite function is typed by SQLite: `null`, `number`, `text`, or `bytes`.
