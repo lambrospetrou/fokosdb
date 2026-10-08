@@ -503,15 +503,18 @@ function analyzeFunction(expression: Record<string, unknown>, depth: number, con
 
 	// A SQLite function reads the stored form of a value, and `if_not_exists` returns its argument
 	// unchanged. For a JSON item the stored form of the complete data is the JSONB blob, which must
-	// never reach a caller, so a projection forbids it as a direct argument of either. Every other
-	// context keeps accepting it because the result never leaves the statement.
+	// never reach a caller or a document. A projection returns its values and an update writes them,
+	// so both forbid the complete data as a direct argument of either. A condition and a filter keep
+	// accepting it because their result never leaves the statement.
 	const sqliteFunction = operation.name.startsWith("sqlite.");
-	if (context.expressionContext === "projection" && (sqliteFunction || operation.name === "if_not_exists")) {
+	const valueLeavesStatement = context.expressionContext === "projection" || context.expressionContext === "update-value";
+	if (valueLeavesStatement && (sqliteFunction || operation.name === "if_not_exists")) {
 		for (const arg of args) {
 			if (typeof arg === "object" && arg !== null && (arg as { ref?: unknown }).ref === "data" && !Object.hasOwn(arg, "path")) {
+				const where = context.expressionContext === "projection" ? "a projection" : "an update value";
 				throw new ExpressionError(
 					"invalid_type",
-					`${sqliteFunction ? "a SQLite function" : "if_not_exists"} must not take the complete data in a projection`,
+					`${sqliteFunction ? "a SQLite function" : "if_not_exists"} must not take the complete data in ${where}`,
 				);
 			}
 		}
