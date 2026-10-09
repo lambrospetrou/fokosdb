@@ -1,6 +1,6 @@
 # RFC — A condition on the state after the write
 
-**State:** Draft
+**State:** Abandoned - with ordered_per_item transaction execution mode this becomes unnecessary for now.
 **Date:** 2026-10-09
 **Author:** Lambros
 
