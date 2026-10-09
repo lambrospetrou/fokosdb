@@ -1,6 +1,6 @@
 # RFC — Ordered per-item execution for transactWriteItems
 
-**State:** Draft
+**State:** Implemented as of 2026-10-07
 **Date:** 2026-10-03
 **Author:** Lambros
 
