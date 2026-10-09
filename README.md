@@ -61,7 +61,6 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
-- Use the partial range topology within each partition to speed up transactions as well.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
@@ -74,14 +73,15 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Features
 
-- Add custom jobs to run on alarms, with their own best-effort interval.
+- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
+- Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Add global eventual indexes (DynamoDB GSIs).
 - Add operation hooks that will run on the final serving partition (onAfterOperation).
 - Batch item operations (non-transactions).
+- Add automatic hashing of the item and signature comparison, similar to the managed "v".
+- Add custom jobs to run on alarms, with their own best-effort interval.
 - Add a healthcheck of each partition DO to a provider Workers KV namespace (or R2) (do name -> partition context, split status, migrations status), since this could be better than a central DO for the state of the partitions, and could also be used by the PartitionTopologyKeeperDO.
 - Add FokosStd class with helper methods (e.g. paginator for queryItems).
-- Cleanup the public API, both for `do-partition.ts` and `db.ts`.
-- Return the same `meta` (operation metrics and partition info) from `transactWriteItems` and `transactGetItems` as every other operation returns.
 - Option to run `transactGetItems` through a coordinator placed close to the partitions when the Worker is far from them.
 - Transactions across tables, think of a nice API due to how we handle PartitionContext.
 - Think about backups and export in a consistent fashion using Durable Object bookmarks.
