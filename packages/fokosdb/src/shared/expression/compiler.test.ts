@@ -101,7 +101,7 @@ describe("condition SQLite compiler", () => {
 
 	it("emits direct placeholders for a homogeneous in expression", () => {
 		const plan = compileConditionExpression({ op: "in", args: [{ ref: "v" }, { val: 1 }, { val: 2 }, { val: 3 }] });
-		expect(plan.sql).toMatch(/ IN \(\?3, \?4, \?5\)/);
+		expect(plan.sql).toMatch(/ IN \(CAST\(\?3 AS INTEGER\), CAST\(\?4 AS INTEGER\), CAST\(\?5 AS INTEGER\)\)/);
 		expect(plan.bindings.filter((binding) => binding.kind === "val")).toEqual([
 			{ kind: "val", value: 1 },
 			{ kind: "val", value: 2 },
@@ -258,7 +258,7 @@ describe("update SQLite compiler", () => {
 		];
 		const plan = compileUpdateExpression(update);
 		expect(plan.documentSql).toMatch(
-			/^jsonb_remove\(jsonb_set\(COALESCE\(i\.data, jsonb\('\{\}'\)\), \?\d+, (?:json_quote\()?\?\d+\)?\), \?\d+\)$/,
+			/^jsonb_remove\(jsonb_set\(COALESCE\(i\.data, jsonb\('\{\}'\)\), \?\d+, CAST\(\?\d+ AS INTEGER\)\), \?\d+\)$/,
 		);
 	});
 

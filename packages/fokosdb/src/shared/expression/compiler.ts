@@ -1065,7 +1065,13 @@ function bindLiteral(value: JsonPrimitive, mode: ValueMode, context: CompileCont
 		mode === "key" && typeof value === "string"
 			? { kind: "keyText", value }
 			: { kind: "val", value: typeof value === "number" && Object.is(value, -0) ? 0 : value };
-	return bindDescriptor(descriptor, context);
+	const sql = bindDescriptor(descriptor, context);
+	// Workers SQLite binds every JavaScript number as a REAL. Without the cast, an update stores the
+	// literal 1 as the JSON number 1.0, and a SQLite function reads it as a real. The pool layout reads
+	// its literals from JSON text, where SQLite reads an integer below 2^63 as an INTEGER; the cast
+	// gives the direct layout the same result.
+	const isInteger = typeof descriptor.value === "number" && Number.isInteger(descriptor.value) && Math.abs(descriptor.value) < 2 ** 63;
+	return context.bindingLayout === "direct" && isInteger ? `CAST(${sql} AS INTEGER)` : sql;
 }
 
 function bindByteLiteral(value: { b64: string }, mode: ValueMode, context: CompileContext): string {

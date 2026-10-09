@@ -771,6 +771,36 @@ describe("PartitionStore - items", () => {
 		});
 	});
 
+	it("updateItemSingleShot stores an integer literal and integer arithmetic as JSON integers", async () => {
+		await withStore((store, state) => {
+			const hk = kb("hk");
+			const sk = kb("sk");
+			store.upsertItem({ hk, sk, data: JSON.stringify({ count: 5 }), kind: "json", ttlAt: null, txOrderTs: 1 });
+			const plan = compileUpdateExpression([
+				{
+					action: "set",
+					target: { ref: "data", path: "$.count" },
+					value: { fn: "+", args: [{ fn: "if_not_exists", args: [{ ref: "data", path: "$.count" }, { val: 0 }] }, { val: 1 }] },
+				},
+				{ action: "set", target: { ref: "data", path: "$.at" }, value: { val: 1_788_000_000 } },
+				{ action: "set", target: { ref: "data", path: "$.ratio" }, value: { val: 1.5 } },
+			]);
+			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
+
+			// JSON.parse reads 6.0 as 6, so the test reads the stored text and the JSON type of each member.
+			const row = state.storage.sql
+				.exec<{ text: string; count: string; at: string; ratio: string }>(
+					`SELECT json(data) AS text, json_type(data, '$.count') AS count, json_type(data, '$.at') AS at,
+					        json_type(data, '$.ratio') AS ratio
+					   FROM items WHERE hk = ? AND sk = ?`,
+					hk,
+					sk,
+				)
+				.one();
+			expect(row).toEqual({ text: '{"count":6,"at":1788000000,"ratio":1.5}', count: "integer", at: "integer", ratio: "real" });
+		});
+	});
+
 	it("bumpItemReadTs advances only the read watermark and never lowers it", async () => {
 		await withStore((store) => {
 			const hk = kb("hk");

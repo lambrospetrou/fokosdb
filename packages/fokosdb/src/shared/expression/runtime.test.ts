@@ -140,6 +140,17 @@ describe("compiled condition runtime", () => {
 		}
 	});
 
+	it("gives a SQLite function an integer literal as an integer and a fraction as a real", async () => {
+		const item: StoredFixture = { hashKey: "item", kind: "json", data: {} };
+		for (const condition of [
+			{ op: "eq", args: [{ fn: "sqlite.typeof", args: [{ val: 1 }] }, { val: "integer" }] },
+			{ op: "eq", args: [{ fn: "sqlite.typeof", args: [{ val: 1.5 }] }, { val: "real" }] },
+			{ op: "eq", args: [{ fn: "sqlite.concat", args: [{ val: "n" }, { val: 6 }] }, { val: "n6" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			expect((await evaluate(item, condition)).conditionOk, JSON.stringify(condition)).toBe(true);
+		}
+	});
+
 	it("matches a text key and never matches a binary key with the same content", async () => {
 		const textItem: StoredFixture = { hashKey: "item", sortKey: "ab", kind: "text", data: "value" };
 		const binaryItem: StoredFixture = { hashKey: "item", sortKey: new Uint8Array([0x61, 0x62]), kind: "text", data: "value" };
