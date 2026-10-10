@@ -5,6 +5,7 @@ import {
 	compileQueryExpression,
 	compileUpdateExpression,
 } from "../../src/shared/expression/compiler.js";
+import { CONDITION_FIXED_BINDING_COUNT, POOL_PARAM } from "../../src/shared/expression/plan.js";
 import type { ConditionExpression, ProjectionExpression, QueryExpressions, UpdateExpression } from "../../src/shared/expression/types.js";
 import type { QueryItemsRpcRequest } from "../../src/server/do-partition.js";
 import { fokosErrorWith } from "../errors-matchers.js";
@@ -149,4 +150,56 @@ describe("PartitionDO — an expression tree that does not compile", () => {
 		expect(await prepare(ABOVE_SQL_LIMIT)).toEqual({ outcome: "accepted" });
 		expect(await lockKeys(stub, "repeated-prepare")).toEqual(["hk/sk"]);
 	});
+});
+
+describe("PartitionDO — an expression with a term that the compiler drops after it registered the bindings of the term", () => {
+	// `$.a + 1` is a number or is absent, so the comparison with `null` never passes. The compiler finds
+	// that after it registered the bindings of `$.a` and `1`, and no SQL uses the two bindings. Workers
+	// SQLite refuses a statement that binds more values than it has parameters.
+	const DROPPED: ConditionExpression = { op: "eq", args: [{ fn: "+", args: [{ ref: "data", path: "$.a" }, { val: 1 }] }, { val: null }] };
+	const B_IS_X: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.b" }, { val: "x" }] };
+	const B_PATH = { kind: "path", value: "$.b" };
+	const X = { kind: "val", value: "x" };
+	const CASES = [
+		{ name: "first", tree: { op: "and", args: [DROPPED, B_IS_X] }, bindings: [B_PATH, X], passes: false },
+		{ name: "last", tree: { op: "or", args: [B_IS_X, DROPPED] }, bindings: [B_PATH, X], passes: true },
+		{ name: "alone", tree: DROPPED, bindings: [], passes: false },
+	] as const satisfies readonly { name: string; tree: ConditionExpression; bindings: unknown[]; passes: boolean }[];
+
+	/** The numbers after each `marker` in the SQL, each one time, in ascending order. */
+	const numbersAfter = (marker: string, ...sql: readonly string[]) =>
+		[...new Set(sql.flatMap((text) => text.split(marker).slice(1)).map((rest) => Number.parseInt(rest, 10)))].sort((a, b) => a - b);
+
+	it.each(CASES)("a condition with the dropped term $name binds only the parameters of its SQL", async ({ tree, bindings, passes }) => {
+		const plan = compileConditionExpression(tree);
+		expect(plan.bindings).toEqual(bindings);
+		expect(numbersAfter("?", plan.sql)).toEqual(bindings.map((_, i) => CONDITION_FIXED_BINDING_COUNT + 1 + i));
+
+		const { ctx, rpc } = makeStub();
+		const key = { hashKey: kb("hk"), sortKey: kb("sk") };
+		await rpc.apiPutItem(ctx, { ...key, ...json({ a: 1, b: "x" }) });
+		expect(await rpc.apiPutItem(ctx, { ...key, ...json({ a: 1, b: "y" }), condition: tree })).toMatchObject(
+			passes ? { outcome: "ok", version: 2 } : { outcome: "rejected", reason: { code: "condition_failed" } },
+		);
+	});
+
+	it.each(CASES)(
+		"a query filter with the dropped term $name reads only the pool elements of its SQL",
+		async ({ tree, bindings, passes }) => {
+			const plan = compileQueryExpression({ filter: tree, projection: [{ expr: { ref: "data", path: "$.b" } }] });
+			// The projection binds the path `$.b` also when the filter does not.
+			const expected = bindings.length === 0 ? [B_PATH] : bindings;
+			expect(plan.bindings).toEqual(expected);
+			expect(numbersAfter(`?${POOL_PARAM}, '$[`, plan.filterSql!, ...plan.projection!.valueSql, ...plan.projection!.typeSql)).toEqual(
+				expected.map((_, i) => i),
+			);
+
+			const { ctx, rpc } = makeStub();
+			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk1"), ...json({ a: 1, b: "x" }) });
+			await rpc.apiPutItem(ctx, { hashKey: kb("hk"), sortKey: kb("sk2"), ...json({ a: 1, b: "y" }) });
+			const result = await rpc.apiQueryItems(ctx, queryRequest({ filter: tree, projection: [{ expr: { ref: "data", path: "$.b" } }] }));
+			expect(result.scannedCount).toBe(2);
+			expect(result.items).toEqual(passes ? [["x"]] : []);
+		},
+	);
 });

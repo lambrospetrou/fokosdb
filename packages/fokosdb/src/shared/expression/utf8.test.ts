@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { utf8ByteLength } from "./utf8.js";
+import { utf8ByteLength, utf8WithinLimit } from "./utf8.js";
 
 describe("utf8ByteLength", () => {
 	it.each([
@@ -40,5 +40,19 @@ describe("utf8ByteLength", () => {
 				expect(utf8ByteLength(text), `U+${unit.toString(16)} then ${JSON.stringify(next)}`).toBe(encoder.encode(text).byteLength);
 			}
 		}
+	});
+});
+
+describe("utf8WithinLimit", () => {
+	it("counts the bytes of a text whose length does not give the answer", () => {
+		// The length gives the answer for a text longer than the limit, and for a text of one third of
+		// the limit or shorter. The texts below are between the two.
+		const limit = 60_000;
+		expect(utf8WithinLimit("a".repeat(20_001), limit)).toBe(true);
+		expect(utf8WithinLimit("a".repeat(limit), limit)).toBe(true);
+		expect(utf8WithinLimit("€".repeat(20_000), limit)).toBe(true);
+		expect(utf8WithinLimit("€".repeat(20_000) + "a", limit)).toBe(false);
+		expect(utf8WithinLimit("€".repeat(20_001), limit)).toBe(false);
+		expect(utf8WithinLimit("€".repeat(limit), limit)).toBe(false);
 	});
 });

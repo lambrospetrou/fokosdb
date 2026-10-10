@@ -82,7 +82,8 @@ import { utf8WithinLimit } from "./utf8.js";
 
 type CompileContext = {
 	bindings: ExpressionBindingDescriptor[];
-	bindingIndexByKey: Map<string, number>;
+	/** For each descriptor kind, the binding index of each bound value. A kind gets its map at its first binding. */
+	bindingIndexes: { [Kind in ExpressionBindingDescriptor["kind"]]?: Map<JsonPrimitive, number> };
 	bindingLayout: ExpressionBindingLayout;
 	/** The statement parameter that carries the pool array under the "pool" layout; unused otherwise. */
 	poolParam: number;
@@ -91,6 +92,8 @@ type CompileContext = {
 	paths: Set<string>;
 	expressionContext: ExpressionContext;
 	preImage: PreImage;
+	/** The callbacks that an operation renders its arguments through. Made at the first function node. */
+	renderers: OperationRenderers | undefined;
 };
 
 /**
@@ -143,6 +146,8 @@ const EQUALITY_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "te
 const ORDERED_TYPE_NAMES: readonly string[] = ["number", "text", "bytes"];
 const PREFIX_TYPE_NAMES: readonly string[] = ["text", "bytes"];
 const ARRAY_SEARCH_TYPE_NAMES: readonly string[] = ["null", "boolean", "number", "text"];
+const DIGITS = "0123456789";
+const DIRECT_PARAMETER_PATTERN = /\?(\d+)/g;
 const JSON_EACH_TYPE_SQL =
 	"CASE je.type WHEN 'null' THEN 'null' WHEN 'true' THEN 'boolean' WHEN 'false' THEN 'boolean' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' ELSE 'missing' END";
 
@@ -151,17 +156,7 @@ export function compileConditionExpression(
 	fixedBindingCount = CONDITION_FIXED_BINDING_COUNT,
 ): CompiledConditionPlan {
 	const analysis = validateConditionExpression(condition);
-	const context: CompileContext = {
-		bindings: [],
-		bindingIndexByKey: new Map(),
-		bindingLayout: "direct",
-		poolParam: 0,
-		paramOffset: fixedBindingCount,
-		completeData: false,
-		paths: new Set(),
-		expressionContext: "condition",
-		preImage: STORED_PRE_IMAGE,
-	};
+	const context = createContext("condition", STORED_PRE_IMAGE, "direct", fixedBindingCount);
 	const sql = compactParameters(compileCondition(condition, context), context);
 	if (!utf8WithinLimit(composeConditionStatement(sql), EXPRESSION_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
@@ -186,18 +181,8 @@ export function compileConditionExpression(
 export function compileUpdateExpression(update: UpdateExpression): CompiledUpdatePlan {
 	const analysis = validateUpdateExpression(update);
 	const orderedActions = orderUpdateActions(update);
-	const context: CompileContext = {
-		bindings: [],
-		bindingIndexByKey: new Map(),
-		bindingLayout: "direct",
-		poolParam: 0,
-		// The keys take ?1 and ?2 in every statement that runs this plan, as they do for a condition.
-		paramOffset: UPDATE_FIXED_BINDING_COUNT,
-		completeData: false,
-		paths: new Set(),
-		expressionContext: "update-value",
-		preImage: UPDATE_PRE_IMAGE,
-	};
+	// The keys take ?1 and ?2 in every statement that runs this plan, as they do for a condition.
+	const context = createContext("update-value", UPDATE_PRE_IMAGE, "direct", UPDATE_FIXED_BINDING_COUNT);
 
 	let accumulator = context.preImage.data;
 	for (const action of orderedActions) {
@@ -278,17 +263,7 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 
 export function compileProjectionExpression(projection: readonly ProjectionExpression[]): CompiledProjectionPlan {
 	const analysis = validateProjectionExpression(projection);
-	const context: CompileContext = {
-		bindings: [],
-		bindingIndexByKey: new Map(),
-		bindingLayout: "pool",
-		poolParam: POOL_PARAM,
-		paramOffset: 0,
-		completeData: false,
-		paths: new Set(),
-		expressionContext: "projection",
-		preImage: STORED_PRE_IMAGE,
-	};
+	const context = createContext("projection", STORED_PRE_IMAGE, "pool");
 	const fragments = compactPlanParameters(
 		[
 			...projection.map((entry) => renderProjectionValue(entry.expr, context)),
@@ -333,17 +308,7 @@ export function compileQueryExpression(input: {
 	const projectionAnalysis = projection === undefined ? undefined : validateProjectionExpression(projection);
 	// The filter and the projection share one compile context. A path or a literal that both halves
 	// use binds one time only.
-	const context: CompileContext = {
-		bindings: [],
-		bindingIndexByKey: new Map(),
-		bindingLayout: "pool",
-		poolParam: POOL_PARAM,
-		paramOffset: 0,
-		completeData: false,
-		paths: new Set(),
-		expressionContext: "filter",
-		preImage: STORED_PRE_IMAGE,
-	};
+	const context = createContext("filter", STORED_PRE_IMAGE, "pool");
 	const rawFilterSql = filter === undefined ? null : compileCondition(filter, context);
 	context.expressionContext = "projection";
 	const rawValueSql = projection?.map((entry) => renderProjectionValue(entry.expr, context)) ?? [];
@@ -379,6 +344,27 @@ export function compileQueryExpression(input: {
 				filterAnalysis?.requiredColumns.includes(column) === true || projectionAnalysis?.requiredColumns.includes(column) === true,
 		),
 		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
+	};
+}
+
+/** The compile context of one plan. `paramOffset` is the count of the fixed statement bindings before a "direct" plan. */
+function createContext(
+	expressionContext: ExpressionContext,
+	preImage: PreImage,
+	bindingLayout: ExpressionBindingLayout,
+	paramOffset = 0,
+): CompileContext {
+	return {
+		bindings: [],
+		bindingIndexes: {},
+		bindingLayout,
+		poolParam: bindingLayout === "pool" ? POOL_PARAM : 0,
+		paramOffset,
+		completeData: false,
+		paths: new Set(),
+		expressionContext,
+		preImage,
+		renderers: undefined,
 	};
 }
 
@@ -524,63 +510,69 @@ function valueTypeGuardSql(value: ExpressionValue, context: CompileContext): str
 }
 
 /**
- * Removes bindings whose numbered parameter no longer appears in the SQL. Constant folding can
- * discard a rendered fragment after its binding was registered; Workers SQLite requires the
- * provided binding count to match the statement parameter count, so survivors are renumbered
- * densely and in their original order.
+ * Removes the bindings that the SQL does not use. Constant folding can discard a rendered fragment
+ * after its binding was registered, and Workers SQLite requires the bound value count to equal the
+ * parameter count of the statement. The bindings that stay keep their order and get dense numbers.
+ *
+ * A fragment refers to binding `i` as `?N` under the "direct" layout, where N is `paramOffset + i + 1`,
+ * and as `json_extract(?P, '$[i]')` under the "pool" layout. The pool array must be dense because the
+ * runtime builds it from the bindings that stay, so element i of the bound array is binding i.
  */
 function compactParameters(sql: string, context: CompileContext): string {
 	return compactPlanParameters([sql], context)[0];
 }
 
 function compactPlanParameters(sqlList: string[], context: CompileContext): string[] {
-	if (context.bindingLayout === "pool") {
-		return compactPoolParameters(sqlList, context);
-	}
-	const used = new Set<number>();
+	const pool = context.bindingLayout === "pool";
+	// The text before the digits of each reference, and the number of the first binding.
+	const marker = pool ? `?${context.poolParam}, '$[` : "?";
+	const first = pool ? 0 : context.paramOffset + 1;
+	const bindingCount = context.bindings.length;
+	// Step 1: find the bindings that the SQL uses. `used[i]` is 1 when a fragment refers to binding i.
+	const used = new Uint8Array(bindingCount);
+	let usedCount = 0;
 	for (const sql of sqlList) {
-		for (const match of sql.matchAll(/\?(\d+)/g)) {
-			used.add(Number(match[1]));
+		for (let at = sql.indexOf(marker); at !== -1; ) {
+			// Read the number that follows the marker.
+			const digitsStart = at + marker.length;
+			let end = digitsStart;
+			let number = 0;
+			// The position of a character in DIGITS is its value, and -1 means that the number ended.
+			for (let digit = DIGITS.indexOf(sql[end]); digit !== -1; digit = DIGITS.indexOf(sql[++end])) {
+				number = number * 10 + digit;
+			}
+			// Count each binding one time. A marker with no digits after it is not a reference.
+			const index = number - first;
+			if (end > digitsStart && index >= 0 && index < bindingCount && used[index] === 0) {
+				used[index] = 1;
+				usedCount++;
+			}
+			at = sql.indexOf(marker, end);
 		}
 	}
-	if (used.size === context.bindings.length) {
+	// Step 2: when the SQL uses each binding, which is the usual result, nothing changes.
+	if (usedCount === bindingCount) {
 		return sqlList;
 	}
+	// Step 3: keep the used bindings in their order. `remap` gives the new index of each one.
 	const remap = new Map<number, number>();
 	const survivors: ExpressionBindingDescriptor[] = [];
-	for (const index of [...used].sort((a, b) => a - b)) {
-		survivors.push(context.bindings[index - context.paramOffset - 1]);
-		remap.set(index, context.paramOffset + survivors.length);
-	}
-	context.bindings = survivors;
-	return sqlList.map((sql) => sql.replace(/\?(\d+)/g, (_, digits: string) => `?${remap.get(Number(digits))}`));
-}
-
-/**
- * The pool-layout variant of compaction: the surviving descriptors keep their original order and
- * their `$[i]` indexes renumber densely from 0. The pool array must be dense because the runtime
- * builds it from the surviving descriptors, so element i of the bound array is descriptor i.
- */
-function compactPoolParameters(sqlList: string[], context: CompileContext): string[] {
-	const elementPattern = new RegExp(String.raw`\?${context.poolParam}, '\$\[(\d+)\]'`, "g");
-	const used = new Set<number>();
-	for (const sql of sqlList) {
-		for (const match of sql.matchAll(elementPattern)) {
-			used.add(Number(match[1]));
+	for (let index = 0; index < bindingCount; index++) {
+		if (used[index] === 1) {
+			remap.set(index, survivors.length);
+			survivors.push(context.bindings[index]);
 		}
 	}
-	if (used.size === context.bindings.length) {
-		return sqlList;
-	}
-	const remap = new Map<number, number>();
-	const survivors: ExpressionBindingDescriptor[] = [];
-	for (const index of [...used].sort((a, b) => a - b)) {
-		survivors.push(context.bindings[index]);
-		remap.set(index, survivors.length - 1);
-	}
 	context.bindings = survivors;
+	// Step 4: write the new index into each reference of each fragment.
+	if (pool) {
+		const elementPattern = new RegExp(String.raw`\?${context.poolParam}, '\$\[(\d+)\]'`, "g");
+		return sqlList.map((sql) =>
+			sql.replace(elementPattern, (_, digits: string) => `?${context.poolParam}, '$[${remap.get(Number(digits))}]'`),
+		);
+	}
 	return sqlList.map((sql) =>
-		sql.replace(elementPattern, (_, digits: string) => `?${context.poolParam}, '$[${remap.get(Number(digits))}]'`),
+		sql.replace(DIRECT_PARAMETER_PATTERN, (_, digits: string) => `?${first + remap.get(Number(digits) - first)!}`),
 	);
 }
 
@@ -815,13 +807,14 @@ function compileContains(container: ExpressionValue, search: ExpressionValue, co
 	return `(${scalar} OR ${array})`;
 }
 
-function makeRenderers(context: CompileContext): OperationRenderers {
-	return {
+/** The one renderer set of a compile. An expression with no function node makes none. */
+function renderersOf(context: CompileContext): OperationRenderers {
+	return (context.renderers ??= {
 		renderValue: (val, mode) => renderValue(val, mode, context),
 		renderType: (val) => renderType(val, context),
 		renderPresent: (val) => renderPresent(val, context),
 		renderSize: (val) => renderSize(val, context),
-	};
+	});
 }
 
 function renderPresent(value: ExpressionValue, context: CompileContext): string {
@@ -837,7 +830,7 @@ function renderPresent(value: ExpressionValue, context: CompileContext): string 
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
 		if (operation.renderPresent) {
-			return operation.renderPresent(value.args, makeRenderers(context));
+			return operation.renderPresent(value.args, renderersOf(context));
 		}
 		return "1";
 	}
@@ -857,7 +850,7 @@ function renderType(value: ExpressionValue, context: CompileContext): string {
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
 		if (operation.renderType) {
-			return operation.renderType(value.args, makeRenderers(context));
+			return operation.renderType(value.args, renderersOf(context));
 		}
 		const call = `${operation.name.slice("sqlite.".length)}(${value.args.map((arg) => renderValue(arg, "sqlite", context)).join(", ")})`;
 		return `CASE typeof(${call}) WHEN 'null' THEN 'null' WHEN 'integer' THEN 'number' WHEN 'real' THEN 'number' WHEN 'text' THEN 'text' WHEN 'blob' THEN 'bytes' ELSE 'missing' END`;
@@ -892,7 +885,7 @@ function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileCo
 			// An operation that returns one of its arguments must render that argument in "json" mode
 			// as well, which is what renderJsonValue is for. Everything else computes a new value that
 			// is already in its final form.
-			return (operation.renderJsonValue ?? operation.renderValue)(value.args, makeRenderers(context));
+			return (operation.renderJsonValue ?? operation.renderValue)(value.args, renderersOf(context));
 		}
 		throw new ExpressionError("invalid_function", "unknown expression function");
 	}
@@ -907,7 +900,7 @@ function renderValue(value: ExpressionValue, mode: ValueMode, context: CompileCo
 	}
 	const operation = getOperationDefinition(value.fn);
 	if (operation && matchesContext(operation.contexts ?? EXPRESSION_CONTEXT_ALL, context.expressionContext)) {
-		return operation.renderValue(value.args, makeRenderers(context));
+		return operation.renderValue(value.args, renderersOf(context));
 	}
 	throw new ExpressionError("invalid_function", "unknown expression function");
 }
@@ -1055,26 +1048,23 @@ function literalType(value: JsonPrimitive): "null" | "boolean" | "number" | "tex
 }
 
 function bindLiteral(value: JsonPrimitive, mode: ValueMode, context: CompileContext): string {
-	const descriptor: ExpressionBindingDescriptor =
-		mode === "key" && typeof value === "string"
-			? { kind: "keyText", value }
-			: { kind: "val", value: typeof value === "number" && Object.is(value, -0) ? 0 : value };
-	const sql = bindDescriptor(descriptor, context);
+	const bound = typeof value === "number" && Object.is(value, -0) ? 0 : value;
+	const sql = bindDescriptor(mode === "key" && typeof bound === "string" ? "keyText" : "val", bound, context);
 	// Workers SQLite binds every JavaScript number as a REAL. Without the cast, an update stores the
 	// literal 1 as the JSON number 1.0, and a SQLite function reads it as a real. The pool layout reads
 	// its literals from JSON text, where SQLite reads an integer below 2^63 as an INTEGER; the cast
 	// gives the direct layout the same result.
-	const isInteger = typeof descriptor.value === "number" && Number.isInteger(descriptor.value) && Math.abs(descriptor.value) < 2 ** 63;
+	const isInteger = typeof bound === "number" && Number.isInteger(bound) && Math.abs(bound) < 2 ** 63;
 	return context.bindingLayout === "direct" && isInteger ? `CAST(${sql} AS INTEGER)` : sql;
 }
 
 function bindByteLiteral(value: { b64: string }, mode: ValueMode, context: CompileContext): string {
 	const { canonical } = decodeByteLiteral(value);
-	return bindDescriptor({ kind: mode === "key" ? "keyB64" : "b64", value: canonical }, context);
+	return bindDescriptor(mode === "key" ? "keyB64" : "b64", canonical, context);
 }
 
 function bindPath(path: string, context: CompileContext): string {
-	return bindDescriptor({ kind: "path", value: path }, context);
+	return bindDescriptor("path", path, context);
 }
 
 /**
@@ -1082,19 +1072,21 @@ function bindPath(path: string, context: CompileContext): string {
  * binding. Under the "direct" layout that is the numbered parameter `?N`, counting from after the
  * fixed statement bindings. Under the "pool" layout it is a `json_extract` of element `i` of the
  * pool parameter, wrapped in `unhex` for the descriptors that carry hex-encoded bytes.
+ *
+ * `value` must be the value type of `kind`. Two bindings are the same when they have the same kind
+ * and the same value, and a `Map` keeps `1` and `"1"` apart.
  */
-function bindDescriptor(descriptor: ExpressionBindingDescriptor, context: CompileContext): string {
-	// The kind names contain no ":" and the value is JSON text, so this key cannot collide.
-	const key = `${descriptor.kind}:${JSON.stringify(descriptor.value)}`;
-	let index = context.bindingIndexByKey.get(key);
+function bindDescriptor(kind: ExpressionBindingDescriptor["kind"], value: JsonPrimitive, context: CompileContext): string {
+	const indexes = (context.bindingIndexes[kind] ??= new Map<JsonPrimitive, number>());
+	let index = indexes.get(value);
 	if (index === undefined) {
 		index = context.bindings.length;
-		context.bindings.push(descriptor);
-		context.bindingIndexByKey.set(key, index);
+		context.bindings.push({ kind, value } as ExpressionBindingDescriptor);
+		indexes.set(value, index);
 	}
 	if (context.bindingLayout === "pool") {
 		const element = `json_extract(?${context.poolParam}, '$[${index}]')`;
-		switch (descriptor.kind) {
+		switch (kind) {
 			case "val":
 			case "path":
 				return element;

@@ -5,8 +5,8 @@ const textEncoder = new TextEncoder();
  *
  * UTF-8 byte length is always >= `text.length` (each UTF-16 code unit produces at least one byte)
  * and always <= `3 * text.length` (a BMP code unit produces at most 3 bytes; a surrogate pair is
- * 2 units for 4 bytes). Both bounds decide most inputs without encoding, so the full encode runs
- * only for text in the narrow ambiguous band.
+ * 2 units for 4 bytes). Both bounds decide most inputs from the length. Only a text in the band
+ * between them gets a byte count, and the count makes no copy of the text.
  */
 export function utf8WithinLimit(text: string, limit: number): boolean {
 	if (text.length > limit) {
@@ -15,7 +15,7 @@ export function utf8WithinLimit(text: string, limit: number): boolean {
 	if (text.length * 3 <= limit) {
 		return true;
 	}
-	return textEncoder.encode(text).byteLength <= limit;
+	return utf8ByteLength(text) <= limit;
 }
 
 /** Where `utf8ByteLength` encodes one part of a text at a time. It reads only the count of the bytes. */

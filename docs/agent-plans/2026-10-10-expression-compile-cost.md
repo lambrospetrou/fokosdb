@@ -4,7 +4,7 @@
 **Date:** 2026-10-10
 **Author:** Lambros
 **Status:** The benchmark suite of section 4.2.1 is built. The plan has no canonical identity and the partition
-has no second plan check (commit `a31c0e8`). Step A, step B and step C are not built.
+has no second plan check (commit `a31c0e8`). Step A is built. Step B and step C are not built.
 
 ---
 
@@ -259,10 +259,11 @@ is the median of 5 samples. Two runs of one case differ by about 10%.
 makes one match array and one substring for each `?N` or `?1, '$[N]'`. When a binding is not used, a `replace`
 with the same pattern renumbers the rest.
 
-**Change.** One function replaces the two. It finds each marker with `indexOf`, reads the digits with
-`charCodeAt`, and sets a flag in a `Uint8Array` that has one entry for each binding. The marker is `?` for the
+**Change.** One function replaces the two. It finds each marker with `indexOf`, reads each digit as its
+position in the text `0123456789`, and sets a flag in a `Uint8Array` that has one entry for each binding. The marker is `?` for the
 direct layout and `?P, '$[` for the pool layout. When the count of set flags equals the binding count, the
-function returns the fragments as they are. The renumbering keeps the `replace` call.
+function returns the fragments as they are. The renumbering keeps the `replace` call. The scan does not use
+`charCodeAt`: `check:keys` permits it only in `key-codec.ts` and `partition-id.ts`.
 
 **Why the scan must stay.** An expression of the public API reaches the renumbering. The example is a
 comparison of an arithmetic value with the literal `null`:
@@ -370,7 +371,8 @@ section 4.2.2 against a prototype that adds these two changes:
 
 The prototype makes the renderer set when it makes the context. That costs 0.2 to 0.7 KiB for an expression with
 no function, which is the increase in the smallest cases. The set at the first function node removes that part
-of the increase. `TODO: measure` the smallest cases after that change.
+of the increase. Measured with step A as built (appendix 8.1): each of the 19 cases allocates less than the
+baseline, and `cond: not_exists(hashKey)` goes from 3.0 KiB to 2.7 KiB.
 
 Step A with no size check change: the compiler before `a31c0e8` against the prototype with the scan, the
 renderer set and the lookup. The time column is a `PartitionDO` in workerd:
@@ -905,6 +907,40 @@ after 3,000 warm-up calls. The Compile column includes one validation and no ide
 | query: one path eq filter | 0.6 | 0.6 | 10.0 | 12.3 | 1.6 |
 | query: four-term filter and 5 projections | 1.3 | 3.9 | 43.6 | 49.9 | 5.5 |
 | query: 40-term filter and 48 projections | 4.0 | 37.1 | 580.5 | 633.8 | 59.5 |
+
+**After step A.** The working tree on commit `9c7b260`, with step A. Each "before" column is the compiler of
+that commit. The workerd run measured the two compilers one after the other, on one machine. Step A changes
+no SQL, so the SQL size, the binding count and the two SQLite columns do not change.
+
+| Case | Heap KiB before | Step A | Change | Compile µs before | Step A | Path µs before | Step A | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 3.0 | 2.7 | -10% | 0.4 | 0.4 | 1.6 | 1.6 | 0% |
+| cond: optimistic lock | 5.3 | 5.0 | -6% | 1.9 | 1.6 | 3.4 | 3.1 | -9% |
+| cond: one path eq | 7.8 | 6.7 | -14% | 3.4 | 2.5 | 5.1 | 4.1 | -20% |
+| cond: contains on an array path | 10.0 | 7.9 | -21% | 4.6 | 3.1 | 6.0 | 4.6 | -23% |
+| cond: four terms | 19.1 | 14.6 | -24% | 9.8 | 6.5 | 11.2 | 8.3 | -26% |
+| cond: nested access policy | 26.1 | 20.9 | -20% | 10.5 | 8.2 | 12.3 | 9.6 | -22% |
+| cond: 40 distinct path eq | 209.5 | 153.7 | -27% | 116.2 | 82.0 | 119.1 | 83.5 | -30% |
+| cond: 80 eq on one path | 490.9 | 341.2 | -30% | 201.2 | 193.4 | 207.0 | 201.2 | -3% |
+| upd: set 1 literal | 7.8 | 6.3 | -19% | 3.4 | 2.4 | 5.2 | 3.5 | -33% |
+| upd: remove 1 path | 6.5 | 5.6 | -14% | 2.3 | 1.4 | 3.5 | 3.0 | -14% |
+| upd: counter and timestamp | 22.4 | 14.4 | -36% | 11.0 | 7.3 | 12.1 | 8.6 | -29% |
+| upd: 20 actions with arithmetic | 307.2 | 176.0 | -43% | 187.5 | 136.7 | 193.4 | 131.8 | -32% |
+| upd: 32 literal sets | 104.3 | 59.9 | -43% | 76.7 | 63.0 | 80.1 | 71.3 | -11% |
+| proj: 1 path | 9.0 | 7.7 | -14% | 4.1 | 2.5 | 5.6 | 4.2 | -25% |
+| proj: 3 paths and v | 20.3 | 16.0 | -21% | 8.2 | 4.9 | 10.1 | 7.2 | -29% |
+| proj: 48 paths | 264.5 | 195.8 | -26% | 98.6 | 74.2 | 144.5 | 104.5 | -28% |
+| query: one path eq filter | 12.3 | 11.0 | -11% | 5.1 | 4.6 | 7.4 | 5.9 | -20% |
+| query: four-term filter and 5 projections | 49.9 | 39.1 | -22% | 19.5 | 13.3 | 24.5 | 15.7 | -36% |
+| query: 40-term filter and 48 projections | 633.8 | 511.5 | -19% | 240.2 | 155.3 | 293.0 | 183.6 | -37% |
+
+In one earlier run of step A, the partition path of `cond: 80 eq on one path` was 134.8 µs. Its change is
+thus not clear of the noise.
+
+The plan comparison of section 4.2.8, step A against the compiler of commit `9c7b260`: 22,740 expressions that
+compile give equal plans, of which 1,401 renumber, and 37,409 expressions that do not compile give equal
+errors. The set has random conditions, updates, projections and queries, the fixtures of `test-fixtures.ts`,
+the 19 benchmark cases, and statements above 33,334 characters.
 
 ### 8.2 How the step tables were measured
 
