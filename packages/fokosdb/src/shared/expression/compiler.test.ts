@@ -176,6 +176,46 @@ describe("condition SQLite compiler", () => {
 		expect(plan.sql).toContain("= 'number'");
 	});
 
+	it("guards a data path against a literal with one json_type test", () => {
+		const path = { ref: "data", path: "$.value" } as const;
+		const guard = (test: string) =>
+			`CASE WHEN (i.hk IS NOT NULL AND i.data_kind = 2) AND json_type(i.data, ?3) ${test} THEN 1 ELSE 0 END AND `;
+		for (const [literal, test] of [
+			[null, "= 'null'"],
+			[true, "IN ('true', 'false')"],
+			[1.5, "IN ('integer', 'real')"],
+			["text", "= 'text'"],
+		] as const) {
+			for (const args of [
+				[path, { val: literal }],
+				[{ val: literal }, path],
+			] as const) {
+				const { sql } = compileConditionExpression({ op: "eq", args });
+				expect(sql.startsWith(`(${guard(test)}`), sql).toBe(true);
+				// The guard reads the path one time, and the value test reads it one time.
+				expect(sql.split("i.data, ?3").length - 1, sql).toBe(2);
+			}
+		}
+		const start = `(${guard("= 'text'")}`;
+		expect(compileConditionExpression({ op: "begins_with", args: [path, { val: "a" }] }).sql.startsWith(start)).toBe(true);
+		expect(compileConditionExpression({ op: "in", args: [path, { val: "a" }, { val: "b" }] }).sql.startsWith(start)).toBe(true);
+		expect(compileConditionExpression({ op: "between", args: [path, { val: "a" }, { val: "b" }] }).sql.startsWith(`(${start}`)).toBe(true);
+	});
+
+	it("keeps the general guards for a comparison that is not a data path against a JSON literal", () => {
+		const path = { ref: "data", path: "$.value" } as const;
+		for (const condition of [
+			{ op: "eq", args: [path, { ref: "data", path: "$.other" }] },
+			{ op: "begins_with", args: [{ ref: "data" }, { b64: "AQID" }] },
+			{ op: "eq", args: [{ ref: "data" }, { val: "text" }] },
+			{ op: "eq", args: [{ fn: "size", args: [path] }, { val: 1 }] },
+			{ op: "contains", args: [path, { val: "text" }] },
+		] as const satisfies readonly ConditionExpression[]) {
+			const { sql } = compileConditionExpression(condition);
+			expect(sql, sql).not.toContain("THEN 1 ELSE 0 END");
+		}
+	});
+
 	it("materializes Boolean literals as Workers SQLite integers", () => {
 		expect(
 			materializeExpressionBindings([

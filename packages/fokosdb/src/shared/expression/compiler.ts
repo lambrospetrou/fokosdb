@@ -384,9 +384,13 @@ function renderProjectionValue(value: ExpressionValue, context: CompileContext):
 
 /**
  * The type fragment of one projection entry: the native type name when the value is present, else
- * 'missing'. A value that is always present folds the CASE away.
+ * 'missing'. A value that is always present folds the CASE away. The type of a reference is already
+ * 'missing' when the reference is absent, so it needs no presence test.
  */
 function renderProjectionType(value: ExpressionValue, context: CompileContext): string {
+	if ("ref" in value) {
+		return renderType(value, context);
+	}
 	const present = renderPresent(value, context);
 	const type = renderType(value, context);
 	if (present === "1") {
@@ -658,6 +662,56 @@ function pushTypeGuards(terms: string[], leftType: string, rightType: string, al
 	return true;
 }
 
+/** For each literal type, the test on the `json_type` of a data path that has the type. */
+const JSON_TYPE_TEST: { readonly [type: string]: string | undefined } = {
+	null: "= 'null'",
+	boolean: "IN ('true', 'false')",
+	number: "IN ('integer', 'real')",
+	text: "= 'text'",
+};
+
+/**
+ * The one guard that a data path is present and has the native type `type`, or nothing when `value`
+ * is not a data path or the type has no test. The caller then uses the general guards.
+ *
+ * `json_type` returns NULL for an absent path, and a `CASE WHEN` reads NULL as false. Thus the guard
+ * is 1 or 0 and never NULL, and a `NOT` around the comparison stays correct.
+ */
+function dataPathTypeGuard(value: ExpressionValue, type: string | undefined, context: CompileContext): string | undefined {
+	const test = type === undefined ? undefined : JSON_TYPE_TEST[type];
+	if (test === undefined || !("ref" in value) || value.ref !== "data" || value.path === undefined) {
+		return undefined;
+	}
+	recordDataReference(value, context);
+	const { data, isJson } = context.preImage;
+	return `CASE WHEN ${isJson} AND json_type(${data}, ${bindPath(value.path, context)}) ${test} THEN 1 ELSE 0 END`;
+}
+
+/**
+ * Appends the presence guards and the type guards of a comparison of two values. A data path against
+ * a literal gets one guard, because the type of the literal is known here. Returns false when the
+ * guards can never pass.
+ */
+function pushComparisonGuards(
+	terms: string[],
+	left: ExpressionValue,
+	right: ExpressionValue,
+	allowed: readonly string[],
+	context: CompileContext,
+): boolean {
+	const leftLiteral = literalNativeType(left);
+	const rightLiteral = literalNativeType(right);
+	const guard = dataPathTypeGuard(left, rightLiteral, context) ?? dataPathTypeGuard(right, leftLiteral, context);
+	if (guard !== undefined) {
+		terms.push(guard);
+		return allowed.includes((rightLiteral ?? leftLiteral)!);
+	}
+	if (!addTerm(terms, renderPresent(left, context)) || !addTerm(terms, renderPresent(right, context))) {
+		return false;
+	}
+	return pushTypeGuards(terms, renderType(left, context), renderType(right, context), allowed);
+}
+
 function compileComparison(
 	op: "eq" | "ne" | "lt" | "lte" | "gt" | "gte",
 	left: ExpressionValue,
@@ -666,16 +720,8 @@ function compileComparison(
 ): string {
 	const [leftMode, rightMode] = comparisonModes(left, right);
 	const terms: string[] = [];
-	if (!addTerm(terms, renderPresent(left, context))) {
-		return "(0)";
-	}
-	if (!addTerm(terms, renderPresent(right, context))) {
-		return "(0)";
-	}
-	const leftType = renderType(left, context);
-	const rightType = renderType(right, context);
 	const allowedTypes = op === "eq" || op === "ne" ? EQUALITY_TYPE_NAMES : ORDERED_TYPE_NAMES;
-	if (!pushTypeGuards(terms, leftType, rightType, allowedTypes)) {
+	if (!pushComparisonGuards(terms, left, right, allowedTypes, context)) {
 		return "(0)";
 	}
 	const leftValue = renderValue(left, leftMode, context);
@@ -714,17 +760,22 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 	if (firstType !== undefined && firstType !== "null" && choices.every((choice) => literalNativeType(choice) === firstType)) {
 		const mode: ValueMode = isDirectKeyReference(target) && (firstType === "text" || firstType === "bytes") ? "key" : "logical";
 		const terms: string[] = [];
-		if (!addTerm(terms, renderPresent(target, context))) {
-			return "(0)";
-		}
-		const type = renderType(target, context);
-		const typeConst = constTypeName(type);
-		if (typeConst !== undefined) {
-			if (typeConst !== firstType) {
+		const guard = dataPathTypeGuard(target, firstType, context);
+		if (guard !== undefined) {
+			terms.push(guard);
+		} else {
+			if (!addTerm(terms, renderPresent(target, context))) {
 				return "(0)";
 			}
-		} else {
-			terms.push(`${type} = '${firstType}'`);
+			const type = renderType(target, context);
+			const typeConst = constTypeName(type);
+			if (typeConst !== undefined) {
+				if (typeConst !== firstType) {
+					return "(0)";
+				}
+			} else {
+				terms.push(`${type} = '${firstType}'`);
+			}
 		}
 		const choiceSql = choices.map((choice) => renderValue(choice, mode, context)).join(", ");
 		terms.push(`${renderValue(target, mode, context)} IN (${choiceSql})`);
@@ -736,15 +787,7 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 function compileBeginsWith(value: ExpressionValue, prefix: ExpressionValue, context: CompileContext): string {
 	const [valueMode, prefixMode] = comparisonModes(value, prefix);
 	const terms: string[] = [];
-	if (!addTerm(terms, renderPresent(value, context))) {
-		return "(0)";
-	}
-	if (!addTerm(terms, renderPresent(prefix, context))) {
-		return "(0)";
-	}
-	const valueType = renderType(value, context);
-	const prefixType = renderType(prefix, context);
-	if (!pushTypeGuards(terms, valueType, prefixType, PREFIX_TYPE_NAMES)) {
+	if (!pushComparisonGuards(terms, value, prefix, PREFIX_TYPE_NAMES, context)) {
 		return "(0)";
 	}
 	const valueSql = renderValue(value, valueMode, context);

@@ -22,7 +22,7 @@ const STATE: readonly ProjectionExpression[] = [{ expr: { ref: "data", path: "$.
  */
 const ABOVE_SQL_LIMIT: ConditionExpression = {
 	op: "or",
-	args: Array.from({ length: 200 }, () => ({ op: "eq", args: [{ ref: "data", path: "$.state" }, { val: "open" }] })),
+	args: Array.from({ length: 200 }, () => ({ op: "contains", args: [{ ref: "data", path: "$.state" }, { val: "open" }] })),
 };
 
 const sqlLimitError = fokosErrorWith("expression_invalid", { expressionCode: "sql_limit" });
@@ -202,4 +202,34 @@ describe("PartitionDO — an expression with a term that the compiler drops afte
 			expect(result.items).toEqual(passes ? [["x"]] : []);
 		},
 	);
+});
+
+describe("PartitionDO — a comparison of a data path with a literal", () => {
+	// The guard of the comparison is 0, never NULL, for an item that is absent, that is not JSON, that
+	// does not have the path, or that has a different type at the path. Thus `not` gives true for each.
+	const IS_X: ConditionExpression = { op: "eq", args: [{ ref: "data", path: "$.s" }, { val: "x" }] };
+	const bytes = { data: new Uint8Array([0x7b, 0x22, 0x73, 0x22]), kind: "bytes" as const };
+	const ITEMS = [
+		{ name: "an absent item", item: undefined, matches: false },
+		{ name: "a bytes item", item: bytes, matches: false },
+		{ name: "a text item", item: { data: '{"s":"x"}', kind: "text" as const }, matches: false },
+		{ name: "a JSON item with no such path", item: json({ other: "x" }), matches: false },
+		{ name: "a JSON item with a number at the path", item: json({ s: 1 }), matches: false },
+		{ name: "a JSON item with null at the path", item: json({ s: null }), matches: false },
+		{ name: "a JSON item with a different text at the path", item: json({ s: "y" }), matches: false },
+		{ name: "a JSON item with the text at the path", item: json({ s: "x" }), matches: true },
+	];
+
+	it.each(ITEMS)("passes or fails, and its `not` gives the opposite result, for $name", async ({ item, matches }) => {
+		const { ctx, rpc } = makeStub();
+		const key = { hashKey: kb("hk"), sortKey: kb("sk") };
+		if (item !== undefined) {
+			await rpc.apiPutItem(ctx, { ...key, ...item });
+		}
+		const ok = { outcome: "ok" };
+		const rejected = { outcome: "rejected", reason: { code: "condition_failed" } };
+		const put = (condition: ConditionExpression) => rpc.apiPutItem(ctx, { ...key, ...(item ?? json({ s: "x" })), condition });
+		expect(await put(IS_X)).toMatchObject(matches ? ok : rejected);
+		expect(await put({ op: "not", args: [IS_X] })).toMatchObject(matches ? rejected : ok);
+	});
 });

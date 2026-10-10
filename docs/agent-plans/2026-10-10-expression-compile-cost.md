@@ -4,7 +4,7 @@
 **Date:** 2026-10-10
 **Author:** Lambros
 **Status:** The benchmark suite of section 4.2.1 is built. The plan has no canonical identity and the partition
-has no second plan check (commit `a31c0e8`). Step A is built. Step B and step C are not built.
+has no second plan check (commit `a31c0e8`). Step A and step B are built. Step C is not built.
 
 ---
 
@@ -941,6 +941,64 @@ The plan comparison of section 4.2.8, step A against the compiler of commit `9c7
 compile give equal plans, of which 1,401 renumber, and 37,409 expressions that do not compile give equal
 errors. The set has random conditions, updates, projections and queries, the fixtures of `test-fixtures.ts`,
 the 19 benchmark cases, and statements above 33,334 characters.
+
+**After step B.** The working tree on commit `d335baf`, with step B. Each "before" column is the compiler of
+that commit, which has step A. The workerd run measured the two compilers one after the other, on one
+machine. The binding count of each case does not change.
+
+| Case | SQL B before | Step B | Change | Heap KiB before | Step B | Change | Path µs before | Step B | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 330 | 330 | 0% | 2.7 | 2.7 | 0% | 1.4 | 1.7 | +21% |
+| cond: optimistic lock | 461 | 461 | 0% | 5.0 | 5.0 | 0% | 2.8 | 2.9 | +4% |
+| cond: one path eq | 845 | 504 | -40% | 6.7 | 4.9 | -27% | 3.7 | 3.6 | -3% |
+| cond: contains on an array path | 1,676 | 1,676 | 0% | 7.9 | 8.0 | +1% | 4.5 | 4.4 | -2% |
+| cond: four terms | 2,066 | 1,055 | -49% | 14.6 | 9.4 | -36% | 8.0 | 8.2 | +2% |
+| cond: nested access policy | 3,067 | 2,385 | -22% | 20.9 | 17.1 | -18% | 9.1 | 9.3 | +2% |
+| cond: 40 distinct path eq | 22,208 | 8,532 | -62% | 153.7 | 81.5 | -47% | 82.0 | 54.2 | -34% |
+| cond: 80 eq on one path | 43,818 | 16,538 | -62% | 341.2 | 142.3 | -58% | 160.2 | 98.6 | -38% |
+| upd: set 1 literal | 958 | 958 | 0% | 6.3 | 6.3 | 0% | 3.7 | 3.5 | -5% |
+| upd: remove 1 path | 831 | 831 | 0% | 5.6 | 5.6 | 0% | 2.6 | 2.8 | +8% |
+| upd: counter and timestamp | 3,753 | 3,753 | 0% | 14.4 | 14.4 | 0% | 7.9 | 8.2 | +4% |
+| upd: 20 actions with arithmetic | 56,071 | 56,071 | 0% | 176.0 | 176.0 | 0% | 112.3 | 114.3 | +2% |
+| upd: 32 literal sets | 6,804 | 6,804 | 0% | 59.9 | 59.9 | 0% | 60.5 | 61.5 | +2% |
+| proj: 1 path | 718 | 561 | -22% | 7.7 | 6.8 | -12% | 3.9 | 4.1 | +5% |
+| proj: 3 paths and v | 2,109 | 1,583 | -25% | 16.0 | 13.0 | -19% | 7.5 | 6.2 | -17% |
+| proj: 48 paths | 30,471 | 22,897 | -25% | 195.8 | 153.7 | -22% | 90.3 | 64.5 | -29% |
+| query: one path eq filter | 1,342 | 979 | -27% | 11.0 | 9.4 | -15% | 5.3 | 5.5 | +4% |
+| query: four-term filter and 5 projections | 5,260 | 3,500 | -33% | 39.1 | 29.6 | -24% | 15.5 | 13.8 | -11% |
+| query: 40-term filter and 48 projections | 58,796 | 36,629 | -38% | 511.5 | 307.4 | -40% | 174.8 | 144.5 | -17% |
+
+| Case | SQLite first before | Step B | Change | SQLite again before | Step B | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 16.8 | 16.7 | -1% | 4.4 | 4.4 | 0% |
+| cond: optimistic lock | 21.9 | 21.7 | -1% | 4.4 | 4.2 | -5% |
+| cond: one path eq | 32.5 | 23.9 | -26% | 5.3 | 5.0 | -6% |
+| cond: contains on an array path | 70.8 | 56.6 | -20% | 7.1 | 6.2 | -13% |
+| cond: four terms | 71.3 | 43.7 | -39% | 9.0 | 7.5 | -17% |
+| cond: nested access policy | 94.7 | 77.1 | -19% | 7.3 | 6.6 | -10% |
+| cond: 40 distinct path eq | 1,418 | 289.1 | -80% | 70.8 | 52.2 | -26% |
+| cond: 80 eq on one path | 3,336 | 1,195 | -64% | 74.7 | 52.7 | -29% |
+| upd: set 1 literal | 42.7 | 42.7 | 0% | 6.7 | 6.8 | +1% |
+| upd: remove 1 path | 37.6 | 38.1 | +1% | 6.5 | 6.8 | +5% |
+| upd: counter and timestamp | 130.9 | 137.7 | +5% | 12.1 | 12.7 | +5% |
+| upd: 20 actions with arithmetic | 2,328 | 2,594 | +11% | 135.7 | 137.7 | +1% |
+| upd: 32 literal sets | 390.6 | 375.0 | -4% | 89.4 | 93.8 | +5% |
+| proj: 1 path | 28.8 | 24.9 | -14% | 5.2 | 4.9 | -6% |
+| proj: 3 paths and v | 67.4 | 53.7 | -20% | 8.5 | 8.0 | -6% |
+| proj: 48 paths | 1,359 | 1,551 | +14% | 98.6 | 93.3 | -5% |
+| query: one path eq filter | 921.9 | 898.4 | -3% | 851.6 | 765.6 | -10% |
+| query: four-term filter and 5 projections | 1,297 | 1,109 | -14% | 1,117 | 953.1 | -15% |
+| query: 40-term filter and 48 projections | 26,250 | 20,750 | -21% | 25,375 | 19,000 | -25% |
+
+The update cases get no shorter SQL, and `cond: contains on an array path` keeps its SQL. Their differences
+are noise, also the +14% of `proj: 48 paths` in the "SQLite first" column, which is against its shorter SQL.
+
+The result comparison of section 4.2.8, step B against the compiler of commit `d335baf`, on SQLite 3.53.4
+(`node:sqlite`): 12,121 expressions that compile, of which 3,497 get shorter SQL, run on 31 items and on an
+absent item. All 298,408 results are equal. The items are bytes, text, and JSON with each value type at each
+path. The set has random conditions, projections, queries and update probes, each comparison operator with
+each literal on each side, and the 19 benchmark cases on the benchmark items. A defect made on purpose
+(`number` tested as `'integer'` only) gave 332 different results in a run of 78,881.
 
 ### 8.2 How the step tables were measured
 

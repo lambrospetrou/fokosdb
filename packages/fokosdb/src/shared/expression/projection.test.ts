@@ -194,6 +194,17 @@ describe("projection compiler", () => {
 		assertRoundTrips(plan);
 	});
 
+	it("gives the type of a reference with no presence test, and keeps the test for a function", () => {
+		const path = { ref: "data", path: "$.a" } as const;
+		const plan = compileProjectionExpression([entry(path), entry({ fn: "if_not_exists", args: [path, { val: 0 }] }, "f")]);
+		// The type of an absent reference is already 'missing', so its fragment reads the path one time.
+		expect(plan.typeSql[0].split("json_type(").length - 1).toBe(1);
+		expect(plan.typeSql[0].startsWith("CASE WHEN (i.hk IS NOT NULL AND i.data_kind = 2) THEN CASE json_type(")).toBe(true);
+		for (const ref of ["hashKey", "sortKey", "v", "ttlAt", "data"] as const) {
+			expect(compileProjectionExpression([entry({ ref })]).typeSql[0]).toContain("ELSE 'missing' END");
+		}
+	});
+
 	it("a projection with no descriptor binds the empty pool", () => {
 		const plan = compileProjectionExpression([{ expr: { ref: "hashKey" } }]);
 		expect(plan.bindingCount).toBe(0);

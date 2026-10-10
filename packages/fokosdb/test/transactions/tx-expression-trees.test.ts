@@ -23,7 +23,7 @@ import {
 /** A condition that is valid and that compiles to more SQL than `compiledSqlBytes`. */
 const ABOVE_SQL_LIMIT: ConditionExpression = {
 	op: "or",
-	args: Array.from({ length: 200 }, () => ({ op: "eq", args: [{ ref: "data", path: "$.state" }, { val: "open" }] })),
+	args: Array.from({ length: 200 }, () => ({ op: "contains", args: [{ ref: "data", path: "$.state" }, { val: "open" }] })),
 };
 
 /** Sends `items` to the one root coordinator of a `controlled` table, as `db.ts` does. */
