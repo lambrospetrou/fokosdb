@@ -2,7 +2,6 @@ import { type KeyBytes } from "../../sharding/key-codec.js";
 import { materializedPlanBindings } from "./bindings.js";
 import { ExpressionError } from "./errors.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "./projection.js";
-import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
 import { tryOne } from "../sql-cursor.js";
 import {
 	composeConditionStatement,
@@ -110,32 +109,12 @@ export function readProjectedItem(
 	}
 }
 
-export function composeUpdateProbeStatement(plan: CompiledUpdatePlan): string {
-	// ?1 and ?2 are the keys, as they are in every statement that runs an update plan.
-	const hkParam = "?1";
-	const skParam = "?2";
-	// value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
-	// bytes for this item instead of only that the update did not apply. It runs over a JSON pre-image
-	// only: the fragment can read a JSON path, and json_type over a text or bytes row raises. An absent
-	// row has a JSON pre-image, because an update creates the item.
-	return `WITH requested(requested_hk, requested_sk) AS (VALUES (${hkParam}, ${skParam}))
-SELECT i.hk IS NOT NULL AS item_present,
-       (${plan.applicableSql}) AS applicable,
-       CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
-       CASE WHEN (${plan.applicableSql}) = 1 THEN (${estRowBytesExpr(plan.documentSql, hkParam, skParam)}) ELSE NULL END AS new_size,
-       i.last_read_ts,
-       i.last_write_ts
-FROM requested
-LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
-}
-
 export function probeUpdatePlan(
 	storage: DurableObjectStorage,
 	plan: CompiledUpdatePlan,
 	hashKey: KeyBytes,
 	sortKey: KeyBytes,
 ): UpdateProbeResult {
-	const statement = composeUpdateProbeStatement(plan);
 	try {
 		const cursor = storage.sql.exec<{
 			item_present: number;
@@ -144,7 +123,7 @@ export function probeUpdatePlan(
 			new_size: number | null;
 			last_read_ts: number | null;
 			last_write_ts: number | null;
-		}>(statement, hashKey, sortKey, ...materializedPlanBindings(plan));
+		}>(plan.probeSql, hashKey, sortKey, ...materializedPlanBindings(plan));
 		const row = cursor.one();
 		return {
 			itemPresent: row.item_present === 1,

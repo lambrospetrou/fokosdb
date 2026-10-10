@@ -5,7 +5,9 @@ import invariant from "../invariant.js";
 import { exists, one, tryOne } from "../sql-cursor.js";
 import {
 	composeQueryStatement,
+	composeUpdateWriteStatement,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
+	UPDATE_STORED_TTL_SQL,
 	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
 } from "../expression/plan.js";
@@ -1659,39 +1661,16 @@ export class PartitionStore {
 		// item this statement creates. The size guard is then the only cause of a statement that writes
 		// no row, which is what lets it report that one cause.
 		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
-		const docExpr = plan.documentSql;
-		const hkParam = "?1";
-		const skParam = "?2";
 		const tail = new StatementTail(plan);
 		const txOrderTsParam = tail.param(opts.txOrderTs);
-		// The TTL of the pre-image survives unless the operation sets one: the insert then carries the
-		// joined row's TTL, which is NULL for an item this statement creates, and the conflict branch
-		// assigns that same value back. WHICH branch applies is known here, so the statement carries the
-		// branch it needs instead of testing a flag at run time. The value still binds.
-		const ttlExpr = opts.ttlAt === undefined ? "i.ttl_epoch_utc_seconds" : tail.param(opts.ttlAt);
+		// WHICH TTL branch applies is known here, so the statement carries the branch it needs instead
+		// of testing a flag at run time. The value still binds.
+		const ttlSql = opts.ttlAt === undefined ? UPDATE_STORED_TTL_SQL : tail.param(opts.ttlAt);
 		const limitParam = tail.param(MAX_ITEM_BYTES);
 
-		// The source is a LEFT JOIN over items, so the document expression reads the stored row when
-		// there is one and the empty pre-image when there is not, and one statement covers both. The
-		// WHERE clause holds the size guard: when it removes the source row, neither branch runs and the
-		// statement returns nothing. The one deletion_metadata row gives the start values of a new row,
-		// with the same rules and the same reason as upsertItem.
+		// The start values of a new row follow the same rules, for the same reason, as upsertItem.
 		const writeRes = this.#storage.sql.exec<{ v: number; est_row_bytes: number }>(
-			`INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
-			 SELECT ${hkParam}, ${skParam}, ${JSON_KIND_CODE}, ${ttlExpr}, d.max_deleted_v + 1,
-			        MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
-			        ${estRowBytesExpr(docExpr, hkParam, skParam)}, ${docExpr}
-			   FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hk = ${hkParam} AND i.sk = ${skParam}
-			  WHERE d.id = 1 AND ${estRowBytesExpr(docExpr, hkParam, skParam)} <= ${limitParam}
-			 ON CONFLICT(hk, sk) DO UPDATE SET
-			   data = excluded.data,
-			   data_kind = excluded.data_kind,
-			   ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
-			   est_row_bytes = excluded.est_row_bytes,
-			   v = v + 1,
-			   last_read_ts = MAX(last_read_ts, ${txOrderTsParam}),
-			   last_write_ts = MAX(last_write_ts, ${txOrderTsParam})
-			 RETURNING v, est_row_bytes`,
+			composeUpdateWriteStatement(plan, { txOrderTsParam, ttlSql, limitParam }),
 			...tail.bindings(opts.hk, opts.sk),
 		);
 		const rows = writeRes.toArray();

@@ -1,6 +1,6 @@
 import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import type { JsonPrimitive } from "../json-types.js";
-import { JSON_KIND_CODE } from "../partition/item-size.js";
+import { estRowBytesExpr, JSON_KIND_CODE } from "../partition/item-size.js";
 import type { QuerySelect } from "../types.js";
 import type { ExpressionRequiredColumn } from "./semantic.js";
 
@@ -53,6 +53,68 @@ SELECT i.hk IS NOT NULL AS item_present,
        i.last_write_ts
 FROM requested
 LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
+}
+
+/**
+ * The statement that reads what an update plan gives for one item, and writes nothing.
+ *
+ * ?1 and ?2 are the keys, as they are in every statement that runs an update plan.
+ *
+ * value_type_ok names ONE cause of an inapplicable update, so a caller learns that its value was
+ * bytes for this item instead of only that the update did not apply. It runs over a JSON pre-image
+ * only: the fragment can read a JSON path, and json_type over a text or bytes row raises. An absent
+ * row has a JSON pre-image, because an update creates the item.
+ */
+export function composeUpdateProbeStatement(plan: Pick<CompiledUpdatePlan, "documentSql" | "applicableSql" | "valueTypeSql">): string {
+	return `WITH requested(requested_hk, requested_sk) AS (VALUES (?1, ?2))
+SELECT i.hk IS NOT NULL AS item_present,
+       (${plan.applicableSql}) AS applicable,
+       CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
+       CASE WHEN (${plan.applicableSql}) = 1 THEN (${estRowBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
+       i.last_read_ts,
+       i.last_write_ts
+FROM requested
+LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
+}
+
+/** The TTL of the stored row. The `ttlSql` of an update write that sets no TTL. */
+export const UPDATE_STORED_TTL_SQL = "i.ttl_epoch_utc_seconds";
+
+/**
+ * The statement that applies an update plan to one item, and creates the item when it is absent.
+ *
+ * ?1 and ?2 are the keys. `txOrderTsParam` and `limitParam` are parameters of the statement tail.
+ * `ttlSql` is a tail parameter for an operation that sets a TTL, and UPDATE_STORED_TTL_SQL for one
+ * that does not: the TTL of the pre-image then survives. The insert carries the TTL of the joined
+ * row, which is NULL for an item that this statement creates, and the conflict branch assigns that
+ * same value back.
+ *
+ * The source is a LEFT JOIN over items, so the document expression reads the stored row when there is
+ * one and the empty pre-image when there is not, and one statement covers both. The WHERE clause
+ * holds the size guard: when it removes the source row, neither branch runs and the statement returns
+ * nothing. The one deletion_metadata row gives the start values of a new row.
+ */
+export function composeUpdateWriteStatement(
+	plan: Pick<CompiledUpdatePlan, "documentSql">,
+	tail: { txOrderTsParam: string; ttlSql: string; limitParam: string },
+): string {
+	const { txOrderTsParam, ttlSql, limitParam } = tail;
+	const estRowBytes = estRowBytesExpr(plan.documentSql, "?1", "?2");
+	return `INSERT INTO items (hk, sk, data_kind, ttl_epoch_utc_seconds, v, last_read_ts, last_write_ts, est_row_bytes, data)
+SELECT ?1, ?2, ${JSON_KIND_CODE}, ${ttlSql}, d.max_deleted_v + 1,
+       MAX(${txOrderTsParam}, d.max_delete_tx_order_ts), MAX(${txOrderTsParam}, d.max_delete_tx_order_ts),
+       ${estRowBytes}, ${plan.documentSql}
+  FROM deletion_metadata AS d LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2
+ WHERE d.id = 1 AND ${estRowBytes} <= ${limitParam}
+ON CONFLICT(hk, sk) DO UPDATE SET
+  data = excluded.data,
+  data_kind = excluded.data_kind,
+  ttl_epoch_utc_seconds = excluded.ttl_epoch_utc_seconds,
+  est_row_bytes = excluded.est_row_bytes,
+  v = v + 1,
+  last_read_ts = MAX(last_read_ts, ${txOrderTsParam}),
+  last_write_ts = MAX(last_write_ts, ${txOrderTsParam})
+RETURNING v, est_row_bytes`;
 }
 
 export function composeProjectionStatement(plan: Pick<CompiledProjectionPlan, "valueSql" | "typeSql">): string {
@@ -186,6 +248,12 @@ export type CompiledUpdatePlan = {
 	 * which a single applicability bit cannot do. `1` when no value needs the test.
 	 */
 	valueTypeSql: string;
+	/**
+	 * The statement of `composeUpdateProbeStatement` for this plan. The compile composes it to count
+	 * its bytes, and the count makes its text flat. The probe runs this same text, so that SQLite gets
+	 * it with no second copy.
+	 */
+	probeSql: string;
 	/** Descriptors for expression values bound to SQL statement parameters. */
 	bindings: readonly ExpressionBindingDescriptor[];
 	/** Number of parameter bindings in this plan. */

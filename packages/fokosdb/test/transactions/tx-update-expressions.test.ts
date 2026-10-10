@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/types.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
+import { compileUpdateExpression } from "../../src/shared/expression/compiler.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import { UPDATE_FIXED_BINDING_COUNT, UPDATE_MAX_TRAILING_BINDING_COUNT } from "../../src/shared/expression/plan.js";
 import { keysAcrossPartitions, makeDB, writeOutcome, writeOutcomeWithClockRetry } from "./tx-helpers.js";
@@ -42,6 +43,60 @@ describe("transactions - an update plan at the binding limit", () => {
 		expect(Object.keys(got.item.data as Record<string, unknown>)).toHaveLength(EXPRESSION_LIMITS.updateActions);
 		expect(got.item.ttlAt).toBe(ttlAt);
 	});
+});
+
+/**
+ * A statement holds a fragment of the plan more than one time, so the SQL limit belongs to the
+ * statements that run the plan. The compiler measures them, and SQLite never gets a statement that is
+ * too long.
+ */
+describe("transactions - an update plan at the SQL limit", () => {
+	// Each action is `$.cI = if_not_exists($.cI, 0) + 1`, and the first `deeper` actions add 1 a second
+	// time. One more addition makes the statements about 800 bytes longer.
+	const counters = (deeper: number): UpdateExpression =>
+		Array.from({ length: EXPRESSION_LIMITS.updateActions }, (_, i) => {
+			const path = { ref: "data" as const, path: `$.c${i}` };
+			const once = { fn: "+", args: [{ fn: "if_not_exists", args: [path, { val: 0 }] }, { val: 1 }] };
+			return { action: "set" as const, target: path, value: i < deeper ? { fn: "+", args: [once, { val: 1 }] } : once };
+		});
+	const compiles = (update: UpdateExpression): boolean => {
+		try {
+			compileUpdateExpression(update);
+			return true;
+		} catch (error) {
+			expect(error).toMatchObject({ code: "sql_limit" });
+			return false;
+		}
+	};
+	// The largest update of this shape that the compiler accepts.
+	let largest = 0;
+	while (compiles(counters(largest + 1))) {
+		largest++;
+	}
+
+	it.each([true, false])(
+		"runs the largest update, and refuses the next one (singlePartitionFastPath=%s)",
+		async (singlePartitionFastPath) => {
+			expect(largest).toBeGreaterThan(0);
+			expect(largest).toBeLessThan(EXPRESSION_LIMITS.updateActions);
+			const db = makeDB({ singlePartitionFastPath });
+			const key = { hashKey: `sql-limit-${crypto.randomUUID()}` };
+			await db.putItem({ ...key, data: { c0: 5 } });
+
+			const res = await writeOutcomeWithClockRetry(db, { items: [{ ...key, operation: "update", update: counters(largest) }] });
+			expect(res).toMatchObject({ outcome: "committed" });
+			const got = await db.getItem(key);
+			invariant(got.found, "expected the updated item");
+			expect(got.item.data).toMatchObject({ c0: 7, [`c${largest}`]: 1, [`c${EXPRESSION_LIMITS.updateActions - 1}`]: 1 });
+
+			const refused = await writeOutcome(
+				db.transactWriteItems({ items: [{ ...key, operation: "update", update: counters(largest + 1) }] }),
+			).catch((error: unknown) => error);
+			// The compile of the partition refuses the update, and the transaction writes nothing.
+			expect(refused).toMatchObject({ outcome: "cancelled", results: [{ outcome: "rejected", reason: { code: "expression_invalid" } }] });
+			expect((await db.getItem(key)).item).toMatchObject({ version: 2 });
+		},
+	);
 });
 
 /**

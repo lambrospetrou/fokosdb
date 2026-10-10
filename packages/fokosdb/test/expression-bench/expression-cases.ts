@@ -15,7 +15,6 @@ import {
 } from "../../src/shared/expression/compiler.js";
 import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity } from "../../src/shared/expression/identity.js";
 import { composeConditionStatement, composeProjectionStatement, composeQueryStatement } from "../../src/shared/expression/plan.js";
-import { composeUpdateProbeStatement } from "../../src/shared/expression/runtime.js";
 import {
 	validateConditionExpression,
 	validateProjectionExpression,
@@ -254,8 +253,7 @@ export function prepareCase(c: ExpressionCase, sortKey: Uint8Array = benchSortKe
 		}
 		case "update": {
 			const plan = compileUpdateExpression(c.tree);
-			const sql = composeUpdateProbeStatement(plan);
-			return { sql, params: [BENCH_HASH_KEY, sortKey, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
+			return { sql: plan.probeSql, params: [BENCH_HASH_KEY, sortKey, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
 		}
 		case "projection": {
 			const plan = compileProjectionExpression(c.tree);

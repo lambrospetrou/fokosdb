@@ -2,6 +2,7 @@ import type { ExpressionNativeType, ExpressionValue } from "./types.js";
 import { EXPRESSION_NATIVE_TYPES } from "./types.js";
 import { ExpressionError } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
+import { joinBalanced } from "./sql-join.js";
 import { SQLITE_FUNCTION_ARITY, SQLITE_MATH_FUNCTIONS, SQLITE_SCALAR_FUNCTIONS } from "./sqlite-functions.js";
 import { utf8WithinLimit } from "./utf8.js";
 
@@ -327,9 +328,19 @@ function nullOrType(arg: ExpressionValue, renderers: OperationRenderers): string
 // SQLite evaluates 1e999 as +Infinity. In SQLite, `abs(x) < 1e999` evaluates to 1 for finite
 // numbers, 0 for +/-Infinity, and NULL for NaN. This guard verifies both operands are numbers
 // and the arithmetic result is finite, because JSON cannot store NaN or Infinity.
+//
+// The presence test of an operand that is also arithmetic holds this same chain of five terms. The
+// balanced groups keep the SQL depth of nested arithmetic below the depth that SQLite permits.
 function renderArithmeticPresent(symbol: "+" | "-" | "*", args: readonly ExpressionValue[], renderers: OperationRenderers): string {
 	const op = `(${renderers.renderValue(args[0], "logical")} ${symbol} ${renderers.renderValue(args[1], "logical")})`;
-	return `(${renderers.renderPresent(args[0])} AND ${renderers.renderPresent(args[1])} AND ${renderers.renderType(args[0])} = 'number' AND ${renderers.renderType(args[1])} = 'number' AND abs(${op}) < 1e999)`;
+	const terms = [
+		renderers.renderPresent(args[0]),
+		renderers.renderPresent(args[1]),
+		`${renderers.renderType(args[0])} = 'number'`,
+		`${renderers.renderType(args[1])} = 'number'`,
+		`abs(${op}) < 1e999`,
+	];
+	return `(${joinBalanced(terms, " AND ")})`;
 }
 
 const FOKOS_OPERATIONS: readonly OperationDefinition[] = [

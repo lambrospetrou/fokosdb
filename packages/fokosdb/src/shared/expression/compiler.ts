@@ -44,6 +44,8 @@ import {
 	composeConditionStatement,
 	composeProjectionStatement,
 	composeQueryStatement,
+	composeUpdateProbeStatement,
+	composeUpdateWriteStatement,
 	CONDITION_FIXED_BINDING_COUNT,
 	CONDITION_PLAN_VERSION,
 	POOL_PARAM,
@@ -55,6 +57,7 @@ import {
 	UPDATE_FIXED_BINDING_COUNT,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
 	UPDATE_PLAN_VERSION,
+	UPDATE_STORED_TTL_SQL,
 	type CompiledConditionPlan,
 	type CompiledProjectionPlan,
 	type CompiledQueryPlan,
@@ -68,6 +71,7 @@ import {
 	validateProjectionExpression,
 	validateUpdateExpression,
 } from "./semantic.js";
+import { joinBalanced } from "./sql-join.js";
 import { DATA_KINDS } from "../types.js";
 import type {
 	ConditionExpression,
@@ -218,28 +222,33 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	// not the same rejection: a value that is bytes for this item names a cause the caller can fix,
 	// while everything else applicableSql tests is "the update does not apply". The probe reads the
 	// fragment separately to tell them apart.
-	const rawValueTypeSql = valueTypeTerms.length === 0 ? "1" : valueTypeTerms.join(" AND ");
+	const rawValueTypeSql = valueTypeTerms.length === 0 ? "1" : joinBalanced(valueTypeTerms, " AND ");
 	if (valueTypeTerms.length > 0) {
 		applicableTerms.push(`(${rawValueTypeSql})`);
 	}
 
 	applicableTerms.push(`(json_type(${rawDocumentSql}) IN ('array', 'object'))`);
 
-	const rawApplicableSql = `(CASE WHEN ${applicableTerms.join(" AND ")} THEN 1 ELSE 0 END)`;
+	const rawApplicableSql = `(CASE WHEN ${joinBalanced(applicableTerms, " AND ")} THEN 1 ELSE 0 END)`;
 
 	const [documentSql, applicableSql, valueTypeSql] = compactPlanParameters([rawDocumentSql, rawApplicableSql, rawValueTypeSql], context);
 
-	if (
-		!utf8WithinLimit(documentSql, EXPRESSION_LIMITS.compiledSqlBytes) ||
-		!utf8WithinLimit(applicableSql, EXPRESSION_LIMITS.compiledSqlBytes)
-	) {
+	const completeBindingCount = UPDATE_FIXED_BINDING_COUNT + context.bindings.length;
+	// The SQL limit belongs to each statement that runs this plan, and a statement holds a fragment
+	// more than one time. The probe and the write are the two longest. The write is longest when it
+	// keeps the stored TTL, and the lock row statement holds `documentSql` one time only.
+	const widestWrite = composeUpdateWriteStatement(
+		{ documentSql },
+		{ txOrderTsParam: `?${completeBindingCount + 1}`, ttlSql: UPDATE_STORED_TTL_SQL, limitParam: `?${completeBindingCount + 2}` },
+	);
+	const probeSql = composeUpdateProbeStatement({ documentSql, applicableSql, valueTypeSql });
+	if (!utf8WithinLimit(probeSql, EXPRESSION_LIMITS.compiledSqlBytes) || !utf8WithinLimit(widestWrite, EXPRESSION_LIMITS.compiledSqlBytes)) {
 		throw new ExpressionError("sql_limit", "compiled SQL exceeds the SQL limit");
 	}
 	// The budget belongs to the WIDEST statement that runs this plan, not to the plan alone. Workers
 	// SQLite caps one query at completeStatementBindings parameters, and every such statement binds the
 	// keys before the plan and its own tail after it. Charging both here rejects an over-budget update
 	// with a limit error, before a statement of the partition fails on it.
-	const completeBindingCount = UPDATE_FIXED_BINDING_COUNT + context.bindings.length;
 	if (completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > EXPRESSION_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");
 	}
@@ -250,6 +259,7 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 		documentSql,
 		applicableSql,
 		valueTypeSql,
+		probeSql,
 		bindings: context.bindings,
 		bindingCount: context.bindings.length,
 		completeBindingCount,
@@ -603,8 +613,9 @@ function compileCondition(condition: ConditionExpression, context: CompileContex
 			if (condition.args.length === 0) {
 				return condition.op === "and" ? "(1)" : "(0)";
 			}
-			const operator = condition.op === "and" ? " AND " : " OR ";
-			return `(${condition.args.map((arg) => compileCondition(arg, context)).join(operator)})`;
+			// A chain can have hundreds of terms, so it is joined as balanced groups.
+			const terms = condition.args.map((arg) => compileCondition(arg, context));
+			return `(${joinBalanced(terms, condition.op === "and" ? " AND " : " OR ")})`;
 		}
 		case "not":
 			return `(NOT ${compileCondition(condition.args[0], context)})`;
@@ -781,7 +792,8 @@ function compileIn(args: readonly ExpressionValue[], context: CompileContext): s
 		terms.push(`${renderValue(target, mode, context)} IN (${choiceSql})`);
 		return `(${terms.join(" AND ")})`;
 	}
-	return `(${choices.map((choice) => compileComparison("eq", target, choice, context)).join(" OR ")})`;
+	const comparisons = choices.map((choice) => compileComparison("eq", target, choice, context));
+	return `(${joinBalanced(comparisons, " OR ")})`;
 }
 
 function compileBeginsWith(value: ExpressionValue, prefix: ExpressionValue, context: CompileContext): string {

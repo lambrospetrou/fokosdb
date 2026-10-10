@@ -4,7 +4,7 @@
 **Date:** 2026-10-10
 **Author:** Lambros
 **Status:** The benchmark suite of section 4.2.1 is built. The plan has no canonical identity and the partition
-has no second plan check (commit `a31c0e8`). Step A and step B are built. Step C is not built.
+has no second plan check (commit `a31c0e8`). Step A, step B and step C are built.
 
 ---
 
@@ -190,8 +190,8 @@ column is a `PartitionDO` in workerd. Appendix 8.2 has the method.
 section 4.2 compares a prototype with the compiler before commit `a31c0e8`. The partition path of both sides
 included the canonical identity and the second plan check, which are gone. Appendix 8.1 has the baseline of
 today: its heap count is 5% to 28% lower than the "before" column, and its time is equal inside the noise. The
-prototypes do not have the size check of section 4.2.3. `TODO: measure` each step again on the compiler of
-today before it merges (section 4.2.8).
+prototypes do not have the size check of section 4.2.3. Appendix 8.1 has the measurement of each step as
+built, against the compiler of the commit before the step.
 
 | Case | Heap KiB before | A | A+B | Change | Path µs before | A | A+B | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -568,8 +568,9 @@ the terms does not change, so SQLite evaluates them from left to right as it doe
 
 **Evidence.** In a `PartitionDO`, the predicate of an `or` of 299 `eq` terms on `v`, joined as balanced groups,
 runs. The flat form fails at 94 terms. For 94 terms, the statement is 12,712 characters flat and 12,896
-characters as balanced groups (+1.4%). `TODO: measure` the nested arithmetic after the change of
-`renderArithmeticPresent`: the two levels for each operation are a calculation.
+characters as balanced groups (+1.4%). Measured with step C as built: `+`, `-` and `*`, each nested to the
+depth limit in each operand, run in a condition, in a projection, and in an update. Appendix 8.1 has the full
+result.
 
 **The rule for completion.** Step C is complete when each of these expressions runs in a `PartitionDO`:
 
@@ -608,15 +609,26 @@ entry points do:
   form".
 - The two checks of one fragment alone go away. The lock row statement is always shorter than the write
   statement.
-- The check measures the text of the probe that runs, and the widest form of the write. The widest form is a
-  few characters longer than a write with no TTL value. Apart from those characters, the check refuses no
-  statement that SQLite accepts today.
+- The check measures the text of the probe that runs, and the widest form of the write. The widest form is
+  the write that sets no TTL value: it holds the column `i.ttl_epoch_utc_seconds` in the place of a
+  parameter, so it is 20 characters longer than a write that sets one. Apart from those characters, the check
+  refuses no statement that SQLite accepts.
 
-The cost: the compile composes two statements more. With the size check of section 4.2.3, a check allocates no
-copy of the text. `updatePlanOf` keeps the plan for the request, so the check runs one time for each update.
-`TODO: measure` the update cases after the change.
+The cost: the compile composes two statements more. `updatePlanOf` keeps the plan for the request, so the
+check runs one time for each update.
 
-Part 1 makes the update statements longer by two characters for each group. Thus part 1 and part 2 ship
+**The plan keeps the probe statement.** The byte count of a statement above 33,334 characters reads the text
+to its end, and V8 then makes one flat copy of the text. `sql.exec` makes the same copy of each statement that
+it runs. A statement that the compile composes, and the runtime composes again, thus gets two copies. For
+`upd: 20 actions with arithmetic` one copy is 64 KiB or more. Thus the update plan has the field `probeSql`:
+the compile composes the probe statement one time, and `probeUpdatePlan` runs that text. Measured (appendix
+8.1): the partition path of that case allocates 255.6 KiB before step C and 255.6 KiB after it. 
+`upd: counter and timestamp` allocates 0.3 KiB more and `upd: 32 literal sets` 2.1 KiB more, for the write
+statement of the size check.
+
+Part 1 makes the update statements longer by two characters for each group. Thus an update that runs before
+step C, with a probe statement in the last 1% below the SQL limit, gets `sql_limit` after it. In the result
+comparison, one update with a probe statement of 99,426 bytes is such a case. Thus part 1 and part 2 ship
 together, and the size check of part 2 measures the text of part 1.
 
 #### 4.2.6 Extensibility
@@ -999,6 +1011,100 @@ absent item. All 298,408 results are equal. The items are bytes, text, and JSON 
 path. The set has random conditions, projections, queries and update probes, each comparison operator with
 each literal on each side, and the 19 benchmark cases on the benchmark items. A defect made on purpose
 (`number` tested as `'integer'` only) gave 332 different results in a run of 78,881.
+
+**After step C.** The working tree on commit `65e7ed2`, with step C. Each "before" column is the compiler of
+that commit, which has step A and step B. The three time columns are step C in workerd, and they are the
+baseline of the compiler as built.
+
+| Case | SQL B before | Step C | Heap KiB before | Step C | Change | Path µs | SQLite first | SQLite again |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 330 | 330 | 2.7 | 2.7 | 0% | 1.5 | 17.5 | 4.5 |
+| cond: optimistic lock | 461 | 461 | 5.0 | 5.0 | 0% | 3.2 | 22.5 | 4.5 |
+| cond: one path eq | 504 | 504 | 4.9 | 4.9 | 0% | 3.5 | 24.9 | 5.3 |
+| cond: contains on an array path | 1,676 | 1,676 | 8.0 | 8.0 | 0% | 4.9 | 59.6 | 6.4 |
+| cond: four terms | 1,055 | 1,059 | 9.4 | 8.9 | -5% | 8.2 | 45.2 | 8.1 |
+| cond: nested access policy | 2,385 | 2,387 | 17.1 | 15.1 | -12% | 8.6 | 80.6 | 6.9 |
+| cond: 40 distinct path eq | 8,532 | 8,608 | 81.5 | 78.0 | -4% | 57.1 | 306.6 | 50.8 |
+| cond: 80 eq on one path | 16,538 | 16,694 | 142.3 | 135.6 | -5% | 99.6 | 1,293 | 52.2 |
+| upd: set 1 literal | 958 | 962 | 6.3 | 7.7 | +22% | 4.2 | 44.4 | 6.8 |
+| upd: remove 1 path | 831 | 831 | 5.6 | 7.0 | +25% | 3.1 | 39.8 | 7.1 |
+| upd: counter and timestamp | 3,753 | 3,777 | 14.4 | 15.4 | +7% | 8.4 | 146.5 | 12.9 |
+| upd: 20 actions with arithmetic | 56,071 | 56,471 | 176.0 | 255.6 | +45% | 125.0 | 2,297 | 140.6 |
+| upd: 32 literal sets | 6,804 | 6,932 | 59.9 | 62.6 | +5% | 64.9 | 398.4 | 100.6 |
+| proj: 1 path | 561 | 561 | 6.8 | 6.8 | 0% | 4.5 | 26.4 | 5.1 |
+| proj: 3 paths and v | 1,583 | 1,583 | 13.0 | 13.0 | 0% | 7.1 | 54.7 | 8.1 |
+| proj: 48 paths | 22,897 | 22,897 | 153.7 | 153.7 | 0% | 67.9 | 1,945 | 99.6 |
+| query: one path eq filter | 979 | 979 | 9.4 | 9.4 | 0% | 6.1 | 820.3 | 804.7 |
+| query: four-term filter and 5 projections | 3,500 | 3,504 | 29.6 | 28.8 | -3% | 13.2 | 1,172 | 1,023 |
+| query: 40-term filter and 48 projections | 36,629 | 36,705 | 307.4 | 302.9 | -1% | 152.3 | 20,375 | 20,375 |
+
+- **The statement size.** A chain of three terms or more gets two characters for each group. The largest
+  change is +0.9%, for `cond: 80 eq on one path` and `cond: 40 distinct path eq`.
+- **The partition path time of the update cases.** One run measured the two compilers one after the other, in
+  µs: 3.6 and 4.2, 2.7 and 3.1, 8.4 and 8.4, 114.3 and 125.0, 62.0 and 64.9. The differences of the other
+  cases in that run are inside the noise.
+- **The heap of the conditions and the queries** goes down by 1% to 12% where a chain has more than two
+  terms. The cause was not examined.
+
+The rule for completion of section 4.2.5, in a `PartitionDO`:
+
+- An `and` and an `or` of 299 terms run.
+- An `in` of 100 choices of two types, with 97 distinct choices, runs. One more distinct choice is above the
+  binding limit.
+- `not`, `and` and `or`, each nested to the depth limit, run.
+- Each of the 60 operations of `OPERATION_REGISTRY` that the validator accepts inside itself runs at its
+  deepest nesting that compiles, at each of its first three argument positions, in a condition, in a
+  projection, and in an update. That is 224 shapes. The nesting is 30 levels in a condition, and 31 in a
+  projection and in an update.
+- Two operations fail at that nesting, and not for the statement: `sqlite.hex` and `sqlite.quote` make their
+  value two times longer at each level. From 19 levels the item is above its size limit, and from 22 levels
+  the value is above the string size of SQLite (`string or blob too big`). These failures exist before step C.
+- An update of 32 `set` actions with nested arithmetic runs its probe and its write at the largest size that
+  the compile accepts, on the two write paths. The next larger update gets `sql_limit` from the compile.
+
+The result comparison of section 4.2.8, step C against the compiler of commit `65e7ed2`, on SQLite 3.53.4
+(`node:sqlite`): 10,040 expressions that compile, of which 3,206 get a longer statement, give 261,297 equal
+results. The set has chains of 3 to 93 terms, `in` with 2 to 61 choices of more than one type, and arithmetic
+nested to 18 levels in conditions, projections and updates of 1 to 32 actions. 110 updates compile before the
+step with a probe statement above 100,000 bytes, and get `sql_limit` after it. One update with a probe
+statement of 99,426 bytes also gets `sql_limit` after the step (section 4.2.5).
+
+**The Path column of the heap tables above is too low.** `expression-alloc.mjs` read the statement to its end
+with a call whose result it did not use, and the optimizing compiler of V8 removed the call. Thus the Path
+column of the baseline table and of the three step tables does not have the flat copy of the statement that
+`sql.exec` makes. The script now keeps the result. The Compile column is not affected, and the comparisons of
+one step with the step before it stay valid, with one exception: the "After step C" heap column of the update
+cases is from a compiler that did not keep `probeSql`.
+
+The baseline of the compiler as built, with the corrected script. Node v24.20.0, heap KiB for each call:
+
+| Case | Validate | Identity | Compile | Path | Kept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 0.5 | 0.3 | 1.6 | 2.8 | 0.7 |
+| cond: optimistic lock | 0.8 | 0.9 | 3.7 | 5.0 | 1.0 |
+| cond: one path eq | 0.6 | 0.5 | 3.4 | 4.9 | 1.0 |
+| cond: contains on an array path | 0.5 | 0.5 | 7.0 | 9.7 | 2.2 |
+| cond: four terms | 0.8 | 2.3 | 8.0 | 10.0 | 1.6 |
+| cond: nested access policy | 0.5 | 2.8 | 14.0 | 17.5 | 2.8 |
+| cond: 40 distinct path eq | 0.5 | 22.0 | 75.5 | 86.5 | 9.5 |
+| cond: 80 eq on one path | 0.4 | 43.9 | 132.5 | 153.6 | 17.4 |
+| upd: set 1 literal | 1.3 | 0.7 | 6.3 | 8.2 | 1.5 |
+| upd: remove 1 path | 1.3 | 0.6 | 5.6 | 7.3 | 1.4 |
+| upd: counter and timestamp | 3.1 | 2.0 | 14.4 | 18.6 | 4.3 |
+| upd: 20 actions with arithmetic | 21.9 | 25.9 | 255.6 | 255.6 | 55.9 |
+| upd: 32 literal sets | 10.9 | 20.6 | 57.1 | 69.0 | 7.8 |
+| proj: 1 path | 0.8 | 0.3 | 5.5 | 7.4 | 1.1 |
+| proj: 3 paths and v | 1.0 | 1.2 | 9.5 | 14.6 | 2.1 |
+| proj: 48 paths | 3.5 | 15.1 | 113.8 | 176.1 | 23.8 |
+| query: one path eq filter | 0.6 | 0.6 | 7.1 | 10.4 | 1.3 |
+| query: four-term filter and 5 projections | 1.3 | 3.9 | 23.3 | 32.3 | 3.9 |
+| query: 40-term filter and 48 projections | 4.0 | 37.1 | 256.3 | 341.6 | 38.0 |
+
+Step B against step C, with the corrected script, partition path, heap KiB: `upd: counter and timestamp` 18.3
+and 18.6, `upd: 20 actions with arithmetic` 255.6 and 255.6, `upd: 32 literal sets` 66.9 and 69.0.
+
+`query: 40-term filter and 48 projections` still gets two flat copies: its widest statement in the compile,
+and the statement that runs. Section 4.3.3 has that question.
 
 ### 8.2 How the step tables were measured
 

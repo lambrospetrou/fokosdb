@@ -92,7 +92,8 @@ async function kept(fn) {
 // A statement that the compiler builds from parts is a tree of string parts until a reader makes it flat.
 const path = (c) => {
 	const prepared = prepareCase(c);
-	prepared.sql.indexOf("\u0001");
+	// The result is kept, so that the optimizing compiler does not remove the read.
+	prepared.end = prepared.sql.indexOf("\u0001");
 	return prepared;
 };
 const kib = (bytes) => (bytes / 1024).toFixed(1);
