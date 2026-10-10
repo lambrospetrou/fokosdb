@@ -30,6 +30,9 @@ PEX_TIMEOUT="${PEX_TIMEOUT:-60}"
 
 declare -A EXPECTED_MONITOR=(
 	[tcBugV1]=VersionIncreases
+	[tcBugW1]=Atomicity
+	[tcBugW2]=LockExclusion
+	[tcBugW3]=ReadAfterCommit
 )
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then

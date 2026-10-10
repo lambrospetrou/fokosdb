@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-09
 **Author:** Lambros Petrou
-**Status:** M0 is complete. M1 to M7 are not started.
+**Status:** M0 and M1 are complete. M2 to M7 are not started.
 
 ## Table of contents
 
@@ -289,35 +289,49 @@ Each milestone ends when its test cases pass, its seeded defects fail with their
 every earlier milestone still pass. Each milestone delivers a design check on its own. Section 4.2 holds the rules
 that each milestone builds.
 
-| # | Scope | P concepts to learn | New monitors | Seeded defects |
-| --- | --- | --- | --- | --- |
-| M0 | Toolchain, one partition, single-item operations | machine, event, `send`, test case, trace replay | `VersionIncreases` | V1 |
-| M1 | `transactWriteItems` on a fixed topology, one drive, no faults | spec monitor, `announce` | `Atomicity`, `AnswerMatchesDecision`, `LockExclusion`, `ReadAfterCommit` | W1–W3 |
-| M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 |
-| M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 |
-| M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 |
-| M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 |
-| M6 | Key promotion with lock copies | — | `PromotionCompletes` | P1–P7 |
-| M7 | Coordinator split (optional) | — | — | C1 |
+| # | Scope | P concepts to learn | New monitors | Seeded defects | Status |
+| --- | --- | --- | --- | --- | --- |
+| M0 | Toolchain, one partition, single-item operations | machine, event, `send`, test case, trace replay | `VersionIncreases` | V1 | Done |
+| M1 | `transactWriteItems` on a fixed topology, one drive, no faults | spec monitor, `announce` | `Atomicity`, `AnswerMatchesDecision`, `LockExclusion`, `ReadAfterCommit` | W1–W3 | Done |
+| M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 | Not started |
+| M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 | Not started |
+| M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 | Not started |
+| M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 | Not started |
+| M6 | Key promotion with lock copies | — | `PromotionCompletes` | P1–P7 | Not started |
+| M7 | Coordinator split (optional) | — | — | C1 | Not started |
 
-### 3.1 M0 — Toolchain and one partition
+### 3.1 M0 — Toolchain and one partition (done)
 
 - **Scope.** The project layout and commands of section 4.2.1. One `Client` and one `Partition` with `apiPutItem`,
   `apiDeleteItem`, and `apiGetItem`. The `formal:p` scripts and the `AGENTS.md` entry of section 4.2.15.
 - **Test cases.** `tcItems`, `tcBugV1`.
 - **Delivers.** A working toolchain, and a first replay of a failing trace.
+- **Result.** Done. `tcItems` passes and `tcBugV1` fails with `VersionIncreases`, in the random checker and in PEx.
+  Section 4.2.1 gives the toolchain and the commands, and section 4.2.13 gives the measurements.
 
-### 3.2 M1 — Write transactions, happy path
+### 3.2 M1 — Write transactions, happy path (done)
 
 - **Scope.** Two partitions, one coordinator with one drive, two clients. The coordinator path of section 4.2.7
   without recovery. `prepareLocal` with `pending_conflict` and `condition_failed`, `commitLocal`, `cancelLocal`, and
-  the lock check of the single-item writes. No fault and no timestamp.
+  the lock check of the single-item writes. Each call goes through an `RpcCall` machine with no fault (section
+  4.2.2). No fault and no timestamp.
 - **Test cases.** `tcWriteHappy`, `tcWriteConflict`, `tcBugW1` to `tcBugW3`.
 - **Delivers.** A check of atomicity and of the client answer on a fixed topology.
+- **Result.** Done. `tcWriteHappy` and `tcWriteConflict` pass in the random checker and in PEx. W1, W2, and W3 fail with
+  their monitors. Section 4.2.13 gives the measurements. The model makes these decisions:
+  - A storage call does not end a block. While a storage call runs, the input gate of the Durable Object holds every
+    other event. Thus `initiateWriteLocal` and `drivePrepare` up to the prepare fan-out are one handler, although the
+    code awaits `scheduleJob` between them. Only an RPC ends a block.
+  - The `invariant` of `runCommit` (each participant has a stored accepted answer) is not in the model. With W1 the
+    code throws there and sends no commit. `Atomicity` checks the same rule, so W1 shows that the monitor finds a
+    commit decision with a rejected participant.
+  - `tcBugW3` does not run `AnswerMatchesDecision`. W3 answers `committed` in `COMMITTING`, and that monitor fails at
+    the answer, before the read. Without it, the test case shows that `ReadAfterCommit` finds the stale read.
+  - The model has no `resumeTransaction`. A token that comes again is an assertion of the coordinator.
 
 ### 3.3 M2 — Faults and recovery
 
-- **Scope.** The `RpcCall` machine, restarts, lost calls, delivery order, and time classes (section 4.2.10). A
+- **Scope.** The faults of the `RpcCall` machine, restarts, lost calls, and time classes (section 4.2.10). A
   retry with the same token. The `tx_recovery` job, `recoverTransactionLocal`, the `idempotency_sweep` job,
   `runPrepareRecovery` with `maxPreparingHoldMs`, the participant `stale_tx_recovery` job, the quarantine, and
   `debugForceResolveTransaction`. Concurrent drives of one transaction: the request, a retry, and `tx_recovery`.
@@ -453,9 +467,12 @@ packages/fokosdb/formal/p/
   `await` becomes two handlers: the first sends the call and stores a continuation in memory state, and the second
   handles the answer.
 - **Delivery order.** P delivers the events from one sender to one receiver in order. Workers RPC gives no such
-  order, and a call can get lost. From M2, each call therefore goes through a new `RpcCall` machine. It delivers the
-  request, can lose the request or the answer within the fault budget, and returns the answer or an error to the
-  caller. Independent `RpcCall` machines give every delivery order. M1 sends directly, because it has no fault.
+  order, and a call can get lost. Each call therefore goes through a new `RpcCall` machine. It delivers the request
+  and returns the answer to the caller. Independent `RpcCall` machines give every delivery order. From M2, it can also
+  lose the request or the answer within the fault budget, and then returns an error to the caller. M1 needs the
+  machine too: a P `send` puts the event in the inbox of the receiver at once, so with direct sends a commit that the
+  coordinator sends before its answer always reaches the partition before a read that the client sends after the
+  answer, and the prepares of two transactions reach each partition in the same order.
 - **Durable and memory state.** Each Durable Object machine keeps its durable state in one record and its memory
   state in another. A restart event clears the memory state, drops the continuations, and keeps the durable record.
   An answer that arrives for a dropped continuation is ignored, as a lost promise in the code.
@@ -487,7 +504,7 @@ packages/fokosdb/formal/p/
 | `Partition` | M0 | identity, `items` (`v`, value, `last_read_ts`, `last_write_ts`), lock rows, `pending_tx_info` (`created_at` class, `guarded_at`), deletion metadata, repartition row and target rows (source side), route override of a promoted key, import record and cursor (target side) | continuations of forwarded calls, the stale job in progress | `PartitionDO`, `TransactionParticipant`, `PartitionStore`, `FokosShardingRuntime`, `RepartitionSource`, `RepartitionTarget`, `FokosMigrationHost` |
 | `Client` | M0 | — | the calls in progress and their retries | `FokosDB` |
 | `Coordinator` | M1 | `tc_state`, `tc_participants`, `tc_items` (participant and operation only) | the drives in progress | `TransactionCoordinatorDO` |
-| `RpcCall` | M2 | — | one request and its answer | Workers RPC, `FokosShardingClient` retries |
+| `RpcCall` | M1 | — | one request and its answer | Workers RPC, `FokosShardingClient` retries |
 | `Environment` | M2 | — | the fault budget | eviction, crashes, the wall clock |
 | `Operator` | M2 | — | — | an operator who calls `debugForceResolveTransaction` |
 
@@ -699,7 +716,7 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | --- | --- | --- | --- |
 | `tcItems` | put, delete, put, get of `a1` | none | pass |
 | `tcWriteHappy` | T1 puts `a1`, `b1`; T2 puts `b2` | none | pass |
-| `tcWriteConflict` | T1 puts `a1`, `b1`; T2 puts `a1` with `not_exists`, `b2`; a put of `a1`; a get of `b1` | none | pass |
+| `tcWriteConflict` | client 1: T1 puts `a1`, `b1`, then a get of `b1`; client 2: T2 puts `a1` with `not_exists`, `b2`, then a put of `a1` | none | pass |
 | `tcWriteFaults` | as `tcWriteConflict` | 2 restarts, 2 lost calls | pass |
 | `tcWriteRetry` | T1 as `tcWriteHappy`, and the caller retries T1 with the same token | 2 lost answers | pass |
 | `tcConcurrentDrives` | T1 puts `a1`, `b1` with a request drive, a retry drive, and a `tx_recovery` drive; T2 puts `a1` | 1 restart, 1 lost answer | pass |
@@ -728,10 +745,21 @@ records that fact.
 
 | Test case | Milestone | Schedules | Run time | Result | PEx |
 | --- | --- | --- | --- | --- | --- |
-| `tcItems` | M0 | 1000 | 5 s | no bug; 1 timeline, because the test case has no nondeterministic choice | `correct for any depth`, 8 states |
+| `tcItems` | M0 | 1000 | 8 s | no bug; 1 timeline, because the test case has no nondeterministic choice | `correct for any depth`, 8 states |
 | `tcBugV1` | M0 | 1000 | 1 s | `VersionIncreases` fails in schedule 1 | counterexample of length 5 |
+| `tcWriteHappy` | M1 | 1000 | 13 s | no bug; 110 timelines (242 in 10000 schedules, 121 s) | `correct for any depth`, 2,935 states, 2 s |
+| `tcWriteConflict` | M1 | 1000 | 20 s | no bug; 802 timelines (5087 in 10000 schedules, 174 s) | `correct for any depth`, 44,675 states, 9 s |
+| `tcBugW1` | M1 | 1000 | 1 s | `Atomicity` fails in schedule 1 | counterexample of length 39 |
+| `tcBugW2` | M1 | 1000 | 7 s | `LockExclusion` fails in schedule 333 | counterexample of length 37 |
+| `tcBugW3` | M1 | 1000 | 1 s | `ReadAfterCommit` fails in schedule 9 | counterexample of length 31 |
 
-The run time is the wall time of `check.sh` for one test case, Docker start included.
+The run time is the wall time of `check.sh` for one test case, Docker start included. The schedule of a defect is
+from one run, and changes with the seed.
+
+In M1, probes (a temporary monitor that fails when a run reaches a state) confirmed that `tcWriteConflict` reaches
+each of these orders: T1 cancelled, T2 committed, T1 and T2 both committed, the put of `a1` applied, and the get of
+`b1` found and absent. A run where T1 and T2 both cancel is not possible: the two transactions share only `a1`, and
+the one that gets its lock first has no other conflict.
 
 #### 4.2.14 Link to the code
 
@@ -760,9 +788,10 @@ P does not run the TypeScript code. The model links to the code in two ways:
 
 #### 4.2.16 Cost
 
-The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M0, `pnpm formal:p`
-takes about 9 s: 3 s for the compile and 6 s for the two test cases. The first run also builds the Docker image,
-which takes about 1 minute. Section 4.2.13 records the run time of each test case.
+The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M1, `pnpm formal:p`
+takes about 55 s: 3 s for the compile and the rest for the seven test cases. `pnpm formal:p --pex` takes about 25 s
+with a warm Maven cache. The first run also builds the Docker image, which takes about 1 minute. Section 4.2.13
+records the run time of each test case.
 
 #### 4.2.17 Testing
 
@@ -808,8 +837,10 @@ reaches that class of defect. PEx explores every state of a small test case, but
 **Why do the monitors stay the same in every milestone?** They state the public guarantees of FokosDB, and a split or
 a promotion must not change those guarantees. Thus a monitor written in M1 checks the split in M5 with no change.
 
-**Why does M1 have no `RpcCall` machine?** M1 has no fault, and the protocol orders the calls between one coordinator
-and one partition. Direct sends keep the first model small. M2 adds `RpcCall` for every call.
+**Why does M1 have an `RpcCall` machine when it has no fault?** A P `send` puts the event in the inbox of the
+receiver at once. With direct sends, a commit that the coordinator sends before its answer always reaches the partition
+before a read that the client sends after the answer, so W3 cannot fail. The prepares of two transactions would also
+reach each partition in the same order. Workers RPC gives no such order. M2 adds the faults to the same machine.
 
 **Why model only one write for each item?** `ordered_per_item` changes how one partition evaluates a request, in one
 block. It does not change the messages between the Durable Objects, which are the subject of this model.
