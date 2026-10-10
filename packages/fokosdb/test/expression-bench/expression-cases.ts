@@ -241,8 +241,8 @@ export function compileCase(c: ExpressionCase): unknown {
 export type PreparedStatement = { sql: string; params: unknown[]; bindingCount: number };
 
 /**
- * The partition path of one expression: compile the tree, check the plan, compose the statement, and
- * make the bound values. The result is what `PartitionStore` gives to `sql.exec`. An update case
+ * The partition path of one expression: compile the tree, compose the statement, and make the bound
+ * values. The result is what `PartitionStore` gives to `sql.exec`. An update case
  * composes its probe statement, which reads the item and writes nothing.
  */
 export function prepareCase(c: ExpressionCase, sortKey: Uint8Array = benchSortKey(0)): PreparedStatement {
