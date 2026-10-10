@@ -54,8 +54,9 @@ the unbounded `PREPARING` hold, shows only as a test that never ends or as a loc
   them one to one.
 - `docs/ideas/2026-09-26-testing-approaches.md` (sections 5.8 and 5.9) recommends a formal model of 2PC as the next
   design-level check, and Quint for its trace export.
-- `docs/agent-plans/2026-10-09-p-model-of-promotion-lock-transfer.md` uses an abstract coordinator. This model checks
-  the rules of that abstract coordinator, so the P model does not need to check them again.
+- `docs/ideas/2026-10-09-p-model-of-fokosdb-transactions.md` also checks the coordinator rules, concurrent drives
+  included, in its milestones M1 and M2. For now that P model is the check of the coordinator, and this model
+  overlaps it.
 
 ### 1.3 The coordinator in one page
 
@@ -129,7 +130,7 @@ at `IDEMPOTENCY_WINDOW_MS` (`packages/fokosdb/src/server/host-config.ts`). Thus
 ### 2.2 Out of scope
 
 - **Partition splits and promotions.** The P model covers them
-  (`docs/agent-plans/2026-10-09-p-model-of-promotion-lock-transfer.md`).
+  (`docs/ideas/2026-10-09-p-model-of-fokosdb-transactions.md`).
 - **Coordinator split.** A transition after a cutover throws `partition_migrating` and the client retries with the
   same token. This adds a second coordinator and a migration stream. It can extend this model after milestone 5.
 - **Coordinator state loss.** `fokosDestroy` deletes the ledger, but it also fences every partition, so the model has
@@ -524,7 +525,7 @@ lock. Both results raise only the read watermark or change nothing. The model ma
 - `packages/fokosdb/test/controlled-transaction-coordinator-do.ts`
 - `docs/agent-plans/2026-09-09-bounded-preparing-hold.md`
 - `docs/agent-plans/2026-10-03-max-deleted-version.md`
-- `docs/agent-plans/2026-10-09-p-model-of-promotion-lock-transfer.md`
+- `docs/ideas/2026-10-09-p-model-of-fokosdb-transactions.md`
 - `docs/ideas/2026-09-26-testing-approaches.md`
 - [Quint documentation](https://quint-lang.org/docs/getting-started)
 - [Quint model checkers](https://quint-lang.org/docs/model-checkers)
