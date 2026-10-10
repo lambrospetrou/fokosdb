@@ -56,7 +56,7 @@ export const EXPRESSION_LIMITS = {
 	 * The payload of one expression: its literals, and each text that is built from all of them. It
 	 * bounds four things:
 	 *
-	 * - The total length of the text literals and the base64 literals of one expression.
+	 * - The total UTF-8 bytes of the text literals and the base64 literals of one expression.
 	 * - The text of one base64 literal.
 	 * - The canonical identity text, which the coordinator hashes and the query cursor uses.
 	 * - The JSON array that holds all bound values of a projection or a query. This array is one bound

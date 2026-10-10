@@ -64,9 +64,15 @@ class IdentityWriter {
 	}
 
 	writeCondition(condition: ConditionExpression): void {
+		if (typeof condition !== "object" || condition === null) {
+			throw new ExpressionError("invalid_ast", "invalid condition expression");
+		}
 		if (!("args" in condition)) {
 			this.#out += `{"op":"${condition.op}"}`;
 			return;
+		}
+		if (!Array.isArray(condition.args)) {
+			throw new ExpressionError("invalid_ast", "invalid condition expression");
 		}
 		this.#out += `{"op":${JSON.stringify(condition.op)},"args":[`;
 		const nestedConditions = condition.op === "and" || condition.op === "or" || condition.op === "not";

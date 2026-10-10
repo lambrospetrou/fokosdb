@@ -21,6 +21,18 @@ describe("canonical expression identity", () => {
 		expect(canonicalConditionIdentity({ op: "not", args: [{ op: "true" }] })).toBe('{"op":"not","args":[{"op":"true"}]}');
 	});
 
+	it.each([
+		["text", "v = 1"],
+		["null", null],
+		["a number", 7],
+		["args that are not an array", { op: "eq", args: null }],
+		["a nested condition that is not an object", { op: "and", args: [{ op: "true" }, "v = 1"] }],
+	])("rejects a condition that is %s with an expression error", (_name, condition) => {
+		expect(() => canonicalConditionIdentity(condition as unknown as ConditionExpression)).toThrow(
+			expect.objectContaining({ name: "ExpressionError", code: "invalid_ast" }),
+		);
+	});
+
 	it("preserves argument order", () => {
 		const reversed: ConditionExpression = { op: "eq", args: [{ val: 1 }, { ref: "v" }] };
 		expect(canonicalConditionIdentity(reversed)).not.toBe(canonicalConditionIdentity(versionEqualsOne));

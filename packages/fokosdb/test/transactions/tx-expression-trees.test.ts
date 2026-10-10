@@ -103,6 +103,42 @@ describe("FokosDB — the client validates and does not compile", () => {
 	});
 });
 
+describe("transactWriteItems — a broken expression from a caller that does not use the client", () => {
+	it("refuses a condition that is not an object before the coordinator stores the transaction", async () => {
+		const db = makeDB({ controlled: true });
+		const [a, b] = keysAcrossPartitions(db, 2, "tree-broken-shape");
+
+		await expect(
+			initiateWrite(db, [
+				{ ...a, operation: "put", data: "never", kind: "text" },
+				{ ...b, operation: "check", condition: "v = 1" as unknown as ConditionExpression },
+			]),
+		).rejects.toThrow(fokosErrorWith("expression_invalid", { expressionCode: "invalid_ast" }));
+
+		expect(await db.getItem(a)).toMatchObject({ found: false });
+		await db.putItem({ ...a, data: "after" });
+	});
+
+	it("cancels a transaction whose condition has an operator that does not exist, and releases the locks", async () => {
+		const db = makeDB({ controlled: true });
+		const [a, b] = keysAcrossPartitions(db, 2, "tree-broken-op");
+
+		const response = await initiateWrite(db, [
+			{ ...a, operation: "put", data: "never", kind: "text" },
+			{ ...b, operation: "check", condition: { op: "bogus", args: [{ ref: "v" }] } as unknown as ConditionExpression },
+		]);
+
+		expect(response).toMatchObject({ outcome: "cancelled" });
+		expect(response.outcome === "cancelled" && response.results[1]).toMatchObject({
+			outcome: "rejected",
+			reason: { code: "expression_invalid" },
+		});
+		expect(await db.getItem(a)).toMatchObject({ found: false });
+		await db.putItem({ ...a, data: "after" });
+		expect(await db.getItem(a)).toMatchObject({ found: true, item: { data: "after", version: 1 } });
+	});
+});
+
 describe("transactWriteItems — expression trees in the coordinator request", () => {
 	it("commits an update and a check that carry expression trees, across two partitions", async () => {
 		const db = makeDB({ controlled: true });

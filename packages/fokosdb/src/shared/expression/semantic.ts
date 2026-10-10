@@ -29,7 +29,7 @@ import {
 } from "./operation-registry.js";
 import { type PathSegment, isParentPath, pathsEqual, validateReadJsonPath, validateWriteJsonPath } from "./path.js";
 import { EXPRESSION_NATIVE_TYPES, type ExpressionNativeType } from "./types.js";
-import { utf8WithinLimit } from "./utf8.js";
+import { utf8ByteLength, utf8WithinLimit } from "./utf8.js";
 
 export const EXPRESSION_REQUIRED_COLUMNS = ["hk", "sk", "v", "ttl_epoch_utc_seconds", "data_kind", "data"] as const;
 
@@ -55,8 +55,8 @@ export type ProjectionExpressionAnalysis = {
 
 type AnalysisContext = {
 	operatorsAndFunctions: number;
-	/** The UTF-16 length of all text literals and all base64 literals of the expression. */
-	literalLength: number;
+	/** The UTF-8 bytes of all text literals and all base64 literals of the expression. */
+	literalBytes: number;
 	requiredColumns: Set<ExpressionRequiredColumn>;
 	expressionContext: ExpressionContext;
 };
@@ -135,7 +135,7 @@ function projectionEntryName(entry: Record<string, unknown>): string {
 }
 
 function createContext(expressionContext: ExpressionContext = "condition"): AnalysisContext {
-	return { operatorsAndFunctions: 0, literalLength: 0, requiredColumns: new Set(), expressionContext };
+	return { operatorsAndFunctions: 0, literalBytes: 0, requiredColumns: new Set(), expressionContext };
 }
 
 function requiredColumnsFrom(context: AnalysisContext): readonly ExpressionRequiredColumn[] {
@@ -160,13 +160,13 @@ function countOperation(context: AnalysisContext): void {
 }
 
 /**
- * Adds the length of one text or base64 literal to the total of the expression. A literal is a bound
+ * Adds the UTF-8 bytes of one text or base64 literal to the total of the expression. A literal is a bound
  * value and not SQL text, so the limits of the compiled SQL do not bound it. This limit bounds the
  * values that one expression makes a partition hold and bind.
  */
-function countLiteral(length: number, context: AnalysisContext): void {
-	context.literalLength += length;
-	if (context.literalLength > EXPRESSION_LIMITS.canonicalPayloadBytes) {
+function countLiteral(bytes: number, context: AnalysisContext): void {
+	context.literalBytes += bytes;
+	if (context.literalBytes > EXPRESSION_LIMITS.canonicalPayloadBytes) {
 		throw new ExpressionError("complexity_limit", "expression literals exceed the payload limit");
 	}
 }
@@ -423,13 +423,14 @@ function analyzeValue(expression: unknown, depth: number, context: AnalysisConte
 		assertFields(expression, "val");
 		const literal = validateScalarLiteral(expression.val);
 		if (typeof literal === "string") {
-			countLiteral(literal.length, context);
+			countLiteral(utf8ByteLength(literal), context);
 		}
 		return literalFacts(literal);
 	}
 	if (Object.hasOwn(expression, "b64")) {
 		assertFields(expression, "b64");
 		decodeByteLiteral(expression as { b64: unknown });
+		// Base64 text is ASCII, so its length is its byte count.
 		countLiteral((expression.b64 as string).length, context);
 		return byteLiteralValue;
 	}

@@ -286,6 +286,14 @@ describe("byte literal validation", () => {
 		expect(() => condition(both(4))).toThrow(/literals exceed the payload limit/);
 	});
 
+	it("counts the UTF-8 bytes of a text literal, not its characters", () => {
+		// One character of 3 bytes.
+		const text = (characters: number) => ({ op: "eq", args: [{ ref: "data", path: "$.a" }, { val: "€".repeat(characters) }] }) as const;
+		const atLimit = Math.floor(EXPRESSION_LIMITS.canonicalPayloadBytes / 3);
+		expect(() => condition(text(atLimit))).not.toThrow();
+		expect(() => condition(text(atLimit + 1))).toThrow(/literals exceed the payload limit/);
+	});
+
 	it.each([
 		["a number", { op: "eq", args: [{ ref: "v" }, { b64: "YQ==" }] }],
 		["text", { op: "eq", args: [{ val: "ab" }, { b64: "YWI=" }] }],

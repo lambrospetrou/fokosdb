@@ -1,6 +1,6 @@
 # RFC — Send expression trees to the partitions, and compile them in the partition
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-10
 **Author:** Lambros
 
@@ -75,7 +75,8 @@ the plan to the partition, and the partition runs the SQL text of the plan. This
   `ProjectionExpression[]`, or a query `filter` with a `projection` (`src/shared/expression/types.ts`).
 - **Plan** — the output of the compiler: `CompiledConditionPlan`, `CompiledUpdatePlan`,
   `CompiledProjectionPlan`, or `CompiledQueryPlan` (`src/shared/expression/plan.ts`).
-- **Client check** — an optional compile of the expression tree in the client, to fail before any I/O.
+- **Client validation** — the check of the expression tree in the client with the validator
+  (`src/shared/expression/semantic.ts`), to fail before any I/O. The client never compiles.
 
 ---
 
@@ -88,15 +89,14 @@ the plan to the partition, and the partition runs the SQL text of the plan. This
    authoritative check.
 3. The coordinator stores expression trees in `tc_items`. It stores no plan.
 4. The coordinator computes the idempotency fingerprint from the canonical identity of each expression tree.
-5. The client check is optional. Correctness does not depend on it.
+5. The client validates each tree and never compiles. Correctness does not depend on the client.
 6. The transaction payload limit counts the bytes of the expression trees.
 7. A compile error in a prepare is a fatal prepare error.
 8. After the rollout, a partition refuses a request that carries a plan.
 
 ### 2.2 Out of scope
 
-- **A plan cache in the partition.** The value depends on how often one partition gets the same expression,
-  and that number is not known. Section 4.3.4 records it as an investigation.
+- **A plan cache in the partition.** Section 4.3.4 records the decision: no cache.
 - **The pool layout for condition and update plans.** A partition can choose its layout without a wire change
   after this RFC. That change needs its own RFC.
 - **A write condition as an array of conditions.** `docs/agent-plans/2026-10-09-condition-arrays.md` covers it.
@@ -108,11 +108,11 @@ the plan to the partition, and the partition runs the SQL text of the plan. This
   its first write. For a transaction, a compile error cancels the transaction through the fatal-error path.
 - **A commit never compiles.** A change of the compiler between prepare and commit must not change the result
   of the commit.
-- **The client check can be stricter than the partition, and never more permissive.** When the client and the
-  partition do not agree, the answer of the partition applies. Section 4.2.6 gives the rule.
-- **The meaning of an expression must stay the same across compiler versions.** During a deploy, two
-  participants of one transaction can run different compiler versions. Section 4.3.3 records the open question
-  for a change of meaning.
+- **The client validation can be stricter than the partition, and never more permissive.** When the client
+  and the partition do not agree, the answer of the partition applies. Section 4.2.6 gives the rule.
+- **The meaning of an expression never changes.** During a deploy, two participants of one transaction can run
+  different compiler versions. A compiler change can change the layout or the shape of the SQL, and it must
+  keep the meaning. Thus a tree carries no version of the expression language.
 - **The extra heap allocation in the partition must stay measured.** Section 4.2.8 gives the numbers and the
   ways to lower them.
 
@@ -120,17 +120,19 @@ the plan to the partition, and the partition runs the SQL text of the plan. This
 
 ## 3. Milestones
 
-1. **The partition accepts both forms.** Each partition RPC accepts an expression tree or a plan. The partition
-   compiles a tree, and runs a plan as it does now. A compile error in a prepare is fatal. This milestone ships
-   alone: no client sends a tree yet.
-2. **The client sends trees, and the coordinator stores trees.** `db.ts` sends trees. The coordinator stores
-   trees and computes the fingerprint from the tree. The payload limit counts tree bytes. This milestone needs
-   milestone 1 on every partition first.
-3. **The partition refuses plans.** The partition removes the plan path. This milestone needs the end of the
-   drain period of section 4.2.9.
-4. **The client check becomes optional.** The client check gets its switch. Section 4.3.1 decides the default.
-5. **Allocation investigation (optional).** Measure the levers of section 4.2.8, and the plan cache of section
-   6.3.4.
+All milestones are implemented. No deploy occurred between them.
+
+1. **The partition and the coordinator accept both forms.** Each partition RPC accepted an expression tree or a
+   plan. The partition compiled a tree, and ran a plan as before. The coordinator stored the form that it got,
+   and computed the fingerprint from the identity of a tree or from the identity field of a plan. Each
+   `FokosExpressionError` from a prepare became fatal.
+2. **The client sends trees.** `db.ts` sends trees. The payload limit counts tree bytes.
+3. **The partition refuses plans.** The partition removed the plan path. Each request field has a tree type
+   only, and a request that carries a plan gets `compiled_plan_refused`.
+4. **The client does not compile.** The client validates each tree and computes the query identities. The
+   build fails when the client entry reaches the compiler, and `fokosdb/client` does not export the compile
+   functions.
+5. **Allocation investigation.** Section 4.2.8 has the measurements. Lever 1 and lever 2 are implemented.
 
 ---
 
@@ -140,12 +142,12 @@ the plan to the partition, and the partition runs the SQL text of the plan. This
 
 The client sends the expression tree that the caller gave. Each partition compiles the tree when it needs the
 SQL, and it uses the plan for that request only. The coordinator stores the tree and sends the tree to each
-participant. The client can still compile the tree first, to fail before any I/O, but the partition decides.
+participant. The client validates the tree first, to fail before any I/O, but the partition decides.
 
 ```
 caller ──tree──▶ FokosDB (db.ts)
                    │ validate the tree (names, requiredColumns, identity for the cursor)
-                   │ optional client check: compile, then drop the plan
+                   │ no compile
                    ├──tree──▶ PartitionDO ──compile──▶ plan ──▶ SQLite      (item RPCs, queries)
                    └──tree──▶ TransactionCoordinatorDO
                                 │ store the tree in tc_items, fingerprint = hash(identity(tree))
@@ -158,8 +160,9 @@ The result:
 - A partition runs only SQL that it generated.
 - A request carries 3.4 to 17.8 times fewer expression bytes.
 - A partition can change how it runs an expression without a change in the coordinator or the client.
-- The cost moves to the partition: 2 to 500 µs of CPU, and 2 KiB to 1 MiB of short-lived heap, for each
-  compile. Section 4.2.7 and section 4.2.8 give the numbers.
+- The client bundle has no compiler.
+- The cost moves to the partition: CPU and short-lived heap for each compile. Section 4.2.7 and section 4.2.8
+  give the numbers.
 
 ### 4.2 Technical details
 
@@ -177,50 +180,58 @@ Each field below changes from a plan type to a tree type:
 | `TransactionReadItem` | `projection` | `CompiledProjectionPlan` | `ProjectionExpression[]` |
 | `TransactWriteOperationLike` (`src/shared/transaction-limits.ts`) | `condition`, `update` | plans | trees |
 
-During milestone 1 and milestone 2, each field accepts the union of both types. The partition tells them apart
-by the `kind` and `version` fields, which only a plan has. Milestone 3 removes the plan type from the union.
+The query type is `QueryExpressions` (`src/shared/expression/types.ts`). No field accepts a plan. A plan has a
+`kind` field and a `version` field, which no tree has. `refuseCompiledPlan` (`src/shared/expression/plan.ts`)
+throws `compiled_plan_refused` for a value that has both.
 
 #### 4.2.2 The client
 
-`db.ts` keeps these steps for each expression tree:
+`db.ts` does these steps for each expression tree:
 
 1. Validate the tree with `validateConditionExpression`, `validateUpdateExpression` or
    `validateProjectionExpression` (`src/shared/expression/semantic.ts`). Validation gives `requiredColumns` and
-   the projection `names`. It costs 0.4 to 18 KiB of heap (appendix 8.1).
+   the projection `names`. It costs 0.4 to 22 KiB of heap (section 4.2.8). A tree that is not valid throws
+   `FokosExpressionError` before any I/O.
 2. For a query, compute `filterIdentity` and `projectionIdentity` with `canonicalConditionIdentity` and
    `canonicalProjectionIdentity` (`src/shared/expression/identity.ts`). `computeCursorFingerprint` needs them.
-3. When the client check is on, compile the tree, then drop the plan. A compile error throws
-   `FokosExpressionError` before any I/O, as it does today.
-4. Send the tree.
+3. Send the tree.
 
-`validateVersionReferences` reads `requiredColumns` from the validation result, not from a plan. The payload
-count in `validateTransactWriteOperations` adds `JSON.stringify` of each tree.
+The client never compiles. `pnpm build` fails when the client entry reaches
+`src/shared/expression/compiler.ts` or `src/shared/expression/request-plans.ts`, and `fokosdb/client` does not
+export a compile function. Thus only a partition checks the limits of the compiled SQL.
 
-The client check keeps the compiler in the client bundle. Without the client check, the client imports only the
-validator and the identity module: about 23 KB minified in place of about 48 KB. Section 4.3.1 asks if the
-bundle must make the compiler optional.
+`validateVersionReferences` gets `requiredColumns` from validation. It validates a tree only for an operation
+that follows a write of the same item. The payload count in `validateTransactWriteOperations` adds
+`JSON.stringify` of each tree.
 
 #### 4.2.3 Compilation in the partition
 
-The partition compiles a tree at the first point where it needs the SQL:
+The compile is in `PartitionStore`. Each store method that takes an expression compiles the tree before its
+statement runs (`src/shared/expression/request-plans.ts`). The handlers and the participant pass the tree of
+the request through with no change. Thus the partition compiles at the first point where it needs the SQL:
 
 | Operation | Compile point |
 | --- | --- |
-| `apiPutItem`, `apiDeleteItem` | In the handler, before the condition runs and before the first write. |
-| `apiGetItem` with a projection | Before `PartitionStore.getItemProjected`. |
-| `apiQueryItems` | Before the first `PartitionStore.scanQueryPage` of the request. One plan serves all visits of one request. |
-| `txPrepare`, `txExecuteSingleShot` | In `TransactionParticipant.#evaluate`, for each operation that the partition evaluates. |
-| `txReadForTransaction`, `txReadSnapshot` | Before `PartitionStore.getItemProjected` for the item. |
+| `apiPutItem`, `apiDeleteItem` | In `PartitionStore.evaluateCondition`, after the lock check and before the first write. |
+| `apiGetItem` with a projection | In `PartitionStore.getItemProjected`. |
+| `apiQueryItems` | In `PartitionStore.scanQueryPage`, which one request calls one time on each partition. |
+| `txPrepare`, `txExecuteSingleShot` | In the store calls of `TransactionParticipant.#evaluate`, for each operation that the partition evaluates. The storage transaction rolls back on a compile error. |
+| `txReadForTransaction`, `txReadSnapshot` | In `PartitionStore.getItemProjected` for the item. |
 
 Rules:
 
 - **Compile only what runs.** A prepare compiles no operation of a sequence that is `lockedBefore`. Thus a
   repeated prepare compiles nothing.
-- **`validateVersionReferences` runs on the compiled analysis.** `sequencePlanOf` needs `requiredColumns`
-  before `#evaluate`. It gets them from `validateConditionExpression` and `validateUpdateExpression`, which
-  cost 0.4 to 18 KiB of heap, and not from a full compile.
-- **The plan lives for one request.** No field and no table keeps it. `materializedPlanBindings` keeps its
-  `WeakMap` cache by the descriptor array, so the statements of one request share one set of bound values.
+- **`validateVersionReferences` does not compile.** `sequencePlanOf` needs `requiredColumns` before
+  `#evaluate`. It gets them from `validateConditionExpression` and `validateUpdateExpression`, and only for an
+  operation that follows a write of the same item.
+- **The plan lives for one request.** No table keeps it, and it carries no identity. One request runs the
+  plan of an update in more than one statement: the probe, then a write or a lock row. `updatePlanOf` keeps
+  that plan in a `WeakMap` by the tree object of the request, so the plan is released with the request.
+  `materializedPlanBindings` keeps its `WeakMap` cache by the descriptor array, so the statements of one
+  request share one set of bound values.
+- **No second check of the plan.** The partition runs the plan that it compiled. `runtime.ts` has no plan
+  validator.
 - **A forward compiles again.** A router that forwards a request sends the tree. The owner compiles it. A
   read-through to the source compiles on the source.
 
@@ -239,31 +250,40 @@ Rules:
 
 | Case | Error | Caller retries |
 | --- | --- | --- |
-| The client check fails | `FokosExpressionError`, before any I/O | No |
-| A compile fails in `apiPutItem`, `apiDeleteItem`, `apiGetItem`, `apiQueryItems` | `FokosExpressionError`, from the partition | No |
-| A compile fails in `txPrepare` | A fatal prepare error. The coordinator cancels. The caller gets the transaction cancellation with the expression error as the reason of the operation. | No |
-| A partition gets a plan after milestone 3 | `FokosValidationError` | No |
+| The client validation fails | `FokosExpressionError`, before any I/O | No |
+| A compile fails in `apiPutItem`, `apiDeleteItem`, `apiGetItem`, `apiQueryItems` | `FokosExpressionError`, from the partition. Nothing is written. | No |
+| A compile fails in `txPrepare` | A fatal prepare error. The coordinator cancels. The caller gets the transaction cancellation with `expression_invalid` as the reason of the operation. | No |
+| A partition gets a plan | `FokosValidationError` with the code `compiled_plan_refused`. In a prepare it is fatal. | No |
 
-A compile error must be fatal in prepare. Today `isFatalPrepareError` accepts only `FokosValidationError`, so the
-coordinator retries an expression error until the transaction is stale. Section 4.3.2 asks which of the two
-mechanisms makes it fatal.
+Each `FokosExpressionError` from a prepare is fatal: `prepareRetry` does not retry it, and
+`isFatalPrepareError` accepts it next to `FokosValidationError`. This includes the `runtime_capability` code,
+which says that SQLite did not run the compiled statement.
 
 #### 4.2.6 Limits
 
-The partition compile is the authoritative check of `EXPRESSION_LIMITS`, also of `compiledSqlBytes` and
-`completeStatementBindings`. The client check uses the limits of the client package version.
+`EXPRESSION_LIMITS` (`src/shared/expression/limits.ts`) has a comment for each limit that gives its origin.
 
-- When the client check rejects a tree, the request stops before any I/O.
-- When the client check accepts a tree and the partition rejects it, the error of section 4.2.5 applies.
-- When a partition removes or raises a limit, an older client check still rejects at the older limit. A caller
-  must upgrade the client to use the new limit. The client check stays a stricter filter, and it cannot make a
-  partition run an expression that the partition rejects.
+- **The validator checks the limits of the tree**: the counts, the depth, the path sizes, and the total UTF-8
+  bytes of the text literals and the base64 literals (`canonicalPayloadBytes`, 512 KiB). The client and the partition
+  both run the validator, so these errors occur before any I/O for a caller that uses the client.
+- **Only the partition compile checks the limits of the compiled SQL**: `compiledSqlBytes`,
+  `completeStatementBindings`, and the size of the pooled bindings of a projection or a query. A tree that
+  passes validation and fails one of these gets `sql_limit` from the partition, after I/O. For example, an `in`
+  with 100 distinct choices is valid and needs more than 100 parameters.
+- **The coordinator checks the identity size.** The fingerprint computes the canonical identity of each
+  condition and each update, which refuses an identity above `canonicalPayloadBytes`.
+- When a partition removes or raises a limit of the validator, an older client still rejects at the older
+  limit. A caller must upgrade the client to use the new limit. The client stays a stricter filter, and it
+  cannot make a partition run an expression that the partition rejects.
 
 #### 4.2.7 Performance
 
-CPU for one received request, in Node v24.20 with default flags. "Today" is the deserialize of the plan, the plan
-checks, the statement composition, and the binding materialization. "Tree" is the deserialize of the tree, the
-compile, and the same composition and materialization.
+The numbers of this section are from before the changes of section 4.2.8, so the cost of a compile is now
+lower.
+
+CPU for one received request, in Node v24.20 with default flags. "Today" is the path before this RFC: the
+deserialize of the plan, the plan checks, the statement composition, and the binding materialization. "Tree" is
+the deserialize of the tree, the compile, and the same composition and materialization.
 
 | Case | Today µs | Tree µs | Extra µs |
 | --- | ---: | ---: | ---: |
@@ -312,94 +332,110 @@ the request ends. Measured GC time for each call, from appendix 8.2:
 
 `TODO: measure` the young generation size of workerd. The default of Node can differ from it.
 
-Where the allocation goes:
+The numbers above are from before the two changes below.
 
-- **Validation:** 0.4 to 18 KiB. The partition needs it.
-- **Canonical identity:** 0.1 to 76 KiB, 5% to 21% of a compile. Only the coordinator and the client need it. A
-  partition compile can skip it.
-- **SQL rendering, compaction, and the size check:** the rest, 67% to 91% of a compile.
+Changes that are implemented:
 
-Levers to lower the allocation, for milestone 5:
+1. **The partition compile computes no identity.** The plan types have no identity field. Only the coordinator
+   and the client call the identity module. The identity step also enforced `canonicalPayloadBytes`, so the
+   validator now counts the UTF-8 bytes of the literals (section 4.2.6).
+2. **The partition does not check its own plan.** `validateConditionPlan`, `validateUpdatePlan`,
+   `validateProjectionPlan` and `validateQueryPlan` are gone. Each one composed the statement a second time to
+   repeat a check of the compiler.
 
-1. Skip the canonical identity in the partition compile.
-2. Reuse the statement that the compiler composes for the size check, in place of a second composition.
-   `TODO: measure`.
-3. Remove the second copy of the SQL that `compactPlanParameters` makes with `replace` when it renumbers.
-   `TODO: measure`.
-4. Cache the plan in the partition (section 4.3.4).
+Heap KiB for one expression on the partition path, `pnpm bench:alloc:expression`, Node v24.20.0:
+
+| Case | Before | After | Saved |
+| --- | ---: | ---: | ---: |
+| cond: optimistic lock | 6.6 | 5.3 | 20% |
+| cond: four terms | 24.0 | 19.1 | 20% |
+| cond: 40 distinct path `eq` | 256.1 | 209.5 | 18% |
+| cond: 80 `eq` on one path | 617.3 | 490.9 | 20% |
+| upd: counter and timestamp | 26.1 | 22.4 | 14% |
+| upd: 20 actions with arithmetic | 384.3 | 307.2 | 20% |
+| proj: 3 paths and `v` | 21.7 | 20.3 | 6% |
+| proj: 48 paths | 313.1 | 264.5 | 16% |
+| query: four-term filter and 5 projections | 59.8 | 49.9 | 17% |
+| query: 40-term filter and 48 projections | 901.5 | 633.8 | 30% |
+
+Not implemented:
+
+- **The parameter scan of `compactPlanParameters`.** The function scans each SQL fragment with `matchAll` for
+  each compile, which costs 8% to 26% of the allocation of one expression. Its `replace` copy runs only when a
+  bound parameter is not used, and no benchmark case causes that. A compiler that records the used parameters
+  while it renders removes the scan.
+- **A plan cache.** Section 4.3.4 records the decision.
 
 #### 4.2.9 Deployment, migration, and rollback
 
-1. Deploy milestone 1 to every partition and coordinator class. Nothing changes for a client.
-2. Deploy milestone 2 to the clients. A new client sends trees. An old client still sends plans, and the
-   partition still runs them. The coordinator stores what it gets.
-3. **Drain period.** The partition accepts plans while a `tc_items` row can still hold a plan. `stripPayload`
-   clears the payload when a transaction completes. Thus the drain ends when every transaction that started
-   before step 2 is complete, and when no old client remains. Section 4.3.5 asks how to detect that.
-4. Deploy milestone 3. The partition refuses a plan.
+The package is not released, so the milestones shipped together with no drain period. The client, the
+coordinator and the partition must deploy at the same version:
 
-Rollback:
-
-- **Rollback of a client** to a version before milestone 2 is safe, because the partition still accepts plans.
-- **Rollback of a partition** to a version before milestone 1 is not safe after step 2: an old partition cannot
-  compile a tree. Roll back the clients first.
+- A client from before this RFC sends a plan. The partition refuses it with `compiled_plan_refused`.
+- A `tc_items` row from before this RFC holds a plan. A recovery drive sends it, the participant refuses it,
+  and the coordinator cancels the transaction, because the error is fatal.
+- A rollback of a partition to a version from before this RFC is not safe: that partition cannot compile a
+  tree.
 
 #### 4.2.10 Testing
 
-- Tests that build a plan and send it to a partition or a store send a tree. These include
-  `transaction-participant.test.ts`, `transaction-participant-ordered.test.ts`, `partition-store.test.ts`,
-  `runtime.test.ts`, `projection-runtime.test.ts` and `do-transaction-coordinator.test.ts`.
-- A partition refuses a request that carries SQL text after milestone 3.
+- Tests that sent a plan to a partition or a store send a tree. The helpers `conditionTree`, `updateTree`,
+  `projectionTree` and `queryTree` (`src/shared/expression/test-fixtures.ts`) keep the literal types of a tree.
+- Each partition RPC refuses a request that carries a plan, and writes nothing
+  (`test/partition-do/expression-trees.test.ts`).
 - A compile error in a prepare cancels the transaction with no retry. The coordinator tests of fatal prepare
-  errors cover the new error.
-- A repeated prepare of a locked sequence compiles nothing.
-- `putItem` with a tree above `compiledSqlBytes` writes nothing and fails with `sql_limit`, with the client
-  check off.
-- The fingerprint of a request is the same before and after milestone 2.
-- During milestone 1 and milestone 2, each partition RPC accepts both a tree and a plan, and gives the same
-  result for both.
+  errors cover `FokosExpressionError`.
+- A repeated prepare of a locked sequence compiles nothing: it accepts a tree that no compile accepts.
+- `putItem` with a valid tree above `compiledSqlBytes` writes nothing and fails with `sql_limit` from the
+  partition.
+- A tree that is not valid fails in the client before any I/O.
+- The partition receives the condition, the update and the projection as the caller gave them
+  (`test/transactions/tx-expression-trees.test.ts`).
+- The payload limit counts the JSON bytes of a tree.
 
-### 4.3 Open Questions
+### 4.3 Decisions and open items
 
-#### 4.3.1 The default of the client check
+#### 4.3.1 The client check
 
-Options: on by default, or off by default. On keeps the fail-before-I/O behavior of today and keeps the compiler
-in the client bundle. Off saves about 25 KB minified in the client and its compile CPU, and moves every
-expression error to the partition. The answer also decides if the build must keep the compiler out of the
-client graph when the check is off.
+Decision: the client validates and never compiles, with no option. The compiler is not in the client bundle,
+and `fokosdb/client` exports no compile function. The cost: a `sql_limit` error comes from the partition, after
+I/O (section 4.2.6).
 
 #### 4.3.2 How a compile error becomes fatal in prepare
 
-Options:
-
-1. The partition raises a compile error in prepare as a `FokosValidationError`.
-2. `isFatalPrepareError` also accepts `FokosExpressionError`.
-
-Option 1 changes the error class that a caller sees for one path. Option 2 changes only the coordinator.
+Decision: `isFatalPrepareError` and `prepareRetry` accept each `FokosExpressionError`, with each expression
+code. The partition raises the same error class for a prepare as for `putItem`.
 
 #### 4.3.3 A change of meaning in the expression language
 
-Two participants of one transaction can run different compiler versions during a deploy. A compiler change that
-keeps the meaning, such as the layout or the shape of the SQL, needs nothing. A change of meaning needs a
-version in the request. The question: does the tree carry an expression-language version that the partition
-must know, or does each change of meaning get its own rollout?
+Decision: the meaning of an expression never changes. A tree carries no version of the expression language.
 
 #### 4.3.4 A plan cache in the partition
 
-A cache keyed by the plan kind, the plan version and the canonical identity costs 0.2 to 11 µs for each lookup.
-A compile costs 2 to 500 µs. The value depends on the share of requests that repeat an expression on one
-partition. `TODO: measure` that share for the expected workloads before a cache is built.
+Decision: no cache for now.
 
 #### 4.3.5 The end of the drain period
 
-What tells the operator that no `tc_items` row and no client sends a plan? Options include a count of the plans
-that partitions receive, or a fixed period longer than the stale-transaction window.
+Not applicable: no drain period occurred (section 4.2.9).
 
 #### 4.3.6 Interaction with condition arrays
 
-`docs/agent-plans/2026-10-09-condition-arrays.md` makes `condition` an array of plans. Its section 5.2 rejects
-compilation in the partition. Section 6 of this RFC answers its four reasons. The two RFCs must agree on one
-wire type for the condition before either ships.
+Open. `docs/agent-plans/2026-10-09-condition-arrays.md` makes `condition` an array of plans, and its section 5.2
+rejects compilation in the partition. That RFC must change to an array of expression trees.
+
+#### 4.3.7 Known gaps
+
+- **The coordinator does not validate a tree.** The fingerprint computes the identity of each condition and
+  each update. The identity step refuses a tree of a wrong shape with a `FokosExpressionError`, before the
+  coordinator stores the transaction. Each other broken tree, for example one with an operator that does not
+  exist, gets a coordinator row and a prepare. The partition refuses it, and the coordinator cancels with no
+  retry. Only a caller that bypasses the client can cause this, because the client validates.
+- **The coordinator does not refuse a plan.** It stores the request, and the first prepare cancels the
+  transaction with `compiled_plan_refused`.
+- **The SQL expression depth has no compile check.** A long `and` or `or` compiles, and SQLite refuses it
+  ("Expression tree is too large (maximum depth 100)"). `docs/agent-plans/2026-10-10-expression-compile-cost.md`
+  covers it.
+- **The young generation size of workerd is not measured**, so the GC numbers of section 4.2.8 are for Node.
 
 ---
 
@@ -418,7 +454,7 @@ large, stays a stored format, and still depends on the client version.
 
 The coordinator compiles each tree before it writes `CREATED`, to reject a transaction before the prepare
 fan-out. Not chosen: it ties the coordinator to the compiler version and to its limits, which this RFC removes.
-The client check covers the early failure.
+The client validation covers the early failure for each error except `sql_limit`.
 
 ### 5.4 Compile in the client only, send the tree, and trust the client
 
@@ -436,11 +472,10 @@ coordinator cancels.
 
 **`2026-10-09-condition-arrays.md` rejects compilation in the partition for four reasons. What changes?**
 
-1. *An expression that is not valid fails only after I/O.* The client check keeps the failure before I/O.
-   Without the client check, a transaction with a bad expression makes a coordinator row, a prepare, and a
-   cancel.
-2. *A retry, a recovery drive, and a forward compile again.* Yes. Section 4.2.7 gives the cost, and section
-   4.3.4 the cache.
+1. *An expression that is not valid fails only after I/O.* The client validation keeps the failure before
+   I/O. Only a valid tree above a limit of the compiled SQL fails after I/O: a transaction with such a tree
+   makes a coordinator row, a prepare, and a cancel.
+2. *A retry, a recovery drive, and a forward compile again.* Yes. Section 4.2.7 gives the cost.
 3. *The coordinator needs the identity, and the version check needs the columns.* The coordinator computes the
    identity from the tree. The version check gets `requiredColumns` from validation.
 4. *The changes are the same for a tree and for a plan.* The changes are the same. The stored format and the
@@ -451,9 +486,9 @@ In Node, with the default young generation, the compile adds up to 28 µs of GC 
 old-generation collection runs. The GC time grows less than the CPU time, because the compile garbage dies before
 the next scavenge. Section 4.2.8 lists the young generation of workerd as `TODO: measure`.
 
-**Why does the partition not trust the client check?**
-The partition must compile to get SQL. The client check runs on another package version, and a caller can
-bypass it.
+**Why does the partition not trust the client validation?**
+The partition must compile to get SQL, and the compile validates. The client runs on another package version,
+and a caller can bypass it.
 
 ---
 
