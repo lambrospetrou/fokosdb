@@ -8,6 +8,7 @@ import { HashTopology } from "../../src/sharding/hash-topology.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex, resolveDescendantHashPartitionContext } from "../../src/sharding/partition-id.js";
 import { FokosShardingStore } from "../../src/sharding/sharding-store.js";
+import { recordedTxCalls } from "../controlled-partition-do.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
 import { executedBy, kb, lockKeys, rangeAncestorsOf, withOpIndex } from "./helpers.js";
@@ -539,9 +540,9 @@ describe.concurrent("PartitionDO — a transaction through a hash jump to a part
 
 		// The root tried the grandchild first, and then sent both keys to their owner in one call. The order
 		// of the items in a sub-request is not part of the contract.
-		expect(await missing.controlled.testTxCalls("txCommit")).toHaveLength(1);
-		expect(await missing.controlled.testTxCalls("txReadSnapshot")).toHaveLength(1);
-		const commits = await owner.controlled.testTxCalls("txCommit");
+		expect(await recordedTxCalls(missing.controlled, "txCommit")).toHaveLength(1);
+		expect(await recordedTxCalls(missing.controlled, "txReadSnapshot")).toHaveLength(1);
+		const commits = await recordedTxCalls(owner.controlled, "txCommit");
 		expect(commits).toHaveLength(1);
 		expect(commits[0].items.map((item) => [KeyCodec.decode(item.hashKey), KeyCodec.decode(item.sortKey)])).toEqual(
 			expect.arrayContaining([
@@ -550,7 +551,7 @@ describe.concurrent("PartitionDO — a transaction through a hash jump to a part
 			]),
 		);
 		expect(commits[0].items).toHaveLength(2);
-		expect(await owner.controlled.testTxCalls("txReadSnapshot")).toHaveLength(1);
+		expect(await recordedTxCalls(owner.controlled, "txReadSnapshot")).toHaveLength(1);
 		expect(await owner.localItemCount(h1)).toBe(1);
 		expect(await owner.localItemCount(h2)).toBe(1);
 		// No split below the root runs during the test or after it.
@@ -693,7 +694,7 @@ describe.concurrent("PartitionDO — the Bloom step of the transaction shapes", 
 		expect(await partition.localItemCount(hashKey)).toBe(2);
 
 		// The commit went to the range root first, and the range root stays without an identity.
-		expect(await rangeRoot.controlled.testTxCalls("txCommit")).toHaveLength(1);
+		expect(await recordedTxCalls(rangeRoot.controlled, "txCommit")).toHaveLength(1);
 		expect(await rangeRoot.stub.fokosStatus({})).toMatchObject({ initialized: false });
 	}, 30_000);
 

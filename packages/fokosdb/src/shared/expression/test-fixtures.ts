@@ -1,7 +1,14 @@
 import type { JsonValue } from "../json-types.js";
 import type { DataKind } from "../types.js";
 import type { ExpressionLimitName } from "./limits.js";
-import type { ConditionExpression, ProjectionExpression } from "./types.js";
+import type { ConditionExpression, ProjectionExpression, QueryExpressions, UpdateExpression } from "./types.js";
+
+// Each function below returns its argument. A test writes an expression tree in place, and the
+// parameter type keeps the literal types of the tree.
+export const conditionTree = (condition: ConditionExpression): ConditionExpression => condition;
+export const updateTree = (update: UpdateExpression): UpdateExpression => update;
+export const projectionTree = (projection: readonly ProjectionExpression[]): readonly ProjectionExpression[] => projection;
+export const queryTree = (query: QueryExpressions): QueryExpressions => query;
 
 export type ExpressionSemanticItem = {
 	hashKey: string | Uint8Array;

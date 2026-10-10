@@ -1,6 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import { DataKind, OperationMetrics, type QuerySelect, type ReturnValuesOnConditionCheckFailure } from "../shared/types.js";
-import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledQueryPlan } from "../shared/expression/plan.js";
+import type { ConditionExpression, ProjectionExpression, QueryExpressions } from "../shared/expression/types.js";
 import type { ProjectedWireRow } from "../shared/expression/projection.js";
 import type {
 	CancelRequest,
@@ -122,7 +122,7 @@ export type PutItemRpcRequest = ItemRpcKeys & {
 	data: string | Uint8Array;
 	kind: DataKind;
 	ttlAt?: number;
-	condition?: CompiledConditionPlan;
+	condition?: ConditionExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
@@ -131,7 +131,7 @@ export type PutItemRpcResponse =
 	| { outcome: "rejected"; reason: RejectionReasonEncoded; meta: OperationMetrics };
 
 export type DeleteItemRpcRequest = ItemRpcKeys & {
-	condition?: CompiledConditionPlan;
+	condition?: ConditionExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
@@ -139,7 +139,7 @@ export type DeleteItemRpcResponse =
 	| { outcome: "ok"; deleted: boolean; meta: OperationMetrics }
 	| { outcome: "rejected"; reason: RejectionReasonEncoded; meta: OperationMetrics };
 
-export type GetItemRpcRequest = ItemRpcKeys & { projection?: CompiledProjectionPlan };
+export type GetItemRpcRequest = ItemRpcKeys & { projection?: readonly ProjectionExpression[] };
 
 // json data is JSON text here; db.ts parses it once at the public boundary. The type is free of the
 // recursive JsonValue so the Workers-RPC type machinery does not instantiate infinitely deep.
@@ -171,8 +171,8 @@ export type QueryItemsRpcRequest = {
 	allowOversizedFirstItem: boolean;
 	cursor: ScanCursor | null;
 	select: QuerySelect;
-	/** The compiled filter/projection plan, or null for a request with neither. */
-	plan: CompiledQueryPlan | null;
+	/** The filter and the projection, as expression trees, or null for a request with neither. */
+	plan: QueryExpressions | null;
 };
 
 /** The metrics of one leaf scan, named by the leaf. `db.ts` pairs it with the route list of the envelope. */

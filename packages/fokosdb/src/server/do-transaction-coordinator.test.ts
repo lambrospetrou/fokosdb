@@ -2079,6 +2079,7 @@ describe("TransactionCoordinatorDO - the stored cause of a failed prepare", () =
 
 describe("TransactionCoordinatorDO - fatal prepare errors", () => {
 	const fatal = () => new FokosValidationError(VALIDATION_CODES.transact_version_after_write, { message: "refused" });
+	const expressionError = () => new FokosExpressionError(EXPRESSION_CODES.expression_invalid, { message: "not valid" });
 	const transient = () => new FokosUnavailableError(SHARDING_UNAVAILABLE_CODES.partition_migrating, { message: "migrating" });
 
 	/** p1 owns operation 0 and p2 owns operation 1. The row is new, so the tx_recovery job does not drive it. */
@@ -2129,11 +2130,14 @@ describe("TransactionCoordinatorDO - fatal prepare errors", () => {
 	const stateOf = (state: DurableObjectState) =>
 		state.storage.sql.exec<{ state: TCState }>(`SELECT state FROM tc_state WHERE transaction_id = ?`, TX_ID).one().state;
 
-	it("tries a prepare that throws a FokosValidationError one time in drivePrepare, and cancels with its code and error_id", async () => {
+	it.each([
+		["a FokosValidationError", fatal, "transact_version_after_write"],
+		["a FokosExpressionError", expressionError, "expression_invalid"],
+	])("tries a prepare that throws %s one time in drivePrepare, and cancels with its code and error_id", async (_name, make, code) => {
 		await withCoordinator(async (tc, state) => {
 			seed(state, "CREATED", undefined, Date.now());
 			insertParticipant(state, { name: "p1" });
-			const error = fatal();
+			const error = make();
 			const { txPrepare, callsFor } = mockPartitions(async () => {
 				throw error;
 			});
@@ -2144,10 +2148,20 @@ describe("TransactionCoordinatorDO - fatal prepare errors", () => {
 			expect(response).toMatchObject({
 				outcome: "cancelled",
 				results: [
-					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
-					{ outcome: "rejected", reason: { code: "transact_version_after_write", error_id: error.error_id } },
+					{ outcome: "rejected", reason: { code, error_id: error.error_id } },
+					{ outcome: "rejected", reason: { code, error_id: error.error_id } },
 				],
 			});
+		});
+	});
+
+	it("keeps a stored FokosExpressionError when a concurrent drive stores a transport error", async () => {
+		await withCoordinator(async (tc, state) => {
+			twoParticipants(state, "PREPARING", { prepare: "accepted" }, {});
+			const first = expressionError();
+			tc.storePrepareError(TX_ID, "p2", first);
+			tc.storePrepareError(TX_ID, "p2", transient());
+			expect(storedError(state, "p2")).toMatchObject({ code: "expression_invalid", error_id: first.error_id });
 		});
 	});
 
@@ -2253,25 +2267,18 @@ describe("TransactionCoordinatorDO - fatal prepare errors", () => {
 		});
 	});
 
-	it.each([
-		["a FokosExpressionError", () => new FokosExpressionError(EXPRESSION_CODES.expression_invalid, { message: "data-dependent" })],
-		["partition_migrating", transient],
-	])(
-		"still retries %s",
-		async (_name, make) => {
-			await withCoordinator(async (tc, state) => {
-				seed(state, "CREATED", undefined, Date.now());
-				insertParticipant(state, { name: "p1" });
-				const { txPrepare, callsFor } = mockPartitions(async () => {
-					throw make();
-				});
-				vi.spyOn(tc, "runCancel").mockResolvedValue();
-
-				await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
-
-				expect(callsFor(txPrepare)).toHaveLength(DEFAULT_COORDINATOR_CONFIG.participantRetry.prepareMaxAttempts);
+	it("still retries partition_migrating", async () => {
+		await withCoordinator(async (tc, state) => {
+			seed(state, "CREATED", undefined, Date.now());
+			insertParticipant(state, { name: "p1" });
+			const { txPrepare, callsFor } = mockPartitions(async () => {
+				throw transient();
 			});
-		},
-		15_000,
-	);
+			vi.spyOn(tc, "runCancel").mockResolvedValue();
+
+			await tc.drivePrepare(TX_ID, TOKEN, BUDGET_MS);
+
+			expect(callsFor(txPrepare)).toHaveLength(DEFAULT_COORDINATOR_CONFIG.participantRetry.prepareMaxAttempts);
+		});
+	}, 15_000);
 });

@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import { hashTransactionOperations } from "./transaction-idempotency.js";
 import { KeyCodec } from "../sharding/key-codec.js";
 import type { TCWriteOperation } from "./transaction-wire-types.js";
-import { compileConditionExpression } from "./expression/compiler.js";
+import { conditionTree } from "./expression/test-fixtures.js";
+import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
 
 const STANDARD_FINGERPRINT = "21d8dc16298317e5";
 const hash = (ops: TCWriteOperation[]) => hashTransactionOperations(ops, "standard");
@@ -48,15 +49,20 @@ describe("hashTransactionOperations", () => {
 
 	it("changes when the condition changes", () => {
 		const base = put("a", "s", "v");
-		const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
+		const condition = conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] });
 		expect(hash([{ ...base, condition }])).not.toBe(hash([base]));
 	});
 
-	it("uses canonical condition identity instead of generated SQL", () => {
-		const base = put("a", "s", "v");
-		const condition = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 1 }] });
-		const reformatted = { ...condition, sql: `(${condition.sql})` };
-		expect(hash([{ ...base, condition: reformatted }])).toBe(hash([{ ...base, condition }]));
+	it("uses the canonical identity of the condition and of the update", () => {
+		const condition = (): ConditionExpression => ({ op: "eq", args: [{ ref: "data", path: "$.state" }, { val: "open" }] });
+		const update = (count: number): UpdateExpression => [
+			{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: count } },
+		];
+		const base: TCWriteOperation = { ...put("a", "s", "v"), operation: "update", data: undefined, kind: undefined };
+		const fingerprint = hash([{ ...base, condition: condition(), update: update(2) }]);
+		expect(hash([{ ...base, condition: condition(), update: update(2) }])).toBe(fingerprint);
+		expect(hash([{ ...base, condition: { op: "true" }, update: update(2) }])).not.toBe(fingerprint);
+		expect(hash([{ ...base, condition: condition(), update: update(3) }])).not.toBe(fingerprint);
 	});
 
 	// Presence flags exist for this: without them the empty string would chain like no field at all.

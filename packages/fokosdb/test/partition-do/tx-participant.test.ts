@@ -8,7 +8,7 @@ import type { FokosDBRouteContext } from "../../src/shared/partition-context.js"
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import invariant from "../../src/shared/invariant.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
-import { compiledCondition, kb, makeStub, openedRpc, withOpIndex } from "./helpers.js";
+import { conditionTree, kb, makeStub, openedRpc, withOpIndex } from "./helpers.js";
 import { PROMOTION_BIG_DATA, PROMOTION_TEST_MAX_SIZE_MB, makePartition } from "./partition-harness.js";
 
 /** Matches the `results` of a rejected answer that hold a rejected entry whose reason matches `reason`. */
@@ -181,7 +181,7 @@ describe("PartitionDO — single-shot transaction", () => {
 					hashKey: kb("shot-checked"),
 					sortKey: kb("sk"),
 					operation: "check",
-					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+					condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 				},
 			]),
 		});
@@ -213,7 +213,7 @@ describe("PartitionDO — single-shot transaction", () => {
 					hashKey: kb("atomic-absent"),
 					sortKey: kb("sk"),
 					operation: "check",
-					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+					condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 				},
 			]),
 		});

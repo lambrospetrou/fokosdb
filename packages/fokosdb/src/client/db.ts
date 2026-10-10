@@ -100,12 +100,9 @@ import {
 	MAX_RESPONSE_BYTES_PER_PAGE,
 	QueryPageBudget,
 } from "../shared/query/page-budget.js";
-import {
-	compileConditionExpression,
-	compileProjectionExpression,
-	compileQueryExpression,
-	compileUpdateExpression,
-} from "../shared/expression/compiler.js";
+import { canonicalConditionIdentity, canonicalProjectionIdentity } from "../shared/expression/identity.js";
+import { validateConditionExpression, validateProjectionExpression, validateUpdateExpression } from "../shared/expression/semantic.js";
+import type { ConditionExpression } from "../shared/expression/types.js";
 import { projectedItemFromWireRow, type ProjectedWireRow } from "../shared/expression/projection.js";
 import {
 	coordinatorShardGroup,
@@ -511,6 +508,17 @@ export class FokosDB {
 		return await withFokosErrors(async () => await this.#destroy());
 	}
 
+	/**
+	 * Validates a condition, so that a condition that is not valid fails before any I/O. The client
+	 * never compiles: the partition compiles the expression tree, and only the partition checks the
+	 * limits of the compiled SQL.
+	 */
+	#checkCondition(condition: ConditionExpression | undefined): void {
+		if (condition !== undefined) {
+			withExpressionErrors(() => validateConditionExpression(condition));
+		}
+	}
+
 	async #putItem(opts: PutItemOptions): Promise<PutItemResult> {
 		validateTtlAt(opts.ttlAt, "putItem");
 		validateItemKeys(opts.hashKey, opts.sortKey);
@@ -519,7 +527,7 @@ export class FokosDB {
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
 		// Encode data once at this boundary; the DO receives string | Uint8Array + kind.
 		const encoded = encodeItemData(opts.data);
-		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
+		this.#checkCondition(opts.condition);
 		// Measured on the ENCODED form, so a json payload is capped by the text actually stored and
 		// the same item is accepted or rejected identically here and in transactWriteItems.
 		validateItemDataSize(encoded.data, "putItem");
@@ -532,7 +540,7 @@ export class FokosDB {
 				data: encoded.data,
 				kind: encoded.kind,
 				ttlAt: opts.ttlAt,
-				condition,
+				condition: opts.condition,
 				returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure,
 			},
 		);
@@ -547,8 +555,8 @@ export class FokosDB {
 		validateItemKeys(opts.hashKey, opts.sortKey);
 		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
-		const projection =
-			opts.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(opts.projection!));
+		const { projection } = opts;
+		const names = projection === undefined ? undefined : withExpressionErrors(() => validateProjectionExpression(projection)).names;
 		const { value: res, routing } = await this.#partitions.point(
 			"apiGetItem",
 			{ hashKey, sortKey },
@@ -559,13 +567,13 @@ export class FokosDB {
 		// json data arrives as JSON text — parse it once here to the public JsonValue.
 		if (res.found) {
 			if (res.item.kind === "projected") {
-				invariant(projection, "fokos/getItem: projected response without a projection plan");
+				invariant(names, "fokos/getItem: projected response without a projection");
 				return {
 					found: true,
 					item: {
 						hashKey: opts.hashKey,
 						sortKey: opts.sortKey,
-						data: projectedItemFromWireRow(projection.names, res.item.projected),
+						data: projectedItemFromWireRow(names, res.item.projected),
 						kind: "projected",
 						...(res.item.ttlAt === undefined ? {} : { ttlAt: res.item.ttlAt }),
 						version: res.item.version,
@@ -587,11 +595,11 @@ export class FokosDB {
 		validateReturnValuesOnConditionCheckFailure(opts.returnValuesOnConditionCheckFailure);
 		const hashKey = encodeHashKey(opts.hashKey, this.#limits);
 		const sortKey = encodeSortKey(opts.sortKey, this.#limits);
-		const condition = opts.condition ? withExpressionErrors(() => compileConditionExpression(opts.condition!)) : undefined;
+		this.#checkCondition(opts.condition);
 		const { value: res, routing } = await this.#partitions.point(
 			"apiDeleteItem",
 			{ hashKey, sortKey },
-			{ hashKey, sortKey, condition, returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure },
+			{ hashKey, sortKey, condition: opts.condition, returnValuesOnConditionCheckFailure: opts.returnValuesOnConditionCheckFailure },
 		);
 		if (res.outcome === "rejected") {
 			throw conditionCheckError(opts, res, routing);
@@ -606,20 +614,21 @@ export class FokosDB {
 			validateClientRequestToken(opts.clientRequestToken);
 		}
 
-		// Encode each put, compile each update, and compile each condition once at this boundary. A `data`
-		// field set on a non-put by a non-TypeScript caller stays present so validation rejects it.
+		// Encode each put, and check each condition and each update, once at this boundary. Each operation
+		// keeps its expression trees. A `data` field set on a non-put by a non-TypeScript caller stays
+		// present so validation rejects it.
 		const prepared = opts.items.map((item) => {
-			const condition = item.condition ? withExpressionErrors(() => compileConditionExpression(item.condition!)) : undefined;
+			this.#checkCondition(item.condition);
 			if (item.operation === "update") {
 				validateTtlAt(item.ttlAt, "transactWriteItems");
-				const update = withExpressionErrors(() => compileUpdateExpression(item.update));
-				return { ...item, update, condition };
+				withExpressionErrors(() => validateUpdateExpression(item.update));
+				return item;
 			}
 			if (item.operation !== "put") {
-				return { ...item, condition };
+				return item;
 			}
 			validateTtlAt(item.ttlAt, "transactWriteItems");
-			return { ...item, ...encodeItemData(item.data), condition };
+			return { ...item, ...encodeItemData(item.data) };
 		});
 		// Validation encodes each key exactly once and hands the canonical bytes back in input order.
 		const keys = validateTransactWriteOperations(prepared, this.#limits, executionMode);
@@ -732,14 +741,15 @@ export class FokosDB {
 	// the caller knows which type belongs to which position.
 	async #transactGetItems(opts: { items: readonly TransactGetItemKey[] }): Promise<TransactGetItemsResult> {
 		validateTransactGetItemCount(opts.items.length);
-		// Each item is built explicitly: the raw projection AST never crosses the RPC boundary, only the
-		// compiled plan does, and only when the caller asked for one.
+		// Each item is built explicitly, and it carries its projection only when the caller asked for one.
+		// `names[i]` holds the output names of the projection of item `i`.
+		const names: (readonly string[] | undefined)[] = [];
 		const items: TransactionReadItem[] = opts.items.map((item) => {
 			validateItemKeys(item.hashKey, item.sortKey);
 			const hashKey = encodeHashKey(item.hashKey, this.#limits);
 			const sortKey = encodeSortKey(item.sortKey, this.#limits);
-			const projection =
-				item.projection === undefined ? undefined : withExpressionErrors(() => compileProjectionExpression(item.projection!));
+			const { projection } = item;
+			names.push(projection === undefined ? undefined : withExpressionErrors(() => validateProjectionExpression(projection)).names);
 			return { hashKey, sortKey, ...(projection === undefined ? {} : { projection }) };
 		});
 		validateTransactGetItemKeys(items);
@@ -764,13 +774,13 @@ export class FokosDB {
 					return { ...keys, found: false as const };
 				}
 				if (item.kind === "projected") {
-					// items[i] answers request.items[i], so the record's names come from that item's own plan.
-					const plan = items[index].projection;
-					invariant(plan, "fokos/transactGetItems: projected result without a projection plan");
+					// items[i] answers request.items[i], so the names of the record come from the projection of that item.
+					const itemNames = names[index];
+					invariant(itemNames, "fokos/transactGetItems: projected result without a projection");
 					return {
 						...keys,
 						found: true as const,
-						data: projectedItemFromWireRow(plan.names, item.projected),
+						data: projectedItemFromWireRow(itemNames, item.projected),
 						kind: "projected" as const,
 						version: item.version,
 						...(item.ttlAt === undefined ? {} : { ttlAt: item.ttlAt }),
@@ -937,10 +947,20 @@ export class FokosDB {
 				message: 'a projection is not valid with select "count"',
 			});
 		}
-		const plan =
-			opts.filter === undefined && opts.projection === undefined
-				? null
-				: withExpressionErrors(() => compileQueryExpression({ filter: opts.filter, projection: opts.projection }));
+		// The partition gets the expression trees and compiles them. The client validates them, which
+		// gives the names of the projection, and computes their identities for the cursor.
+		const { filter, projection } = opts;
+		const expressions = filter === undefined && projection === undefined ? null : { filter, projection };
+		const { filterIdentity, projectionIdentity, projectionNames } = withExpressionErrors(() => {
+			if (filter !== undefined) {
+				validateConditionExpression(filter, "filter");
+			}
+			return {
+				filterIdentity: filter === undefined ? null : canonicalConditionIdentity(filter),
+				projectionNames: projection === undefined ? null : validateProjectionExpression(projection).names,
+				projectionIdentity: projection === undefined ? null : canonicalProjectionIdentity(projection),
+			};
+		});
 
 		const normalizedQueries = opts.queries.map((q) => {
 			const direction = (q.scanIndexForward ?? true) ? ("asc" as const) : ("desc" as const);
@@ -955,7 +975,7 @@ export class FokosDB {
 				cursorDirection: direction === "asc" ? ("fwd" as const) : ("rev" as const),
 			};
 		});
-		const fingerprint = computeCursorFingerprint(normalizedQueries, plan?.filterIdentity ?? null, plan?.projectionIdentity ?? null);
+		const fingerprint = computeCursorFingerprint(normalizedQueries, filterIdentity, projectionIdentity);
 
 		const budget = new QueryPageBudget({
 			remainingEvaluatedItems: Math.min(opts.limit ?? DEFAULT_EVALUATED_ITEMS_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE),
@@ -1026,7 +1046,7 @@ export class FokosDB {
 					allowOversizedFirstItem: budget.allowOversizedFirstItem,
 					cursor: rpcCursor,
 					select,
-					plan,
+					plan: expressions,
 				},
 			);
 
@@ -1034,9 +1054,9 @@ export class FokosDB {
 			scannedCount += rpcResult.scannedCount;
 			rowsReturned += rpcResult.rowsReturned;
 			if (select === "projection") {
-				if (plan?.projection) {
+				if (projectionNames) {
 					for (const item of rpcResult.items) {
-						items.push(projectedItemFromWireRow(plan.projection.names, item as ProjectedWireRow));
+						items.push(projectedItemFromWireRow(projectionNames, item as ProjectedWireRow));
 					}
 				} else {
 					for (const item of rpcResult.items) {

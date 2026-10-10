@@ -52,3 +52,6 @@ export type UpdateTarget = { ref: "data"; path: string };
 export type UpdateAction = { action: "set"; target: UpdateTarget; value: ExpressionValue } | { action: "remove"; target: UpdateTarget };
 
 export type UpdateExpression = readonly UpdateAction[];
+
+/** The filter and the projection of a query request. A request carries one of them or both. */
+export type QueryExpressions = { filter?: ConditionExpression; projection?: readonly ProjectionExpression[] };

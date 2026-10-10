@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex } from "../../src/sharding/partition-id.js";
-import { compileUpdateExpression } from "../../src/shared/expression/compiler.js";
+import { updateTree } from "../../src/shared/expression/test-fixtures.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import type { PrepareRequest, TransactionItem, TransactionItemKey } from "../../src/shared/transaction-wire-types.js";
 import { testCoordinatorRef } from "../stub-helpers.js";
@@ -24,7 +24,7 @@ import {
 
 type Op = Omit<TransactionItem, "opIndex">;
 
-const incN = compileUpdateExpression([
+const incN = updateTree([
 	{
 		action: "set",
 		target: { ref: "data", path: "$.n" },

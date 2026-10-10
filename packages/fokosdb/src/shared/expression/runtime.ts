@@ -221,8 +221,8 @@ export function validateUpdatePlan(plan: CompiledUpdatePlan): void {
 	if (plan.bindings.length !== plan.bindingCount || plan.completeBindingCount !== UPDATE_FIXED_BINDING_COUNT + plan.bindingCount) {
 		throw new ExpressionError("sql_limit", "update plan has an invalid binding count");
 	}
-	// The compiler charged the widest tail to the plan; re-check it here, because the plan crossed the
-	// wire and a statement that binds its tail past the cap fails with no useful error.
+	// The compiler charged the widest tail to the plan; re-check it here, because a statement that
+	// binds its tail past the cap fails with no useful error.
 	if (plan.completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > EXPRESSION_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "update plan exceeds the complete statement binding limit");
 	}

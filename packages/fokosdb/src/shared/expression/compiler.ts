@@ -255,7 +255,7 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 	// The budget belongs to the WIDEST statement that runs this plan, not to the plan alone. Workers
 	// SQLite caps one query at completeStatementBindings parameters, and every such statement binds the
 	// keys before the plan and its own tail after it. Charging both here rejects an over-budget update
-	// in the client, with a limit error, instead of letting a partition fail on it mid-transaction.
+	// with a limit error, before a statement of the partition fails on it.
 	const completeBindingCount = UPDATE_FIXED_BINDING_COUNT + context.bindings.length;
 	if (completeBindingCount + UPDATE_MAX_TRAILING_BINDING_COUNT > EXPRESSION_LIMITS.completeStatementBindings) {
 		throw new ExpressionError("sql_limit", "complete statement exceeds the binding limit");

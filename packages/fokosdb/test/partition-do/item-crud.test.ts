@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
+import { projectionTree } from "../../src/shared/expression/test-fixtures.js";
 import { kb, makeStub } from "./helpers.js";
 
 describe.concurrent("PartitionDO - putItem / getItem", () => {
@@ -141,7 +141,7 @@ describe.concurrent("PartitionDO - putItem / getItem", () => {
 			data: JSON.stringify({ n: 7, none: null, k: [1, 2] }),
 			kind: "json",
 		});
-		const projection = compileProjectionExpression([
+		const projection = projectionTree([
 			{ expr: { ref: "data", path: "$.n" } },
 			{ expr: { ref: "data", path: "$.none" } },
 			{ expr: { ref: "data", path: "$.k" }, as: "k" },

@@ -16,7 +16,7 @@ import {
 } from "../../src/shared/partition-context.js";
 import { txOrderTimestampNow, type FokosDBLimitOverrides } from "../../src/shared/transaction-limits.js";
 import type { TransactionItem } from "../../src/shared/transaction-wire-types.js";
-import type { ControlledPartitionDO, TxOp, TxRequest } from "../controlled-partition-do.js";
+import { recordedTxCalls, type ControlledPartitionDO, type TxOp, type TxRequest } from "../controlled-partition-do.js";
 import type { ControlledTransactionCoordinatorDO } from "../controlled-transaction-coordinator-do.js";
 import { openedRpc } from "../partition-do/helpers.js";
 import { testCoordinatorRef, testPartitionStub } from "../stub-helpers.js";
@@ -208,8 +208,7 @@ export function controlledPartition(db: FokosDB, key: Key): DurableObjectStub<Co
  */
 export async function txCalls<Op extends TxOp>(db: FokosDB, keys: Key[], op: Op): Promise<TxRequest<Op>[]> {
 	const partitions = new Map(keys.map((key) => [partitionNameOf(db, key), controlledPartition(db, key)]));
-	// The RPC stub type drops the type parameter of `testTxCalls`, so the cast restores it.
-	return (await Promise.all([...partitions.values()].map((p) => p.testTxCalls(op)))).flat() as TxRequest<Op>[];
+	return (await Promise.all([...partitions.values()].map((p) => recordedTxCalls(p, op)))).flat();
 }
 
 /** The router of the coordinator group of a table, built as FokosDB builds it: `fokos.tc.<tableName>`. */

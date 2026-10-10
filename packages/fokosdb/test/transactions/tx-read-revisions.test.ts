@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
+import { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
+import { recordedTxCalls } from "../controlled-partition-do.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
 	betweenPhases,
@@ -15,7 +16,7 @@ import {
 
 const kb = (s: string) => KeyCodec.encode(s);
 
-const itemExists = () => compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
+const itemExists = () => conditionTree({ op: "exists", args: [{ ref: "hashKey" }] });
 
 describe("transactGetItems — read revisions and pending checks", () => {
 	it("a committed check between the phases does not abort the read", async () => {
@@ -201,8 +202,8 @@ describe("transactGetItems — read revisions and pending checks", () => {
 			await releasePut();
 		}
 
-		expect(await partition.testTxCalls("txReadSnapshot")).toHaveLength(2);
-		expect(await partition.testTxCalls("txReadForTransaction")).toHaveLength(0);
+		expect(await recordedTxCalls(partition, "txReadSnapshot")).toHaveLength(2);
+		expect(await recordedTxCalls(partition, "txReadForTransaction")).toHaveLength(0);
 	});
 
 	it("a committed put between the phases aborts a projected read", async () => {

@@ -1,3 +1,4 @@
+import { FokosValidationError, VALIDATION_CODES } from "../errors.js";
 import type { JsonPrimitive } from "../json-types.js";
 import { JSON_KIND_CODE } from "../partition/item-size.js";
 import type { QuerySelect } from "../types.js";
@@ -124,7 +125,7 @@ export type ExpressionBindingLayout = "direct" | "pool";
 
 /**
  * Compiled SQL plan for evaluating a write condition expression.
- * The plan is JSON-serializable and survives coordinator persistence.
+ * The plan lives for one request in the node that compiled it. No request and no table carries it.
  */
 export type CompiledConditionPlan = {
 	/** Plan schema version number. */
@@ -159,7 +160,7 @@ export type CompiledConditionPlan = {
 
 /**
  * Compiled SQL plan for applying an update expression to a JSON item.
- * The plan is JSON-serializable and survives coordinator persistence.
+ * The plan lives for one request in the node that compiled it. No request and no table carries it.
  */
 export type CompiledUpdatePlan = {
 	/** Plan schema version number. */
@@ -211,7 +212,7 @@ export type CompiledUpdatePlan = {
 
 /**
  * Compiled SQL plan for a projected point read.
- * The plan is JSON-serializable and crosses the RPC boundary to the partition.
+ * The plan lives for one request in the node that compiled it. No request and no table carries it.
  */
 export type CompiledProjectionPlan = {
 	/** Plan schema version number. */
@@ -247,7 +248,7 @@ export type CompiledProjectionPlan = {
 
 /**
  * Compiled SQL plan for one queryItems leaf scan with a filter, a projection, or both.
- * The plan is JSON-serializable and crosses the RPC boundary to the partition.
+ * The plan lives for one request in the node that compiled it. No request and no table carries it.
  */
 export type CompiledQueryPlan = {
 	/** Plan schema version number. */
@@ -280,3 +281,15 @@ export type CompiledQueryPlan = {
 	/** Canonical deterministic fingerprint of the projection, or null without one. */
 	projectionIdentity: string | null;
 };
+
+/**
+ * Throws when a request carries a compiled plan in place of an expression tree. A partition runs only
+ * the SQL that it compiled from a tree. Only a plan has a `kind` field and a `version` field.
+ */
+export function refuseCompiledPlan(expression: object): void {
+	if ("kind" in expression && "version" in expression) {
+		throw new FokosValidationError(VALIDATION_CODES.compiled_plan_refused, {
+			message: "a request must carry an expression tree, not a compiled plan",
+		});
+	}
+}

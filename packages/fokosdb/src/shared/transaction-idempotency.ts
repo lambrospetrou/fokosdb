@@ -6,6 +6,7 @@
  */
 
 import { hash64 } from "../sharding/hash-primitives.js";
+import { canonicalConditionIdentity, canonicalUpdateIdentity } from "./expression/identity.js";
 import type { TCWriteOperation } from "./transaction-wire-types.js";
 import type { TransactWriteExecutionMode } from "./transaction-api-types.js";
 
@@ -37,10 +38,10 @@ function hashOperation(op: TCWriteOperation): bigint {
 		h = hash64(String(op.ttlAt), h);
 	}
 	if (op.condition !== undefined) {
-		h = hash64(op.condition.identity, h);
+		h = hash64(canonicalConditionIdentity(op.condition), h);
 	}
 	if (op.update !== undefined) {
-		h = hash64(op.update.identity, h);
+		h = hash64(canonicalUpdateIdentity(op.update), h);
 	}
 	return h;
 }

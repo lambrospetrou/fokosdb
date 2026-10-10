@@ -6,11 +6,11 @@ import { exists, one, tryOne } from "../sql-cursor.js";
 import {
 	composeQueryStatement,
 	UPDATE_MAX_TRAILING_BINDING_COUNT,
-	type CompiledConditionPlan,
-	type CompiledProjectionPlan,
 	type CompiledQueryPlan,
 	type CompiledUpdatePlan,
 } from "../expression/plan.js";
+import type { ConditionExpression, ProjectionExpression, QueryExpressions, UpdateExpression } from "../expression/types.js";
+import { conditionPlanOf, projectionPlanOf, queryPlanOf, updatePlanOf } from "../expression/request-plans.js";
 import { materializedPlanBindings } from "../expression/bindings.js";
 import { decodeProjectedRow, type ProjectedWireRow } from "../expression/projection.js";
 import {
@@ -863,16 +863,28 @@ export class PartitionStore {
 		return { row, rowsRead: res.rowsRead, rowsWritten: res.rowsWritten };
 	}
 
-	evaluateCondition(plan: CompiledConditionPlan, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
-		return withExpressionErrors(() => evaluateConditionPlan(this.#storage, plan, hk, sk));
+	// Each method below that takes an expression compiles a tree before its statement runs. A tree that
+	// does not compile throws before the method reads or writes a row.
+
+	evaluateCondition(condition: ConditionExpression, hk: KeyBytes, sk: KeyBytes): ConditionEvaluationResult {
+		return withExpressionErrors(() => evaluateConditionPlan(this.#storage, conditionPlanOf(condition), hk, sk));
 	}
 
-	getItemProjected(plan: CompiledProjectionPlan, hk: KeyBytes, sk: KeyBytes): ProjectedReadResult {
-		return withExpressionErrors(() => readProjectedItem(this.#storage, plan, hk, sk));
+	getItemProjected(projection: readonly ProjectionExpression[], hk: KeyBytes, sk: KeyBytes): ProjectedReadResult {
+		return withExpressionErrors(() => readProjectedItem(this.#storage, projectionPlanOf(projection), hk, sk));
 	}
 
-	probeUpdate(plan: CompiledUpdatePlan, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
-		return withExpressionErrors(() => probeUpdatePlan(this.#storage, plan, hk, sk));
+	probeUpdate(update: UpdateExpression, hk: KeyBytes, sk: KeyBytes): UpdateProbeResult {
+		return withExpressionErrors(() => probeUpdatePlan(this.#storage, updatePlanOf(update), hk, sk));
+	}
+
+	/** The validated plan of an update that a write statement runs. */
+	#updatePlan(update: UpdateExpression): CompiledUpdatePlan {
+		return withExpressionErrors(() => {
+			const plan = updatePlanOf(update);
+			validateUpdatePlan(plan);
+			return plan;
+		});
 	}
 
 	/**
@@ -1470,14 +1482,19 @@ export class PartitionStore {
 	 * statement selects `matched` plus the gated columns its mode needs.
 	 */
 	scanQueryPage(
-		opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: CompiledQueryPlan | null },
+		opts: RangeScanBounds & { limit: number; select: QuerySelect; plan: QueryExpressions | null },
 		consumer: QueryCandidateConsumer,
 	): SqlMetrics {
-		const plan = opts.plan;
-		if (plan !== null) {
-			withExpressionErrors(() => validateQueryPlan(plan));
-		}
-		const { sql, params } = queryScanStatement(opts);
+		const query = opts.plan;
+		const plan =
+			query === null
+				? null
+				: withExpressionErrors(() => {
+						const compiled = queryPlanOf(query);
+						validateQueryPlan(compiled);
+						return compiled;
+					});
+		const { sql, params } = queryScanStatement({ ...opts, plan });
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const entryCount = plan?.projection?.names.length ?? 0;
 		// The mode is fixed per request. A count scan carries no payload, a complete-item scan carries
@@ -1610,16 +1627,16 @@ export class PartitionStore {
 		hk: KeyBytes;
 		sk: KeyBytes;
 		tx: PendingTxInfo;
-		plan: CompiledUpdatePlan;
+		plan: UpdateExpression;
 		ttlAt?: number;
 		opList: OpList;
 	}): {
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		validateUpdatePlan(opts.plan);
+		const plan = this.#updatePlan(opts.plan);
 		this.#upsertPendingTx(opts.tx);
-		const tail = new StatementTail(opts.plan);
+		const tail = new StatementTail(plan);
 		const transactionIdParam = tail.param(opts.tx.transaction_id);
 		const opListParam = tail.param(JSON.stringify(opts.opList));
 		// The TTL of the pre-image survives unless the operation sets one. WHICH branch applies is known
@@ -1629,7 +1646,7 @@ export class PartitionStore {
 
 		const res = this.#storage.sql.exec(
 			`INSERT OR IGNORE INTO pending_transactions (hk, sk, transaction_id, operation, op_list, data_kind, ttl_epoch_utc_seconds, data)
-			SELECT ?1, ?2, ${transactionIdParam}, 'update', ${opListParam}, ${JSON_KIND_CODE}, ${ttlExpr}, ${opts.plan.documentSql}
+			SELECT ?1, ?2, ${transactionIdParam}, 'update', ${opListParam}, ${JSON_KIND_CODE}, ${ttlExpr}, ${plan.documentSql}
 			FROM (VALUES (1)) LEFT JOIN items AS i ON i.hk = ?1 AND i.sk = ?2`,
 			...tail.bindings(opts.hk, opts.sk),
 		);
@@ -1643,22 +1660,22 @@ export class PartitionStore {
 	 *
 	 * Throws when the new document would exceed MAX_ITEM_BYTES — see throwItemTooLarge.
 	 */
-	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: CompiledUpdatePlan; ttlAt?: number; txOrderTs: number }): {
+	updateItemSingleShot(opts: { hk: KeyBytes; sk: KeyBytes; plan: UpdateExpression; ttlAt?: number; txOrderTs: number }): {
 		version: number;
 		keyEstBytes: number;
 		rowsRead: number;
 		rowsWritten: number;
 	} {
-		validateUpdatePlan(opts.plan);
+		const plan = this.#updatePlan(opts.plan);
 		// Zero means the row is absent, never a row of zero size: est_row_bytes always carries both keys
 		// and EST_ROW_BYTES_K. It is also the right old value for the key_size_estimates delta of an
 		// item this statement creates. The size guard is then the only cause of a statement that writes
 		// no row, which is what lets it report that one cause.
 		const oldEst = this.#storedEstRowBytes(opts.hk, opts.sk);
-		const docExpr = opts.plan.documentSql;
+		const docExpr = plan.documentSql;
 		const hkParam = "?1";
 		const skParam = "?2";
-		const tail = new StatementTail(opts.plan);
+		const tail = new StatementTail(plan);
 		const txOrderTsParam = tail.param(opts.txOrderTs);
 		// The TTL of the pre-image survives unless the operation sets one: the insert then carries the
 		// joined row's TTL, which is NULL for an item this statement creates, and the conflict branch

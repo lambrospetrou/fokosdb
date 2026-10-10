@@ -8,8 +8,8 @@ import type { FokosDBRouteContext } from "../../src/shared/partition-context.js"
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { hashChildIndex, PartitionIdHelper, resolveHashChildPartitionContexts } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
-import { compiledCondition, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
-import { compileProjectionExpression } from "../../src/shared/expression/compiler.js";
+import { conditionTree, expectSplitStatus, kb, makeStub, opened, openedRpc } from "./helpers.js";
+import { projectionTree } from "../../src/shared/expression/test-fixtures.js";
 import { fokosErrorWith } from "../errors-matchers.js";
 import {
 	assertSplitTreeComplete,
@@ -260,7 +260,7 @@ describe("PartitionDO - splitting", () => {
 				sortKey: kb("sk"),
 				data: "val",
 				kind: "text" as const,
-				condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+				condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 			});
 			expect(putResult.meta.forwardCount).toBe(1);
 			expect(putResult.meta.servedByActorName).not.toBe(ctx.doName);
@@ -293,7 +293,7 @@ describe("PartitionDO - splitting", () => {
 				kind: "json",
 			});
 
-			const projection = compileProjectionExpression([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
+			const projection = projectionTree([{ expr: { ref: "data", path: "$.n" } }, { expr: { ref: "v" }, as: "ver" }]);
 			const result = await rpc.apiGetItem(ctx, { hashKey: kb(hashKey), sortKey: kb("sk"), projection });
 			expect(result).toMatchObject({ found: true, item: { projected: [3, 1], kind: "projected" } });
 			expect(result.meta.forwardCount).toBe(1);
@@ -691,7 +691,7 @@ describe("PartitionDO - splitting", () => {
 				}
 
 				// A projected read takes the same fallback: the parent answers the wire cells.
-				const projection = compileProjectionExpression([{ expr: { ref: "data" } }]);
+				const projection = projectionTree([{ expr: { ref: "data" } }]);
 				const alphaOwner = await partition.childOwning("alpha");
 				const projected = await alphaOwner.get({ hashKey: kb("alpha"), sortKey: kb("s1"), projection });
 				expect(projected).toMatchObject({

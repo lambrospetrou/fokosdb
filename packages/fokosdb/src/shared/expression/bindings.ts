@@ -7,7 +7,7 @@ const poolBindingsCache = new WeakMap<readonly ExpressionBindingDescriptor[], re
 
 /**
  * The bound values of a plan, materialized once per plan object and shared by every statement that
- * runs the plan. A plan arrives once per request and several statements bind it (a probe, then a
+ * runs the plan. A partition compiles a plan once per request and several statements bind it (a probe, then a
  * lock or a write; one leaf scan per child), so the descriptors are decoded one time instead of one
  * time per statement. The cache is keyed by the descriptor array, which no code mutates after the
  * compiler builds it, and it holds the plan weakly so a finished request releases its values.

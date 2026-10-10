@@ -2,7 +2,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../server/do-partition.js";
 import { testPartitionStub } from "../../../test/stub-helpers.js";
-import { compileProjectionExpression, compileUpdateExpression } from "../expression/compiler.js";
+import { projectionTree, updateTree } from "../expression/test-fixtures.js";
 import type { UpdateExpression } from "../expression/types.js";
 import { type KeyBytes, KeyCodec } from "../../sharding/key-codec.js";
 import invariant from "../invariant.js";
@@ -177,7 +177,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const doc = { n: 7, s: "x", none: null, k: [1, 2] };
 			store.upsertItem({ hk: kb("hk"), sk: kb("j"), data: JSON.stringify(doc), kind: "json", ttlAt: 1234, txOrderTs: 0 });
-			const plan = compileProjectionExpression([
+			const plan = projectionTree([
 				{ expr: { ref: "data", path: "$.n" } },
 				{ expr: { ref: "data", path: "$.absent" }, as: "missing" },
 				{ expr: { ref: "data", path: "$.none" } },
@@ -196,7 +196,7 @@ describe("PartitionStore - items", () => {
 
 			const bin = new Uint8Array([9, 8]);
 			store.upsertItem({ hk: kb("hk"), sk: kb("b"), data: bin, kind: "bytes", ttlAt: null, txOrderTs: 0 });
-			const binPlan = compileProjectionExpression([{ expr: { ref: "data" } }]);
+			const binPlan = projectionTree([{ expr: { ref: "data" } }]);
 			expect(store.getItemProjected(binPlan, kb("hk"), kb("b")).row?.projected).toEqual([bin]);
 
 			expect(store.getItemProjected(plan, kb("hk"), kb("missing")).row).toBeUndefined();
@@ -728,7 +728,7 @@ describe("PartitionStore - items", () => {
 	it("updateItemSingleShot creates the absent item, then increments the version it created", async () => {
 		await withStore((store, state) => {
 			const update: UpdateExpression = [{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }];
-			const plan = compileUpdateExpression(update);
+			const plan = updateTree(update);
 			const hk = kb("created-hk");
 			const sk = kb("created-sk");
 
@@ -751,7 +751,7 @@ describe("PartitionStore - items", () => {
 		await withStore((store) => {
 			const hk = kb("hk");
 			const sk = kb("sk");
-			const plan = (x: number) => compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: x } }]);
+			const plan = (x: number) => updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: x } }]);
 
 			// As if committed by a transaction whose coordinator clock ran ahead of this partition's.
 			store.upsertItem({ hk, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 5_000 });
@@ -776,7 +776,7 @@ describe("PartitionStore - items", () => {
 			const hk = kb("hk");
 			const sk = kb("sk");
 			store.upsertItem({ hk, sk, data: JSON.stringify({ count: 5 }), kind: "json", ttlAt: null, txOrderTs: 1 });
-			const plan = compileUpdateExpression([
+			const plan = updateTree([
 				{
 					action: "set",
 					target: { ref: "data", path: "$.count" },
@@ -842,7 +842,7 @@ describe("PartitionStore - items", () => {
 			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 600 });
 
 			// A single-shot update stamped between the two watermarks lands between them too.
-			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
 			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 650 });
 			expect(timestamps()).toMatchObject({ last_read_ts: 700, last_write_ts: 650 });
 		});
@@ -855,7 +855,7 @@ describe("PartitionStore - items", () => {
 			const update: UpdateExpression = [
 				{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: "a".repeat(MAX_ITEM_BYTES) } },
 			];
-			const plan = compileUpdateExpression(update);
+			const plan = updateTree(update);
 			expect(() => store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 1 })).toThrow(fokosErrorWith("item_too_large"));
 			expect(store.getItem(hk, sk).row).toBeUndefined();
 		});
@@ -870,7 +870,7 @@ describe("PartitionStore - items", () => {
 				{ action: "set", target: { ref: "data", path: "$.hk" }, value: { ref: "hashKey" } },
 				{ action: "set", target: { ref: "data", path: "$.sk" }, value: { ref: "sortKey" } },
 			];
-			const plan = compileUpdateExpression(update);
+			const plan = updateTree(update);
 			store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
 			const { row } = store.getItem(hk, sk);
 			expect(row).toBeDefined();
@@ -893,7 +893,7 @@ describe("PartitionStore - items", () => {
 				{ fn: "sqlite.coalesce" as const, args: [{ ref: "sortKey" as const }, { val: "fallback" }] },
 			];
 			for (const value of values) {
-				const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression);
+				const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value }] as UpdateExpression);
 				const probe = store.probeUpdate(plan, hk, sk);
 				expect(probe.applicable).toBe(false);
 				expect(probe.valueTypeOk).toBe(false);
@@ -910,7 +910,7 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk, sk, data: JSON.stringify({ note: "short" }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			const before = kseBytes(state, "hk");
 
-			const plan = compileUpdateExpression([
+			const plan = updateTree([
 				{ action: "set", target: { ref: "data", path: "$.note" }, value: { val: "a considerably longer note than the first one" } },
 			]);
 			const res = store.updateItemSingleShot({ hk, sk, plan, txOrderTs: 2 });
@@ -1003,13 +1003,13 @@ describe("PartitionStore - items", () => {
 			store.upsertItem({ hk, sk, data: JSON.stringify({ a: 1 }), kind: "json", ttlAt: null, txOrderTs: 1 });
 			// A missing target parent is inapplicable, but the values are fine, so the cause is not the
 			// value type. Only that distinction lets a caller tell a fixable value from a stale item.
-			const missingParent = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } }]);
+			const missingParent = updateTree([{ action: "set", target: { ref: "data", path: "$.absent.x" }, value: { val: 1 } }]);
 			const probe = store.probeUpdate(missingParent, hk, sk);
 			expect(probe.applicable).toBe(false);
 			expect(probe.valueTypeOk).toBe(true);
 
 			// A text key is a valid update value, so the same plan that fails over a binary key applies here.
-			const keyValue = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
+			const keyValue = updateTree([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
 			expect(store.probeUpdate(keyValue, hk, sk)).toMatchObject({ applicable: true, valueTypeOk: true });
 		});
 	});
@@ -1215,7 +1215,7 @@ describe("PartitionStore - deletion watermark", () => {
 describe("PartitionStore - max_deleted_v and the timestamp watermark of a key", () => {
 	const text = (store: PartitionStore, hk: string, txOrderTs: number) =>
 		store.upsertItem({ hk: kb(hk), sk: kb("s"), data: "d", kind: "text", ttlAt: null, txOrderTs }).version;
-	const setA = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+	const setA = updateTree([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
 	const row = (store: PartitionStore, hk: string) => store.getItem(kb(hk), kb("s")).row;
 
 	it("starts the first item row of a new partition at v = 1", async () => {

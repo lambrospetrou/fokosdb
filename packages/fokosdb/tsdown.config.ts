@@ -2,8 +2,12 @@ import { gzipSync } from "node:zlib";
 import { transformSync } from "esbuild";
 import { defineConfig } from "tsdown";
 
-/** Source directory that the client entry must never reach. */
-const CLIENT_FORBIDDEN_SRC = "src/server/";
+/**
+ * Sources that the client entry must never reach: the Durable Object classes, and the expression
+ * compiler. Only a partition compiles an expression, so the limits of the compiled SQL come from the
+ * partition and never from the package version of a client.
+ */
+const CLIENT_FORBIDDEN_SRC = ["src/server/", "src/shared/expression/compiler.ts", "src/shared/expression/request-plans.ts"];
 
 /** Bare specifiers that the client is allowed to import at runtime. */
 const CLIENT_ALLOWED_EXTERNALS = [/^cloudflare:workers$/, /^xxhash-wasm$/, /^durable-utils\//];
@@ -155,11 +159,11 @@ export default defineConfig({
 
 					const serverModules = chunks
 						.flatMap((chunk) => chunk.moduleIds)
-						.filter((id) => id.includes(CLIENT_FORBIDDEN_SRC))
+						.filter((id) => CLIENT_FORBIDDEN_SRC.some((rule) => id.includes(rule)))
 						.sort();
 					if (serverModules.length > 0) {
 						this.error(
-							`The client bundle contains server modules. Import them with \`import type\` only, or move the shared part to src/shared/:\n  ${serverModules.join("\n  ")}`,
+							`The client bundle contains server modules or the expression compiler. Import them with \`import type\` only, or move the shared part to src/shared/:\n  ${serverModules.join("\n  ")}`,
 						);
 					}
 

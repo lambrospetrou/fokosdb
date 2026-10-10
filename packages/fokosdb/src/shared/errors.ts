@@ -321,6 +321,7 @@ export const VALIDATION_CODES = defineCodes("FokosValidationError", "caller", 40
 	transact_payload_too_large: "hsvepa",
 	transact_operation_fields_invalid: "jr49a5",
 	transact_version_after_write: "ja8vq2",
+	compiled_plan_refused: "shbucy",
 	transact_execution_mode_invalid: "k7nq3d",
 	query_queries_empty: "k44ag9",
 	query_limit_invalid: "k4g8z5",

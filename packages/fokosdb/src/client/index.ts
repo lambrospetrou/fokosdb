@@ -89,7 +89,6 @@ export type {
 export type { ProjectedItem, ProjectedValue } from "../shared/expression/projection.js";
 
 export { ExpressionError } from "../shared/expression/errors.js";
-export { compileConditionExpression, compileUpdateExpression } from "../shared/expression/compiler.js";
 
 // ─── Table options ────────────────────────────────────────────────────────────
 

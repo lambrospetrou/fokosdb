@@ -16,11 +16,14 @@ import type {
 	TransactionOperationType,
 	TransactionTimestamp,
 } from "./transaction-wire-types.js";
-import type { CompiledConditionPlan, CompiledUpdatePlan } from "./expression/plan.js";
+import { refuseCompiledPlan } from "./expression/plan.js";
+import type { ConditionExpression, UpdateExpression } from "./expression/types.js";
+import { validateConditionExpression, validateUpdateExpression } from "./expression/semantic.js";
 import type { DataKind, ReturnValuesOnConditionCheckFailure } from "./types.js";
 import type { TransactWriteExecutionMode } from "./transaction-api-types.js";
 import { KeyCodec, KeyPairMap, type KeyBytes } from "../sharding/key-codec.js";
 import { FokosValidationError, VALIDATION_CODES } from "./errors.js";
+import { withExpressionErrors } from "./errors-operations.js";
 import { SHARDING_VALIDATION_CODES } from "../sharding/errors.js";
 import invariant from "./invariant.js";
 
@@ -221,8 +224,8 @@ export type TransactWriteOperationLike = {
 	operation: TransactionOperationType;
 	// Already-encoded data (json stringified upstream), so payload accounting is a plain byte/char count.
 	data?: Uint8Array | string;
-	condition?: CompiledConditionPlan;
-	update?: CompiledUpdatePlan;
+	condition?: ConditionExpression;
+	update?: UpdateExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
@@ -421,9 +424,25 @@ export function validateTransactWriteOperations(
 	return encodedKeys;
 }
 
-/** True when a compiled plan reads the `v` of its item. */
-function readsVersion(plan: { requiredColumns: readonly string[] } | undefined): boolean {
-	return plan?.requiredColumns.includes("v") === true;
+/**
+ * True when the condition or the update of an operation reads the `v` of its item. Validation gives
+ * the columns that an expression reads, and it is a small part of a compile.
+ */
+function readsVersion(op: { condition?: ConditionExpression; update?: UpdateExpression }): boolean {
+	const { condition, update } = op;
+	return withExpressionErrors(() => {
+		if (condition !== undefined) {
+			refuseCompiledPlan(condition);
+			if (validateConditionExpression(condition).requiredColumns.includes("v")) {
+				return true;
+			}
+		}
+		if (update !== undefined) {
+			refuseCompiledPlan(update);
+			return validateUpdateExpression(update).requiredColumns.includes("v");
+		}
+		return false;
+	});
 }
 
 /**
@@ -447,7 +466,7 @@ export function validateVersionReferences(
 	const earlierWrite = new KeyPairMap<number>();
 	for (const op of ops) {
 		const writeIndex = earlierWrite.get(op.hashKey, op.sortKey);
-		if (writeIndex !== undefined && (readsVersion(op.condition) || readsVersion(op.update))) {
+		if (writeIndex !== undefined && readsVersion(op)) {
 			throw new FokosValidationError(VALIDATION_CODES.transact_version_after_write, {
 				message: "a condition or an update value that reads the version must come before every put, update, and delete of the same item",
 				attributes: { opIndex: op.opIndex, earlierOpIndex: writeIndex, ...decodeItemKeys(op.hashKey, op.sortKey) },

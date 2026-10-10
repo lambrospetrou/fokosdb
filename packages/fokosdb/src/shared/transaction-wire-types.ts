@@ -3,7 +3,7 @@
  * other. None of it reaches a caller of FokosDB — the caller-facing shapes are in
  * `transaction-api-types.ts`, which this module builds on and never imports back from.
  */
-import type { CompiledConditionPlan, CompiledProjectionPlan, CompiledUpdatePlan } from "./expression/plan.js";
+import type { ConditionExpression, ProjectionExpression, UpdateExpression } from "./expression/types.js";
 import type { ProjectedWireRow } from "./expression/projection.js";
 import type { KeyBytes } from "../sharding/key-codec.js";
 import type { FokosDBTableConfig } from "./partition-context.js";
@@ -45,9 +45,9 @@ export type TransactionItem = TransactionItemKey & {
 	/** Epoch UTC seconds. Present only for a put that has an expiry instant. */
 	ttlAt?: number;
 	/** Optional for put and delete; required for check. */
-	condition?: CompiledConditionPlan;
-	/** Compiled update plan; present for "update". */
-	update?: CompiledUpdatePlan;
+	condition?: ConditionExpression;
+	/** The update expression; present for "update". */
+	update?: UpdateExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 
@@ -153,8 +153,8 @@ export type DebugForceResolveTransactionResponse = (CommitResponse | CancelRespo
 
 // ─── PartitionDO — ReadForTransaction ─────────────────────────────────────────
 
-/** A read item on the wire: the canonical keys plus the item's compiled projection plan, when it has one. */
-export type TransactionReadItem = TransactionItemKey & { projection?: CompiledProjectionPlan };
+/** A read item on the wire: the canonical keys plus the projection of the item, when it has one. */
+export type TransactionReadItem = TransactionItemKey & { projection?: readonly ProjectionExpression[] };
 
 export type ReadForTransactionRequest = {
 	transactionId: TransactionId;
@@ -307,8 +307,8 @@ export type TCWriteOperation = {
 	data?: Uint8Array | string;
 	kind?: DataKind;
 	ttlAt?: number;
-	condition?: CompiledConditionPlan;
-	update?: CompiledUpdatePlan;
+	condition?: ConditionExpression;
+	update?: UpdateExpression;
 	returnValuesOnConditionCheckFailure?: ReturnValuesOnConditionCheckFailure;
 };
 

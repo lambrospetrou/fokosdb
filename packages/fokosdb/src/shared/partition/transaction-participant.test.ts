@@ -9,7 +9,7 @@ import type { PrepareRequest, TransactionItem } from "../transaction-wire-types.
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import invariant from "../invariant.js";
-import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
+import { conditionTree, updateTree } from "../expression/test-fixtures.js";
 import { EST_ROW_BYTES_K } from "./item-size.js";
 import { MAX_CONDITION_CHECK_IMAGE_BYTES_PER_TX, MAX_ITEM_BYTES } from "../transaction-limits.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
@@ -137,7 +137,7 @@ describe("TransactionParticipant - prepare", () => {
 						operation: "put",
 						data: "v",
 						kind: "text",
-						condition: compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+						condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 					},
 				],
 			});
@@ -171,7 +171,7 @@ describe("TransactionParticipant - prepare", () => {
 					hashKey,
 					sortKey: KeyCodec.encodeOptional(undefined),
 					operation: "delete" as const,
-					condition: compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+					condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 					returnValuesOnConditionCheckFailure: "all_old" as const,
 				})),
 			});
@@ -201,7 +201,7 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("rejects with update_not_applicable when the item is not json", async () => {
 		await withParticipant(({ participant, store }) => {
-			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.field" }, value: { val: "new" } }]);
+			const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.field" }, value: { val: "new" } }]);
 
 			// The item exists but is kind: "text", not json. An absent item is NOT this case: it has the
 			// empty document as its pre-image, so the update creates it.
@@ -234,7 +234,7 @@ describe("TransactionParticipant - prepare", () => {
 	it("locks an absent item for an update, and commit creates it", async () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
-			const plan = compileUpdateExpression([
+			const plan = updateTree([
 				{
 					action: "set",
 					target: { ref: "data", path: "$.n" },
@@ -271,8 +271,8 @@ describe("TransactionParticipant - prepare", () => {
 	it("rejects an update of an absent item when its condition needs the item", async () => {
 		await withParticipant(({ participant, store }) => {
 			const sk = KeyCodec.encodeOptional(undefined);
-			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
-			const condition = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+			const condition = conditionTree({ op: "exists", args: [{ ref: "hashKey" }] });
 
 			const request = prepareReq({
 				items: [{ hashKey: kb("guarded"), sortKey: sk, operation: "update", update: plan, condition }],
@@ -291,7 +291,7 @@ describe("TransactionParticipant - prepare", () => {
 			// The same plan is valid for a text key and not for a binary one, so the cause belongs to the
 			// item, not to the expression. A caller that only saw "not applicable" could not tell this
 			// apart from a missing item or a missing path, and could not act on it.
-			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.k" }, value: { ref: "hashKey" } }]);
 			const sk = KeyCodec.encodeOptional(undefined);
 			const binaryKey = KeyCodec.encode(new Uint8Array([1, 2, 3]));
 			store.upsertItem({ hk: binaryKey, sk, data: JSON.stringify({}), kind: "json", ttlAt: null, txOrderTs: 1 });
@@ -328,7 +328,7 @@ describe("TransactionParticipant - prepare", () => {
 				txOrderTs: 10,
 			});
 
-			const updatePlan = compileUpdateExpression([
+			const updatePlan = updateTree([
 				{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 20 } },
 				{ action: "set", target: { ref: "data", path: "$.role" }, value: { val: "admin" } },
 			]);
@@ -377,7 +377,7 @@ describe("TransactionParticipant - prepare", () => {
 
 	it("persists the TTL and the facts of the transaction after prepare accepts it", async () => {
 		await withParticipant(({ participant, store }) => {
-			const condition = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
+			const condition = conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] });
 			const request = prepareReq({
 				items: [{ hashKey: kb("new"), sortKey: kb("sk"), operation: "put", data: "v", kind: "text", ttlAt: 777, condition }],
 			});
@@ -445,7 +445,7 @@ describe("TransactionParticipant - prepare", () => {
 						hashKey: kb("hk"),
 						sortKey: sk,
 						operation: "check",
-						condition: compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }),
+						condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 					},
 				],
 			});
@@ -475,7 +475,7 @@ describe("TransactionParticipant - prepare", () => {
 				ttlAt: null,
 				txOrderTs: (BASE_NOW + 10) * TX_ORDER_TS_UNITS_PER_MS,
 			});
-			const condition = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
+			const condition = conditionTree({ op: "exists", args: [{ ref: "hashKey" }] });
 
 			for (const transactionTimestamp of [(BASE_NOW + 10) * TX_ORDER_TS_UNITS_PER_MS, (BASE_NOW + 9) * TX_ORDER_TS_UNITS_PER_MS]) {
 				const request = prepareReq({
@@ -890,7 +890,7 @@ describe("TransactionParticipant - single shot", () => {
 				txOrderTs: 10,
 			});
 
-			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }]);
+			const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.count" }, value: { val: 2 } }]);
 
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("u1"), sortKey, operation: "update", update: updatePlan }]),
@@ -907,7 +907,7 @@ describe("TransactionParticipant - single shot", () => {
 	it("creates the item when a single-shot update finds none", async () => {
 		await withParticipant(({ participant, store }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
-			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
+			const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.a" }, value: { val: 1 } }]);
 
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("missing-u"), sortKey, operation: "update", update: updatePlan, ttlAt: 42 }]),
@@ -925,7 +925,7 @@ describe("TransactionParticipant - single shot", () => {
 		await withParticipant(({ participant, store }) => {
 			const sortKey = KeyCodec.encodeOptional(undefined);
 			// The empty pre-image has no `$.a`, so `$.a.b` has no parent to write into.
-			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.a.b" }, value: { val: 1 } }]);
+			const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.a.b" }, value: { val: 1 } }]);
 
 			const res = participant.executeSingleShot({
 				items: withOpIndex([{ hashKey: kb("no-parent"), sortKey, operation: "update", update: updatePlan }]),
@@ -969,7 +969,7 @@ describe("TransactionParticipant - cancel", () => {
 			const sk = KeyCodec.encodeOptional(undefined);
 			store.upsertItem({ hk: kb("user"), sk, data: JSON.stringify({ score: 10 }), kind: "json", ttlAt: null, txOrderTs: 10 });
 
-			const plan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 999 } }]);
+			const plan = updateTree([{ action: "set", target: { ref: "data", path: "$.score" }, value: { val: 999 } }]);
 			const request = prepareReq({ items: [{ hashKey: kb("user"), sortKey: sk, operation: "update", update: plan }] });
 			expect(participant.prepareLocal(request)).toEqual({ outcome: "accepted" });
 
@@ -1108,7 +1108,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 						hashKey: hk,
 						sortKey: sk,
 						operation: "check",
-						condition: compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] }),
+						condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 					},
 				],
 			});
@@ -1122,7 +1122,7 @@ describe("TransactionParticipant - readForTransaction", () => {
 			expect(hasPendingWrite()).toBe(true);
 			participant.cancelLocal(put.transactionId, put.items);
 
-			const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
+			const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.x" }, value: { val: 1 } }]);
 			const update = prepareReq({ items: [{ hashKey: hk, sortKey: sk, operation: "update", update: updatePlan }] });
 			expect(participant.prepareLocal(update)).toEqual({ outcome: "accepted" });
 			expect(hasPendingWrite()).toBe(true);

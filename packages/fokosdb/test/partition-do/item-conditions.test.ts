@@ -1,7 +1,7 @@
 import { runInDurableObject } from "cloudflare:test";
 import { describe, it } from "vitest";
 import { PartitionDO } from "../../src/server/do-partition.js";
-import { compiledCondition, kb, makeStub, opened } from "./helpers.js";
+import { conditionTree, kb, makeStub, opened } from "./helpers.js";
 
 describe("PartitionDO - conditional putItem", () => {
 	describe("item_not_exists", () => {
@@ -12,7 +12,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "value",
-				condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+				condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 				kind: "text",
 			});
 
@@ -32,7 +32,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+						condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 						kind: "text",
 					}),
 				);
@@ -54,7 +54,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb(),
 						data: "overwrite",
-						condition: compiledCondition({ op: "not_exists", args: [{ ref: "hashKey" }] }),
+						condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }),
 						kind: "text",
 					}),
 				);
@@ -75,7 +75,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "second",
-				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				kind: "text",
 			});
 
@@ -94,7 +94,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "stale",
-						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+						condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						kind: "text",
 					}),
 				);
@@ -114,7 +114,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "value",
-						condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+						condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						kind: "text",
 					}),
 				);
@@ -132,7 +132,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v2",
-				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				kind: "text",
 			});
 			expect(r2).toMatchObject({ outcome: "ok", version: 2 });
@@ -141,7 +141,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "v3",
-				condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 2 }] }),
+				condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 2 }] }),
 				kind: "text",
 			});
 			expect(r3).toMatchObject({ outcome: "ok", version: 3 });
@@ -157,7 +157,7 @@ describe("PartitionDO - conditional putItem", () => {
 				hashKey: kb("hk"),
 				sortKey: kb("sk"),
 				data: "second",
-				condition: compiledCondition({
+				condition: conditionTree({
 					op: "and",
 					args: [
 						{ op: "eq", args: [{ ref: "v" }, { val: 1 }] },
@@ -183,7 +183,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						condition: compiledCondition({
+						condition: conditionTree({
 							op: "and",
 							args: [
 								{ op: "not_exists", args: [{ ref: "hashKey" }] },
@@ -213,7 +213,7 @@ describe("PartitionDO - conditional putItem", () => {
 						hashKey: kb("hk"),
 						sortKey: kb("sk"),
 						data: "overwrite",
-						condition: compiledCondition({
+						condition: conditionTree({
 							op: "and",
 							args: [
 								{ op: "eq", args: [{ ref: "v" }, { val: 2 }] },
@@ -255,7 +255,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await rpc.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+					condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 				});
 
 				expect(result).toMatchObject({ outcome: "ok", deleted: true });
@@ -270,7 +270,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+							condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -288,7 +288,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb(),
-							condition: compiledCondition({ op: "exists", args: [{ ref: "hashKey" }] }),
+							condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -304,7 +304,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await rpc.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+					condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 				});
 
 				expect(result).toMatchObject({ outcome: "ok", deleted: true });
@@ -321,7 +321,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+							condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -341,7 +341,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: compiledCondition({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
+							condition: conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 1 }] }),
 						}),
 					);
 					expect(res).toMatchObject({ outcome: "rejected", reason: { code: "condition_failed" } });
@@ -357,7 +357,7 @@ describe("PartitionDO - deleteItem", () => {
 				const result = await rpc.apiDeleteItem(ctx, {
 					hashKey: kb("hk"),
 					sortKey: kb("sk"),
-					condition: compiledCondition({
+					condition: conditionTree({
 						op: "and",
 						args: [
 							{ op: "exists", args: [{ ref: "hashKey" }] },
@@ -379,7 +379,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: compiledCondition({
+							condition: conditionTree({
 								op: "and",
 								args: [
 									{ op: "exists", args: [{ ref: "hashKey" }] },
@@ -404,7 +404,7 @@ describe("PartitionDO - deleteItem", () => {
 						await instance.apiDeleteItem(ctx, {
 							hashKey: kb("hk"),
 							sortKey: kb("sk"),
-							condition: compiledCondition({
+							condition: conditionTree({
 								op: "and",
 								args: [
 									{ op: "exists", args: [{ ref: "hashKey" }] },

@@ -20,7 +20,7 @@ import { describe, expect, it } from "vitest";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import { DEFAULT_PARTITION_CONFIG } from "../../src/server/host-config.js";
 import { KeyCodec, KeyPairMap } from "../../src/sharding/key-codec.js";
-import { compileConditionExpression, compileUpdateExpression } from "../../src/shared/expression/compiler.js";
+import { conditionTree, updateTree } from "../../src/shared/expression/test-fixtures.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
 import { TransactionParticipant } from "../../src/shared/partition/transaction-participant.js";
 import { TX_ORDER_TS_UNITS_PER_MS } from "../../src/shared/transaction-limits.js";
@@ -33,14 +33,14 @@ const BASE_NOW = 1_000_000;
 const T = (BASE_NOW + 100) * TX_ORDER_TS_UNITS_PER_MS;
 const KEYS = ["a", "b", "c"].map((sk) => ({ hashKey: KeyCodec.encode("h"), sortKey: KeyCodec.encode(sk) }));
 
-const alwaysTrue = compileConditionExpression({
+const alwaysTrue = conditionTree({
 	op: "or",
 	args: [
 		{ op: "exists", args: [{ ref: "hashKey" }] },
 		{ op: "not_exists", args: [{ ref: "hashKey" }] },
 	],
 });
-const incN = compileUpdateExpression([
+const incN = updateTree([
 	{
 		action: "set",
 		target: { ref: "data", path: "$.n" },

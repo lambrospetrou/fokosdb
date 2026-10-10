@@ -13,7 +13,7 @@ import invariant from "../../src/shared/invariant.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { MAX_EVALUATED_BYTES_PER_PAGE, MAX_EVALUATED_ITEMS_PER_PAGE } from "../../src/shared/query/page-budget.js";
 import { estimateProjectedRowBytes, PartitionStore, type StoredItem } from "../../src/shared/partition/partition-store.js";
-import { compileQueryExpression } from "../../src/shared/expression/compiler.js";
+import { queryTree } from "../../src/shared/expression/test-fixtures.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
 import type { ProjectionExpression } from "../../src/shared/expression/types.js";
 import { EST_ROW_BYTES_K } from "../../src/shared/partition/item-size.js";
@@ -144,7 +144,7 @@ describe("PartitionDO — range split", () => {
 			const hashKey = kb("lp-count-filter");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
-				const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
+				const plan = queryTree({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: "040" }] } });
 
 				const result = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, select: "count", plan })));
 
@@ -162,7 +162,7 @@ describe("PartitionDO — range split", () => {
 			const hashKey = kb("lp-rejected");
 			await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 				seed45(state, hashKey);
-				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
+				const plan = queryTree({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "044" }] } });
 
 				const first = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingEvaluatedItems: 10 })));
 				expect(first.count).toBe(0);
@@ -206,7 +206,7 @@ describe("PartitionDO — range split", () => {
 						txOrderTs: 0,
 					});
 				}
-				const plan = compileQueryExpression({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "big5" }] } });
+				const plan = queryTree({ filter: { op: "eq", args: [{ ref: "sortKey" }, { val: "big5" }] } });
 
 				// 250 KiB admits two 100 KiB items but not six. The page drains only because the five
 				// rejected candidates charged nothing to the response budget.
@@ -283,7 +283,7 @@ describe("PartitionDO — range split", () => {
 				const hashKey = kb(`lp-projection-${direction}`);
 				await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
 					seed45(state, hashKey);
-					const plan = compileQueryExpression({
+					const plan = queryTree({
 						projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }],
 					});
 
@@ -310,7 +310,7 @@ describe("PartitionDO — range split", () => {
 				for (let i = 0; i < 6; i++) {
 					store.upsertItem({ hk: hashKey, sk: kb(`big${i}`), data: doc, kind: "json", ttlAt: null, txOrderTs: 0 });
 				}
-				const plan = compileQueryExpression({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
+				const plan = queryTree({ projection: [{ expr: { ref: "data", path: "$.big" } }] });
 
 				const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan, remainingResponseBytes: 250 * 1024 })));
 				expect(res.items).toHaveLength(2);
@@ -349,7 +349,7 @@ describe("PartitionDO — range split", () => {
 			});
 
 			// Calling the stub directly crosses a real RPC boundary, which runInDurableObject does not.
-			const plan = compileQueryExpression({
+			const plan = queryTree({
 				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
 			});
 			const result = await rpc.apiQueryItems(ctx, request("asc", { hashKey, plan }));
@@ -379,7 +379,7 @@ describe("PartitionDO — range split", () => {
 				const projection: ProjectionExpression[] = Array.from({ length: EXPRESSION_LIMITS.projectionEntries }, (_, k) => ({
 					expr: { ref: "data", path: `$.f${k}` },
 				}));
-				const plan = compileQueryExpression({ projection });
+				const plan = queryTree({ projection });
 
 				const res = opened(await instance.apiQueryItems(ctx, request("asc", { hashKey, plan })));
 				expect(res.items).toHaveLength(1);
@@ -853,7 +853,7 @@ describe("PartitionDO — range split", () => {
 			const N = 4;
 			const { root, sks } = sharedTree;
 			// The seeded items are text, so the $.opt cell is missing on every row.
-			const plan = compileQueryExpression({
+			const plan = queryTree({
 				projection: [{ expr: { ref: "data", path: "$.opt" } }, { expr: { ref: "sortKey" } }],
 			});
 
@@ -876,7 +876,7 @@ describe("PartitionDO — range split", () => {
 			const { root, sks } = sharedTree;
 			const sorted = [...sks].sort();
 			const median = sorted[Math.floor(sorted.length / 2)];
-			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
+			const plan = queryTree({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
 
 			const res = await queryPage(root, { plan });
 			const expected = sorted.filter((sk) => sk >= median);
@@ -898,7 +898,7 @@ describe("PartitionDO — range split", () => {
 				await waitForAllChildRequests();
 
 				const child = (await root.children())[0];
-				const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
+				const plan = queryTree({ projection: [{ expr: { ref: "sortKey" } }] });
 				const res = await leafPage(child, { plan });
 				// The parent still holds every row of the key, but it clips the page to the calling child's
 				// slice, so the child never serves rows a sibling owns.
@@ -926,7 +926,7 @@ describe("PartitionDO — range split", () => {
 
 				const sorted = [...sks].sort();
 				const median = sorted[Math.floor(sorted.length / 2)];
-				const plan = compileQueryExpression({
+				const plan = queryTree({
 					filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] },
 					projection: [{ expr: { ref: "sortKey" } }],
 				});
@@ -1046,7 +1046,7 @@ describe("PartitionDO — range split", () => {
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
 			// The seeded rows carry no TTL, so exists(ttlAt) matches no candidate.
-			const plan = compileQueryExpression({ filter: { op: "exists", args: [{ ref: "ttlAt" }] } });
+			const plan = queryTree({ filter: { op: "exists", args: [{ ref: "ttlAt" }] } });
 			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
 
 			expect(res.count).toBe(0);
@@ -1060,7 +1060,7 @@ describe("PartitionDO — range split", () => {
 			const { root, writes } = shared;
 			const hk = writes[0].hashKey;
 			const expected = writes.filter((w) => KeyCodec.compare(w.hashKey, hk) === 0).length;
-			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
+			const plan = queryTree({ projection: [{ expr: { ref: "sortKey" } }, { expr: { ref: "v" } }] });
 			const res = await root.rpc.apiQueryItems(root.ctx, fullRequest({ hashKey: hk, plan }));
 
 			expect(res.count).toBe(expected);
@@ -1084,7 +1084,7 @@ describe("PartitionDO — range split", () => {
 			const { partition, writes, rangeRoot } = shared;
 			const sorted = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();
 			const median = sorted[Math.floor(sorted.length / 2)];
-			const plan = compileQueryExpression({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
+			const plan = queryTree({ filter: { op: "gte", args: [{ ref: "sortKey" }, { val: median }] } });
 			const res = await partition.rpc.apiQueryItems(partition.ctx, fullRequest({ plan }));
 
 			const expected = sorted.filter((sk) => sk >= median);
@@ -1096,7 +1096,7 @@ describe("PartitionDO — range split", () => {
 
 		it("serves a projected page from the range root", async () => {
 			const { partition, writes, rangeRoot } = shared;
-			const plan = compileQueryExpression({ projection: [{ expr: { ref: "sortKey" } }] });
+			const plan = queryTree({ projection: [{ expr: { ref: "sortKey" } }] });
 			const res = await partition.rpc.apiQueryItems(partition.ctx, fullRequest({ plan }));
 
 			const expected = writes.map((w) => KeyCodec.decode(w.sortKey!) as string).sort();

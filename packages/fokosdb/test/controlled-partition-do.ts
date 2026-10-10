@@ -287,3 +287,12 @@ export class ControlledPartitionDO extends PartitionDO {
 		(this as unknown as { __cachedConfig?: unknown }).__cachedConfig = undefined;
 	}
 }
+
+/**
+ * The requests of `op` that `partition` received, in order of arrival. The RPC stub type cannot map
+ * the recursive JSON type of an expression tree in a request. Thus the call uses a plain method type,
+ * and the cast restores the request type.
+ */
+export function recordedTxCalls<Op extends TxOp>(partition: DurableObjectStub<ControlledPartitionDO>, op: Op): Promise<TxRequest<Op>[]> {
+	return (partition as unknown as { testTxCalls(op: TxOp): Promise<unknown[]> }).testTxCalls(op) as Promise<TxRequest<Op>[]>;
+}

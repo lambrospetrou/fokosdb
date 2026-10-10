@@ -6,7 +6,7 @@ import type { JsonValue } from "../json-types.js";
 import { KeyCodec } from "../../sharding/key-codec.js";
 import { PartitionStore } from "../partition/partition-store.js";
 import type { DataKind } from "../types.js";
-import { compileConditionExpression, compileUpdateExpression } from "./compiler.js";
+import { compileConditionExpression } from "./compiler.js";
 import { evaluateConditionPlan } from "./runtime.js";
 import type { ConditionExpression, UpdateExpression } from "./types.js";
 
@@ -692,7 +692,7 @@ async function applyUpdate(before: JsonValue | undefined, update: UpdateExpressi
 		if (before !== undefined) {
 			store.upsertItem({ hk, sk, data: JSON.stringify(before), kind: "json", ttlAt: null, txOrderTs: 1 });
 		}
-		store.updateItemSingleShot({ hk, sk, plan: compileUpdateExpression(update), txOrderTs: 2 });
+		store.updateItemSingleShot({ hk, sk, plan: update, txOrderTs: 2 });
 		return JSON.parse(store.getItem(hk, sk).row?.data as string) as JsonValue;
 	});
 }

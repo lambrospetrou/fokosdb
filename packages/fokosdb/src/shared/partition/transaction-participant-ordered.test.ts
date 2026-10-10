@@ -9,7 +9,7 @@ import { DEFAULT_PARTITION_CONFIG } from "../../server/host-config.js";
 import { testCoordinatorRef, testPartitionStub } from "../../../test/stub-helpers.js";
 import { fokosErrorWith, invariantFailure } from "../../../test/errors-matchers.js";
 import { KeyCodec, KeyPairMap } from "../../sharding/key-codec.js";
-import { compileConditionExpression, compileUpdateExpression } from "../expression/compiler.js";
+import { conditionTree, updateTree } from "../expression/test-fixtures.js";
 import { MAX_ITEM_BYTES, TX_ORDER_TS_UNITS_PER_MS } from "../transaction-limits.js";
 import type { PrepareRequest, TransactionItem, TransactionItemKey } from "../transaction-wire-types.js";
 import { PartitionStore } from "./partition-store.js";
@@ -41,9 +41,9 @@ async function withPartition<R>(fn: (h: Harness) => R): Promise<R> {
 
 type Op = Omit<TransactionItem, "opIndex">;
 
-const exists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
-const notExists = compileConditionExpression({ op: "not_exists", args: [{ ref: "hashKey" }] });
-const incN = compileUpdateExpression([
+const exists = conditionTree({ op: "exists", args: [{ ref: "hashKey" }] });
+const notExists = conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] });
+const incN = updateTree([
 	{
 		action: "set",
 		target: { ref: "data", path: "$.n" },
@@ -215,7 +215,7 @@ describe("ordered per-item execution: the paths give the result of the reference
 
 describe("ordered per-item execution: evaluate", () => {
 	it("reports the first failure of an item, not_evaluated after it, and the outcomes of the other items", async () => {
-		const failsOnTemporaryState = compileConditionExpression({ op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] });
+		const failsOnTemporaryState = conditionTree({ op: "eq", args: [{ ref: "data", path: "$.n" }, { val: 1 }] });
 		const ops = withOpIndex([
 			put("A", { n: 5 }),
 			{ ...check("A", true), condition: failsOnTemporaryState },
@@ -496,9 +496,7 @@ describe("ordered per-item execution: versions", () => {
 	});
 
 	it("refuses a plan that reads v after a write of its item, on both paths, and writes nothing", async () => {
-		const setPrevVersion = compileUpdateExpression([
-			{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } },
-		]);
+		const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
 		const ops = withOpIndex([put("X", { n: 1 }), { ...update("X"), update: setPrevVersion }]);
 		await withPartition(({ participant, store, storage }) => {
 			seed(store);

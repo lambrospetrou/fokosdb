@@ -7,8 +7,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { vi } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import { testPartitionStub } from "../stub-helpers.js";
-import { compileConditionExpression } from "../../src/shared/expression/compiler.js";
-import type { ConditionExpression } from "../../src/shared/expression/types.js";
+export { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { createTableConfig, type FokosTableIdentity, type FokosTableOptions } from "../../src/shared/partition-context.js";
 import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { FokosRouter } from "../../src/sharding/router.js";
@@ -20,7 +19,6 @@ import type { FokosEnvelope, FokosPublicRouting } from "../../src/sharding/runti
 import { leafPartitionInfo, partitionInfoOf } from "../../src/client/partition-info.js";
 
 export const kb = (s?: string) => KeyCodec.encodeOptional(s);
-export const compiledCondition = (condition: ConditionExpression) => compileConditionExpression(condition);
 
 // ─── opening the envelope ─────────────────────────────────────────────────────
 

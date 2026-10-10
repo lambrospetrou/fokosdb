@@ -41,6 +41,7 @@ import {
 import { partitionStubByName, txCoordinatorStubByName } from "../shared/do-stubs.js";
 import {
 	FokosError,
+	FokosExpressionError,
 	FokosInternalError,
 	FokosTransactionPendingError,
 	FokosUnavailableError,
@@ -54,7 +55,7 @@ import {
 import invariant from "../shared/invariant.js";
 import { exists, one, tryOne } from "../shared/sql-cursor.js";
 import { hashTransactionOperations } from "../shared/transaction-idempotency.js";
-import { unexpectedTransactionStateError } from "../shared/errors-operations.js";
+import { unexpectedTransactionStateError, withExpressionErrors } from "../shared/errors-operations.js";
 import {
 	ADMISSION_MARGIN,
 	applyImageCap,
@@ -72,7 +73,7 @@ import {
 	type TransactionCoordinatorDOConfig,
 	type TransactionCoordinatorDOConfigOverrides,
 } from "./host-config.js";
-import { CompiledConditionPlan, CompiledUpdatePlan } from "../shared/expression/plan.js";
+import type { ConditionExpression, UpdateExpression } from "../shared/expression/types.js";
 import { parseJSONTrusted } from "../shared/tsutils.js";
 
 type TcStateRow = {
@@ -283,7 +284,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
                 answer_json             TEXT,
                 -- The FokosErrorWire of the error of the last prepare attempt that threw. It is written only
                 -- while prepare_outcome is NULL, so a later answer replaces it. A fatal error (a
-                -- FokosValidationError) stays: no later error replaces it, and no later answer is stored.
+                -- FokosValidationError or a FokosExpressionError) stays: no later error replaces it, and no
+                -- later answer is stored.
                 error_json              TEXT,
                 PRIMARY KEY (transaction_id, partition_do_name)
             ) WITHOUT ROWID, STRICT;
@@ -612,7 +614,7 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 		const idempotencyToken = request.clientRequestToken;
 
 		// Computed once and used twice: to validate a replay, and as the stored fingerprint below.
-		const operationsHash = hashTransactionOperations(request.items, request.executionMode ?? "standard");
+		const operationsHash = withExpressionErrors(() => hashTransactionOperations(request.items, request.executionMode ?? "standard"));
 
 		const existingRow = this.loadStateRowByToken(idempotencyToken);
 		if (existingRow) {
@@ -1869,25 +1871,30 @@ export class TransactionCoordinatorDO extends DurableObject<Env> implements Coor
 }
 
 /**
- * The retry rule of a prepare: every error except `partition_over_size` and a `FokosValidationError`,
- * up to `maxAttempts` attempts. A validation error says that the request is not valid, so the same
- * request gets it again on each try.
+ * The retry rule of a prepare: every error except `partition_over_size` and a fatal error, up to
+ * `maxAttempts` attempts.
  */
 function prepareRetry(retry: ParticipantRetryConfig, maxAttempts: number): FokosRetryPolicy {
 	return {
 		shouldRetry: (err, nextAttempt) =>
-			!FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && !FokosValidationError.is(err) && nextAttempt <= maxAttempts,
+			!FokosError.isCode(err, UNAVAILABLE_CODES.partition_over_size) && !isFatalPrepare(err) && nextAttempt <= maxAttempts,
 		baseDelayMs: retry.baseDelayMs,
 		maxDelayMs: retry.maxDelayMs,
 	};
 }
 
 /**
- * True when a stored prepare error cannot clear on a retry: a `FokosValidationError`. The category
- * survives each RPC hop, because `FokosError.is` reads `_tag`.
+ * True for a prepare error that cannot clear on a retry: a `FokosValidationError` or a
+ * `FokosExpressionError`. Each one says that the request is not valid, so the same request gets it
+ * again on each try. The category survives each RPC hop, because `FokosError.is` reads `_tag`.
  */
+function isFatalPrepare(err: unknown): boolean {
+	return FokosValidationError.is(err) || FokosExpressionError.is(err);
+}
+
+/** True when a stored prepare error is fatal (`isFatalPrepare`). */
 function isFatalPrepareError(errorJson: string | null): boolean {
-	return errorJson !== null && FokosValidationError.is(FokosError.fromWire(parseTagged<FokosErrorWire>(errorJson)));
+	return errorJson !== null && isFatalPrepare(FokosError.fromWire(parseTagged<FokosErrorWire>(errorJson)));
 }
 
 /** The time at which the `idempotency_sweep` job can delete a transaction that completed at `completedAt`. */
@@ -1993,8 +2000,8 @@ function toTransactionItems(rows: TcItemRow[]): TransactionItem[] {
 		data: row.data instanceof ArrayBuffer ? new Uint8Array(row.data) : (row.data ?? undefined),
 		kind: row.data_kind === null ? undefined : (DATA_KINDS[row.data_kind] as DataKind),
 		ttlAt: row.ttl_epoch_utc_seconds ?? undefined,
-		condition: row.conditions_json ? parseJSONTrusted<CompiledConditionPlan>(row.conditions_json) : undefined,
-		update: row.update_json ? parseJSONTrusted<CompiledUpdatePlan>(row.update_json) : undefined,
+		condition: row.conditions_json ? parseJSONTrusted<ConditionExpression>(row.conditions_json) : undefined,
+		update: row.update_json ? parseJSONTrusted<UpdateExpression>(row.update_json) : undefined,
 		returnValuesOnConditionCheckFailure: row.return_values_on_condition_check_failure === 1 ? "all_old" : undefined,
 	}));
 }

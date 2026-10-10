@@ -20,11 +20,11 @@ import {
 	type TransactWriteOperationLike,
 } from "./transaction-limits.js";
 import { KeyCodec } from "../sharding/key-codec.js";
-import { compileConditionExpression, compileUpdateExpression } from "./expression/compiler.js";
+import { conditionTree, updateTree } from "./expression/test-fixtures.js";
 import { fokosErrorWith } from "../../test/errors-matchers.js";
 
 const validate = (ops: readonly TransactWriteOperationLike[]) => validateTransactWriteOperations(ops, DEFAULT_LIMITS);
-const itemExists = compileConditionExpression({ op: "exists", args: [{ ref: "hashKey" }] });
+const itemExists = conditionTree({ op: "exists", args: [{ ref: "hashKey" }] });
 
 function putOp(hashKey: string, sortKey?: string, data: Uint8Array | string = "x"): TransactWriteOperationLike {
 	return { hashKey, sortKey, operation: "put", data };
@@ -166,7 +166,7 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("accepts a valid update operation with an update plan and no data", () => {
-		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
 		expect(() => validate([{ hashKey: "a", operation: "update", update: updatePlan }])).not.toThrow();
 	});
 
@@ -177,14 +177,14 @@ describe("validateTransactWriteOperations", () => {
 	});
 
 	it("rejects an update operation carrying data", () => {
-		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
 		expect(() => validate([{ hashKey: "a", operation: "update", update: updatePlan, data: "forbidden" }])).toThrow(
 			fokosErrorWith("transact_operation_fields_invalid", { operation: "update" }),
 		);
 	});
 
 	it("rejects a non-update operation carrying an update plan", () => {
-		const updatePlan = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
+		const updatePlan = updateTree([{ action: "set", target: { ref: "data", path: "$.status" }, value: { val: "active" } }]);
 		expect(() => validate([{ hashKey: "a", operation: "put", data: "x", update: updatePlan }])).toThrow(
 			fokosErrorWith("transact_operation_fields_invalid", { operation: "put" }),
 		);
@@ -218,14 +218,17 @@ describe("validateTransactWriteOperations", () => {
 		expect(() => validate([...ops, putOp("one-more", undefined, maxItem)])).toThrow(fokosErrorWith("transact_payload_too_large"));
 	});
 
-	it("includes serialized condition plans in the transaction payload", () => {
-		const condition = { ...itemExists, identity: "x".repeat(52 * 1024) };
-		const ops: TransactWriteOperationLike[] = Array.from({ length: 80 }, (_, i) => ({
-			hashKey: `condition-${i}`,
-			operation: "check",
-			condition,
-		}));
-		expect(() => validate(ops)).toThrow(fokosErrorWith("transact_payload_too_large"));
+	it("counts the JSON bytes of an expression tree in the transaction payload", () => {
+		const condition = { op: "eq", args: [{ ref: "data", path: "$.text" }, { val: "x".repeat(50 * 1024) }] } as const;
+		const update = [{ action: "set", target: { ref: "data", path: "$.text" }, value: { val: "y".repeat(50 * 1024) } }] as const;
+		// Ten items at the item limit leave 96 KB of the transaction payload.
+		const data = "d".repeat(MAX_ITEM_BYTES);
+		const ops: TransactWriteOperationLike[] = Array.from({ length: 10 }, (_, i) => putOp(`tree-${i}`, undefined, data));
+		expect(() => validate(ops)).not.toThrow();
+		const treeBytes = JSON.stringify(condition).length + JSON.stringify(update).length;
+		expect(() => validate([...ops, { hashKey: "tree-update", operation: "update", condition, update }])).toThrow(
+			fokosErrorWith("transact_payload_too_large", { bytes: 10 * data.length + treeBytes }),
+		);
 	});
 });
 
@@ -312,8 +315,8 @@ describe("resolveLimits", () => {
 });
 
 describe("validateVersionReferences", () => {
-	const readsV = compileConditionExpression({ op: "eq", args: [{ ref: "v" }, { val: 3 }] });
-	const setPrevVersion = compileUpdateExpression([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
+	const readsV = conditionTree({ op: "eq", args: [{ ref: "v" }, { val: 3 }] });
+	const setPrevVersion = updateTree([{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }]);
 	const op = (
 		opIndex: number,
 		operation: TransactWriteOperationLike["operation"],
@@ -333,6 +336,20 @@ describe("validateVersionReferences", () => {
 		expect(() => validateVersionReferences([op(0, earlier), op(1, "update", { update: setPrevVersion })])).toThrow(
 			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0 }),
 		);
+	});
+
+	it("refuses a version reference of an expression tree after a write of the same item", () => {
+		const condition = { op: "eq", args: [{ ref: "v" }, { val: 3 }] } as const;
+		const update = [{ action: "set", target: { ref: "data", path: "$.prevVersion" }, value: { ref: "v" } }] as const;
+		expect(() => validateVersionReferences([op(0, "put"), op(1, "check", { condition })])).toThrow(
+			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0 }),
+		);
+		expect(() => validateVersionReferences([op(0, "put"), op(1, "update", { update })])).toThrow(
+			fokosErrorWith("transact_version_after_write", { opIndex: 1, earlierOpIndex: 0 }),
+		);
+		expect(() =>
+			validateVersionReferences([op(0, "put"), op(1, "check", { condition: { op: "exists", args: [{ ref: "hashKey" }] } })]),
+		).not.toThrow();
 	});
 
 	it("accepts a version reference on the first operation of an item, after a check, and on another item", () => {
