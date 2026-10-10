@@ -6,6 +6,7 @@ import { compileProjectionExpression, compileQueryExpression } from "./compiler.
 import { ExpressionError, type ExpressionErrorCode } from "./errors.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
+	composeProjectionStatement,
 	POOL_PARAM,
 	PROJECTION_FIXED_BINDING_COUNT,
 	PROJECTION_PLAN_VERSION,
@@ -14,7 +15,6 @@ import {
 	type CompiledProjectionPlan,
 	type CompiledQueryPlan,
 } from "./plan.js";
-import { validateProjectionPlan, validateQueryPlan } from "./runtime.js";
 import { validateProjectionExpression } from "./semantic.js";
 import type { ConditionExpression, ProjectionExpression } from "./types.js";
 
@@ -181,7 +181,7 @@ describe("projection compiler", () => {
 		expect(plan.requiredColumns).toEqual(["hk", "data_kind", "data"]);
 		expect(plan.dataDependencies).toEqual({ completeData: false, paths: ["$.total"] });
 		assertRoundTrips(plan);
-		expect(validateProjectionPlan(plan)).toContain("AS p0");
+		expect(composeProjectionStatement(plan)).toContain("AS p0");
 	});
 
 	it("numbers pool elements densely across value and type fragments", () => {
@@ -215,24 +215,19 @@ describe("query compiler", () => {
 		});
 		expect(plan.bindings.filter((binding) => binding.kind === "path" && binding.value === "$.a")).toHaveLength(1);
 		expect(plan.completeBindingCount).toBe(5);
-		expect(plan.filterIdentity).not.toBeNull();
-		expect(plan.projectionIdentity).not.toBeNull();
 		expect(plan.requiredColumns).toEqual(["data_kind", "data"]);
 		expect(plan.dataDependencies).toEqual({ completeData: false, paths: ["$.a"] });
 		assertRoundTrips(plan);
-		expect(() => validateQueryPlan(plan)).not.toThrow();
 	});
 
 	it("sets filterSql and projection to null for the absent half", () => {
 		const filterOnly = compileQueryExpression({ filter: { op: "exists", args: [{ ref: "hashKey" }] } });
 		expect(filterOnly.filterSql).not.toBeNull();
 		expect(filterOnly.projection).toBeNull();
-		expect(filterOnly.projectionIdentity).toBeNull();
 		assertRoundTrips(filterOnly);
 
 		const projectionOnly = compileQueryExpression({ projection: [{ expr: { ref: "hashKey" } }] });
 		expect(projectionOnly.filterSql).toBeNull();
-		expect(projectionOnly.filterIdentity).toBeNull();
 		expect(projectionOnly.projection).not.toBeNull();
 		assertRoundTrips(projectionOnly);
 	});
@@ -247,7 +242,6 @@ describe("query compiler", () => {
 		});
 		expect(plan.completeBindingCount).toBe(5);
 		assertRoundTrips(plan);
-		expect(() => validateQueryPlan(plan)).not.toThrow();
 	});
 
 	it("numbers pool elements densely in filterSql after folding", () => {
@@ -328,77 +322,5 @@ describe("pool binding materialization", () => {
 
 	it("returns an empty array text for no descriptors", () => {
 		expect(materializeExpressionBindings([], "pool")).toEqual(["[]"]);
-	});
-});
-
-describe("plan validators", () => {
-	const projectionPlan = compileProjectionExpression([entry({ ref: "data", path: "$.a" })]);
-	const queryPlan = compileQueryExpression({
-		filter: { op: "eq", args: [{ ref: "v" }, { val: 1 }] },
-		projection: [{ expr: { ref: "hashKey" } }],
-	});
-
-	it("accepts compiled plans", () => {
-		expect(validateProjectionPlan(projectionPlan)).toContain("FROM items AS i");
-		expect(() => validateQueryPlan(queryPlan)).not.toThrow();
-	});
-
-	it("rejects a wrong version, kind, or binding layout", () => {
-		expectExpressionError(
-			() => validateProjectionPlan({ ...projectionPlan, version: 2 } as unknown as CompiledProjectionPlan),
-			"runtime_capability",
-		);
-		expectExpressionError(
-			() => validateProjectionPlan({ ...projectionPlan, kind: "query" } as unknown as CompiledProjectionPlan),
-			"runtime_capability",
-		);
-		expectExpressionError(
-			() => validateProjectionPlan({ ...projectionPlan, bindingLayout: "direct" } as unknown as CompiledProjectionPlan),
-			"runtime_capability",
-			/binding layout/,
-		);
-		expectExpressionError(() => validateQueryPlan({ ...queryPlan, version: 2 } as unknown as CompiledQueryPlan), "runtime_capability");
-		expectExpressionError(
-			() => validateQueryPlan({ ...queryPlan, kind: "projection" } as unknown as CompiledQueryPlan),
-			"runtime_capability",
-		);
-		expectExpressionError(
-			() => validateQueryPlan({ ...queryPlan, bindingLayout: "direct" } as unknown as CompiledQueryPlan),
-			"runtime_capability",
-			/binding layout/,
-		);
-	});
-
-	it("rejects an inconsistent binding count and a wrong complete count", () => {
-		expectExpressionError(
-			() => validateProjectionPlan({ ...projectionPlan, bindingCount: projectionPlan.bindingCount + 1 }),
-			"sql_limit",
-			/binding count/,
-		);
-		expectExpressionError(
-			() => validateProjectionPlan({ ...projectionPlan, completeBindingCount: projectionPlan.completeBindingCount + 1 }),
-			"sql_limit",
-			/binding count/,
-		);
-		expectExpressionError(
-			() => validateQueryPlan({ ...queryPlan, bindingCount: queryPlan.bindingCount + 1 }),
-			"sql_limit",
-			/binding count/,
-		);
-		expectExpressionError(() => validateQueryPlan({ ...queryPlan, completeBindingCount: 4 }), "sql_limit", /binding count/);
-	});
-
-	it("rejects a projection shape mismatch and a query plan with neither half", () => {
-		expectExpressionError(() => validateProjectionPlan({ ...projectionPlan, names: [] }), "runtime_capability", /shape/);
-		expectExpressionError(
-			() => validateQueryPlan({ ...queryPlan, filterSql: null, projection: null }),
-			"runtime_capability",
-			/neither a filter nor a projection/,
-		);
-		expectExpressionError(
-			() => validateQueryPlan({ ...queryPlan, projection: { ...queryPlan.projection!, names: [] } }),
-			"runtime_capability",
-			/shape/,
-		);
 	});
 });

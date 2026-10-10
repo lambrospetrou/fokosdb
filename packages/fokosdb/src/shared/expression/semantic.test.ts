@@ -272,6 +272,20 @@ describe("byte literal validation", () => {
 		expect(() => condition({ op: "eq", args: [{ ref: "data" }, aboveLimit] })).toThrow(/payload limit/);
 	});
 
+	it("rejects text and byte literals whose total length is above the payload limit", () => {
+		const half = EXPRESSION_LIMITS.canonicalPayloadBytes / 2;
+		const both = (extra: number) =>
+			({
+				op: "and",
+				args: [
+					{ op: "eq", args: [{ ref: "data", path: "$.a" }, { val: "x".repeat(half) }] },
+					{ op: "eq", args: [{ ref: "hashKey" }, { b64: "A".repeat(half - 4 + extra) + "AA==" }] },
+				],
+			}) as const;
+		expect(() => condition(both(0))).not.toThrow();
+		expect(() => condition(both(4))).toThrow(/literals exceed the payload limit/);
+	});
+
 	it.each([
 		["a number", { op: "eq", args: [{ ref: "v" }, { b64: "YQ==" }] }],
 		["text", { op: "eq", args: [{ val: "ab" }, { b64: "YWI=" }] }],

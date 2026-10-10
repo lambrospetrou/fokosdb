@@ -7,7 +7,7 @@
  * accepts only a count that no collection disturbed.
  *
  * - Validate, Identity, Compile: the three functions of the expression engine, each alone. The compile
- *   includes one validation and one identity.
+ *   includes one validation, and no identity.
  * - Path: the partition path of `prepareCase`. The script reads the statement to its end, as SQLite does,
  *   so that the count includes the flat copy of the statement text.
  * - Kept: the bytes that the result of the partition path keeps alive, until the request drops it.

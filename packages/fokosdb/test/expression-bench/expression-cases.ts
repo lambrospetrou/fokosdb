@@ -14,14 +14,8 @@ import {
 	compileUpdateExpression,
 } from "../../src/shared/expression/compiler.js";
 import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity } from "../../src/shared/expression/identity.js";
-import { composeQueryStatement } from "../../src/shared/expression/plan.js";
-import {
-	composeUpdateProbeStatement,
-	validateConditionPlan,
-	validateProjectionPlan,
-	validateQueryPlan,
-	validateUpdatePlan,
-} from "../../src/shared/expression/runtime.js";
+import { composeConditionStatement, composeProjectionStatement, composeQueryStatement } from "../../src/shared/expression/plan.js";
+import { composeUpdateProbeStatement } from "../../src/shared/expression/runtime.js";
 import {
 	validateConditionExpression,
 	validateProjectionExpression,
@@ -255,23 +249,21 @@ export function prepareCase(c: ExpressionCase, sortKey: Uint8Array = benchSortKe
 	switch (c.kind) {
 		case "condition": {
 			const plan = compileConditionExpression(c.tree);
-			const sql = validateConditionPlan(plan);
+			const sql = composeConditionStatement(plan.sql);
 			return { sql, params: [BENCH_HASH_KEY, sortKey, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
 		}
 		case "update": {
 			const plan = compileUpdateExpression(c.tree);
-			validateUpdatePlan(plan);
 			const sql = composeUpdateProbeStatement(plan);
 			return { sql, params: [BENCH_HASH_KEY, sortKey, ...materializedPlanBindings(plan)], bindingCount: plan.bindingCount };
 		}
 		case "projection": {
 			const plan = compileProjectionExpression(c.tree);
-			const sql = validateProjectionPlan(plan);
+			const sql = composeProjectionStatement(plan);
 			return { sql, params: [...materializedPlanBindings(plan, "pool"), BENCH_HASH_KEY, sortKey], bindingCount: plan.bindingCount };
 		}
 		case "query": {
 			const plan = compileQueryExpression(c.tree);
-			validateQueryPlan(plan);
 			const sql = composeQueryStatement(plan, { select: "projection", direction: "asc", scanConditions: ["hk = ?"] });
 			return {
 				sql,

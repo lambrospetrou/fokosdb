@@ -17,8 +17,6 @@ import {
 	evaluateConditionPlan,
 	probeUpdatePlan,
 	readProjectedItem,
-	validateQueryPlan,
-	validateUpdatePlan,
 	type ConditionEvaluationResult,
 	type ProjectedReadResult,
 	type UpdateProbeResult,
@@ -878,13 +876,9 @@ export class PartitionStore {
 		return withExpressionErrors(() => probeUpdatePlan(this.#storage, updatePlanOf(update), hk, sk));
 	}
 
-	/** The validated plan of an update that a write statement runs. */
+	/** The plan of an update that a write statement runs. */
 	#updatePlan(update: UpdateExpression): CompiledUpdatePlan {
-		return withExpressionErrors(() => {
-			const plan = updatePlanOf(update);
-			validateUpdatePlan(plan);
-			return plan;
-		});
+		return withExpressionErrors(() => updatePlanOf(update));
 	}
 
 	/**
@@ -1486,14 +1480,7 @@ export class PartitionStore {
 		consumer: QueryCandidateConsumer,
 	): SqlMetrics {
 		const query = opts.plan;
-		const plan =
-			query === null
-				? null
-				: withExpressionErrors(() => {
-						const compiled = queryPlanOf(query);
-						validateQueryPlan(compiled);
-						return compiled;
-					});
+		const plan = query === null ? null : withExpressionErrors(() => queryPlanOf(query));
 		const { sql, params } = queryScanStatement({ ...opts, plan });
 		const cursor = this.#storage.sql.exec<Record<string, SqlStorageValue>>(sql, ...params);
 		const entryCount = plan?.projection?.names.length ?? 0;

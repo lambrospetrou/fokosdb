@@ -154,8 +154,6 @@ export type CompiledConditionPlan = {
 		nativeTypes: readonly ["boolean"];
 		canBeMissing: false;
 	};
-	/** Canonical deterministic fingerprint used for transaction idempotency. */
-	identity: string;
 };
 
 /**
@@ -206,8 +204,6 @@ export type CompiledUpdatePlan = {
 		/** List of distinct JSON paths modified or accessed in item data. */
 		paths: readonly string[];
 	};
-	/** Canonical deterministic fingerprint used for transaction idempotency. */
-	identity: string;
 };
 
 /**
@@ -242,8 +238,6 @@ export type CompiledProjectionPlan = {
 		/** List of distinct JSON paths accessed in item data. */
 		paths: readonly string[];
 	};
-	/** Canonical deterministic fingerprint of the projection expression. */
-	identity: string;
 };
 
 /**
@@ -276,10 +270,6 @@ export type CompiledQueryPlan = {
 		/** List of distinct JSON paths accessed in item data. */
 		paths: readonly string[];
 	};
-	/** Canonical deterministic fingerprint of the filter, or null without one. */
-	filterIdentity: string | null;
-	/** Canonical deterministic fingerprint of the projection, or null without one. */
-	projectionIdentity: string | null;
 };
 
 /**

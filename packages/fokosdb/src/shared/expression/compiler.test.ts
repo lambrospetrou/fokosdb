@@ -57,7 +57,6 @@ describe("condition SQLite compiler", () => {
 			expect(plan.bindings).toEqual([]);
 			expect(plan.requiredColumns).toEqual([]);
 			expect(plan.dataDependencies).toEqual({ completeData: false, paths: [] });
-			expect(plan.identity).toBe(`{"op":"${condition.op}"}`);
 		}
 	});
 

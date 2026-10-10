@@ -31,7 +31,6 @@ import type { JsonPrimitive } from "../json-types.js";
 import { materializeExpressionBindings } from "./bindings.js";
 import { decodeByteLiteral } from "./byte-literal.js";
 import { ExpressionError } from "./errors.js";
-import { canonicalConditionIdentity, canonicalProjectionIdentity, canonicalUpdateIdentity } from "./identity.js";
 import { EXPRESSION_LIMITS } from "./limits.js";
 import {
 	type ExpressionContext,
@@ -181,7 +180,6 @@ export function compileConditionExpression(
 		requiredColumns: analysis.requiredColumns,
 		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
 		result: { nativeTypes: ["boolean"], canBeMissing: false },
-		identity: canonicalConditionIdentity(condition),
 	};
 }
 
@@ -275,7 +273,6 @@ export function compileUpdateExpression(update: UpdateExpression): CompiledUpdat
 			completeData: context.completeData,
 			paths: [...context.paths],
 		},
-		identity: canonicalUpdateIdentity(update),
 	};
 }
 
@@ -321,7 +318,6 @@ export function compileProjectionExpression(projection: readonly ProjectionExpre
 		completeBindingCount,
 		requiredColumns: analysis.requiredColumns,
 		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
-		identity: canonicalProjectionIdentity(projection),
 	};
 }
 
@@ -383,8 +379,6 @@ export function compileQueryExpression(input: {
 				filterAnalysis?.requiredColumns.includes(column) === true || projectionAnalysis?.requiredColumns.includes(column) === true,
 		),
 		dataDependencies: { completeData: context.completeData, paths: [...context.paths] },
-		filterIdentity: filter === undefined ? null : canonicalConditionIdentity(filter),
-		projectionIdentity: projection === undefined ? null : canonicalProjectionIdentity(projection),
 	};
 }
 
