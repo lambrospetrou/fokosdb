@@ -122,3 +122,4 @@ Tests run in the real Workers runtime through `@cloudflare/vitest-plugin`. Each 
 - `docs/adr/` — architecture decisions.
 - `docs/agent-plans/` — one dated specification per feature. Read the matching one before you change that feature.
 - `docs/ideas/` — proposals that are not decided yet.
+- `packages/fokosdb/formal/p/` — the P model of the transactions, with its monitors and seeded defects. `pnpm formal:p` compiles it and runs every test case in Docker; `pnpm formal:p <test case>` runs one, and `pnpm formal:p --pex [test case...]` runs the exhaustive checker PEx. Options after `--` go to `p check`, for example `pnpm formal:p -- --sch-pct 3`. A `tcBug<Id>` test case must fail with its monitor, and every other test case must pass. `pnpm test` does not run it.

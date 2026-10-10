@@ -47,6 +47,7 @@
 		"check": "tsc --noEmit && pnpm lint",
 		"check:keys": "bash ../../tools/check-key-invariants.sh",
 		"check:test-machinery": "node ../../tools/check-test-machinery.js",
+		"formal:p": "bash formal/p/check.sh",
 		"lint": "oxlint",
 		"lint:fix": "oxlint --fix",
 		"lint:pkg": "publint",

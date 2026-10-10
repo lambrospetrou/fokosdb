@@ -168,3 +168,9 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# P model output
+
+PGenerated/
+PCheckerOutput/
+.p-cache/
