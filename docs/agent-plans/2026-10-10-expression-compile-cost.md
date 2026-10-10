@@ -1,8 +1,10 @@
 # RFC — Lower the memory cost and the CPU cost of the expression compile
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-10
 **Author:** Lambros
+**How to read this RFC:** Sections 1 to 7 are the design, as written before the steps. In them, "today" and
+"current" mean the system before step A (commit `9c7b260`). Appendix 8.1 has what each step gave as built.
 **Status:** The benchmark suite of section 4.2.1 is built. The plan has no canonical identity and the partition
 has no second plan check (commit `a31c0e8`). Step A, step B and step C are built.
 
@@ -68,7 +70,7 @@ The rest is the SQL text and its parts.
 The profile is from the compiler before commit `a31c0e8`. That compiler also computed the canonical identity,
 which was 5% to 11% of the bytes. Thus each share of today is a little higher than its row.
 
-### 1.3 What the reader must know about the current system
+### 1.3 What the reader must know about the system before the steps
 
 - **The compiler.** `packages/fokosdb/src/shared/expression/compiler.ts` has four entry points:
   `compileConditionExpression`, `compileUpdateExpression`, `compileProjectionExpression` and
@@ -186,10 +188,10 @@ plan ──▶ statement composition ──▶ sql.exec
 The result for the partition path, with step A and step B. The heap column is Node v24.20.0, and the time
 column is a `PartitionDO` in workerd. Appendix 8.2 has the method.
 
-**The "before" columns of this RFC are not the baseline of today.** Each step table of section 4.1 and
-section 4.2 compares a prototype with the compiler before commit `a31c0e8`. The partition path of both sides
-included the canonical identity and the second plan check, which are gone. Appendix 8.1 has the baseline of
-today: its heap count is 5% to 28% lower than the "before" column, and its time is equal inside the noise. The
+**The "before" columns of sections 4.1 and 4.2 are not the baseline of appendix 8.1.** Each step table of
+these two sections compares a prototype with the compiler before commit `a31c0e8`. The partition path of both sides
+included the canonical identity and the second plan check, which are gone. The baseline of appendix 8.1 does
+not have them, and its time is equal to the "before" column inside the noise. The
 prototypes do not have the size check of section 4.2.3. Appendix 8.1 has the measurement of each step as
 built, against the compiler of the commit before the step.
 
@@ -255,7 +257,7 @@ is the median of 5 samples. Two runs of one case differ by about 10%.
 
 #### 4.2.2 Step A: scan for the used bindings with no regular expression
 
-**Today.** `compactPlanParameters` and `compactPoolParameters` call `matchAll` on each SQL fragment. `matchAll`
+**Before the step.** `compactPlanParameters` and `compactPoolParameters` call `matchAll` on each SQL fragment. `matchAll`
 makes one match array and one substring for each `?N` or `?1, '$[N]'`. When a binding is not used, a `replace`
 with the same pattern renumbers the rest.
 
@@ -310,7 +312,7 @@ change only:
 
 #### 4.2.3 Step A: one renderer set, a binding lookup with no key string, and a size check with no buffer
 
-**Today.**
+**Before the step.**
 
 - `utf8WithinLimit` encodes a text of 33,334 to 100,000 characters to count its bytes (section 1.3).
 - `makeRenderers` makes four closures and one object each time `renderValue`, `renderType` or `renderPresent`
@@ -372,7 +374,7 @@ section 4.2.2 against a prototype that adds these two changes:
 The prototype makes the renderer set when it makes the context. That costs 0.2 to 0.7 KiB for an expression with
 no function, which is the increase in the smallest cases. The set at the first function node removes that part
 of the increase. Measured with step A as built (appendix 8.1): each of the 19 cases allocates less than the
-baseline, and `cond: not_exists(hashKey)` goes from 3.0 KiB to 2.7 KiB.
+baseline, and `cond: not_exists(hashKey)` goes from 3.0 KiB to 2.8 KiB.
 
 Step A with no size check change: the compiler before `a31c0e8` against the prototype with the scan, the
 renderer set and the lookup. The time column is a `PartitionDO` in workerd:
@@ -587,7 +589,7 @@ against `EXPRESSION_LIMITS.compiledSqlBytes`, each one alone. No statement runs 
 
 | Statement | Fragments in its text |
 | --- | --- |
-| The probe (`composeUpdateProbeStatement`) | `applicableSql` two times, `valueTypeSql` one time, `documentSql` one time. `applicableSql` also holds `documentSql`. |
+| The probe (`composeUpdateProbeStatement`) | Before step C: `applicableSql` two times, `valueTypeSql` one time, `documentSql` one time. `applicableSql` also holds `documentSql`. As built: `applicableSql` one time (see below). |
 | The write (`PartitionStore.updateItemSingleShot`) | `documentSql` three times |
 | The lock row (`PartitionStore.insertPendingUpdateLock`) | `documentSql` one time |
 
@@ -617,18 +619,47 @@ entry points do:
 The cost: the compile composes two statements more. `updatePlanOf` keeps the plan for the request, so the
 check runs one time for each update.
 
+**The probe statement holds `applicableSql` one time.** Before step C, the statement had the fragment as the
+`applicable` column and again as the guard of `new_size`. As built, a subquery in the `FROM` clause computes
+the column, and the guard reads it:
+
+```sql
+SELECT i.hk IS NOT NULL AS item_present, i.applicable, <value_type_ok>,
+       CASE WHEN i.applicable = 1 THEN (<size of documentSql>) ELSE NULL END AS new_size, ...
+FROM (SELECT i.*, (<applicableSql>) AS applicable
+      FROM requested LEFT JOIN items AS i ON ...) AS i
+```
+
+The subquery has the alias `i` and all columns of the item, so the other fragments read it with no change. It
+makes no temporary table. Measured in a `PartitionDO`, two runs of each form, one after the other:
+
+| Case | Statement characters before | As built | Change | SQLite first µs before | As built | SQLite again µs before | As built |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| upd: set 1 literal | 962 | 805 | -16% | 42.5, 44.2 | 53.2, 55.2 | 6.8, 6.8 | 6.7, 6.7 |
+| upd: remove 1 path | 831 | 739 | -11% | 37.4, 39.3 | 46.9, 47.6 | 6.8, 6.7 | 6.8, 6.7 |
+| upd: counter and timestamp | 3,777 | 2,372 | -37% | 135.7, 133.8 | 154.3, 151.4 | 12.3, 12.6 | 12.6, 12.5 |
+| upd: 20 actions with arithmetic | 56,471 | 31,604 | -44% | 3,094, 2,281 | 2,438, 2,234 | 142.6, 143.6 | 152.3, 134.8 |
+| upd: 32 literal sets | 6,932 | 4,113 | -41% | 390.6, 382.8 | 388.7, 386.7 | 95.7, 94.2 | 90.3, 95.2 |
+
+- A statement that SQLite saw before runs in the same time.
+- The first `sql.exec` of a small update statement costs 9 to 18 µs more, for the subquery. A list of the
+  necessary columns in the place of `i.*` lowers that by about 2 µs, and is not used: a fragment that reads a
+  column that is not in the list would fail.
+- The result comparison of section 4.2.8, this form against the form before it, on SQLite 3.53.4
+  (`node:sqlite`): all 225,842 results are equal.
+
 **The plan keeps the probe statement.** The byte count of a statement above 33,334 characters reads the text
 to its end, and V8 then makes one flat copy of the text. `sql.exec` makes the same copy of each statement that
 it runs. A statement that the compile composes, and the runtime composes again, thus gets two copies. For
 `upd: 20 actions with arithmetic` one copy is 64 KiB or more. Thus the update plan has the field `probeSql`:
 the compile composes the probe statement one time, and `probeUpdatePlan` runs that text. Measured (appendix
-8.1): the partition path of that case allocates 255.6 KiB before step C and 255.6 KiB after it. 
-`upd: counter and timestamp` allocates 0.3 KiB more and `upd: 32 literal sets` 2.1 KiB more, for the write
-statement of the size check.
+8.1): with the shorter probe statement, the partition path of that case allocates 255.6 KiB before step C and
+199.1 KiB after it. The two smallest update cases allocate 0.7 and 0.8 KiB more, for the write statement of
+the size check.
 
-Part 1 makes the update statements longer by two characters for each group. Thus an update that runs before
-step C, with a probe statement in the last 1% below the SQL limit, gets `sql_limit` after it. In the result
-comparison, one update with a probe statement of 99,426 bytes is such a case. Thus part 1 and part 2 ship
+Part 1 makes the update statements longer by two characters for each group. The shorter probe statement is
+more than that difference: in the result comparison, no update that compiles before step C gets `sql_limit`
+after it, apart from the updates whose statement was above the limit. Thus part 1 and part 2 ship
 together, and the size check of part 2 measures the text of part 1.
 
 #### 4.2.6 Extensibility
@@ -711,16 +742,17 @@ renumbering code that no test can run, so this RFC does not make that change.
 Step B does not change the update SQL. The update SQL repeats text in three ways:
 
 - `applicableSql` holds the full `documentSql` inside `json_type(...)`, and the probe statement holds
-  `applicableSql` two times and `documentSql` one more time.
+  `documentSql` one more time. Step C removed the second copy of `applicableSql` from the probe statement
+  (section 4.2.5).
 - `renderArithmeticPresent` keeps terms that are constant, such as `1 AND 1` and `'number' = 'number'`.
 - Two `set` actions with the same parent path give the same target guard two times.
 
-Part 2 of step C refuses an update whose statement is above the SQL limit. It does not make the statement
-shorter. With the probe statement of today, the largest update that runs has an `applicableSql` of about one
-half of the limit.
+Part 2 of step C refuses an update whose statement is above the SQL limit. With the probe statement as built,
+the largest update that runs has an `applicableSql` of about 87% of the limit: in the SQL limit test, it is
+86,720 characters in a probe statement of 99,579.
 
-`upd: 20 actions with arithmetic` is 3,312 bytes as a tree and 56,071 characters as a probe statement. Its first
-`sql.exec` costs 2,313 µs. The question: which of the three can go with no change to the result?
+`upd: 20 actions with arithmetic` is 3,312 bytes as a tree and 31,604 characters as a probe statement. The
+question: which of the three can go with no change to the result?
 
 #### 4.3.3 One statement composition for a query
 
@@ -896,29 +928,37 @@ median of 5 batches of at least 100 ms:
 | query: 40-term filter and 48 projections | 5377 | 58796 | 128 | 248.0 | 263.7 | 25250.0 | 24750.0 |
 
 `pnpm --filter fokosdb bench:alloc:expression`. Node v24.20.0, heap KiB for each call, mean of 8 to 2,000 calls
-after 3,000 warm-up calls. The Compile column includes one validation and no identity:
+after 3,000 warm-up calls. The Compile column includes one validation and no identity. The Path column includes
+the flat copy of the statement text that `sql.exec` makes:
 
 | Case | Validate | Identity | Compile | Path | Kept |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| cond: not_exists(hashKey) | 0.5 | 0.3 | 1.8 | 3.0 | 0.7 |
-| cond: optimistic lock | 0.8 | 0.9 | 4.0 | 5.3 | 1.0 |
-| cond: one path eq | 0.6 | 0.5 | 6.0 | 7.8 | 1.3 |
-| cond: contains on an array path | 0.5 | 0.5 | 9.1 | 10.0 | 2.2 |
-| cond: four terms | 0.8 | 2.3 | 18.3 | 19.1 | 2.5 |
-| cond: nested access policy | 0.5 | 2.8 | 25.0 | 26.1 | 3.5 |
-| cond: 40 distinct path eq | 0.5 | 22.0 | 208.0 | 209.5 | 22.8 |
-| cond: 80 eq on one path | 0.4 | 43.9 | 490.8 | 490.9 | 44.0 |
-| upd: set 1 literal | 1.3 | 0.7 | 6.2 | 7.8 | 1.4 |
-| upd: remove 1 path | 1.3 | 0.6 | 5.0 | 6.5 | 1.3 |
-| upd: counter and timestamp | 3.1 | 2.0 | 21.5 | 22.4 | 4.2 |
-| upd: 20 actions with arithmetic | 21.9 | 25.9 | 307.2 | 307.2 | 55.6 |
-| upd: 32 literal sets | 10.9 | 20.6 | 101.3 | 104.3 | 7.7 |
-| proj: 1 path | 0.8 | 0.3 | 7.5 | 9.0 | 1.3 |
-| proj: 3 paths and v | 1.0 | 1.2 | 16.3 | 20.3 | 2.6 |
-| proj: 48 paths | 3.5 | 15.1 | 219.5 | 264.5 | 31.2 |
-| query: one path eq filter | 0.6 | 0.6 | 10.0 | 12.3 | 1.6 |
-| query: four-term filter and 5 projections | 1.3 | 3.9 | 43.6 | 49.9 | 5.5 |
-| query: 40-term filter and 48 projections | 4.0 | 37.1 | 580.5 | 633.8 | 59.5 |
+| cond: not_exists(hashKey) | 0.5 | 0.3 | 1.9 | 3.0 | 0.7 |
+| cond: optimistic lock | 0.8 | 0.9 | 4.0 | 5.4 | 1.0 |
+| cond: one path eq | 0.6 | 0.5 | 6.1 | 7.9 | 1.4 |
+| cond: contains on an array path | 0.5 | 0.5 | 9.1 | 11.7 | 2.2 |
+| cond: four terms | 0.8 | 2.3 | 18.3 | 21.2 | 2.6 |
+| cond: nested access policy | 0.5 | 2.8 | 25.0 | 29.2 | 3.5 |
+| cond: 40 distinct path eq | 0.5 | 22.0 | 208.0 | 232.7 | 22.8 |
+| cond: 80 eq on one path | 0.4 | 43.9 | 490.8 | 554.7 | 43.9 |
+| upd: set 1 literal | 1.3 | 0.7 | 6.2 | 8.8 | 1.5 |
+| upd: remove 1 path | 1.3 | 0.6 | 5.0 | 7.4 | 1.4 |
+| upd: counter and timestamp | 3.1 | 2.0 | 21.5 | 26.2 | 4.3 |
+| upd: 20 actions with arithmetic | 21.9 | 25.9 | 307.2 | 383.7 | 55.5 |
+| upd: 32 literal sets | 10.9 | 20.6 | 101.3 | 110.9 | 7.7 |
+| proj: 1 path | 0.8 | 0.3 | 7.5 | 9.8 | 1.3 |
+| proj: 3 paths and v | 1.0 | 1.2 | 16.3 | 22.4 | 2.7 |
+| proj: 48 paths | 3.5 | 15.1 | 219.5 | 292.8 | 31.2 |
+| query: one path eq filter | 0.6 | 0.6 | 10.0 | 13.7 | 1.7 |
+| query: four-term filter and 5 projections | 1.3 | 3.9 | 43.6 | 55.2 | 5.6 |
+| query: 40-term filter and 48 projections | 4.0 | 37.1 | 580.5 | 698.0 | 59.5 |
+
+**The heap columns of this appendix are from the corrected script.** `expression-alloc.mjs` first read the
+statement to its end with a call whose result it did not use, and the optimizing compiler of V8 removed the
+call. The Path column then did not have the flat copy of the statement. The script now keeps the result, and
+each heap number of this appendix was measured again with it, for each commit. The heap columns of the
+prototype tables in sections 4.1, 4.2 and 5.1 are from the script before the correction: their Path numbers
+are too low by one flat copy of the statement on each side, and the prototypes are not in the repository.
 
 **After step A.** The working tree on commit `9c7b260`, with step A. Each "before" column is the compiler of
 that commit. The workerd run measured the two compilers one after the other, on one machine. Step A changes
@@ -926,25 +966,25 @@ no SQL, so the SQL size, the binding count and the two SQLite columns do not cha
 
 | Case | Heap KiB before | Step A | Change | Compile µs before | Step A | Path µs before | Step A | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| cond: not_exists(hashKey) | 3.0 | 2.7 | -10% | 0.4 | 0.4 | 1.6 | 1.6 | 0% |
-| cond: optimistic lock | 5.3 | 5.0 | -6% | 1.9 | 1.6 | 3.4 | 3.1 | -9% |
-| cond: one path eq | 7.8 | 6.7 | -14% | 3.4 | 2.5 | 5.1 | 4.1 | -20% |
-| cond: contains on an array path | 10.0 | 7.9 | -21% | 4.6 | 3.1 | 6.0 | 4.6 | -23% |
-| cond: four terms | 19.1 | 14.6 | -24% | 9.8 | 6.5 | 11.2 | 8.3 | -26% |
-| cond: nested access policy | 26.1 | 20.9 | -20% | 10.5 | 8.2 | 12.3 | 9.6 | -22% |
-| cond: 40 distinct path eq | 209.5 | 153.7 | -27% | 116.2 | 82.0 | 119.1 | 83.5 | -30% |
-| cond: 80 eq on one path | 490.9 | 341.2 | -30% | 201.2 | 193.4 | 207.0 | 201.2 | -3% |
-| upd: set 1 literal | 7.8 | 6.3 | -19% | 3.4 | 2.4 | 5.2 | 3.5 | -33% |
-| upd: remove 1 path | 6.5 | 5.6 | -14% | 2.3 | 1.4 | 3.5 | 3.0 | -14% |
-| upd: counter and timestamp | 22.4 | 14.4 | -36% | 11.0 | 7.3 | 12.1 | 8.6 | -29% |
-| upd: 20 actions with arithmetic | 307.2 | 176.0 | -43% | 187.5 | 136.7 | 193.4 | 131.8 | -32% |
-| upd: 32 literal sets | 104.3 | 59.9 | -43% | 76.7 | 63.0 | 80.1 | 71.3 | -11% |
-| proj: 1 path | 9.0 | 7.7 | -14% | 4.1 | 2.5 | 5.6 | 4.2 | -25% |
-| proj: 3 paths and v | 20.3 | 16.0 | -21% | 8.2 | 4.9 | 10.1 | 7.2 | -29% |
-| proj: 48 paths | 264.5 | 195.8 | -26% | 98.6 | 74.2 | 144.5 | 104.5 | -28% |
-| query: one path eq filter | 12.3 | 11.0 | -11% | 5.1 | 4.6 | 7.4 | 5.9 | -20% |
-| query: four-term filter and 5 projections | 49.9 | 39.1 | -22% | 19.5 | 13.3 | 24.5 | 15.7 | -36% |
-| query: 40-term filter and 48 projections | 633.8 | 511.5 | -19% | 240.2 | 155.3 | 293.0 | 183.6 | -37% |
+| cond: not_exists(hashKey) | 3.0 | 2.8 | -7% | 0.4 | 0.4 | 1.6 | 1.6 | 0% |
+| cond: optimistic lock | 5.4 | 5.1 | -6% | 1.9 | 1.6 | 3.4 | 3.1 | -9% |
+| cond: one path eq | 7.9 | 6.7 | -15% | 3.4 | 2.5 | 5.1 | 4.1 | -20% |
+| cond: contains on an array path | 11.7 | 9.6 | -18% | 4.6 | 3.1 | 6.0 | 4.6 | -23% |
+| cond: four terms | 21.2 | 16.7 | -21% | 9.8 | 6.5 | 11.2 | 8.3 | -26% |
+| cond: nested access policy | 29.2 | 24.0 | -18% | 10.5 | 8.2 | 12.3 | 9.6 | -22% |
+| cond: 40 distinct path eq | 232.7 | 177.3 | -24% | 116.2 | 82.0 | 119.1 | 83.5 | -30% |
+| cond: 80 eq on one path | 554.7 | 384.0 | -31% | 201.2 | 193.4 | 207.0 | 201.2 | -3% |
+| upd: set 1 literal | 8.8 | 7.3 | -17% | 3.4 | 2.4 | 5.2 | 3.5 | -33% |
+| upd: remove 1 path | 7.4 | 6.4 | -14% | 2.3 | 1.4 | 3.5 | 3.0 | -14% |
+| upd: counter and timestamp | 26.2 | 18.3 | -30% | 11.0 | 7.3 | 12.1 | 8.6 | -29% |
+| upd: 20 actions with arithmetic | 383.7 | 255.6 | -33% | 187.5 | 136.7 | 193.4 | 131.8 | -32% |
+| upd: 32 literal sets | 110.9 | 66.9 | -40% | 76.7 | 63.0 | 80.1 | 71.3 | -11% |
+| proj: 1 path | 9.8 | 8.5 | -13% | 4.1 | 2.5 | 5.6 | 4.2 | -25% |
+| proj: 3 paths and v | 22.4 | 18.3 | -18% | 8.2 | 4.9 | 10.1 | 7.2 | -29% |
+| proj: 48 paths | 292.8 | 227.5 | -22% | 98.6 | 74.2 | 144.5 | 104.5 | -28% |
+| query: one path eq filter | 13.7 | 12.4 | -9% | 5.1 | 4.6 | 7.4 | 5.9 | -20% |
+| query: four-term filter and 5 projections | 55.2 | 44.3 | -20% | 19.5 | 13.3 | 24.5 | 15.7 | -36% |
+| query: 40-term filter and 48 projections | 698.0 | 512.3 | -27% | 240.2 | 155.3 | 293.0 | 183.6 | -37% |
 
 In one earlier run of step A, the partition path of `cond: 80 eq on one path` was 134.8 µs. Its change is
 thus not clear of the noise.
@@ -960,25 +1000,25 @@ machine. The binding count of each case does not change.
 
 | Case | SQL B before | Step B | Change | Heap KiB before | Step B | Change | Path µs before | Step B | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| cond: not_exists(hashKey) | 330 | 330 | 0% | 2.7 | 2.7 | 0% | 1.4 | 1.7 | +21% |
-| cond: optimistic lock | 461 | 461 | 0% | 5.0 | 5.0 | 0% | 2.8 | 2.9 | +4% |
+| cond: not_exists(hashKey) | 330 | 330 | 0% | 2.8 | 2.8 | 0% | 1.4 | 1.7 | +21% |
+| cond: optimistic lock | 461 | 461 | 0% | 5.1 | 5.1 | 0% | 2.8 | 2.9 | +4% |
 | cond: one path eq | 845 | 504 | -40% | 6.7 | 4.9 | -27% | 3.7 | 3.6 | -3% |
-| cond: contains on an array path | 1,676 | 1,676 | 0% | 7.9 | 8.0 | +1% | 4.5 | 4.4 | -2% |
-| cond: four terms | 2,066 | 1,055 | -49% | 14.6 | 9.4 | -36% | 8.0 | 8.2 | +2% |
-| cond: nested access policy | 3,067 | 2,385 | -22% | 20.9 | 17.1 | -18% | 9.1 | 9.3 | +2% |
-| cond: 40 distinct path eq | 22,208 | 8,532 | -62% | 153.7 | 81.5 | -47% | 82.0 | 54.2 | -34% |
-| cond: 80 eq on one path | 43,818 | 16,538 | -62% | 341.2 | 142.3 | -58% | 160.2 | 98.6 | -38% |
-| upd: set 1 literal | 958 | 958 | 0% | 6.3 | 6.3 | 0% | 3.7 | 3.5 | -5% |
-| upd: remove 1 path | 831 | 831 | 0% | 5.6 | 5.6 | 0% | 2.6 | 2.8 | +8% |
-| upd: counter and timestamp | 3,753 | 3,753 | 0% | 14.4 | 14.4 | 0% | 7.9 | 8.2 | +4% |
-| upd: 20 actions with arithmetic | 56,071 | 56,071 | 0% | 176.0 | 176.0 | 0% | 112.3 | 114.3 | +2% |
-| upd: 32 literal sets | 6,804 | 6,804 | 0% | 59.9 | 59.9 | 0% | 60.5 | 61.5 | +2% |
-| proj: 1 path | 718 | 561 | -22% | 7.7 | 6.8 | -12% | 3.9 | 4.1 | +5% |
-| proj: 3 paths and v | 2,109 | 1,583 | -25% | 16.0 | 13.0 | -19% | 7.5 | 6.2 | -17% |
-| proj: 48 paths | 30,471 | 22,897 | -25% | 195.8 | 153.7 | -22% | 90.3 | 64.5 | -29% |
-| query: one path eq filter | 1,342 | 979 | -27% | 11.0 | 9.4 | -15% | 5.3 | 5.5 | +4% |
-| query: four-term filter and 5 projections | 5,260 | 3,500 | -33% | 39.1 | 29.6 | -24% | 15.5 | 13.8 | -11% |
-| query: 40-term filter and 48 projections | 58,796 | 36,629 | -38% | 511.5 | 307.4 | -40% | 174.8 | 144.5 | -17% |
+| cond: contains on an array path | 1,676 | 1,676 | 0% | 9.6 | 9.7 | +1% | 4.5 | 4.4 | -2% |
+| cond: four terms | 2,066 | 1,055 | -49% | 16.7 | 10.5 | -37% | 8.0 | 8.2 | +2% |
+| cond: nested access policy | 3,067 | 2,385 | -22% | 24.0 | 19.5 | -19% | 9.1 | 9.3 | +2% |
+| cond: 40 distinct path eq | 22,208 | 8,532 | -62% | 177.3 | 90.4 | -49% | 82.0 | 54.2 | -34% |
+| cond: 80 eq on one path | 43,818 | 16,538 | -62% | 384.0 | 160.0 | -58% | 160.2 | 98.6 | -38% |
+| upd: set 1 literal | 958 | 958 | 0% | 7.3 | 7.3 | 0% | 3.7 | 3.5 | -5% |
+| upd: remove 1 path | 831 | 831 | 0% | 6.4 | 6.4 | 0% | 2.6 | 2.8 | +8% |
+| upd: counter and timestamp | 3,753 | 3,753 | 0% | 18.3 | 18.3 | 0% | 7.9 | 8.2 | +4% |
+| upd: 20 actions with arithmetic | 56,071 | 56,071 | 0% | 255.6 | 255.6 | 0% | 112.3 | 114.3 | +2% |
+| upd: 32 literal sets | 6,804 | 6,804 | 0% | 66.9 | 66.9 | 0% | 60.5 | 61.5 | +2% |
+| proj: 1 path | 718 | 561 | -22% | 8.5 | 7.4 | -13% | 3.9 | 4.1 | +5% |
+| proj: 3 paths and v | 2,109 | 1,583 | -25% | 18.3 | 14.7 | -20% | 7.5 | 6.2 | -17% |
+| proj: 48 paths | 30,471 | 22,897 | -25% | 227.5 | 176.1 | -23% | 90.3 | 64.5 | -29% |
+| query: one path eq filter | 1,342 | 979 | -27% | 12.4 | 10.4 | -16% | 5.3 | 5.5 | +4% |
+| query: four-term filter and 5 projections | 5,260 | 3,500 | -33% | 44.3 | 33.1 | -25% | 15.5 | 13.8 | -11% |
+| query: 40-term filter and 48 projections | 58,796 | 36,629 | -38% | 512.3 | 341.7 | -33% | 174.8 | 144.5 | -17% |
 
 | Case | SQLite first before | Step B | Change | SQLite again before | Step B | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1013,38 +1053,42 @@ each literal on each side, and the 19 benchmark cases on the benchmark items. A 
 (`number` tested as `'integer'` only) gave 332 different results in a run of 78,881.
 
 **After step C.** The working tree on commit `65e7ed2`, with step C. Each "before" column is the compiler of
-that commit, which has step A and step B. The three time columns are step C in workerd, and they are the
-baseline of the compiler as built.
+that commit, which has step A and step B. The three time columns are step C in workerd. The statement size and
+the time columns of the update rows are from the probe statement with two copies of `applicableSql`: section
+4.2.5 has the statement size and the times of the update cases as built. The heap columns are the compiler as
+built.
 
 | Case | SQL B before | Step C | Heap KiB before | Step C | Change | Path µs | SQLite first | SQLite again |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| cond: not_exists(hashKey) | 330 | 330 | 2.7 | 2.7 | 0% | 1.5 | 17.5 | 4.5 |
-| cond: optimistic lock | 461 | 461 | 5.0 | 5.0 | 0% | 3.2 | 22.5 | 4.5 |
+| cond: not_exists(hashKey) | 330 | 330 | 2.8 | 2.8 | 0% | 1.5 | 17.5 | 4.5 |
+| cond: optimistic lock | 461 | 461 | 5.1 | 5.1 | 0% | 3.2 | 22.5 | 4.5 |
 | cond: one path eq | 504 | 504 | 4.9 | 4.9 | 0% | 3.5 | 24.9 | 5.3 |
-| cond: contains on an array path | 1,676 | 1,676 | 8.0 | 8.0 | 0% | 4.9 | 59.6 | 6.4 |
-| cond: four terms | 1,055 | 1,059 | 9.4 | 8.9 | -5% | 8.2 | 45.2 | 8.1 |
-| cond: nested access policy | 2,385 | 2,387 | 17.1 | 15.1 | -12% | 8.6 | 80.6 | 6.9 |
-| cond: 40 distinct path eq | 8,532 | 8,608 | 81.5 | 78.0 | -4% | 57.1 | 306.6 | 50.8 |
-| cond: 80 eq on one path | 16,538 | 16,694 | 142.3 | 135.6 | -5% | 99.6 | 1,293 | 52.2 |
-| upd: set 1 literal | 958 | 962 | 6.3 | 7.7 | +22% | 4.2 | 44.4 | 6.8 |
-| upd: remove 1 path | 831 | 831 | 5.6 | 7.0 | +25% | 3.1 | 39.8 | 7.1 |
-| upd: counter and timestamp | 3,753 | 3,777 | 14.4 | 15.4 | +7% | 8.4 | 146.5 | 12.9 |
-| upd: 20 actions with arithmetic | 56,071 | 56,471 | 176.0 | 255.6 | +45% | 125.0 | 2,297 | 140.6 |
-| upd: 32 literal sets | 6,804 | 6,932 | 59.9 | 62.6 | +5% | 64.9 | 398.4 | 100.6 |
-| proj: 1 path | 561 | 561 | 6.8 | 6.8 | 0% | 4.5 | 26.4 | 5.1 |
-| proj: 3 paths and v | 1,583 | 1,583 | 13.0 | 13.0 | 0% | 7.1 | 54.7 | 8.1 |
-| proj: 48 paths | 22,897 | 22,897 | 153.7 | 153.7 | 0% | 67.9 | 1,945 | 99.6 |
-| query: one path eq filter | 979 | 979 | 9.4 | 9.4 | 0% | 6.1 | 820.3 | 804.7 |
-| query: four-term filter and 5 projections | 3,500 | 3,504 | 29.6 | 28.8 | -3% | 13.2 | 1,172 | 1,023 |
-| query: 40-term filter and 48 projections | 36,629 | 36,705 | 307.4 | 302.9 | -1% | 152.3 | 20,375 | 20,375 |
+| cond: contains on an array path | 1,676 | 1,676 | 9.7 | 9.7 | 0% | 4.9 | 59.6 | 6.4 |
+| cond: four terms | 1,055 | 1,059 | 10.5 | 10.0 | -5% | 8.2 | 45.2 | 8.1 |
+| cond: nested access policy | 2,385 | 2,387 | 19.5 | 17.5 | -10% | 8.6 | 80.6 | 6.9 |
+| cond: 40 distinct path eq | 8,532 | 8,608 | 90.4 | 86.5 | -4% | 57.1 | 306.6 | 50.8 |
+| cond: 80 eq on one path | 16,538 | 16,694 | 160.0 | 153.6 | -4% | 99.6 | 1,293 | 52.2 |
+| upd: set 1 literal | 958 | 962 | 7.3 | 8.0 | +10% | 4.2 | 44.4 | 6.8 |
+| upd: remove 1 path | 831 | 831 | 6.4 | 7.2 | +12% | 3.1 | 39.8 | 7.1 |
+| upd: counter and timestamp | 3,753 | 3,777 | 18.3 | 17.1 | -7% | 8.4 | 146.5 | 12.9 |
+| upd: 20 actions with arithmetic | 56,071 | 56,471 | 255.6 | 199.1 | -22% | 125.0 | 2,297 | 140.6 |
+| upd: 32 literal sets | 6,804 | 6,932 | 66.9 | 66.1 | -1% | 64.9 | 398.4 | 100.6 |
+| proj: 1 path | 561 | 561 | 7.4 | 7.4 | 0% | 4.5 | 26.4 | 5.1 |
+| proj: 3 paths and v | 1,583 | 1,583 | 14.7 | 14.6 | -1% | 7.1 | 54.7 | 8.1 |
+| proj: 48 paths | 22,897 | 22,897 | 176.1 | 176.1 | 0% | 67.9 | 1,945 | 99.6 |
+| query: one path eq filter | 979 | 979 | 10.4 | 10.4 | 0% | 6.1 | 820.3 | 804.7 |
+| query: four-term filter and 5 projections | 3,500 | 3,504 | 33.1 | 32.3 | -2% | 13.2 | 1,172 | 1,023 |
+| query: 40-term filter and 48 projections | 36,629 | 36,705 | 341.7 | 341.6 | 0% | 152.3 | 20,375 | 20,375 |
 
 - **The statement size.** A chain of three terms or more gets two characters for each group. The largest
   change is +0.9%, for `cond: 80 eq on one path` and `cond: 40 distinct path eq`.
 - **The partition path time of the update cases.** One run measured the two compilers one after the other, in
   µs: 3.6 and 4.2, 2.7 and 3.1, 8.4 and 8.4, 114.3 and 125.0, 62.0 and 64.9. The differences of the other
   cases in that run are inside the noise.
-- **The heap of the conditions and the queries** goes down by 1% to 12% where a chain has more than two
-  terms. The cause was not examined.
+- **The heap.** A condition or a query with a chain of more than two terms allocates up to 10% less. The
+  cause was not examined. `upd: 20 actions with arithmetic` allocates 22% less, because its probe statement
+  holds `applicableSql` one time. The two smallest update cases allocate 10% and 13% more, for the write
+  statement of the size check.
 
 The rule for completion of section 4.2.5, in a `PartitionDO`:
 
@@ -1069,39 +1113,53 @@ nested to 18 levels in conditions, projections and updates of 1 to 32 actions. 1
 step with a probe statement above 100,000 bytes, and get `sql_limit` after it. One update with a probe
 statement of 99,426 bytes also gets `sql_limit` after the step (section 4.2.5).
 
-**The Path column of the heap tables above is too low.** `expression-alloc.mjs` read the statement to its end
-with a call whose result it did not use, and the optimizing compiler of V8 removed the call. Thus the Path
-column of the baseline table and of the three step tables does not have the flat copy of the statement that
-`sql.exec` makes. The script now keeps the result. The Compile column is not affected, and the comparisons of
-one step with the step before it stay valid, with one exception: the "After step C" heap column of the update
-cases is from a compiler that did not keep `probeSql`.
-
-The baseline of the compiler as built, with the corrected script. Node v24.20.0, heap KiB for each call:
+**The compiler as built.** The heap of all three steps. Node v24.20.0, heap KiB for each call:
 
 | Case | Validate | Identity | Compile | Path | Kept |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| cond: not_exists(hashKey) | 0.5 | 0.3 | 1.6 | 2.8 | 0.7 |
-| cond: optimistic lock | 0.8 | 0.9 | 3.7 | 5.0 | 1.0 |
+| cond: not_exists(hashKey) | 0.5 | 0.3 | 1.7 | 2.8 | 0.7 |
+| cond: optimistic lock | 0.8 | 0.9 | 3.7 | 5.1 | 1.0 |
 | cond: one path eq | 0.6 | 0.5 | 3.4 | 4.9 | 1.0 |
 | cond: contains on an array path | 0.5 | 0.5 | 7.0 | 9.7 | 2.2 |
 | cond: four terms | 0.8 | 2.3 | 8.0 | 10.0 | 1.6 |
-| cond: nested access policy | 0.5 | 2.8 | 14.0 | 17.5 | 2.8 |
+| cond: nested access policy | 0.5 | 2.8 | 14.0 | 17.5 | 2.9 |
 | cond: 40 distinct path eq | 0.5 | 22.0 | 75.5 | 86.5 | 9.5 |
 | cond: 80 eq on one path | 0.4 | 43.9 | 132.5 | 153.6 | 17.4 |
-| upd: set 1 literal | 1.3 | 0.7 | 6.3 | 8.2 | 1.5 |
-| upd: remove 1 path | 1.3 | 0.6 | 5.6 | 7.3 | 1.4 |
-| upd: counter and timestamp | 3.1 | 2.0 | 14.4 | 18.6 | 4.3 |
-| upd: 20 actions with arithmetic | 21.9 | 25.9 | 255.6 | 255.6 | 55.9 |
-| upd: 32 literal sets | 10.9 | 20.6 | 57.1 | 69.0 | 7.8 |
+| upd: set 1 literal | 1.3 | 0.7 | 6.2 | 8.0 | 1.3 |
+| upd: remove 1 path | 1.3 | 0.6 | 5.6 | 7.2 | 1.3 |
+| upd: counter and timestamp | 3.1 | 2.0 | 14.3 | 17.1 | 2.9 |
+| upd: 20 actions with arithmetic | 21.9 | 25.9 | 161.7 | 199.1 | 31.6 |
+| upd: 32 literal sets | 10.9 | 20.6 | 57.1 | 66.1 | 5.1 |
 | proj: 1 path | 0.8 | 0.3 | 5.5 | 7.4 | 1.1 |
 | proj: 3 paths and v | 1.0 | 1.2 | 9.5 | 14.6 | 2.1 |
 | proj: 48 paths | 3.5 | 15.1 | 113.8 | 176.1 | 23.8 |
 | query: one path eq filter | 0.6 | 0.6 | 7.1 | 10.4 | 1.3 |
 | query: four-term filter and 5 projections | 1.3 | 3.9 | 23.3 | 32.3 | 3.9 |
-| query: 40-term filter and 48 projections | 4.0 | 37.1 | 256.3 | 341.6 | 38.0 |
+| query: 40-term filter and 48 projections | 4.0 | 37.1 | 256.2 | 341.6 | 38.0 |
 
-Step B against step C, with the corrected script, partition path, heap KiB: `upd: counter and timestamp` 18.3
-and 18.6, `upd: 20 actions with arithmetic` 255.6 and 255.6, `upd: 32 literal sets` 66.9 and 69.0.
+The partition path of each step, heap KiB for each call:
+
+| Case | Baseline | Step A | Step B | Step C | Baseline to step C |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| cond: not_exists(hashKey) | 3.0 | 2.8 | 2.8 | 2.8 | -7% |
+| cond: optimistic lock | 5.4 | 5.1 | 5.1 | 5.1 | -6% |
+| cond: one path eq | 7.9 | 6.7 | 4.9 | 4.9 | -38% |
+| cond: contains on an array path | 11.7 | 9.6 | 9.7 | 9.7 | -17% |
+| cond: four terms | 21.2 | 16.7 | 10.5 | 10.0 | -53% |
+| cond: nested access policy | 29.2 | 24.0 | 19.5 | 17.5 | -40% |
+| cond: 40 distinct path eq | 232.7 | 177.3 | 90.4 | 86.5 | -63% |
+| cond: 80 eq on one path | 554.7 | 384.0 | 160.0 | 153.6 | -72% |
+| upd: set 1 literal | 8.8 | 7.3 | 7.3 | 8.0 | -9% |
+| upd: remove 1 path | 7.4 | 6.4 | 6.4 | 7.2 | -3% |
+| upd: counter and timestamp | 26.2 | 18.3 | 18.3 | 17.1 | -35% |
+| upd: 20 actions with arithmetic | 383.7 | 255.6 | 255.6 | 199.1 | -48% |
+| upd: 32 literal sets | 110.9 | 66.9 | 66.9 | 66.1 | -40% |
+| proj: 1 path | 9.8 | 8.5 | 7.4 | 7.4 | -24% |
+| proj: 3 paths and v | 22.4 | 18.3 | 14.7 | 14.6 | -35% |
+| proj: 48 paths | 292.8 | 227.5 | 176.1 | 176.1 | -40% |
+| query: one path eq filter | 13.7 | 12.4 | 10.4 | 10.4 | -24% |
+| query: four-term filter and 5 projections | 55.2 | 44.3 | 33.1 | 32.3 | -41% |
+| query: 40-term filter and 48 projections | 698.0 | 512.3 | 341.7 | 341.6 | -51% |
 
 `query: 40-term filter and 48 projections` still gets two flat copies: its widest statement in the compile,
 and the statement that runs. Section 4.3.3 has that question.

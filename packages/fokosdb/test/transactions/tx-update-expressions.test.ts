@@ -1,6 +1,7 @@
 import { describe, it, expect } from "vitest";
 import invariant from "../../src/shared/invariant.js";
 import type { ConditionExpression, UpdateExpression } from "../../src/shared/types.js";
+import type { ExpressionValue } from "../../src/shared/expression/types.js";
 import { MAX_ITEM_BYTES } from "../../src/shared/transaction-limits.js";
 import { compileUpdateExpression } from "../../src/shared/expression/compiler.js";
 import { EXPRESSION_LIMITS } from "../../src/shared/expression/limits.js";
@@ -51,13 +52,19 @@ describe("transactions - an update plan at the binding limit", () => {
  * too long.
  */
 describe("transactions - an update plan at the SQL limit", () => {
-	// Each action is `$.cI = if_not_exists($.cI, 0) + 1`, and the first `deeper` actions add 1 a second
-	// time. One more addition makes the statements about 800 bytes longer.
-	const counters = (deeper: number): UpdateExpression =>
-		Array.from({ length: EXPRESSION_LIMITS.updateActions }, (_, i) => {
+	const ACTIONS = EXPRESSION_LIMITS.updateActions;
+	// How many times action `i` adds 1, when the update has `extra` additions above one for each action.
+	const additions = (i: number, extra: number) => 1 + Math.floor(extra / ACTIONS) + (i < extra % ACTIONS ? 1 : 0);
+	// Each action is `$.cI = if_not_exists($.cI, 0) + 1 + 1 ...`. One more addition makes the statements
+	// some hundreds of bytes longer.
+	const counters = (extra: number): UpdateExpression =>
+		Array.from({ length: ACTIONS }, (_, i) => {
 			const path = { ref: "data" as const, path: `$.c${i}` };
-			const once = { fn: "+", args: [{ fn: "if_not_exists", args: [path, { val: 0 }] }, { val: 1 }] };
-			return { action: "set" as const, target: path, value: i < deeper ? { fn: "+", args: [once, { val: 1 }] } : once };
+			let value: ExpressionValue = { fn: "if_not_exists", args: [path, { val: 0 }] };
+			for (let n = 0; n < additions(i, extra); n++) {
+				value = { fn: "+", args: [value, { val: 1 }] };
+			}
+			return { action: "set" as const, target: path, value };
 		});
 	const compiles = (update: UpdateExpression): boolean => {
 		try {
@@ -69,8 +76,10 @@ describe("transactions - an update plan at the SQL limit", () => {
 		}
 	};
 	// The largest update of this shape that the compiler accepts.
+	// The operator limit is far above the count of additions that the SQL limit permits.
+	const MOST = 4 * ACTIONS;
 	let largest = 0;
-	while (compiles(counters(largest + 1))) {
+	while (largest < MOST && compiles(counters(largest + 1))) {
 		largest++;
 	}
 
@@ -78,7 +87,7 @@ describe("transactions - an update plan at the SQL limit", () => {
 		"runs the largest update, and refuses the next one (singlePartitionFastPath=%s)",
 		async (singlePartitionFastPath) => {
 			expect(largest).toBeGreaterThan(0);
-			expect(largest).toBeLessThan(EXPRESSION_LIMITS.updateActions);
+			expect(largest).toBeLessThan(MOST);
 			const db = makeDB({ singlePartitionFastPath });
 			const key = { hashKey: `sql-limit-${crypto.randomUUID()}` };
 			await db.putItem({ ...key, data: { c0: 5 } });
@@ -87,7 +96,7 @@ describe("transactions - an update plan at the SQL limit", () => {
 			expect(res).toMatchObject({ outcome: "committed" });
 			const got = await db.getItem(key);
 			invariant(got.found, "expected the updated item");
-			expect(got.item.data).toMatchObject({ c0: 7, [`c${largest}`]: 1, [`c${EXPRESSION_LIMITS.updateActions - 1}`]: 1 });
+			expect(got.item.data).toMatchObject({ c0: 5 + additions(0, largest), [`c${ACTIONS - 1}`]: additions(ACTIONS - 1, largest) });
 
 			const refused = await writeOutcome(
 				db.transactWriteItems({ items: [{ ...key, operation: "update", update: counters(largest + 1) }] }),

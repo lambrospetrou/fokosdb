@@ -68,13 +68,14 @@ LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.reque
 export function composeUpdateProbeStatement(plan: Pick<CompiledUpdatePlan, "documentSql" | "applicableSql" | "valueTypeSql">): string {
 	return `WITH requested(requested_hk, requested_sk) AS (VALUES (?1, ?2))
 SELECT i.hk IS NOT NULL AS item_present,
-       (${plan.applicableSql}) AS applicable,
+       i.applicable,
        CASE WHEN i.hk IS NULL OR i.data_kind = ${JSON_KIND_CODE} THEN (${plan.valueTypeSql}) ELSE 1 END AS value_type_ok,
-       CASE WHEN (${plan.applicableSql}) = 1 THEN (${estRowBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
+       CASE WHEN i.applicable = 1 THEN (${estRowBytesExpr(plan.documentSql, "?1", "?2")}) ELSE NULL END AS new_size,
        i.last_read_ts,
        i.last_write_ts
-FROM requested
-LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk`;
+FROM (SELECT i.*, (${plan.applicableSql}) AS applicable
+      FROM requested
+      LEFT JOIN items AS i ON i.hk = requested.requested_hk AND i.sk = requested.requested_sk) AS i`;
 }
 
 /** The TTL of the stored row. The `ttlSql` of an update write that sets no TTL. */
