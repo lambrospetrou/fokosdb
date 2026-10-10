@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-09
 **Author:** Lambros Petrou
-**Status:** Not started. No model, script, or test exists yet.
+**Status:** M0 is complete. M1 to M7 are not started.
 
 ## Table of contents
 
@@ -413,7 +413,7 @@ the model is too coarse at that point, and the milestone is not complete.
 
 ```text
 packages/fokosdb/formal/p/
-  FokosDB.pproj
+  FokosDB.pproj, Dockerfile, check.sh
   PSrc/   Types.p, Client.p, Coordinator.p, Partition.p, Participant.p, Topology.p, RpcCall.p,
           Environment.p, Operator.p
   PSpec/  Atomicity.p, Answers.p, Locks.p, Versions.p, WriteSerializable.p, ReadSerializable.p,
@@ -421,18 +421,31 @@ packages/fokosdb/formal/p/
   PTst/   TestDriver.p, TestCases.p
 ```
 
-- The checks run in the official Docker image `ghcr.io/p-org/p:<tag>`, which holds the .NET SDK 8.0, Java, and the
-  `p` tool. M0 pins the tag. Only Docker is necessary on the machine.
-- Commands, from `packages/fokosdb/formal/p/`:
-
-  ```sh
-  docker run --rm -v "$PWD":/workspace ghcr.io/p-org/p:<tag> p compile
-  docker run --rm -v "$PWD":/workspace ghcr.io/p-org/p:<tag> p check -tc <test case> -i <runs>
-  ```
-
-- A small test case can also run in the exhaustive checker PEx: `p compile --mode pex`, then
-  `p check --mode pex -tc <test case> --timeout <seconds>`.
-- The run counts and the run times are `TODO: measure` in M0, and each milestone records its own.
+- The checks run in Docker. The P project publishes no public image (`ghcr.io/p-org/p` refuses an anonymous pull),
+  so `Dockerfile` builds the local image `fokosdb-p:3.1.0`: `mcr.microsoft.com/dotnet/sdk:8.0`, OpenJDK 17, Maven,
+  and the NuGet tool `P` at version 3.1.0. `check.sh` pins the version and builds the image when it is missing. Only
+  Docker is necessary on the machine.
+- `pnpm formal:p` compiles the model and runs every test case. `pnpm formal:p <test case>` runs one. `SCHEDULES`
+  sets the number of schedules of each test case (default 1000). The script fails when a `tcBug<Id>` test case does
+  not fail with the monitor of section 4.2.12, when another test case finds a bug, or when a name runs more than one
+  test case: `p check -tc` runs every test case whose name starts with the given name.
+- The random checker stops at the first bug. For each test case, the output gives the number of schedules and of
+  timelines that the checker explored. A timeline count far below the schedule count shows that more schedules add
+  little.
+- `pnpm formal:p [--pex] [test case...] -- <p check option>...` gives each option after `--` to every `p check`
+  call, for example `-- --sch-pct 3 --seed 42` for the PCT strategy with a fixed seed. The script refuses an option
+  that it sets itself: `-tc`, `-o`, `--mode`, `--replay`, `-s`, and `-t`.
+- The output of a test case goes to `PCheckerOutput/<test case>/`. `check.sh --replay <test case> <schedule file>`
+  replays a bug.
+- A small test case can also run in the exhaustive checker PEx: `pnpm formal:p --pex [test case...]`.
+  `PEX_TIMEOUT` sets the time limit of each test case in seconds (default 60). A test case passes only when PEx
+  explores every state (`correct for any depth`), and a `tcBug<Id>` test case only when PEx finds the violation of
+  its monitor. A run that stops at the time limit before it explores every state gives `INCOMPLETE`. The output goes to
+  `PCheckerOutput/pex/<test case>/`.
+- The PEx compile builds the model with Maven. The Maven repository (46 MB) stays in the ignored folder
+  `packages/fokosdb/formal/p/.p-cache/`. The first PEx compile downloads it in about 40 s, and a later compile takes
+  about 6 s.
+- Each milestone records the run counts and the run times of its test cases in section 4.2.13.
 
 #### 4.2.2 Semantics of the mapping
 
@@ -710,8 +723,15 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcCoordinatorSplit` | T1 as `tcWriteHappy`, with retries | the split of the coordinator | pass |
 | `tcBug<Id>` | the test case of the milestone that the defect needs | as that test case | fail with the monitor of section 4.2.12 |
 
-`TODO: measure` the run count of each test case in its milestone. A test case that passes in PEx within its timeout
+Each milestone measures the run count of each of its test cases. A test case that passes in PEx within its timeout
 records that fact.
+
+| Test case | Milestone | Schedules | Run time | Result | PEx |
+| --- | --- | --- | --- | --- | --- |
+| `tcItems` | M0 | 1000 | 5 s | no bug; 1 timeline, because the test case has no nondeterministic choice | `correct for any depth`, 8 states |
+| `tcBugV1` | M0 | 1000 | 1 s | `VersionIncreases` fails in schedule 1 | counterexample of length 5 |
+
+The run time is the wall time of `check.sh` for one test case, Docker start included.
 
 #### 4.2.14 Link to the code
 
@@ -740,8 +760,9 @@ P does not run the TypeScript code. The model links to the code in two ways:
 
 #### 4.2.16 Cost
 
-The model adds no production code and no runtime cost. The checks run outside `pnpm test`. Their run time is
-`TODO: measure` in M0, and each milestone records its own.
+The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M0, `pnpm formal:p`
+takes about 9 s: 3 s for the compile and 6 s for the two test cases. The first run also builds the Docker image,
+which takes about 1 minute. Section 4.2.13 records the run time of each test case.
 
 #### 4.2.17 Testing
 
