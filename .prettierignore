@@ -1,6 +1,7 @@
 node_modules/
 dist/
 .wrangler/
+.cloudflare/
 worker-configuration.d.ts
 examples/http-api/test/hurl/report-json/
 docs/ideas/
