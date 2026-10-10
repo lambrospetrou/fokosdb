@@ -193,13 +193,15 @@ package export condition for.
 
 ## Scripts
 
-| Command                 | Purpose                                                                                                        |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `pnpm build`            | Build `dist/client` and `dist/server` with tsdown, which also reports entry sizes and guards the client bundle |
-| `pnpm test`             | Typecheck, key invariants, then vitest inside real `workerd`                                                   |
-| `pnpm lint:pkg`         | `publint` on the packaged output                                                                               |
-| `pnpm cf-typegen`       | Regenerate `worker-configuration.d.ts`                                                                         |
-| `pnpm bench:expression` | Expression engine benchmarks                                                                                   |
+| Command                         | Purpose                                                                                                        |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `pnpm build`                    | Build `dist/client` and `dist/server` with tsdown, which also reports entry sizes and guards the client bundle |
+| `pnpm test`                     | Typecheck, key invariants, then vitest inside real `workerd`                                                   |
+| `pnpm lint:pkg`                 | `publint` on the packaged output                                                                               |
+| `pnpm cf-typegen`               | Regenerate `worker-configuration.d.ts`                                                                         |
+| `pnpm bench:expression`         | Expression engine benchmarks                                                                                   |
+| `pnpm bench:workerd expression` | Expression compile and SQLite statement times inside a `PartitionDO`                                           |
+| `pnpm bench:alloc:expression`   | Heap bytes of the expression compile, in Node                                                                  |
 
 `wrangler.jsonc` here is never deployed. It gives vitest and `wrangler types` an entry point
 (`test/worker-entry.ts`) that exports the library Durable Objects.

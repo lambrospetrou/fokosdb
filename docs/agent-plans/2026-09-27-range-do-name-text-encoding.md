@@ -364,8 +364,8 @@ and that each ASCII component keeps its name of today.
   and the encoder adds code that the old percent-encoding loop did not have.
 - `packages/fokosdb/src/shared/partition-context.ts`
 - `packages/fokosdb/src/client/db.ts`
-- `packages/fokosdb/test/do-names-bench/`: the benchmark of the performance section, with its own vitest config,
-  and the `bench:workerd` script. It holds a copy of the encoder.
+- `packages/fokosdb/test/do-names-bench/`: the benchmark of the performance section. It holds a copy of the
+  encoder. The `bench:workerd` script runs it with `packages/fokosdb/test/vitest.workerd-bench.config.ts`.
   When the encoder moves into `partition-id.ts`, the benchmark must import it from there.
 
 #### Testing
@@ -472,7 +472,7 @@ The name rules must not change, so they cannot depend on it.
 - `packages/fokosdb/src/shared/partition-context.ts`
 - `packages/fokosdb/src/client/db.ts`
 - `packages/fokosdb/test/do-names-bench/range-do-name.workerd-bench.ts`
-- `packages/fokosdb/test/do-names-bench/vitest.config.ts`
+- `packages/fokosdb/test/vitest.workerd-bench.config.ts`
 - `docs/agent-plans/2026-09-26-range-partition-id-base64url.md`
 - [DynamoDB naming rules](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.NamingRulesDataTypes.html)
 
