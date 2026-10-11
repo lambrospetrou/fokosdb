@@ -1,0 +1,322 @@
+#!/usr/bin/env node
+// Compiles the P model of FokosDB and runs its test cases in Docker. `check.js --help` gives the usage.
+//
+// A test case named tcBug<Defect> must report a violation of the monitor that EXPECTED_MONITOR gives.
+// Every other test case must report no bug. The script exits non-zero on any other result.
+
+import { spawn } from "node:child_process";
+import { closeSync, mkdirSync, openSync, readdirSync, readFileSync, rmSync } from "node:fs";
+import { parseArgs } from "node:util";
+
+const USAGE = `Compiles the P model of FokosDB and runs its test cases in Docker.
+
+Usage:
+  check.js [--pex] [--jobs <n>] [test case...] [-- <p check option>...]
+  check.js --replay <test case> <schedule file>
+  check.js --help
+
+Without a test case, the script runs every test case in PTst/. A test case named tcBug<Defect> must
+report a violation of the monitor of its seeded defect. Every other test case must report no bug.
+
+Options:
+  --pex           Use the exhaustive checker PEx, not the random checker. A test case passes only when
+                  PEx explores every state, and a tcBug<Defect> test case only when PEx finds the
+                  violation.
+  -j, --jobs <n>  Run <n> test cases at the same time. The default is JOBS, else 1. Each run is slower
+                  when more runs share the CPU.
+  --replay        Replay a schedule of the random checker, for example
+                  PCheckerOutput/<test case>/BugFinding/FokosDB_0_0.schedule.
+  -h, --help      Show this help.
+
+The script gives each option after "--" to every \`p check\` call without a change, for example
+\`-- --sch-pct 3 --seed 42\`. The script refuses an option that it sets itself. Without them, a test
+case in TEST_STRATEGY uses its own strategy.
+
+Environment:
+  SCHEDULES       The number of schedules of the random checker (default 1000). The random checker
+                  stops at the first bug.
+  PEX_TIMEOUT     The time limit of PEx for each test case, in seconds (default 60).
+  JOBS            The default of --jobs.
+
+Output:
+  One line for each test case, in the order of the test cases: the name, the schedules and timelines
+  that the checker explored (or the time limit of PEx), the time in seconds, and the result. The
+  output of a test case goes to PCheckerOutput/<test case>/, and to PCheckerOutput/pex/<test case>/
+  for PEx. The random checker writes the schedule of a bug to BugFinding/FokosDB_0_0.schedule there.
+  The Maven repository of PEx stays in .p-cache/ between runs.
+
+Exit status: 0 when every test case gives the expected result, else 1.`;
+
+const P_VERSION = "3.1.0";
+const IMAGE = `fokosdb-p:${P_VERSION}`;
+
+const EXPECTED_MONITOR = {
+	tcBugNewRowVersionFromOne: "VersionIncreases",
+	tcBugCommitOnOneAccept: "Atomicity",
+	tcBugPutIgnoresLock: "LockExclusion",
+	tcBugCommittedBeforeApply: "ReadAfterCommit",
+	tcBugTokenRowIgnored: "SingleApply",
+	tcBugStaleCancelsOnDriving: "Atomicity",
+	tcBugCancelInAnyState: "Atomicity",
+	tcBugNoPreparingHold: "LocksResolve",
+	tcBugPrepareSkipsWatermark: "WriteSerializable",
+	tcBugSingleShotIgnoresLock: "LockExclusion",
+	tcBugNewRowTsFromOwnStamp: "WriteSerializable",
+	tcBugAbsentCheckKeepsNoStamp: "WriteSerializable",
+	tcBugQuarantineStampedChecks: "CommittedNeverQuarantined",
+};
+
+// The search strategy of the random checker for a test case whose orders need many unlikely steps in
+// a row. Options after "--" replace it.
+const FAIR_PCT = ["--sch-fairpct", "10"];
+const TEST_STRATEGY = {
+	tcStale: FAIR_PCT,
+	tcRepair: FAIR_PCT,
+	tcBugPutIgnoresLock: FAIR_PCT,
+	tcBugCancelInAnyState: FAIR_PCT,
+	tcBugSingleShotIgnoresLock: FAIR_PCT,
+	tcBugNewRowTsFromOwnStamp: FAIR_PCT,
+	tcAbsentCheck: FAIR_PCT,
+	tcLateCheck: FAIR_PCT,
+	tcBugQuarantineStampedChecks: FAIR_PCT,
+};
+
+// The `p check` options that the script sets itself.
+const OWN_OPTIONS = ["-tc", "--testcase", "-o", "--outdir", "-md", "--mode", "-r", "--replay", "-s", "--schedules", "-t", "--timeout"];
+
+function fail(message) {
+	console.error(message);
+	process.exit(1);
+}
+
+function positiveInt(name, value) {
+	if (!/^[1-9][0-9]*$/.test(value)) {
+		fail(`${name} must be a positive integer, not "${value}".`);
+	}
+	return value;
+}
+
+/** Runs a command in this directory and resolves to its exit code and, for piped streams, its output. */
+function run(command, args, stdio) {
+	const child = spawn(command, args, { stdio });
+	let output = "";
+	child.stdout?.on("data", (data) => (output += data));
+	child.stderr?.on("data", (data) => (output += data));
+	return new Promise((resolve, reject) => {
+		child.on("error", reject);
+		child.on("close", (code) => resolve({ code: code ?? 1, output }));
+	});
+}
+
+async function p(args, stdio) {
+	return await run(
+		"docker",
+		[
+			"run",
+			"--rm",
+			"--user",
+			`${process.getuid()}:${process.getgid()}`,
+			"-e",
+			"HOME=/tmp",
+			"-e",
+			"MAVEN_OPTS=-Dmaven.repo.local=/workspace/.p-cache/m2",
+			"-v",
+			`${process.cwd()}:/workspace`,
+			IMAGE,
+			"p",
+			...args,
+		],
+		stdio,
+	);
+}
+
+/** The first line of `text` that matches `pattern`, or "". */
+function firstLine(text, pattern) {
+	return text.split("\n").find((line) => pattern.test(line)) ?? "";
+}
+
+// The monitor that an error line names. A liveness error names the monitor. An assertion gives its
+// source location, and the monitor is the spec block that holds that line.
+function violatedMonitor(line) {
+	const named = line.match(/([A-Za-z0-9_]+) detected liveness bug/) ?? line.match(/Monitor .([A-Za-z0-9_]+)/);
+	if (named) {
+		return named[1];
+	}
+	const location = line.match(/(PSpec\/[A-Za-z0-9_]+\.p):([0-9]+)/);
+	if (!location) {
+		return "(no monitor)";
+	}
+	const lines = readFileSync(location[1], "utf8").split("\n").slice(0, Number(location[2]));
+	return lines.map((source) => source.trim().split(/\s+/)).findLast((fields) => fields[0] === "spec")?.[1] ?? "";
+}
+
+/** Runs one test case and resolves to its output line and whether it gave the expected result. */
+async function runTestCase(tc, { mode, schedules, pexTimeout, checkOptions }) {
+	const outdir = mode === "pex" ? `PCheckerOutput/pex/${tc}` : `PCheckerOutput/${tc}`;
+	const log = `${outdir}/check.log`;
+	rmSync(outdir, { recursive: true, force: true });
+	mkdirSync(outdir, { recursive: true });
+	const pex = mode === "pex";
+	const options = pex || checkOptions.length > 0 ? checkOptions : (TEST_STRATEGY[tc] ?? []);
+	const args = pex
+		? ["check", "--mode", "pex", "-tc", tc, "-t", pexTimeout, "-o", outdir, ...options]
+		: ["check", "-tc", tc, "-s", schedules, "-o", outdir, ...options];
+	const start = Date.now();
+	const fd = openSync(log, "w");
+	try {
+		await p(args, ["ignore", fd, fd]);
+	} finally {
+		closeSync(fd);
+	}
+	const secs = Math.floor((Date.now() - start) / 1000);
+	const text = readFileSync(log, "utf8");
+	let bound, cleanPattern, bugPattern, errorLine;
+	if (pex) {
+		bound = `time limit ${pexTimeout}s`;
+		cleanPattern = /Result: correct for any depth/;
+		bugPattern = /Result: found cex/;
+		errorLine = () => firstLine(text, /Property violated/);
+	} else {
+		const explored = (word) => text.match(new RegExp(`Explored ([0-9]+) ${word}`))?.[1] ?? "0";
+		const strategy = checkOptions.length === 0 && options.length > 0 ? `, ${options.join(" ")}` : "";
+		bound = `${explored("schedule")} of ${schedules} schedules, ${explored("timeline")} timelines${strategy}`;
+		cleanPattern = /Found 0 bugs\./;
+		bugPattern = /Checker found a bug\./;
+		errorLine = () => {
+			const files = readdirSync(`${outdir}/BugFinding`).filter((name) => name.endsWith("_0_0.txt"));
+			return firstLine(files.map((name) => readFileSync(`${outdir}/BugFinding/${name}`, "utf8")).join("\n"), /^<ErrorLog>/);
+		};
+	}
+	const ran = text.match(/^\.\. Test case :: /gm)?.length ?? 0;
+	const expected = EXPECTED_MONITOR[tc];
+	const error = text.match(/^Error: ?(.*)$/m);
+	let result;
+	if (error) {
+		result = `ERROR: ${error[1]}, see ${log}`;
+	} else if (ran !== 1) {
+		result = `ERROR: the name ran ${ran} test cases, see ${log}`;
+	} else if (cleanPattern.test(text)) {
+		result = expected ? `FAIL: expected a violation of ${expected}` : "ok";
+	} else if (bugPattern.test(text)) {
+		const got = violatedMonitor(errorLine());
+		if (!tc.startsWith("tcBug")) {
+			result = `FAIL: violation of ${got}, see ${outdir}`;
+		} else if (got === expected) {
+			result = `ok (violation of ${got})`;
+		} else {
+			result = `FAIL: expected a violation of ${expected ?? "a monitor in EXPECTED_MONITOR"}, got ${got}, see ${outdir}`;
+		}
+	} else if (pex && /Result:/.test(text)) {
+		result = `INCOMPLETE:${text.match(/Result:([^[\n]*)/)[1]}`;
+	} else {
+		result = `ERROR: see ${log}`;
+	}
+	return {
+		line: `${tc.padEnd(28)} ${bound.padEnd(54)} ${String(secs).padStart(5)}s  ${result}`,
+		ok: result.startsWith("ok"),
+	};
+}
+
+async function main() {
+	let argv = process.argv.slice(2);
+	let checkOptions = [];
+	const separator = argv.indexOf("--");
+	if (separator >= 0) {
+		checkOptions = argv.slice(separator + 1);
+		argv = argv.slice(0, separator);
+	}
+	let parsed;
+	try {
+		parsed = parseArgs({
+			args: argv,
+			allowPositionals: true,
+			options: {
+				help: { type: "boolean", short: "h" },
+				pex: { type: "boolean" },
+				jobs: { type: "string", short: "j" },
+				replay: { type: "boolean" },
+			},
+		});
+	} catch (error) {
+		// The advice of parseArgs about "--" does not apply: here "--" starts the `p check` options.
+		fail(`${error.message.replace(/\. To specify a positional argument.*/s, ".")}\nRun check.js --help for the usage.`);
+	}
+	const { values: flags, positionals } = parsed;
+	if (flags.help) {
+		console.log(USAGE);
+		process.exit(0);
+	}
+	if (flags.replay && (flags.pex || flags.jobs !== undefined || positionals.length !== 2 || separator >= 0)) {
+		fail("Usage: check.js --replay <test case> <schedule file>");
+	}
+	for (const option of checkOptions) {
+		if (OWN_OPTIONS.includes(option)) {
+			fail(`The script sets ${option}. Use the test case arguments, SCHEDULES, or PEX_TIMEOUT.`);
+		}
+	}
+
+	const settings = {
+		mode: flags.pex ? "pex" : "bugfinding",
+		schedules: positiveInt("SCHEDULES", process.env.SCHEDULES ?? "1000"),
+		pexTimeout: positiveInt("PEX_TIMEOUT", process.env.PEX_TIMEOUT ?? "60"),
+		checkOptions,
+	};
+	const jobs = Number(positiveInt("--jobs", flags.jobs ?? process.env.JOBS ?? "1"));
+
+	process.chdir(import.meta.dirname);
+
+	if ((await run("docker", ["image", "inspect", IMAGE], "ignore")).code !== 0) {
+		const build = await run("docker", ["build", "--build-arg", `P_VERSION=${P_VERSION}`, "-t", IMAGE, "."], "inherit");
+		if (build.code !== 0) {
+			process.exit(build.code);
+		}
+	}
+
+	const compile = await p(["compile", "--mode", settings.mode], ["ignore", "pipe", "pipe"]);
+	if (compile.code !== 0) {
+		fail(compile.output.trimEnd());
+	}
+
+	if (flags.replay) {
+		const [tc, schedule] = positionals;
+		process.exit((await p(["check", "-tc", tc, "--replay", schedule, "-o", `PCheckerOutput/${tc}/replay`], "inherit")).code);
+	}
+
+	let tests = [...new Set(positionals)];
+	if (tests.length === 0) {
+		tests = readdirSync("PTst")
+			.filter((name) => name.endsWith(".p"))
+			.sort()
+			.flatMap((name) => [...readFileSync(`PTst/${name}`, "utf8").matchAll(/^test ([A-Za-z0-9_]+)/gm)].map((match) => match[1]));
+	}
+	if (tests.length === 0) {
+		fail("No test case to run.");
+	}
+	if (checkOptions.length > 0) {
+		console.log(`p check options: ${checkOptions.join(" ")}`);
+	}
+
+	// Each worker takes the next test case. A line prints when every test case before it has its line,
+	// thus the output keeps the order of the test cases.
+	const results = [];
+	let next = 0;
+	let printed = 0;
+	async function worker() {
+		while (next < tests.length) {
+			const i = next++;
+			results[i] = await runTestCase(tests[i], settings);
+			for (; printed < tests.length && results[printed]; printed++) {
+				console.log(results[printed].line);
+			}
+		}
+	}
+	await Promise.all(Array.from({ length: Math.min(jobs, tests.length) }, worker));
+
+	const failures = results.filter((r) => !r.ok).length;
+	if (failures > 0) {
+		console.log(`${failures} test case(s) did not give the expected result.`);
+		process.exit(1);
+	}
+}
+
+await main();

@@ -379,7 +379,7 @@ that each milestone builds.
     `transaction_undecided`, and then sends the token one more time after the final answer.
   - **`tcConcurrentDrives`** has 1 restart and 1 lost answer, and client 1 retries T1 up to 2 times.
   - **Search strategy.** `tcStale`, `tcRepair`, `tcBugPutIgnoresLock`, and `tcBugCancelInAnyState` run with
-    `--sch-fairpct 10` (`TEST_STRATEGY` in `check.sh`). Their orders need many unlikely steps in a row: in 3000
+    `--sch-fairpct 10` (`TEST_STRATEGY` in `check.js`). Their orders need many unlikely steps in a row: in 3000
     random schedules, the quarantine and the W6 order did not come. The unfair `--sch-pct` reports false liveness violations, because it
     can hold a machine back for longer than the clock runs. Use `--sch-fairpct` with the liveness monitors.
   - **Not in the model.** A fatal prepare error (`FokosValidationError`, `FokosExpressionError`),
@@ -544,7 +544,7 @@ the model is too coarse at that point, and the milestone is not complete.
 
 ```text
 packages/fokosdb/formal/p/
-  FokosDB.pproj, Dockerfile, check.sh
+  FokosDB.pproj, Dockerfile, check.js
   PSrc/   Types.p, Client.p, Coordinator.p, Partition.p, Participant.p, Topology.p, RpcCall.p,
           Environment.p, Operator.p
   PSpec/  Atomicity.p, Answers.p, Locks.p, Versions.p, WriteSerializable.p, ReadSerializable.p,
@@ -554,7 +554,7 @@ packages/fokosdb/formal/p/
 
 - The checks run in Docker. The P project publishes no public image (`ghcr.io/p-org/p` refuses an anonymous pull),
   so `Dockerfile` builds the local image `fokosdb-p:3.1.0`: `mcr.microsoft.com/dotnet/sdk:8.0`, OpenJDK 17, Maven,
-  and the NuGet tool `P` at version 3.1.0. `check.sh` pins the version and builds the image when it is missing. Only
+  and the NuGet tool `P` at version 3.1.0. `check.js` pins the version and builds the image when it is missing. Only
   Docker is necessary on the machine.
 - `pnpm formal:p` compiles the model and runs every test case. `pnpm formal:p <test case>` runs one. `SCHEDULES`
   sets the number of schedules of each test case (default 1000). The script fails when a `tcBug<Defect>` test case does
@@ -566,7 +566,7 @@ packages/fokosdb/formal/p/
 - `pnpm formal:p [--pex] [test case...] -- <p check option>...` gives each option after `--` to every `p check`
   call, for example `-- --sch-pct 3 --seed 42` for the PCT strategy with a fixed seed. The script refuses an option
   that it sets itself: `-tc`, `-o`, `--mode`, `--replay`, `-s`, and `-t`.
-- The output of a test case goes to `PCheckerOutput/<test case>/`. `check.sh --replay <test case> <schedule file>`
+- The output of a test case goes to `PCheckerOutput/<test case>/`. `check.js --replay <test case> <schedule file>`
   replays a bug.
 - A small test case can also run in the exhaustive checker PEx: `pnpm formal:p --pex [test case...]`.
   `PEX_TIMEOUT` sets the time limit of each test case in seconds (default 60). A test case passes only when PEx
@@ -913,7 +913,7 @@ the model of M1.
 | `tcBugAbsentCheckKeepsNoStamp` | M3 | 1000 | 3 s | `WriteSerializable` fails in schedule 69 | — |
 | `tcBugQuarantineStampedChecks` | M3 | 1000, fair PCT | 5 s | `CommittedNeverQuarantined` fails in schedule 187 | — |
 
-The run time is the wall time of `check.sh` for one test case, Docker start included. The schedule of a defect is
+The run time is the wall time of `check.js` for one test case, Docker start included. The schedule of a defect is
 from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
 
 In M2, probes confirmed that `tcStale` and `tcRepair` reach a lock that a late prepare wrote after the cancel, the
