@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-09
 **Author:** Lambros Petrou
-**Status:** M0 to M4 are complete. M5 to M7 are not started.
+**Status:** M0 to M5 are complete. M6 to M7 are not started.
 
 ## Table of contents
 
@@ -299,7 +299,7 @@ that each milestone builds.
 | M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 | Done |
 | M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 | Done |
 | M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 | Done |
-| M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 | Not started |
+| M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 | Done |
 | M6 | Key promotion with lock copies | — | `PromotionCompletes` | P1–P7 | Not started |
 | M7 | Coordinator split (optional) | — | — | C1 | Not started |
 
@@ -512,13 +512,107 @@ that each milestone builds.
     `aborted` in `tcSnapshot` (6), and a snapshot that sees T1 and then T2 (335).
   - **Not in the model.** Projections, `ttlAt`, and `not_applicable` of the snapshot path (M5).
 
-### 3.6 M5 — Hash split
+### 3.6 M5 — Hash split (done)
 
 - **Scope.** A hash split of one root into two children while write and read transactions run, with the faults of
-  M2. The router, the import gate, the read-through, the group dispatch, the migration streams, the merge of the
-  deletion metadata, and the lock copies of the router (section 4.2.9).
-- **Test cases.** `tcSplitWrites`, `tcSplitReads`, `tcSplitFaults`, the test cases of S1 to S5.
+  M2. The router, the import gate, the read-through, the group dispatch, the single-owner rule, the migration
+  streams, the merge of the deletion metadata, and the lock copies of the router (section 4.2.9).
+- **Test cases.** `tcSplitWrites`, `tcSplitReads`, `tcSplitFaults`, `tcSplitSingleOwner`, `tcForwardRestart`,
+  `tcBugChildSkipsDeletionMetadata`, `tcBugImportingChildServesPrepare`, `tcBugRouterServesGetItem`,
+  `tcBugImportSkipsPendingTx`, `tcBugRouterDeletesCopiesAtCutover`.
 - **Delivers.** A check that every earlier guarantee holds across a split.
+- **Result.** Every test case gives its expected result, and every test case of M0 to M4 still gives its expected
+  result. The model found no defect of the code. Section 4.2.13 gives the measurements. The model makes these
+  decisions:
+  - **Topology.** Root `A` holds hash keys `a` and `c` in every test case. `ChildIndexOf` gives the child of each
+    hash key: `c` goes to child 1, and every other hash key to child 0. The `Environment` requests the split in one
+    of its 20 steps, so the split starts before, between, or after the calls of the clients. When no step requested
+    it, the last step does.
+  - **Children.** The source creates the two `Partition` machines in its plan step, and the machine stands for the
+    Durable Object name of the child. It tells the `Environment` with `eDoCreated`. The child starts with the clock
+    of its source, and gets the ticks, the fine steps, the offset moves, and the restarts from then on.
+  - **Forward of a `point` or a `single_owner` request.** The router keeps a continuation and starts a new
+    `RpcCall` whose caller is the router. The answer carries the id of that continuation in `eForwardResp`.
+    The router forwards the answer only while the continuation exists. A restart fails the waiting caller,
+    clears the continuation, and ignores a later answer or error. The child can still apply a write, so an error
+    can leave the caller with an unknown outcome. A target keeps the same continuation for a read-through.
+  - **Group dispatch.** A split router owns no key, and a source before the cutover and a child own every key that
+    they receive. Thus a `group` request is all local or all remote, and the model has no request with a local
+    part and a remote part (M6 adds it). The router keeps one continuation for each `group` request. `txPrepare`
+    and `txReadForTransaction` answer the error at the first part that failed. `txCommit` and `txCancel` wait for
+    every part. One rejected prepare rejects the request. A restart of the router gives each waiting caller an
+    error.
+  - **`partition_migrating` is a failed call.** The import gate, `partition_fanout_failed`, and a pull that the
+    source refuses all give the caller `eRpcFailed`, as a lost call does. Thus the snapshot path of
+    `transactGetItems` sends a call again after `partition_migrating`, which the code does not. A read applies
+    nothing, so the extra attempts add orders and no false violation.
+  - **Repartition flow.** `eSourceStep` is one step of the source job: plan, initialize, cutover, and one cleanup
+    step for the copies of one transaction. The calls `fokosInit`, `fokosMigrationPull`, and `fokosMigrationAck`
+    keep no continuation: an answer applies by the durable state, and a failed call runs the step again. The
+    target has no `eImportStep` event: it pulls the next page in the handler that applied a page.
+  - **`fokosStartImport`.** The source sends `eStartImport` to each child one time at the cutover, with no
+    `RpcCall`, and the model does not lose it. Thus a target in `awaiting_data` has no alarm, and it never pulls
+    before the cutover. The handler of the pull keeps the two refusals of `servePage`.
+  - **Restart of a target.** The alarm runs the import job again, so a second pull of the same cursor can be in
+    flight. The cursor check then drops the second page.
+  - **Pages.** A page holds one row. The last page of the `items` stream hands over to the `pending_tx` stream.
+    Each `pending_tx` page carries the deletion metadata, and a slice with no lock gets one empty page. The
+    overrides phase is not in the model, because no promotion comes before the split.
+  - **The repartition jobs are alarm deadlines.** A source has a deadline from `queued` until `cleaned`, and a
+    target until `active`, as the runtime jobs have in the code. Without them, `tcSplitFaults` gave a false
+    `TransactionsComplete` violation (fair PCT, schedule 308): the scheduler held the coordinator back for 20 ticks
+    and the clock stopped. Then T3 started, the cutover came, and the cancel of T3 got `partition_migrating` from a
+    child that still imported. No tick came for the retry. With the deadlines, each change of a split is a change of
+    an alarm, so the clock runs for 20 more ticks after the split ends.
+  - **Stale job.** It does not run on a router or on a target that imports (`canSweepLocally`). An answer of the
+    coordinator that arrives after the cutover changes nothing, because the router owns no row.
+  - **Monitors.** `Authority` learns the router and the child index of each child from `eOwnerChanged`, and the
+    targets that import from `eImportState`. A local decision on a lock row announces `eLocalTxMutation`. On a
+    router the row is a transfer copy, and the decision announces `eCopyChanged`, which `CopiesUntouched` refuses.
+    The cleanup announces `eCopyDeleted` with the target that owns the key, and also `eLockDeleted`, so
+    `LocksResolve` holds only after the cleanup. An imported lock row announces `eLockWritten` on the child.
+    `SplitCompletes` observes `eSplitState` and `eImportState`. Only the test cases with a split check the four
+    monitors of M5.
+  - **Clients.** `tcSplitWrites` has a get of `a1` after T3. It gives the read-through a caller, and S3 a read
+    after a committed write. `tcSplitReads` uses `c1` in place of `b1`, so W1 and the read of root `A` have a part
+    on each child. `tcSplitSingleOwner` is new: it runs the single-partition paths on root `A`, with a request for
+    one child and a request for two children. The client op field `generatedToken` is the token that the client
+    generates after `not_applicable`.
+  - **Restart regression.** `tcForwardRestart` holds both import pulls, starts a read-through on a child,
+    and restarts that child while its source call waits. It requires an error before it releases the source
+    call. After the split ends, it repeats the same order on the router for `apiPutItem`, `apiDeleteItem`,
+    `apiGetItem`, `txExecuteSingleShot`, and `txReadSnapshot`. One more get loses its forwarded request after
+    the restart, so its late result is an error. Each call reuses request id 0. A later answer or error must
+    not reach the caller or match a new continuation. A final get confirms that the single-shot write applied
+    despite the error. The test case fails before the continuation fix.
+  - **S1** (`tcBugChildSkipsDeletionMetadata`). The child also loses `max_delete_tx_order_ts`. A put of a key with
+    no earlier value can then commit at a timestamp at or below an earlier delete, and `WriteSerializable` fails
+    first. The test case leaves that monitor out. The order needs a put of `a1`, a delete of `a1`, the cutover,
+    and a put of `a1`. Fair PCT found it in 8 of 8 runs, at schedules 64 to 567, and the random strategy found
+    nothing in 3000 schedules. `TEST_SCHEDULES` gives the test case at least 3000 schedules. S1 has no test case
+    for `ReadSerializable`: that order also needs the split between the two read phases.
+  - **S4** (`tcBugImportSkipsPendingTx`). The import inserts no lock row, but it merges the deletion metadata of
+    the page. Otherwise the defect is also S1. Its monitor reports the lost write: the commit finds no lock on the
+    child, answers the idempotent success, and the transaction reaches `COMMITTED`.
+  - **S5** (`tcBugRouterDeletesCopiesAtCutover`). `Retention` fails at the cutover. A probe without `Retention`
+    also found the lost write: `Atomicity` failed in schedule 6.
+  - **Search strategy.** The four test cases that must pass, and S1, run with `--sch-fairpct 10`. They also pass
+    with the random strategy in 1000 schedules. S2 to S5 run with the random strategy, which found each one in at
+    most 12 schedules.
+  - **Probes.** A temporary assertion confirmed these orders with fair PCT in 2000 schedules. In `tcSplitWrites`:
+    a commit with a part on each child (schedule 5), a commit that applies on a child (2), a prepare that one child
+    of two rejects (2), a get that reads through the source (1), a cleanup step that deletes a copy (5), a split
+    request after a commit on `A` (4), and a cutover with items and no lock (1). In `tcSplitReads`: a read with a
+    part on each child (1), and an import that brings a lock (4). In `tcSplitSingleOwner`: `not_applicable` for
+    the transaction and for the read (1 and 1), and a forward to one child for each (8 and 2). In `tcSplitFaults`:
+    a pull or an acknowledgement that the target sent again (7), a `fokosInit` that the source sent again (1), a
+    commit with a failed part (3), a restart of a router with an open group request (24), a stale job of a child
+    that gets the answer for its lock (15), a page that the cursor check drops (310), and a stale answer that
+    arrives on a router with copies (335).
+  - **Not in the model.** `debugForceResolveTransaction` on a router: no test case of M5 has an operator, so the
+    handler has an assertion, and M6 adds the dispatch for `tcPromotionRepair`. The overrides phase. The alarm of
+    a target in `awaiting_data`, a lost `fokosStartImport`, and a pull before the cutover. The retry of
+    `partition_migrating` until `partitionMigratingRetryDeadlineMs`. A split of a child.
 
 ### 3.7 M6 — Key promotion
 
@@ -652,7 +746,8 @@ packages/fokosdb/formal/p/
   other Durable Object after tick `t`, and an age never looks smaller than in real time. The clock ticks only while
   some Durable Object has an alarm deadline (`eArmed`), and only while no call is open (`eRpcOpened`,
   `eRpcClosed`): a call takes milliseconds, and a tick is about `staleTransactionMs`. It stops 20 ticks after the end
-  of the faults and the last change of an alarm, so a run ends. A test case can set a lower count
+  of the faults and the last change of an alarm, so a run ends. From M5, the repartition job of a source and the
+  import job of a target are alarm deadlines too (section 3.6). A test case can set a lower count
   (`maxTicksAfterFaults` in `tFaults`): the faults of `tcHold` and `tcBugNoPreparingHold` use 6, because root B never
   answers and each tick only repeats the cancel attempts to B.
 - **Timestamps (M3).** A timestamp is `(tick + 1) · TS_PER_TICK + fine + offset`, with `TS_PER_TICK` = 100. The
@@ -667,7 +762,7 @@ packages/fokosdb/formal/p/
 
 | Machine | From | Durable state | Memory state | Code |
 | --- | --- | --- | --- | --- |
-| `Partition` | M0 | identity, `items` (`v`, value, `last_read_ts`, `last_write_ts`), lock rows, `pending_tx_info` (`created_at` class, `guarded_at`), deletion metadata, repartition row and target rows (source side), route override of a promoted key, import record and cursor (target side) | continuations of forwarded calls, the stale job in progress | `PartitionDO`, `TransactionParticipant`, `PartitionStore`, `FokosShardingRuntime`, `RepartitionSource`, `RepartitionTarget`, `FokosMigrationHost` |
+| `Partition` | M0 | identity, `items` (`v`, value, `last_read_ts`, `last_write_ts`), lock rows, `pending_tx_info` (`created_at` class, `guarded_at`), deletion metadata, repartition row and target rows (source side), route override of a promoted key, import record and cursor (target side) | continuations of point, single-owner, read-through, and group forwards, the stale job in progress | `PartitionDO`, `TransactionParticipant`, `PartitionStore`, `FokosShardingRuntime`, `RepartitionSource`, `RepartitionTarget`, `FokosMigrationHost` |
 | `Client` | M0 | — | the calls in progress and their retries | `FokosDB` |
 | `Coordinator` | M1 | `tc_state`, `tc_participants`, `tc_items` (participant and operation only) | the drives in progress | `TransactionCoordinatorDO` |
 | `RpcCall` | M1 | — | one request and its answer | Workers RPC, `FokosShardingClient` retries |
@@ -675,8 +770,8 @@ packages/fokosdb/formal/p/
 | `Operator` | M2 | — | the transactions it repaired | an operator who reads the lock-age guard error and the completion log, and calls `debugForceResolveTransaction` |
 
 One `Partition` machine type serves every role, as one `PartitionDO` class does in the code. A source creates a
-child or a range root with `new` on the first `fokosInit`. A later `fokosInit` to the same target reaches the same
-machine.
+child or a range root with `new` in its plan step, and the machine stands for the Durable Object name of the
+target. Each `fokosInit` to the same target reaches the same machine.
 
 #### 4.2.5 Events
 
@@ -703,10 +798,11 @@ machine.
 | `eSourceStep` | Partition → itself (alarm) | M5 | `sourceStep`: plan, initialize, cutover, notify, cleanup step |
 | `eFokosInit` / `eFokosInitResp` | Partition ↔ Partition | M5 | `fokosInit`, `#initializeTargets` |
 | `eStartImport` | Partition → Partition | M5 | `fokosStartImport` |
-| `eImportStep` | Partition → itself (alarm) | M5 | `importOnePage` |
-| `eMigrationPull` / `eMigrationPage` | Partition ↔ Partition | M5 | `servePage`, `buildPage` and `applyPage` of `FokosMigrationHost` |
+| `eDoCreated` | Partition → Environment | M5 | a Durable Object that a split created |
+| `eMigrationPull` / `eMigrationPage` | Partition ↔ Partition | M5 | `importOnePage`, `servePage`, `buildPage` and `applyPage` of `FokosMigrationHost` |
 | `eMigrationAck` / `eMigrationAckResp` | Partition ↔ Partition | M5 | `acceptAck`, `beforeComplete` |
 | `eExecuteLocal` / answer | Partition ↔ Partition | M5 | the read-through with `fokosExecuteLocal` |
+| `eForwardResp` | RpcCall → Partition | M5 | the continuation after a point, single-owner, or read-through forward |
 
 Each machine also announces the monitor events of section 4.2.11.
 
@@ -868,11 +964,11 @@ runs every test case whose name starts with the given name.
 | R1 | M4 | `tcBugReadSkipsPhaseTwo` | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
 | R2 | M4 | `tcBugReadIgnoresPendingWrite` | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
 | R3 | M4 | `tcBugReadIgnoresMaxDeletedV` | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
-| S1 | M5 | — | A child does not merge the deletion metadata of the source. | `VersionIncreases`, `ReadSerializable` | section 1.3.6 |
-| S2 | M5 | — | An importing child serves `txPrepare`. | `Authority` | section 4.2.9, rule 2 |
-| S3 | M5 | — | A router serves `apiGetItem` from its own item rows. | `ReadAfterCommit` | section 1.3.6 |
-| S4 | M5 | — | The import skips the `pending_tx` stream. | `Atomicity` | section 1.3.6 |
-| S5 | M5 | — | A split router deletes its lock copies at cutover. | `Retention` | section 4.2.9, rule 6 |
+| S1 | M5 | `tcBugChildSkipsDeletionMetadata` | A child does not merge the deletion metadata of the source. | `VersionIncreases`, in a test case that does not check `WriteSerializable`. `ReadSerializable` has no test case. | section 1.3.6 |
+| S2 | M5 | `tcBugImportingChildServesPrepare` | An importing child serves `txPrepare`. | `Authority` | section 4.2.9, rule 2 |
+| S3 | M5 | `tcBugRouterServesGetItem` | A router serves `apiGetItem` from its own item rows. | `ReadAfterCommit` | section 1.3.6 |
+| S4 | M5 | `tcBugImportSkipsPendingTx` | The import inserts no lock row of the `pending_tx` stream. | `Atomicity` | section 1.3.6 |
+| S5 | M5 | `tcBugRouterDeletesCopiesAtCutover` | A split router deletes its lock copies at cutover. | `Retention` | section 4.2.9, rule 6 |
 | P1 | M6 | — | The stale job deletes a `not_found` transaction when no row is owned. | `CopiesUntouched`, `SingleApply` or `Atomicity` | Promotion RFC 1.2, item 1 |
 | P2 | M6 | — | `commitLocal` compares the request with all rows, copies included. | `ClientAnswered`, `LocksResolve` | Promotion RFC 1.2, item 2 |
 | P3 | M6 | — | The routed `txCommit` and `txCancel` delete by transaction id. | `CopiesUntouched` | Promotion RFC 1.2, item 3 |
@@ -884,7 +980,8 @@ runs every test case whose name starts with the given name.
 
 For P1, P3, and P4, the run that loses a decided write must also exist: the copy goes before the `pending_tx` stream
 reads it. The test case for each one asserts the first monitor, and the milestone records whether the checker also
-finds the lost write. The same applies to S4 and S5.
+finds the lost write. The same applies to S4 and S5. Section 3.6 records the result for both: the monitor of S4
+reports the lost write, and a probe found the lost write of S5.
 
 #### 4.2.13 Configurations and test cases
 
@@ -913,9 +1010,11 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcSnapshot` | client 1: R1 reads `b1`, `b2` on the snapshot path; client 2: T1 puts `b1`, `b2`; client 3: T2 puts `a1`, `b1` | none | pass |
 | `tcBugReadIgnoresMaxDeletedV` | client 1: W1 of `tcReadVsWrites`, then W2; clients 2 to 4: R1 of `tcReadVsWrites` | none | fail with `ReadSerializable` |
 | `tcBugReusedVersionRead` | client 1: a put of `a1` (W1), then R1 reads `a1`, `b2`; client 2: W2 deletes `a1`, puts `b2`, then a put of `a1` (W3) | none | fail with `ReadSerializable` |
-| `tcSplitWrites` | T1 puts `a1`, `b1`; T2 deletes `a1` and puts `c1`; T3 puts `a1` | the split of `A` | pass |
-| `tcSplitReads` | as `tcReadVsWrites` with `a1` and `c1` on `A` | the split of `A` | pass |
+| `tcSplitWrites` | client 1: T1 puts `a1`, `b1`, T3 puts `a1`, then a get of `a1`; client 2: T2 deletes `a1` and puts `c1` | the split of `A` | pass |
+| `tcSplitReads` | client 1: W1 creates `a1`, puts `c1`; client 2: W2 deletes `a1`, puts `b2`; client 3: R1 reads `a1`, `c1`, `b2` | the split of `A` | pass |
 | `tcSplitFaults` | as `tcSplitWrites` | the split of `A`, 2 restarts, 2 lost calls | pass |
+| `tcSplitSingleOwner` | client 1: a single-partition transaction with no token puts `a1`, `c1`, then R1 reads `a1`, `c1`; client 2: a single-partition transaction with no token puts `a1`, then R2 reads `a1` | the split of `A` | pass |
+| `tcForwardRestart` | a read-through, then a put, a delete, a get, a single-shot write, a snapshot, a failed get, and a final get of `a1` | the split of `A`; a restart during each of the first seven forwards, then the held calls complete or fail | pass |
 | `tcPromotionHappy` | T1 on `a1`, `c1`; T2 on `a2` | the promotion of `a` | pass |
 | `tcPromotionFaults` | T1 on `a1`, `c1`; T2 on `a2`; T3 on `a1` (conflicts with T1) | the promotion of `a`, 2 restarts, 2 lost calls | pass |
 | `tcPromotionStale` | T1 on `a1`, `c1` | the promotion of `a`; the coordinator does not answer until `OverWindow`, then answers `not_found` | pass |
@@ -967,10 +1066,28 @@ the model of M1.
 | `tcBugReadIgnoresPendingWrite` | M4 | 1000, fair PCT | 6 s | `ReadSerializable` fails in schedule 87 | — |
 | `tcBugReadIgnoresMaxDeletedV` | M4 | 5000, fair PCT | 36 s | `ReadSerializable` fails in schedule 544; between 177 and 1236 in other runs | — |
 | `tcBugReusedVersionRead` | M4 | 1000, fair PCT | 6 s | `ReadSerializable` fails in schedule 110 | — |
+| `tcSplitWrites` | M5 | 1000, fair PCT | 96 s | no bug; 999 timelines | — |
+| `tcSplitReads` | M5 | 1000, fair PCT | 93 s | no bug; 1000 timelines | — |
+| `tcSplitFaults` | M5 | 1000, fair PCT | 96 s | no bug; 1000 timelines | — |
+| `tcSplitSingleOwner` | M5 | 1000, fair PCT | 60 s | no bug; 982 timelines | — |
+| `tcForwardRestart` | M5 | 1000 | 66 s | no bug; 55 timelines; seed 42 | — |
+| `tcBugChildSkipsDeletionMetadata` | M5 | 3000, fair PCT | 49 s | `VersionIncreases` fails in schedule 550; between 64 and 567 in other runs; none in 3000 random schedules | — |
+| `tcBugImportingChildServesPrepare` | M5 | 1000 | 2 s | `Authority` fails in schedule 12 | — |
+| `tcBugRouterServesGetItem` | M5 | 1000 | 1 s | `ReadAfterCommit` fails in schedule 1 | — |
+| `tcBugImportSkipsPendingTx` | M5 | 1000 | 1 s | `Atomicity` fails in schedule 1 | — |
+| `tcBugRouterDeletesCopiesAtCutover` | M5 | 1000 | 1 s | `Retention` fails in schedule 2 | — |
 
-The run time is the wall time of `check.js` for one test case, Docker start included. The values of M4 are from a
-run of all 34 test cases with 4 jobs at the same time, so each one is slower than a run alone. The schedule of a
-defect is from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
+The run time is the wall time of the test runner for one test case, Docker start included. The values of M4 are
+from a run of all 34 test cases with 4 jobs at the same time, so each one is slower than a run alone. The M5 values,
+except `tcForwardRestart`, are from the first 43 test cases, before the forward-continuation fix, with 4 jobs.
+`tcForwardRestart` is from the corrected model with 44 test cases and 4 jobs. It also passes 1000 schedules with
+fair PCT at seed 42 (79 timelines). The schedule of a defect changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
+
+After the forward-continuation fix, all 22 normal test cases pass 1000 schedules at seed 42. Three seeded defects
+need another search: `tcBugCancelInAnyState` fails in schedule 1552 and `tcBugReusedVersionRead` in 1423 at seed 42;
+`tcBugChildSkipsDeletionMetadata` fails in 161 at seed 7 after seed 42 misses it in 3000 schedules. The first two
+searches also miss their defects in 1000 schedules before the fix. All 22 seeded defects fail with their expected
+monitors after these retries. The default search bounds stay unchanged.
 
 In M2, probes confirmed that `tcStale` and `tcRepair` reach a lock that a late prepare wrote after the cancel, the
 quarantine, and the repair after the quarantine (with fair PCT: 245, 397, and 474 schedules), and that the
@@ -1010,8 +1127,9 @@ P does not run the TypeScript code. The model links to the code in two ways:
 
 #### 4.2.16 Cost
 
-The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M4, the 34 test
-cases take about 13 minutes of run time in sum, and `pnpm formal:p` runs 2 of them at the same time by default.
+The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M5, the 44 test
+cases take about 20 minutes of run time in sum, and about 6 minutes of wall time with 4 jobs. `pnpm formal:p` runs
+2 of them at the same time by default.
 `pnpm formal:p --pex` stops each test case that it cannot complete at `PEX_TIMEOUT`, so run it on chosen test cases.
 The first run also builds the Docker image, which takes about 1 minute. Section 4.2.13 records the run time of each
 test case.

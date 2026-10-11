@@ -29,18 +29,27 @@ type tItemRow = (v: int, value: tValue, lastReadTs: int, lastWriteTs: int);
 //   readSkipsPhaseTwo: the two-phase path of transactGetItems returns the result of phase 1.
 //   readIgnoresPendingWrite: the two-phase path ignores hasPendingWrite.
 //   readIgnoresMaxDeletedV: the two-phase path does not compare maxDeletedV for an absent item.
+//   childSkipsDeletionMetadata: a child of a split does not merge the deletion metadata of its source.
+//   importingChildServesPrepare: a child serves txPrepare while it imports.
+//   routerServesGetItem: a split router serves apiGetItem from its own item rows.
+//   importSkipsPendingTx: the import inserts no lock row of the pending_tx stream.
+//   routerDeletesCopiesAtCutover: a split router deletes its lock copies at the cutover.
 type tBugs = (newRowVersionFromOne: bool, commitOnOneAccept: bool, putIgnoresLock: bool, committedBeforeApply: bool,
               tokenRowIgnored: bool, staleCancelsOnDriving: bool, cancelInAnyState: bool, noPreparingHold: bool,
               prepareSkipsWatermark: bool, singleShotIgnoresLock: bool, newRowTsFromOwnStamp: bool,
               absentCheckKeepsNoStamp: bool, quarantineStampedChecks: bool, readSkipsPhaseTwo: bool,
-              readIgnoresPendingWrite: bool, readIgnoresMaxDeletedV: bool);
+              readIgnoresPendingWrite: bool, readIgnoresMaxDeletedV: bool, childSkipsDeletionMetadata: bool,
+              importingChildServesPrepare: bool, routerServesGetItem: bool, importSkipsPendingTx: bool,
+              routerDeletesCopiesAtCutover: bool);
 
 fun NoBugs(): tBugs {
   return (newRowVersionFromOne = false, commitOnOneAccept = false, putIgnoresLock = false, committedBeforeApply = false,
           tokenRowIgnored = false, staleCancelsOnDriving = false, cancelInAnyState = false, noPreparingHold = false,
           prepareSkipsWatermark = false, singleShotIgnoresLock = false, newRowTsFromOwnStamp = false,
           absentCheckKeepsNoStamp = false, quarantineStampedChecks = false, readSkipsPhaseTwo = false,
-          readIgnoresPendingWrite = false, readIgnoresMaxDeletedV = false);
+          readIgnoresPendingWrite = false, readIgnoresMaxDeletedV = false, childSkipsDeletionMetadata = false,
+          importingChildServesPrepare = false, routerServesGetItem = false, importSkipsPendingTx = false,
+          routerDeletesCopiesAtCutover = false);
 }
 
 // The clock of a Durable Object, as transaction order timestamps read it (txOrderTimestampNow). A
@@ -166,20 +175,22 @@ event eTxCommitResp: tCommitResp;
 event eTxCancel: tCancelReq;
 event eTxCancelResp: tCancelResp;
 
-// txExecuteSingleShot and its answer: committed, or rejected with nothing written.
+// txExecuteSingleShot and its answer: committed, or rejected with nothing written. `notApplicable`
+// is the outcome not_applicable: one owner does not hold every key of the request.
 type tSingleShotReq = (caller: machine, reqId: int, items: seq[tTxOp]);
-type tSingleShotResp = (reqId: int, committed: bool);
+type tSingleShotResp = (reqId: int, notApplicable: bool, committed: bool);
 
 event eExecuteSingleShot: tSingleShotReq;
 event eExecuteSingleShotResp: tSingleShotResp;
 
 // txReadForTransaction and txReadSnapshot, and their answers: one item for each requested key.
 // `maxDeletedV` is the max_deleted_v of the partition. `aborted` is the snapshot outcome for a
-// pending write, and its answer then holds no item.
+// pending write, and its answer then holds no item. `notApplicable` is the snapshot outcome
+// not_applicable: one owner does not hold every key of the request.
 type tReadReq = (caller: machine, reqId: int, readKeys: seq[tKey]);
 type tReadItem = (key: tKey, found: bool, value: tValue, version: int, maxDeletedV: int, hasPendingWrite: bool);
 type tReadForTransactionResp = (reqId: int, partition: machine, items: seq[tReadItem]);
-type tReadSnapshotResp = (reqId: int, aborted: bool, items: seq[tReadItem]);
+type tReadSnapshotResp = (reqId: int, notApplicable: bool, aborted: bool, items: seq[tReadItem]);
 
 event eReadForTransaction: tReadReq;
 event eReadForTransactionResp: tReadForTransactionResp;
@@ -201,8 +212,48 @@ type tForceResolveResp = (reqId: int, partition: machine);
 event eForceResolve: tForceResolveReq;
 event eForceResolveResp: tForceResolveResp;
 
-// A call failed: the request or the answer got lost, or the target restarted. The caller does not
-// know whether the target ran the request.
+// The repartition flow of a hash split: the states of the source (RepartitionSource) and of a target
+// (RepartitionTarget). NOT_SOURCE is a partition that queued no split, and NOT_TARGET is a root.
+enum tSplitState { NOT_SOURCE, SPLIT_QUEUED, SPLIT_PLANNED, SPLIT_CUTOVER, SPLIT_COMPLETED, SPLIT_CLEANED }
+enum tImportState { NOT_TARGET, AWAITING_DATA, IMPORTING, IMPORTED, ACTIVE }
+
+// RepartitionSource.queue: the Environment requests the hash split of a partition.
+event eRequestSplit;
+
+// One step of the source_repartition job, from the alarm of the source.
+event eSourceStep;
+
+// fokosInit and its answer. `slice` is the child index of the target, and the answer repeats it.
+type tFokosInitReq = (caller: machine, reqId: int, source: machine, slice: int);
+event eFokosInit: tFokosInitReq;
+event eFokosInitResp: int;
+
+// fokosStartImport: the source cut over, and the target starts its import.
+event eStartImport;
+
+// fokosMigrationPull and its page. A cursor is a stream and the index of the next row of the slice
+// in it. A page holds at most one row. Each page of the pending_tx stream carries the deletion
+// metadata of the source. `cursor` is the cursor of the request, and `done` marks the last page.
+enum tStream { STREAM_ITEMS, STREAM_PENDING_TX }
+type tCursor = (stream: tStream, index: int);
+type tMigrationPullReq = (caller: machine, reqId: int, slice: int, cursor: tCursor);
+type tMigrationPage = (cursor: tCursor, items: map[tKey, tItemRow], locks: map[tKey, tLockRow],
+                       pendingTx: map[int, tPendingTxInfo], maxDeletedV: int, maxDeleteTxOrderTs: int, next: tCursor,
+                       done: bool);
+event eMigrationPull: tMigrationPullReq;
+event eMigrationPage: tMigrationPage;
+
+// fokosMigrationAck and its answer.
+type tMigrationAckReq = (caller: machine, reqId: int, slice: int);
+event eMigrationAck: tMigrationAckReq;
+event eMigrationAckResp;
+
+// fokosExecuteLocal for apiGetItem: the read-through of a target that imports. The answer is the
+// answer of apiGetItem.
+event eExecuteLocal: tGetItemReq;
+
+// A call failed: the request or the answer got lost, or the target restarted or refused the call
+// (partition_migrating). The caller does not know whether the target ran the request.
 type tRpcFailed = (reqId: int, target: machine);
 event eRpcFailed: tRpcFailed;
 
@@ -221,6 +272,9 @@ event eLossDecision: tLoss;
 event eTick: int;
 type tArmed = (who: machine, armed: bool);
 event eArmed: tArmed;
+
+// A Durable Object that a split created. The Environment sends it the clock, and can restart it.
+event eDoCreated: machine;
 
 // The alarm of a Durable Object fires.
 event eAlarm;
@@ -293,3 +347,27 @@ event eReadResult: tReadResult;
 type tClientCall = (client: machine, reqId: int);
 event eCallStarted: tClientCall;
 event eCallEnded: tClientCall;
+
+// A local decision (a prepare, a commit, a cancel, or a quarantine) wrote, applied, released, or
+// guarded the lock row of a key that the partition owns by the topology, or changed a transfer copy:
+// the lock row of a key that the partition gave to a target.
+event eLocalTxMutation: tLockEvent;
+event eCopyChanged: tLockEvent;
+
+// A source deleted a transfer copy. `target` is the target that owns the key.
+type tCopyDeleted = (partition: machine, key: tKey, tx: int, target: machine);
+event eCopyDeleted: tCopyDeleted;
+
+// A source recorded the acknowledgement of a target.
+type tAckRecorded = (source: machine, target: machine);
+event eAckRecorded: tAckRecorded;
+
+// A source wrote a state of its split, and a target wrote a state of its import.
+type tSplitStateChanged = (partition: machine, current: tSplitState);
+event eSplitState: tSplitStateChanged;
+type tImportStateChanged = (partition: machine, current: tImportState);
+event eImportState: tImportStateChanged;
+
+// A source cut over: it owns no key, and child i owns the keys of child index i.
+type tOwnerChanged = (source: machine, children: seq[machine]);
+event eOwnerChanged: tOwnerChanged;

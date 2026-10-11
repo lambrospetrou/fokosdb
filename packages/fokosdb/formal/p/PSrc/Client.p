@@ -4,9 +4,10 @@ enum tClientOpKind { PUT_ITEM, DELETE_ITEM, GET_ITEM, TRANSACT_WRITE, TRANSACT_G
 // to transactWriteItems, and token 0 is a call with no token. After an error,
 // transaction_commit_pending, or transaction_undecided, the caller sends the same token again, up to
 // `retries` times. With `replay`, it sends the same token one more time after the final answer.
-// `readKeys` belong to transactGetItems.
+// `readKeys` belong to transactGetItems. `generatedToken` is the token that the client generates
+// when a call with no token goes to the coordinator.
 type tClientOp = (kind: tClientOpKind, key: tKey, value: tValue, token: int, items: seq[tTxOp], retries: int, replay: bool,
-                  readKeys: seq[tKey]);
+                  readKeys: seq[tKey], generatedToken: int);
 
 type tClientConfig = (bugs: tBugs, topology: tTopology, coordinator: machine, env: machine, ops: seq[tClientOp]);
 
@@ -14,7 +15,8 @@ type tClientConfig = (bugs: tBugs, topology: tTopology, coordinator: machine, en
 // partition of the key. A transactWriteItems with no token whose keys are all on one root goes to
 // that partition (#writeSingleShotFastPath), and every other one to the coordinator. A
 // transactGetItems whose keys are all on one root goes to that partition (#readSnapshotFastPath),
-// and every other one runs the two-phase path (#readTransaction). It sends the next call after the
+// and every other one runs the two-phase path (#readTransaction). The outcome not_applicable of
+// either single-partition path sends the call to the other path. It sends the next call after the
 // answer.
 machine Client {
   var bugs: tBugs;
@@ -25,6 +27,8 @@ machine Client {
   var next: int;
   var retried: int;
   var replayed: bool;
+  // The token of the transactWriteItems in progress, or 0 for a call with no token.
+  var token: int;
   // The read in progress: the keys of each root partition, the path, the phase, the attempts of the
   // call to each root, the answers of the phase, the calls of the phase that used up their attempts,
   // and the result of phase 1.
@@ -54,6 +58,7 @@ machine Client {
       }
       retried = 0;
       replayed = false;
+      token = ops[next].token;
       Send();
     }
 
@@ -65,7 +70,15 @@ machine Client {
       announce eReadResult, (client = this, reqId = resp.reqId, transaction = false, results = readValues);
       Answered(resp.reqId);
     }
-    on eExecuteSingleShotResp do (resp: tSingleShotResp) { Answered(resp.reqId); }
+    // not_applicable: the client generates a token and uses the coordinator path.
+    on eExecuteSingleShotResp do (resp: tSingleShotResp) {
+      if (resp.notApplicable) {
+        token = ops[next].generatedToken;
+        Send();
+        return;
+      }
+      Answered(resp.reqId);
+    }
     on eInitiateWriteResp do (resp: tInitiateWriteResp) {
       announce eClientAnswer, (client = this, tx = resp.tx, answer = resp.answer);
       announce eCallEnded, (client = this, reqId = resp.reqId);
@@ -79,9 +92,15 @@ machine Client {
       }
     }
 
-    // The snapshot path: the outcome aborted is the pending-write error.
+    // The snapshot path: the outcome aborted is the pending-write error, and the outcome
+    // not_applicable starts the two-phase path.
     on eReadSnapshotResp do (resp: tReadSnapshotResp) {
       assert resp.reqId == next, format("client got the answer of read {0} while it waits for call {1}", resp.reqId, next);
+      if (resp.notApplicable) {
+        snapshot = false;
+        StartPhase();
+        return;
+      }
       if (resp.aborted) {
         ReadFailed();
         return;
@@ -102,7 +121,7 @@ machine Client {
         return;
       }
       announce eCallEnded, (client = this, reqId = f.reqId);
-      if (ops[next].kind == TRANSACT_WRITE && ops[next].token != 0) {
+      if (ops[next].kind == TRANSACT_WRITE && token != 0) {
         RetryOrNext();
       } else {
         Next();
@@ -131,12 +150,12 @@ machine Client {
       foreach (txOp in op.items) {
         roots += (RootOf(topology, txOp.key));
       }
-      if (op.token == 0 && sizeof(roots) == 1) {
+      if (token == 0 && sizeof(roots) == 1) {
         send NewRpc(this, RootOf(topology, op.items[0].key), env), eExecuteSingleShot, (caller = this, reqId = next, items = op.items);
         return;
       }
-      assert op.token != 0, "the test driver gives each transaction of the coordinator path a token";
-      send NewRpc(this, coordinator, env), eInitiateWrite, (caller = this, reqId = next, token = op.token, items = op.items);
+      assert token != 0, "the test driver gives each transaction of the coordinator path a token";
+      send NewRpc(this, coordinator, env), eInitiateWrite, (caller = this, reqId = next, token = token, items = op.items);
     }
   }
 

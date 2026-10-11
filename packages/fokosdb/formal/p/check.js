@@ -78,6 +78,11 @@ const EXPECTED_MONITOR = {
 	tcBugReadIgnoresPendingWrite: "ReadSerializable",
 	tcBugReadIgnoresMaxDeletedV: "ReadSerializable",
 	tcBugReusedVersionRead: "ReadSerializable",
+	tcBugChildSkipsDeletionMetadata: "VersionIncreases",
+	tcBugImportingChildServesPrepare: "Authority",
+	tcBugRouterServesGetItem: "ReadAfterCommit",
+	tcBugImportSkipsPendingTx: "Atomicity",
+	tcBugRouterDeletesCopiesAtCutover: "Retention",
 };
 
 // The two search strategies of the random checker. RANDOM is the default of `p check`.
@@ -105,12 +110,18 @@ const TEST_STRATEGY = {
 	tcBugReadIgnoresPendingWrite: FAIR_PCT,
 	tcBugReadIgnoresMaxDeletedV: FAIR_PCT,
 	tcBugReusedVersionRead: FAIR_PCT,
+	tcSplitWrites: FAIR_PCT,
+	tcSplitReads: FAIR_PCT,
+	tcSplitFaults: FAIR_PCT,
+	tcSplitSingleOwner: FAIR_PCT,
+	tcBugChildSkipsDeletionMetadata: FAIR_PCT,
 };
 
 // The least number of schedules of the random checker for a test case whose defect needs more
 // schedules than the default. The checker stops at the first bug, so a found defect costs no more.
 const TEST_SCHEDULES = {
 	tcBugReadIgnoresMaxDeletedV: 5000,
+	tcBugChildSkipsDeletionMetadata: 3000,
 };
 
 // The `p check` options that the script sets itself.

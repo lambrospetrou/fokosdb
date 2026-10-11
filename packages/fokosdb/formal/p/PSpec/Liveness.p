@@ -83,3 +83,30 @@ spec TransactionsComplete observes eTxCreated, eTxCompleted {
     }
   }
 }
+
+// A split eventually reaches `cleaned`, and each of its targets eventually reaches `active`.
+spec SplitCompletes observes eSplitState, eImportState {
+  var open: set[machine];
+
+  start cold state Complete {
+    on eSplitState do (s: tSplitStateChanged) { Track(s.partition, s.current == SPLIT_CLEANED); }
+    on eImportState do (s: tImportStateChanged) { Track(s.partition, s.current == ACTIVE); }
+  }
+
+  hot state Incomplete {
+    on eSplitState do (s: tSplitStateChanged) { Track(s.partition, s.current == SPLIT_CLEANED); }
+    on eImportState do (s: tImportStateChanged) { Track(s.partition, s.current == ACTIVE); }
+  }
+
+  fun Track(partition: machine, done: bool) {
+    if (done) {
+      open -= (partition);
+    } else {
+      open += (partition);
+    }
+    if (sizeof(open) == 0) {
+      goto Complete;
+    }
+    goto Incomplete;
+  }
+}

@@ -1,4 +1,6 @@
-type tRpcConfig = (caller: machine, target: machine, env: machine);
+type tRpcConfig = (caller: machine, target: machine, env: machine, forwardId: int);
+type tForwardResp = (forwardId: int, response: event, payload: any);
+event eForwardResp: tForwardResp;
 
 // The request of a call whose answer got lost reaches the target in a later handler of the call.
 event eDeliverLate;
@@ -6,13 +8,21 @@ event eDeliverLate;
 // Starts one call. The caller sends the request event to the machine that this returns.
 fun NewRpc(caller: machine, target: machine, env: machine): machine {
   send env, eRpcOpened;
-  return new RpcCall((caller = caller, target = target, env = env));
+  return new RpcCall((caller = caller, target = target, env = env, forwardId = 0));
+}
+
+fun NewForwardRpc(caller: machine, target: machine, env: machine, forwardId: int): machine {
+  send env, eRpcOpened;
+  return new RpcCall((caller = caller, target = target, env = env, forwardId = forwardId));
 }
 
 // One Workers RPC call: the request to the target, and the answer back to the caller. Workers RPC
 // keeps no order between calls, so each call has its own machine, and the checker can deliver the
 // request and the answer of each call at any point relative to the other calls. The Environment
 // counts the open calls.
+//
+// A partition that forwards a request keeps its continuation. The outbound call returns its
+// answer or error to that partition, with the id of the continuation.
 //
 // The Environment can lose the request or the answer. The caller then gets eRpcFailed. When the
 // answer gets lost, the request still reaches the target, before or after the caller sees the error.
@@ -21,6 +31,7 @@ machine RpcCall {
   var target: machine;
   var env: machine;
   var reqId: int;
+  var forwardId: int;
   var lateEvent: event;
   var latePayload: any;
 
@@ -29,6 +40,7 @@ machine RpcCall {
       caller = c.caller;
       target = c.target;
       env = c.env;
+      forwardId = c.forwardId;
     }
 
     on ePutItem do (req: tPutItemReq) {
@@ -104,18 +116,46 @@ machine RpcCall {
       Deliver(r.reqId, eReadSnapshot, r);
     }
 
-    on ePutItemResp do (resp: tPutItemResp) { send caller, ePutItemResp, resp; Close(); }
-    on eDeleteItemResp do (resp: tDeleteItemResp) { send caller, eDeleteItemResp, resp; Close(); }
-    on eGetItemResp do (resp: tGetItemResp) { send caller, eGetItemResp, resp; Close(); }
+    on eExecuteLocal do (req: tGetItemReq) {
+      var r: tGetItemReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eExecuteLocal, r);
+    }
+    on eFokosInit do (req: tFokosInitReq) {
+      var r: tFokosInitReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eFokosInit, r);
+    }
+    on eMigrationPull do (req: tMigrationPullReq) {
+      var r: tMigrationPullReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eMigrationPull, r);
+    }
+    on eMigrationAck do (req: tMigrationAckReq) {
+      var r: tMigrationAckReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eMigrationAck, r);
+    }
+
+    on ePutItemResp do (resp: tPutItemResp) { Reply(ePutItemResp, resp); }
+    on eDeleteItemResp do (resp: tDeleteItemResp) { Reply(eDeleteItemResp, resp); }
+    on eGetItemResp do (resp: tGetItemResp) { Reply(eGetItemResp, resp); }
     on eInitiateWriteResp do (resp: tInitiateWriteResp) { send caller, eInitiateWriteResp, resp; Close(); }
     on eTxPrepareResp do (resp: tPrepareResp) { send caller, eTxPrepareResp, resp; Close(); }
     on eTxCommitResp do (resp: tCommitResp) { send caller, eTxCommitResp, resp; Close(); }
     on eTxCancelResp do (resp: tCancelResp) { send caller, eTxCancelResp, resp; Close(); }
-    on eExecuteSingleShotResp do (resp: tSingleShotResp) { send caller, eExecuteSingleShotResp, resp; Close(); }
+    on eExecuteSingleShotResp do (resp: tSingleShotResp) { Reply(eExecuteSingleShotResp, resp); }
     on eRecoverResp do (resp: tRecoverResp) { send caller, eRecoverResp, resp; Close(); }
     on eForceResolveResp do (resp: tForceResolveResp) { send caller, eForceResolveResp, resp; Close(); }
     on eReadForTransactionResp do (resp: tReadForTransactionResp) { send caller, eReadForTransactionResp, resp; Close(); }
-    on eReadSnapshotResp do (resp: tReadSnapshotResp) { send caller, eReadSnapshotResp, resp; Close(); }
+    on eReadSnapshotResp do (resp: tReadSnapshotResp) { Reply(eReadSnapshotResp, resp); }
+    on eFokosInitResp do (slice: int) { send caller, eFokosInitResp, slice; Close(); }
+    on eMigrationPage do (page: tMigrationPage) { send caller, eMigrationPage, page; Close(); }
+    on eMigrationAckResp do { send caller, eMigrationAckResp; Close(); }
 
     on eRpcBroken do {
       send caller, eRpcFailed, (reqId = reqId, target = target);
@@ -131,13 +171,22 @@ machine RpcCall {
     }
     on ePutItemResp, eDeleteItemResp, eGetItemResp, eInitiateWriteResp, eTxPrepareResp, eTxCommitResp,
       eTxCancelResp, eExecuteSingleShotResp, eRecoverResp, eForceResolveResp, eReadForTransactionResp, eReadSnapshotResp,
-      eRpcBroken goto Done;
+      eFokosInitResp, eMigrationPage, eMigrationAckResp, eRpcBroken goto Done;
   }
 
   state Done {
     entry {
       Close();
     }
+  }
+
+  fun Reply(response: event, payload: any) {
+    if (forwardId == 0) {
+      send caller, response, payload;
+    } else {
+      send caller, eForwardResp, (forwardId = forwardId, response = response, payload = payload);
+    }
+    Close();
   }
 
   fun Close() {
@@ -148,6 +197,9 @@ machine RpcCall {
   fun Deliver(id: int, ev: event, payload: any) {
     var loss: tLoss;
     reqId = id;
+    if (forwardId != 0) {
+      reqId = forwardId;
+    }
     send env, eMayLose, (rpc = this, target = target);
     receive {
       case eLossDecision: (d: tLoss) { loss = d; }

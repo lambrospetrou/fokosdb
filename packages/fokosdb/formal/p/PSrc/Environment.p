@@ -11,9 +11,10 @@ fun TICKS_AFTER_FAULTS(): int { return 20; }
 // `down` holds the Durable Objects that drop every call, also after the end of the faults.
 // `fineSteps` is the number of fine steps of the clock, and `offsetMoves` the number of offset
 // moves of one Durable Object. `maxTicksAfterFaults` is the number of ticks after the end of the
-// faults and after the last change of an alarm (TICKS_AFTER_FAULTS).
+// faults and after the last change of an alarm (TICKS_AFTER_FAULTS). `split` is the partition whose
+// hash split the Environment requests, or null.
 type tEnvConfig = (restarts: int, losses: int, answersOnly: bool, down: set[machine], fineSteps: int, offsetMoves: int,
-                   maxTicksAfterFaults: int);
+                   maxTicksAfterFaults: int, split: machine);
 type tEnvSetup = (config: tEnvConfig, dos: seq[machine]);
 event eEnvSetup: tEnvSetup;
 event eEnvStep;
@@ -39,6 +40,10 @@ event eRpcClosed;
 // Object in one handler, so it adds no skew. An offset move gives one Durable Object a new offset
 // between 0 and MAX_CLOCK_SKEW() + 1. The clocks of two Durable Objects then differ by at most
 // MAX_CLOCK_SKEW() + 1, and a clock can go back.
+//
+// Topology: it requests the hash split of one partition in one of its steps, so the split starts
+// before, between, or after the calls of the clients. A Durable Object that the split creates gets the
+// clock and the faults from then on.
 machine Environment {
   var config: tEnvConfig;
   var dos: seq[machine];
@@ -73,8 +78,12 @@ machine Environment {
 
     on eEnvStep do {
       var target: machine;
-      if (steps < ENVIRONMENT_STEPS() && (config.restarts > 0 || config.losses > 0 || config.fineSteps > 0 || config.offsetMoves > 0)) {
+      if (steps < ENVIRONMENT_STEPS()
+          && (config.restarts > 0 || config.losses > 0 || config.fineSteps > 0 || config.offsetMoves > 0 || config.split != null)) {
         steps = steps + 1;
+        if (config.split != null && $) {
+          RequestSplit();
+        }
         if (config.restarts > 0 && $) {
           config.restarts = config.restarts - 1;
           send choose(dos), eRestart;
@@ -95,7 +104,17 @@ machine Environment {
         send this, eEnvStep;
         return;
       }
+      if (config.split != null) {
+        RequestSplit();
+      }
       faultsEnded = true;
+    }
+
+    on eDoCreated do (created: machine) {
+      dos += (sizeof(dos), created);
+      offsets[created] = 0;
+      send created, eTick, now;
+      send created, eClock, (fine = fine, offset = 0);
     }
 
     on eMayLose do (q: tMayLose) {
@@ -148,6 +167,11 @@ machine Environment {
       }
       Wake();
     }
+  }
+
+  fun RequestSplit() {
+    send config.split, eRequestSplit;
+    config.split = default(machine);
   }
 
   fun CanTick(): bool {

@@ -5,19 +5,43 @@ type tLockRow = (tx: int, op: tTxOp);
 // of the stale job.
 type tPendingTxInfo = (ts: int, coordinator: machine, createdAt: int, nextRecoveryAt: int, guarded: bool);
 
+// One target row of a split: the child, whether its fokosInit succeeded, and whether it acknowledged
+// its import.
+type tSplitTarget = (child: machine, initialized: bool, acked: bool);
+
 // The SQLite state of a partition: the `items` table, the `deletion_metadata` row, the lock rows,
-// and the `pending_tx_info` rows. The alarm is durable too.
+// and the `pending_tx_info` rows. The alarm is durable too. A split source also has the state of its
+// split and its target rows. A target also has its source, its child index, and its import record
+// with the cursor.
 type tPartitionDurable = (items: map[tKey, tItemRow], maxDeletedV: int, maxDeleteTxOrderTs: int,
-                          locks: map[tKey, tLockRow], pendingTx: map[int, tPendingTxInfo], alarmArmed: bool);
+                          locks: map[tKey, tLockRow], pendingTx: map[int, tPendingTxInfo], alarmArmed: bool,
+                          split: tSplitState, children: seq[tSplitTarget],
+                          source: machine, slice: int, importState: tImportState, cursor: tCursor);
 
 // The stale job in progress: the start time of the step, and the transaction that waits for the
 // answer of its coordinator.
 type tStaleStep = (running: bool, startedAt: int, tx: int, reqId: int);
 
-type tPartitionConfig = (bugs: tBugs, env: machine, clock: machine, operator: machine);
+// A `group` request that a router divided by owner: the caller and its request id, the children that
+// did not answer yet, and the parts of the answer. `failed` is a part that threw, and `rejected` a
+// prepare that a child rejected.
+enum tFanoutKind { FAN_PREPARE, FAN_COMMIT, FAN_CANCEL, FAN_READ }
+type tFanout = (caller: machine, reqId: int, kind: tFanoutKind, waiting: set[machine], failed: bool, rejected: bool,
+                items: seq[tReadItem]);
 
-// PartitionDO with its PartitionStore and TransactionParticipant. Each handler is one block of the
-// code. The topology is fixed, so this partition owns every key that it receives.
+// `now` and `tsClock` are the clock of the source that creates a child.
+type tPartitionConfig = (bugs: tBugs, env: machine, clock: machine, operator: machine, now: int, tsClock: tClock);
+
+// PartitionDO with its PartitionStore, its TransactionParticipant, and its FokosShardingRuntime. Each
+// handler is one block of the code.
+//
+// A partition owns every key that it receives, until its hash split cuts over. From the cutover it
+// is a router: it owns no key, and sends each request to the child that owns the key. A child answers
+// partition_migrating until its import ends, and reads apiGetItem through its source.
+//
+// A partition keeps a continuation for a `point`, a `single_owner`, or a read-through forward.
+// Its outbound RpcCall returns to that continuation before the partition answers the caller.
+// It also keeps one for a `group` request, which can have a part on each child.
 machine Partition {
   var bugs: tBugs;
   var env: machine;
@@ -31,8 +55,11 @@ machine Partition {
   // An eAlarm waits in the inbox.
   var alarmQueued: bool;
   // The ids of the calls of this machine. A model value, not a value of the code: a restart keeps it,
-  // so that an answer to a call from before the restart does not match a new call.
+  // so that an answer to a call from before the restart does not match a new call. The calls of the
+  // repartition flow have the id 0: they keep no continuation.
   var nextReqId: int;
+  var fanouts: map[int, tFanout];
+  var forwards: map[int, machine];
 
   start state Init {
     entry (cfg: tPartitionConfig) {
@@ -40,15 +67,32 @@ machine Partition {
       env = cfg.env;
       clock = cfg.clock;
       operator = cfg.operator;
+      now = cfg.now;
+      tsClock = cfg.tsClock;
       goto Serving;
     }
   }
 
   state Serving {
     // An eviction or a crash between two handlers: the memory state goes, SQLite and the alarm stay.
+    // Each request that waits for a forward gets an error.
     on eRestart do {
+      var f: tFanout;
+      var forwarded: machine;
+      foreach (forwarded in values(forwards)) {
+        send forwarded, eRpcBroken;
+      }
+      forwards = default(map[int, machine]);
+      foreach (f in values(fanouts)) {
+        send f.caller, eRpcBroken;
+      }
+      fanouts = default(map[int, tFanout]);
       step = default(tStaleStep);
       CheckAlarm();
+      // The alarm runs the import job again. A target in awaiting_data waits for fokosStartImport.
+      if (durable.importState != AWAITING_DATA) {
+        ImportStep();
+      }
     }
 
     on eTick do (t: int) {
@@ -65,6 +109,9 @@ machine Partition {
     on ePutItem do (req: tPutItemReq) {
       var v: int;
       var ts: int;
+      if (Routed(req.caller, req.key, ePutItem, req)) {
+        return;
+      }
       if (req.key in durable.locks && !bugs.putIgnoresLock) {
         send req.caller, ePutItemResp, (reqId = req.reqId, locked = true, version = 0);
         return;
@@ -79,6 +126,9 @@ machine Partition {
     // removes the row at the clock of this partition. A delete of an absent row changes nothing.
     on eDeleteItem do (req: tDeleteItemReq) {
       var ts: int;
+      if (Routed(req.caller, req.key, eDeleteItem, req)) {
+        return;
+      }
       if (req.key in durable.locks) {
         send req.caller, eDeleteItemResp, (reqId = req.reqId, locked = true, deleted = false);
         return;
@@ -93,15 +143,24 @@ machine Partition {
       send req.caller, eDeleteItemResp, (reqId = req.reqId, locked = false, deleted = true);
     }
 
-    // apiGetItem: readItemLocally reads the committed row. A lock does not block it.
+    // apiGetItem: readItemLocally reads the committed row. A lock does not block it. A target that
+    // imports reads through its source (fokosExecuteLocal), and a router forwards to the owner.
     on eGetItem do (req: tGetItemReq) {
-      var row: tItemRow;
-      if (!(req.key in durable.items)) {
-        send req.caller, eGetItemResp, (reqId = req.reqId, found = false, value = 0, version = 0);
+      if (Importing()) {
+        Forward(req.caller, durable.source, eExecuteLocal, req);
         return;
       }
-      row = durable.items[req.key];
-      send req.caller, eGetItemResp, (reqId = req.reqId, found = true, value = row.value, version = row.v);
+      if (IsRouter() && !bugs.routerServesGetItem) {
+        Forward(req.caller, OwnerOf(req.key), eGetItem, req);
+        return;
+      }
+      ReadItemLocally(req);
+    }
+
+    // fokosExecuteLocal: the source runs the local handler of apiGetItem for a target that imports,
+    // with no owner resolution. A split source keeps its item rows for life.
+    on eExecuteLocal do (req: tGetItemReq) {
+      ReadItemLocally(req);
     }
 
     // txPrepare: prepareLocal. A timestamp more than maxClockSkewMs ahead of the clock of this
@@ -111,10 +170,31 @@ machine Partition {
     // is last_write_ts, of a put or a delete last_read_ts, and of an absent item
     // max_delete_tx_order_ts. Each rejection writes no lock. Otherwise the lock block writes one
     // pending_tx_info row and one lock row for each key. A repeated prepare finds its own locks and
-    // passes.
+    // passes. A router sends the operations of each child in one call (fail_fast).
     on eTxPrepare do (req: tPrepareReq) {
       var op: tTxOp;
       var watermark: int;
+      var parts: map[machine, seq[tTxOp]];
+      var child: machine;
+      var id: int;
+      if (!bugs.importingChildServesPrepare && Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        foreach (op in req.items) {
+          child = OwnerOf(op.key);
+          if (!(child in parts)) {
+            parts[child] = default(seq[tTxOp]);
+          }
+          parts[child] += (sizeof(parts[child]), op);
+        }
+        id = NewFanout(req.caller, req.reqId, FAN_PREPARE, keys(parts));
+        foreach (child in keys(parts)) {
+          send NewRpc(this, child, env), eTxPrepare,
+            (caller = this, reqId = id, coordinator = req.coordinator, tx = req.tx, ts = req.ts, items = parts[child]);
+        }
+        return;
+      }
       if (req.ts > TsNow() + MAX_CLOCK_SKEW()) {
         Reject(req);
         return;
@@ -151,21 +231,50 @@ machine Partition {
         if (!(op.key in durable.locks)) {
           durable.locks[op.key] = (tx = req.tx, op = op);
           announce eLockWritten, (partition = this, key = op.key, tx = req.tx);
+          Mutated(op.key, req.tx);
         }
       }
       UpdateAlarm();
       send req.caller, eTxPrepareResp, (reqId = req.reqId, partition = this, outcome = PREPARE_ACCEPTED);
     }
 
-    // txCommit: commitLocal.
+    // txCommit: commitLocal. A router sends the keys of each child in one call (attempt_all).
     on eTxCommit do (req: tCommitReq) {
       var ok: bool;
+      var parts: map[machine, seq[tKey]];
+      var child: machine;
+      var id: int;
+      if (Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        parts = KeysByOwner(req.itemKeys);
+        id = NewFanout(req.caller, req.reqId, FAN_COMMIT, keys(parts));
+        foreach (child in keys(parts)) {
+          send NewRpc(this, child, env), eTxCommit, (caller = this, reqId = id, tx = req.tx, ts = req.ts, itemKeys = parts[child]);
+        }
+        return;
+      }
       ok = CommitLocal(req.tx, req.itemKeys);
       send req.caller, eTxCommitResp, (reqId = req.reqId, partition = this, ok = ok);
     }
 
-    // txCancel: cancelLocal.
+    // txCancel: cancelLocal. A router sends the keys of each child in one call (attempt_all).
     on eTxCancel do (req: tCancelReq) {
+      var parts: map[machine, seq[tKey]];
+      var child: machine;
+      var id: int;
+      if (Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        parts = KeysByOwner(req.itemKeys);
+        id = NewFanout(req.caller, req.reqId, FAN_CANCEL, keys(parts));
+        foreach (child in keys(parts)) {
+          send NewRpc(this, child, env), eTxCancel, (caller = this, reqId = id, tx = req.tx, itemKeys = parts[child]);
+        }
+        return;
+      }
       CancelLocal(req.tx, req.itemKeys);
       send req.caller, eTxCancelResp, (reqId = req.reqId, partition = this);
     }
@@ -173,47 +282,128 @@ machine Partition {
     // txExecuteSingleShot: executeSingleShot applies the whole transaction in one storage
     // transaction at the clock of this partition. It takes no lock and checks no timestamp. A lock
     // of a two-phase transaction gives pending_conflict, and a failed condition gives
-    // condition_failed. A rejection writes nothing.
+    // condition_failed. A rejection writes nothing. A router forwards the request when one child owns
+    // every key, and answers not_applicable for every other request.
     on eExecuteSingleShot do (req: tSingleShotReq) {
       var op: tTxOp;
       var ts: int;
+      var owners: set[machine];
+      if (Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        foreach (op in req.items) {
+          owners += (OwnerOf(op.key));
+        }
+        if (sizeof(owners) == 1) {
+          Forward(req.caller, owners[0], eExecuteSingleShot, req);
+        } else {
+          send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, notApplicable = true, committed = false);
+        }
+        return;
+      }
       ts = TsNow();
       foreach (op in req.items) {
         if ((op.key in durable.locks && !bugs.singleShotIgnoresLock) || !ConditionHolds(op)) {
-          send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, committed = false);
+          send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, notApplicable = false, committed = false);
           return;
         }
       }
       foreach (op in req.items) {
         ApplyOp(op, 0, ts, false);
       }
-      send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, committed = true);
+      send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, notApplicable = false, committed = true);
     }
 
     // txReadForTransaction: readForTransactionLocal reads every key in one block and writes nothing.
+    // A router sends the keys of each child in one call (fail_fast).
     on eReadForTransaction do (req: tReadReq) {
+      var parts: map[machine, seq[tKey]];
+      var child: machine;
+      var id: int;
+      if (Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        parts = KeysByOwner(req.readKeys);
+        id = NewFanout(req.caller, req.reqId, FAN_READ, keys(parts));
+        foreach (child in keys(parts)) {
+          send NewRpc(this, child, env), eReadForTransaction, (caller = this, reqId = id, readKeys = parts[child]);
+        }
+        return;
+      }
       send req.caller, eReadForTransactionResp, (reqId = req.reqId, partition = this, items = ReadLocal(req.readKeys));
     }
 
     // txReadSnapshot: the same read in one block. A pending write on any key gives the outcome
-    // aborted.
+    // aborted. A router forwards the request when one child owns every key, and answers
+    // not_applicable for every other request.
     on eReadSnapshot do (req: tReadReq) {
       var items: seq[tReadItem];
       var item: tReadItem;
+      var parts: map[machine, seq[tKey]];
+      if (Migrating(req.caller)) {
+        return;
+      }
+      if (IsRouter()) {
+        parts = KeysByOwner(req.readKeys);
+        if (sizeof(parts) == 1) {
+          Forward(req.caller, keys(parts)[0], eReadSnapshot, req);
+        } else {
+          send req.caller, eReadSnapshotResp, (reqId = req.reqId, notApplicable = true, aborted = false, items = items);
+        }
+        return;
+      }
       items = ReadLocal(req.readKeys);
       foreach (item in items) {
         if (item.hasPendingWrite) {
-          send req.caller, eReadSnapshotResp, (reqId = req.reqId, aborted = true, items = default(seq[tReadItem]));
+          send req.caller, eReadSnapshotResp,
+            (reqId = req.reqId, notApplicable = false, aborted = true, items = default(seq[tReadItem]));
           return;
         }
       }
-      send req.caller, eReadSnapshotResp, (reqId = req.reqId, aborted = false, items = items);
+      send req.caller, eReadSnapshotResp, (reqId = req.reqId, notApplicable = false, aborted = false, items = items);
     }
 
-    // debugForceResolveTransaction: sends every row of the transaction through dispatch. On a fixed
-    // topology this partition owns each row, so the commit or the cancel applies here.
+    on eForwardResp do (resp: tForwardResp) {
+      if (resp.forwardId in forwards) {
+        send forwards[resp.forwardId], resp.response, resp.payload;
+        forwards -= (resp.forwardId);
+      }
+    }
+
+    // The answers of the children to the parts of a group request.
+    on eTxPrepareResp do (resp: tPrepareResp) {
+      if (resp.reqId in fanouts && resp.outcome == PREPARE_REJECTED) {
+        fanouts[resp.reqId].rejected = true;
+      }
+      PartSettled(resp.reqId, resp.partition, false);
+    }
+    on eTxCommitResp do (resp: tCommitResp) {
+      PartSettled(resp.reqId, resp.partition, !resp.ok);
+    }
+    on eTxCancelResp do (resp: tCancelResp) {
+      PartSettled(resp.reqId, resp.partition, false);
+    }
+    on eReadForTransactionResp do (resp: tReadForTransactionResp) {
+      var item: tReadItem;
+      if (resp.reqId in fanouts) {
+        foreach (item in resp.items) {
+          fanouts[resp.reqId].items += (sizeof(fanouts[resp.reqId].items), item);
+        }
+      }
+      PartSettled(resp.reqId, resp.partition, false);
+    }
+
+    // debugForceResolveTransaction: sends every row of the transaction through dispatch. This
+    // partition owns each row, so the commit or the cancel applies here. No test case repairs a
+    // lock after a split, so the model has no repair on a router.
     on eForceResolve do (req: tForceResolveReq) {
       var rows: seq[tKey];
+      if (Migrating(req.caller)) {
+        return;
+      }
+      assert !IsRouter(), "the model has no debugForceResolveTransaction on a router";
       rows = RowsOf(req.tx);
       if (req.commit) {
         CommitLocal(req.tx, rows);
@@ -234,7 +424,8 @@ machine Partition {
     }
 
     // The answer of recoverTransactionForParticipant. The step reads the rows of the transaction
-    // again, because they can change during the call, and applies the answer through dispatch.
+    // again, because they can change during the call, and applies the answer through dispatch. A
+    // partition that cut over during the call owns no row, so the answer changes nothing.
     on eRecoverResp do (resp: tRecoverResp) {
       var rows: seq[tKey];
       var tx: int;
@@ -243,7 +434,7 @@ machine Partition {
       }
       tx = step.tx;
       rows = RowsOf(tx);
-      if (sizeof(rows) > 0) {
+      if (sizeof(rows) > 0 && !IsRouter()) {
         if (resp.ledgerState == RECOVER_COMMITTED) {
           CommitLocal(tx, rows);
         } else if (resp.ledgerState == RECOVER_CANCELLED || (resp.ledgerState == RECOVER_DRIVING && bugs.staleCancelsOnDriving)) {
@@ -263,12 +454,408 @@ machine Partition {
       ClaimNext();
     }
 
+    // A call failed: a forward, a part of a group request, the call of the stale job, or a call of the
+    // repartition flow, whose job then runs its step again.
     on eRpcFailed do (f: tRpcFailed) {
-      if (!step.running || f.reqId != step.reqId) {
+      if (f.reqId in forwards) {
+        send forwards[f.reqId], eRpcBroken;
+        forwards -= (f.reqId);
+      } else if (f.reqId in fanouts) {
+        PartSettled(f.reqId, f.target, true);
+      } else if (step.running && f.reqId == step.reqId) {
+        ClaimNext();
+      } else if (f.reqId == 0 && f.target == durable.source) {
+        ImportStep();
+      } else if (f.reqId == 0) {
+        send this, eSourceStep;
+      }
+    }
+
+    // RepartitionSource.queue: writes the split in `queued`, and schedules the source_repartition job.
+    on eRequestSplit do {
+      SetSplit(SPLIT_QUEUED);
+      send this, eSourceStep;
+    }
+
+    // sourceStep and sourceCleanupStep: one step of the source_repartition job.
+    on eSourceStep do {
+      var i: int;
+      var child: machine;
+      var pending: bool;
+      if (durable.split == SPLIT_QUEUED) {
+        // #plan: writes one target row for each of the hashSplitN children. The machine of a child
+        // stands for its Durable Object name.
+        while (i < HASH_SPLIT_N()) {
+          child = new Partition((bugs = bugs, env = env, clock = clock, operator = operator, now = now, tsClock = tsClock));
+          send env, eDoCreated, child;
+          durable.children += (i, (child = child, initialized = false, acked = false));
+          i = i + 1;
+        }
+        SetSplit(SPLIT_PLANNED);
+        send this, eSourceStep;
+      } else if (durable.split == SPLIT_PLANNED) {
+        // #initializeTargets: calls fokosInit on each target that is not initialized. #cutover: when
+        // every target is initialized, the source becomes a router.
+        while (i < sizeof(durable.children)) {
+          if (!durable.children[i].initialized) {
+            pending = true;
+            send NewRpc(this, durable.children[i].child, env), eFokosInit, (caller = this, reqId = 0, source = this, slice = i);
+          }
+          i = i + 1;
+        }
+        if (!pending) {
+          Cutover();
+        }
+      } else if (durable.split == SPLIT_COMPLETED) {
+        // cleanupSourceStep: deletes the lock copies of one transaction in each step, then writes
+        // `cleaned`. A split router keeps its item rows.
+        if (sizeof(durable.pendingTx) > 0) {
+          DeleteCopies(keys(durable.pendingTx)[0]);
+          send this, eSourceStep;
+        } else {
+          SetSplit(SPLIT_CLEANED);
+        }
+      }
+    }
+
+    // The answer of fokosInit: the source marks the target `initialized`.
+    on eFokosInitResp do (slice: int) {
+      var target: tSplitTarget;
+      if (durable.split != SPLIT_PLANNED) {
         return;
       }
-      ClaimNext();
+      durable.children[slice].initialized = true;
+      foreach (target in durable.children) {
+        if (!target.initialized) {
+          return;
+        }
+      }
+      send this, eSourceStep;
     }
+
+    // fokosInit: initAsTarget writes the identity of the target and its import record in
+    // `awaiting_data`. A repeated call changes nothing.
+    on eFokosInit do (req: tFokosInitReq) {
+      if (durable.importState == NOT_TARGET) {
+        durable.source = req.source;
+        durable.slice = req.slice;
+        SetImport(AWAITING_DATA);
+      }
+      send req.caller, eFokosInitResp, durable.slice;
+    }
+
+    // fokosStartImport: the target starts its import. In the code a target in awaiting_data also
+    // starts from its own alarm, and the source refuses a pull before the cutover. The model sends
+    // this event one time at the cutover and does not lose it, so that alarm is not necessary.
+    on eStartImport do {
+      ImportStep();
+    }
+
+    // fokosMigrationPull: servePage refuses a pull before the cutover (repartition_not_cut_over) and
+    // after the completion (partition_migrating).
+    on eMigrationPull do (req: tMigrationPullReq) {
+      if (durable.split != SPLIT_CUTOVER) {
+        send req.caller, eRpcBroken;
+        return;
+      }
+      send req.caller, eMigrationPage, BuildPage(req.slice, req.cursor);
+    }
+
+    // The page of a pull: importOnePage commits the page with its cursor. It drops a page whose cursor
+    // is not the durable cursor. applyPage inserts the item rows with their v and their timestamps,
+    // and the lock rows with their pending_tx_info rows, guarded_at included, and merges the deletion
+    // metadata with MAX. The last page writes `imported`. The step keeps no continuation, so the page
+    // of a pull from before a restart can apply, and the cursor check then drops the page of the pull
+    // that the restart started.
+    on eMigrationPage do (page: tMigrationPage) {
+      var key: tKey;
+      var tx: int;
+      if (!Importing() || page.cursor != durable.cursor) {
+        return;
+      }
+      foreach (key in keys(page.items)) {
+        if (!(key in durable.items)) {
+          durable.items[key] = page.items[key];
+        }
+      }
+      if (!bugs.importSkipsPendingTx) {
+        foreach (tx in keys(page.pendingTx)) {
+          if (!(tx in durable.pendingTx)) {
+            durable.pendingTx[tx] = page.pendingTx[tx];
+            if (page.pendingTx[tx].guarded) {
+              announce eLockGuarded, (partition = this, tx = tx);
+            }
+          }
+        }
+        foreach (key in keys(page.locks)) {
+          if (!(key in durable.locks)) {
+            durable.locks[key] = page.locks[key];
+            announce eLockWritten, (partition = this, key = key, tx = page.locks[key].tx);
+          }
+        }
+      }
+      if (!bugs.childSkipsDeletionMetadata) {
+        durable.maxDeletedV = Max(durable.maxDeletedV, page.maxDeletedV);
+        durable.maxDeleteTxOrderTs = Max(durable.maxDeleteTxOrderTs, page.maxDeleteTxOrderTs);
+      }
+      durable.cursor = page.next;
+      if (page.done) {
+        SetImport(IMPORTED);
+      } else if (durable.importState == AWAITING_DATA) {
+        SetImport(IMPORTING);
+      }
+      ImportStep();
+    }
+
+    // fokosMigrationAck: acceptAck records the acknowledgement of a target. When every target
+    // acknowledged, the same transaction writes `completed`. A repeated acknowledgement after that is
+    // a success.
+    on eMigrationAck do (req: tMigrationAckReq) {
+      var target: tSplitTarget;
+      var open: bool;
+      if (durable.split == SPLIT_CUTOVER) {
+        durable.children[req.slice].acked = true;
+        announce eAckRecorded, (source = this, target = durable.children[req.slice].child);
+        foreach (target in durable.children) {
+          open = open || !target.acked;
+        }
+        if (!open) {
+          SetSplit(SPLIT_COMPLETED);
+          send this, eSourceStep;
+        }
+      }
+      send req.caller, eMigrationAckResp;
+    }
+
+    // The answer of fokosMigrationAck: sendAck writes `active`.
+    on eMigrationAckResp do {
+      if (durable.importState == IMPORTED) {
+        SetImport(ACTIVE);
+      }
+    }
+  }
+
+  // A split source in cutover, completed, or cleaned owns no key.
+  fun IsRouter(): bool {
+    return durable.split == SPLIT_CUTOVER || durable.split == SPLIT_COMPLETED || durable.split == SPLIT_CLEANED;
+  }
+
+  // The child that owns a key of this router.
+  fun OwnerOf(key: tKey): machine {
+    return durable.children[ChildIndexOf(key.hk)].child;
+  }
+
+  // A target in awaiting_data or importing holds only some of the rows of its slice.
+  fun Importing(): bool {
+    return durable.importState == AWAITING_DATA || durable.importState == IMPORTING;
+  }
+
+  // The import gate: a target that imports answers partition_migrating. Returns true when it did.
+  fun Migrating(caller: machine): bool {
+    if (Importing()) {
+      send caller, eRpcBroken;
+    }
+    return Importing();
+  }
+
+  // The import gate and the forward of a `point` request. Returns true when this partition does not
+  // run the request.
+  fun Routed(caller: machine, key: tKey, ev: event, req: any): bool {
+    if (Migrating(caller)) {
+      return true;
+    }
+    if (IsRouter()) {
+      Forward(caller, OwnerOf(key), ev, req);
+    }
+    return IsRouter();
+  }
+
+  fun Forward(caller: machine, target: machine, ev: event, req: any) {
+    nextReqId = nextReqId + 1;
+    forwards[nextReqId] = caller;
+    send NewForwardRpc(this, target, env, nextReqId), ev, req;
+  }
+
+  // The keys of a `group` or a `single_owner` request on a router, by the child that owns each one.
+  fun KeysByOwner(ks: seq[tKey]): map[machine, seq[tKey]] {
+    var parts: map[machine, seq[tKey]];
+    var key: tKey;
+    var child: machine;
+    foreach (key in ks) {
+      child = OwnerOf(key);
+      if (!(child in parts)) {
+        parts[child] = default(seq[tKey]);
+      }
+      parts[child] += (sizeof(parts[child]), key);
+    }
+    return parts;
+  }
+
+  fun NewFanout(caller: machine, reqId: int, kind: tFanoutKind, children: seq[machine]): int {
+    var f: tFanout;
+    var child: machine;
+    f.caller = caller;
+    f.reqId = reqId;
+    f.kind = kind;
+    foreach (child in children) {
+      f.waiting += (child);
+    }
+    nextReqId = nextReqId + 1;
+    fanouts[nextReqId] = f;
+    return nextReqId;
+  }
+
+  // One part of a group request settled. txPrepare and txReadForTransaction are fail_fast: the
+  // request throws at the first part that failed. txCommit and txCancel are attempt_all: the
+  // request waits for every part, and then throws partition_fanout_failed when a part failed.
+  // Otherwise the answer merges the parts: one rejected prepare rejects the request.
+  fun PartSettled(id: int, child: machine, failed: bool) {
+    var f: tFanout;
+    var outcome: tPrepareOutcome;
+    if (!(id in fanouts)) {
+      return;
+    }
+    f = fanouts[id];
+    f.waiting -= (child);
+    f.failed = f.failed || failed;
+    fanouts[id] = f;
+    if (f.failed && (f.kind == FAN_PREPARE || f.kind == FAN_READ || sizeof(f.waiting) == 0)) {
+      send f.caller, eRpcBroken;
+    } else if (sizeof(f.waiting) > 0) {
+      return;
+    } else if (f.kind == FAN_PREPARE) {
+      outcome = PREPARE_ACCEPTED;
+      if (f.rejected) {
+        outcome = PREPARE_REJECTED;
+      }
+      send f.caller, eTxPrepareResp, (reqId = f.reqId, partition = this, outcome = outcome);
+    } else if (f.kind == FAN_COMMIT) {
+      send f.caller, eTxCommitResp, (reqId = f.reqId, partition = this, ok = true);
+    } else if (f.kind == FAN_CANCEL) {
+      send f.caller, eTxCancelResp, (reqId = f.reqId, partition = this);
+    } else {
+      send f.caller, eReadForTransactionResp, (reqId = f.reqId, partition = this, items = f.items);
+    }
+    fanouts -= (id);
+  }
+
+  fun SetSplit(current: tSplitState) {
+    durable.split = current;
+    announce eSplitState, (partition = this, current = current);
+    UpdateAlarm();
+  }
+
+  fun SetImport(current: tImportState) {
+    durable.importState = current;
+    announce eImportState, (partition = this, current = current);
+    UpdateAlarm();
+  }
+
+  // #cutover: from here the source is a router, and its lock rows are transfer copies. Then
+  // #notifyStart tells each target to start its import.
+  fun Cutover() {
+    var target: tSplitTarget;
+    var owners: seq[machine];
+    var tx: int;
+    SetSplit(SPLIT_CUTOVER);
+    foreach (target in durable.children) {
+      owners += (sizeof(owners), target.child);
+    }
+    announce eOwnerChanged, (source = this, children = owners);
+    if (bugs.routerDeletesCopiesAtCutover) {
+      foreach (tx in keys(durable.pendingTx)) {
+        DeleteCopies(tx);
+      }
+    }
+    foreach (target in durable.children) {
+      send target.child, eStartImport;
+    }
+  }
+
+  // PartitionStore.deletePendingTxCopiesBatch: deletes the lock copies of one whole transaction, and
+  // its pending_tx_info row.
+  fun DeleteCopies(tx: int) {
+    var key: tKey;
+    foreach (key in RowsOf(tx)) {
+      durable.locks -= (key);
+      announce eCopyDeleted, (partition = this, key = key, tx = tx, target = OwnerOf(key));
+      announce eLockDeleted, (partition = this, key = key, tx = tx);
+    }
+    durable.pendingTx -= (tx);
+  }
+
+  // FokosMigrationHost.buildPage: one row of the slice at the cursor. The `items` stream hands over
+  // to the `pending_tx` stream. Each page of the `pending_tx` stream carries the deletion metadata, so
+  // a slice with no lock receives it in one empty page.
+  fun BuildPage(slice: int, cursor: tCursor): tMigrationPage {
+    var page: tMigrationPage;
+    var rows: seq[tKey];
+    var key: tKey;
+    var tx: int;
+    page.cursor = cursor;
+    if (cursor.stream == STREAM_ITEMS) {
+      foreach (key in keys(durable.items)) {
+        if (ChildIndexOf(key.hk) == slice) {
+          rows += (sizeof(rows), key);
+        }
+      }
+      if (cursor.index < sizeof(rows)) {
+        page.items[rows[cursor.index]] = durable.items[rows[cursor.index]];
+      }
+      if (cursor.index + 1 < sizeof(rows)) {
+        page.next = (stream = STREAM_ITEMS, index = cursor.index + 1);
+      } else {
+        page.next = (stream = STREAM_PENDING_TX, index = 0);
+      }
+      return page;
+    }
+    foreach (key in keys(durable.locks)) {
+      if (ChildIndexOf(key.hk) == slice) {
+        rows += (sizeof(rows), key);
+      }
+    }
+    if (cursor.index < sizeof(rows)) {
+      key = rows[cursor.index];
+      tx = durable.locks[key].tx;
+      page.locks[key] = durable.locks[key];
+      page.pendingTx[tx] = durable.pendingTx[tx];
+    }
+    page.maxDeletedV = durable.maxDeletedV;
+    page.maxDeleteTxOrderTs = durable.maxDeleteTxOrderTs;
+    page.next = (stream = STREAM_PENDING_TX, index = cursor.index + 1);
+    page.done = cursor.index + 1 >= sizeof(rows);
+    return page;
+  }
+
+  // One step of the import job: importOnePage pulls the page of the durable cursor, and sendAck
+  // acknowledges an import that ended.
+  fun ImportStep() {
+    if (Importing()) {
+      send NewRpc(this, durable.source, env), eMigrationPull,
+        (caller = this, reqId = 0, slice = durable.slice, cursor = durable.cursor);
+    } else if (durable.importState == IMPORTED) {
+      send NewRpc(this, durable.source, env), eMigrationAck, (caller = this, reqId = 0, slice = durable.slice);
+    }
+  }
+
+  // A local decision changed the lock row of a key. On a router the row is a transfer copy.
+  fun Mutated(key: tKey, tx: int) {
+    if (IsRouter()) {
+      announce eCopyChanged, (partition = this, key = key, tx = tx);
+    } else {
+      announce eLocalTxMutation, (partition = this, key = key, tx = tx);
+    }
+  }
+
+  // readItemLocally: the committed row of the key.
+  fun ReadItemLocally(req: tGetItemReq) {
+    var row: tItemRow;
+    if (!(req.key in durable.items)) {
+      send req.caller, eGetItemResp, (reqId = req.reqId, found = false, value = 0, version = 0);
+      return;
+    }
+    row = durable.items[req.key];
+    send req.caller, eGetItemResp, (reqId = req.reqId, found = true, value = row.value, version = row.v);
   }
 
   fun Reject(req: tPrepareReq) {
@@ -400,6 +987,7 @@ machine Partition {
   fun DeleteLock(key: tKey, tx: int) {
     durable.locks -= (key);
     announce eLockDeleted, (partition = this, key = key, tx = tx);
+    Mutated(key, tx);
     if (sizeof(RowsOf(tx)) == 0) {
       durable.pendingTx -= (tx);
       UpdateAlarm();
@@ -432,6 +1020,7 @@ machine Partition {
   // PartitionStore.guardPendingTx: sets guarded_at one time, and logs the lock-age guard error.
   fun Guard(tx: int) {
     var info: tPendingTxInfo;
+    var key: tKey;
     info = durable.pendingTx[tx];
     if (info.guarded) {
       return;
@@ -439,6 +1028,9 @@ machine Partition {
     info.guarded = true;
     durable.pendingTx[tx] = info;
     announce eLockGuarded, (partition = this, tx = tx);
+    foreach (key in RowsOf(tx)) {
+      Mutated(key, tx);
+    }
     if (operator != null) {
       send operator, eGuardLogged, (partition = this, tx = tx);
     }
@@ -476,7 +1068,7 @@ machine Partition {
 
   // claimStaleTransactions: claims the unguarded transaction with the earliest next_recovery_at that
   // was due when the step started, and moves its next_recovery_at forward. Then the step calls its
-  // coordinator. The step ends when no transaction is due.
+  // coordinator. The step ends when no transaction is due, or when the job cannot run.
   fun ClaimNext() {
     var tx: int;
     var best: int;
@@ -484,7 +1076,7 @@ machine Partition {
     best = 0;
     foreach (tx in keys(durable.pendingTx)) {
       info = durable.pendingTx[tx];
-      if (!info.guarded && info.nextRecoveryAt <= step.startedAt
+      if (CanSweepLocally() && !info.guarded && info.nextRecoveryAt <= step.startedAt
           && (best == 0 || info.nextRecoveryAt < durable.pendingTx[best].nextRecoveryAt)) {
         best = tx;
       }
@@ -503,11 +1095,17 @@ machine Partition {
     send NewRpc(this, info.coordinator, env), eRecover, (caller = this, reqId = nextReqId, tx = best);
   }
 
+  // canSweepLocally: a router and a target that imports do not own complete lock state, so the stale
+  // job does not run there.
+  fun CanSweepLocally(): bool {
+    return !IsRouter() && !Importing();
+  }
+
   // The deadline of the job: the earliest next_recovery_at of an unguarded transaction.
   fun HasDeadline(): bool {
     var info: tPendingTxInfo;
     foreach (info in values(durable.pendingTx)) {
-      if (!info.guarded) {
+      if (CanSweepLocally() && !info.guarded) {
         return true;
       }
     }
@@ -517,17 +1115,20 @@ machine Partition {
   fun IsDue(): bool {
     var info: tPendingTxInfo;
     foreach (info in values(durable.pendingTx)) {
-      if (!info.guarded && info.nextRecoveryAt <= now) {
+      if (CanSweepLocally() && !info.guarded && info.nextRecoveryAt <= now) {
         return true;
       }
     }
     return false;
   }
 
-  // The runtime arms the alarm at the deadline of the job, and clears it when no deadline is left.
+  // The runtime arms the alarm at the earliest deadline of its jobs, and clears it when no deadline is
+  // left. The source_repartition job has a deadline from `queued` until `cleaned`, and the import job
+  // until `active`.
   fun UpdateAlarm() {
     var armed: bool;
-    armed = HasDeadline();
+    armed = HasDeadline() || (durable.split != NOT_SOURCE && durable.split != SPLIT_CLEANED)
+      || (durable.importState != NOT_TARGET && durable.importState != ACTIVE);
     if (armed != durable.alarmArmed) {
       durable.alarmArmed = armed;
       send clock, eArmed, (who = this, armed = armed);

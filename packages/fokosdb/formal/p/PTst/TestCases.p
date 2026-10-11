@@ -1,7 +1,9 @@
 module FokosDB = { Client, Coordinator, Partition, RpcCall, Environment, Operator };
 
 // A test case named tcBug<Defect> must fail with the monitor of its seeded defect. Every other test
-// case must pass. Each test case checks every monitor, except where a comment says otherwise.
+// case must pass. Each test case checks every monitor, except where a comment says otherwise. Only a
+// test case with a split checks the monitors of a split: Authority, CopiesUntouched, Retention, and
+// SplitCompletes.
 
 test tcItems [main = TestItems]:
   assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
@@ -116,3 +118,37 @@ test tcBugReadIgnoresMaxDeletedV [main = TestBugReadIgnoresMaxDeletedV]:
 test tcBugReusedVersionRead [main = TestBugReusedVersionRead]:
   assert Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
     LocksResolve, ClientAnswered, TransactionsComplete in (union FokosDB, { TestBugReusedVersionRead });
+
+test tcSplitWrites [main = TestSplitWrites]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestSplitWrites });
+test tcSplitReads [main = TestSplitReads]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestSplitReads });
+test tcSplitFaults [main = TestSplitFaults]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestSplitFaults });
+test tcSplitSingleOwner [main = TestSplitSingleOwner]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestSplitSingleOwner });
+test tcForwardRestart [main = TestForwardRestart]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestForwardRestart });
+// The child also loses max_delete_tx_order_ts, so a put of a key with no earlier value can commit at
+// a timestamp at or below an earlier delete, and WriteSerializable then fails first. The test case
+// leaves that monitor out, so that it shows that VersionIncreases finds the repeated v.
+test tcBugChildSkipsDeletionMetadata [main = TestBugChildSkipsDeletionMetadata]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestBugChildSkipsDeletionMetadata });
+test tcBugImportingChildServesPrepare [main = TestBugImportingChildServesPrepare]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestBugImportingChildServesPrepare });
+test tcBugRouterServesGetItem [main = TestBugRouterServesGetItem]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestBugRouterServesGetItem });
+test tcBugImportSkipsPendingTx [main = TestBugImportSkipsPendingTx]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestBugImportSkipsPendingTx });
+test tcBugRouterDeletesCopiesAtCutover [main = TestBugRouterDeletesCopiesAtCutover]:
+  assert VersionIncreases, Atomicity, AnswerMatchesDecision, LockExclusion, ReadAfterCommit, SingleApply, WriteSerializable, CommittedNeverQuarantined, ReadSerializable,
+    Authority, CopiesUntouched, Retention, LocksResolve, ClientAnswered, TransactionsComplete, SplitCompletes in (union FokosDB, { TestBugRouterDeletesCopiesAtCutover });
