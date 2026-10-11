@@ -26,16 +26,21 @@ type tItemRow = (v: int, value: tValue, lastReadTs: int, lastWriteTs: int);
 //     max_delete_tx_order_ts.
 //   quarantineStampedChecks: the stale job quarantines an over-age not_found lock also when it holds
 //     only checks whose stamps already cover the transaction.
+//   readSkipsPhaseTwo: the two-phase path of transactGetItems returns the result of phase 1.
+//   readIgnoresPendingWrite: the two-phase path ignores hasPendingWrite.
+//   readIgnoresMaxDeletedV: the two-phase path does not compare maxDeletedV for an absent item.
 type tBugs = (newRowVersionFromOne: bool, commitOnOneAccept: bool, putIgnoresLock: bool, committedBeforeApply: bool,
               tokenRowIgnored: bool, staleCancelsOnDriving: bool, cancelInAnyState: bool, noPreparingHold: bool,
               prepareSkipsWatermark: bool, singleShotIgnoresLock: bool, newRowTsFromOwnStamp: bool,
-              absentCheckKeepsNoStamp: bool, quarantineStampedChecks: bool);
+              absentCheckKeepsNoStamp: bool, quarantineStampedChecks: bool, readSkipsPhaseTwo: bool,
+              readIgnoresPendingWrite: bool, readIgnoresMaxDeletedV: bool);
 
 fun NoBugs(): tBugs {
   return (newRowVersionFromOne = false, commitOnOneAccept = false, putIgnoresLock = false, committedBeforeApply = false,
           tokenRowIgnored = false, staleCancelsOnDriving = false, cancelInAnyState = false, noPreparingHold = false,
           prepareSkipsWatermark = false, singleShotIgnoresLock = false, newRowTsFromOwnStamp = false,
-          absentCheckKeepsNoStamp = false, quarantineStampedChecks = false);
+          absentCheckKeepsNoStamp = false, quarantineStampedChecks = false, readSkipsPhaseTwo = false,
+          readIgnoresPendingWrite = false, readIgnoresMaxDeletedV = false);
 }
 
 // The clock of a Durable Object, as transaction order timestamps read it (txOrderTimestampNow). A
@@ -108,6 +113,9 @@ fun PREPARE_MAX_ATTEMPTS(): int { return 3; }
 fun PREPARE_RECOVERY_MAX_ATTEMPTS(): int { return 5; }
 fun FANOUT_MAX_ATTEMPTS(): int { return 3; }
 
+// The attempts of one read call of transactGetItems: maxAttempts of the default retry options.
+fun READ_MAX_ATTEMPTS(): int { return 5; }
+
 // The single-item RPCs of PartitionDO. `caller` is the machine that gets the answer. `locked` is
 // the error item_locked_by_transaction.
 type tPutItemReq = (caller: machine, reqId: int, key: tKey, value: tValue);
@@ -164,6 +172,19 @@ type tSingleShotResp = (reqId: int, committed: bool);
 
 event eExecuteSingleShot: tSingleShotReq;
 event eExecuteSingleShotResp: tSingleShotResp;
+
+// txReadForTransaction and txReadSnapshot, and their answers: one item for each requested key.
+// `maxDeletedV` is the max_deleted_v of the partition. `aborted` is the snapshot outcome for a
+// pending write, and its answer then holds no item.
+type tReadReq = (caller: machine, reqId: int, readKeys: seq[tKey]);
+type tReadItem = (key: tKey, found: bool, value: tValue, version: int, maxDeletedV: int, hasPendingWrite: bool);
+type tReadForTransactionResp = (reqId: int, partition: machine, items: seq[tReadItem]);
+type tReadSnapshotResp = (reqId: int, aborted: bool, items: seq[tReadItem]);
+
+event eReadForTransaction: tReadReq;
+event eReadForTransactionResp: tReadForTransactionResp;
+event eReadSnapshot: tReadReq;
+event eReadSnapshotResp: tReadSnapshotResp;
 
 // recoverTransactionForParticipant and its answer.
 enum tRecoverState { RECOVER_COMMITTED, RECOVER_CANCELLED, RECOVER_NOT_FOUND, RECOVER_DRIVING }
@@ -260,9 +281,11 @@ event eTxCompleted: tTxCompleted;
 type tClientAnswer = (client: machine, tx: int, answer: tWriteAnswer);
 event eClientAnswer: tClientAnswer;
 
-// A client sent a getItem, and got its result.
-type tReadStart = (client: machine, reqId: int, key: tKey);
-type tReadResult = (client: machine, reqId: int, key: tKey, found: bool, value: tValue);
+// A client sent a getItem or a transactGetItems, and got its result. `transaction` is true for a
+// transactGetItems. A read that ends with an error has no result.
+type tReadStart = (client: machine, reqId: int, transaction: bool);
+type tReadValue = (key: tKey, found: bool, value: tValue);
+type tReadResult = (client: machine, reqId: int, transaction: bool, results: seq[tReadValue]);
 event eReadStart: tReadStart;
 event eReadResult: tReadResult;
 

@@ -30,12 +30,14 @@ spec AnswerMatchesDecision observes eDecision, eTxCompleted, eClientAnswer {
 type tKeyWrite = (tx: int, deleted: bool, value: tValue);
 
 // A read that starts after the client got committed for a transaction returns, for each key that
-// the transaction put or deleted, the value of that transaction or of a later writer.
+// the transaction put or deleted, the value of that transaction or of a later writer. A read is a
+// getItem or a transactGetItems.
 spec ReadAfterCommit observes eDecision, eItemWritten, eClientAnswer, eReadStart, eReadResult {
   var txKeys: map[int, set[tKey]];
   var history: map[tKey, seq[tKeyWrite]];
   var committedAnswers: set[int];
-  // The committed transactions that each read must see, by the client and the request of the read.
+  // The transactions that answered committed before each read started, by the client and the
+  // request of the read.
   var mustSee: map[(client: machine, reqId: int), set[int]];
 
   start state Watching {
@@ -57,45 +59,47 @@ spec ReadAfterCommit observes eDecision, eItemWritten, eClientAnswer, eReadStart
     }
 
     on eReadStart do (r: tReadStart) {
-      var tx: int;
-      var txs: set[int];
-      foreach (tx in committedAnswers) {
-        if (r.key in txKeys[tx]) {
-          txs += (tx);
-        }
-      }
-      mustSee[(client = r.client, reqId = r.reqId)] = txs;
+      mustSee[(client = r.client, reqId = r.reqId)] = committedAnswers;
     }
 
     on eReadResult do (r: tReadResult) {
       var tx: int;
-      var writes: seq[tKeyWrite];
-      var i: int;
-      var at: int;
-      var seen: bool;
-      if (r.key in history) {
-        writes = history[r.key];
-      }
-      foreach (tx in mustSee[(client = r.client, reqId = r.reqId)]) {
-        at = -1;
-        i = 0;
-        while (i < sizeof(writes)) {
-          if (writes[i].tx == tx) {
-            at = i;
+      var result: tReadValue;
+      foreach (result in r.results) {
+        foreach (tx in mustSee[(client = r.client, reqId = r.reqId)]) {
+          if (result.key in txKeys[tx]) {
+            CheckSeen(result, tx);
           }
-          i = i + 1;
         }
-        assert at >= 0, format("a read of key {0} started after transaction {1} answered committed, but the transaction has not applied the key", r.key, tx);
-        seen = false;
-        i = at;
-        while (i < sizeof(writes)) {
-          if ((r.found && !writes[i].deleted && writes[i].value == r.value) || (!r.found && writes[i].deleted)) {
-            seen = true;
-          }
-          i = i + 1;
-        }
-        assert seen, format("a read of key {0} returned (found {1}, value {2}), which is older than the write of committed transaction {3}", r.key, r.found, r.value, tx);
       }
     }
+  }
+
+  fun CheckSeen(r: tReadValue, tx: int) {
+    var writes: seq[tKeyWrite];
+    var i: int;
+    var at: int;
+    var seen: bool;
+    if (r.key in history) {
+      writes = history[r.key];
+    }
+    at = -1;
+    i = 0;
+    while (i < sizeof(writes)) {
+      if (writes[i].tx == tx) {
+        at = i;
+      }
+      i = i + 1;
+    }
+    assert at >= 0, format("a read of key {0} started after transaction {1} answered committed, but the transaction has not applied the key", r.key, tx);
+    seen = false;
+    i = at;
+    while (i < sizeof(writes)) {
+      if ((r.found && !writes[i].deleted && writes[i].value == r.value) || (!r.found && writes[i].deleted)) {
+        seen = true;
+      }
+      i = i + 1;
+    }
+    assert seen, format("a read of key {0} returned (found {1}, value {2}), which is older than the write of committed transaction {3}", r.key, r.found, r.value, tx);
   }
 }

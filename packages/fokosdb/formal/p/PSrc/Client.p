@@ -1,18 +1,23 @@
-enum tClientOpKind { PUT_ITEM, DELETE_ITEM, GET_ITEM, TRANSACT_WRITE }
+enum tClientOpKind { PUT_ITEM, DELETE_ITEM, GET_ITEM, TRANSACT_WRITE, TRANSACT_GET }
 
 // One call of the caller. `key` and `value` belong to a single-item call. `token` and `items` belong
 // to transactWriteItems, and token 0 is a call with no token. After an error,
 // transaction_commit_pending, or transaction_undecided, the caller sends the same token again, up to
 // `retries` times. With `replay`, it sends the same token one more time after the final answer.
-type tClientOp = (kind: tClientOpKind, key: tKey, value: tValue, token: int, items: seq[tTxOp], retries: int, replay: bool);
+// `readKeys` belong to transactGetItems.
+type tClientOp = (kind: tClientOpKind, key: tKey, value: tValue, token: int, items: seq[tTxOp], retries: int, replay: bool,
+                  readKeys: seq[tKey]);
 
-type tClientConfig = (topology: tTopology, coordinator: machine, env: machine, ops: seq[tClientOp]);
+type tClientConfig = (bugs: tBugs, topology: tTopology, coordinator: machine, env: machine, ops: seq[tClientOp]);
 
 // FokosDB in the Worker, and the caller that uses it. It sends each single-item call to the root
 // partition of the key. A transactWriteItems with no token whose keys are all on one root goes to
-// that partition (#writeSingleShotFastPath), and every other one to the coordinator. It sends the
-// next call after the answer.
+// that partition (#writeSingleShotFastPath), and every other one to the coordinator. A
+// transactGetItems whose keys are all on one root goes to that partition (#readSnapshotFastPath),
+// and every other one runs the two-phase path (#readTransaction). It sends the next call after the
+// answer.
 machine Client {
+  var bugs: tBugs;
   var topology: tTopology;
   var coordinator: machine;
   var env: machine;
@@ -20,9 +25,20 @@ machine Client {
   var next: int;
   var retried: int;
   var replayed: bool;
+  // The read in progress: the keys of each root partition, the path, the phase, the attempts of the
+  // call to each root, the answers of the phase, the calls of the phase that used up their attempts,
+  // and the result of phase 1.
+  var groups: map[machine, seq[tKey]];
+  var snapshot: bool;
+  var phase: int;
+  var attempts: map[machine, int];
+  var replies: map[machine, seq[tReadItem]];
+  var failedCalls: int;
+  var phase1: map[tKey, tReadItem];
 
   start state Init {
     entry (cfg: tClientConfig) {
+      bugs = cfg.bugs;
       topology = cfg.topology;
       coordinator = cfg.coordinator;
       env = cfg.env;
@@ -44,7 +60,9 @@ machine Client {
     on ePutItemResp do (resp: tPutItemResp) { Answered(resp.reqId); }
     on eDeleteItemResp do (resp: tDeleteItemResp) { Answered(resp.reqId); }
     on eGetItemResp do (resp: tGetItemResp) {
-      announce eReadResult, (client = this, reqId = resp.reqId, key = ops[resp.reqId].key, found = resp.found, value = resp.value);
+      var readValues: seq[tReadValue];
+      readValues += (0, (key = ops[resp.reqId].key, found = resp.found, value = resp.value));
+      announce eReadResult, (client = this, reqId = resp.reqId, transaction = false, results = readValues);
       Answered(resp.reqId);
     }
     on eExecuteSingleShotResp do (resp: tSingleShotResp) { Answered(resp.reqId); }
@@ -60,8 +78,29 @@ machine Client {
         Next();
       }
     }
-    // The single-partition path does not retry: the outcome of a failed call is unknown.
+
+    // The snapshot path: the outcome aborted is the pending-write error.
+    on eReadSnapshotResp do (resp: tReadSnapshotResp) {
+      assert resp.reqId == next, format("client got the answer of read {0} while it waits for call {1}", resp.reqId, next);
+      if (resp.aborted) {
+        ReadFailed();
+        return;
+      }
+      ReadDone(resp.items);
+    }
+    on eReadForTransactionResp do (resp: tReadForTransactionResp) {
+      assert resp.reqId == next, format("client got the answer of read {0} while it waits for call {1}", resp.reqId, next);
+      replies[resp.partition] = resp.items;
+      PhaseCallSettled();
+    }
+
+    // The single-partition path does not retry: the outcome of a failed call is unknown. A read
+    // applies nothing, so each read call sends again.
     on eRpcFailed do (f: tRpcFailed) {
+      if (ops[next].kind == TRANSACT_GET) {
+        ReadCallFailed(f.target);
+        return;
+      }
       announce eCallEnded, (client = this, reqId = f.reqId);
       if (ops[next].kind == TRANSACT_WRITE && ops[next].token != 0) {
         RetryOrNext();
@@ -84,8 +123,10 @@ machine Client {
     } else if (op.kind == DELETE_ITEM) {
       send NewRpc(this, RootOf(topology, op.key), env), eDeleteItem, (caller = this, reqId = next, key = op.key);
     } else if (op.kind == GET_ITEM) {
-      announce eReadStart, (client = this, reqId = next, key = op.key);
+      announce eReadStart, (client = this, reqId = next, transaction = false);
       send NewRpc(this, RootOf(topology, op.key), env), eGetItem, (caller = this, reqId = next, key = op.key);
+    } else if (op.kind == TRANSACT_GET) {
+      StartRead(op);
     } else {
       foreach (txOp in op.items) {
         roots += (RootOf(topology, txOp.key));
@@ -97,6 +138,135 @@ machine Client {
       assert op.token != 0, "the test driver gives each transaction of the coordinator path a token";
       send NewRpc(this, coordinator, env), eInitiateWrite, (caller = this, reqId = next, token = op.token, items = op.items);
     }
+  }
+
+  // #transactGetItems: groups the keys by root partition. One group takes the snapshot path, and
+  // more groups take the two-phase path.
+  fun StartRead(op: tClientOp) {
+    var key: tKey;
+    var root: machine;
+    groups = default(map[machine, seq[tKey]]);
+    foreach (key in op.readKeys) {
+      root = RootOf(topology, key);
+      if (!(root in groups)) {
+        groups[root] = default(seq[tKey]);
+      }
+      groups[root] += (sizeof(groups[root]), key);
+    }
+    announce eReadStart, (client = this, reqId = next, transaction = true);
+    snapshot = sizeof(groups) == 1;
+    phase = 1;
+    StartPhase();
+  }
+
+  // One read phase: one call to each group at the same time (Promise.allSettled).
+  fun StartPhase() {
+    var root: machine;
+    replies = default(map[machine, seq[tReadItem]]);
+    failedCalls = 0;
+    foreach (root in keys(groups)) {
+      attempts[root] = 1;
+      SendRead(root);
+    }
+  }
+
+  fun SendRead(root: machine) {
+    if (snapshot) {
+      send NewRpc(this, root, env), eReadSnapshot, (caller = this, reqId = next, readKeys = groups[root]);
+    } else {
+      send NewRpc(this, root, env), eReadForTransaction, (caller = this, reqId = next, readKeys = groups[root]);
+    }
+  }
+
+  // The retry policy of a read call: up to READ_MAX_ATTEMPTS attempts. A lost call and a restart are
+  // transient faults of the runtime, so the snapshot path sends again too. When the last attempt
+  // fails, the read throws that error after the other calls of the phase settled.
+  fun ReadCallFailed(target: machine) {
+    if (attempts[target] < READ_MAX_ATTEMPTS()) {
+      attempts[target] = attempts[target] + 1;
+      SendRead(target);
+      return;
+    }
+    if (snapshot) {
+      ReadFailed();
+      return;
+    }
+    failedCalls = failedCalls + 1;
+    PhaseCallSettled();
+  }
+
+  // The end of a phase of the two-phase path, when every call settled. A pending write in either
+  // phase gives the pending-write error. After phase 2, each key compares the two phases: found
+  // must match, a found item compares version, and an absent item compares maxDeletedV. A
+  // difference gives read_conflict. The result is the result of phase 1.
+  fun PhaseCallSettled() {
+    var root: machine;
+    var item: tReadItem;
+    var items: seq[tReadItem];
+    if (sizeof(replies) + failedCalls < sizeof(groups)) {
+      return;
+    }
+    if (failedCalls > 0) {
+      ReadFailed();
+      return;
+    }
+    foreach (root in keys(groups)) {
+      foreach (item in replies[root]) {
+        if (item.hasPendingWrite && !bugs.readIgnoresPendingWrite) {
+          ReadFailed();
+          return;
+        }
+        items += (sizeof(items), item);
+      }
+    }
+    if (phase == 1) {
+      phase1 = default(map[tKey, tReadItem]);
+      foreach (item in items) {
+        phase1[item.key] = item;
+      }
+      if (bugs.readSkipsPhaseTwo) {
+        ReadDone(items);
+        return;
+      }
+      phase = 2;
+      StartPhase();
+      return;
+    }
+    foreach (item in items) {
+      if (!SameCommittedState(phase1[item.key], item)) {
+        ReadFailed();
+        return;
+      }
+    }
+    ReadDone(values(phase1));
+  }
+
+  fun SameCommittedState(a: tReadItem, b: tReadItem): bool {
+    if (a.found != b.found) {
+      return false;
+    }
+    if (a.found) {
+      return a.version == b.version;
+    }
+    return a.maxDeletedV == b.maxDeletedV || bugs.readIgnoresMaxDeletedV;
+  }
+
+  fun ReadDone(items: seq[tReadItem]) {
+    var item: tReadItem;
+    var readValues: seq[tReadValue];
+    foreach (item in items) {
+      readValues += (sizeof(readValues), (key = item.key, found = item.found, value = item.value));
+    }
+    announce eReadResult, (client = this, reqId = next, transaction = true, results = readValues);
+    announce eCallEnded, (client = this, reqId = next);
+    Next();
+  }
+
+  // The read ends with an error: the pending-write error, read_conflict, or the error of a call
+  // that used up its attempts.
+  fun ReadFailed() {
+    announce eCallEnded, (client = this, reqId = next);
+    Next();
   }
 
   fun RetryOrNext() {

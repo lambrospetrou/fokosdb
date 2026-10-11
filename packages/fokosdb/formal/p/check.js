@@ -26,7 +26,8 @@ Options:
   -j, --jobs <n>  Run <n> test cases at the same time. The default is JOBS, else 2. Each run is slower
                   when more runs share the CPU.
   --schedules <n> The number of schedules of the random checker. The default is SCHEDULES, else
-                  1000. The random checker stops at the first bug.
+                  1000. A test case in TEST_SCHEDULES runs at least its own number. The random
+                  checker stops at the first bug.
   --both-strategies
                   Run each test case that must report no bug twice: with the random strategy and with
                   fair PCT (--sch-fairpct 10). Each tcBug<Defect> test case runs once, with its own
@@ -73,6 +74,10 @@ const EXPECTED_MONITOR = {
 	tcBugNewRowTsFromOwnStamp: "WriteSerializable",
 	tcBugAbsentCheckKeepsNoStamp: "WriteSerializable",
 	tcBugQuarantineStampedChecks: "CommittedNeverQuarantined",
+	tcBugReadSkipsPhaseTwo: "ReadSerializable",
+	tcBugReadIgnoresPendingWrite: "ReadSerializable",
+	tcBugReadIgnoresMaxDeletedV: "ReadSerializable",
+	tcBugReusedVersionRead: "ReadSerializable",
 };
 
 // The two search strategies of the random checker. RANDOM is the default of `p check`.
@@ -92,6 +97,20 @@ const TEST_STRATEGY = {
 	tcLateCheck: FAIR_PCT,
 	tcBugQuarantineStampedChecks: FAIR_PCT,
 	tcBugAbsentCheckKeepsNoStamp: FAIR_PCT,
+	tcReadHappy: FAIR_PCT,
+	tcReadVsWrites: FAIR_PCT,
+	tcReadFaults: FAIR_PCT,
+	tcSnapshot: FAIR_PCT,
+	tcBugReadSkipsPhaseTwo: FAIR_PCT,
+	tcBugReadIgnoresPendingWrite: FAIR_PCT,
+	tcBugReadIgnoresMaxDeletedV: FAIR_PCT,
+	tcBugReusedVersionRead: FAIR_PCT,
+};
+
+// The least number of schedules of the random checker for a test case whose defect needs more
+// schedules than the default. The checker stops at the first bug, so a found defect costs no more.
+const TEST_SCHEDULES = {
+	tcBugReadIgnoresMaxDeletedV: 5000,
 };
 
 // The `p check` options that the script sets itself.
@@ -167,11 +186,12 @@ function violatedMonitor(line) {
  * Runs one test case and resolves to its output line and whether it gave the expected result.
  * `options` go to `p check`, and the output line shows `shown`.
  */
-async function runTestCase({ tc, outdir, options, shown }, { mode, schedules, pexTimeout }) {
+async function runTestCase({ tc, outdir, options, shown }, { mode, pexTimeout, ...settings }) {
 	const log = `${outdir}/check.log`;
 	rmSync(outdir, { recursive: true, force: true });
 	mkdirSync(outdir, { recursive: true });
 	const pex = mode === "pex";
+	const schedules = String(Math.max(Number(settings.schedules), TEST_SCHEDULES[tc] ?? 0));
 	const args = pex
 		? ["check", "--mode", "pex", "-tc", tc, "-t", pexTimeout, "-o", outdir, ...options]
 		: ["check", "-tc", tc, "-s", schedules, "-o", outdir, ...options];

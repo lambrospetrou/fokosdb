@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-09
 **Author:** Lambros Petrou
-**Status:** M0, M1, and M2 are complete. M3 is in review. M4 to M7 are not started.
+**Status:** M0 to M4 are complete. M5 to M7 are not started.
 
 ## Table of contents
 
@@ -297,8 +297,8 @@ that each milestone builds.
 | M0 | Toolchain, one partition, single-item operations | machine, event, `send`, test case, trace replay | `VersionIncreases` | V1 | Done |
 | M1 | `transactWriteItems` on a fixed topology, one drive, no faults | spec monitor, `announce` | `Atomicity`, `AnswerMatchesDecision`, `LockExclusion`, `ReadAfterCommit` | W1–W3 | Done |
 | M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 | Done |
-| M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 | In review |
-| M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 | Not started |
+| M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 | Done |
+| M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 | Done |
 | M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 | Not started |
 | M6 | Key promotion with lock copies | — | `PromotionCompletes` | P1–P7 | Not started |
 | M7 | Coordinator split (optional) | — | — | C1 | Not started |
@@ -386,7 +386,7 @@ that each milestone builds.
     `partition_over_size`, the time budgets of a step, `recoveryConcurrentDrives`, and `staleLockScanRows`. The step
     of `tx_recovery` claims every due transaction, and a test case has at most two.
 
-### 3.4 M3 — Timestamps and the single-partition path
+### 3.4 M3 — Timestamps and the single-partition path (done)
 
 - **Scope.** A clock for each Durable Object with bounded skew. The timestamp rules of section 1.3.3, `clock_skew`,
   `check` operations, deletes and recreates, and `txExecuteSingleShot`.
@@ -465,13 +465,52 @@ that each milestone builds.
       probe, and `tcBugQuarantineStampedChecks` keeps the old quarantine as a defect. The vitest regression tests are
       in `packages/fokosdb/test/partition-do/tx-stale-recovery.test.ts`.
 
-### 3.5 M4 — Read transactions
+### 3.5 M4 — Read transactions (done)
 
 - **Scope.** `txReadSnapshot`, the two-phase path, `hasPendingWrite`, the `version` comparison, and the `maxDeletedV`
   comparison. The `getItem` part of `ReadAfterCommit` extends to `transactGetItems`.
-- **Test cases.** `tcReadHappy`, `tcReadVsWrites`, `tcReadFaults`, `tcSnapshot`, the test cases of R1 to R3, and
-  `tcReadVsWrites` with V1.
+- **Test cases.** `tcReadHappy`, `tcReadVsWrites`, `tcReadFaults`, `tcSnapshot`, `tcBugReadSkipsPhaseTwo`,
+  `tcBugReadIgnoresPendingWrite`, `tcBugReadIgnoresMaxDeletedV`, `tcBugReusedVersionRead`.
 - **Delivers.** A check that a read transaction returns a state of some serial order of the committed writes.
+- **Result.** Every test case gives its expected result, and every test case of M0 to M3 still gives its expected
+  result. Section 4.2.13 gives the measurements. The model makes these decisions:
+  - **Client.** One group of keys takes the snapshot path, and more groups take the two-phase path. Each phase sends
+    one call to each group at the same time, and waits until every call settled (`Promise.allSettled`). Each call
+    has up to 5 attempts (`maxAttempts`). The snapshot path also retries a lost call and a restart, because Workers
+    RPC marks them as transient faults of the runtime. `not_applicable` cannot occur before M5, because each root
+    owns every key of its hash keys.
+  - **`ReadSerializable`.** A writer is a write transaction with the decision commit, a single-partition
+    transaction, or a single-item write. A key that a writer with the decision commit did not apply yet comes after
+    every applied write of the key, and no read value matches it. Without this rule, a read that sees one key of a
+    partly applied transaction and the old value of its other key passes, and R2 cannot fail. A single-item write
+    and a single-partition transaction carry no transaction id, so each of their writes counts as one writer. For a
+    single-partition transaction, the monitor then accepts more orders than the code gives. The monitor checks only
+    `transactGetItems`: a seeded write defect in a test case with a `getItem` would otherwise fail with
+    `ReadSerializable`, and not with its own monitor.
+  - **`ReadAfterCommit`** checks each key of a `transactGetItems` result as it checks a `getItem`.
+  - **Monitor events.** `eReadStart` and `eReadResult` carry a `transaction` flag, and `eReadResult` carries one value
+    for each key. A read that ends with an error announces no result.
+  - **Clients.** `tcReadVsWrites` and `tcReadFaults` run W1, W2, and R1 in three clients, so R1 can start before W1,
+    and W2 can come before W1. R1 and R2 use the same clients. `tcSnapshot` runs R1, T1, and T2 in three clients.
+  - **R3** (`tcBugReadIgnoresMaxDeletedV`). The order of Appendix A needs two long delays: phase 1 on `B` waits for
+    all of W1, and phase 2 on `A` waits for the prepare of W2 and its commit on `A`. With the clients of
+    `tcReadVsWrites`, fair PCT found the order in 1 of 3 runs of 3000 schedules. The test case therefore runs W1 and
+    then W2 in one client, and R1 in each of three more clients. It found the order in 7 of 7 runs, at schedules 177
+    to 1236. `TEST_SCHEDULES` in `check.js` gives it at least 5000 schedules.
+  - **V1 in a read** (`tcBugReusedVersionRead`). V1 changes a `v` only when a key gets a row again after a delete,
+    so it has no effect in `tcReadVsWrites`. The test case adds W3, which creates `a1` again. Client 1 runs a
+    single-item put W1 of `a1`, then R1 reads `a1` and `b2`. Client 2 runs W2 (a delete of `a1` and a put of `b2`),
+    then a single-item put W3 of `a1`. With V1, the row of W3 gets the `v` of the row of W1, and R1 can return `a1`
+    of W1 with `b2` of W2. The test case does not check `VersionIncreases`, because that monitor fails first at the
+    put of W3. Earlier setups were slower: with W3 as a transaction, fair PCT found nothing in 3000 schedules, and
+    with W1 as a transaction it needed 682 to 2414. This setup needed 110 to 187.
+  - **Search strategy.** Every test case of M4 runs with `--sch-fairpct 10`. The random strategy found none of the
+    four defects in 300 schedules, and it did not reach four of the probes below in 3000 schedules.
+  - **Probes.** A temporary assertion in the client confirmed these orders with fair PCT in 3000 schedules: a
+    pending write in phase 2 of `tcReadVsWrites` (schedule 5), a read that sees W1 and W2 (1), `read_conflict` from
+    `maxDeletedV` (539), a read of `tcReadFaults` that sent a call again and then returned (66), the snapshot outcome
+    `aborted` in `tcSnapshot` (6), and a snapshot that sees T1 and then T2 (335).
+  - **Not in the model.** Projections, `ttlAt`, and `not_applicable` of the snapshot path (M5).
 
 ### 3.6 M5 — Hash split
 
@@ -557,8 +596,9 @@ packages/fokosdb/formal/p/
   so `Dockerfile` builds the local image `fokosdb-p:3.1.0`: `mcr.microsoft.com/dotnet/sdk:8.0`, OpenJDK 17, Maven,
   and the NuGet tool `P` at version 3.1.0. `check.js` pins the version and builds the image when it is missing. Only
   Docker is necessary on the machine.
-- `pnpm formal:p` compiles the model and runs every test case. `pnpm formal:p <test case>` runs one. `SCHEDULES`
-  sets the number of schedules of each test case (default 1000). The script fails when a `tcBug<Defect>` test case does
+- `pnpm formal:p` compiles the model and runs every test case. `pnpm formal:p <test case>` runs one. `--schedules`
+  or `SCHEDULES` sets the number of schedules of each test case (default 1000). A test case in `TEST_SCHEDULES` of
+  `check.js` runs at least its own number. The script fails when a `tcBug<Defect>` test case does
   not fail with the monitor of section 4.2.12, when another test case finds a bug, or when a name runs more than one
   test case: `p check -tc` runs every test case whose name starts with the given name.
 - The random checker stops at the first bug. For each test case, the output gives the number of schedules and of
@@ -774,7 +814,7 @@ These rules start in M5. Before M5, each root partition owns every key of its ha
 | `ReadAfterCommit` | M1 | A read that starts after the client got `committed` returns, for each key of that transaction, the value of that transaction or of a later writer. M4 extends it from `getItem` to `transactGetItems`. | `eClientAnswer`, `eReadStart`, `eReadResult` |
 | `SingleApply` | M2 | For each `clientRequestToken`, each key of its puts and deletes applies at most once, over all partitions, inside the idempotency window of the token. A `check` is not counted, because a second apply of it changes nothing (section 3.4). | `eDecision`, `eApplied`, `eTokenSwept` |
 | `WriteSerializable` | M3 | On each key, a committed write of a two-phase transaction has a timestamp above the stamp of every earlier committed read or write of the key. A committed `check` has a timestamp above the stamp of every earlier committed write. A single-item write and a single-partition transaction add their stamps, but the rule does not apply to them, because `MAX` absorbs a clock that lags. A `check` of an absent item also adds its stamp, because its commit raises `max_delete_tx_order_ts`. Thus the timestamp order is a serial order of the two-phase transactions. | `eStamped` |
-| `ReadSerializable` | M4 | The result of a read transaction equals the state after some prefix of some serial order of the writers. | `eItemWritten`, `eReadStart`, `eReadResult` |
+| `ReadSerializable` | M4 | The result of a read transaction equals the state after some prefix of some serial order of the writers. | `eDecision`, `eItemWritten`, `eClientAnswer`, `eReadStart`, `eReadResult` |
 | `Authority` | M5 | A lock, an apply, a release, or a guard of an owned row happens only on the current owner of the key, and never on an importing target. | `eLocalTxMutation`, `eOwnerChanged`, `eImportState` |
 | `CopiesUntouched` | M5 | No commit, cancel, quarantine, or repair deletes or changes a transfer copy. | `eCopyChanged` |
 | `Retention` | M5 | A source deletes a transfer copy only after it recorded the acknowledgement of the target. | `eCopyDeleted`, `eAckRecorded` |
@@ -786,9 +826,11 @@ transaction on that partition.
 **`ReadSerializable` in detail.** The monitor keeps, for each key, the list of writers in apply order. When a read
 ends, it lists every serial order of the writers that keeps the apply order of each key. For each order and each
 prefix, it computes the value of each read key. The read passes when one prefix gives the read result, and that
-prefix holds every writer whose client got `committed` before the read started. A test case has at most 4 writers,
-so the monitor checks at most 4! = 24 orders and 5 prefixes for each order. Appendix A gives an order that this
-monitor rejects.
+prefix holds every writer whose client got `committed` before the read started. A key that a writer with the
+decision commit did not apply yet comes after every applied write of the key, and its value matches no read result
+(`eDecision` gives the keys of each writer). The monitor searches the prefixes in depth, so it visits each prefix of
+each order one time. A test case has at most 4 writers, so the monitor checks at most 4! = 24 orders and 5 prefixes
+for each order. Appendix A gives an order that this monitor rejects.
 
 **Liveness monitors** (hot states). Each one holds when the environment stops the faults after its budget:
 
@@ -810,7 +852,7 @@ runs every test case whose name starts with the given name.
 
 | Id | From | Test case | Change | Monitor that must fail | Source of the rule |
 | --- | --- | --- | --- | --- | --- |
-| V1 | M0 | `tcBugNewRowVersionFromOne` | A new row starts at `v = 1`, not at `max_deleted_v + 1`. | `VersionIncreases`; in `tcReadVsWrites` also `ReadSerializable` | `docs/agent-plans/2026-10-03-max-deleted-version.md` |
+| V1 | M0 | `tcBugNewRowVersionFromOne`, `tcBugReusedVersionRead` (M4) | A new row starts at `v = 1`, not at `max_deleted_v + 1`. | `VersionIncreases`; `ReadSerializable` in `tcBugReusedVersionRead`, which does not check `VersionIncreases` | `docs/agent-plans/2026-10-03-max-deleted-version.md` |
 | W1 | M1 | `tcBugCommitOnOneAccept` | `drivePrepare` and `markCommitting` decide commit when one participant accepted. | `Atomicity` | 2PC |
 | W2 | M1 | `tcBugPutIgnoresLock` | `apiPutItem` ignores the lock. | `LockExclusion` | `AGENTS.md`, "A non-transactional write to a locked item is REFUSED" |
 | W3 | M1 | `tcBugCommittedBeforeApply` | `drivePrepare` answers `committed` after `markCommitting`, before `runCommit` ends. | `ReadAfterCommit` | `loadFinalResponse`: `committed` promises read-your-writes |
@@ -823,9 +865,9 @@ runs every test case whose name starts with the given name.
 | W10 | M3 | `tcBugNewRowTsFromOwnStamp` | A new row starts its timestamps at its own stamp, not at least `max_delete_tx_order_ts`. | `WriteSerializable` | section 1.3.3 |
 | W11 | M3 | `tcBugAbsentCheckKeepsNoStamp` | The commit of a `check` of an absent item does not raise `max_delete_tx_order_ts`. | `WriteSerializable` | `docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md` |
 | W12 | M3 | `tcBugQuarantineStampedChecks` | The stale job quarantines an over-age `not_found` lock also when it holds only checks whose stamps already cover the transaction. | `CommittedNeverQuarantined` | section 3.4, the finding |
-| R1 | M4 | — | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
-| R2 | M4 | — | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
-| R3 | M4 | — | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
+| R1 | M4 | `tcBugReadSkipsPhaseTwo` | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
+| R2 | M4 | `tcBugReadIgnoresPendingWrite` | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
+| R3 | M4 | `tcBugReadIgnoresMaxDeletedV` | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
 | S1 | M5 | — | A child does not merge the deletion metadata of the source. | `VersionIncreases`, `ReadSerializable` | section 1.3.6 |
 | S2 | M5 | — | An importing child serves `txPrepare`. | `Authority` | section 4.2.9, rule 2 |
 | S3 | M5 | — | A router serves `apiGetItem` from its own item rows. | `ReadAfterCommit` | section 1.3.6 |
@@ -866,9 +908,11 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcAbsentCheck` | client 1: T1 checks `a1` with `not_exists` and puts `b1`; client 2: T2 puts `a1` | 2 lost answers | pass |
 | `tcLateCheck` | a put of `a1`, then T1 checks `a1` with `exists` and puts `b1` | 2 lost answers; the coordinator drops `recoverTransactionForParticipant` until the sweep deleted the transaction | pass |
 | `tcReadHappy` | R1 reads `a1`, `b1` after T1 | none | pass |
-| `tcReadVsWrites` | W1 creates `a1`, puts `b1`; W2 deletes `a1`, puts `b2`; R1 reads `a1`, `b1`, `b2` | none | pass |
+| `tcReadVsWrites` | client 1: W1 creates `a1`, puts `b1`; client 2: W2 deletes `a1`, puts `b2`; client 3: R1 reads `a1`, `b1`, `b2` | none | pass |
 | `tcReadFaults` | as `tcReadVsWrites` | 2 restarts, 2 lost calls | pass |
-| `tcSnapshot` | R1 reads `b1`, `b2` on the snapshot path; T1 puts `b1`, `b2`; T2 puts `a1`, `b1` | none | pass |
+| `tcSnapshot` | client 1: R1 reads `b1`, `b2` on the snapshot path; client 2: T1 puts `b1`, `b2`; client 3: T2 puts `a1`, `b1` | none | pass |
+| `tcBugReadIgnoresMaxDeletedV` | client 1: W1 of `tcReadVsWrites`, then W2; clients 2 to 4: R1 of `tcReadVsWrites` | none | fail with `ReadSerializable` |
+| `tcBugReusedVersionRead` | client 1: a put of `a1` (W1), then R1 reads `a1`, `b2`; client 2: W2 deletes `a1`, puts `b2`, then a put of `a1` (W3) | none | fail with `ReadSerializable` |
 | `tcSplitWrites` | T1 puts `a1`, `b1`; T2 deletes `a1` and puts `c1`; T3 puts `a1` | the split of `A` | pass |
 | `tcSplitReads` | as `tcReadVsWrites` with `a1` and `c1` on `A` | the split of `A` | pass |
 | `tcSplitFaults` | as `tcSplitWrites` | the split of `A`, 2 restarts, 2 lost calls | pass |
@@ -915,9 +959,18 @@ the model of M1.
 | `tcBugNewRowTsFromOwnStamp` | M3 | 1000, fair PCT | 1 s | `WriteSerializable` fails in schedule 8; none in 1000 random schedules | not complete in 120 s |
 | `tcBugAbsentCheckKeepsNoStamp` | M3 | 1000, fair PCT | 1 s | `WriteSerializable` fails in schedule 7; with the random strategy, the schedule changes from 69 to more than 1000 with the seed | — |
 | `tcBugQuarantineStampedChecks` | M3 | 1000, fair PCT | 5 s | `CommittedNeverQuarantined` fails in schedule 187 | — |
+| `tcReadHappy` | M4 | 1000, fair PCT | 33 s | no bug; 286 timelines | — |
+| `tcReadVsWrites` | M4 | 1000, fair PCT | 47 s | no bug; 980 timelines | — |
+| `tcReadFaults` | M4 | 1000, fair PCT | 50 s | no bug; 995 timelines | — |
+| `tcSnapshot` | M4 | 1000, fair PCT | 38 s | no bug; 945 timelines | — |
+| `tcBugReadSkipsPhaseTwo` | M4 | 1000, fair PCT | 1 s | `ReadSerializable` fails in schedule 1 | — |
+| `tcBugReadIgnoresPendingWrite` | M4 | 1000, fair PCT | 6 s | `ReadSerializable` fails in schedule 87 | — |
+| `tcBugReadIgnoresMaxDeletedV` | M4 | 5000, fair PCT | 36 s | `ReadSerializable` fails in schedule 544; between 177 and 1236 in other runs | — |
+| `tcBugReusedVersionRead` | M4 | 1000, fair PCT | 6 s | `ReadSerializable` fails in schedule 110 | — |
 
-The run time is the wall time of `check.js` for one test case, Docker start included. The schedule of a defect is
-from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
+The run time is the wall time of `check.js` for one test case, Docker start included. The values of M4 are from a
+run of all 34 test cases with 4 jobs at the same time, so each one is slower than a run alone. The schedule of a
+defect is from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
 
 In M2, probes confirmed that `tcStale` and `tcRepair` reach a lock that a late prepare wrote after the cancel, the
 quarantine, and the repair after the quarantine (with fair PCT: 245, 397, and 474 schedules), and that the
@@ -957,10 +1010,11 @@ P does not run the TypeScript code. The model links to the code in two ways:
 
 #### 4.2.16 Cost
 
-The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M3, `pnpm formal:p`
-takes about 9 minutes for the 26 test cases. `pnpm formal:p --pex` stops each test case that it cannot complete at
-`PEX_TIMEOUT`, so run it on chosen test cases. The first run also builds the Docker image, which takes about 1
-minute. Section 4.2.13 records the run time of each test case.
+The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M4, the 34 test
+cases take about 13 minutes of run time in sum, and `pnpm formal:p` runs 2 of them at the same time by default.
+`pnpm formal:p --pex` stops each test case that it cannot complete at `PEX_TIMEOUT`, so run it on chosen test cases.
+The first run also builds the Docker image, which takes about 1 minute. Section 4.2.13 records the run time of each
+test case.
 
 #### 4.2.17 Testing
 
@@ -972,11 +1026,6 @@ The work is correct when:
 
 ## 5. Alternative options
 
-- **The Quint model of the coordinator** (`docs/ideas/2026-10-09-quint-model-of-the-transaction-coordinator.md`) for
-  the coordinator rules of section 4.2.7, concurrent drives included. It adds the ITF trace replay in vitest and
-  liveness under fairness in TLC. It is not chosen for now: this model checks the same rules in M1 and M2, and one
-  tool keeps one set of monitors. When the Quint model is built later, M2 drops `tcConcurrentDrives` and the defect
-  W6, and the coordinator of this model follows the rules that the Quint model checks.
 - **Quint with Choreo for the whole plan.** Choreo gives a fixed process set (`choreo(processes = NODES)`) and a
   message soup, in which a message stays in the set of its receiver and a transition reads the whole set. This gives
   every delivery order and every duplicate with no extra work, and Quint states a property over the whole state with

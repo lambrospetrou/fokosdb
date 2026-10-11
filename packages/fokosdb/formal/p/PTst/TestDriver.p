@@ -3,11 +3,18 @@ fun B1(): tKey { return (hk = "b", sk = "1"); }
 fun B2(): tKey { return (hk = "b", sk = "2"); }
 
 fun ItemOp(kind: tClientOpKind, key: tKey, value: tValue): tClientOp {
-  return (kind = kind, key = key, value = value, token = 0, items = default(seq[tTxOp]), retries = 0, replay = false);
+  return (kind = kind, key = key, value = value, token = 0, items = default(seq[tTxOp]), retries = 0, replay = false,
+          readKeys = default(seq[tKey]));
 }
 
 fun TxOp(token: int, items: seq[tTxOp]): tClientOp {
-  return (kind = TRANSACT_WRITE, key = default(tKey), value = 0, token = token, items = items, retries = 0, replay = false);
+  return (kind = TRANSACT_WRITE, key = default(tKey), value = 0, token = token, items = items, retries = 0, replay = false,
+          readKeys = default(seq[tKey]));
+}
+
+fun ReadOp(readKeys: seq[tKey]): tClientOp {
+  return (kind = TRANSACT_GET, key = default(tKey), value = 0, token = 0, items = default(seq[tTxOp]), retries = 0,
+          replay = false, readKeys = readKeys);
 }
 
 fun Put(key: tKey, condition: tCondition, value: tValue): tTxOp {
@@ -77,7 +84,7 @@ fun StartSystem(bugs: tBugs, faults: tFaults, scripts: seq[seq[tClientOp]]) {
     send operator, eOperatorSetup, (coordinator = coordinator, partitions = partitions, env = env);
   }
   foreach (script in scripts) {
-    new Client((topology = topology, coordinator = coordinator, env = env, ops = script));
+    new Client((bugs = bugs, topology = topology, coordinator = coordinator, env = env, ops = script));
   }
 }
 
@@ -254,6 +261,124 @@ fun RunSingleShot(bugs: tBugs) {
   StartSystem(bugs, FaultsSkew(), scripts);
 }
 
+// One client: T1 puts a1 and b1, then R1 reads a1 and b1 on the two-phase path.
+fun RunReadHappy(bugs: tBugs) {
+  var t1: seq[tTxOp];
+  var r1: seq[tKey];
+  var c1: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  t1 += (0, Put(A1(), NO_CONDITION, 11));
+  t1 += (1, Put(B1(), NO_CONDITION, 12));
+  r1 += (0, A1());
+  r1 += (1, B1());
+  c1 += (0, TxOp(1, t1));
+  c1 += (1, ReadOp(r1));
+  scripts += (0, c1);
+  StartSystem(bugs, NoFaults(), scripts);
+}
+
+// Client 1: W1 creates a1 and puts b1. Client 2: W2 deletes a1 and puts b2. Client 3: R1 reads a1,
+// b1, and b2 on the two-phase path.
+fun RunReadVsWrites(bugs: tBugs, faults: tFaults) {
+  var w: seq[tTxOp];
+  var r1: seq[tKey];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var c3: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  w += (0, Put(A1(), NO_CONDITION, 11));
+  w += (1, Put(B1(), NO_CONDITION, 12));
+  c1 += (0, TxOp(1, w));
+  w = default(seq[tTxOp]);
+  w += (0, Delete(A1()));
+  w += (1, Put(B2(), NO_CONDITION, 22));
+  c2 += (0, TxOp(2, w));
+  r1 += (0, A1());
+  r1 += (1, B1());
+  r1 += (2, B2());
+  c3 += (0, ReadOp(r1));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  scripts += (2, c3);
+  StartSystem(bugs, faults, scripts);
+}
+
+// The writers and the read of RunReadVsWrites, for the order of Appendix A of the RFC. That order
+// needs two long delays: phase 1 on B waits for all of W1, and phase 2 on A waits for the prepare of
+// W2 and its commit on A. Client 1 runs W1 and then W2, which drops the orders with W2 first, and
+// clients 2 to 4 each run R1, which gives three chances in one run.
+fun RunDeleteBetweenPhases(bugs: tBugs) {
+  var w: seq[tTxOp];
+  var r1: seq[tKey];
+  var c1: seq[tClientOp];
+  var reader: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  w += (0, Put(A1(), NO_CONDITION, 11));
+  w += (1, Put(B1(), NO_CONDITION, 12));
+  c1 += (0, TxOp(1, w));
+  w = default(seq[tTxOp]);
+  w += (0, Delete(A1()));
+  w += (1, Put(B2(), NO_CONDITION, 22));
+  c1 += (1, TxOp(2, w));
+  r1 += (0, A1());
+  r1 += (1, B1());
+  r1 += (2, B2());
+  reader += (0, ReadOp(r1));
+  scripts += (0, c1);
+  scripts += (1, reader);
+  scripts += (2, reader);
+  scripts += (3, reader);
+  StartSystem(bugs, NoFaults(), scripts);
+}
+
+// Client 1: a single-item put W1 creates a1, then R1 reads a1 and b2 on the two-phase path. Client
+// 2: W2 deletes a1 and puts b2, then a single-item put W3 creates a1 again. A defect that gives the
+// new row of W3 the v of the row of W1 hides the delete and the recreate from the comparison of the
+// two phases.
+fun RunReusedVersionRead(bugs: tBugs) {
+  var w: seq[tTxOp];
+  var r1: seq[tKey];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  r1 += (0, A1());
+  r1 += (1, B2());
+  c1 += (0, ItemOp(PUT_ITEM, A1(), 11));
+  c1 += (1, ReadOp(r1));
+  w += (0, Delete(A1()));
+  w += (1, Put(B2(), NO_CONDITION, 22));
+  c2 += (0, TxOp(2, w));
+  c2 += (1, ItemOp(PUT_ITEM, A1(), 31));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  StartSystem(bugs, NoFaults(), scripts);
+}
+
+// Client 1: R1 reads b1 and b2 on the snapshot path. Client 2: T1 puts b1 and b2. Client 3: T2 puts
+// a1 and b1.
+fun RunSnapshot(bugs: tBugs) {
+  var t: seq[tTxOp];
+  var r1: seq[tKey];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var c3: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  r1 += (0, B1());
+  r1 += (1, B2());
+  c1 += (0, ReadOp(r1));
+  t += (0, Put(B1(), NO_CONDITION, 11));
+  t += (1, Put(B2(), NO_CONDITION, 12));
+  c2 += (0, TxOp(1, t));
+  t = default(seq[tTxOp]);
+  t += (0, Put(A1(), NO_CONDITION, 21));
+  t += (1, Put(B1(), NO_CONDITION, 22));
+  c3 += (0, TxOp(2, t));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  scripts += (2, c3);
+  StartSystem(bugs, NoFaults(), scripts);
+}
+
 fun FaultsSkew(): tFaults {
   var f: tFaults;
   f = NoFaults();
@@ -314,6 +439,10 @@ machine TestClocks { start state Init { entry { RunClocks(NoBugs()); } } }
 machine TestSingleShot { start state Init { entry { RunSingleShot(NoBugs()); } } }
 machine TestAbsentCheck { start state Init { entry { RunAbsentCheck(NoBugs(), FaultsRetry()); } } }
 machine TestLateCheck { start state Init { entry { RunLateCheck(NoBugs()); } } }
+machine TestReadHappy { start state Init { entry { RunReadHappy(NoBugs()); } } }
+machine TestReadVsWrites { start state Init { entry { RunReadVsWrites(NoBugs(), NoFaults()); } } }
+machine TestReadFaults { start state Init { entry { RunReadVsWrites(NoBugs(), FaultsWrite()); } } }
+machine TestSnapshot { start state Init { entry { RunSnapshot(NoBugs()); } } }
 
 machine TestBugNewRowVersionFromOne {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowVersionFromOne = true; RunItems(b); } }
@@ -354,4 +483,20 @@ machine TestBugQuarantineStampedChecks {
 // The defect needs no fault: a prepare of T2 after T1 committed is enough.
 machine TestBugAbsentCheckKeepsNoStamp {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.absentCheckKeepsNoStamp = true; RunAbsentCheck(b, NoFaults()); } }
+}
+machine TestBugReadSkipsPhaseTwo {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.readSkipsPhaseTwo = true; RunReadVsWrites(b, NoFaults()); } }
+}
+machine TestBugReadIgnoresPendingWrite {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.readIgnoresPendingWrite = true; RunReadVsWrites(b, NoFaults()); } }
+}
+machine TestBugReadIgnoresMaxDeletedV {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.readIgnoresMaxDeletedV = true; RunDeleteBetweenPhases(b); } }
+}
+// The defect newRowVersionFromOne in a read transaction. W3 creates a1 again after the delete of W2,
+// and with the defect the new row has the v of the row of W1. Its name must not start with
+// tcBugNewRowVersionFromOne, because `p check -tc` runs every test case whose name starts with the
+// given name.
+machine TestBugReusedVersionRead {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowVersionFromOne = true; RunReusedVersionRead(b); } }
 }

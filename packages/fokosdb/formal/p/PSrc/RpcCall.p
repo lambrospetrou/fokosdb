@@ -91,6 +91,18 @@ machine RpcCall {
       r.caller = this;
       Deliver(r.reqId, eForceResolve, r);
     }
+    on eReadForTransaction do (req: tReadReq) {
+      var r: tReadReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eReadForTransaction, r);
+    }
+    on eReadSnapshot do (req: tReadReq) {
+      var r: tReadReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eReadSnapshot, r);
+    }
 
     on ePutItemResp do (resp: tPutItemResp) { send caller, ePutItemResp, resp; Close(); }
     on eDeleteItemResp do (resp: tDeleteItemResp) { send caller, eDeleteItemResp, resp; Close(); }
@@ -102,6 +114,8 @@ machine RpcCall {
     on eExecuteSingleShotResp do (resp: tSingleShotResp) { send caller, eExecuteSingleShotResp, resp; Close(); }
     on eRecoverResp do (resp: tRecoverResp) { send caller, eRecoverResp, resp; Close(); }
     on eForceResolveResp do (resp: tForceResolveResp) { send caller, eForceResolveResp, resp; Close(); }
+    on eReadForTransactionResp do (resp: tReadForTransactionResp) { send caller, eReadForTransactionResp, resp; Close(); }
+    on eReadSnapshotResp do (resp: tReadSnapshotResp) { send caller, eReadSnapshotResp, resp; Close(); }
 
     on eRpcBroken do {
       send caller, eRpcFailed, (reqId = reqId, target = target);
@@ -116,7 +130,8 @@ machine RpcCall {
       send target, lateEvent, latePayload;
     }
     on ePutItemResp, eDeleteItemResp, eGetItemResp, eInitiateWriteResp, eTxPrepareResp, eTxCommitResp,
-      eTxCancelResp, eExecuteSingleShotResp, eRecoverResp, eForceResolveResp, eRpcBroken goto Done;
+      eTxCancelResp, eExecuteSingleShotResp, eRecoverResp, eForceResolveResp, eReadForTransactionResp, eReadSnapshotResp,
+      eRpcBroken goto Done;
   }
 
   state Done {

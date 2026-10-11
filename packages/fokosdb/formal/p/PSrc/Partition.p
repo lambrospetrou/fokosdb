@@ -190,6 +190,26 @@ machine Partition {
       send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, committed = true);
     }
 
+    // txReadForTransaction: readForTransactionLocal reads every key in one block and writes nothing.
+    on eReadForTransaction do (req: tReadReq) {
+      send req.caller, eReadForTransactionResp, (reqId = req.reqId, partition = this, items = ReadLocal(req.readKeys));
+    }
+
+    // txReadSnapshot: the same read in one block. A pending write on any key gives the outcome
+    // aborted.
+    on eReadSnapshot do (req: tReadReq) {
+      var items: seq[tReadItem];
+      var item: tReadItem;
+      items = ReadLocal(req.readKeys);
+      foreach (item in items) {
+        if (item.hasPendingWrite) {
+          send req.caller, eReadSnapshotResp, (reqId = req.reqId, aborted = true, items = default(seq[tReadItem]));
+          return;
+        }
+      }
+      send req.caller, eReadSnapshotResp, (reqId = req.reqId, aborted = false, items = items);
+    }
+
     // debugForceResolveTransaction: sends every row of the transaction through dispatch. On a fixed
     // topology this partition owns each row, so the commit or the cancel applies here.
     on eForceResolve do (req: tForceResolveReq) {
@@ -262,6 +282,27 @@ machine Partition {
 
   fun ConditionHolds(op: tTxOp): bool {
     return !((op.condition == EXISTS && !(op.key in durable.items)) || (op.condition == NOT_EXISTS && op.key in durable.items));
+  }
+
+  // readForTransactionLocal: the committed row of each key, and the max_deleted_v of the partition. A
+  // lock row of a check does not set hasPendingWrite (READ_ONLY_PENDING_OPERATIONS).
+  fun ReadLocal(readKeys: seq[tKey]): seq[tReadItem] {
+    var items: seq[tReadItem];
+    var key: tKey;
+    var item: tReadItem;
+    foreach (key in readKeys) {
+      item = (key = key, found = false, value = 0, version = 0, maxDeletedV = durable.maxDeletedV, hasPendingWrite = false);
+      if (key in durable.locks) {
+        item.hasPendingWrite = durable.locks[key].op.operation != OP_CHECK;
+      }
+      if (key in durable.items) {
+        item.found = true;
+        item.value = durable.items[key].value;
+        item.version = durable.items[key].v;
+      }
+      items += (sizeof(items), item);
+    }
+    return items;
   }
 
   // The keys of the lock rows of a transaction.
