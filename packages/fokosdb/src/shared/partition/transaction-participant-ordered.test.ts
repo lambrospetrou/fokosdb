@@ -671,11 +671,17 @@ describe("ordered per-item execution: lock rows and commit", () => {
 		});
 	});
 
-	it.each([
-		["a present item", [check("A", true), check("A", true)]],
-		["an absent item", [check("X", false), check("X", false)]],
-	])("accepts a late prepare of a committed check → check on %s", async (_name, ops) => {
-		expect(await latePrepare(ops)).toEqual({ outcome: "accepted" });
+	// A check orders only against writes, so a row that only a check read still accepts the same check.
+	it("accepts a late prepare of a committed check → check on a present item", async () => {
+		expect(await latePrepare([check("A", true), check("A", true)])).toEqual({ outcome: "accepted" });
+	});
+
+	// An absent item has one watermark for reads and writes, and the commit of the check raised it.
+	it("rejects a late prepare of a committed check → check on an absent item", async () => {
+		expect(await latePrepare([check("X", false), check("X", false)])).toMatchObject({
+			outcome: "rejected",
+			results: [{ outcome: "rejected", reason: { code: "timestamp_conflict" } }, { outcome: "not_evaluated" }],
+		});
 	});
 
 	// Above 8 keys the hash part of KeyPairMap answers. Each key must stay its own item at each site.

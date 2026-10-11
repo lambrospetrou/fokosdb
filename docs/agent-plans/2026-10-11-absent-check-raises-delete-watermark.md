@@ -1,9 +1,10 @@
 # RFC — A committed check on an absent item raises the delete watermark of its partition
 
-**State:** Draft
+**State:** Implemented
 **Date:** 2026-10-11
 **Author:** Lambros Petrou
-**Status:** Not built. Today the commit of a `check` on an absent item records no timestamp.
+**Status:** Implemented. A committed transactional `check` on an absent item raises `max_delete_tx_order_ts`, on the
+two-phase path and on the single-partition path.
 
 ## Table of Contents
 
@@ -106,8 +107,10 @@ applies that reading at commit. Section 6 gives the reason for no change at canc
 
 ### 2.1 In scope
 
-- When a two-phase commit applies a `check` and the item has no row, the partition must raise
+- When a transaction applies a `check` and the item has no row, the partition must raise
   `max_delete_tx_order_ts` to at least the transaction timestamp.
+- The two-phase path, the single-partition path and the reference run of
+  `docs/agent-plans/2026-10-03-ordered-per-item-transact-write.md` must give the same `max_delete_tx_order_ts`.
 - After the change, for each key, the watermark that a prepare compares must be at least the timestamp of each
   committed two-phase operation that the watermark orders against.
 - A late prepare of a committed `check` on an absent item must get `timestamp_conflict`.
@@ -118,8 +121,6 @@ applies that reading at commit. Section 6 gives the reason for no change at canc
 ### 2.2 Out of scope
 
 - A cancel must not raise `max_delete_tx_order_ts`. A cancelled transaction has no place in the serial order.
-- A `check` in a single-partition transaction (`executeSingleShot`) must not raise `max_delete_tx_order_ts`.
-  Section 6 gives the reason.
 - The change must not add a second watermark for absent reads, and must not add a row for an absent key.
 - The change must not touch `max_deleted_v`. A read transaction must see no new `read_conflict`.
 - The change must not add the optimizations of section 4 of the DynamoDB paper.
@@ -177,11 +178,12 @@ The guard also applies to the transactional delete of an absent item, which call
 
 #### 4.2.3 Participant
 
-In `TransactionParticipant`, the `check` branch of `#write` calls `bumpItemReadTs`. When the call updated no row
-and the caller is the two-phase commit (`commitLocal`, through `#apply`), the branch calls
-`bumpMaxDeleteTxOrderTs` with the transaction timestamp.
+In `TransactionParticipant`, the `check` branch of `#write` calls `bumpItemReadTs`. When the call updated no row,
+the branch calls `bumpMaxDeleteTxOrderTs` with the transaction timestamp.
 
-The single-partition path (`executeSingleShot`, through `#writeRequest`) does not make the second call.
+Both paths use `#write`, so both raise the delete watermark. The two-phase commit (`commitLocal`) uses the
+timestamp of its coordinator. The single-partition path (`executeSingleShot`) uses the clock of the partition, as
+its delete of an absent item does.
 
 The comment on the watermark in `#evaluate` and the comment on `max_delete_tx_order_ts` in the schema of
 `partition-store.ts` must state the new rule.
@@ -214,6 +216,11 @@ true:
 
 A `check` on an absent key is also rejected, although two reads of one key do not conflict.
 
+A single-partition `check` on an absent item raises the delete watermark to the clock of the partition. That value
+is above the timestamp of a two-phase transaction that started earlier. Thus the partition rejects the prepare of
+such a transaction on an absent key when the prepare arrives after the `check`. A single-partition delete of an
+absent item and a delete of a present row have the same effect today.
+
 The conflicts have the same form as the ones that a transactional delete causes today. Three causes make an older
 transaction arrive after the commit of a newer one:
 
@@ -239,8 +246,8 @@ of section 4.2.2 removes the write when the value stays.
 
 #### 4.2.7 Failure and recovery
 
-The raise runs in the storage transaction of `commitLocal`, with the release of the lock. A commit that throws
-rolls both back. A repeated commit finds no owned lock row and writes nothing.
+On the two-phase path, the raise runs in the storage transaction of `commitLocal`, with the release of the
+lock. A commit that throws rolls both back. A repeated commit finds no owned lock row and writes nothing.
 
 A late prepare of the committed transaction compares its timestamp `T` with a delete watermark of at least `T`,
 and gets `timestamp_conflict`. It writes no lock.
@@ -259,7 +266,7 @@ In `packages/fokosdb/src/shared/partition/transaction-participant.test.ts`:
 - After that commit, a repeated prepare of the same transaction gets `timestamp_conflict` and writes no lock.
 - A committed two-phase `check` on an item that has a row does not change `max_delete_tx_order_ts`.
 - A cancelled `check` on an absent item does not change `max_delete_tx_order_ts`.
-- A single-partition `check` on an absent item does not change `max_delete_tx_order_ts`.
+- A single-partition `check` on an absent item raises `max_delete_tx_order_ts` to the clock of the partition.
 - A committed `check` on an absent item does not change `max_deleted_v`.
 
 In `packages/fokosdb/src/shared/partition/partition-store.test.ts`:
@@ -288,6 +295,12 @@ Keep `max_absent_read_ts` next to `max_delete_tx_order_ts`. A write on an absent
 checks on absent keys. It adds a column and a second comparison, and a write on an absent key gets the same false
 conflicts as in the proposed solution.
 
+### 5.4 Raise the delete watermark only on the two-phase commit
+
+The single-partition path then records nothing for a `check` on an absent item. This option causes fewer false
+conflicts, because no `check` stamps the clock of the partition. It makes the two paths give a different
+`max_delete_tx_order_ts` for the same request, which breaks the comparison with the reference run.
+
 ## 6. Frequently Asked Questions
 
 ### Is the current behavior a serializability defect?
@@ -300,13 +313,12 @@ that order for an absent key.
 A cancelled transaction applied nothing and its `check` result reached no committed state. No later write must
 order after it. A raise at cancel lets each rejected transaction cause conflicts for other transactions.
 
-### Why does the single-partition path not raise the delete watermark?
+### Why does the single-partition path also raise the delete watermark?
 
-The single-partition path stamps with the clock of the partition at the time of the request. That value is above
-the timestamp of each two-phase transaction that is in flight, so each such `check` rejects all of them on absent
-keys. The single-partition path takes no timestamp test itself, and `WriteSerializable` excludes it.
-
-A single-partition delete of an absent item raises the delete watermark today. This document does not change it.
+The tests of `docs/agent-plans/2026-10-03-ordered-per-item-transact-write.md` compare the two-phase path and the
+single-partition path with a reference run of one-operation transactions. All three must give the same
+`max_delete_tx_order_ts`. A single-partition delete of an absent item already raises the delete watermark, and the
+`check` now follows the same rule. Section 4.2.5 gives the cost.
 
 ### Does the change affect a `check` on an item that has a row?
 

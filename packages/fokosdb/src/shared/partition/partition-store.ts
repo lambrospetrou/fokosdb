@@ -701,7 +701,8 @@ const sqlMigrations: SQLSchemaMigration[] = [
             -- delete of an item row, so they describe keys that have no row.
             --
             -- max_delete_tx_order_ts : the highest transaction order timestamp of a delete or of a TTL expiry, and at least
-            --                          the last_read_ts of each removed row. The prepare of an absent item rejects a
+            --                          the last_read_ts of each removed row. A committed transactional check on an absent
+            --                          item also raises it, because no row can hold that read. The prepare of an absent item rejects a
             --                          transaction timestamp that is not greater than this value. A new item row starts with
             --                          last_read_ts and last_write_ts at least this value. Thus the timestamp watermark of a
             --                          key never goes down, and a late prepare of a committed transaction gets a conflict.
@@ -1176,9 +1177,13 @@ export class PartitionStore {
 		});
 	}
 
-	/** The transactional "check" operation: advances only the item's read watermark. */
-	bumpItemReadTs(hk: KeyBytes, sk: KeyBytes, ts: number): void {
-		this.#storage.sql.exec(`UPDATE items SET last_read_ts = MAX(last_read_ts, ?) WHERE hk = ? AND sk = ?`, ts, hk, sk);
+	/**
+	 * The transactional "check" operation: advances only the item's read watermark. An absent item has
+	 * no row to hold it, and `itemPresent` is then false.
+	 */
+	bumpItemReadTs(hk: KeyBytes, sk: KeyBytes, ts: number): { itemPresent: boolean } {
+		const res = this.#storage.sql.exec(`UPDATE items SET last_read_ts = MAX(last_read_ts, ?) WHERE hk = ? AND sk = ?`, ts, hk, sk);
+		return { itemPresent: res.rowsWritten > 0 };
 	}
 
 	/**
@@ -1911,9 +1916,16 @@ export class PartitionStore {
 		);
 	}
 
-	/** The single definition of the deletion transaction-order-watermark update (monotonic MAX). */
-	bumpMaxDeleteTxOrderTs(ts: number): void {
-		this.#storage.sql.exec(`UPDATE deletion_metadata SET max_delete_tx_order_ts = MAX(max_delete_tx_order_ts, ?) WHERE id = 1`, ts);
+	/**
+	 * The single definition of the deletion transaction-order-watermark update. The value only goes up,
+	 * and a call that does not raise it writes no row.
+	 */
+	bumpMaxDeleteTxOrderTs(ts: number): { rowsWritten: number } {
+		const res = this.#storage.sql.exec(
+			`UPDATE deletion_metadata SET max_delete_tx_order_ts = ?1 WHERE id = 1 AND max_delete_tx_order_ts < ?1`,
+			ts,
+		);
+		return { rowsWritten: res.rowsWritten };
 	}
 
 	/**

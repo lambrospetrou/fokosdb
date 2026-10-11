@@ -393,6 +393,9 @@ transaction_timestamp <= max_delete_tx_order_ts
 A `check` on an absent item must not add another watermark. Locks continue to provide serializability for this
 case.
 
+`docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md` replaces this rule: a committed
+transactional `check` on an absent item raises `max_delete_tx_order_ts`.
+
 The pending-lock rule does not change for write transactions. A pending `check` remains an exclusive lock against
 another write transaction and against a non-transactional writer.
 

@@ -1123,6 +1123,15 @@ describe("PartitionStore - deletion watermark", () => {
 		});
 	});
 
+	it("bumpMaxDeleteTxOrderTs writes a row only when it raises the value", async () => {
+		await withStore((store) => {
+			expect(store.bumpMaxDeleteTxOrderTs(100).rowsWritten).toBe(1);
+			expect(store.bumpMaxDeleteTxOrderTs(100).rowsWritten).toBe(0);
+			expect(store.bumpMaxDeleteTxOrderTs(50).rowsWritten).toBe(0);
+			expect(store.getMaxDeleteTxOrderTs()).toBe(100);
+		});
+	});
+
 	it("deleteItem bumps the watermark only when a row was deleted, unless bumpTxOrderTsAlways", async () => {
 		await withStore((store) => {
 			// Absent row, default behavior: no bump.

@@ -141,7 +141,8 @@ The participant (`packages/fokosdb/src/shared/partition/transaction-participant.
 - Every write increments the `v` of the item. A new row starts at `max_deleted_v + 1`, so the `v` of a key never
   repeats. `max_deleted_v` is the highest `v` of a row that a delete or a TTL expiry removed.
 - Each item has `last_read_ts` and `last_write_ts`. A put and an update raise both with `MAX`. A committed `check`
-  raises `last_read_ts` only.
+  raises `last_read_ts` only. A committed transactional `check` on an absent key raises `max_delete_tx_order_ts`
+  (`docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md`).
 - A prepared write must have a timestamp above `last_read_ts`. A prepared `check` must have a timestamp above
   `last_write_ts`. An operation on an absent key must have a timestamp above `max_delete_tx_order_ts`.
 - A delete raises `max_delete_tx_order_ts` to at least the `last_read_ts` of the removed row. A new row starts its

@@ -633,6 +633,95 @@ describe("TransactionParticipant - prepare", () => {
 		});
 	});
 
+	// No row can hold the read timestamp of a check on an absent item, so the check raises the deletion
+	// watermark of the partition. A later write of the key then cannot order below the read.
+	describe("a check on an absent item", () => {
+		const X = { hashKey: kb("x"), sortKey: KeyCodec.encodeOptional(undefined) };
+		const checkTs = (BASE_NOW + 500) * TX_ORDER_TS_UNITS_PER_MS;
+		const olderTs = (BASE_NOW + 300) * TX_ORDER_TS_UNITS_PER_MS;
+		const checkAbsent = (): PrepareRequest =>
+			prepareReq({
+				transactionTimestamp: checkTs,
+				items: [{ ...X, operation: "check", condition: conditionTree({ op: "not_exists", args: [{ ref: "hashKey" }] }) }],
+			});
+
+		it("raises the deletion watermark at commit, and rejects an older prepare on every absent key", async () => {
+			await withParticipant(({ participant, store }) => {
+				const check = checkAbsent();
+				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
+				expect(store.getMaxDeleteTxOrderTs()).toBe(0);
+				expect(participant.commitLocal(check).response).toEqual({ outcome: "committed" });
+				expect(store.getMaxDeleteTxOrderTs()).toBe(checkTs);
+				// The item stayed absent, so a read transaction sees no change.
+				expect(store.getMaxDeletedV()).toBe(0);
+
+				const olderPut = prepareReq({ transactionTimestamp: olderTs, items: [{ ...X, operation: "put", data: "v", kind: "text" }] });
+				expect(participant.prepareLocal(olderPut)).toMatchObject({
+					outcome: "rejected",
+					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
+				});
+				// The watermark is one value for the partition, so it also rejects on another absent key.
+				const olderOther = prepareReq({
+					transactionTimestamp: olderTs,
+					items: [{ ...X, hashKey: kb("other"), operation: "put", data: "v", kind: "text" }],
+				});
+				expect(participant.prepareLocal(olderOther)).toMatchObject({
+					outcome: "rejected",
+					results: aRejection({ code: "timestamp_conflict", hashKey: "other" }),
+				});
+
+				const newerPut = prepareReq({
+					transactionTimestamp: checkTs + 1,
+					items: [{ ...X, operation: "put", data: "v", kind: "text" }],
+				});
+				expect(participant.prepareLocal(newerPut)).toEqual({ outcome: "accepted" });
+			});
+		});
+
+		it("rejects a late prepare of the committed check, and writes no lock", async () => {
+			await withParticipant(({ participant, store }) => {
+				const check = checkAbsent();
+				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
+				expect(participant.commitLocal(check).response).toEqual({ outcome: "committed" });
+
+				expect(participant.prepareLocal(check)).toMatchObject({
+					outcome: "rejected",
+					results: aRejection({ code: "timestamp_conflict", hashKey: "x" }),
+				});
+				expect(store.pendingLockFor(X.hashKey, X.sortKey)).toBeUndefined();
+			});
+		});
+
+		it("does not raise the deletion watermark at cancel", async () => {
+			await withParticipant(({ participant, store }) => {
+				const check = checkAbsent();
+				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
+				participant.cancelLocal(check.transactionId, check.items);
+				expect(store.getMaxDeleteTxOrderTs()).toBe(0);
+			});
+		});
+
+		it("raises the deletion watermark to the partition clock on the single-partition path", async () => {
+			await withParticipant(({ participant, store, clock }) => {
+				const res = participant.executeSingleShot({ items: checkAbsent().items });
+				expect(res.response).toEqual({ outcome: "committed" });
+				expect(store.getMaxDeleteTxOrderTs()).toBe(clock.now * TX_ORDER_TS_UNITS_PER_MS);
+				expect(store.getMaxDeletedV()).toBe(0);
+			});
+		});
+
+		it("does not raise the deletion watermark when the item has a row", async () => {
+			await withParticipant(({ participant, store }) => {
+				store.upsertItem({ hk: X.hashKey, sk: X.sortKey, data: "v", kind: "text", ttlAt: null, txOrderTs: 1 });
+				const check = prepareReq({ transactionTimestamp: checkTs, items: [{ ...X, operation: "check" }] });
+				expect(participant.prepareLocal(check)).toEqual({ outcome: "accepted" });
+				expect(participant.commitLocal(check).response).toEqual({ outcome: "committed" });
+				expect(store.getMaxDeleteTxOrderTs()).toBe(0);
+				expect(store.getItem(X.hashKey, X.sortKey).row).toMatchObject({ last_read_ts: checkTs, last_write_ts: 1 });
+			});
+		});
+	});
+
 	it("rejects every operation with clock_skew when the transaction timestamp is too far ahead of the injected clock", async () => {
 		await withParticipant(({ participant, clock }) => {
 			const skewed = prepareReq({

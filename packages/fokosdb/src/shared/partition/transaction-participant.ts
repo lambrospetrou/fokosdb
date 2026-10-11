@@ -466,9 +466,9 @@ export class TransactionParticipant {
 	 * - A delete can raise `max_deleted_v` for the whole partition. Every passed delete must run so
 	 *   that the failure images of later new rows show the same versions on both paths. The
 	 *   version-reference check does not cover the versions in those images.
-	 * - A check changes only `last_read_ts`. No plan and no image reads it, and the timestamp check
-	 *   uses the stamps from before the transaction. Also, later writes use `MAX(current, T)`,
-	 *   so the temporary check's `MAX(current, T)` is redundant.
+	 * - A check changes only `last_read_ts`, or `max_delete_tx_order_ts` for an absent item. No plan and
+	 *   no image reads either, and the timestamp check uses the stamps from before the transaction.
+	 *   Also, later writes use `MAX(current, T)`, so the temporary check's `MAX(current, T)` is redundant.
 	 *
 	 * Conditions, update checks, and size checks read `items`, which holds the state that the earlier
 	 * operations left. The timestamp check uses only the state from before the transaction: all
@@ -559,8 +559,8 @@ export class TransactionParticipant {
 				// A check reads the item and does not change it, so only a newer write orders against it. A
 				// content mutation must stay above every earlier read and write. No stamp means no live item,
 				// so the deletion watermark is the only ordering signal left. This holds for every
-				// operation: a check, which writes nothing but still orders itself against later
-				// transactions, and an update of an absent item, which creates it.
+				// operation: a check, whose commit raises the deletion watermark to order itself against
+				// later transactions, and an update of an absent item, which creates it.
 				const watermark =
 					stamp === null
 						? (committedMaxDeleteTs ??= this.#store.getMaxDeleteTxOrderTs())
@@ -649,8 +649,12 @@ export class TransactionParticipant {
 		}
 		if (operation === "check") {
 			// A check writes nothing, but it still orders this transaction against later writes through
-			// the item's read watermark.
-			this.#store.bumpItemReadTs(hk, sk, ts);
+			// the item's read watermark. An absent item has no row to hold it, so the check then raises the
+			// deletion watermark of the partition, as a delete of an absent item does. A later two-phase
+			// write of the key thus cannot order below this read.
+			if (!this.#store.bumpItemReadTs(hk, sk, ts).itemPresent) {
+				this.#store.bumpMaxDeleteTxOrderTs(ts);
+			}
 			return undefined;
 		}
 		invariant(isWrite(operation), () => `fokos/partition: unknown operation ${operation} (${KeyCodec.pairForLog(hk, sk)})`);

@@ -964,7 +964,8 @@ The **reference run** is the oracle of the sequence tests. It applies the standa
 - Each operation is a one-operation call of `executeSingleShot`. Its `txOrderTimestamp` returns the `T` of the run
   under test.
 - A one-operation transaction uses the transactional store writes: `deleteItem` with `bumpTxOrderTsAlways`, and
-  `bumpItemReadTs` for a `check`.
+  `bumpItemReadTs` for a `check`. A `check` on an absent item also raises `max_delete_tx_order_ts`
+  (`docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md`).
 - The single-partition path has no timestamp check, so operations with the same `T` do not reject each other.
 - Non-transactional requests are not a reference. Each one takes its own `T`. A non-transactional delete of an absent
   item does not raise `max_delete_tx_order_ts`. No non-transactional `check` exists.
