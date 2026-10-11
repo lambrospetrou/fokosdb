@@ -1,4 +1,5 @@
-// The number of steps in which the Environment can inject a restart. After them, every fault stops.
+// The number of steps in which the Environment can inject a restart, a fine step of the clock, or an
+// offset move. After them, every fault stops.
 fun ENVIRONMENT_STEPS(): int { return 20; }
 
 // The ticks after the end of the faults and after the last change of an alarm. A Durable Object
@@ -8,7 +9,9 @@ fun ENVIRONMENT_STEPS(): int { return 20; }
 fun TICKS_AFTER_FAULTS(): int { return 20; }
 
 // `down` holds the Durable Objects that drop every call, also after the end of the faults.
-type tEnvConfig = (restarts: int, losses: int, answersOnly: bool, down: set[machine]);
+// `fineSteps` is the number of fine steps of the clock, and `offsetMoves` the number of offset
+// moves of one Durable Object.
+type tEnvConfig = (restarts: int, losses: int, answersOnly: bool, down: set[machine], fineSteps: int, offsetMoves: int);
 type tEnvSetup = (config: tEnvConfig, dos: seq[machine]);
 event eEnvSetup: tEnvSetup;
 event eEnvStep;
@@ -27,6 +30,13 @@ event eRpcClosed;
 // alarm deadline, and only while no call is open: a call takes milliseconds, and a tick is about
 // staleTransactionMs. Each inbox is in send order, so a message that a Durable Object sends after it
 // read tick t reaches each other Durable Object after tick t.
+//
+// Timestamps (TS_PER_TICK in Types.p tells why each part exists): a fine step moves the clock of
+// every Durable Object forward by 1 inside a tick, also while calls are open, so two transactions of
+// one tick can get the same timestamp or different ones. The Environment sends it to every Durable
+// Object in one handler, so it adds no skew. An offset move gives one Durable Object a new offset
+// between 0 and MAX_CLOCK_SKEW() + 1. The clocks of two Durable Objects then differ by at most
+// MAX_CLOCK_SKEW() + 1, and a clock can go back.
 machine Environment {
   var config: tEnvConfig;
   var dos: seq[machine];
@@ -37,12 +47,19 @@ machine Environment {
   var now: int;
   var ticking: bool;
   var ticksAfterFaults: int;
+  var fine: int;
+  var offsets: map[machine, int];
 
   start state Init {
     defer eMayLose, eArmed, eRpcOpened, eRpcClosed;
     on eEnvSetup do (s: tEnvSetup) {
+      var target: machine;
       config = s.config;
       dos = s.dos;
+      assert config.fineSteps + MAX_CLOCK_SKEW() + 1 < TS_PER_TICK(), "the fine steps and the offsets must stay inside one tick";
+      foreach (target in dos) {
+        offsets[target] = 0;
+      }
       goto Running;
     }
   }
@@ -53,11 +70,25 @@ machine Environment {
     }
 
     on eEnvStep do {
-      if (steps < ENVIRONMENT_STEPS() && (config.restarts > 0 || config.losses > 0)) {
+      var target: machine;
+      if (steps < ENVIRONMENT_STEPS() && (config.restarts > 0 || config.losses > 0 || config.fineSteps > 0 || config.offsetMoves > 0)) {
         steps = steps + 1;
         if (config.restarts > 0 && $) {
           config.restarts = config.restarts - 1;
           send choose(dos), eRestart;
+        }
+        if (config.fineSteps > 0 && $) {
+          config.fineSteps = config.fineSteps - 1;
+          fine = fine + 1;
+          foreach (target in dos) {
+            send target, eClock, (fine = fine, offset = offsets[target]);
+          }
+        }
+        if (config.offsetMoves > 0 && $) {
+          config.offsetMoves = config.offsetMoves - 1;
+          target = choose(dos);
+          offsets[target] = choose(MAX_CLOCK_SKEW() + 2);
+          send target, eClock, (fine = fine, offset = offsets[target]);
         }
         send this, eEnvStep;
         return;

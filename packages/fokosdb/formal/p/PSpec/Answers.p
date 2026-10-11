@@ -29,8 +29,8 @@ spec AnswerMatchesDecision observes eDecision, eTxCompleted, eClientAnswer {
 // One write of a key, in the order that the partitions applied the writes.
 type tKeyWrite = (tx: int, deleted: bool, value: tValue);
 
-// A read that starts after the client got committed for a transaction returns, for each key of that
-// transaction, the value of that transaction or of a later writer.
+// A read that starts after the client got committed for a transaction returns, for each key that
+// the transaction put or deleted, the value of that transaction or of a later writer.
 spec ReadAfterCommit observes eDecision, eItemWritten, eClientAnswer, eReadStart, eReadResult {
   var txKeys: map[int, set[tKey]];
   var history: map[tKey, seq[tKeyWrite]];
@@ -40,7 +40,7 @@ spec ReadAfterCommit observes eDecision, eItemWritten, eClientAnswer, eReadStart
 
   start state Watching {
     on eDecision do (d: tDecision) {
-      txKeys[d.tx] = d.itemKeys;
+      txKeys[d.tx] = d.writeKeys;
     }
 
     on eItemWritten do (w: tItemWritten) {

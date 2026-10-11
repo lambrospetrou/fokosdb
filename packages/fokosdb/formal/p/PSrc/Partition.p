@@ -25,6 +25,8 @@ machine Partition {
   var operator: machine;
   var durable: tPartitionDurable;
   var now: int;
+  // The clock of this Durable Object as the Environment sets it. A restart keeps it.
+  var tsClock: tClock;
   var step: tStaleStep;
   // An eAlarm waits in the inbox.
   var alarmQueued: bool;
@@ -54,23 +56,29 @@ machine Partition {
       CheckAlarm();
     }
 
+    on eClock do (c: tClock) {
+      tsClock = c;
+    }
+
     // apiPutItem: putItemLocal refuses a key with a lock row (item_locked_by_transaction), then
-    // PartitionStore.upsertItem writes the row. A single-item write stamps 0, which MAX absorbs.
+    // PartitionStore.upsertItem writes the row at the clock of this partition (txOrderTimestampNow).
     on ePutItem do (req: tPutItemReq) {
       var v: int;
+      var ts: int;
       if (req.key in durable.locks && !bugs.putIgnoresLock) {
         send req.caller, ePutItemResp, (reqId = req.reqId, locked = true, version = 0);
         return;
       }
-      v = WriteItem(req.key, req.value, 0, 0);
+      ts = TsNow();
+      v = WriteItem(req.key, req.value, 0, ts);
+      announce eStamped, (partition = this, key = req.key, operation = OP_PUT, ts = ts, twoPhase = false);
       send req.caller, ePutItemResp, (reqId = req.reqId, locked = false, version = v);
     }
 
     // apiDeleteItem: deleteItemLocal refuses a key with a lock row, then PartitionStore.deleteItem
-    // removes the row, raises max_deleted_v to its v, and raises max_delete_tx_order_ts to its
-    // last_read_ts.
+    // removes the row at the clock of this partition. A delete of an absent row changes nothing.
     on eDeleteItem do (req: tDeleteItemReq) {
-      var removed: tItemRow;
+      var ts: int;
       if (req.key in durable.locks) {
         send req.caller, eDeleteItemResp, (reqId = req.reqId, locked = true, deleted = false);
         return;
@@ -79,15 +87,9 @@ machine Partition {
         send req.caller, eDeleteItemResp, (reqId = req.reqId, locked = false, deleted = false);
         return;
       }
-      removed = durable.items[req.key];
-      durable.items -= (req.key);
-      if (removed.v > durable.maxDeletedV) {
-        durable.maxDeletedV = removed.v;
-      }
-      if (removed.lastReadTs > durable.maxDeleteTxOrderTs) {
-        durable.maxDeleteTxOrderTs = removed.lastReadTs;
-      }
-      announce eItemWritten, (partition = this, key = req.key, deleted = true, value = 0, v = removed.v, tx = 0);
+      ts = TsNow();
+      DeleteItem(req.key, 0, ts);
+      announce eStamped, (partition = this, key = req.key, operation = OP_DELETE, ts = ts, twoPhase = false);
       send req.caller, eDeleteItemResp, (reqId = req.reqId, locked = false, deleted = true);
     }
 
@@ -102,14 +104,21 @@ machine Partition {
       send req.caller, eGetItemResp, (reqId = req.reqId, found = true, value = row.value, version = row.v);
     }
 
-    // txPrepare: prepareLocal. A lock of another transaction gives pending_conflict, a failed
-    // condition gives condition_failed, and a timestamp that is not above the watermark of the item
-    // gives timestamp_conflict. Each rejection writes no lock. Otherwise the lock block writes one
+    // txPrepare: prepareLocal. A timestamp more than maxClockSkewMs ahead of the clock of this
+    // partition gives clock_skew for the whole request. Then, for each key, a lock of another
+    // transaction gives pending_conflict, a failed condition gives condition_failed, and a timestamp
+    // that is not above the watermark of the item gives timestamp_conflict. The watermark of a check
+    // is last_write_ts, of a put or a delete last_read_ts, and of an absent item
+    // max_delete_tx_order_ts. Each rejection writes no lock. Otherwise the lock block writes one
     // pending_tx_info row and one lock row for each key. A repeated prepare finds its own locks and
     // passes.
     on eTxPrepare do (req: tPrepareReq) {
       var op: tTxOp;
       var watermark: int;
+      if (req.ts > TsNow() + MAX_CLOCK_SKEW()) {
+        Reject(req);
+        return;
+      }
       foreach (op in req.items) {
         if (op.key in durable.locks) {
           if (durable.locks[op.key].tx != req.tx) {
@@ -118,16 +127,18 @@ machine Partition {
           }
           continue;
         }
-        if ((op.condition == EXISTS && !(op.key in durable.items)) || (op.condition == NOT_EXISTS && op.key in durable.items)) {
+        if (!ConditionHolds(op)) {
           Reject(req);
           return;
         }
-        if (op.key in durable.items) {
-          watermark = durable.items[op.key].lastReadTs;
-        } else {
+        if (!(op.key in durable.items)) {
           watermark = durable.maxDeleteTxOrderTs;
+        } else if (op.operation == OP_CHECK) {
+          watermark = durable.items[op.key].lastWriteTs;
+        } else {
+          watermark = durable.items[op.key].lastReadTs;
         }
-        if (req.ts <= watermark) {
+        if (req.ts <= watermark && !bugs.prepareSkipsWatermark) {
           Reject(req);
           return;
         }
@@ -157,6 +168,26 @@ machine Partition {
     on eTxCancel do (req: tCancelReq) {
       CancelLocal(req.tx, req.itemKeys);
       send req.caller, eTxCancelResp, (reqId = req.reqId, partition = this);
+    }
+
+    // txExecuteSingleShot: executeSingleShot applies the whole transaction in one storage
+    // transaction at the clock of this partition. It takes no lock and checks no timestamp. A lock
+    // of a two-phase transaction gives pending_conflict, and a failed condition gives
+    // condition_failed. A rejection writes nothing.
+    on eExecuteSingleShot do (req: tSingleShotReq) {
+      var op: tTxOp;
+      var ts: int;
+      ts = TsNow();
+      foreach (op in req.items) {
+        if ((op.key in durable.locks && !bugs.singleShotIgnoresLock) || !ConditionHolds(op)) {
+          send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, committed = false);
+          return;
+        }
+      }
+      foreach (op in req.items) {
+        ApplyOp(op, 0, ts, false);
+      }
+      send req.caller, eExecuteSingleShotResp, (reqId = req.reqId, committed = true);
     }
 
     // debugForceResolveTransaction: sends every row of the transaction through dispatch. On a fixed
@@ -220,6 +251,15 @@ machine Partition {
     send req.caller, eTxPrepareResp, (reqId = req.reqId, partition = this, outcome = PREPARE_REJECTED);
   }
 
+  // The transaction order timestamp of this partition now (txOrderTimestampNow).
+  fun TsNow(): int {
+    return TsOf(now, tsClock);
+  }
+
+  fun ConditionHolds(op: tTxOp): bool {
+    return !((op.condition == EXISTS && !(op.key in durable.items)) || (op.condition == NOT_EXISTS && op.key in durable.items));
+  }
+
   // The keys of the lock rows of a transaction.
   fun RowsOf(tx: int): seq[tKey] {
     var rows: seq[tKey];
@@ -235,7 +275,7 @@ machine Partition {
   // commitLocal: with no lock row of the transaction left, it answers the idempotent success.
   // Otherwise the keys of the request must be the keys of the lock rows, or it throws
   // commit_keyset_mismatch. It applies the operation of each lock row at the timestamp of the
-  // transaction, and deletes one lock row for each key.
+  // transaction (apply), and deletes one lock row for each key.
   fun CommitLocal(tx: int, requestKeys: seq[tKey]): bool {
     var owned: set[tKey];
     var requested: set[tKey];
@@ -255,11 +295,45 @@ machine Partition {
     }
     ts = durable.pendingTx[tx].ts;
     foreach (key in owned) {
-      WriteItem(key, durable.locks[key].op.value, tx, ts);
+      ApplyOp(durable.locks[key].op, tx, ts, true);
       announce eApplied, (partition = this, key = key, tx = tx);
       DeleteLock(key, tx);
     }
     return true;
+  }
+
+  // TransactionParticipant.#write: one operation at `ts`. A transactional delete also raises
+  // max_delete_tx_order_ts for an absent row (bumpTxOrderTsAlways). A check raises only
+  // last_read_ts, and only of a present row (bumpItemReadTs). `tx` is 0 for a single-partition
+  // transaction.
+  fun ApplyOp(op: tTxOp, tx: int, ts: int, twoPhase: bool) {
+    var row: tItemRow;
+    if (op.operation == OP_PUT) {
+      WriteItem(op.key, op.value, tx, ts);
+    } else if (op.operation == OP_DELETE) {
+      if (op.key in durable.items) {
+        DeleteItem(op.key, tx, ts);
+      } else {
+        durable.maxDeleteTxOrderTs = Max(durable.maxDeleteTxOrderTs, ts);
+        announce eItemWritten, (partition = this, key = op.key, deleted = true, value = 0, v = 0, tx = tx);
+      }
+    } else if (op.key in durable.items) {
+      row = durable.items[op.key];
+      row.lastReadTs = Max(row.lastReadTs, ts);
+      durable.items[op.key] = row;
+    }
+    announce eStamped, (partition = this, key = op.key, operation = op.operation, ts = ts, twoPhase = twoPhase);
+  }
+
+  // PartitionStore.deleteItem of a present row: removes the row, raises max_deleted_v to its v, and
+  // raises max_delete_tx_order_ts to the larger of `ts` and its last_read_ts.
+  fun DeleteItem(key: tKey, tx: int, ts: int) {
+    var removed: tItemRow;
+    removed = durable.items[key];
+    durable.items -= (key);
+    durable.maxDeletedV = Max(durable.maxDeletedV, removed.v);
+    durable.maxDeleteTxOrderTs = Max(durable.maxDeleteTxOrderTs, Max(ts, removed.lastReadTs));
+    announce eItemWritten, (partition = this, key = key, deleted = true, value = 0, v = removed.v, tx = tx);
   }
 
   // cancelLocal: deletes the lock rows of the transaction under the given keys.
@@ -316,7 +390,11 @@ machine Partition {
       } else {
         row.v = durable.maxDeletedV + 1;
       }
-      row.lastReadTs = Max(ts, durable.maxDeleteTxOrderTs);
+      if (bugs.newRowTsFromOwnStamp) {
+        row.lastReadTs = ts;
+      } else {
+        row.lastReadTs = Max(ts, durable.maxDeleteTxOrderTs);
+      }
       row.lastWriteTs = row.lastReadTs;
     }
     row.value = value;

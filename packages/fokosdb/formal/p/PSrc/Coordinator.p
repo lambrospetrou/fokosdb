@@ -35,6 +35,8 @@ machine Coordinator {
   var recoverBlackout: bool;
   var durable: tCoordinatorDurable;
   var now: int;
+  // The clock of this Durable Object as the Environment sets it. A restart keeps it.
+  var tsClock: tClock;
   var drives: map[int, tDrive];
   // The drives of the tx_recovery step in progress.
   var stepDrives: set[int];
@@ -81,9 +83,13 @@ machine Coordinator {
       CheckAlarm();
     }
 
+    on eClock do (c: tClock) {
+      tsClock = c;
+    }
+
     // initiateWriteLocal: a token with a stored row resumes that transaction (resumeTransaction).
-    // Otherwise it groups the operations by the root partition of each key, inserts the transaction
-    // in CREATED, and calls drivePrepare.
+    // Otherwise it stamps the transaction with its clock (txOrderTimestampNow), groups the operations
+    // by the root partition of each key, inserts the transaction in CREATED, and calls drivePrepare.
     on eInitiateWrite do (req: tInitiateWriteReq) {
       var tx: int;
       var t: tTcTransaction;
@@ -101,7 +107,7 @@ machine Coordinator {
       durable.nextTx = tx + 1;
       t.token = req.token;
       t.tcState = CREATED;
-      t.ts = tx;
+      t.ts = TsOf(now, tsClock);
       t.createdAt = now;
       t.completedAt = -1;
       t.nextRecoveryAt = now + STALE_TRANSACTION();
@@ -526,7 +532,7 @@ machine Coordinator {
     if ((bugs.commitOnOneAccept && accepted > 0) || accepted == sizeof(t.participants)) {
       t.tcState = COMMITTING;
       durable.txs[tx] = t;
-      announce eDecision, (tx = tx, token = t.token, commit = true, itemKeys = KeysOf(t));
+      announce eDecision, (tx = tx, token = t.token, commit = true, itemKeys = KeysOf(t, false), writeKeys = KeysOf(t, true));
     }
   }
 
@@ -539,7 +545,7 @@ machine Coordinator {
     }
     t.tcState = CANCELLING;
     durable.txs[tx] = t;
-    announce eDecision, (tx = tx, token = t.token, commit = false, itemKeys = KeysOf(t));
+    announce eDecision, (tx = tx, token = t.token, commit = false, itemKeys = KeysOf(t, false), writeKeys = KeysOf(t, true));
   }
 
   // completeTransaction: writes the terminal state and completed_at only from COMMITTING or
@@ -700,13 +706,16 @@ fun KeysOfParticipant(p: tTcParticipant): seq[tKey] {
   return ks;
 }
 
-fun KeysOf(t: tTcTransaction): set[tKey] {
+// The keys of a transaction, or only the keys of its puts and deletes.
+fun KeysOf(t: tTcTransaction, writesOnly: bool): set[tKey] {
   var ks: set[tKey];
   var p: tTcParticipant;
   var op: tTxOp;
   foreach (p in values(t.participants)) {
     foreach (op in p.items) {
-      ks += (op.key);
+      if (!writesOnly || op.operation != OP_CHECK) {
+        ks += (op.key);
+      }
     }
   }
   return ks;

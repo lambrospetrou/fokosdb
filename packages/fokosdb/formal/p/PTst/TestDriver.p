@@ -11,14 +11,31 @@ fun TxOp(token: int, items: seq[tTxOp]): tClientOp {
 }
 
 fun Put(key: tKey, condition: tCondition, value: tValue): tTxOp {
-  return (key = key, condition = condition, value = value);
+  return (key = key, operation = OP_PUT, condition = condition, value = value);
 }
 
-// The faults of a test case. `down` names the roots that drop every call.
-type tFaults = (restarts: int, losses: int, answersOnly: bool, down: set[string], recoverBlackout: bool, operator: bool);
+fun Delete(key: tKey): tTxOp {
+  return (key = key, operation = OP_DELETE, condition = NO_CONDITION, value = 0);
+}
+
+fun Check(key: tKey, condition: tCondition): tTxOp {
+  return (key = key, operation = OP_CHECK, condition = condition, value = 0);
+}
+
+// The fine steps of the clock in every test case, and the offset moves in a test case with clock
+// skew. A fine step is real time that passes, and an offset move is skew between two clocks
+// (TS_PER_TICK in Types.p).
+fun FINE_STEPS(): int { return 2; }
+fun OFFSET_MOVES(): int { return 3; }
+
+// The faults of a test case. `down` names the roots that drop every call. `skew` moves the offsets
+// of the clocks.
+type tFaults = (restarts: int, losses: int, answersOnly: bool, down: set[string], recoverBlackout: bool, operator: bool,
+                skew: bool);
 
 fun NoFaults(): tFaults {
-  return (restarts = 0, losses = 0, answersOnly = false, down = default(set[string]), recoverBlackout = false, operator = false);
+  return (restarts = 0, losses = 0, answersOnly = false, down = default(set[string]), recoverBlackout = false, operator = false,
+          skew = false);
 }
 
 // Root A holds hash key a, and root B holds hash key b. One coordinator, the Environment, which is
@@ -33,6 +50,7 @@ fun StartSystem(bugs: tBugs, faults: tFaults, scripts: seq[seq[tClientOp]]) {
   var partitions: seq[machine];
   var down: set[machine];
   var hk: string;
+  var offsetMoves: int;
   env = new Environment();
   if (faults.operator) {
     operator = new Operator();
@@ -48,7 +66,11 @@ fun StartSystem(bugs: tBugs, faults: tFaults, scripts: seq[seq[tClientOp]]) {
   }
   dos = partitions;
   dos += (sizeof(dos), coordinator);
-  send env, eEnvSetup, (config = (restarts = faults.restarts, losses = faults.losses, answersOnly = faults.answersOnly, down = down),
+  if (faults.skew) {
+    offsetMoves = OFFSET_MOVES();
+  }
+  send env, eEnvSetup, (config = (restarts = faults.restarts, losses = faults.losses, answersOnly = faults.answersOnly, down = down,
+                                  fineSteps = FINE_STEPS(), offsetMoves = offsetMoves),
                         dos = dos);
   if (faults.operator) {
     send operator, eOperatorSetup, (coordinator = coordinator, partitions = partitions, env = env);
@@ -150,6 +172,57 @@ fun RunSingle(bugs: tBugs, faults: tFaults) {
   StartSystem(bugs, faults, scripts);
 }
 
+// Client 1: T1 checks that a1 exists and puts b1, T3 deletes b1, then a put of b1. Client 2: T2
+// puts a1, then T4 puts b1.
+fun RunClocks(bugs: tBugs) {
+  var t: seq[tTxOp];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  t += (0, Check(A1(), EXISTS));
+  t += (1, Put(B1(), NO_CONDITION, 12));
+  c1 += (0, TxOp(1, t));
+  t = default(seq[tTxOp]);
+  t += (0, Delete(B1()));
+  c1 += (1, TxOp(3, t));
+  c1 += (2, ItemOp(PUT_ITEM, B1(), 31));
+  t = default(seq[tTxOp]);
+  t += (0, Put(A1(), NO_CONDITION, 21));
+  c2 += (0, TxOp(2, t));
+  t = default(seq[tTxOp]);
+  t += (0, Put(B1(), NO_CONDITION, 41));
+  c2 += (1, TxOp(4, t));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  StartSystem(bugs, FaultsSkew(), scripts);
+}
+
+// Client 1: a single-partition transaction with no token puts b1 and b2. Client 2: T1 puts a1 and
+// b1.
+fun RunSingleShot(bugs: tBugs) {
+  var s: seq[tTxOp];
+  var t1: seq[tTxOp];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  s += (0, Put(B1(), NO_CONDITION, 51));
+  s += (1, Put(B2(), NO_CONDITION, 52));
+  t1 += (0, Put(A1(), NO_CONDITION, 11));
+  t1 += (1, Put(B1(), NO_CONDITION, 12));
+  c1 += (0, TxOp(0, s));
+  c2 += (0, TxOp(1, t1));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  StartSystem(bugs, FaultsSkew(), scripts);
+}
+
+fun FaultsSkew(): tFaults {
+  var f: tFaults;
+  f = NoFaults();
+  f.skew = true;
+  return f;
+}
+
 fun FaultsWrite(): tFaults {
   var f: tFaults;
   f = NoFaults();
@@ -196,6 +269,8 @@ machine TestConcurrentDrives { start state Init { entry { RunConcurrentDrives(No
 machine TestStale { start state Init { entry { RunWriteConflict(NoBugs(), FaultsStale(false)); } } }
 machine TestRepair { start state Init { entry { RunWriteConflict(NoBugs(), FaultsStale(true)); } } }
 machine TestHold { start state Init { entry { RunSingle(NoBugs(), FaultsHold()); } } }
+machine TestClocks { start state Init { entry { RunClocks(NoBugs()); } } }
+machine TestSingleShot { start state Init { entry { RunSingleShot(NoBugs()); } } }
 
 machine TestBugNewRowVersionFromOne {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowVersionFromOne = true; RunItems(b); } }
@@ -220,4 +295,13 @@ machine TestBugCancelInAnyState {
 }
 machine TestBugNoPreparingHold {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.noPreparingHold = true; RunSingle(b, FaultsHold()); } }
+}
+machine TestBugPrepareSkipsWatermark {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.prepareSkipsWatermark = true; RunClocks(b); } }
+}
+machine TestBugSingleShotIgnoresLock {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.singleShotIgnoresLock = true; RunSingleShot(b); } }
+}
+machine TestBugNewRowTsFromOwnStamp {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowTsFromOwnStamp = true; RunClocks(b); } }
 }

@@ -1,16 +1,17 @@
 enum tClientOpKind { PUT_ITEM, DELETE_ITEM, GET_ITEM, TRANSACT_WRITE }
 
 // One call of the caller. `key` and `value` belong to a single-item call. `token` and `items` belong
-// to transactWriteItems. After an error, transaction_commit_pending, or transaction_undecided, the
-// caller sends the same token again, up to `retries` times. With `replay`, it sends the same token
-// one more time after the final answer.
+// to transactWriteItems, and token 0 is a call with no token. After an error,
+// transaction_commit_pending, or transaction_undecided, the caller sends the same token again, up to
+// `retries` times. With `replay`, it sends the same token one more time after the final answer.
 type tClientOp = (kind: tClientOpKind, key: tKey, value: tValue, token: int, items: seq[tTxOp], retries: int, replay: bool);
 
 type tClientConfig = (topology: tTopology, coordinator: machine, env: machine, ops: seq[tClientOp]);
 
 // FokosDB in the Worker, and the caller that uses it. It sends each single-item call to the root
-// partition of the key, and each transactWriteItems to the coordinator. It sends the next call
-// after the answer.
+// partition of the key. A transactWriteItems with no token whose keys are all on one root goes to
+// that partition (#writeSingleShotFastPath), and every other one to the coordinator. It sends the
+// next call after the answer.
 machine Client {
   var topology: tTopology;
   var coordinator: machine;
@@ -46,6 +47,7 @@ machine Client {
       announce eReadResult, (client = this, reqId = resp.reqId, key = ops[resp.reqId].key, found = resp.found, value = resp.value);
       Answered(resp.reqId);
     }
+    on eExecuteSingleShotResp do (resp: tSingleShotResp) { Answered(resp.reqId); }
     on eInitiateWriteResp do (resp: tInitiateWriteResp) {
       announce eClientAnswer, (client = this, tx = resp.tx, answer = resp.answer);
       announce eCallEnded, (client = this, reqId = resp.reqId);
@@ -58,9 +60,10 @@ machine Client {
         Next();
       }
     }
+    // The single-partition path does not retry: the outcome of a failed call is unknown.
     on eRpcFailed do (f: tRpcFailed) {
       announce eCallEnded, (client = this, reqId = f.reqId);
-      if (ops[next].kind == TRANSACT_WRITE) {
+      if (ops[next].kind == TRANSACT_WRITE && ops[next].token != 0) {
         RetryOrNext();
       } else {
         Next();
@@ -72,6 +75,8 @@ machine Client {
 
   fun Send() {
     var op: tClientOp;
+    var roots: set[machine];
+    var txOp: tTxOp;
     op = ops[next];
     announce eCallStarted, (client = this, reqId = next);
     if (op.kind == PUT_ITEM) {
@@ -82,6 +87,14 @@ machine Client {
       announce eReadStart, (client = this, reqId = next, key = op.key);
       send NewRpc(this, RootOf(topology, op.key), env), eGetItem, (caller = this, reqId = next, key = op.key);
     } else {
+      foreach (txOp in op.items) {
+        roots += (RootOf(topology, txOp.key));
+      }
+      if (op.token == 0 && sizeof(roots) == 1) {
+        send NewRpc(this, RootOf(topology, op.items[0].key), env), eExecuteSingleShot, (caller = this, reqId = next, items = op.items);
+        return;
+      }
+      assert op.token != 0, "the test driver gives each transaction of the coordinator path a token";
       send NewRpc(this, coordinator, env), eInitiateWrite, (caller = this, reqId = next, token = op.token, items = op.items);
     }
   }

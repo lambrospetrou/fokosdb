@@ -73,6 +73,12 @@ machine RpcCall {
       r.caller = this;
       Deliver(r.reqId, eTxCancel, r);
     }
+    on eExecuteSingleShot do (req: tSingleShotReq) {
+      var r: tSingleShotReq;
+      r = req;
+      r.caller = this;
+      Deliver(r.reqId, eExecuteSingleShot, r);
+    }
     on eRecover do (req: tRecoverReq) {
       var r: tRecoverReq;
       r = req;
@@ -93,6 +99,7 @@ machine RpcCall {
     on eTxPrepareResp do (resp: tPrepareResp) { send caller, eTxPrepareResp, resp; Close(); }
     on eTxCommitResp do (resp: tCommitResp) { send caller, eTxCommitResp, resp; Close(); }
     on eTxCancelResp do (resp: tCancelResp) { send caller, eTxCancelResp, resp; Close(); }
+    on eExecuteSingleShotResp do (resp: tSingleShotResp) { send caller, eExecuteSingleShotResp, resp; Close(); }
     on eRecoverResp do (resp: tRecoverResp) { send caller, eRecoverResp, resp; Close(); }
     on eForceResolveResp do (resp: tForceResolveResp) { send caller, eForceResolveResp, resp; Close(); }
 
@@ -109,7 +116,7 @@ machine RpcCall {
       send target, lateEvent, latePayload;
     }
     on ePutItemResp, eDeleteItemResp, eGetItemResp, eInitiateWriteResp, eTxPrepareResp, eTxCommitResp,
-      eTxCancelResp, eRecoverResp, eForceResolveResp, eRpcBroken goto Done;
+      eTxCancelResp, eExecuteSingleShotResp, eRecoverResp, eForceResolveResp, eRpcBroken goto Done;
   }
 
   state Done {

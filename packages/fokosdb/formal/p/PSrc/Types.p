@@ -18,12 +18,60 @@ type tItemRow = (v: int, value: tValue, lastReadTs: int, lastWriteTs: int);
 //   staleCancelsOnDriving: the stale job of a partition cancels on the answer driving.
 //   cancelInAnyState: runCancel sends cancels in every state, not only in CANCELLING.
 //   noPreparingHold: runPrepareRecovery has no maxPreparingHoldMs bound.
+//   prepareSkipsWatermark: prepareLocal skips the timestamp watermark check.
+//   singleShotIgnoresLock: executeSingleShot ignores the lock of a key.
+//   newRowTsFromOwnStamp: a new row starts its timestamps at its own stamp, not at least
+//     max_delete_tx_order_ts.
 type tBugs = (newRowVersionFromOne: bool, commitOnOneAccept: bool, putIgnoresLock: bool, committedBeforeApply: bool,
-              tokenRowIgnored: bool, staleCancelsOnDriving: bool, cancelInAnyState: bool, noPreparingHold: bool);
+              tokenRowIgnored: bool, staleCancelsOnDriving: bool, cancelInAnyState: bool, noPreparingHold: bool,
+              prepareSkipsWatermark: bool, singleShotIgnoresLock: bool, newRowTsFromOwnStamp: bool);
 
 fun NoBugs(): tBugs {
   return (newRowVersionFromOne = false, commitOnOneAccept = false, putIgnoresLock = false, committedBeforeApply = false,
-          tokenRowIgnored = false, staleCancelsOnDriving = false, cancelInAnyState = false, noPreparingHold = false);
+          tokenRowIgnored = false, staleCancelsOnDriving = false, cancelInAnyState = false, noPreparingHold = false,
+          prepareSkipsWatermark = false, singleShotIgnoresLock = false, newRowTsFromOwnStamp = false);
+}
+
+// The clock of a Durable Object, as transaction order timestamps read it (txOrderTimestampNow). A
+// timestamp is (tick + 1) * TS_PER_TICK + fine + offset. The + 1 keeps it above 0 as in the code,
+// and a tick moves it above every value of the tick before. The ages of the recovery jobs use whole
+// ticks with no fine step and no offset, so the parts below do not change the recovery timing.
+//
+// The three parts model three different facts:
+//
+// - tick: the wall clock of the Environment. A tick is about staleTransactionMs, and it moves only
+//   while no call is open, because it moves the ages of the recovery jobs. Thus all the calls of a
+//   burst of requests read the same tick.
+//
+// - fine: real time that passes inside a tick. In the code, time passes between two requests, so two
+//   transactions of one coordinator can get the same timestamp (the same millisecond) or different
+//   ones. With the tick alone, every transaction of one tick gets the same timestamp. Then a second
+//   transaction on a shared key always gets timestamp_conflict, and a check with EXISTS after the
+//   put that created the item never commits. A fine step moves the clock of every Durable Object
+//   together, so it adds no skew.
+//
+// - offset: the difference between the clocks of the Durable Objects, which run on different
+//   machines. Without it, all clocks are equal. Then a prepare is never ahead of the partition, so
+//   clock_skew cannot occur. A single-item write or a single-partition transaction also never stamps
+//   below an earlier stamp of the coordinator, so MAX never absorbs a clock that lags, and the
+//   defect newRowTsFromOwnStamp cannot show. An offset that goes down also lets a later transaction
+//   get a lower timestamp.
+//
+// Each part needs its own mechanism. An offset move in every test case adds real skew, and
+// clock_skew then cancels transactions of a test case that has no skew. A fine step for one Durable
+// Object alone also adds skew. Thus the Environment makes fine steps in every test case, and offset
+// moves only in a test case with clock skew.
+fun TS_PER_TICK(): int { return 100; }
+
+// maxClockSkewMs in the unit of a timestamp. The Environment keeps each offset between 0 and
+// MAX_CLOCK_SKEW() + 1, so the real skew can pass the configured bound and clock_skew can occur.
+fun MAX_CLOCK_SKEW(): int { return 1; }
+
+type tClock = (fine: int, offset: int);
+event eClock: tClock;
+
+fun TsOf(tick: int, clock: tClock): int {
+  return (tick + 1) * TS_PER_TICK() + clock.fine + clock.offset;
 }
 
 // Time is in ticks of the clock of the Environment. These values keep the order of the defaults of the code:
@@ -70,9 +118,11 @@ event eDeleteItemResp: tDeleteItemResp;
 event eGetItem: tGetItemReq;
 event eGetItemResp: tGetItemResp;
 
-// A write transaction. Each operation is a put of one item, with an optional condition on the item.
+// A write transaction. Each operation is a put, a delete, or a check of one item, with an optional
+// condition on the item. A check always has a condition. `value` belongs to a put.
+enum tOperation { OP_PUT, OP_DELETE, OP_CHECK }
 enum tCondition { NO_CONDITION, EXISTS, NOT_EXISTS }
-type tTxOp = (key: tKey, condition: tCondition, value: tValue);
+type tTxOp = (key: tKey, operation: tOperation, condition: tCondition, value: tValue);
 
 // The answer of initiateWrite that the client gives the caller: the outcome committed or cancelled,
 // or the error transaction_commit_pending or transaction_undecided.
@@ -101,6 +151,13 @@ event eTxCommit: tCommitReq;
 event eTxCommitResp: tCommitResp;
 event eTxCancel: tCancelReq;
 event eTxCancelResp: tCancelResp;
+
+// txExecuteSingleShot and its answer: committed, or rejected with nothing written.
+type tSingleShotReq = (caller: machine, reqId: int, items: seq[tTxOp]);
+type tSingleShotResp = (reqId: int, committed: bool);
+
+event eExecuteSingleShot: tSingleShotReq;
+event eExecuteSingleShotResp: tSingleShotResp;
 
 // recoverTransactionForParticipant and its answer.
 enum tRecoverState { RECOVER_COMMITTED, RECOVER_CANCELLED, RECOVER_NOT_FOUND, RECOVER_DRIVING }
@@ -153,10 +210,16 @@ event eLogEntry: tLogEntry;
 // Monitor events.
 
 // A partition changed an item row. A put gives the new value and its v. A delete gives the v of the
-// row that it removed. `tx` is the transaction that wrote, or 0 for a single-item write. A delete of
-// an absent row changes nothing and is not announced.
+// row that it removed. `tx` is the transaction that wrote, or 0 for a single-item write and a
+// single-partition transaction. A transactional delete of an absent row gives v 0. A single-item
+// delete of an absent row changes nothing and is not announced.
 type tItemWritten = (partition: machine, key: tKey, deleted: bool, value: tValue, v: int, tx: int);
 event eItemWritten: tItemWritten;
+
+// An operation applied on a key at timestamp `ts`. `twoPhase` is false for a single-item write and
+// a single-partition transaction.
+type tStamped = (partition: machine, key: tKey, operation: tOperation, ts: int, twoPhase: bool);
+event eStamped: tStamped;
 
 // A partition wrote or deleted the lock row of a key.
 type tLockEvent = (partition: machine, key: tKey, tx: int);
@@ -179,8 +242,8 @@ event eTxCreated: int;
 event eTokenSwept: int;
 
 // The coordinator wrote COMMITTING (commit) or CANCELLING (cancel) for a transaction of a token,
-// with these keys.
-type tDecision = (tx: int, token: int, commit: bool, itemKeys: set[tKey]);
+// with these keys. `writeKeys` are the keys of its puts and deletes.
+type tDecision = (tx: int, token: int, commit: bool, itemKeys: set[tKey], writeKeys: set[tKey]);
 event eDecision: tDecision;
 
 // The coordinator wrote COMMITTED or CANCELLED.
