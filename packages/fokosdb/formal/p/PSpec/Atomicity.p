@@ -43,3 +43,35 @@ spec Atomicity observes eDecision, eApplied, eReleased, eTxCompleted {
     }
   }
 }
+
+// For each clientRequestToken, each key of its operations applies at most once, over all
+// partitions, inside the idempotency window of the token.
+spec SingleApply observes eDecision, eApplied, eTokenSwept {
+  var tokenOf: map[int, int];
+  var applied: map[int, set[tKey]];
+
+  start state Watching {
+    on eDecision do (d: tDecision) {
+      tokenOf[d.tx] = d.token;
+    }
+
+    on eTokenSwept do (token: int) {
+      applied -= (token);
+    }
+
+    on eApplied do (e: tLockEvent) {
+      var token: int;
+      // Atomicity reports an apply with no decision.
+      if (!(e.tx in tokenOf)) {
+        return;
+      }
+      token = tokenOf[e.tx];
+      if (!(token in applied)) {
+        applied[token] = default(set[tKey]);
+      }
+      assert !(e.key in applied[token]),
+        format("key {0} of token {1} applied a second time, by transaction {2}", e.key, token, e.tx);
+      applied[token] += (e.key);
+    }
+  }
+}

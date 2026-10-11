@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Compiles the P model of FokosDB and runs its test cases in Docker.
 #
-# A test case named tcBug<Id> must report a violation of the monitor that EXPECTED_MONITOR gives.
+# A test case named tcBug<Defect> must report a violation of the monitor that EXPECTED_MONITOR gives.
 # Every other test case must report no bug. The script exits non-zero on any other result.
 #
 # Usage:
@@ -9,10 +9,11 @@
 #       The random checker (default: every test case of the model).
 #   check.sh --pex [test case...] [-- <p check option>...]
 #       The exhaustive checker PEx. A test case passes only when PEx explores every state, and a
-#       tcBug<Id> test case only when PEx finds the violation.
+#       tcBug<Defect> test case only when PEx finds the violation.
 #   check.sh --replay <test case> <schedule file>
 # The script gives each option after "--" to every `p check` call without a change, for example
-# `-- --sch-pct 3 --seed 42`. The script refuses an option that it sets itself.
+# `-- --sch-pct 3 --seed 42`. The script refuses an option that it sets itself. Without them, a test
+# case in TEST_STRATEGY uses its own strategy.
 # SCHEDULES sets the number of schedules of the random checker (default 1000). PEX_TIMEOUT sets the
 # time limit of PEx for each test case, in seconds (default 60). The random checker stops at the
 # first bug, and the output gives the number of schedules and timelines that it explored.
@@ -29,10 +30,23 @@ SCHEDULES="${SCHEDULES:-1000}"
 PEX_TIMEOUT="${PEX_TIMEOUT:-60}"
 
 declare -A EXPECTED_MONITOR=(
-	[tcBugV1]=VersionIncreases
-	[tcBugW1]=Atomicity
-	[tcBugW2]=LockExclusion
-	[tcBugW3]=ReadAfterCommit
+	[tcBugNewRowVersionFromOne]=VersionIncreases
+	[tcBugCommitOnOneAccept]=Atomicity
+	[tcBugPutIgnoresLock]=LockExclusion
+	[tcBugCommittedBeforeApply]=ReadAfterCommit
+	[tcBugTokenRowIgnored]=SingleApply
+	[tcBugStaleCancelsOnDriving]=Atomicity
+	[tcBugCancelInAnyState]=Atomicity
+	[tcBugNoPreparingHold]=LocksResolve
+)
+
+# The search strategy of the random checker for a test case whose orders need many unlikely steps in
+# a row. Options after "--" replace it.
+declare -A TEST_STRATEGY=(
+	[tcStale]="--sch-fairpct 10"
+	[tcRepair]="--sch-fairpct 10"
+	[tcBugPutIgnoresLock]="--sch-fairpct 10"
+	[tcBugCancelInAnyState]="--sch-fairpct 10"
 )
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
@@ -98,7 +112,7 @@ fi
 # source location, and the monitor is the spec block that holds that line.
 violated_monitor() {
 	local line="$1" file lineno
-	if [[ "$line" =~ Monitor\ .([A-Za-z0-9_]+) ]]; then
+	if [[ "$line" =~ ([A-Za-z0-9_]+)\ detected\ liveness\ bug ]] || [[ "$line" =~ Monitor\ .([A-Za-z0-9_]+) ]]; then
 		echo "${BASH_REMATCH[1]}"
 	elif [[ "$line" =~ (PSpec/[A-Za-z0-9_]+\.p):([0-9]+) ]]; then
 		file="${BASH_REMATCH[1]}"
@@ -123,12 +137,19 @@ for tc in "${tests[@]}"; do
 		error_line() { grep -m1 'Property violated' "$log" || true; }
 		bound="time limit ${PEX_TIMEOUT}s"
 	else
-		p check -tc "$tc" -s "$SCHEDULES" -o "$outdir" "${check_options[@]}" >"$log" 2>&1 || true
+		options=("${check_options[@]}")
+		if [[ ${#options[@]} -eq 0 && -n "${TEST_STRATEGY[$tc]:-}" ]]; then
+			read -ra options <<<"${TEST_STRATEGY[$tc]}"
+		fi
+		p check -tc "$tc" -s "$SCHEDULES" -o "$outdir" "${options[@]}" >"$log" 2>&1 || true
 		clean_pattern='Found 0 bugs\.'
 		bug_pattern='Checker found a bug\.'
 		error_line() { grep -m1 -h '^<ErrorLog>' "$outdir"/BugFinding/*_0_0.txt || true; }
 		explored() { grep -m1 -oE "Explored [0-9]+ $1" "$log" | awk '{ print $2 } END { if (NR == 0) print 0 }' || true; }
 		bound="$(explored schedule) of $SCHEDULES schedules, $(explored timeline) timelines"
+		if [[ ${#check_options[@]} -eq 0 && ${#options[@]} -gt 0 ]]; then
+			bound="$bound, ${options[*]}"
+		fi
 	fi
 	secs=$(($(date +%s) - start))
 	ran=$(grep -c '^\.\. Test case :: ' "$log" || true)
@@ -153,7 +174,7 @@ for tc in "${tests[@]}"; do
 	else
 		result="ERROR: see $log"
 	fi
-	printf '%-24s %-36s %5ss  %s\n' "$tc" "$bound" "$secs" "$result"
+	printf '%-28s %-54s %5ss  %s\n' "$tc" "$bound" "$secs" "$result"
 	[[ "$result" == ok* ]] || failures=$((failures + 1))
 done
 
