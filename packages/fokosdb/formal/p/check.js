@@ -22,7 +22,7 @@ Options:
   --pex           Use the exhaustive checker PEx, not the random checker. A test case passes only when
                   PEx explores every state, and a tcBug<Defect> test case only when PEx finds the
                   violation.
-  -j, --jobs <n>  Run <n> test cases at the same time. The default is JOBS, else 1. Each run is slower
+  -j, --jobs <n>  Run <n> test cases at the same time. The default is JOBS, else 2. Each run is slower
                   when more runs share the CPU.
   --replay        Replay a schedule of the random checker, for example
                   PCheckerOutput/<test case>/BugFinding/FokosDB_0_0.schedule.
@@ -79,6 +79,7 @@ const TEST_STRATEGY = {
 	tcAbsentCheck: FAIR_PCT,
 	tcLateCheck: FAIR_PCT,
 	tcBugQuarantineStampedChecks: FAIR_PCT,
+	tcBugAbsentCheckKeepsNoStamp: FAIR_PCT,
 };
 
 // The `p check` options that the script sets itself.
@@ -261,7 +262,7 @@ async function main() {
 		pexTimeout: positiveInt("PEX_TIMEOUT", process.env.PEX_TIMEOUT ?? "60"),
 		checkOptions,
 	};
-	const jobs = Number(positiveInt("--jobs", flags.jobs ?? process.env.JOBS ?? "1"));
+	const jobs = Number(positiveInt("--jobs", flags.jobs ?? process.env.JOBS ?? "2"));
 
 	process.chdir(import.meta.dirname);
 

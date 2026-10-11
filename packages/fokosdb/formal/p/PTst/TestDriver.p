@@ -29,13 +29,14 @@ fun FINE_STEPS(): int { return 2; }
 fun OFFSET_MOVES(): int { return 3; }
 
 // The faults of a test case. `down` names the roots that drop every call. `skew` moves the offsets
-// of the clocks.
+// of the clocks. `maxTicksAfterFaults` is the number of ticks after the end of the faults and after
+// the last change of an alarm (TICKS_AFTER_FAULTS in Environment.p).
 type tFaults = (restarts: int, losses: int, answersOnly: bool, down: set[string], recoverBlackout: bool, operator: bool,
-                skew: bool);
+                skew: bool, maxTicksAfterFaults: int);
 
 fun NoFaults(): tFaults {
   return (restarts = 0, losses = 0, answersOnly = false, down = default(set[string]), recoverBlackout = false, operator = false,
-          skew = false);
+          skew = false, maxTicksAfterFaults = TICKS_AFTER_FAULTS());
 }
 
 // Root A holds hash key a, and root B holds hash key b. One coordinator, the Environment, which is
@@ -70,7 +71,7 @@ fun StartSystem(bugs: tBugs, faults: tFaults, scripts: seq[seq[tClientOp]]) {
     offsetMoves = OFFSET_MOVES();
   }
   send env, eEnvSetup, (config = (restarts = faults.restarts, losses = faults.losses, answersOnly = faults.answersOnly, down = down,
-                                  fineSteps = FINE_STEPS(), offsetMoves = offsetMoves),
+                                  fineSteps = FINE_STEPS(), offsetMoves = offsetMoves, maxTicksAfterFaults = faults.maxTicksAfterFaults),
                         dos = dos);
   if (faults.operator) {
     send operator, eOperatorSetup, (coordinator = coordinator, partitions = partitions, env = env);
@@ -294,6 +295,9 @@ fun FaultsHold(): tFaults {
   f = NoFaults();
   f.restarts = 1;
   f.down += ("b");
+  // Root b never answers, so the coordinator keeps a deadline for good, and each tick only repeats
+  // its cancel attempts to b. The locks of root a resolve within 3 ticks, and 6 keeps a margin.
+  f.maxTicksAfterFaults = 6;
   return f;
 }
 

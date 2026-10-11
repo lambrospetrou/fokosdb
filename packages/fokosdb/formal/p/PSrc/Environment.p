@@ -2,16 +2,18 @@
 // offset move. After them, every fault stops.
 fun ENVIRONMENT_STEPS(): int { return 20; }
 
-// The ticks after the end of the faults and after the last change of an alarm. A Durable Object
-// that keeps a deadline for good, such as a coordinator whose participant never answers, otherwise
-// keeps the run going for good. Each change of an alarm starts the count again, and the work of a
-// run is finite, so each run ends.
+// The default number of ticks after the end of the faults and after the last change of an alarm. A
+// Durable Object that keeps a deadline for good, such as a coordinator whose participant never
+// answers, otherwise keeps the run going for good. Each change of an alarm starts the count again,
+// and the work of a run is finite, so each run ends.
 fun TICKS_AFTER_FAULTS(): int { return 20; }
 
 // `down` holds the Durable Objects that drop every call, also after the end of the faults.
 // `fineSteps` is the number of fine steps of the clock, and `offsetMoves` the number of offset
-// moves of one Durable Object.
-type tEnvConfig = (restarts: int, losses: int, answersOnly: bool, down: set[machine], fineSteps: int, offsetMoves: int);
+// moves of one Durable Object. `maxTicksAfterFaults` is the number of ticks after the end of the
+// faults and after the last change of an alarm (TICKS_AFTER_FAULTS).
+type tEnvConfig = (restarts: int, losses: int, answersOnly: bool, down: set[machine], fineSteps: int, offsetMoves: int,
+                   maxTicksAfterFaults: int);
 type tEnvSetup = (config: tEnvConfig, dos: seq[machine]);
 event eEnvSetup: tEnvSetup;
 event eEnvStep;
@@ -149,7 +151,7 @@ machine Environment {
   }
 
   fun CanTick(): bool {
-    return openCalls == 0 && sizeof(armed) > 0 && ticksAfterFaults < TICKS_AFTER_FAULTS();
+    return openCalls == 0 && sizeof(armed) > 0 && ticksAfterFaults < config.maxTicksAfterFaults;
   }
 
   fun Wake() {

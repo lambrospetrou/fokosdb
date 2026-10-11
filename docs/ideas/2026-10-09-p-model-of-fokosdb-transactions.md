@@ -435,8 +435,9 @@ that each milestone builds.
     item (240), `timestamp_conflict` on a row that a single-item put created again after a delete (189), T1 and T2
     both committed in `tcWriteConflict` (673), and a single-partition transaction that commits (1) and one that a
     lock refuses (1173).
-  - **Search strategy.** `tcBugSingleShotIgnoresLock` and `tcBugNewRowTsFromOwnStamp` run with `--sch-fairpct 10`.
-    The random strategy found neither in 1000 schedules. In W9, client 1 sends the single-partition transaction
+  - **Search strategy.** `tcBugSingleShotIgnoresLock`, `tcBugNewRowTsFromOwnStamp`, and
+    `tcBugAbsentCheckKeepsNoStamp` run with `--sch-fairpct 10`. The random strategy found neither of the first two in
+    1000 schedules, and it missed the third in 1000 schedules with some seeds. In W9, client 1 sends the single-partition transaction
     first, and the lock of T1 comes four calls later. `tcClocks` and `tcSingleShot` also pass with
     `--sch-fairpct 10` in 3000 schedules (1309 and 1642 timelines).
   - **Not in the model.** The sub-millisecond digits of the timestamp, `update` operations, and `not_applicable` of
@@ -611,7 +612,9 @@ packages/fokosdb/formal/p/
   other Durable Object after tick `t`, and an age never looks smaller than in real time. The clock ticks only while
   some Durable Object has an alarm deadline (`eArmed`), and only while no call is open (`eRpcOpened`,
   `eRpcClosed`): a call takes milliseconds, and a tick is about `staleTransactionMs`. It stops 20 ticks after the end
-  of the faults and the last change of an alarm, so a run ends.
+  of the faults and the last change of an alarm, so a run ends. A test case can set a lower count
+  (`maxTicksAfterFaults` in `tFaults`): the faults of `tcHold` and `tcBugNoPreparingHold` use 6, because root B never
+  answers and each tick only repeats the cancel attempts to B.
 - **Timestamps (M3).** A timestamp is `(tick + 1) · TS_PER_TICK + fine + offset`, with `TS_PER_TICK` = 100. The
   `Environment` sends each fine step to every Durable Object with `eClock`, and the fine steps can come while calls
   are open. It moves the offset of one Durable Object with `eClock`, and keeps every offset from 0 to
@@ -910,7 +913,7 @@ the model of M1.
 | `tcBugPrepareSkipsWatermark` | M3 | 1000 | 1 s | `WriteSerializable` fails in schedule 3 | counterexample in 9 s |
 | `tcBugSingleShotIgnoresLock` | M3 | 1000, fair PCT | 1 s | `LockExclusion` fails in schedule 5; none in 1000 random schedules | counterexample in 110 s |
 | `tcBugNewRowTsFromOwnStamp` | M3 | 1000, fair PCT | 1 s | `WriteSerializable` fails in schedule 8; none in 1000 random schedules | not complete in 120 s |
-| `tcBugAbsentCheckKeepsNoStamp` | M3 | 1000 | 3 s | `WriteSerializable` fails in schedule 69 | — |
+| `tcBugAbsentCheckKeepsNoStamp` | M3 | 1000, fair PCT | 1 s | `WriteSerializable` fails in schedule 7; with the random strategy, the schedule changes from 69 to more than 1000 with the seed | — |
 | `tcBugQuarantineStampedChecks` | M3 | 1000, fair PCT | 5 s | `CommittedNeverQuarantined` fails in schedule 187 | — |
 
 The run time is the wall time of `check.js` for one test case, Docker start included. The schedule of a defect is
