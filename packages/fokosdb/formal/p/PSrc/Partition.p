@@ -229,7 +229,11 @@ machine Partition {
         } else if (resp.ledgerState == RECOVER_CANCELLED || (resp.ledgerState == RECOVER_DRIVING && bugs.staleCancelsOnDriving)) {
           CancelLocal(tx, rows);
         } else if (resp.ledgerState == RECOVER_NOT_FOUND) {
-          if (now - durable.pendingTx[tx].createdAt > IDEMPOTENCY_WINDOW()) {
+          // A lock older than the idempotency window gets the quarantine, except a lock of checks
+          // whose stamps already cover the transaction. That lock is what a late prepare of a
+          // committed check writes again, and a cancel is correct for either outcome.
+          if (now - durable.pendingTx[tx].createdAt > IDEMPOTENCY_WINDOW()
+              && (bugs.quarantineStampedChecks || !ChecksAlreadyStamped(tx, rows))) {
             Guard(tx);
           } else {
             CancelLocal(tx, rows);
@@ -303,9 +307,10 @@ machine Partition {
   }
 
   // TransactionParticipant.#write: one operation at `ts`. A transactional delete also raises
-  // max_delete_tx_order_ts for an absent row (bumpTxOrderTsAlways). A check raises only
-  // last_read_ts, and only of a present row (bumpItemReadTs). `tx` is 0 for a single-partition
-  // transaction.
+  // max_delete_tx_order_ts for an absent row (bumpTxOrderTsAlways). A check raises last_read_ts of a
+  // present row (bumpItemReadTs). An absent item has no row to hold the stamp, so a check of an
+  // absent item raises max_delete_tx_order_ts (bumpMaxDeleteTxOrderTs). `tx` is 0 for a
+  // single-partition transaction.
   fun ApplyOp(op: tTxOp, tx: int, ts: int, twoPhase: bool) {
     var row: tItemRow;
     if (op.operation == OP_PUT) {
@@ -321,6 +326,8 @@ machine Partition {
       row = durable.items[op.key];
       row.lastReadTs = Max(row.lastReadTs, ts);
       durable.items[op.key] = row;
+    } else if (!bugs.absentCheckKeepsNoStamp) {
+      durable.maxDeleteTxOrderTs = Max(durable.maxDeleteTxOrderTs, ts);
     }
     announce eStamped, (partition = this, key = op.key, operation = op.operation, ts = ts, twoPhase = twoPhase);
   }
@@ -356,6 +363,29 @@ machine Partition {
       durable.pendingTx -= (tx);
       UpdateAlarm();
     }
+  }
+
+  // PartitionDO.#checksAlreadyStamped: each lock row of the transaction is a check, and the stamp that
+  // a check of its item records (last_read_ts of a present item, max_delete_tx_order_ts of an absent
+  // one) is at or above the timestamp of the transaction. While the lock exists, no other request
+  // changes the item, so a commit and a cancel then leave the same state.
+  fun ChecksAlreadyStamped(tx: int, rows: seq[tKey]): bool {
+    var key: tKey;
+    var stamp: int;
+    foreach (key in rows) {
+      if (durable.locks[key].op.operation != OP_CHECK) {
+        return false;
+      }
+      if (key in durable.items) {
+        stamp = durable.items[key].lastReadTs;
+      } else {
+        stamp = durable.maxDeleteTxOrderTs;
+      }
+      if (stamp < durable.pendingTx[tx].ts) {
+        return false;
+      }
+    }
+    return true;
   }
 
   // PartitionStore.guardPendingTx: sets guarded_at one time, and logs the lock-age guard error.

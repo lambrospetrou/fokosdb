@@ -163,7 +163,9 @@ The participant (`packages/fokosdb/src/shared/partition/transaction-participant.
   when every row is a copy, and calls `recoverTransactionForParticipant` on the coordinator. After the `await`, it
   reads the rows and their owners again, and applies the answer through `dispatch`. `COMMITTED` gives a commit,
   `CANCELLED` gives a cancel, and `driving` changes nothing. `not_found` gives a cancel when the lock is no older
-  than `IDEMPOTENCY_WINDOW_MS`, and a quarantine (`guarded_at` on the `pending_tx_info` row) when it is older.
+  than `IDEMPOTENCY_WINDOW_MS`, and a quarantine (`guarded_at` on the `pending_tx_info` row) when it is older. An
+  older lock whose owned rows hold only checks, each with a stamp at or above the transaction timestamp, gets a
+  cancel and no quarantine (`#checksAlreadyStamped`, section 3.4).
 - **Coordinator.** `recoverTransactionLocal` answers from the ledger: `COMMITTED`, `CANCELLED`, `not_found` after
   the idempotency sweep, or `driving`. For `driving`, it makes the transaction and the `tx_recovery` job due now.
   The `tx_recovery` job claims due transactions and drives each one from its stored state. The `idempotency_sweep`
@@ -388,10 +390,10 @@ that each milestone builds.
 
 - **Scope.** A clock for each Durable Object with bounded skew. The timestamp rules of section 1.3.3, `clock_skew`,
   `check` operations, deletes and recreates, and `txExecuteSingleShot`.
-- **Test cases.** `tcClocks`, `tcSingleShot`, `tcBugPrepareSkipsWatermark`, `tcBugSingleShotIgnoresLock`,
-  `tcBugNewRowTsFromOwnStamp`.
-- **Delivers.** A check that the timestamp order is a serial order of the committed two-phase transactions, except for
-  a check of an absent item.
+- **Test cases.** `tcClocks`, `tcSingleShot`, `tcAbsentCheck`, `tcLateCheck`, `tcBugPrepareSkipsWatermark`,
+  `tcBugSingleShotIgnoresLock`, `tcBugNewRowTsFromOwnStamp`, `tcBugAbsentCheckKeepsNoStamp`,
+  `tcBugQuarantineStampedChecks`.
+- **Delivers.** A check that the timestamp order is a serial order of the committed two-phase transactions.
 - **Result.** Every test case gives its expected result, and every test case of M0 to M2 still gives its expected
   result. Section 4.2.13 gives the measurements. The model makes these decisions:
   - **Clock.** A timestamp is `(tick + 1) · TS_PER_TICK + fine + offset`, with `TS_PER_TICK` = 100. The `+ 1` keeps
@@ -409,26 +411,23 @@ that each milestone builds.
     above the real skew. With a configuration that breaks this rule, the model checks that safety still holds.
   - **Stamps.** The coordinator stamps a transaction with its clock when it inserts the row. A single-item write and
     a single-partition transaction stamp with the clock of the partition.
-  - **A check of an absent item adds no stamp.** `bumpItemReadTs` changes no row, and plan
-    `docs/agent-plans/2026-09-05-item-order-timestamps-and-read-revisions.md` (section 4.2.4) decides that this
-    check adds no watermark. The locks order this check against the writers of the key: each lock stays from
-    prepare to commit, and no commit starts before every prepare is accepted. Thus, in the code, a check of an
-    absent `a1` at timestamp `c`, and then a put of `a1` at a timestamp at or below `c`, both commit.
-    `WriteSerializable` records no stamp for this check, and the timestamp order is a serial order of the two-phase
-    transactions only outside this case. DynamoDB has the same rule
-    (`docs/research/atc23-idziorek-dynamodb-transactions.md`, section 3.3): a prepare for an item that does not exist
-    compares only with the partition max delete timestamp, and only a delete raises it. Section 4 of the paper needs
-    a read stamp on each item that a transaction read, for the optimizations that order by timestamp: a read
-    transaction in a single round, a single-item write that goes before a prepared transaction, and the acceptance of
-    an old timestamp. A change that adds one of these must first make the commit of a check of an absent item raise
-    `max_delete_tx_order_ts`, and must remove this exception from the monitor.
+  - **A check of an absent item raises `max_delete_tx_order_ts`.** An absent item has no row to hold the stamp of
+    the check, so its commit raises the delete watermark of the partition, on the two-phase path and on the
+    single-partition path (`docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md`).
+    `WriteSerializable` therefore records the stamp of every committed check. Without the raise, a check of an
+    absent `a1` at timestamp `c`, and then a put of `a1` at a timestamp at or below `c`, both commit: the locks give
+    the order "check, then put", and the timestamps give the reverse order. `tcBugAbsentCheckKeepsNoStamp` keeps
+    that rule as a defect, and `WriteSerializable` fails.
   - **Monitor events.** Each applied operation announces `eStamped` with its timestamp. `eDecision` carries
     `writeKeys`, so that `ReadAfterCommit` expects no written value from a check. A transactional delete of an
     absent row announces `eItemWritten` with `v` 0, because it raises `max_delete_tx_order_ts`.
   - **`tcClocks`.** Client 1 runs T1 (a check of `a1` with `EXISTS`, a put of `b1`), T3 (a delete of `b1`), and a put
     of `b1`. Client 2 runs T2 (a put of `a1`) and T4 (a put of `b1`). T1 commits only after T2 created `a1` at a
-    lower timestamp. Thus `tcClocks` covers the check of a present item, and no test case covers the check of an
-    absent item.
+    lower timestamp. Thus `tcClocks` covers the check of a present item.
+  - **`tcAbsentCheck`.** Client 1 runs T1 (a check of `a1` with `NOT_EXISTS`, a put of `b1`). Client 2 runs T2 (a
+    put of `a1`). The test case has 2 lost answers and runs with `--sch-fairpct 10`. Thus it covers a prepare of T2
+    after T1 committed, and a late prepare of the committed T1. A probe confirmed that the late prepare of T1 gets
+    `timestamp_conflict` (schedule 113 of 5000). `tcBugAbsentCheckKeepsNoStamp` runs the same clients with no fault.
   - **`tcSingleShot`.** Client 1 runs a single-partition transaction with no token that puts `b1` and `b2`. Client 2
     runs T1.
   - **Probes.** A temporary monitor that fails when a run reaches a state confirmed these orders in 3000 random
@@ -444,16 +443,26 @@ that each milestone builds.
     the single-partition path, because the topology does not change before M5. `ReadAfterCommit` and
     `AnswerMatchesDecision` do not check the answer of a single-partition transaction, because it has no
     coordinator transaction.
-  - **Finding: a late prepare of a committed check locks the key again.** A probe with a check of an absent `a1`, a
-    put of `b1`, and 2 lost answers found this order with `--sch-fairpct 10` in schedule 1177. The answer of the
-    first prepare to `A` gets lost, and the retry is accepted. T1 commits and completes. Then the first prepare
-    reaches `A`. The watermark of a check is `last_write_ts`, or `max_delete_tx_order_ts` for an absent item, and the
-    commit of a check raises neither. Thus the prepare passes, and it writes the lock again. The stale job gets
-    `COMMITTED` and applies the check a second time, and `SingleApply` fails. The second apply changes only
-    `last_read_ts`, with `MAX`. But until the stale job runs, the lock refuses every writer of the key. The code has
-    the same rules (`prepareLocal`, `bumpItemReadTs`), also for a check of a present item.
-  - `TODO: the author decides whether the late prepare of a committed check is a defect. If it is, it gets a vitest
-    regression test and a fix in a separate plan. Otherwise, SingleApply does not count a second apply of a check.`
+  - **Finding: a late prepare of a committed check of a present item locks the key again.** A probe with a put of
+    `a1`, then T1 (a check of `a1` with `EXISTS`, a put of `b1`), and 2 lost answers found this order with
+    `--sch-fairpct 10` in schedule 61. The answer of the first prepare to `A` gets lost, and the retry is accepted.
+    T1 commits and completes. Then the first prepare reaches `A`. The watermark of a check of a present item is
+    `last_write_ts`, and the commit of a check raises only `last_read_ts`. Thus the prepare passes, and it writes the
+    lock again. The code has the same rules (`prepareLocal`, `bumpItemReadTs`). For a check of an absent item, the
+    raise of `max_delete_tx_order_ts` stops the late prepare, and `tcAbsentCheck` covers it. A single item timestamp,
+    as in DynamoDB, also stops it, but then two checks of one item conflict again. The finding has two results:
+    - **The duplicate lock is accepted.** The stale job gets `COMMITTED` and applies the check a second time. The
+      second apply changes only `last_read_ts`, with `MAX`, which is already at the timestamp of the transaction.
+      Until the stale job runs, the lock refuses every writer of the key. `SingleApply` therefore counts only puts
+      and deletes, and `Atomicity` lets a cancel release a lock of a committed transaction after its key applied.
+    - **The duplicate lock is never quarantined.** When the coordinator swept the transaction before the stale job
+      reached the lock, the answer is `not_found` for a lock older than the idempotency window. The code then
+      cancels a lock whose owned rows hold only checks, each with a stamp at or above the transaction timestamp
+      (`#checksAlreadyStamped` in `do-partition.ts`), and quarantines every other one. While the lock exists, no
+      other request changes the item, so a commit and a cancel leave the same state. The monitor
+      `CommittedNeverQuarantined` checks the rule. `tcLateCheck` adds the coordinator blackout of `tcStale` to the
+      probe, and `tcBugQuarantineStampedChecks` keeps the old quarantine as a defect. The vitest regression tests are
+      in `packages/fokosdb/test/partition-do/tx-stale-recovery.test.ts`.
 
 ### 3.5 M4 — Read transactions
 
@@ -755,12 +764,13 @@ These rules start in M5. Before M5, each root partition owns every key of its ha
 | Monitor | From | Rule | Events it observes |
 | --- | --- | --- | --- |
 | `VersionIncreases` | M0 | On each key, over all partitions, each new value has a `v` above every earlier `v` of the key, also after a delete and a recreate. | `eItemWritten` |
-| `Atomicity` | M1 | No key of a transaction applies when the decision is cancel. No owned lock of a transaction is released by a cancel when the decision is commit. When a transaction reaches `COMMITTED`, every key of it has applied. | `eDecision`, `eApplied`, `eReleased`, `eTxCompleted` |
+| `Atomicity` | M1 | No key of a transaction applies when the decision is cancel. No owned lock of a transaction is released by a cancel when the decision is commit, before its key applied. After that, a lock of the key is a duplicate that a late prepare wrote (section 3.4). When a transaction reaches `COMMITTED`, every key of it has applied. | `eDecision`, `eApplied`, `eReleased`, `eTxCompleted` |
 | `AnswerMatchesDecision` | M1 | The client gets `committed` only for a transaction in `COMMITTED`, and `cancelled` only for a transaction with the decision cancel. | `eDecision`, `eTxCompleted`, `eClientAnswer` |
 | `LockExclusion` | M1 | While a transaction holds the lock of a key, no other writer changes the key. | `eLockWritten`, `eLockDeleted`, `eItemWritten` |
+| `CommittedNeverQuarantined` | M3 | The stale job never quarantines a lock of a transaction that reached `COMMITTED`. | `eTxCompleted`, `eLockGuarded` |
 | `ReadAfterCommit` | M1 | A read that starts after the client got `committed` returns, for each key of that transaction, the value of that transaction or of a later writer. M4 extends it from `getItem` to `transactGetItems`. | `eClientAnswer`, `eReadStart`, `eReadResult` |
-| `SingleApply` | M2 | For each `clientRequestToken`, each key of its operations applies at most once, over all partitions, inside the idempotency window of the token. | `eDecision`, `eApplied`, `eTokenSwept` |
-| `WriteSerializable` | M3 | On each key, a committed write of a two-phase transaction has a timestamp above the stamp of every earlier committed read or write of the key. A committed `check` has a timestamp above the stamp of every earlier committed write. A single-item write and a single-partition transaction add their stamps, but the rule does not apply to them, because `MAX` absorbs a clock that lags. A `check` of an absent item adds no stamp, because the code keeps no watermark for it, and the locks order it (section 3.4). Thus the timestamp order is a serial order of the two-phase transactions, except for a `check` of an absent item. | `eStamped`, `eItemWritten` |
+| `SingleApply` | M2 | For each `clientRequestToken`, each key of its puts and deletes applies at most once, over all partitions, inside the idempotency window of the token. A `check` is not counted, because a second apply of it changes nothing (section 3.4). | `eDecision`, `eApplied`, `eTokenSwept` |
+| `WriteSerializable` | M3 | On each key, a committed write of a two-phase transaction has a timestamp above the stamp of every earlier committed read or write of the key. A committed `check` has a timestamp above the stamp of every earlier committed write. A single-item write and a single-partition transaction add their stamps, but the rule does not apply to them, because `MAX` absorbs a clock that lags. A `check` of an absent item also adds its stamp, because its commit raises `max_delete_tx_order_ts`. Thus the timestamp order is a serial order of the two-phase transactions. | `eStamped` |
 | `ReadSerializable` | M4 | The result of a read transaction equals the state after some prefix of some serial order of the writers. | `eItemWritten`, `eReadStart`, `eReadResult` |
 | `Authority` | M5 | A lock, an apply, a release, or a guard of an owned row happens only on the current owner of the key, and never on an importing target. | `eLocalTxMutation`, `eOwnerChanged`, `eImportState` |
 | `CopiesUntouched` | M5 | No commit, cancel, quarantine, or repair deletes or changes a transfer copy. | `eCopyChanged` |
@@ -808,6 +818,8 @@ runs every test case whose name starts with the given name.
 | W8 | M3 | `tcBugPrepareSkipsWatermark` | `prepareLocal` skips the timestamp watermark check. | `WriteSerializable` | section 1.3.3 |
 | W9 | M3 | `tcBugSingleShotIgnoresLock` | `executeSingleShot` ignores the lock. | `LockExclusion` | `executeSingleShot` |
 | W10 | M3 | `tcBugNewRowTsFromOwnStamp` | A new row starts its timestamps at its own stamp, not at least `max_delete_tx_order_ts`. | `WriteSerializable` | section 1.3.3 |
+| W11 | M3 | `tcBugAbsentCheckKeepsNoStamp` | The commit of a `check` of an absent item does not raise `max_delete_tx_order_ts`. | `WriteSerializable` | `docs/agent-plans/2026-10-11-absent-check-raises-delete-watermark.md` |
+| W12 | M3 | `tcBugQuarantineStampedChecks` | The stale job quarantines an over-age `not_found` lock also when it holds only checks whose stamps already cover the transaction. | `CommittedNeverQuarantined` | section 3.4, the finding |
 | R1 | M4 | — | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
 | R2 | M4 | — | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
 | R3 | M4 | — | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
@@ -848,6 +860,8 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcHold` | T1 puts `a1`, `b1` | `B` drops every call; 1 restart | pass |
 | `tcClocks` | client 1: T1 checks `a1` with `exists` and puts `b1`, T3 deletes `b1`, then a put of `b1`; client 2: T2 puts `a1`, then T4 puts `b1` | clock skew: 3 offset moves | pass |
 | `tcSingleShot` | client 1: a single-partition transaction with no token puts `b1`, `b2`; client 2: T1 puts `a1`, `b1` | clock skew: 3 offset moves | pass |
+| `tcAbsentCheck` | client 1: T1 checks `a1` with `not_exists` and puts `b1`; client 2: T2 puts `a1` | 2 lost answers | pass |
+| `tcLateCheck` | a put of `a1`, then T1 checks `a1` with `exists` and puts `b1` | 2 lost answers; the coordinator drops `recoverTransactionForParticipant` until the sweep deleted the transaction | pass |
 | `tcReadHappy` | R1 reads `a1`, `b1` after T1 | none | pass |
 | `tcReadVsWrites` | W1 creates `a1`, puts `b1`; W2 deletes `a1`, puts `b2`; R1 reads `a1`, `b1`, `b2` | none | pass |
 | `tcReadFaults` | as `tcReadVsWrites` | 2 restarts, 2 lost calls | pass |
@@ -891,9 +905,13 @@ the model of M1.
 | `tcBugNoPreparingHold` | M2 | 1000 | 5 s | `LocksResolve` fails in schedule 28 | counterexample in 22 s |
 | `tcClocks` | M3 | 1000 | 44 s | no bug; 339 timelines | — |
 | `tcSingleShot` | M3 | 1000 | 23 s | no bug; 284 timelines | not complete in 120 s |
+| `tcAbsentCheck` | M3 | 1000, fair PCT | 30 s | no bug; 969 timelines | — |
+| `tcLateCheck` | M3 | 1000, fair PCT | 25 s | no bug; 719 timelines | — |
 | `tcBugPrepareSkipsWatermark` | M3 | 1000 | 1 s | `WriteSerializable` fails in schedule 3 | counterexample in 9 s |
 | `tcBugSingleShotIgnoresLock` | M3 | 1000, fair PCT | 1 s | `LockExclusion` fails in schedule 5; none in 1000 random schedules | counterexample in 110 s |
 | `tcBugNewRowTsFromOwnStamp` | M3 | 1000, fair PCT | 1 s | `WriteSerializable` fails in schedule 8; none in 1000 random schedules | not complete in 120 s |
+| `tcBugAbsentCheckKeepsNoStamp` | M3 | 1000 | 3 s | `WriteSerializable` fails in schedule 69 | — |
+| `tcBugQuarantineStampedChecks` | M3 | 1000, fair PCT | 5 s | `CommittedNeverQuarantined` fails in schedule 187 | — |
 
 The run time is the wall time of `check.sh` for one test case, Docker start included. The schedule of a defect is
 from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
@@ -937,7 +955,7 @@ P does not run the TypeScript code. The model links to the code in two ways:
 #### 4.2.16 Cost
 
 The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M3, `pnpm formal:p`
-takes about 7 minutes for the 22 test cases. `pnpm formal:p --pex` stops each test case that it cannot complete at
+takes about 9 minutes for the 26 test cases. `pnpm formal:p --pex` stops each test case that it cannot complete at
 `PEX_TIMEOUT`, so run it on chosen test cases. The first run also builds the Docker image, which takes about 1
 minute. Section 4.2.13 records the run time of each test case.
 

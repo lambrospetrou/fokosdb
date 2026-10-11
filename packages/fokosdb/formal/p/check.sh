@@ -41,6 +41,8 @@ declare -A EXPECTED_MONITOR=(
 	[tcBugPrepareSkipsWatermark]=WriteSerializable
 	[tcBugSingleShotIgnoresLock]=LockExclusion
 	[tcBugNewRowTsFromOwnStamp]=WriteSerializable
+	[tcBugAbsentCheckKeepsNoStamp]=WriteSerializable
+	[tcBugQuarantineStampedChecks]=CommittedNeverQuarantined
 )
 
 # The search strategy of the random checker for a test case whose orders need many unlikely steps in
@@ -52,6 +54,9 @@ declare -A TEST_STRATEGY=(
 	[tcBugCancelInAnyState]="--sch-fairpct 10"
 	[tcBugSingleShotIgnoresLock]="--sch-fairpct 10"
 	[tcBugNewRowTsFromOwnStamp]="--sch-fairpct 10"
+	[tcAbsentCheck]="--sch-fairpct 10"
+	[tcLateCheck]="--sch-fairpct 10"
+	[tcBugQuarantineStampedChecks]="--sch-fairpct 10"
 )
 
 if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then

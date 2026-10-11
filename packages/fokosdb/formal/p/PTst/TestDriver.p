@@ -197,6 +197,43 @@ fun RunClocks(bugs: tBugs) {
   StartSystem(bugs, FaultsSkew(), scripts);
 }
 
+// Client 1: T1 checks that a1 does not exist and puts b1. Client 2: T2 puts a1. When T1 commits
+// first, T2 can still prepare a1 later at a timestamp at or below the one of T1.
+fun RunAbsentCheck(bugs: tBugs, faults: tFaults) {
+  var t1: seq[tTxOp];
+  var t2: seq[tTxOp];
+  var c1: seq[tClientOp];
+  var c2: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  t1 += (0, Check(A1(), NOT_EXISTS));
+  t1 += (1, Put(B1(), NO_CONDITION, 12));
+  t2 += (0, Put(A1(), NO_CONDITION, 21));
+  c1 += (0, TxOp(1, t1));
+  c2 += (0, TxOp(2, t2));
+  scripts += (0, c1);
+  scripts += (1, c2);
+  StartSystem(bugs, faults, scripts);
+}
+
+// One client: a put of a1, then T1 checks that a1 exists and puts b1. A lost answer of the prepare
+// to A lets the first prepare arrive after T1 committed, and lock a1 again. The coordinator drops
+// recoverTransactionForParticipant until it swept T1, so the stale job then gets not_found for a
+// lock older than the idempotency window.
+fun RunLateCheck(bugs: tBugs) {
+  var t1: seq[tTxOp];
+  var c1: seq[tClientOp];
+  var scripts: seq[seq[tClientOp]];
+  var f: tFaults;
+  t1 += (0, Check(A1(), EXISTS));
+  t1 += (1, Put(B1(), NO_CONDITION, 12));
+  c1 += (0, ItemOp(PUT_ITEM, A1(), 5));
+  c1 += (1, TxOp(1, t1));
+  scripts += (0, c1);
+  f = FaultsStale(false);
+  f.answersOnly = true;
+  StartSystem(bugs, f, scripts);
+}
+
 // Client 1: a single-partition transaction with no token puts b1 and b2. Client 2: T1 puts a1 and
 // b1.
 fun RunSingleShot(bugs: tBugs) {
@@ -271,6 +308,8 @@ machine TestRepair { start state Init { entry { RunWriteConflict(NoBugs(), Fault
 machine TestHold { start state Init { entry { RunSingle(NoBugs(), FaultsHold()); } } }
 machine TestClocks { start state Init { entry { RunClocks(NoBugs()); } } }
 machine TestSingleShot { start state Init { entry { RunSingleShot(NoBugs()); } } }
+machine TestAbsentCheck { start state Init { entry { RunAbsentCheck(NoBugs(), FaultsRetry()); } } }
+machine TestLateCheck { start state Init { entry { RunLateCheck(NoBugs()); } } }
 
 machine TestBugNewRowVersionFromOne {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowVersionFromOne = true; RunItems(b); } }
@@ -304,4 +343,11 @@ machine TestBugSingleShotIgnoresLock {
 }
 machine TestBugNewRowTsFromOwnStamp {
   start state Init { entry { var b: tBugs; b = NoBugs(); b.newRowTsFromOwnStamp = true; RunClocks(b); } }
+}
+machine TestBugQuarantineStampedChecks {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.quarantineStampedChecks = true; RunLateCheck(b); } }
+}
+// The defect needs no fault: a prepare of T2 after T1 committed is enough.
+machine TestBugAbsentCheckKeepsNoStamp {
+  start state Init { entry { var b: tBugs; b = NoBugs(); b.absentCheckKeepsNoStamp = true; RunAbsentCheck(b, NoFaults()); } }
 }

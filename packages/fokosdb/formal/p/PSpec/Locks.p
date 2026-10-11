@@ -1,3 +1,23 @@
+// The stale job never quarantines a lock of a transaction that reached COMMITTED. The quarantine waits
+// for an operator, and is for a lock whose outcome the partition cannot know. A lock of a committed
+// transaction can stay only as a duplicate that a late prepare of a check wrote, and its checks
+// already applied.
+spec CommittedNeverQuarantined observes eTxCompleted, eLockGuarded {
+  var committed: set[int];
+
+  start state Watching {
+    on eTxCompleted do (c: tTxCompleted) {
+      if (c.committed) {
+        committed += (c.tx);
+      }
+    }
+
+    on eLockGuarded do (g: tTxGuarded) {
+      assert !(g.tx in committed), format("a partition quarantined a lock of transaction {0}, which is COMMITTED", g.tx);
+    }
+  }
+}
+
 // While a transaction holds the lock of a key on a partition, no other writer changes the key there,
 // and no other transaction takes the lock.
 spec LockExclusion observes eLockWritten, eLockDeleted, eItemWritten {

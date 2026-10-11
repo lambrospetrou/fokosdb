@@ -1199,6 +1199,44 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 					const lockCreatedAt = Math.min(...ownedRows.map((pending) => pending.created_at));
 					const lockAgeMs = now - lockCreatedAt;
 					if (lockAgeMs > IDEMPOTENCY_WINDOW_MS) {
+						// A late prepare of a committed check can leave a lock that holds no decision:
+						//
+						//   1. The coordinator sends the prepare of a check of a present item. The answer gets
+						//      lost, and the coordinator sends the prepare again. The first request is still in
+						//      flight.
+						//   2. The second prepare locks the key. The transaction commits, and this partition
+						//      applies the check (last_read_ts rises to the timestamp T) and deletes the lock.
+						//   3. The first prepare arrives now. It finds no lock of its transaction, so it is a
+						//      new prepare to this partition. A check compares T only with last_write_ts, and
+						//      the commit raised only last_read_ts, so the prepare passes and locks the key
+						//      again.
+						//
+						// The stale job normally gets COMMITTED and releases this lock. But when the
+						// coordinator has swept the transaction and the lock is older than the idempotency
+						// window, the answer is not_found, and the lock must not be quarantined for an
+						// operator: it refuses every writer of the key and has nothing to resolve. A put, an
+						// update, or a delete in the same request makes the late prepare fail
+						// (timestamp_conflict), so only a lock whose rows here are all checks gets here.
+						//
+						// Such a lock can be released with no decision. While a lock exists, no other request
+						// changes its item, so the stamps below are the stamps from before the lock, plus the
+						// commit of this transaction if it applied here. A check writes only its stamp. When
+						// the stamp is already at or above T, a commit changes nothing, and a cancel changes
+						// nothing, so a cancel is correct for either outcome of the transaction. When the
+						// stamp is below T, the check did not apply here, and the quarantine stays.
+						if (this.#checksAlreadyStamped(ownedRows)) {
+							console.warn({
+								...this.logParams(),
+								message: "fokos/partition: released an over-age not_found lock of checks that are already stamped",
+								transactionId: row.transaction_id,
+								coordinatorDoName,
+								idempotencyToken,
+								keys: ownedRows.map((pending) => KeyCodec.pairForLog(pending.hk, pending.sk)),
+								lockAgeMs,
+							});
+							await this.fokos.dispatch("txCancel", ctx, { transactionId: row.transaction_id, items });
+							continue;
+						}
 						if (this.#store.guardPendingTx(row.transaction_id, now)) {
 							console.error({
 								...this.logParams(),
@@ -1228,6 +1266,23 @@ export class PartitionDO extends DurableObject implements PartitionRpc {
 				});
 			}
 		}
+	}
+
+	/**
+	 * True when each row holds only checks, and the stamp that a check of its item records is at or above
+	 * the timestamp of the transaction: last_read_ts of a present item, and max_delete_tx_order_ts of an
+	 * absent item. The caller must not await between this read and the release that depends on it.
+	 */
+	#checksAlreadyStamped(rows: ReturnType<PartitionStore["listPendingTxItems"]>): boolean {
+		let maxDeleteTxOrderTs: number | undefined;
+		return rows.every((pending) => {
+			if (!pending.op_list.every(([, operation]) => operation === "check")) {
+				return false;
+			}
+			const stamp = this.#store.getItemStamp(pending.hk, pending.sk).row;
+			const recorded = stamp ? stamp.last_read_ts : (maxDeleteTxOrderTs ??= this.#store.getMaxDeleteTxOrderTs());
+			return recorded >= pending.transaction_ts;
+		});
 	}
 
 	/** The rows of `rows` that this partition owns now, with one owner check for each hash key. */

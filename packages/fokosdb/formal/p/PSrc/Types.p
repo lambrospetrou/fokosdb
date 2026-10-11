@@ -22,14 +22,20 @@ type tItemRow = (v: int, value: tValue, lastReadTs: int, lastWriteTs: int);
 //   singleShotIgnoresLock: executeSingleShot ignores the lock of a key.
 //   newRowTsFromOwnStamp: a new row starts its timestamps at its own stamp, not at least
 //     max_delete_tx_order_ts.
+//   absentCheckKeepsNoStamp: the commit of a check of an absent item does not raise
+//     max_delete_tx_order_ts.
+//   quarantineStampedChecks: the stale job quarantines an over-age not_found lock also when it holds
+//     only checks whose stamps already cover the transaction.
 type tBugs = (newRowVersionFromOne: bool, commitOnOneAccept: bool, putIgnoresLock: bool, committedBeforeApply: bool,
               tokenRowIgnored: bool, staleCancelsOnDriving: bool, cancelInAnyState: bool, noPreparingHold: bool,
-              prepareSkipsWatermark: bool, singleShotIgnoresLock: bool, newRowTsFromOwnStamp: bool);
+              prepareSkipsWatermark: bool, singleShotIgnoresLock: bool, newRowTsFromOwnStamp: bool,
+              absentCheckKeepsNoStamp: bool, quarantineStampedChecks: bool);
 
 fun NoBugs(): tBugs {
   return (newRowVersionFromOne = false, commitOnOneAccept = false, putIgnoresLock = false, committedBeforeApply = false,
           tokenRowIgnored = false, staleCancelsOnDriving = false, cancelInAnyState = false, noPreparingHold = false,
-          prepareSkipsWatermark = false, singleShotIgnoresLock = false, newRowTsFromOwnStamp = false);
+          prepareSkipsWatermark = false, singleShotIgnoresLock = false, newRowTsFromOwnStamp = false,
+          absentCheckKeepsNoStamp = false, quarantineStampedChecks = false);
 }
 
 // The clock of a Durable Object, as transaction order timestamps read it (txOrderTimestampNow). A

@@ -5,12 +5,13 @@ import { KeyCodec } from "../../src/sharding/key-codec.js";
 import type { PartitionDO } from "../../src/server/do-partition.js";
 import type { TransactionCoordinatorDO } from "../../src/server/do-transaction-coordinator.js";
 import * as doStubs from "../../src/shared/do-stubs.js";
-import { testCoordinatorContext, testCoordinatorStubByName, testPartitionStub } from "../stub-helpers.js";
+import { testCoordinatorContext, testCoordinatorRef, testCoordinatorStubByName, testPartitionStub } from "../stub-helpers.js";
 import type { FokosDBRouteContext } from "../../src/shared/partition-context.js";
 import { PartitionIdHelper } from "../../src/sharding/partition-id.js";
 import { refOf } from "../../src/sharding/route-context.js";
 import { DEFAULT_STALE_TRANSACTION_MS, IDEMPOTENCY_WINDOW_MS } from "../../src/shared/transaction-limits.js";
 import { PartitionStore } from "../../src/shared/partition/partition-store.js";
+import { conditionTree } from "../../src/shared/expression/test-fixtures.js";
 import { FOKOS_KV_KEYS, FokosShardingStore } from "../../src/sharding/sharding-store.js";
 import type { FokosImportRecord } from "../../src/sharding/repartition-types.js";
 import { captureConsoleError, kb, makeStub } from "./helpers.js";
@@ -26,19 +27,27 @@ describe("PartitionDO — stale transaction recovery", () => {
 		state: DurableObjectState,
 		transactionId: string,
 		coordinator: FokosDBRouteContext,
-		options?: { createdAt?: number; hashKey?: string; data?: string; guardedAt?: number | null; transactionTimestamp?: number },
+		options?: {
+			createdAt?: number;
+			hashKey?: string;
+			data?: string;
+			guardedAt?: number | null;
+			transactionTimestamp?: number;
+			operation?: "put" | "check";
+		},
 	): PartitionStore {
 		const createdAt = options?.createdAt ?? Date.now() - 10_000;
+		const operation = options?.operation ?? "put";
 		const store = new PartitionStore(state.storage);
 		store.insertPendingLock({
 			hk: kb(options?.hashKey ?? `stale-${transactionId}`),
 			sk: kb("sk"),
 			transaction_id: transactionId,
 			transaction_ts: options?.transactionTimestamp ?? createdAt,
-			operation: "put",
-			op_list: [[0, "put"] as [number, "put"]],
-			data: options?.data ?? "value",
-			kind: "text",
+			operation,
+			op_list: [[0, operation]],
+			data: operation === "put" ? (options?.data ?? "value") : null,
+			kind: operation === "put" ? "text" : null,
 			ttl_epoch_utc_seconds: null,
 			coordinator_json: JSON.stringify({ v: 1, doName: coordinator.doName, idempotencyToken: `token-${transactionId}` }),
 			created_at: createdAt,
@@ -247,6 +256,99 @@ describe("PartitionDO — stale transaction recovery", () => {
 			windowMs: IDEMPOTENCY_WINDOW_MS,
 			doName: ctx.doName,
 			partitionId: ctx.partitionId,
+		});
+	});
+
+	// The answer of the first prepare gets lost, the second prepare commits, and the first prepare then
+	// arrives. A check compares its timestamp only with last_write_ts, which its commit does not raise,
+	// so the late prepare locks the key again. When the coordinator has swept the transaction, the
+	// stale job must release that lock, and not quarantine it.
+	it("releases, and does not quarantine, the lock that a late prepare of a committed check writes again", async () => {
+		const { ctx, stub, rpc } = makeStub();
+		const recoverTransaction = mockCoordinatorRecovery();
+		const consoleError = captureConsoleError();
+		const key = { hashKey: kb("late-check"), sortKey: kb("sk") };
+		await rpc.apiPutItem(ctx, { ...key, data: "v", kind: "text" });
+
+		const transactionId = crypto.randomUUID();
+		const transactionTimestamp = (Date.now() + 1) * 1000;
+		const prepare = {
+			transactionId,
+			transactionTimestamp,
+			coordinator: testCoordinatorRef(`token-${transactionId}`),
+			items: [{ ...key, opIndex: 0, operation: "check" as const, condition: conditionTree({ op: "exists", args: [{ ref: "hashKey" }] }) }],
+		};
+		expect(await rpc.txPrepare(ctx, prepare)).toEqual({ outcome: "accepted" });
+		expect(await rpc.txCommit(ctx, { transactionId, transactionTimestamp, items: [key] })).toEqual({ outcome: "committed" });
+		expect(await rpc.txPrepare(ctx, prepare)).toEqual({ outcome: "accepted" });
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			const store = new PartitionStore(state.storage);
+			const [lock] = store.listPendingTxItems(transactionId);
+			expect(lock).toBeDefined();
+			// The coordinator answers not_found, as after its sweep, and the lock is older than the window.
+			const now = lock.created_at + IDEMPOTENCY_WINDOW_MS + 1;
+			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			state.storage.sql.exec(`UPDATE pending_tx_info SET next_recovery_at = 0 WHERE transaction_id = ?`, transactionId);
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			expect(store.listPendingTxKeys(transactionId)).toHaveLength(0);
+			expect(store.getItemStamp(key.hashKey, key.sortKey).row?.last_read_ts).toBe(transactionTimestamp);
+		});
+		expect(recoverTransaction).toHaveBeenCalledTimes(1);
+		expect(consoleError.withMessage(LOCK_AGE_GUARD_LOG).filter((log) => log.transactionId === transactionId)).toHaveLength(0);
+	});
+
+	it("releases an over-age not_found check lock of an absent item when max_delete_tx_order_ts already covers it", async () => {
+		const now = Date.now();
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		mockCoordinatorRecovery();
+		const transactionId = crypto.randomUUID();
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			const store = insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+				createdAt: now - IDEMPOTENCY_WINDOW_MS - 1,
+				operation: "check",
+				transactionTimestamp: 5,
+			});
+			store.bumpMaxDeleteTxOrderTs(5);
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			expect(store.listPendingTxKeys(transactionId)).toHaveLength(0);
+		});
+	});
+
+	// A check below its stamp did not apply here, and a put holds a decision that only the coordinator
+	// knows. Neither lock can be released without a decision.
+	it.each([
+		["a check whose stamp is below the transaction timestamp", false],
+		["a check and a put", true],
+	])("quarantines an over-age not_found lock of %s", async (_name, withPut) => {
+		const now = Date.now();
+		const { ctx, stub, rpc } = makeStub();
+		await rpc.status(ctx);
+		mockCoordinatorRecovery();
+		const transactionId = crypto.randomUUID();
+		const createdAt = now - IDEMPOTENCY_WINDOW_MS - 1;
+
+		await runInDurableObject(stub, async (instance: PartitionDO, state: DurableObjectState) => {
+			vi.spyOn(instance, "fokosNow").mockReturnValue(now);
+			const store = new PartitionStore(state.storage);
+			// The checked item has a stamp of 10. With a put in the request, the check alone is covered.
+			store.upsertItem({ hk: kb(`checked-${transactionId}`), sk: kb("sk"), data: "v", kind: "text", ttlAt: null, txOrderTs: 10 });
+			const transactionTimestamp = withPut ? 10 : 11;
+			insertStalePendingLock(state, transactionId, testCoordinatorContext(), {
+				createdAt,
+				hashKey: `checked-${transactionId}`,
+				operation: "check",
+				transactionTimestamp,
+			});
+			if (withPut) {
+				insertStalePendingLock(state, transactionId, testCoordinatorContext(), { createdAt, transactionTimestamp });
+			}
+			await instance.alarm({ isRetry: false, retryCount: 0, scheduledTime: now });
+			expect(store.listPendingTxKeys(transactionId)).toHaveLength(withPut ? 2 : 1);
+			expect(store.listPendingTxItems(transactionId)[0].guarded_at).toBe(now);
 		});
 	});
 

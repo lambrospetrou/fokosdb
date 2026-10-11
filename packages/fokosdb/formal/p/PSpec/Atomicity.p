@@ -1,6 +1,8 @@
 // A write transaction applies on all its items or on none:
 // - No key of a transaction applies when the decision is cancel.
-// - No lock of a transaction is released by a cancel when the decision is commit.
+// - No lock of a transaction is released by a cancel when the decision is commit, before the key of
+//   the lock applied. After the key applied, a lock of the same key is a duplicate that a late
+//   prepare wrote, and it holds nothing that a cancel can lose.
 // - When a transaction reaches COMMITTED, every key of it has applied.
 spec Atomicity observes eDecision, eApplied, eReleased, eTxCompleted {
   var decisions: map[int, tDecision];
@@ -27,8 +29,8 @@ spec Atomicity observes eDecision, eApplied, eReleased, eTxCompleted {
     }
 
     on eReleased do (e: tLockEvent) {
-      assert !(e.tx in decisions && decisions[e.tx].commit),
-        format("a cancel released key {0} of transaction {1}, but the decision is commit", e.key, e.tx);
+      assert !(e.tx in decisions && decisions[e.tx].commit) || (e.tx in applied && e.key in applied[e.tx]),
+        format("a cancel released key {0} of transaction {1}, but the decision is commit and the key has not applied", e.key, e.tx);
       if (!(e.tx in released)) {
         released[e.tx] = default(set[tKey]);
       }
@@ -44,15 +46,19 @@ spec Atomicity observes eDecision, eApplied, eReleased, eTxCompleted {
   }
 }
 
-// For each clientRequestToken, each key of its operations applies at most once, over all
-// partitions, inside the idempotency window of the token.
+// For each clientRequestToken, each key of its puts and deletes applies at most once, over all
+// partitions, inside the idempotency window of the token. A check is not counted: its apply only
+// raises a stamp with MAX, so a second apply changes nothing. A late prepare of a committed check can
+// lock the key again, and the stale job then applies the check a second time.
 spec SingleApply observes eDecision, eApplied, eTokenSwept {
   var tokenOf: map[int, int];
+  var writeKeys: map[int, set[tKey]];
   var applied: map[int, set[tKey]];
 
   start state Watching {
     on eDecision do (d: tDecision) {
       tokenOf[d.tx] = d.token;
+      writeKeys[d.tx] = d.writeKeys;
     }
 
     on eTokenSwept do (token: int) {
@@ -62,7 +68,7 @@ spec SingleApply observes eDecision, eApplied, eTokenSwept {
     on eApplied do (e: tLockEvent) {
       var token: int;
       // Atomicity reports an apply with no decision.
-      if (!(e.tx in tokenOf)) {
+      if (!(e.tx in tokenOf) || !(e.key in writeKeys[e.tx])) {
         return;
       }
       token = tokenOf[e.tx];
