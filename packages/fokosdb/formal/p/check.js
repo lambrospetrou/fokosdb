@@ -11,7 +11,8 @@ import { parseArgs } from "node:util";
 const USAGE = `Compiles the P model of FokosDB and runs its test cases in Docker.
 
 Usage:
-  check.js [--pex] [--jobs <n>] [test case...] [-- <p check option>...]
+  check.js [--pex] [--jobs <n>] [--schedules <n>] [test case...] [-- <p check option>...]
+  check.js --both-strategies [--jobs <n>] [--schedules <n>] [test case...]
   check.js --replay <test case> <schedule file>
   check.js --help
 
@@ -24,6 +25,13 @@ Options:
                   violation.
   -j, --jobs <n>  Run <n> test cases at the same time. The default is JOBS, else 2. Each run is slower
                   when more runs share the CPU.
+  --schedules <n> The number of schedules of the random checker. The default is SCHEDULES, else
+                  1000. The random checker stops at the first bug.
+  --both-strategies
+                  Run each test case that must report no bug twice: with the random strategy and with
+                  fair PCT (--sch-fairpct 10). Each tcBug<Defect> test case runs once, with its own
+                  strategy, because the random strategy does not find some seeded defects in 10000
+                  schedules.
   --replay        Replay a schedule of the random checker, for example
                   PCheckerOutput/<test case>/BugFinding/FokosDB_0_0.schedule.
   -h, --help      Show this help.
@@ -33,17 +41,18 @@ The script gives each option after "--" to every \`p check\` call without a chan
 case in TEST_STRATEGY uses its own strategy.
 
 Environment:
-  SCHEDULES       The number of schedules of the random checker (default 1000). The random checker
-                  stops at the first bug.
+  SCHEDULES       The default of --schedules.
   PEX_TIMEOUT     The time limit of PEx for each test case, in seconds (default 60).
   JOBS            The default of --jobs.
 
 Output:
-  One line for each test case, in the order of the test cases: the name, the schedules and timelines
-  that the checker explored (or the time limit of PEx), the time in seconds, and the result. The
-  output of a test case goes to PCheckerOutput/<test case>/, and to PCheckerOutput/pex/<test case>/
-  for PEx. The random checker writes the schedule of a bug to BugFinding/FokosDB_0_0.schedule there.
-  The Maven repository of PEx stays in .p-cache/ between runs.
+  One line for each run of a test case, in the order of the test cases: the name, the schedules and
+  timelines that the checker explored (or the time limit of PEx), the time in seconds, and the
+  result. The output of a run goes to PCheckerOutput/<test case>/, and to
+  PCheckerOutput/pex/<test case>/ for PEx. With --both-strategies, the second run of a test case
+  goes to PCheckerOutput/random/<test case>/ or PCheckerOutput/fairpct/<test case>/. The random
+  checker writes the schedule of a bug to BugFinding/FokosDB_0_0.schedule there. The Maven
+  repository of PEx stays in .p-cache/ between runs.
 
 Exit status: 0 when every test case gives the expected result, else 1.`;
 
@@ -66,9 +75,12 @@ const EXPECTED_MONITOR = {
 	tcBugQuarantineStampedChecks: "CommittedNeverQuarantined",
 };
 
-// The search strategy of the random checker for a test case whose orders need many unlikely steps in
-// a row. Options after "--" replace it.
+// The two search strategies of the random checker. RANDOM is the default of `p check`.
+const RANDOM = ["--sch-random"];
 const FAIR_PCT = ["--sch-fairpct", "10"];
+
+// The search strategy for a test case whose orders need many unlikely steps in a row. Options after
+// "--" replace it.
 const TEST_STRATEGY = {
 	tcStale: FAIR_PCT,
 	tcRepair: FAIR_PCT,
@@ -151,14 +163,15 @@ function violatedMonitor(line) {
 	return lines.map((source) => source.trim().split(/\s+/)).findLast((fields) => fields[0] === "spec")?.[1] ?? "";
 }
 
-/** Runs one test case and resolves to its output line and whether it gave the expected result. */
-async function runTestCase(tc, { mode, schedules, pexTimeout, checkOptions }) {
-	const outdir = mode === "pex" ? `PCheckerOutput/pex/${tc}` : `PCheckerOutput/${tc}`;
+/**
+ * Runs one test case and resolves to its output line and whether it gave the expected result.
+ * `options` go to `p check`, and the output line shows `shown`.
+ */
+async function runTestCase({ tc, outdir, options, shown }, { mode, schedules, pexTimeout }) {
 	const log = `${outdir}/check.log`;
 	rmSync(outdir, { recursive: true, force: true });
 	mkdirSync(outdir, { recursive: true });
 	const pex = mode === "pex";
-	const options = pex || checkOptions.length > 0 ? checkOptions : (TEST_STRATEGY[tc] ?? []);
 	const args = pex
 		? ["check", "--mode", "pex", "-tc", tc, "-t", pexTimeout, "-o", outdir, ...options]
 		: ["check", "-tc", tc, "-s", schedules, "-o", outdir, ...options];
@@ -179,7 +192,7 @@ async function runTestCase(tc, { mode, schedules, pexTimeout, checkOptions }) {
 		errorLine = () => firstLine(text, /Property violated/);
 	} else {
 		const explored = (word) => text.match(new RegExp(`Explored ([0-9]+) ${word}`))?.[1] ?? "0";
-		const strategy = checkOptions.length === 0 && options.length > 0 ? `, ${options.join(" ")}` : "";
+		const strategy = shown.length > 0 ? `, ${shown.join(" ")}` : "";
 		bound = `${explored("schedule")} of ${schedules} schedules, ${explored("timeline")} timelines${strategy}`;
 		cleanPattern = /Found 0 bugs\./;
 		bugPattern = /Checker found a bug\./;
@@ -235,6 +248,8 @@ async function main() {
 				help: { type: "boolean", short: "h" },
 				pex: { type: "boolean" },
 				jobs: { type: "string", short: "j" },
+				schedules: { type: "string" },
+				"both-strategies": { type: "boolean" },
 				replay: { type: "boolean" },
 			},
 		});
@@ -247,20 +262,26 @@ async function main() {
 		console.log(USAGE);
 		process.exit(0);
 	}
-	if (flags.replay && (flags.pex || flags.jobs !== undefined || positionals.length !== 2 || separator >= 0)) {
+	const bothStrategies = flags["both-strategies"] === true;
+	if (
+		flags.replay &&
+		(flags.pex || bothStrategies || flags.jobs !== undefined || flags.schedules !== undefined || positionals.length !== 2 || separator >= 0)
+	) {
 		fail("Usage: check.js --replay <test case> <schedule file>");
+	}
+	if (bothStrategies && (flags.pex || separator >= 0)) {
+		fail("--both-strategies sets the strategy of each run, thus it takes no --pex and no options after --.");
 	}
 	for (const option of checkOptions) {
 		if (OWN_OPTIONS.includes(option)) {
-			fail(`The script sets ${option}. Use the test case arguments, SCHEDULES, or PEX_TIMEOUT.`);
+			fail(`The script sets ${option}. Use the test case arguments, --schedules, or PEX_TIMEOUT.`);
 		}
 	}
 
 	const settings = {
 		mode: flags.pex ? "pex" : "bugfinding",
-		schedules: positiveInt("SCHEDULES", process.env.SCHEDULES ?? "1000"),
+		schedules: positiveInt("--schedules", flags.schedules ?? process.env.SCHEDULES ?? "1000"),
 		pexTimeout: positiveInt("PEX_TIMEOUT", process.env.PEX_TIMEOUT ?? "60"),
-		checkOptions,
 	};
 	const jobs = Number(positiveInt("--jobs", flags.jobs ?? process.env.JOBS ?? "2"));
 
@@ -297,25 +318,38 @@ async function main() {
 		console.log(`p check options: ${checkOptions.join(" ")}`);
 	}
 
-	// Each worker takes the next test case. A line prints when every test case before it has its line,
-	// thus the output keeps the order of the test cases.
+	const runs = tests.flatMap((tc) => {
+		if (settings.mode === "pex") {
+			return [{ tc, outdir: `PCheckerOutput/pex/${tc}`, options: checkOptions, shown: [] }];
+		}
+		const own = checkOptions.length > 0 ? checkOptions : (TEST_STRATEGY[tc] ?? (bothStrategies ? RANDOM : []));
+		const first = { tc, outdir: `PCheckerOutput/${tc}`, options: own, shown: checkOptions.length > 0 ? [] : own };
+		if (!bothStrategies || tc.startsWith("tcBug")) {
+			return [first];
+		}
+		const [other, name] = own === FAIR_PCT ? [RANDOM, "random"] : [FAIR_PCT, "fairpct"];
+		return [first, { tc, outdir: `PCheckerOutput/${name}/${tc}`, options: other, shown: other }];
+	});
+
+	// Each worker takes the next run. A line prints when every run before it has its line, thus the
+	// output keeps the order of the runs.
 	const results = [];
 	let next = 0;
 	let printed = 0;
 	async function worker() {
-		while (next < tests.length) {
+		while (next < runs.length) {
 			const i = next++;
-			results[i] = await runTestCase(tests[i], settings);
-			for (; printed < tests.length && results[printed]; printed++) {
+			results[i] = await runTestCase(runs[i], settings);
+			for (; printed < runs.length && results[printed]; printed++) {
 				console.log(results[printed].line);
 			}
 		}
 	}
-	await Promise.all(Array.from({ length: Math.min(jobs, tests.length) }, worker));
+	await Promise.all(Array.from({ length: Math.min(jobs, runs.length) }, worker));
 
 	const failures = results.filter((r) => !r.ok).length;
 	if (failures > 0) {
-		console.log(`${failures} test case(s) did not give the expected result.`);
+		console.log(`${failures} run(s) did not give the expected result.`);
 		process.exit(1);
 	}
 }

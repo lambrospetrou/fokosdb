@@ -48,6 +48,7 @@
 		"check:keys": "bash ../../tools/check-key-invariants.sh",
 		"check:test-machinery": "node ../../tools/check-test-machinery.js",
 		"formal:p": "node formal/p/check.js",
+		"formal:p:slow": "node formal/p/check.js --both-strategies --schedules 5000",
 		"lint": "oxlint",
 		"lint:fix": "oxlint --fix",
 		"lint:pkg": "publint",
