@@ -61,10 +61,11 @@ The code has `FIXME` and `TODO` items as well, so check those periodically too.
 
 ### Performance and Reliability
 
+- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
 - Add topology keeper and encoding. Schema and versioning per change (split).
 - Add partial topology caching in worker passed from response. Partition DOs also fetch periodically the topology (and store it in storage) and forward the request as far as they can instead of only child partitions.
 - Fix transaction coordinator scaling (`docs/agent-plans/2026-08-31-dynamic-transaction-coordinator-pool.md`).
-- Allow transactional reads during a migration by falling back to the parent partition, as `getItem` and `queryItems` already do.
+- Optimize the transactions RTTs by having the Worker send the Transaction Coordinator (TC) request in parallel to the partitions prepare() and handing off the driving to the TC. Partitions reply to the TC directly, not the Worker. It has some nuances if partitions RPC the TC before the initial call arrives, but with some wait timeout it might worth it.
 - Garbage collect the items table after splits and hash key promotions. Tradeoff between cold-starts (not cleaning) and causing charges due to "rows written" when deleting.
 - Optimize the range partition splitting to go straight to N partitions vs copying to root range.
 - Circuit breaker for overloaded DOs, keep an LRU-cache in the isolate memory of a Worker and reject reqs to a DO for 1-2s.
