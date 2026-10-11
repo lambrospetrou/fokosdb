@@ -3,7 +3,7 @@
 **State:** Draft
 **Date:** 2026-10-09
 **Author:** Lambros Petrou
-**Status:** M0 and M1 are complete. M2 to M7 are not started.
+**Status:** M0 and M1 are complete. M2 is in review. M3 to M7 are not started.
 
 ## Table of contents
 
@@ -293,7 +293,7 @@ that each milestone builds.
 | --- | --- | --- | --- | --- | --- |
 | M0 | Toolchain, one partition, single-item operations | machine, event, `send`, test case, trace replay | `VersionIncreases` | V1 | Done |
 | M1 | `transactWriteItems` on a fixed topology, one drive, no faults | spec monitor, `announce` | `Atomicity`, `AnswerMatchesDecision`, `LockExclusion`, `ReadAfterCommit` | W1–W3 | Done |
-| M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 | Not started |
+| M2 | Faults, retries, recovery, concurrent drives | `$`, `choose`, failure injection, hot states | `SingleApply`, `LocksResolve`, `ClientAnswered`, `TransactionsComplete` | W4–W7 | In review |
 | M3 | Clocks, timestamps, the single-partition path | ghost state | `WriteSerializable` | W8–W10 | Not started |
 | M4 | `transactGetItems`: the snapshot path and the two-phase path | a monitor that searches serial orders | `ReadSerializable` | R1–R3 | Not started |
 | M5 | Hash split under all of the above | `new` at run time | `Authority`, `CopiesUntouched`, `Retention`, `SplitCompletes` | S1–S5 | Not started |
@@ -304,10 +304,10 @@ that each milestone builds.
 
 - **Scope.** The project layout and commands of section 4.2.1. One `Client` and one `Partition` with `apiPutItem`,
   `apiDeleteItem`, and `apiGetItem`. The `formal:p` scripts and the `AGENTS.md` entry of section 4.2.15.
-- **Test cases.** `tcItems`, `tcBugV1`.
+- **Test cases.** `tcItems`, `tcBugNewRowVersionFromOne`.
 - **Delivers.** A working toolchain, and a first replay of a failing trace.
-- **Result.** Done. `tcItems` passes and `tcBugV1` fails with `VersionIncreases`, in the random checker and in PEx.
-  Section 4.2.1 gives the toolchain and the commands, and section 4.2.13 gives the measurements.
+- **Result.** Done. `tcItems` passes and `tcBugNewRowVersionFromOne` fails with `VersionIncreases`, in the random
+  checker and in PEx. Section 4.2.1 gives the toolchain and the commands, and section 4.2.13 gives the measurements.
 
 ### 3.2 M1 — Write transactions, happy path (done)
 
@@ -315,7 +315,8 @@ that each milestone builds.
   without recovery. `prepareLocal` with `pending_conflict` and `condition_failed`, `commitLocal`, `cancelLocal`, and
   the lock check of the single-item writes. Each call goes through an `RpcCall` machine with no fault (section
   4.2.2). No fault and no timestamp.
-- **Test cases.** `tcWriteHappy`, `tcWriteConflict`, `tcBugW1` to `tcBugW3`.
+- **Test cases.** `tcWriteHappy`, `tcWriteConflict`, `tcBugCommitOnOneAccept`, `tcBugPutIgnoresLock`,
+  `tcBugCommittedBeforeApply`.
 - **Delivers.** A check of atomicity and of the client answer on a fixed topology.
 - **Result.** Done. `tcWriteHappy` and `tcWriteConflict` pass in the random checker and in PEx. W1, W2, and W3 fail with
   their monitors. Section 4.2.13 gives the measurements. The model makes these decisions:
@@ -325,33 +326,74 @@ that each milestone builds.
   - The `invariant` of `runCommit` (each participant has a stored accepted answer) is not in the model. With W1 the
     code throws there and sends no commit. `Atomicity` checks the same rule, so W1 shows that the monitor finds a
     commit decision with a rejected participant.
-  - `tcBugW3` does not run `AnswerMatchesDecision`. W3 answers `committed` in `COMMITTING`, and that monitor fails at
-    the answer, before the read. Without it, the test case shows that `ReadAfterCommit` finds the stale read.
+  - `tcBugCommittedBeforeApply` does not run `AnswerMatchesDecision`. W3 answers `committed` in `COMMITTING`, and
+    that monitor fails at the answer, before the read. Without it, the test case shows that `ReadAfterCommit` finds
+    the stale read.
   - The model has no `resumeTransaction`. A token that comes again is an assertion of the coordinator.
 
 ### 3.3 M2 — Faults and recovery
 
-- **Scope.** The faults of the `RpcCall` machine, restarts, lost calls, and time classes (section 4.2.10). A
+- **Scope.** The faults of the `RpcCall` machine, restarts, lost calls, and the clock (section 4.2.10). A
   retry with the same token. The `tx_recovery` job, `recoverTransactionLocal`, the `idempotency_sweep` job,
   `runPrepareRecovery` with `maxPreparingHoldMs`, the participant `stale_tx_recovery` job, the quarantine, and
   `debugForceResolveTransaction`. Concurrent drives of one transaction: the request, a retry, and `tx_recovery`.
-- **Test cases.** `tcWriteFaults`, `tcWriteRetry`, `tcConcurrentDrives`, `tcStale`, `tcRepair`, `tcHold`, `tcBugW4`
-  to `tcBugW7`.
+  The prepare watermark of section 1.3.3 for puts.
+- **Test cases.** `tcWriteFaults`, `tcWriteRetry`, `tcConcurrentDrives`, `tcStale`, `tcRepair`, `tcHold`,
+  `tcBugTokenRowIgnored`, `tcBugStaleCancelsOnDriving`, `tcBugCancelInAnyState`, `tcBugNoPreparingHold`.
 - **Delivers.** A check that a fault never breaks atomicity, and that every lock and every transaction ends when the
   faults stop.
+- **Result.** Every test case gives its expected result. Section 4.2.13 gives the measurements. The model makes
+  these decisions:
+  - **Clock.** The `Environment` machine is also the wall clock (section 4.2.3). Each Durable Object stores
+    `created_at`, `next_recovery_at`, and `completed_at` as ticks, and `nextRecoveryAt` follows the code. The values
+    are `staleTransactionMs` = 1 tick, `maxPreparingHoldMs` = 2, `IDEMPOTENCY_WINDOW_MS` = 3, and
+    `STALE_RECOVERY_MAX_DELAY_MS` = 2. Per-item age classes are not used, because they can make a lock look younger
+    than its transaction. M3 adds an offset for each Durable Object within `maxClockSkewMs`.
+  - **Faults.** The `Environment` owns one restart budget and one loss budget for the run. Each `RpcCall` asks it
+    whether to lose the request or the answer. A lost answer gives the caller the error at once, and the request
+    reaches the target in a later handler of the call, so later calls of the caller can reach the target first. A
+    restart clears the memory state, keeps SQLite and the alarm, and gives each request that waits for the
+    coordinator an error. The restarts can come only in the first 20 steps of the `Environment`.
+  - **The watermark starts in M2.** Without it, a prepare retry that arrives after the commit locks the key again,
+    and recovery applies the write a second time: a false `SingleApply` violation. In the code only the watermark
+    stops this. The coordinator stamps each transaction with its id, which only goes up. A single-item write stamps
+    0, which `MAX` absorbs. M3 adds the clocks, `clock_skew`, `check`, deletes, and W8 to W10.
+  - **`SingleApply` holds inside the idempotency window.** A token that comes after the sweep starts a new
+    transaction, as in the code. The monitor forgets a token when the sweep deletes it (`eTokenSwept`).
+  - **A drive whose transaction the sweep deleted.** `loadFinalResponse` finds no row and throws, so the request
+    gets an error.
+  - **`tcHold` has 1 restart.** With only "`B` drops every call", `drivePrepare` cancels on the failed prepare, and
+    W7 cannot fail. A coordinator restart during the prepare leaves the transaction in `PREPARING` for
+    `runPrepareRecovery`.
+  - **`tcStale` and `tcRepair` use the two clients of `tcWriteConflict`.** A lock stays after its transaction
+    completed only when a prepare reaches a partition after the cancel. A late prepare after a commit gets
+    `timestamp_conflict`. With T1 alone, T1 is never cancelled, so neither test case can reach the quarantine or the
+    repair. Both test cases have the blackout and 2 lost calls. M3 adds `clock_skew`, which can cancel T1 alone. M6
+    adds lock copies, which outlive their transaction, but the stale job skips a transaction whose rows are all
+    copies. Neither makes the quarantine of an owned lock easier.
+  - **`tcWriteRetry`** retries T1 up to 2 times after an error, `transaction_commit_pending`, or
+    `transaction_undecided`, and then sends the token one more time after the final answer.
+  - **`tcConcurrentDrives`** has 1 restart and 1 lost answer, and client 1 retries T1 up to 2 times.
+  - **Search strategy.** `tcStale`, `tcRepair`, `tcBugPutIgnoresLock`, and `tcBugCancelInAnyState` run with
+    `--sch-fairpct 10` (`TEST_STRATEGY` in `check.sh`). Their orders need many unlikely steps in a row: in 3000
+    random schedules, the quarantine and the W6 order did not come. The unfair `--sch-pct` reports false liveness violations, because it
+    can hold a machine back for longer than the clock runs. Use `--sch-fairpct` with the liveness monitors.
+  - **Not in the model.** A fatal prepare error (`FokosValidationError`, `FokosExpressionError`),
+    `partition_over_size`, the time budgets of a step, `recoveryConcurrentDrives`, and `staleLockScanRows`. The step
+    of `tx_recovery` claims every due transaction, and a test case has at most two.
 
 ### 3.4 M3 — Timestamps and the single-partition path
 
 - **Scope.** A clock for each Durable Object with bounded skew. The timestamp rules of section 1.3.3, `clock_skew`,
   `check` operations, deletes and recreates, and `txExecuteSingleShot`.
-- **Test cases.** `tcClocks`, `tcSingleShot`, `tcBugW8` to `tcBugW10`.
+- **Test cases.** `tcClocks`, `tcSingleShot`, the test cases of W8 to W10.
 - **Delivers.** A check that the timestamp order is a serial order of the committed two-phase transactions.
 
 ### 3.5 M4 — Read transactions
 
 - **Scope.** `txReadSnapshot`, the two-phase path, `hasPendingWrite`, the `version` comparison, and the `maxDeletedV`
   comparison. The `getItem` part of `ReadAfterCommit` extends to `transactGetItems`.
-- **Test cases.** `tcReadHappy`, `tcReadVsWrites`, `tcReadFaults`, `tcSnapshot`, `tcBugR1` to `tcBugR3`, and
+- **Test cases.** `tcReadHappy`, `tcReadVsWrites`, `tcReadFaults`, `tcSnapshot`, the test cases of R1 to R3, and
   `tcReadVsWrites` with V1.
 - **Delivers.** A check that a read transaction returns a state of some serial order of the committed writes.
 
@@ -360,7 +402,7 @@ that each milestone builds.
 - **Scope.** A hash split of one root into two children while write and read transactions run, with the faults of
   M2. The router, the import gate, the read-through, the group dispatch, the migration streams, the merge of the
   deletion metadata, and the lock copies of the router (section 4.2.9).
-- **Test cases.** `tcSplitWrites`, `tcSplitReads`, `tcSplitFaults`, `tcBugS1` to `tcBugS5`.
+- **Test cases.** `tcSplitWrites`, `tcSplitReads`, `tcSplitFaults`, the test cases of S1 to S5.
 - **Delivers.** A check that every earlier guarantee holds across a split.
 
 ### 3.7 M6 — Key promotion
@@ -368,7 +410,7 @@ that each milestone builds.
 - **Scope.** One promotion of one hash key while 2 or 3 transactions run, with the faults of M2. The transfer copies,
   the retention until the acknowledgement, the cleanup, the stale job that skips copies, and the repair.
 - **Test cases.** `tcPromotionHappy`, `tcPromotionFaults`, `tcPromotionStale`, `tcPromotionRepair`,
-  `tcPromotionReads`, `tcBugP1` to `tcBugP7`.
+  `tcPromotionReads`, the test cases of P1 to P7.
 - **Delivers.** A check that every earlier guarantee holds across a promotion, and that the copies stay intact.
 
 ### 3.8 M7 — Coordinator split (optional)
@@ -376,7 +418,7 @@ that each milestone builds.
 - **Scope.** A hash split of the coordinator shard group `fokos.tc.<tableName>`. Every durable transition runs
   `fokos.owns(token)` inside its `transactionSync`, and after the cutover it writes nothing and throws
   `partition_migrating`. The client retries with the same token until the child resumes the transaction.
-- **Test cases.** `tcCoordinatorSplit`, `tcBugC1`.
+- **Test cases.** `tcCoordinatorSplit`, the test case of C1.
 - **Delivers.** A check that a token never drives two transactions across a coordinator split.
 - `TODO: the author decides whether M7 is in scope, and supplies the coordinator migration facts for it.`
 
@@ -440,7 +482,7 @@ packages/fokosdb/formal/p/
   and the NuGet tool `P` at version 3.1.0. `check.sh` pins the version and builds the image when it is missing. Only
   Docker is necessary on the machine.
 - `pnpm formal:p` compiles the model and runs every test case. `pnpm formal:p <test case>` runs one. `SCHEDULES`
-  sets the number of schedules of each test case (default 1000). The script fails when a `tcBug<Id>` test case does
+  sets the number of schedules of each test case (default 1000). The script fails when a `tcBug<Defect>` test case does
   not fail with the monitor of section 4.2.12, when another test case finds a bug, or when a name runs more than one
   test case: `p check -tc` runs every test case whose name starts with the given name.
 - The random checker stops at the first bug. For each test case, the output gives the number of schedules and of
@@ -453,7 +495,7 @@ packages/fokosdb/formal/p/
   replays a bug.
 - A small test case can also run in the exhaustive checker PEx: `pnpm formal:p --pex [test case...]`.
   `PEX_TIMEOUT` sets the time limit of each test case in seconds (default 60). A test case passes only when PEx
-  explores every state (`correct for any depth`), and a `tcBug<Id>` test case only when PEx finds the violation of
+  explores every state (`correct for any depth`), and a `tcBug<Defect>` test case only when PEx finds the violation of
   its monitor. A run that stops at the time limit before it explores every state gives `INCOMPLETE`. The output goes to
   `PCheckerOutput/pex/<test case>/`.
 - The PEx compile builds the model with Maven. The Maven repository (46 MB) stays in the ignored folder
@@ -489,11 +531,14 @@ packages/fokosdb/formal/p/
   returns.
 - **Operations.** `put`, `delete`, and `check`. A condition is `exists`, `not_exists`, or none.
 - **Versions.** `v` and `max_deleted_v` are integers, as in the code.
-- **Timestamps (M3).** Each Durable Object has an integer clock. The environment moves each clock forward on its own,
+- **Time (M2).** One wall clock in integer ticks. The `Environment` sends each tick to every Durable Object with
+  `eTick`. Each inbox is in send order, so a message that a Durable Object sends after it read tick `t` reaches each
+  other Durable Object after tick `t`, and an age never looks smaller than in real time. The clock ticks only while
+  some Durable Object has an alarm deadline (`eArmed`), and only while no call is open (`eRpcOpened`,
+  `eRpcClosed`): a call takes milliseconds, and a tick is about `staleTransactionMs`. It stops 20 ticks after the end
+  of the faults and the last change of an alarm, so a run ends.
+- **Timestamps (M3).** Each Durable Object adds its own offset to the wall clock. The environment moves each offset,
   and keeps every pair of clocks within the skew bound. `maxClockSkewMs` is an integer of the same unit.
-- **Time (M2).** Ages are classes, as in section 4.2.5 of the Quint RFC: `Fresh`, `Stale` (at least
-  `staleTransactionMs`), `OverHold` (above `maxPreparingHoldMs`), and `OverWindow` (above
-  `IDEMPOTENCY_WINDOW_MS`). The environment moves one class forward at a time.
 - **Page size.** One row for each migration page. This gives the most interleavings between the `items` stream, the
   `pending_tx` stream, and the transaction operations.
 
@@ -505,8 +550,8 @@ packages/fokosdb/formal/p/
 | `Client` | M0 | — | the calls in progress and their retries | `FokosDB` |
 | `Coordinator` | M1 | `tc_state`, `tc_participants`, `tc_items` (participant and operation only) | the drives in progress | `TransactionCoordinatorDO` |
 | `RpcCall` | M1 | — | one request and its answer | Workers RPC, `FokosShardingClient` retries |
-| `Environment` | M2 | — | the fault budget | eviction, crashes, the wall clock |
-| `Operator` | M2 | — | — | an operator who calls `debugForceResolveTransaction` |
+| `Environment` | M2 | — | the fault budget, the wall clock, the alarms that have a deadline, the open calls | eviction, crashes, the wall clock |
+| `Operator` | M2 | — | the transactions it repaired | an operator who reads the lock-age guard error and the completion log, and calls `debugForceResolveTransaction` |
 
 One `Partition` machine type serves every role, as one `PartitionDO` class does in the code. A source creates a
 child or a range root with `new` on the first `fokosInit`. A later `fokosInit` to the same target reaches the same
@@ -519,14 +564,16 @@ machine.
 | `ePutItem`, `eDeleteItem`, `eGetItem` and answers | Client ↔ Partition | M0 | `apiPutItem`, `apiDeleteItem`, `apiGetItem` |
 | `eInitiateWrite` / `eInitiateWriteResp` | Client ↔ Coordinator | M1 | `initiateWriteLocal`, `resumeTransaction`, `loadFinalResponse` |
 | `eTxPrepare`, `eTxCommit`, `eTxCancel` and answers | Coordinator ↔ Partition, Partition ↔ Partition | M1 | `drivePrepare`, `runCommit`, `runCancel`, `dispatch` of a `group` operation, `prepareLocal`, `commitLocal`, `cancelLocal` |
-| `eRecoveryStep` | Coordinator → itself (alarm) | M2 | `recoverStaleTransactions` of the coordinator, `driveTransaction` |
-| `eSweepStep` | Coordinator → itself (alarm) | M2 | `sweepExpiredTransactions` |
-| `eStaleStep` | Partition → itself (alarm) | M2 | `recoverStaleTransactions` of the partition |
+| `eAlarm` on the coordinator | Coordinator → itself (alarm) | M2 | `sweepExpiredTransactions`, then `recoverStaleTransactions` of the coordinator and `driveTransaction` |
+| `eAlarm` on a partition | Partition → itself (alarm) | M2 | `recoverStaleTransactions` of the partition |
+| `eGuardLogged`, `eLogLookup` / `eLogEntry` | Partition → Operator, Operator ↔ Coordinator | M2 | the lock-age guard error, and the completion log that an operator reads |
 | `eRecover` / `eRecoverResp` | Partition ↔ Coordinator | M2 | `recoverTransactionForParticipant`, `recoverTransactionLocal` |
 | `eForceResolve` / `eForceResolveResp` | Operator ↔ Partition | M2 | `debugForceResolveTransaction` |
 | `eRestart` | Environment → any Durable Object | M2 | eviction or crash |
-| `eAge` | Environment → Partition, Coordinator | M2 | the wall clock |
-| `eTick` | Environment → any Durable Object | M3 | the clock of one Durable Object |
+| `eTick` | Environment → every Durable Object | M2 | the wall clock; from M3 each Durable Object adds its offset |
+| `eArmed`, `eAlarm` | Durable Object → Environment, Durable Object → itself | M2 | the alarm of a Durable Object and the `deadline()` of its jobs |
+| `eMayLose` / `eLossDecision`, `eRpcOpened`, `eRpcClosed` | RpcCall ↔ Environment | M2 | a lost call, and the calls that are open |
+| `eRpcFailed`, `eRpcBroken` | RpcCall → caller, target → RpcCall | M2 | a failed call, and a target that restarted or refused the call |
 | `eExecuteSingleShot` / answer | Client ↔ Partition | M3 | `txExecuteSingleShot`, `executeSingleShot` |
 | `eReadSnapshot` / answer | Client ↔ Partition | M4 | `txReadSnapshot` |
 | `eReadForTransaction` / answer | Client ↔ Partition, Partition ↔ Partition | M4 | `txReadForTransaction`, `readForTransactionLocal` |
@@ -622,7 +669,8 @@ These rules start in M5. Before M5, each root partition owns every key of its ha
 
 - **Restart.** A restart of any Durable Object between any two blocks, within the restart budget of the test case.
 - **Lost call.** An `RpcCall` can drop the request or the answer, within the loss budget. The caller sees an error.
-- **Time.** `eAge` moves the age class of one transaction or one lock forward. `eTick` (M3) moves one clock forward.
+  After a lost answer, the request still reaches the target, before or after the later calls of the caller.
+- **Time.** `eTick` moves the wall clock forward (section 4.2.3). M3 also moves the offset of one Durable Object.
 - **End of faults.** After its budget, the environment stops all faults. The liveness monitors apply from that
   point.
 - **Topology** (M5, M6). The environment requests the split or the promotion at a nondeterministic point. Thus a run
@@ -640,7 +688,7 @@ These rules start in M5. Before M5, each root partition owns every key of its ha
 | `AnswerMatchesDecision` | M1 | The client gets `committed` only for a transaction in `COMMITTED`, and `cancelled` only for a transaction with the decision cancel. | `eDecision`, `eTxCompleted`, `eClientAnswer` |
 | `LockExclusion` | M1 | While a transaction holds the lock of a key, no other writer changes the key. | `eLockWritten`, `eLockDeleted`, `eItemWritten` |
 | `ReadAfterCommit` | M1 | A read that starts after the client got `committed` returns, for each key of that transaction, the value of that transaction or of a later writer. M4 extends it from `getItem` to `transactGetItems`. | `eClientAnswer`, `eReadStart`, `eReadResult` |
-| `SingleApply` | M2 | For each `clientRequestToken`, each key of its operations applies at most once, over all partitions. | `eApplied` |
+| `SingleApply` | M2 | For each `clientRequestToken`, each key of its operations applies at most once, over all partitions, inside the idempotency window of the token. | `eDecision`, `eApplied`, `eTokenSwept` |
 | `WriteSerializable` | M3 | On each key, a committed write of a two-phase transaction has a timestamp above the stamp of every earlier committed read or write of the key. A committed `check` has a timestamp above the stamp of every earlier committed write. A single-item write and a single-partition transaction add their stamps, but the rule does not apply to them, because `MAX` absorbs a clock that lags. Thus the timestamp order is a serial order of the two-phase transactions. | `eApplied`, `eItemWritten` |
 | `ReadSerializable` | M4 | The result of a read transaction equals the state after some prefix of some serial order of the writers. | `eItemWritten`, `eReadStart`, `eReadResult` |
 | `Authority` | M5 | A lock, an apply, a release, or a guard of an owned row happens only on the current owner of the key, and never on an importing target. | `eLocalTxMutation`, `eOwnerChanged`, `eImportState` |
@@ -670,37 +718,41 @@ monitor rejects.
 
 #### 4.2.12 Seeded defects
 
-Each defect is a field of a `Bugs` record that the test driver passes to each machine at creation.
+Each defect is a field of the `tBugs` record that the test driver passes to each machine at creation. The field and
+its test case are named after what the defect does: the field `commitOnOneAccept` has the test case
+`tcBugCommitOnOneAccept`. The Id links the defect to this table. A milestone names the field and the test case of
+each defect that it adds. A test-case name must not be the start of another test-case name, because `p check -tc`
+runs every test case whose name starts with the given name.
 
-| Id | From | Change | Monitor that must fail | Source of the rule |
-| --- | --- | --- | --- | --- |
-| V1 | M0 | A new row starts at `v = 1`, not at `max_deleted_v + 1`. | `VersionIncreases`; in `tcReadVsWrites` also `ReadSerializable` | `docs/agent-plans/2026-10-03-max-deleted-version.md` |
-| W1 | M1 | `drivePrepare` and `markCommitting` decide commit when one participant accepted. | `Atomicity` | 2PC |
-| W2 | M1 | `apiPutItem` ignores the lock. | `LockExclusion` | `AGENTS.md`, "A non-transactional write to a locked item is REFUSED" |
-| W3 | M1 | `drivePrepare` answers `committed` after `markCommitting`, before `runCommit` ends. | `ReadAfterCommit` | `loadFinalResponse`: `committed` promises read-your-writes |
-| W4 | M2 | `initiateWriteLocal` ignores the stored row of the token. | `SingleApply` | idempotency of `clientRequestToken` |
-| W5 | M2 | The participant stale job cancels on `driving`. | `Atomicity` | section 1.3.5 |
-| W6 | M2 | `runCancel` sends cancels without the `CANCELLING` check. | `Atomicity` | Quint RFC, section 1.1 |
-| W7 | M2 | `runPrepareRecovery` has no `maxPreparingHoldMs` bound. | `LocksResolve` in `tcHold` | `docs/agent-plans/2026-09-09-bounded-preparing-hold.md` |
-| W8 | M3 | `prepareLocal` skips the timestamp watermark check. | `WriteSerializable` | section 1.3.3 |
-| W9 | M3 | `executeSingleShot` ignores the lock. | `LockExclusion` | `executeSingleShot` |
-| W10 | M3 | A new row starts its timestamps at its own stamp, not at least `max_delete_tx_order_ts`. | `WriteSerializable` | section 1.3.3 |
-| R1 | M4 | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
-| R2 | M4 | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
-| R3 | M4 | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
-| S1 | M5 | A child does not merge the deletion metadata of the source. | `VersionIncreases`, `ReadSerializable` | section 1.3.6 |
-| S2 | M5 | An importing child serves `txPrepare`. | `Authority` | section 4.2.9, rule 2 |
-| S3 | M5 | A router serves `apiGetItem` from its own item rows. | `ReadAfterCommit` | section 1.3.6 |
-| S4 | M5 | The import skips the `pending_tx` stream. | `Atomicity` | section 1.3.6 |
-| S5 | M5 | A split router deletes its lock copies at cutover. | `Retention` | section 4.2.9, rule 6 |
-| P1 | M6 | The stale job deletes a `not_found` transaction when no row is owned. | `CopiesUntouched`, `SingleApply` or `Atomicity` | Promotion RFC 1.2, item 1 |
-| P2 | M6 | `commitLocal` compares the request with all rows, copies included. | `ClientAnswered`, `LocksResolve` | Promotion RFC 1.2, item 2 |
-| P3 | M6 | The routed `txCommit` and `txCancel` delete by transaction id. | `CopiesUntouched` | Promotion RFC 1.2, item 3 |
-| P4 | M6 | The source deletes the copies of `K` at cutover. | `Retention` | Promotion RFC 4.2.8 |
-| P5 | M6 | An importing `R` serves transaction operations. | `Authority` | Promotion RFC 4.2.2, stage 3 |
-| P6 | M6 | The stale job uses the owner result from before the coordinator call. | `Authority` | Promotion RFC 4.2.6 |
-| P7 | M6 | A cancel with an empty `items` list releases by transaction id. | `CopiesUntouched` | Promotion RFC 4.2.5 |
-| C1 | M7 | A coordinator transition writes after the cutover. | `SingleApply` | `AGENTS.md`, `fokos.owns(token)` |
+| Id | From | Test case | Change | Monitor that must fail | Source of the rule |
+| --- | --- | --- | --- | --- | --- |
+| V1 | M0 | `tcBugNewRowVersionFromOne` | A new row starts at `v = 1`, not at `max_deleted_v + 1`. | `VersionIncreases`; in `tcReadVsWrites` also `ReadSerializable` | `docs/agent-plans/2026-10-03-max-deleted-version.md` |
+| W1 | M1 | `tcBugCommitOnOneAccept` | `drivePrepare` and `markCommitting` decide commit when one participant accepted. | `Atomicity` | 2PC |
+| W2 | M1 | `tcBugPutIgnoresLock` | `apiPutItem` ignores the lock. | `LockExclusion` | `AGENTS.md`, "A non-transactional write to a locked item is REFUSED" |
+| W3 | M1 | `tcBugCommittedBeforeApply` | `drivePrepare` answers `committed` after `markCommitting`, before `runCommit` ends. | `ReadAfterCommit` | `loadFinalResponse`: `committed` promises read-your-writes |
+| W4 | M2 | `tcBugTokenRowIgnored` | `initiateWriteLocal` ignores the stored row of the token. | `SingleApply` | idempotency of `clientRequestToken` |
+| W5 | M2 | `tcBugStaleCancelsOnDriving` | The participant stale job cancels on `driving`. | `Atomicity` | section 1.3.5 |
+| W6 | M2 | `tcBugCancelInAnyState` | `runCancel` sends cancels without the `CANCELLING` check. | `Atomicity` | Quint RFC, section 1.1 |
+| W7 | M2 | `tcBugNoPreparingHold` | `runPrepareRecovery` has no `maxPreparingHoldMs` bound. | `LocksResolve` in `tcHold` | `docs/agent-plans/2026-09-09-bounded-preparing-hold.md` |
+| W8 | M3 | — | `prepareLocal` skips the timestamp watermark check. | `WriteSerializable` | section 1.3.3 |
+| W9 | M3 | — | `executeSingleShot` ignores the lock. | `LockExclusion` | `executeSingleShot` |
+| W10 | M3 | — | A new row starts its timestamps at its own stamp, not at least `max_delete_tx_order_ts`. | `WriteSerializable` | section 1.3.3 |
+| R1 | M4 | — | The two-phase path skips phase 2. | `ReadSerializable` | section 1.3.2 |
+| R2 | M4 | — | The two-phase path ignores `hasPendingWrite`. | `ReadSerializable` | section 1.3.2 |
+| R3 | M4 | — | The two-phase path ignores `maxDeletedV` for an absent item. | `ReadSerializable` | Appendix A |
+| S1 | M5 | — | A child does not merge the deletion metadata of the source. | `VersionIncreases`, `ReadSerializable` | section 1.3.6 |
+| S2 | M5 | — | An importing child serves `txPrepare`. | `Authority` | section 4.2.9, rule 2 |
+| S3 | M5 | — | A router serves `apiGetItem` from its own item rows. | `ReadAfterCommit` | section 1.3.6 |
+| S4 | M5 | — | The import skips the `pending_tx` stream. | `Atomicity` | section 1.3.6 |
+| S5 | M5 | — | A split router deletes its lock copies at cutover. | `Retention` | section 4.2.9, rule 6 |
+| P1 | M6 | — | The stale job deletes a `not_found` transaction when no row is owned. | `CopiesUntouched`, `SingleApply` or `Atomicity` | Promotion RFC 1.2, item 1 |
+| P2 | M6 | — | `commitLocal` compares the request with all rows, copies included. | `ClientAnswered`, `LocksResolve` | Promotion RFC 1.2, item 2 |
+| P3 | M6 | — | The routed `txCommit` and `txCancel` delete by transaction id. | `CopiesUntouched` | Promotion RFC 1.2, item 3 |
+| P4 | M6 | — | The source deletes the copies of `K` at cutover. | `Retention` | Promotion RFC 4.2.8 |
+| P5 | M6 | — | An importing `R` serves transaction operations. | `Authority` | Promotion RFC 4.2.2, stage 3 |
+| P6 | M6 | — | The stale job uses the owner result from before the coordinator call. | `Authority` | Promotion RFC 4.2.6 |
+| P7 | M6 | — | A cancel with an empty `items` list releases by transaction id. | `CopiesUntouched` | Promotion RFC 4.2.5 |
+| C1 | M7 | — | A coordinator transition writes after the cutover. | `SingleApply` | `AGENTS.md`, `fokos.owns(token)` |
 
 For P1, P3, and P4, the run that loses a decided write must also exist: the copy goes before the `pending_tx` stream
 reads it. The test case for each one asserts the first monitor, and the milestone records whether the checker also
@@ -718,11 +770,11 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcWriteHappy` | T1 puts `a1`, `b1`; T2 puts `b2` | none | pass |
 | `tcWriteConflict` | client 1: T1 puts `a1`, `b1`, then a get of `b1`; client 2: T2 puts `a1` with `not_exists`, `b2`, then a put of `a1` | none | pass |
 | `tcWriteFaults` | as `tcWriteConflict` | 2 restarts, 2 lost calls | pass |
-| `tcWriteRetry` | T1 as `tcWriteHappy`, and the caller retries T1 with the same token | 2 lost answers | pass |
+| `tcWriteRetry` | T1 as `tcWriteHappy`, and the caller retries T1 with the same token up to 2 times, then sends it once more after the final answer | 2 lost answers | pass |
 | `tcConcurrentDrives` | T1 puts `a1`, `b1` with a request drive, a retry drive, and a `tx_recovery` drive; T2 puts `a1` | 1 restart, 1 lost answer | pass |
-| `tcStale` | T1 puts `a1`, `b1` | the coordinator does not answer until `OverWindow`, then answers `not_found` | pass |
-| `tcRepair` | as `tcStale` | as `tcStale`, then the operator repairs on `A` and on `B` | pass |
-| `tcHold` | T1 puts `a1`, `b1` | `B` drops every call | pass |
+| `tcStale` | as `tcWriteConflict` | the coordinator drops `recoverTransactionForParticipant` until the sweep deleted the transaction, then answers `not_found`; 2 lost calls | pass |
+| `tcRepair` | as `tcStale` | as `tcStale`, and the operator repairs on `A` and on `B` after a lock-age guard error | pass |
+| `tcHold` | T1 puts `a1`, `b1` | `B` drops every call; 1 restart | pass |
 | `tcClocks` | T1 checks `a1` and puts `b1`; T2 puts `a1`; T3 deletes `b1`; a put of `b1`; T4 puts `b1` | clock skew | pass |
 | `tcSingleShot` | a single-partition transaction on `b1`, `b2`; T1 puts `a1`, `b1` | clock skew | pass |
 | `tcReadHappy` | R1 reads `a1`, `b1` after T1 | none | pass |
@@ -738,23 +790,42 @@ moves `a` to child `A0` and `c` to child `A1` (`hashSplitN = 2`). M6 adds `a2`: 
 | `tcPromotionRepair` | T1 on `a1`, `c1` | as `tcPromotionStale`, then the operator repairs on `A` and on `R` | pass |
 | `tcPromotionReads` | as `tcReadVsWrites` with `a1`, `a2`, `c1` on `A` | the promotion of `a` | pass |
 | `tcCoordinatorSplit` | T1 as `tcWriteHappy`, with retries | the split of the coordinator | pass |
-| `tcBug<Id>` | the test case of the milestone that the defect needs | as that test case | fail with the monitor of section 4.2.12 |
+| `tcBug<Defect>` | the test case of the milestone that the defect needs | as that test case | fail with the monitor of section 4.2.12 |
 
 Each milestone measures the run count of each of its test cases. A test case that passes in PEx within its timeout
 records that fact.
 
+The values are from the model of M2, which adds the clock, the recovery jobs, and the `Environment` to every test
+case. The PEx column of M1 also gives the result with the model of M1.
+
 | Test case | Milestone | Schedules | Run time | Result | PEx |
 | --- | --- | --- | --- | --- | --- |
-| `tcItems` | M0 | 1000 | 8 s | no bug; 1 timeline, because the test case has no nondeterministic choice | `correct for any depth`, 8 states |
-| `tcBugV1` | M0 | 1000 | 1 s | `VersionIncreases` fails in schedule 1 | counterexample of length 5 |
-| `tcWriteHappy` | M1 | 1000 | 13 s | no bug; 110 timelines (242 in 10000 schedules, 121 s) | `correct for any depth`, 2,935 states, 2 s |
-| `tcWriteConflict` | M1 | 1000 | 20 s | no bug; 802 timelines (5087 in 10000 schedules, 174 s) | `correct for any depth`, 44,675 states, 9 s |
-| `tcBugW1` | M1 | 1000 | 1 s | `Atomicity` fails in schedule 1 | counterexample of length 39 |
-| `tcBugW2` | M1 | 1000 | 7 s | `LockExclusion` fails in schedule 333 | counterexample of length 37 |
-| `tcBugW3` | M1 | 1000 | 1 s | `ReadAfterCommit` fails in schedule 9 | counterexample of length 31 |
+| `tcItems` | M0 | 1000 | 12 s | no bug; 3 timelines | `correct for any depth` |
+| `tcBugNewRowVersionFromOne` | M0 | 1000 | 1 s | `VersionIncreases` fails in schedule 1 | counterexample |
+| `tcWriteHappy` | M1 | 1000 | 26 s | no bug; 122 timelines | not complete in 120 s (M1 model: `correct for any depth`, 2,935 states, 2 s) |
+| `tcWriteConflict` | M1 | 1000 | 34 s | no bug; 797 timelines | not complete in 120 s (M1 model: `correct for any depth`, 44,675 states, 9 s) |
+| `tcBugCommitOnOneAccept` | M1 | 1000 | 1 s | `Atomicity` fails in schedule 1 | counterexample |
+| `tcBugPutIgnoresLock` | M1 | 1000, fair PCT | 1 s | `LockExclusion` fails in schedule 7; the random strategy needs about 400 to 900 | counterexample in 94 s |
+| `tcBugCommittedBeforeApply` | M1 | 1000 | 1 s | `ReadAfterCommit` fails in schedule 4 | counterexample |
+| `tcWriteFaults` | M2 | 1000 | 37 s | no bug; 948 timelines | — |
+| `tcWriteRetry` | M2 | 1000 | 38 s | no bug; 552 timelines | — |
+| `tcConcurrentDrives` | M2 | 1000 | 33 s | no bug; 764 timelines | — |
+| `tcStale` | M2 | 1000, fair PCT | 28 s | no bug; 956 timelines | — |
+| `tcRepair` | M2 | 1000, fair PCT | 32 s | no bug; 958 timelines | — |
+| `tcHold` | M2 | 1000 | 82 s | no bug; 44 timelines; each run lasts until the clock stops | — |
+| `tcBugTokenRowIgnored` | M2 | 1000 | 1 s | `SingleApply` fails in schedule 1 | counterexample in 2 s |
+| `tcBugStaleCancelsOnDriving` | M2 | 1000 | 1 s | `Atomicity` fails in schedule 5 | counterexample in 4 s |
+| `tcBugCancelInAnyState` | M2 | 1000, fair PCT | 21 s | `Atomicity` fails in schedule 592; between 10 and 600 in other runs; none in 5000 random schedules | not complete in 120 s |
+| `tcBugNoPreparingHold` | M2 | 1000 | 1 s | `LocksResolve` fails in schedule 2 | counterexample in 22 s |
 
 The run time is the wall time of `check.sh` for one test case, Docker start included. The schedule of a defect is
-from one run, and changes with the seed.
+from one run, and changes with the seed. "Fair PCT" is `--sch-fairpct 10`.
+
+In M2, probes confirmed that `tcStale` and `tcRepair` reach a lock that a late prepare wrote after the cancel, the
+quarantine, and the repair after the quarantine (with fair PCT: 245, 397, and 474 schedules), and that the
+`tcWriteRetry` replay answers `committed` from the ledger. In `tcConcurrentDrives`, no answer was
+`transaction_commit_pending` or `transaction_undecided` in 3000 schedules: with 1 lost answer, no fan-out can use up
+its attempts.
 
 In M1, probes (a temporary monitor that fails when a run reaches a state) confirmed that `tcWriteConflict` reaches
 each of these orders: T1 cancelled, T2 committed, T1 and T2 both committed, the put of `a1` applied, and the get of
@@ -788,10 +859,10 @@ P does not run the TypeScript code. The model links to the code in two ways:
 
 #### 4.2.16 Cost
 
-The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M1, `pnpm formal:p`
-takes about 55 s: 3 s for the compile and the rest for the seven test cases. `pnpm formal:p --pex` takes about 25 s
-with a warm Maven cache. The first run also builds the Docker image, which takes about 1 minute. Section 4.2.13
-records the run time of each test case.
+The model adds no production code and no runtime cost. The checks run outside `pnpm test`. In M2, `pnpm formal:p`
+takes about 6 minutes for the 17 test cases. `pnpm formal:p --pex` stops each test case that it cannot complete at
+`PEX_TIMEOUT`, so run it on chosen test cases. The first run also builds the Docker image, which takes about 1
+minute. Section 4.2.13 records the run time of each test case.
 
 #### 4.2.17 Testing
 
