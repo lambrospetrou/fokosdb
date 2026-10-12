@@ -13,6 +13,7 @@
 //   4. The operations of a write transaction, in the vocabulary of the model.
 //   5. The counters that prove a run met the states it exists for.
 //   6. The key pool: the state a run starts from, and the reads that compare it.
+//      A second pool puts a known number of keys on each root partition.
 //   7. The commands, their arbitraries, and the run that drives them.
 //   8. A batch of transactions over disjoint keys, where the model predicts every outcome.
 //   9. A batch of transactions over the same keys, where the oracle is serializability.
@@ -42,6 +43,7 @@ import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
+import { partitionRouter } from "../transactions/tx-helpers.js";
 
 // ─── The size of a run ────────────────────────────────────────────────────────
 
@@ -149,10 +151,13 @@ const arbJsonLeaf: fc.Arbitrary<JsonPrimitive> = fc.oneof(fc.string({ maxLength:
 // gives the model the exact object a read returns: a plain prototype, and no `-0`.
 const jsonRoundTrip = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
+/** A json object. Every update applies to it, which is not true of an array, a text or a bytes item. */
+export const arbJsonObject: fc.Arbitrary<JsonComposite> = fc
+	.dictionary(fc.string({ minLength: 1, maxLength: 8 }), arbJsonLeaf, { maxKeys: 4 })
+	.map((o) => jsonRoundTrip(o as { [k: string]: JsonValue }));
+
 export const arbJsonData: fc.Arbitrary<JsonComposite> = fc.oneof(
-	fc
-		.dictionary(fc.string({ minLength: 1, maxLength: 8 }), arbJsonLeaf, { maxKeys: 4 })
-		.map((o) => jsonRoundTrip(o as { [k: string]: JsonValue })),
+	arbJsonObject,
 	fc.array(arbJsonLeaf, { maxLength: 4 }).map((a) => jsonRoundTrip(a as JsonValue[])),
 );
 
@@ -181,6 +186,41 @@ function poolKeys(prefix: string): ItemKey[] {
 
 export const POOL_KEYS: readonly ItemKey[] = poolKeys("");
 export const arbPoolKey: fc.Arbitrary<ItemKey> = fc.constantFrom(...POOL_KEYS);
+
+/**
+ * The name of the root partition that owns `key`. On a table that does not split, that partition
+ * is the participant of every transaction on the key.
+ */
+function rootPartitionOf(db: FokosDB, key: ItemKey): string {
+	return partitionRouter(db).rootContext(KeyCodec.encode(key.hashKey)).doName;
+}
+
+/**
+ * A key pool with two keys on each root partition of `db`, so a run can choose how many partitions
+ * a transaction touches. `poolKeys` leaves that number to the hash of four keys, and a run then
+ * often has no key on one of the partitions.
+ *
+ * The function tries string and binary hash keys in turn and gives each partition the first two it
+ * owns. Each partition gets one item with a sort key. The second item has no sort key, but on the
+ * first partition it shares the hash key of the first item, so the pool also holds two items of one
+ * hash key.
+ */
+export function placedPoolKeys(db: FokosDB, prefix: string): ItemKey[] {
+	const roots = partitionRouter(db).allRoots().length;
+	const hashKeys = new Map<string, (string | Uint8Array)[]>();
+	const isFull = () => hashKeys.size === roots && [...hashKeys.values()].every((owned) => owned.length === 2);
+	for (let i = 0; !isFull(); i++) {
+		const hashKey = i % 2 === 0 ? `${prefix}${i}` : new Uint8Array([...textEncoder.encode(prefix), 0xff, i >> 8, i & 0xff]);
+		const owned = hashKeys.get(rootPartitionOf(db, { hashKey })) ?? [];
+		if (owned.length < 2) {
+			hashKeys.set(rootPartitionOf(db, { hashKey }), [...owned, hashKey]);
+		}
+	}
+	return [...hashKeys.values()].flatMap(([first, second], partition) => [
+		{ hashKey: first, sortKey: typeof first === "string" ? "profile" : new Uint8Array([0x0a, 0x0b]) },
+		partition === 0 ? { hashKey: first, sortKey: "settings" } : { hashKey: second },
+	]);
+}
 
 // ─── The waits ────────────────────────────────────────────────────────────────
 
@@ -453,6 +493,22 @@ const ORDERING_CANCEL_CODES: ReadonlySet<string> = new Set(["timestamp_conflict"
 // ─── The counters of a run ────────────────────────────────────────────────────
 
 /**
+ * The paths a write transaction can take, by the number of partitions it touches. The client sends
+ * a transaction on one partition to that partition in one round trip, unless the transaction
+ * carries a `clientRequestToken`. Every other transaction goes through a coordinator and two phases.
+ */
+export const TRANSACTION_PATHS = [
+	"single-shot, 1 participant",
+	"coordinator, 1 participant",
+	"coordinator, 2 participants",
+	"coordinator, 3 participants",
+] as const;
+export type TransactionPath = (typeof TRANSACTION_PATHS)[number];
+
+const transactionPath = (participants: number, withToken: boolean): TransactionPath =>
+	TRANSACTION_PATHS[participants === 1 && !withToken ? 0 : participants];
+
+/**
  * What a run observed over the transactions it sent. A suite that sends transactions at one time
  * asserts on these counts once its property has run, because a suite where every transaction
  * cancels agrees with the model and proves nothing.
@@ -471,10 +527,22 @@ export type TransactionStats = {
 	lockProbes: number;
 	/** Lock probes that met a lock and waited for it to clear. */
 	lockProbeWaits: number;
+	/** How the transactions of each path ended. Only a run that knows the placement of its keys fills it. */
+	paths: Map<TransactionPath, { committed: number; cancelled: number }>;
 };
 
 export function newTransactionStats(): TransactionStats {
-	return { started: 0, committed: 0, cancelled: 0, peakInFlight: 0, inFlight: 0, rejections: new Map(), lockProbes: 0, lockProbeWaits: 0 };
+	return {
+		started: 0,
+		committed: 0,
+		cancelled: 0,
+		peakInFlight: 0,
+		inFlight: 0,
+		rejections: new Map(),
+		lockProbes: 0,
+		lockProbeWaits: 0,
+		paths: new Map(),
+	};
 }
 
 /** One line of the counts, for the message of a coverage assertion. */
@@ -485,13 +553,15 @@ export function describeTransactionStats(s: TransactionStats): string {
 		`${s.peakInFlight} at most in flight`,
 		`${s.lockProbes} lock probes, ${s.lockProbeWaits} of them waited`,
 		`rejections: ${rejections}`,
+		...[...s.paths].map(([path, n]) => `${path}: ${n.committed} committed, ${n.cancelled} cancelled`),
 	].join("; ");
 }
 
-/** Runs one transaction and counts how many ran at one time and how each one ended. */
+/** Runs one transaction and counts how many ran at one time and how each one ended, also for its `path`. */
 async function recordTransaction(
 	stats: TransactionStats | undefined,
 	send: () => Promise<TransactWriteOperationResult[] | undefined>,
+	path?: TransactionPath,
 ): Promise<TransactWriteOperationResult[] | undefined> {
 	if (stats === undefined) {
 		return await send();
@@ -501,6 +571,11 @@ async function recordTransaction(
 	stats.peakInFlight = Math.max(stats.peakInFlight, stats.inFlight);
 	try {
 		const results = await send();
+		if (path !== undefined) {
+			const ended = stats.paths.get(path) ?? { committed: 0, cancelled: 0 };
+			ended[results === undefined ? "committed" : "cancelled"]++;
+			stats.paths.set(path, ended);
+		}
 		if (results === undefined) {
 			stats.committed++;
 		} else {
@@ -679,9 +754,15 @@ export class TransactGet extends ModelCommand {
 }
 
 export class TransactWrite extends ModelCommand {
+	/**
+	 * `withToken` sends the transaction with a `clientRequestToken`, which keeps a transaction on one
+	 * partition on the coordinator path. `path` is the path the run expects, for the counters.
+	 */
 	constructor(
 		readonly ops: TxOp[],
 		readonly stats?: TransactionStats,
+		readonly withToken = false,
+		readonly path?: TransactionPath,
 	) {
 		super();
 	}
@@ -692,16 +773,25 @@ export class TransactWrite extends ModelCommand {
 
 		const rejections = this.ops.map((op) => expectedRejection(m, op));
 		// `results` is undefined on a commit and holds the positional answers on a cancel.
-		const results = await recordTransaction(this.stats, () =>
-			untilAvailable(() => db.transactWriteItems({ items: this.ops.map(toTransactWriteItem) })).then(
-				() => undefined,
-				(e: unknown) => {
-					if (FokosTransactionCancelledError.is(e)) {
-						return e.results;
-					}
-					throw e;
-				},
-			),
+		// Each try gets a token of its own, as the client gives a call that has none. A try after a 503
+		// is then a new transaction, and never the stored answer of the try before it.
+		const request = () => ({
+			items: this.ops.map(toTransactWriteItem),
+			clientRequestToken: this.withToken ? `pbt${crypto.randomUUID().replaceAll("-", "")}` : undefined,
+		});
+		const results = await recordTransaction(
+			this.stats,
+			() =>
+				untilAvailable(() => db.transactWriteItems(request())).then(
+					() => undefined,
+					(e: unknown) => {
+						if (FokosTransactionCancelledError.is(e)) {
+							return e.results;
+						}
+						throw e;
+					},
+				),
+			this.path,
 		);
 
 		if (rejections.some((codes) => codes !== null)) {
@@ -739,7 +829,7 @@ export class TransactWrite extends ModelCommand {
 		applyTxOps(m, this.ops);
 	}
 	toString(): string {
-		return `TransactWrite(${describeTxOps(this.ops)})`;
+		return `TransactWrite${this.withToken ? "[token]" : ""}(${describeTxOps(this.ops)})`;
 	}
 }
 
@@ -785,11 +875,13 @@ function txOpArbitrary(keys: fc.Arbitrary<ItemKey>, data: fc.Arbitrary<ItemData>
 
 /**
  * The command arbitraries of a stateful run over `keys`. The key arbitrary must draw from a small
- * pool, so the commands hit the same keys again. `data` is the payload of every put.
+ * pool, so the commands hit the same keys again. `data` is the payload of every put. `transactions`
+ * replaces the two transaction commands, for a run that chooses the partitions of each one.
  */
 export function commandArbitraries(
 	keys: fc.Arbitrary<ItemKey>,
 	data: fc.Arbitrary<ItemData>,
+	transactions?: { write: fc.Arbitrary<TransactWrite>; readKeys: fc.Arbitrary<ItemKey[]> },
 ): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
 	const arbTxOp = txOpArbitrary(keys, data);
 	// A transaction rejects two operations on one key, so the keys of a set are unique.
@@ -800,9 +892,39 @@ export function commandArbitraries(
 		fc.tuple(keys, data).map(([key, d]) => new PutItem(key, d)),
 		keys.map((key) => new GetItem(key)),
 		keys.map((key) => new DeleteItem(key)),
-		arbTxOps.map((ops) => new TransactWrite(ops)),
-		arbReadKeys.map((ks) => new TransactGet(ks)),
+		transactions?.write ?? arbTxOps.map((ops) => new TransactWrite(ops)),
+		(transactions?.readKeys ?? arbReadKeys).map((ks) => new TransactGet(ks)),
 	];
+}
+
+/**
+ * The command arbitraries of a run over a pool of `placedPoolKeys`. A transaction first draws the
+ * partitions it touches, from one to all of them, and then one or more of the pool keys of each. A
+ * write transaction also draws whether it carries a token, and counts how it ended in `stats.paths`.
+ */
+export function placedCommandArbitraries(
+	db: FokosDB,
+	keys: readonly ItemKey[],
+	data: fc.Arbitrary<ItemData>,
+	stats: TransactionStats,
+): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
+	const partitions = [...Map.groupBy(keys, (key) => rootPartitionOf(db, key)).values()];
+	const arbKeys = fc
+		.shuffledSubarray(partitions, { minLength: 1 })
+		.chain((touched) => fc.tuple(...touched.map((owned) => fc.shuffledSubarray(owned, { minLength: 1 }))))
+		// The last shuffle mixes the keys of the partitions, so the request order does not group them.
+		.chain((groups) => fc.shuffledSubarray(groups.flat(), { minLength: groups.flat().length }));
+	const participants = (ops: readonly TxOp[]) => new Set(ops.map((op) => rootPartitionOf(db, op.key))).size;
+	const write = fc
+		.tuple(
+			arbKeys.chain((ks) => fc.tuple(...ks.map((key) => txOpArbitrary(fc.constant(key), data)))),
+			fc.boolean(),
+		)
+		.map(([ops, withToken]) => new TransactWrite(ops, stats, withToken, transactionPath(participants(ops), withToken)));
+
+	// The counters are for the write transactions, so a run draws one more often than every other command together.
+	const commands = commandArbitraries(fc.constantFrom(...keys), data, { write, readKeys: arbKeys });
+	return [fc.oneof({ arbitrary: write, weight: 4 }, ...commands.map((arbitrary) => ({ arbitrary, weight: 1 })))];
 }
 
 // ─── One run of a stateful property ───────────────────────────────────────────
@@ -812,14 +934,16 @@ export type Run = { keys: readonly ItemKey[]; cmds: Iterable<fc.AsyncCommand<Mod
 
 /**
  * A run over a key pool of its own. `makeCommands` builds the command arbitraries over that pool.
- * The run draws the prefix of its pool, so a replay with the same seed uses the same keys.
+ * The run draws the prefix of its pool, so a replay with the same seed uses the same keys. `pool`
+ * builds the keys from the prefix.
  */
 export function arbRun(
 	makeCommands: (keys: ItemKey[]) => fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[],
 	constraints: fc.CommandsContraints,
+	pool: (prefix: string) => ItemKey[] = poolKeys,
 ): fc.Arbitrary<Run> {
 	return fc.uuid().chain((prefix) => {
-		const keys = poolKeys(`${prefix}:`);
+		const keys = pool(`${prefix}:`);
 		return fc.record({ keys: fc.constant(keys), cmds: fc.commands(makeCommands(keys), constraints) });
 	});
 }
