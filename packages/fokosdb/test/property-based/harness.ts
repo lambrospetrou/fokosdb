@@ -18,6 +18,7 @@
 //   8. A batch of transactions over disjoint keys, where the model predicts every outcome.
 //   9. A batch of transactions over the same keys, where the oracle is serializability.
 //  10. The table whose partitions split while a suite writes to it.
+//  11. A write transaction with a fault on one participant, and the table that takes faults.
 //
 // query-harness.ts holds the second model, for `queryItems`: a key order oracle, the pages of a
 // request, and the range tree the split suites read.
@@ -31,6 +32,7 @@ import { expect } from "vitest";
 import { FokosDB } from "../../src/client/db.js";
 import {
 	CONFLICT_CODES,
+	CORE_INTERNAL_CODES,
 	FokosError,
 	FokosTransactionPendingError,
 	FokosUnavailableError,
@@ -43,7 +45,8 @@ import { KeyCodec } from "../../src/sharding/key-codec.js";
 import { MAX_HASH_KEY_BYTES, MAX_SORT_KEY_BYTES } from "../../src/shared/transaction-limits.js";
 import type { MaybeReadItem, TransactWriteItem, TransactWriteOperationResult } from "../../src/shared/transaction-api-types.js";
 import type { DeleteItemResult, PutItemResult } from "../../src/shared/types.js";
-import { partitionRouter } from "../transactions/tx-helpers.js";
+import { testControlledPartitionStub } from "../stub-helpers.js";
+import { controlledCoordinator, partitionRouter } from "../transactions/tx-helpers.js";
 
 // ─── The size of a run ────────────────────────────────────────────────────────
 
@@ -77,16 +80,19 @@ export const textDecoder = new TextDecoder();
  * A fresh table on three root partitions, so random hash keys spread over the partition DOs. The
  * default split thresholds are far above what a run writes, so no partition splits. A suite that
  * wants hash splits passes a small `hashSplitMaxSizeMb`, and one that wants a key promoted into a
- * range tree passes a small `rangeSplitMaxSizeMb` as well.
+ * range tree passes a small `rangeSplitMaxSizeMb` as well. `controlled` puts the table on the
+ * Durable Object classes that have test controls, with one root coordinator, so a suite can make a
+ * call to one partition fail.
  */
-export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number; rangeSplitMaxSizeMb?: number }): FokosDB {
+export function makeTestDB(opts?: { hashSplitMaxSizeMb?: number; rangeSplitMaxSizeMb?: number; controlled?: boolean }): FokosDB {
 	return new FokosDB({
 		table: {
 			name: `test.pbt.${crypto.randomUUID()}`,
-			ns: "PARTITION_DO",
-			nsTx: "TRANSACTION_COORDINATOR_DO",
+			ns: opts?.controlled ? "CONTROLLED_PARTITION_DO" : "PARTITION_DO",
+			nsTx: opts?.controlled ? "CONTROLLED_TRANSACTION_COORDINATOR_DO" : "TRANSACTION_COORDINATOR_DO",
 			rootTreesN: 3,
 			hashSplitN: 2,
+			coordinatorRootsN: opts?.controlled ? 1 : undefined,
 		},
 		rangeSplitN: 2,
 		hashSplitConditions: { maxSizeMb: opts?.hashSplitMaxSizeMb ?? 500 },
@@ -529,6 +535,8 @@ export type TransactionStats = {
 	lockProbeWaits: number;
 	/** How the transactions of each path ended. Only a run that knows the placement of its keys fills it. */
 	paths: Map<TransactionPath, { committed: number; cancelled: number }>;
+	/** The fault and the answer of each transaction that a `FaultyTransactWrite` sent. */
+	faults: { fault: Fault | undefined; outcome: FaultOutcome }[];
 };
 
 export function newTransactionStats(): TransactionStats {
@@ -542,6 +550,7 @@ export function newTransactionStats(): TransactionStats {
 		lockProbes: 0,
 		lockProbeWaits: 0,
 		paths: new Map(),
+		faults: [],
 	};
 }
 
@@ -881,7 +890,7 @@ function txOpArbitrary(keys: fc.Arbitrary<ItemKey>, data: fc.Arbitrary<ItemData>
 export function commandArbitraries(
 	keys: fc.Arbitrary<ItemKey>,
 	data: fc.Arbitrary<ItemData>,
-	transactions?: { write: fc.Arbitrary<TransactWrite>; readKeys: fc.Arbitrary<ItemKey[]> },
+	transactions?: { write: fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>; readKeys: fc.Arbitrary<ItemKey[]> },
 ): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
 	const arbTxOp = txOpArbitrary(keys, data);
 	// A transaction rejects two operations on one key, so the keys of a set are unique.
@@ -898,9 +907,47 @@ export function commandArbitraries(
 }
 
 /**
- * The command arbitraries of a run over a pool of `placedPoolKeys`. A transaction first draws the
- * partitions it touches, from one to all of them, and then one or more of the pool keys of each. A
- * write transaction also draws whether it carries a token, and counts how it ended in `stats.paths`.
+ * The keys of one transaction over a pool of `placedPoolKeys`: first the partitions it touches, from
+ * one to all of them, and then one or more of the pool keys of each.
+ */
+function arbPlacedKeys(db: FokosDB, keys: readonly ItemKey[]): fc.Arbitrary<ItemKey[]> {
+	const partitions = [...Map.groupBy(keys, (key) => rootPartitionOf(db, key)).values()];
+	return (
+		fc
+			.shuffledSubarray(partitions, { minLength: 1 })
+			.chain((touched) => fc.tuple(...touched.map((owned) => fc.shuffledSubarray(owned, { minLength: 1 }))))
+			// The last shuffle mixes the keys of the partitions, so the request order does not group them.
+			.chain((groups) => fc.shuffledSubarray(groups.flat(), { minLength: groups.flat().length }))
+	);
+}
+
+/** One operation for each of the keys that `keys` draws. */
+function arbOpsOver(keys: fc.Arbitrary<ItemKey[]>, data: fc.Arbitrary<ItemData>): fc.Arbitrary<TxOp[]> {
+	return keys.chain((ks) => fc.tuple(...ks.map((key) => txOpArbitrary(fc.constant(key), data))));
+}
+
+/** The root partitions that a transaction of `ops` touches. */
+const participantsOf = (db: FokosDB, ops: readonly TxOp[]): string[] => [...new Set(ops.map((op) => rootPartitionOf(db, op.key)))];
+
+/**
+ * The commands of a run over a placed pool, with `write` in the place of the write transaction. The
+ * counters of a suite are for the write transactions, so a run draws one more often than every
+ * other command together.
+ */
+function placedCommands(
+	keys: readonly ItemKey[],
+	data: fc.Arbitrary<ItemData>,
+	write: fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>,
+	readKeys: fc.Arbitrary<ItemKey[]>,
+): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
+	const commands = commandArbitraries(fc.constantFrom(...keys), data, { write, readKeys });
+	return [fc.oneof({ arbitrary: write, weight: 4 }, ...commands.map((arbitrary) => ({ arbitrary, weight: 1 })))];
+}
+
+/**
+ * The command arbitraries of a run over a pool of `placedPoolKeys`. A transaction draws the
+ * partitions it touches, as `arbPlacedKeys` says. A write transaction also draws whether it carries
+ * a token, and counts how it ended in `stats.paths`.
  */
 export function placedCommandArbitraries(
 	db: FokosDB,
@@ -908,23 +955,11 @@ export function placedCommandArbitraries(
 	data: fc.Arbitrary<ItemData>,
 	stats: TransactionStats,
 ): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
-	const partitions = [...Map.groupBy(keys, (key) => rootPartitionOf(db, key)).values()];
-	const arbKeys = fc
-		.shuffledSubarray(partitions, { minLength: 1 })
-		.chain((touched) => fc.tuple(...touched.map((owned) => fc.shuffledSubarray(owned, { minLength: 1 }))))
-		// The last shuffle mixes the keys of the partitions, so the request order does not group them.
-		.chain((groups) => fc.shuffledSubarray(groups.flat(), { minLength: groups.flat().length }));
-	const participants = (ops: readonly TxOp[]) => new Set(ops.map((op) => rootPartitionOf(db, op.key))).size;
+	const arbKeys = arbPlacedKeys(db, keys);
 	const write = fc
-		.tuple(
-			arbKeys.chain((ks) => fc.tuple(...ks.map((key) => txOpArbitrary(fc.constant(key), data)))),
-			fc.boolean(),
-		)
-		.map(([ops, withToken]) => new TransactWrite(ops, stats, withToken, transactionPath(participants(ops), withToken)));
-
-	// The counters are for the write transactions, so a run draws one more often than every other command together.
-	const commands = commandArbitraries(fc.constantFrom(...keys), data, { write, readKeys: arbKeys });
-	return [fc.oneof({ arbitrary: write, weight: 4 }, ...commands.map((arbitrary) => ({ arbitrary, weight: 1 })))];
+		.tuple(arbOpsOver(arbKeys, data), fc.boolean())
+		.map(([ops, withToken]) => new TransactWrite(ops, stats, withToken, transactionPath(participantsOf(db, ops).length, withToken)));
+	return placedCommands(keys, data, write, arbKeys);
 }
 
 // ─── One run of a stateful property ───────────────────────────────────────────
@@ -1371,4 +1406,246 @@ export async function expectSeedIntact(db: FokosDB): Promise<number> {
 		});
 	}
 	return maxHashDepth;
+}
+
+// ─── A write transaction with a fault on one participant ──────────────────────
+//
+// A fault makes one RPC of one participant fail. The request is lost before the partition does its
+// work, or the partition does its work and the answer is lost. One call fails, or each call fails
+// until the command removes the fault.
+//
+// The run is serial, so the model still predicts the state exactly. What the client must get depends
+// on the RPC:
+//
+//   - `txExecuteSingleShot`: the client reports the failure, and cannot know if the write applied.
+//     The model knows: the write applied only when the answer was lost and every premise held.
+//   - `txPrepare`: the coordinator sends a prepare again, so one failure changes nothing. A
+//     participant that never answers cancels the transaction.
+//   - `txCommit`: the decision is durable, so the transaction commits. While a participant does not
+//     confirm, the client gets `transaction_commit_pending`.
+//   - `txCancel`: the transaction is cancelled and applied nothing. The participant keeps its locks
+//     until the recovery of the partition or of the coordinator releases them.
+//
+// After each transaction, the keys it touched must agree with the model, each key must take a write
+// that no transaction drives, and a call with the same token must give the same outcome. The recovery
+// jobs or that call finish the work that the fault stopped, and the reads and the writes wait for it.
+
+type FaultOp = "txExecuteSingleShot" | "txPrepare" | "txCommit" | "txCancel";
+
+export type Fault = {
+	op: FaultOp;
+	/** The name of the root partition whose calls fail. */
+	partition: string;
+	/** True when the partition does its work and the answer is lost. False when the request is lost. */
+	replyLost: boolean;
+	/** True when each call fails until the command removes the fault. False when one call fails. */
+	untilCleared: boolean;
+};
+
+/** What the client got: `failed` is an error that does not say if the transaction applied. */
+export type FaultOutcome = "committed" | "cancelled" | "pending" | "failed";
+
+const describeFault = (fault: Fault | undefined): string =>
+	fault === undefined
+		? "no fault"
+		: `${fault.op}, ${fault.replyLost ? "reply lost" : "request lost"}, ${fault.untilCleared ? "until cleared" : "once"}`;
+
+/** One line per fault kind with the count of each outcome, for the message of a coverage assertion. */
+export function describeFaultStats(stats: TransactionStats): string {
+	const counts = new Map<string, number>();
+	for (const { fault, outcome } of stats.faults) {
+		const line = `${describeFault(fault)} → ${outcome}`;
+		counts.set(line, (counts.get(line) ?? 0) + 1);
+	}
+	return [...counts]
+		.map(([line, n]) => `${line}: ${n}`)
+		.sort((a, b) => a.localeCompare(b))
+		.join("\n");
+}
+
+// The code of an operation whose participant never answered the prepare: the coordinator stores the
+// error of its last try, and an injected failure is not an error of the library.
+const PREPARE_FAULT_CODES: ReadonlySet<string> = new Set([CORE_INTERNAL_CODES.foreign_error.code]);
+
+// Short times, so the answer to a fault that stays and the recovery after it take a part of a
+// second. A participant retry must fit in the request budget many times.
+const FAULT_BUDGET_MS = 250;
+
+/**
+ * Gives the coordinator and every root partition of a `controlled` table short budgets, short
+ * stale times and short retry waits. A setting is a field of one Durable Object instance.
+ */
+export async function useShortRecoveryTimes(db: FokosDB): Promise<void> {
+	await controlledCoordinator(db).testConfig({
+		fanoutRequestBudgetMs: FAULT_BUDGET_MS,
+		staleTransactionMs: FAULT_BUDGET_MS,
+		participantRetry: { baseDelayMs: 10, maxDelayMs: 40 },
+	});
+	for (const root of partitionRouter(db).allRoots()) {
+		await testControlledPartitionStub(root.doName).testConfig({
+			staleTransactionMs: FAULT_BUDGET_MS,
+			coordinatorFanoutBudgetMs: FAULT_BUDGET_MS,
+		});
+	}
+}
+
+/**
+ * One write transaction on a `controlled` table, with `fault` on one of its participants while the
+ * client waits. `replayFirst` sends the call with the same token again before the keys are read, so
+ * that call finishes the transaction. Without it, the recovery jobs do.
+ */
+export class FaultyTransactWrite extends ModelCommand {
+	constructor(
+		readonly ops: TxOp[],
+		readonly withToken: boolean,
+		readonly fault: Fault | undefined,
+		readonly replayFirst: boolean,
+		readonly stats: TransactionStats,
+	) {
+		super();
+	}
+
+	async run(m: Model, db: FokosDB): Promise<void> {
+		// The clock moves first, as in `TransactWrite`.
+		await sleep(2);
+
+		const rejections = this.ops.map((op) => expectedRejection(m, op));
+		const premisesHold = rejections.every((codes) => codes === null);
+		const token = this.withToken ? `pbt${crypto.randomUUID().replaceAll("-", "")}` : undefined;
+		const fault = this.fault;
+		const partition = fault && testControlledPartitionStub(fault.partition);
+
+		await partition?.testTxResponse(fault!.op, {
+			error: "the test fails this call",
+			afterWork: fault!.replyLost,
+			...(fault!.untilCleared ? {} : { times: 1 }),
+		});
+		let answer: TransactWriteOperationResult[] | Exclude<FaultOutcome, "cancelled">;
+		try {
+			answer = await db.transactWriteItems({ items: this.ops.map(toTransactWriteItem), clientRequestToken: token }).then(
+				() => "committed" as const,
+				(e: unknown) => {
+					if (FokosTransactionCancelledError.is(e)) {
+						return e.results;
+					}
+					if (FokosTransactionPendingError.is(e)) {
+						return "pending" as const;
+					}
+					if (FokosError.isCode(e, CORE_INTERNAL_CODES.foreign_error)) {
+						return "failed" as const;
+					}
+					throw e;
+				},
+			);
+		} finally {
+			// A fault that no call used must not fail a call of the next command.
+			await partition?.testClearTxResponse(fault!.op);
+		}
+		const outcome = typeof answer === "string" ? answer : "cancelled";
+		this.stats.faults.push({ fault, outcome });
+
+		const prepareNeverAnswers = fault?.op === "txPrepare" && fault.untilCleared;
+		const context = `${this.toString()} answered ${outcome}`;
+		if (fault?.op === "txExecuteSingleShot") {
+			expect(outcome, `the client has one round trip and it failed — ${context}`).toBe("failed");
+		} else if (!premisesHold || prepareNeverAnswers) {
+			expect(outcome, `a failing premise and a prepare with no answer must cancel — ${context}`).toBe("cancelled");
+		} else {
+			// The premises hold, so the transaction commits unless the order of the partition refuses it.
+			// A slow commit can also answer pending when no fault is there.
+			expect(outcome, `only a single round trip can fail with no outcome — ${context}`).not.toBe("failed");
+			if (fault?.op === "txCommit" && fault.untilCleared) {
+				expect(outcome, `a participant that never confirms must keep the answer pending — ${context}`).not.toBe("committed");
+			}
+		}
+		if (typeof answer !== "string") {
+			expect(answer).toHaveLength(this.ops.length);
+			answer.forEach((r, i) => {
+				const code = r.outcome === "rejected" ? r.reason.code : undefined;
+				if (prepareNeverAnswers && rootPartitionOf(db, this.ops[i].key) === fault.partition) {
+					// The coordinator has no answer for these operations, also when a premise of one failed.
+					expect(PREPARE_FAULT_CODES, `operation ${i} of ${context}`).toContain(code);
+				} else if (rejections[i] !== null) {
+					expect(rejections[i], `operation ${i} of ${context}`).toContain(premiseCode(r));
+				} else if (code !== undefined) {
+					expect(ORDERING_CANCEL_CODES, `operation ${i} of ${context}`).toContain(code);
+				}
+			});
+		}
+
+		// A pending answer says that the transaction will commit. A failed single round trip applied
+		// when the partition did its work and every premise held.
+		if (outcome === "committed" || outcome === "pending" || (outcome === "failed" && fault!.replyLost && premisesHold)) {
+			applyTxOps(m, this.ops);
+		}
+
+		const replay = async (): Promise<void> => {
+			if (token === undefined) {
+				return;
+			}
+			// `sendPinned` waits out a pending answer, so this is the terminal outcome of the transaction.
+			const again = await sendPinned(db, this.ops, token);
+			expect(describeOutcome(again), `a call with the same token answered differently — ${context}`).toBe(
+				describeOutcome(typeof answer === "string" ? undefined : answer),
+			);
+		};
+		const keys = this.ops.map((op) => op.key);
+		if (this.replayFirst) {
+			await replay();
+		}
+		// The read waits while a key holds a pending write, and the probe waits while it holds any lock.
+		await expectModelMatches(db, m, keys);
+		for (const key of keys) {
+			await expectKeyUnlocked(m, db, key, this.stats);
+		}
+		if (!this.replayFirst) {
+			await replay();
+		}
+	}
+
+	toString(): string {
+		const flags = [this.withToken ? "[token]" : "", this.withToken && this.replayFirst ? "[replay first]" : ""].join("");
+		return `FaultyTransactWrite${flags}[${describeFault(this.fault)}](${describeTxOps(this.ops)})`;
+	}
+}
+
+/**
+ * The command arbitraries of a run over a pool of `placedPoolKeys` on a `controlled` table. Each
+ * write transaction is a `FaultyTransactWrite`, and seven of eight have a fault. A transaction that
+ * goes to one partition in one round trip has the fault on that call. Every other transaction
+ * draws the prepare, the commit or the cancel of one of its participants.
+ */
+export function faultyCommandArbitraries(
+	db: FokosDB,
+	keys: readonly ItemKey[],
+	data: fc.Arbitrary<ItemData>,
+	stats: TransactionStats,
+): fc.Arbitrary<fc.AsyncCommand<Model, FokosDB>>[] {
+	const arbKeys = arbPlacedKeys(db, keys);
+	const write = fc
+		.record({
+			ops: arbOpsOver(arbKeys, data),
+			withToken: fc.boolean(),
+			faulted: fc.oneof({ arbitrary: fc.constant(true), weight: 7 }, { arbitrary: fc.constant(false), weight: 1 }),
+			op: fc.constantFrom<FaultOp>("txPrepare", "txCommit", "txCancel"),
+			participant: fc.nat(),
+			replyLost: fc.boolean(),
+			untilCleared: fc.boolean(),
+			replayFirst: fc.boolean(),
+		})
+		.map(({ ops, withToken, faulted, op, participant, replyLost, untilCleared, replayFirst }) => {
+			const participants = participantsOf(db, ops);
+			const singleRoundTrip = participants.length === 1 && !withToken;
+			const fault: Fault | undefined = faulted
+				? {
+						op: singleRoundTrip ? "txExecuteSingleShot" : op,
+						partition: participants[participant % participants.length],
+						replyLost,
+						// The client does not send a single round trip again, so one failure is all it meets.
+						untilCleared: !singleRoundTrip && untilCleared,
+					}
+				: undefined;
+			return new FaultyTransactWrite(ops, withToken, fault, replayFirst, stats);
+		});
+	return placedCommands(keys, data, write, arbKeys);
 }

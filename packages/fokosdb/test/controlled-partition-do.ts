@@ -60,15 +60,16 @@ function pageRows(page: unknown): number {
 }
 
 /** The transaction operations that this class logs, and that a test can make answer or fail. */
-export type TxOp = "txReadSnapshot" | "txReadForTransaction" | "txExecuteSingleShot" | "txCommit" | "txCancel";
+export type TxOp = "txReadSnapshot" | "txReadForTransaction" | "txExecuteSingleShot" | "txPrepare" | "txCommit" | "txCancel";
 export type TxRequest<Op extends TxOp> = Parameters<PartitionDO[Op]>[1];
 type TxResponse<Op extends TxOp> = Awaited<ReturnType<PartitionDO[Op]>>;
 
 /**
  * What an operation does in place of its work, for `times` calls. `error` fails the call with that
- * message, and `value` answers the call with that value.
+ * message, and `value` answers the call with that value. With `afterWork`, a failing call first does
+ * its work, as when the partition applies a request and its answer is lost.
  */
-export type TxResponseRule<Op extends TxOp> = ({ error: string } | { value: TxResponse<Op> }) & { times?: number };
+export type TxResponseRule<Op extends TxOp> = ({ error: string; afterWork?: boolean } | { value: TxResponse<Op> }) & { times?: number };
 
 export class ControlledPartitionDO extends PartitionDO {
 	#pullGate: (Gate & { spec: PullGateSpec }) | null = null;
@@ -80,6 +81,7 @@ export class ControlledPartitionDO extends PartitionDO {
 		txReadSnapshot: [],
 		txReadForTransaction: [],
 		txExecuteSingleShot: [],
+		txPrepare: [],
 		txCommit: [],
 		txCancel: [],
 	};
@@ -102,7 +104,10 @@ export class ControlledPartitionDO extends PartitionDO {
 		if (rule.times !== undefined && --rule.times <= 0) {
 			delete this.#txRules[op];
 		}
-		return "error" in rule ? Promise.reject(new Error(rule.error)) : Promise.resolve(rule.value);
+		if ("value" in rule) {
+			return Promise.resolve(rule.value);
+		}
+		return (rule.afterWork ? work() : Promise.resolve()).then(() => Promise.reject(new Error(rule.error)));
 	}
 
 	override txReadSnapshot(ctx: FokosDBRouteContext, req: TxRequest<"txReadSnapshot">) {
@@ -125,14 +130,16 @@ export class ControlledPartitionDO extends PartitionDO {
 		return this.#tx("txExecuteSingleShot", req, () => super.txExecuteSingleShot(ctx, req));
 	}
 
-	override async txPrepare(ctx: FokosDBRouteContext, req: Parameters<PartitionDO["txPrepare"]>[1]) {
-		const response = await super.txPrepare(ctx, req);
-		const prepareGate = this.#prepareGate;
-		if (prepareGate && !prepareGate.parked) {
-			prepareGate.parked = true;
-			await prepareGate.held;
-		}
-		return response;
+	override txPrepare(ctx: FokosDBRouteContext, req: TxRequest<"txPrepare">) {
+		return this.#tx("txPrepare", req, async () => {
+			const response = await super.txPrepare(ctx, req);
+			const prepareGate = this.#prepareGate;
+			if (prepareGate && !prepareGate.parked) {
+				prepareGate.parked = true;
+				await prepareGate.held;
+			}
+			return response;
+		});
 	}
 
 	override txCommit(ctx: FokosDBRouteContext, req: TxRequest<"txCommit">) {
